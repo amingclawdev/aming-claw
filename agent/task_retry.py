@@ -149,8 +149,8 @@ def retry_task(
     # ── AC-2: State validation ──
     if status == "accepted":
         return False, "任务已验收通过并归档，无法重新开发", None
-    if status != "rejected":
-        return False, "只能对验收拒绝的任务重新开发（当前状态: {}）".format(status), None
+    if status not in ("rejected", "pending_acceptance"):
+        return False, "只能对验收拒绝或待验收的任务重新开发（当前状态: {}）".format(status), None
     if stage != "results":
         return False, "任务不在results阶段，无法重新开发（当前stage: {}）".format(stage), None
 

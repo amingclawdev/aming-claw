@@ -220,7 +220,11 @@ def set_pipeline_stages(stages: List[Dict], changed_by: Optional[int] = None) ->
 
 
 def format_pipeline_stages(stages: List[Dict]) -> str:
-    """Human-readable stage list, e.g. 'plan(claude) → code(claude) → verify(codex)'"""
+    """Human-readable stage list showing model name when available.
+
+    With model: 'pm(claude-opus-4-6 [C]) → dev(claude-opus-4-6 [C])'
+    Without model (fallback): 'plan(claude) → code(claude) → verify(codex)'
+    """
     if not stages:
         return "(empty)"
     parts = []
@@ -228,11 +232,23 @@ def format_pipeline_stages(stages: List[Dict]) -> str:
         name = s.get("name", "?")
         backend = s.get("backend", "?")
         model = s.get("model", "")
+        provider = s.get("provider", "")
         if model:
-            parts.append("{}({}/{})".format(name, backend, model))
+            tag = _provider_tag(provider)
+            display = "{} {}".format(model, tag).rstrip() if tag else model
+            parts.append("{}({})".format(name, display))
         else:
             parts.append("{}({})".format(name, backend))
     return " → ".join(parts)
+
+
+def _provider_tag(provider: str) -> str:
+    """Return short provider tag like [C] for anthropic, [O] for openai."""
+    if provider == "anthropic":
+        return "[C]"
+    if provider == "openai":
+        return "[O]"
+    return ""
 
 
 # ── Role pipeline stages ─────────────────────────────────────────────────────

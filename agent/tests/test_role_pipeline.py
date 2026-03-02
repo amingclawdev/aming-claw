@@ -130,6 +130,91 @@ class TestRolePipelineConfig(unittest.TestCase):
         self.assertEqual(len(stages), 4)
 
 
+class TestRolePipelinePresetMerge(unittest.TestCase):
+    """T1: Verify that selecting role_pipeline preset merges per-role model config."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_merge_role_config_into_preset(self):
+        """When user has configured per-role models, selecting role_pipeline preset
+        should produce stages that include those models."""
+        # Configure PM=claude-opus-4-6, Test=gpt-4o
+        set_role_stage_model("pm", "claude-opus-4-6", provider="anthropic", validate=False)
+        set_role_stage_model("test", "gpt-4o", provider="openai", validate=False)
+
+        # Simulate what bot_commands does when selecting role_pipeline preset
+        from config import PIPELINE_PRESETS
+        stages = [dict(s) for s in PIPELINE_PRESETS["role_pipeline"]]
+        role_stages = get_role_pipeline_stages()
+        role_config = {s["name"]: s for s in role_stages if "name" in s}
+        for stage in stages:
+            name = stage.get("name", "")
+            if name in role_config:
+                rc = role_config[name]
+                if rc.get("model"):
+                    stage["model"] = rc["model"]
+                    stage["provider"] = rc.get("provider", "")
+
+        # Verify PM has model
+        pm = next(s for s in stages if s["name"] == "pm")
+        self.assertEqual(pm["model"], "claude-opus-4-6")
+        self.assertEqual(pm["provider"], "anthropic")
+
+        # Verify Test has model
+        test_stage = next(s for s in stages if s["name"] == "test")
+        self.assertEqual(test_stage["model"], "gpt-4o")
+        self.assertEqual(test_stage["provider"], "openai")
+
+        # Verify unconfigured roles don't have model
+        dev = next(s for s in stages if s["name"] == "dev")
+        self.assertFalse(dev.get("model"))
+
+    def test_format_shows_model_after_merge(self):
+        """Confirmation message should show model names after merge."""
+        set_role_stage_model("pm", "claude-opus-4-6", provider="anthropic", validate=False)
+
+        from config import PIPELINE_PRESETS
+        stages = [dict(s) for s in PIPELINE_PRESETS["role_pipeline"]]
+        role_stages = get_role_pipeline_stages()
+        role_config = {s["name"]: s for s in role_stages if "name" in s}
+        for stage in stages:
+            name = stage.get("name", "")
+            if name in role_config:
+                rc = role_config[name]
+                if rc.get("model"):
+                    stage["model"] = rc["model"]
+                    stage["provider"] = rc.get("provider", "")
+
+        text = format_pipeline_stages(stages)
+        self.assertIn("claude-opus-4-6", text)
+        self.assertIn("[C]", text)
+        # Unconfigured stages show backend
+        self.assertIn("dev(claude)", text)
+
+    def test_no_role_config_uses_defaults(self):
+        """Without per-role config, preset stages should remain unchanged."""
+        from config import PIPELINE_PRESETS
+        stages = [dict(s) for s in PIPELINE_PRESETS["role_pipeline"]]
+        role_stages = get_role_pipeline_stages()
+        role_config = {s["name"]: s for s in role_stages if "name" in s}
+        for stage in stages:
+            name = stage.get("name", "")
+            if name in role_config:
+                rc = role_config[name]
+                if rc.get("model"):
+                    stage["model"] = rc["model"]
+
+        # No model should be set
+        for s in stages:
+            self.assertFalse(s.get("model"))
+
+
 class TestFormatRolePipelineStages(unittest.TestCase):
     def test_empty(self):
         result = format_role_pipeline_stages([])
@@ -156,13 +241,24 @@ class TestFormatRolePipelineStages(unittest.TestCase):
 
 
 class TestFormatPipelineStagesWithModel(unittest.TestCase):
-    def test_stage_with_model(self):
+    def test_stage_with_model_no_provider(self):
         stages = [
             {"name": "pm", "backend": "claude", "model": "claude-opus-4-6"},
             {"name": "dev", "backend": "claude"},
         ]
         result = format_pipeline_stages(stages)
-        self.assertIn("pm(claude/claude-opus-4-6)", result)
+        self.assertIn("pm(claude-opus-4-6)", result)
+        self.assertIn("dev(claude)", result)
+
+    def test_stage_with_model_and_provider(self):
+        stages = [
+            {"name": "pm", "backend": "claude", "model": "claude-opus-4-6", "provider": "anthropic"},
+            {"name": "test", "backend": "openai", "model": "gpt-4o", "provider": "openai"},
+            {"name": "dev", "backend": "claude"},
+        ]
+        result = format_pipeline_stages(stages)
+        self.assertIn("pm(claude-opus-4-6 [C])", result)
+        self.assertIn("test(gpt-4o [O])", result)
         self.assertIn("dev(claude)", result)
 
 

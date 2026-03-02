@@ -534,10 +534,11 @@ def task_status_list_keyboard(
     return {"inline_keyboard": rows}
 
 
-def task_detail_keyboard(task_code: str, status: str) -> Dict:
+def task_detail_keyboard(task_code: str, status: str, is_pipeline: bool = False) -> Dict:
     """Build action keyboard for a task detail page based on its status.
 
     Different statuses get different action buttons.
+    When is_pipeline=True, adds a "查看阶段详情" button.
     """
     rows: List[List[Dict]] = []
     s = str(status or "").strip().lower()
@@ -596,6 +597,10 @@ def task_detail_keyboard(task_code: str, status: str) -> Dict:
         ])
         back_cb = "menu:sub_task_mgmt"
 
+    if is_pipeline:
+        rows.append([
+            {"text": "\U0001f50d \u67e5\u770b\u9636\u6bb5\u8be6\u60c5", "callback_data": "stage_detail:{}".format(code)},
+        ])
     rows.append([{"text": "\u00ab \u8fd4\u56de\u5217\u8868", "callback_data": back_cb}])
     return {"inline_keyboard": rows}
 

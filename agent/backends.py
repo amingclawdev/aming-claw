@@ -212,7 +212,8 @@ def get_git_changed_files(workspace: Path) -> Optional[List[str]]:
 
 # ── Backend runners ───────────────────────────────────────────────────────────
 
-def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "", prompt_override: Optional[str] = None) -> Dict:
+def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "",
+              prompt_override: Optional[str] = None, model_override: str = "") -> Dict:
     # Use the actual project directory (not the isolated search-workspace)
     # so Codex can read and modify project source files.
     workspace = resolve_active_workspace()
@@ -222,7 +223,7 @@ def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "", prompt_o
         raise RuntimeError("task rejected: request touches sensitive paths (e.g. .ssh)")
     timeout_sec = int(os.getenv("CODEX_TIMEOUT_SEC", "1200"))
     max_retries = int(os.getenv("CODEX_TIMEOUT_RETRIES", "1"))
-    model = os.getenv("CODEX_MODEL", "").strip()
+    model = model_override.strip() if model_override else os.getenv("CODEX_MODEL", "").strip()
     codex_bin = os.getenv("CODEX_BIN", "").strip()
     if not codex_bin:
         codex_bin = "codex.cmd" if os.name == "nt" else "codex"
@@ -738,13 +739,12 @@ def run_stage_with_retry(task: Dict, stage: Dict, prompt: str, stage_idx: int) -
                 stage_name, actual_model, actual_provider)
 
     def _run(p: str, tag: str) -> Dict:
+        # Route to the correct CLI based on the effective provider.
+        # openai provider -> Codex CLI (uses subscription, no API key needed)
+        # anthropic provider -> Claude CLI (uses Max subscription)
         if backend == "openai":
-            return run_via_api(
-                task,
-                prompt_override=p,
-                model_override=actual_model,
-                provider_override="openai",
-            )
+            return run_codex(task, attempt_tag=tag, prompt_override=p,
+                             model_override=actual_model)
         if backend == "claude":
             # Apply per-stage model/provider override if configured.
             if stage_model:
@@ -755,22 +755,15 @@ def run_stage_with_retry(task: Dict, stage: Dict, prompt: str, stage_idx: int) -
                 try:
                     set_claude_model(stage_model, provider=eff_provider)
                     if eff_provider == "openai":
-                        return run_via_api(
-                            task,
-                            prompt_override=p,
-                            model_override=stage_model,
-                            provider_override=eff_provider,
-                        )
+                        # OpenAI model -> use Codex CLI with specific model
+                        return run_codex(task, attempt_tag=tag, prompt_override=p,
+                                         model_override=stage_model)
                     return run_claude(task, attempt_tag=tag, prompt_override=p)
                 finally:
                     set_claude_model(orig_model, provider=orig_provider)
             if global_provider == "openai":
-                return run_via_api(
-                    task,
-                    prompt_override=p,
-                    model_override=global_model,
-                    provider_override=global_provider,
-                )
+                return run_codex(task, attempt_tag=tag, prompt_override=p,
+                                 model_override=global_model)
             return run_claude(task, attempt_tag=tag, prompt_override=p)
         return run_codex(task, attempt_tag=tag, prompt_override=p)
 
@@ -928,14 +921,10 @@ def process_codex(task: Dict, processing: Path) -> Dict:
 def process_claude(task: Dict, processing: Path) -> Dict:
     from config import get_model_provider
     provider = get_model_provider()
-    # Anthropic models: use Claude CLI (has tool-use, can actually modify files).
-    # OpenAI models: use direct API (no CLI equivalent); apply noop detection.
+    # Anthropic models: use Claude CLI (has tool-use, Max subscription).
+    # OpenAI models: use Codex CLI (has tool-use, Codex subscription).
     if provider == "openai":
-        run = run_via_api(task)
-        # Direct API has no tool-use; detect if the AI actually did anything.
-        if not run.get("noop_reason"):
-            noop_reason = detect_noop_execution(run)
-            run["noop_reason"] = noop_reason
+        run = run_codex_with_retry(task)
     else:
         # "anthropic" or unset: use Claude CLI with model from config
         run = run_claude_with_retry(task)

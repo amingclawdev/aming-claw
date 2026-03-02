@@ -32,6 +32,7 @@ from interactive_menu import (  # noqa: E402
     security_menu_keyboard,
     set_pending_action,
     system_menu_keyboard,
+    task_detail_keyboard,
     task_list_action_keyboard,
     workspace_menu_keyboard,
     workspace_select_keyboard,
@@ -346,6 +347,45 @@ class TestModelListKeyboard(unittest.TestCase):
         kb = system_menu_keyboard()
         all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
         self.assertTrue(any("model_list" in d for d in all_data))
+
+
+class TestTaskDetailKeyboard(unittest.TestCase):
+    """Tests for task_detail_keyboard including pipeline button."""
+
+    def _all_callback_data(self, kb):
+        return [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+
+    def test_pending_acceptance_buttons(self):
+        kb = task_detail_keyboard("T0001", "pending_acceptance")
+        data = self._all_callback_data(kb)
+        self.assertIn("accept:T0001", data)
+        self.assertIn("reject:T0001", data)
+
+    def test_pipeline_button_shown(self):
+        kb = task_detail_keyboard("T0001", "pending_acceptance", is_pipeline=True)
+        data = self._all_callback_data(kb)
+        self.assertIn("stage_detail:T0001", data)
+
+    def test_pipeline_button_hidden_by_default(self):
+        kb = task_detail_keyboard("T0001", "pending_acceptance")
+        data = self._all_callback_data(kb)
+        self.assertNotIn("stage_detail:T0001", data)
+
+    def test_pipeline_button_hidden_non_pipeline(self):
+        kb = task_detail_keyboard("T0001", "pending_acceptance", is_pipeline=False)
+        data = self._all_callback_data(kb)
+        self.assertNotIn("stage_detail:T0001", data)
+
+    def test_pipeline_button_for_failed(self):
+        kb = task_detail_keyboard("T0002", "failed", is_pipeline=True)
+        data = self._all_callback_data(kb)
+        self.assertIn("stage_detail:T0002", data)
+
+    def test_back_button_always_present(self):
+        for status in ["pending", "processing", "pending_acceptance", "rejected", "accepted", "failed"]:
+            kb = task_detail_keyboard("T0001", status)
+            texts = [btn["text"] for row in kb["inline_keyboard"] for btn in row]
+            self.assertTrue(any("返回" in t for t in texts), "Missing back button for status={}".format(status))
 
 
 if __name__ == "__main__":

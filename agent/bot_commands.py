@@ -608,6 +608,63 @@ def build_status_summary(task: Dict) -> str:
     return "(暂无概要)"
 
 
+def format_stage_execution_summary(task: Dict) -> str:
+    """Build stage execution summary text for pipeline tasks.
+
+    Returns empty string for non-pipeline tasks or when no stage data exists.
+    """
+    executor = task.get("executor") or {}
+    if executor.get("action") != "pipeline":
+        return ""
+    stages = executor.get("stages")
+    if not stages:
+        return ""
+    model_info = task.get("stages_model_info") or []
+    model_map = {m["stage"]: m for m in model_info if isinstance(m, dict) and "stage" in m}
+
+    lines = ["\u2699\ufe0f \u6d41\u6c34\u7ebf\u6267\u884c\u8be6\u60c5:"]
+    for s in stages:
+        stage_name = s.get("stage", "?")
+        idx = s.get("stage_index", "?")
+        elapsed = s.get("elapsed_ms")
+        noop = s.get("noop_reason", "")
+        rc = s.get("returncode")
+        role_def = ROLE_DEFINITIONS.get(stage_name, {})
+        emoji = role_def.get("emoji", "")
+        label = role_def.get("label", stage_name)
+
+        # Determine model display from stages_model_info, fallback to backend
+        mi = model_map.get(stage_name, {})
+        model = mi.get("model", "")
+        provider = mi.get("provider", "")
+        if model and model != "(default)":
+            from config import _provider_tag
+            tag = _provider_tag(provider)
+            model_display = "{} {}".format(model, tag).rstrip()
+        else:
+            model_display = s.get("backend", "?")
+
+        # Status icon
+        if elapsed is None and rc is None:
+            status_icon = "(\u672a\u6267\u884c)"
+            time_str = ""
+        elif noop:
+            status_icon = "\u274c"
+            time_str = " {:.1f}s".format(elapsed / 1000.0) if elapsed else ""
+        elif rc == 0 or rc is None:
+            status_icon = "\u2705"
+            time_str = " {:.1f}s".format(elapsed / 1000.0) if elapsed else ""
+        else:
+            status_icon = "\u274c"
+            time_str = " {:.1f}s".format(elapsed / 1000.0) if elapsed else ""
+
+        line = "  {}. {} {} \u2192 {} {}{}".format(idx, emoji, label, model_display, status_icon, time_str)
+        if noop:
+            line += " (noop: {})".format(noop[:40])
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def status_tag(status: str) -> str:
     mapping = {
         "pending": "待处理",
@@ -874,7 +931,18 @@ def handle_callback_query(cb: Dict) -> None:
                 return
             preset_name = data[len("pipeline_preset:"):]
             if preset_name in PIPELINE_PRESETS:
-                stages = PIPELINE_PRESETS[preset_name]
+                stages = [dict(s) for s in PIPELINE_PRESETS[preset_name]]
+                # For role_pipeline preset, merge per-role model config
+                if preset_name == "role_pipeline":
+                    role_stages = get_role_pipeline_stages()
+                    role_config = {s["name"]: s for s in role_stages if "name" in s}
+                    for stage in stages:
+                        name = stage.get("name", "")
+                        if name in role_config:
+                            rc = role_config[name]
+                            if rc.get("model"):
+                                stage["model"] = rc["model"]
+                                stage["provider"] = rc.get("provider", "")
                 set_pipeline_stages(stages, changed_by=user_id)
                 answer_callback_query(cb_id, "流水线已配置")
                 send_text(
@@ -1069,6 +1137,9 @@ def handle_callback_query(cb: Dict) -> None:
         # ---- Task management callbacks ----
         if data.startswith("task_detail:"):
             _handle_task_detail_callback(cb_id, data, chat_id, user_id)
+            return
+        if data.startswith("stage_detail:"):
+            _handle_stage_detail_callback(cb_id, data, chat_id, user_id)
             return
         if data.startswith("task_cancel:"):
             ref = data.split(":", 1)[1].strip()
@@ -1990,8 +2061,73 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
     if acceptance.get("reason"):
         detail += "\n\u62d2\u7edd\u539f\u56e0: {}".format(str(acceptance["reason"])[:200])
 
-    send_text(chat_id, detail, reply_markup=task_detail_keyboard(found.get("task_code", task_code), status))
+    # Append pipeline stage execution info if available
+    stage_summary = format_stage_execution_summary(found)
+    if stage_summary:
+        detail += "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" + stage_summary
+
+    # Determine if this is a pipeline task for keyboard
+    is_pipeline = bool((found.get("executor") or {}).get("action") == "pipeline")
+    send_text(chat_id, detail, reply_markup=task_detail_keyboard(found.get("task_code", task_code), status, is_pipeline=is_pipeline))
     answer_callback_query(cb_id, "\u4efb\u52a1\u8be6\u60c5")
+
+
+def _handle_stage_detail_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> None:
+    """Handle stage_detail:{task_code} callback to show per-stage output."""
+    task_code = data.split(":", 1)[1].strip()
+    task_id = resolve_task_ref(task_code) or task_code
+
+    # Read run log from logs/{task_id}.run.json
+    run_log_path = tasks_root() / "logs" / (task_id + ".run.json")
+    if not run_log_path.exists():
+        send_text(chat_id, "\u65e0\u9636\u6bb5\u6267\u884c\u8bb0\u5f55\uff08\u65e5\u5fd7\u6587\u4ef6\u4e0d\u5b58\u5728\uff09", reply_markup=back_to_menu_keyboard())
+        answer_callback_query(cb_id, "\u65e0\u8bb0\u5f55")
+        return
+
+    try:
+        run_data = load_json(run_log_path)
+    except Exception:
+        send_text(chat_id, "\u65e0\u6cd5\u8bfb\u53d6\u9636\u6bb5\u6267\u884c\u8bb0\u5f55", reply_markup=back_to_menu_keyboard())
+        answer_callback_query(cb_id, "\u8bfb\u53d6\u5931\u8d25")
+        return
+
+    stage_details = run_data.get("stage_details")
+    if not stage_details:
+        send_text(chat_id, "\u65e0\u9636\u6bb5\u6267\u884c\u8bb0\u5f55", reply_markup=back_to_menu_keyboard())
+        answer_callback_query(cb_id, "\u65e0\u8bb0\u5f55")
+        return
+
+    lines = ["\U0001f50d \u9636\u6bb5\u8be6\u60c5 [{}]".format(task_code), "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+    for sd in stage_details:
+        stage_name = sd.get("stage", "?")
+        role_def = ROLE_DEFINITIONS.get(stage_name, {})
+        emoji = role_def.get("emoji", "")
+        label = role_def.get("label", stage_name)
+        idx = sd.get("stage_index", "?")
+        elapsed = sd.get("elapsed_ms")
+        noop = sd.get("noop_reason", "")
+        rc = sd.get("returncode")
+        time_str = " ({:.1f}s)".format(elapsed / 1000.0) if elapsed else ""
+
+        lines.append("\n{} {}. {} {}{}".format(emoji, idx, label, "\u274c" if noop or (rc and rc != 0) else "\u2705", time_str))
+        if noop:
+            lines.append("  noop: {}".format(noop[:100]))
+        # Show output preview (last_message preferred, fallback stdout)
+        output = (sd.get("last_message") or sd.get("stdout") or "").strip()
+        if output:
+            preview = output[:800]
+            if len(output) > 800:
+                preview += "\n... (\u5df2\u622a\u65ad)"
+            lines.append(preview)
+        else:
+            lines.append("  (\u65e0\u8f93\u51fa)")
+
+    text = "\n".join(lines)
+    # Telegram message limit: 4096 chars
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (\u5df2\u622a\u65ad)"
+    send_text(chat_id, text, reply_markup=back_to_menu_keyboard())
+    answer_callback_query(cb_id, "\u9636\u6bb5\u8be6\u60c5")
 
 
 def _handle_task_doc_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> None:
@@ -2839,7 +2975,26 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             return True
         lines = ["当前流水线 (后端=pipeline):"]
         for i, s in enumerate(stages, 1):
-            lines.append("  {}. {}({})".format(i, s.get("name", "?"), s.get("backend", "?")))
+            name = s.get("name", "?")
+            role_def = ROLE_DEFINITIONS.get(name)
+            model = s.get("model", "")
+            provider = s.get("provider", "")
+            if role_def:
+                emoji = role_def.get("emoji", "")
+                label = role_def.get("label", name)
+                if model:
+                    from config import _provider_tag
+                    tag = _provider_tag(provider)
+                    lines.append("  {}. {} {} \u2192 {} {}".format(i, emoji, label, model, tag).rstrip())
+                else:
+                    lines.append("  {}. {} {} \u2192 ({})".format(i, emoji, label, s.get("backend", "?")))
+            else:
+                if model:
+                    from config import _provider_tag
+                    tag = _provider_tag(provider)
+                    lines.append("  {}. {} \u2192 {} {}".format(i, name, model, tag).rstrip())
+                else:
+                    lines.append("  {}. {}({})".format(i, name, s.get("backend", "?")))
         lines.append("\n内置预设: " + ", ".join(PIPELINE_PRESETS.keys()))
         send_text(chat_id, "\n".join(lines))
         return True
