@@ -197,7 +197,8 @@ class TestTaskDetailKeyboard(unittest.TestCase):
         self.assertIn("accept:T0003", data)
         self.assertIn("reject:T0003", data)
         self.assertIn("task_doc:T0003", data)
-        self.assertIn("events:T0003", data)
+        self.assertIn("task_summary:T0003", data)
+        self.assertIn("task_log:T0003", data)
         self.assertIn("menu:tasks_pending_acceptance", data)
 
     def test_rejected_actions(self):
@@ -215,7 +216,8 @@ class TestTaskDetailKeyboard(unittest.TestCase):
         self._assert_valid_keyboard(kb)
         data = self._get_all_data(kb)
         self.assertIn("task_doc:T0005", data)
-        self.assertIn("events:T0005", data)
+        self.assertIn("task_summary:T0005", data)
+        self.assertIn("task_log:T0005", data)
         self.assertIn("menu:tasks_accepted", data)
 
     def test_completed_actions(self):
@@ -223,7 +225,8 @@ class TestTaskDetailKeyboard(unittest.TestCase):
         kb = task_detail_keyboard("T0006", "completed")
         data = self._get_all_data(kb)
         self.assertIn("task_doc:T0006", data)
-        self.assertIn("events:T0006", data)
+        self.assertIn("task_summary:T0006", data)
+        self.assertIn("task_log:T0006", data)
         self.assertIn("menu:tasks_accepted", data)
 
     def test_failed_actions(self):
@@ -232,6 +235,7 @@ class TestTaskDetailKeyboard(unittest.TestCase):
         data = self._get_all_data(kb)
         self.assertIn("retry:T0007", data)
         self.assertIn("task_doc:T0007", data)
+        self.assertIn("task_log:T0007", data)
         self.assertIn("task_delete:T0007", data)
         self.assertIn("menu:tasks_failed", data)
 
@@ -241,6 +245,7 @@ class TestTaskDetailKeyboard(unittest.TestCase):
         data = self._get_all_data(kb)
         self.assertIn("retry:T0008", data)
         self.assertIn("task_doc:T0008", data)
+        self.assertIn("task_log:T0008", data)
         self.assertIn("menu:tasks_failed", data)
 
     def test_unknown_status_fallback(self):
@@ -705,6 +710,138 @@ class TestRemoveArchiveEntry(unittest.TestCase):
         from bot_commands import _remove_archive_entry
         result = _remove_archive_entry("arc-nonexistent")
         self.assertFalse(result)
+
+
+class TestArchiveMenuEntryBug(unittest.TestCase):
+    """T5: Test archive entry with missing fields does not crash."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        for d in ["pending", "processing", "results", "state", "state/task_state", "archive"]:
+            (Path(self.tmp.name) / "codex-tasks" / d).mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_archive_entry_missing_archive_id(self):
+        """Archive entry without archive_id should not crash the menu."""
+        from task_state import _archive_index_file
+        idx_file = _archive_index_file()
+        # Write entry missing archive_id
+        entry = json.dumps({"task_id": "task-old-1", "task_code": "T0001",
+                            "text": "old task", "summary": "done"})
+        idx_file.write_text(entry + "\n", encoding="utf-8")
+
+        from bot_commands import _collect_tasks_by_status
+        tasks = _collect_tasks_by_status(chat_id=100, status_key="archived")
+        self.assertEqual(len(tasks), 1)
+        # archive_id should be filled with fallback
+        self.assertTrue(tasks[0].get("archive_id"))
+
+    def test_archive_entry_missing_task_code(self):
+        """Archive entry without task_code should get a fallback."""
+        from task_state import _archive_index_file
+        idx_file = _archive_index_file()
+        entry = json.dumps({"archive_id": "arc-123", "task_id": "task-old-2",
+                            "text": "old task"})
+        idx_file.write_text(entry + "\n", encoding="utf-8")
+
+        from bot_commands import _collect_tasks_by_status
+        tasks = _collect_tasks_by_status(chat_id=100, status_key="archived")
+        self.assertEqual(len(tasks), 1)
+        # task_code should be filled
+        self.assertTrue(tasks[0].get("task_code"))
+        self.assertNotEqual(tasks[0]["task_code"], "-")
+
+    def test_archive_entry_empty_fields(self):
+        """Archive entry with empty string fields should get fallbacks."""
+        from task_state import _archive_index_file
+        idx_file = _archive_index_file()
+        entry = json.dumps({"archive_id": "", "task_id": "task-old-3",
+                            "task_code": "", "text": "empty fields"})
+        idx_file.write_text(entry + "\n", encoding="utf-8")
+
+        from bot_commands import _collect_tasks_by_status
+        tasks = _collect_tasks_by_status(chat_id=100, status_key="archived")
+        self.assertEqual(len(tasks), 1)
+        self.assertTrue(tasks[0].get("archive_id"))
+        self.assertTrue(tasks[0].get("task_code"))
+
+    def test_archive_keyboard_fallback_on_empty_archive_id(self):
+        """Keyboard should use task_id as fallback when archive_id is empty."""
+        tasks = [{"task_code": "T0001", "text": "test", "archive_id": "",
+                  "task_id": "task-fallback-1"}]
+        kb = task_status_list_keyboard(tasks, "archived")
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        # Should use task_id as fallback, not empty string
+        archive_btns = [d for d in all_data if d.startswith("archive_detail:")]
+        self.assertEqual(len(archive_btns), 1)
+        self.assertNotEqual(archive_btns[0], "archive_detail:")
+
+    @patch("bot_commands.answer_callback_query")
+    @patch("bot_commands.send_text")
+    def test_archived_menu_with_incomplete_entries(self, mock_send, mock_answer):
+        """Full integration: archive menu should work with incomplete entries."""
+        from task_state import _archive_index_file
+        idx_file = _archive_index_file()
+        entries = [
+            json.dumps({"archive_id": "arc-1", "task_code": "T0001", "text": "task 1"}),
+            json.dumps({"task_id": "task-2", "text": "task 2 no code no archive_id"}),
+        ]
+        idx_file.write_text("\n".join(entries) + "\n", encoding="utf-8")
+
+        from bot_commands import handle_callback_query
+        cb = {
+            "id": "cb_arch",
+            "data": "menu:tasks_archived",
+            "message": {"chat": {"id": 100}},
+            "from": {"id": 200},
+        }
+        handle_callback_query(cb)
+        mock_send.assert_called()
+        # Should not crash and should show 2 entries
+        kb = mock_send.call_args[1].get("reply_markup") or {}
+        all_data = [btn["callback_data"] for row in kb.get("inline_keyboard", []) for btn in row]
+        archive_btns = [d for d in all_data if d.startswith("archive_detail:")]
+        self.assertEqual(len(archive_btns), 2)
+
+
+class TestArchiveDetailMissingFields(unittest.TestCase):
+    """T5/T6: Archive detail page should handle missing fields gracefully."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        for d in ["archive", "state"]:
+            (Path(self.tmp.name) / "codex-tasks" / d).mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    @patch("bot_commands.answer_callback_query")
+    @patch("bot_commands.send_text")
+    def test_archive_detail_minimal_entry(self, mock_send, mock_answer):
+        """Archive detail should work with minimal entry fields."""
+        from task_state import _archive_index_file
+        idx_file = _archive_index_file()
+        entry = json.dumps({"archive_id": "arc-minimal", "text": "minimal task"})
+        idx_file.write_text(entry + "\n", encoding="utf-8")
+
+        from bot_commands import handle_callback_query
+        cb = {
+            "id": "cb_detail",
+            "data": "archive_detail:arc-minimal",
+            "message": {"chat": {"id": 100}},
+            "from": {"id": 200},
+        }
+        handle_callback_query(cb)
+        mock_send.assert_called()
+        text = mock_send.call_args[0][1]
+        self.assertIn("\u5f52\u6863\u8be6\u60c5", text)
+        self.assertIn("arc-minimal", text)
 
 
 if __name__ == "__main__":

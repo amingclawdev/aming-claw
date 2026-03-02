@@ -16,7 +16,10 @@ from task_accept import (  # noqa: E402
     acceptance_root,
     build_acceptance_cases,
     build_task_summary,
+    finalize_codex_task,
     finalize_pipeline_task,
+    format_elapsed,
+    generate_stage_summary,
     json_sha256,
     task_inline_keyboard,
     to_pending_acceptance,
@@ -197,26 +200,55 @@ class TestAcceptanceNoticeText(unittest.TestCase):
         }
         text = acceptance_notice_text(result, "task-1", "T0001", detailed=True)
         self.assertIn("T0001", text)
-        self.assertIn("pending_acceptance", text)
-        self.assertIn("/accept T0001", text)
+        self.assertIn("\u2705", text)  # success emoji
+        self.assertIn("\u6267\u884c\u5b8c\u6210", text)
+        # New format: no UUID, no /accept, no pending_acceptance
+        self.assertNotIn("task-1", text)
+        self.assertNotIn("/accept", text)
+        self.assertNotIn("pending_acceptance", text)
 
     def test_failed_notice(self):
         result = {
             "execution_status": "failed",
-            "executor": {"elapsed_ms": 500, "noop_reason": "无执行"},
+            "executor": {"elapsed_ms": 500, "noop_reason": "\u65e0\u6267\u884c"},
         }
         text = acceptance_notice_text(result, "task-2", "T0002", detailed=False)
-        self.assertIn("执行失败", text)
-        self.assertIn("/reject T0002", text)
+        self.assertIn("\u6267\u884c\u5931\u8d25", text)
+        self.assertIn("T0002", text)
+        # New format: no /reject command prompt
+        self.assertNotIn("/reject", text)
+        self.assertNotIn("pending_acceptance", text)
 
-    def test_brief_vs_detailed(self):
+    def test_notice_no_uuid(self):
+        """UUID task_id should not appear in the notice text."""
+        result = {
+            "execution_status": "completed",
+            "executor": {"elapsed_ms": 3000, "last_message": "done"},
+        }
+        text = acceptance_notice_text(result, "task-uuid-12345", "T0042", detailed=True)
+        self.assertNotIn("task-uuid-12345", text)
+        self.assertIn("T0042", text)
+
+    def test_elapsed_human_readable(self):
+        """Elapsed time should be in seconds/minutes, not ms."""
+        result = {
+            "execution_status": "completed",
+            "executor": {"elapsed_ms": 83000, "last_message": "done"},
+        }
+        text = acceptance_notice_text(result, "t1", "T1", detailed=True)
+        self.assertIn("\u79d2", text)  # "秒" in the output
+        self.assertNotIn("83000 ms", text)
+
+    def test_brief_same_format(self):
+        """Brief and detailed now use the same format (simplified)."""
         result = {
             "execution_status": "completed",
             "executor": {"elapsed_ms": 1000, "last_message": "ok"},
         }
         brief = acceptance_notice_text(result, "t1", "T1", detailed=False)
         detailed = acceptance_notice_text(result, "t1", "T1", detailed=True)
-        self.assertGreater(len(detailed), len(brief))
+        # Both should be the same simplified format
+        self.assertEqual(brief, detailed)
 
 
 class TestTaskInlineKeyboard(unittest.TestCase):
@@ -230,6 +262,11 @@ class TestTaskInlineKeyboard(unittest.TestCase):
         # Check callback data contains task code
         all_data = [btn["callback_data"] for row in rows for btn in row]
         self.assertTrue(any("T0001" in d for d in all_data))
+        # New format: has accept/reject and doc/detail, no status button
+        self.assertIn("accept:T0001", all_data)
+        self.assertIn("reject:T0001", all_data)
+        self.assertIn("task_doc:T0001", all_data)
+        self.assertIn("task_detail:T0001", all_data)
 
 
 class TestFinalizePipelineTask(unittest.TestCase):
@@ -343,6 +380,181 @@ class TestFinalizePipelineTask(unittest.TestCase):
         result = finalize_pipeline_task(task, processing, stage_results, "completed")
         self.assertEqual(result["executor"]["stages"][0]["model"], "")
         self.assertEqual(result["executor"]["stages"][0]["provider"], "")
+
+
+class TestFormatElapsed(unittest.TestCase):
+    """Tests for format_elapsed helper."""
+
+    def test_seconds(self):
+        self.assertIn("\u79d2", format_elapsed(1500))
+        self.assertIn("1.5", format_elapsed(1500))
+
+    def test_minutes(self):
+        result = format_elapsed(83000)
+        self.assertIn("1 \u5206", result)
+        self.assertIn("23 \u79d2", result)
+
+    def test_zero(self):
+        result = format_elapsed(0)
+        self.assertIn("\u79d2", result)
+
+    def test_none(self):
+        result = format_elapsed(None)
+        self.assertIn("\u79d2", result)
+
+    def test_exact_minutes(self):
+        result = format_elapsed(120000)
+        self.assertIn("2 \u5206\u949f", result)
+
+
+class TestGenerateStageSummary(unittest.TestCase):
+    """Tests for generate_stage_summary."""
+
+    def test_with_last_message(self):
+        result = generate_stage_summary({
+            "last_message": "\u5df2\u5b8c\u6210\u63a5\u53e3\u4e0e\u53c2\u6570\u6821\u9a8c",
+            "git_changed_files": ["api/status.py"],
+        })
+        self.assertIn("\u5b8c\u6210", result)
+        self.assertIn("status.py", result)
+        self.assertLessEqual(len(result), 200)
+
+    def test_with_noop(self):
+        result = generate_stage_summary({
+            "last_message": "",
+            "noop_reason": "ack only",
+            "git_changed_files": [],
+        })
+        self.assertIn("\u672a\u6267\u884c", result)
+
+    def test_with_error(self):
+        result = generate_stage_summary({
+            "last_message": "",
+            "error": "timeout exceeded",
+        })
+        self.assertIn("\u9519\u8bef", result)
+
+    def test_empty_result(self):
+        result = generate_stage_summary({})
+        self.assertEqual(result, "(\u65e0\u6267\u884c\u8f93\u51fa)")
+        self.assertLessEqual(len(result), 200)
+
+    def test_max_200_chars(self):
+        result = generate_stage_summary({
+            "last_message": "A" * 500,
+            "git_changed_files": ["file{}.py".format(i) for i in range(20)],
+        })
+        self.assertLessEqual(len(result), 200)
+
+
+class TestSummaryFileGeneration(unittest.TestCase):
+    """Test that summary files are generated during finalization."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        from utils import tasks_root
+        (tasks_root() / "processing").mkdir(parents=True, exist_ok=True)
+        (tasks_root() / "logs").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_codex_generates_summary_file(self):
+        from utils import tasks_root
+        task = {"task_id": "test-sum-1", "text": "test task"}
+        processing = tasks_root() / "processing" / "test-sum-1.json"
+        run = {
+            "returncode": 0, "elapsed_ms": 1000, "last_message": "done ok",
+            "stdout": "output", "stderr": "", "cmd": "echo",
+            "git_changed_files": ["a.py"], "noop_reason": None,
+            "attempt_count": 1, "attempt_tag": "", "workspace": "/ws",
+        }
+        finalize_codex_task(task, processing, run, "completed")
+        summary_path = tasks_root() / "logs" / "test-sum-1.summary.txt"
+        self.assertTrue(summary_path.exists())
+        content = summary_path.read_text(encoding="utf-8")
+        self.assertGreater(len(content), 0)
+        self.assertLessEqual(len(content), 200)
+
+    def test_codex_run_log_has_summary(self):
+        from utils import tasks_root
+        task = {"task_id": "test-sum-2", "text": "test task"}
+        processing = tasks_root() / "processing" / "test-sum-2.json"
+        run = {
+            "returncode": 0, "elapsed_ms": 500, "last_message": "completed",
+            "stdout": "out", "stderr": "", "cmd": "echo",
+            "git_changed_files": [], "noop_reason": None,
+            "attempt_count": 1, "attempt_tag": "", "workspace": "/ws",
+        }
+        finalize_codex_task(task, processing, run, "completed")
+        run_log = load_json(tasks_root() / "logs" / "test-sum-2.run.json")
+        self.assertIn("summary", run_log)
+        self.assertGreater(len(run_log["summary"]), 0)
+
+    def test_pipeline_generates_summary_file(self):
+        from utils import tasks_root
+        task = {"task_id": "test-sum-3", "text": "test task"}
+        processing = tasks_root() / "processing" / "test-sum-3.json"
+        stage_results = [
+            {
+                "stage": "dev", "backend": "claude", "stage_index": 1,
+                "run": {"returncode": 0, "elapsed_ms": 1000, "last_message": "code done",
+                        "stdout": "out", "stderr": "", "cmd": "echo", "noop_reason": None,
+                        "attempt_count": 1, "git_changed_files": ["a.py"]},
+            },
+        ]
+        finalize_pipeline_task(task, processing, stage_results, "completed")
+        summary_path = tasks_root() / "logs" / "test-sum-3.summary.txt"
+        self.assertTrue(summary_path.exists())
+
+    def test_pipeline_stage_details_have_summary(self):
+        from utils import tasks_root
+        task = {"task_id": "test-sum-4", "text": "test task"}
+        processing = tasks_root() / "processing" / "test-sum-4.json"
+        stage_results = [
+            {
+                "stage": "pm", "backend": "claude", "stage_index": 1,
+                "run": {"returncode": 0, "elapsed_ms": 500, "last_message": "plan done",
+                        "stdout": "out", "stderr": "", "cmd": "echo", "noop_reason": None,
+                        "attempt_count": 1, "git_changed_files": []},
+            },
+            {
+                "stage": "dev", "backend": "codex", "stage_index": 2,
+                "run": {"returncode": 0, "elapsed_ms": 2000, "last_message": "code done",
+                        "stdout": "out2", "stderr": "", "cmd": "echo2", "noop_reason": None,
+                        "attempt_count": 1, "git_changed_files": ["b.py"]},
+            },
+        ]
+        finalize_pipeline_task(task, processing, stage_results, "completed")
+        run_log = load_json(tasks_root() / "logs" / "test-sum-4.run.json")
+        for sd in run_log["stage_details"]:
+            self.assertIn("summary", sd)
+            self.assertGreater(len(sd["summary"]), 0)
+        self.assertIn("summary", run_log)
+
+
+class TestTaskInlineKeyboardNew(unittest.TestCase):
+    """Test the new simplified inline keyboard structure."""
+
+    def test_no_status_button(self):
+        """New keyboard should not have status button."""
+        kb = task_inline_keyboard("T0001", "task-1")
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertFalse(any(d.startswith("status:") for d in all_data))
+
+    def test_has_doc_and_detail_buttons(self):
+        kb = task_inline_keyboard("T0001", "task-1")
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("task_doc:T0001", all_data)
+        self.assertIn("task_detail:T0001", all_data)
+
+    def test_has_accept_reject(self):
+        kb = task_inline_keyboard("T0001", "task-1")
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("accept:T0001", all_data)
+        self.assertIn("reject:T0001", all_data)
 
 
 if __name__ == "__main__":
