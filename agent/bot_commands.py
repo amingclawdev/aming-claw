@@ -293,6 +293,18 @@ def is_ops_allowed(chat_id: int, user_id: int) -> bool:
     return (chat_id, user_id) in pairs
 
 
+def _looks_like_screenshot_task_tail(tail: str) -> bool:
+    """Return True when `/screenshot <tail>` looks like engineering-task text."""
+    if not tail:
+        return False
+    return bool(re.match(
+        r"^(命令|command|功能|feature|模块|module|问题|issue|误判|任务|task|"
+        r"报告|report|日志|log|流程|flow|逻辑|logic|修复|fix|排查|检查|优化|"
+        r"失败|异常|debug|bug)",
+        tail.strip().lower(),
+    ))
+
+
 def is_screenshot_text(text: str) -> bool:
     """Return True only when the user's PRIMARY intent is to take a screenshot.
 
@@ -308,12 +320,7 @@ def is_screenshot_text(text: str) -> bool:
         tail = low[len("/screenshot"):].strip()
         if not tail:
             return True
-        if re.match(
-            r"^(命令|command|功能|feature|模块|module|问题|issue|误判|任务|task|"
-            r"报告|report|日志|log|流程|flow|逻辑|logic|修复|fix|排查|检查|优化|"
-            r"失败|异常|debug|bug)",
-            tail,
-        ):
+        if _looks_like_screenshot_task_tail(tail):
             return False
         return True
     # 2) Guard against task descriptions that start with screenshot keywords.
@@ -2936,6 +2943,20 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
     if t.startswith("/screenshot"):
         try:
             body = t[12:].strip() if len(t) > 11 else ""
+            if body and _looks_like_screenshot_task_tail(body):
+                task_id = create_task(chat_id, user_id, "/task {}".format(t))
+                task = load_json(task_file("pending", task_id))
+                task_code = task.get("task_code", "-")
+                send_text(
+                    chat_id,
+                    "检测到该输入更像任务描述，已按任务创建: [{code}] {task_id}\n状态: pending\n内容: {text}".format(
+                        code=task_code,
+                        task_id=task_id,
+                        text=t[:200],
+                    ),
+                    reply_markup=task_inline_keyboard(task_code),
+                )
+                return True
             run_screenshot_once(chat_id, body or "请截图")
         except Exception as exc:
             send_text(chat_id, "截图失败: {}".format(str(exc)[:1000]))
