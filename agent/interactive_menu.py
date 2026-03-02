@@ -226,6 +226,23 @@ def workspace_select_keyboard(workspaces: List[Dict], callback_prefix: str = "ws
     return {"inline_keyboard": rows}
 
 
+def fuzzy_workspace_add_keyboard(candidates: list, callback_prefix: str = "ws_fuzzy_add") -> Dict:
+    """Build a dynamic keyboard for fuzzy workspace search results.
+
+    Each candidate gets a button with callback_data: <prefix>:<1-based-index>
+    candidates is a list of Path objects.
+    """
+    rows: List[List[Dict]] = []
+    for idx, path in enumerate(candidates, 1):
+        display = "{} ({})".format(path.name, str(path.parent))
+        # Truncate display to avoid Telegram text limits
+        if len(display) > 60:
+            display = "{}...{}".format(display[:30], display[-27:])
+        rows.append([{"text": display, "callback_data": "{}:{}".format(callback_prefix, idx)}])
+    rows.append([{"text": "\u00ab \u53d6\u6d88", "callback_data": "menu:cancel"}])
+    return {"inline_keyboard": rows}
+
+
 def security_menu_keyboard() -> Dict:
     """Sub-menu: security & identity."""
     return {
@@ -521,9 +538,10 @@ PENDING_PROMPTS = {
     "workspace_add": (
         "\u2795 \u6dfb\u52a0\u5de5\u4f5c\u76ee\u5f55\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u8bf7\u8f93\u5165\u5de5\u4f5c\u76ee\u5f55\u8def\u5f84\u548c\u53ef\u9009\u6807\u7b7e\n"
-        "\u683c\u5f0f: <\u8def\u5f84> [\u6807\u7b7e]\n\n"
-        "\u793a\u4f8b: C:\\Users\\me\\projects\\my-app my-app"
+        "\u8bf7\u8f93\u5165\u5de5\u4f5c\u76ee\u5f55\u8def\u5f84\u6216\u5173\u952e\u8bcd\n"
+        "\u683c\u5f0f: <\u8def\u5f84|\u5173\u952e\u8bcd> [\u6807\u7b7e]\n\n"
+        "\u793a\u4f8b1: C:\\Users\\me\\projects\\my-app my-app\n"
+        "\u793a\u4f8b2: toolbox  (\u6a21\u7cca\u641c\u7d22\u5e26.git\u7684\u76ee\u5f55)"
     ),
     "workspace_remove": (
         "\u2796 \u5220\u9664\u5de5\u4f5c\u76ee\u5f55\n"

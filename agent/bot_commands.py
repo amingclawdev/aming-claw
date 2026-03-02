@@ -61,6 +61,7 @@ from interactive_menu import (
     security_menu_keyboard,
     workspace_menu_keyboard,
     workspace_select_keyboard,
+    fuzzy_workspace_add_keyboard,
     backend_select_keyboard,
     pipeline_preset_keyboard,
     cancel_keyboard,
@@ -209,6 +210,29 @@ def find_git_workspace_candidates(query: str) -> List[Path]:
             break
     found.sort(key=lambda p: str(p).lower())
     return found
+
+
+def _looks_like_path(text: str) -> bool:
+    """Return True if text looks like a filesystem path rather than a keyword."""
+    s = text.strip()
+    if not s:
+        return False
+    # Windows absolute path: C:\ or C:/
+    if len(s) >= 3 and s[1] == ":" and s[2] in ("\\/"):
+        return True
+    # Unix absolute path
+    if s.startswith("/"):
+        return True
+    # Relative path with separators
+    if "\\" in s or "/" in s:
+        return True
+    # Starts with ~
+    if s.startswith("~"):
+        return True
+    # Dot-relative paths
+    if s.startswith("./") or s.startswith(".\\") or s == ".":
+        return True
+    return False
 
 
 def parse_allow_pairs() -> Set[Tuple[int, int]]:
@@ -799,6 +823,51 @@ def handle_callback_query(cb: Dict) -> None:
             else:
                 send_text(chat_id, "\u5de5\u4f5c\u76ee\u5f55\u672a\u627e\u5230: {}".format(ws_id))
                 answer_callback_query(cb_id, "\u672a\u627e\u5230", show_alert=True)
+            return
+
+        if data.startswith("ws_fuzzy_add:"):
+            idx_str = data.split(":", 1)[1].strip()
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                answer_callback_query(cb_id, "无效序号", show_alert=True)
+                return
+            candidates = read_workspace_candidates(chat_id, user_id)
+            if not candidates:
+                send_text(chat_id, "候选列表已过期，请重新搜索。", reply_markup=back_to_menu_keyboard())
+                answer_callback_query(cb_id, "已过期")
+                return
+            if idx < 1 or idx > len(candidates):
+                send_text(chat_id, "序号越界，有效范围: 1-{}".format(len(candidates)))
+                answer_callback_query(cb_id, "序号越界", show_alert=True)
+                return
+            target = candidates[idx - 1]
+            clear_workspace_candidates(chat_id, user_id)
+            if is_risky_workspace(target):
+                send_text(chat_id, "拒绝添加高风险目录: {}".format(str(target)))
+                answer_callback_query(cb_id, "高风险目录", show_alert=True)
+                return
+            try:
+                from workspace_registry import add_workspace as _add_ws_fuzzy
+                ws = _add_ws_fuzzy(target, label=target.name, created_by=user_id)
+                send_text(
+                    chat_id,
+                    "工作目录已添加:\n"
+                    "ID: {id}\n"
+                    "标签: {label}\n"
+                    "路径: {path}\n"
+                    "默认: {default}".format(
+                        id=ws["id"],
+                        label=ws["label"],
+                        path=ws["path"],
+                        default="是" if ws.get("is_default") else "否",
+                    ),
+                    reply_markup=back_to_menu_keyboard(),
+                )
+                answer_callback_query(cb_id, "已添加")
+            except ValueError as exc:
+                send_text(chat_id, "添加失败: {}".format(str(exc)))
+                answer_callback_query(cb_id, "添加失败", show_alert=True)
             return
 
         # ---- Confirm callbacks (destructive actions) ----
@@ -2552,36 +2621,85 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
     if t.startswith("/workspace_add"):
         parts = t.split(maxsplit=2)
         if len(parts) < 2:
-            send_text(chat_id, "用法: /workspace_add <路径> [标签]")
+            send_text(chat_id, "用法: /workspace_add <路径|关键词> [标签]")
             return True
         raw_path = parts[1].strip()
         label = parts[2].strip() if len(parts) >= 3 else ""
         p = Path(raw_path).expanduser()
-        if not p.exists() or not p.is_dir():
+        if p.exists() and p.is_dir():
+            # Exact path provided
+            if is_risky_workspace(p.resolve()):
+                send_text(chat_id, "拒绝添加高风险目录: {}".format(str(p.resolve())))
+                return True
+            try:
+                from workspace_registry import add_workspace
+                ws = add_workspace(p, label=label, created_by=user_id)
+                send_text(
+                    chat_id,
+                    "工作目录已添加:\n"
+                    "ID: {id}\n"
+                    "标签: {label}\n"
+                    "路径: {path}\n"
+                    "默认: {default}".format(
+                        id=ws["id"],
+                        label=ws["label"],
+                        path=ws["path"],
+                        default="是" if ws.get("is_default") else "否",
+                    ),
+                    reply_markup=back_to_menu_keyboard(),
+                )
+            except ValueError as exc:
+                send_text(chat_id, "添加失败: {}".format(str(exc)))
+            return True
+
+        # Path doesn't exist — try fuzzy search if it looks like a keyword
+        if _looks_like_path(raw_path):
             send_text(chat_id, "路径不存在或不是目录: {}".format(raw_path))
             return True
-        if is_risky_workspace(p.resolve()):
-            send_text(chat_id, "拒绝添加高风险目录: {}".format(str(p.resolve())))
-            return True
-        try:
-            from workspace_registry import add_workspace
-            ws = add_workspace(p, label=label, created_by=user_id)
+
+        # Fuzzy search for git workspaces matching the keyword
+        candidates = find_git_workspace_candidates(raw_path)
+        if not candidates:
             send_text(
                 chat_id,
-                "工作目录已添加:\n"
-                "ID: {id}\n"
-                "标签: {label}\n"
-                "路径: {path}\n"
-                "默认: {default}".format(
-                    id=ws["id"],
-                    label=ws["label"],
-                    path=ws["path"],
-                    default="是" if ws.get("is_default") else "否",
-                ),
+                "未找到匹配 '{}' 的 Git 工作目录。\n"
+                "请输入完整路径或检查搜索关键词。".format(raw_path),
                 reply_markup=back_to_menu_keyboard(),
             )
-        except ValueError as exc:
-            send_text(chat_id, "添加失败: {}".format(str(exc)))
+            return True
+        if len(candidates) == 1:
+            target = candidates[0]
+            if is_risky_workspace(target):
+                send_text(chat_id, "拒绝添加高风险目录: {}".format(str(target)))
+                return True
+            try:
+                from workspace_registry import add_workspace
+                ws = add_workspace(target, label=label or target.name, created_by=user_id)
+                send_text(
+                    chat_id,
+                    "模糊匹配成功，工作目录已添加:\n"
+                    "ID: {id}\n"
+                    "标签: {label}\n"
+                    "路径: {path}\n"
+                    "默认: {default}".format(
+                        id=ws["id"],
+                        label=ws["label"],
+                        path=ws["path"],
+                        default="是" if ws.get("is_default") else "否",
+                    ),
+                    reply_markup=back_to_menu_keyboard(),
+                )
+            except ValueError as exc:
+                send_text(chat_id, "添加失败: {}".format(str(exc)))
+            return True
+
+        # Multiple matches — show interactive selection
+        store_workspace_candidates(chat_id, user_id, raw_path, candidates)
+        send_text(
+            chat_id,
+            "检索到 {} 个匹配 '{}' 的 Git 工作目录，请选择:".format(len(candidates), raw_path),
+            reply_markup=fuzzy_workspace_add_keyboard(candidates),
+        )
         return True
 
     if t.startswith("/workspace_remove"):

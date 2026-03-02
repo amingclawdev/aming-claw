@@ -21,6 +21,7 @@ from interactive_menu import (  # noqa: E402
     cancel_keyboard,
     clear_pending_action,
     confirm_cancel_keyboard,
+    fuzzy_workspace_add_keyboard,
     get_pending_action,
     main_menu_keyboard,
     ops_menu_keyboard,
@@ -193,6 +194,59 @@ class TestTextConstants(unittest.TestCase):
         self.assertIn("workspace_remove", PENDING_PROMPTS)
         self.assertIn("workspace_set_default", PENDING_PROMPTS)
         self.assertIn("new_task_with_workspace", PENDING_PROMPTS)
+
+    def test_workspace_add_prompt_has_fuzzy_hint(self):
+        prompt = PENDING_PROMPTS["workspace_add"]
+        self.assertIn("关键词", prompt)
+        self.assertIn("模糊", prompt)
+
+
+class TestFuzzyWorkspaceAddKeyboard(unittest.TestCase):
+    def _assert_valid_keyboard(self, kb):
+        self.assertIn("inline_keyboard", kb)
+        for row in kb["inline_keyboard"]:
+            for btn in row:
+                self.assertIn("text", btn)
+                self.assertIn("callback_data", btn)
+
+    def test_single_candidate(self):
+        candidates = [Path("/tmp/my-toolbox")]
+        kb = fuzzy_workspace_add_keyboard(candidates)
+        self._assert_valid_keyboard(kb)
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("ws_fuzzy_add:1", all_data)
+        # Cancel button
+        self.assertTrue(any("menu:cancel" in d for d in all_data))
+
+    def test_multiple_candidates(self):
+        candidates = [Path("/tmp/toolbox-a"), Path("/tmp/toolbox-b"), Path("/tmp/toolbox-c")]
+        kb = fuzzy_workspace_add_keyboard(candidates)
+        self._assert_valid_keyboard(kb)
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("ws_fuzzy_add:1", all_data)
+        self.assertIn("ws_fuzzy_add:2", all_data)
+        self.assertIn("ws_fuzzy_add:3", all_data)
+        # Total: 3 candidates + 1 cancel
+        self.assertEqual(len(kb["inline_keyboard"]), 4)
+
+    def test_empty_candidates(self):
+        kb = fuzzy_workspace_add_keyboard([])
+        self._assert_valid_keyboard(kb)
+        # Only cancel button
+        self.assertEqual(len(kb["inline_keyboard"]), 1)
+
+    def test_custom_prefix(self):
+        candidates = [Path("/tmp/proj")]
+        kb = fuzzy_workspace_add_keyboard(candidates, callback_prefix="custom")
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("custom:1", all_data)
+
+    def test_long_path_truncated(self):
+        long_name = "a" * 100
+        candidates = [Path("/very/long/directory/path") / long_name]
+        kb = fuzzy_workspace_add_keyboard(candidates)
+        btn_text = kb["inline_keyboard"][0][0]["text"]
+        self.assertLessEqual(len(btn_text), 63)  # 60 + "..."
 
 
 if __name__ == "__main__":

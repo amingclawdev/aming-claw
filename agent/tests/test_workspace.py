@@ -273,5 +273,84 @@ class TestResolveWorkspaceForTask(unittest.TestCase):
         self.assertEqual(resolved["id"], ws["id"])
 
 
+class TestLooksLikePath(unittest.TestCase):
+    """Tests for bot_commands._looks_like_path helper."""
+
+    def setUp(self):
+        from bot_commands import _looks_like_path
+        self._looks_like_path = _looks_like_path
+
+    def test_windows_absolute(self):
+        self.assertTrue(self._looks_like_path("C:\\Users\\me\\project"))
+        self.assertTrue(self._looks_like_path("D:/repos/foo"))
+
+    def test_unix_absolute(self):
+        self.assertTrue(self._looks_like_path("/home/user/project"))
+        self.assertTrue(self._looks_like_path("/tmp/test"))
+
+    def test_relative_with_separators(self):
+        self.assertTrue(self._looks_like_path("./myproject"))
+        self.assertTrue(self._looks_like_path("dir/subdir"))
+        self.assertTrue(self._looks_like_path("dir\\subdir"))
+
+    def test_tilde_path(self):
+        self.assertTrue(self._looks_like_path("~/projects/foo"))
+
+    def test_keyword_not_path(self):
+        self.assertFalse(self._looks_like_path("toolbox"))
+        self.assertFalse(self._looks_like_path("my-project"))
+        self.assertFalse(self._looks_like_path("frontend"))
+        self.assertFalse(self._looks_like_path("aming_claw"))
+
+    def test_empty(self):
+        self.assertFalse(self._looks_like_path(""))
+        self.assertFalse(self._looks_like_path("   "))
+
+
+class TestFuzzyWorkspaceAddFlow(unittest.TestCase):
+    """Tests for fuzzy workspace search (find_git_workspace_candidates)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        # Create mock git repos
+        for name in ["my-toolbox", "toolbox-utils", "frontend-app", "backend-api"]:
+            d = self.root / name
+            d.mkdir()
+            (d / ".git").mkdir()
+        # Non-git dir (should not match)
+        nogit = self.root / "toolbox-docs"
+        nogit.mkdir()
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        os.environ.pop("WORKSPACE_SEARCH_ROOTS", None)
+        self.tmp.cleanup()
+
+    def test_fuzzy_match_keyword(self):
+        from bot_commands import find_git_workspace_candidates
+        os.environ["WORKSPACE_SEARCH_ROOTS"] = str(self.root)
+        results = find_git_workspace_candidates("toolbox")
+        names = [p.name for p in results]
+        self.assertIn("my-toolbox", names)
+        self.assertIn("toolbox-utils", names)
+        # toolbox-docs has no .git, should not appear
+        self.assertNotIn("toolbox-docs", names)
+
+    def test_fuzzy_no_match(self):
+        from bot_commands import find_git_workspace_candidates
+        os.environ["WORKSPACE_SEARCH_ROOTS"] = str(self.root)
+        results = find_git_workspace_candidates("nonexistent-xyz")
+        self.assertEqual(results, [])
+
+    def test_fuzzy_single_match(self):
+        from bot_commands import find_git_workspace_candidates
+        os.environ["WORKSPACE_SEARCH_ROOTS"] = str(self.root)
+        results = find_git_workspace_candidates("frontend")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "frontend-app")
+
+
 if __name__ == "__main__":
     unittest.main()
