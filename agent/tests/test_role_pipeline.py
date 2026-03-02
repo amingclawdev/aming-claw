@@ -360,11 +360,13 @@ class TestRoleModelSelectKeyboard(unittest.TestCase):
         ]
         kb = role_model_select_keyboard("pm", models)
         self._assert_valid_keyboard(kb)
-        # 2 models + 1 back button = 3 rows
-        self.assertEqual(len(kb["inline_keyboard"]), 3)
+        # 2 section headers + 2 models + 1 back button = 5 rows
+        self.assertEqual(len(kb["inline_keyboard"]), 5)
         all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
         self.assertIn("role_model:pm:anthropic:claude-opus-4-6", all_data)
         self.assertIn("role_model:pm:openai:gpt-4o", all_data)
+        # Verify section headers are present
+        self.assertIn("noop:section", all_data)
 
     def test_empty_models(self):
         kb = role_model_select_keyboard("dev", [])
