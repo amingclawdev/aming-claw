@@ -182,6 +182,7 @@ class TestTextConstants(unittest.TestCase):
         self.assertIn("/task", HELP_TEXT)
         self.assertIn("/accept", HELP_TEXT)
         self.assertIn("/reject", HELP_TEXT)
+        self.assertIn("/set_role_model", HELP_TEXT)
 
     def test_submenu_texts(self):
         self.assertIn("system", SUBMENU_TEXTS)

@@ -668,6 +668,21 @@ def detect_stage_noop(run: Dict, stage: Dict) -> Optional[str]:
     return detect_noop_execution(run)
 
 
+def _infer_provider(model: str, provider: str) -> str:
+    """Infer provider from model id when provider is not explicitly set."""
+    p = (provider or "").strip().lower()
+    if p in {"anthropic", "openai"}:
+        return p
+    m = (model or "").strip().lower()
+    if not m:
+        return ""
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith(("gpt-", "o1", "o3", "o4")):
+        return "openai"
+    return ""
+
+
 def run_stage_with_retry(task: Dict, stage: Dict, prompt: str, stage_idx: int) -> Dict:
     """Run one pipeline stage with noop retry logic.
 
@@ -682,30 +697,64 @@ def run_stage_with_retry(task: Dict, stage: Dict, prompt: str, stage_idx: int) -
     max_noop_retries = int(os.getenv("TASK_NOOP_RETRIES", "1"))
     base_tag = "s{}_{}".format(stage_idx, stage_name)
 
+    from config import get_claude_model, get_model_provider
+    global_model = (get_claude_model() or "").strip()
+    global_provider = _infer_provider(global_model, get_model_provider())
+
     # Determine actual model/provider for this stage
-    if stage_model:
+    if backend == "openai":
+        default_openai_model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-4o"
+        if stage_model:
+            actual_model = stage_model
+        elif global_provider == "openai" and global_model:
+            actual_model = global_model
+        else:
+            actual_model = default_openai_model
+        actual_provider = "openai"
+    elif stage_model:
         actual_model = stage_model
-        actual_provider = stage_provider
+        actual_provider = _infer_provider(stage_model, stage_provider)
     else:
-        from config import get_claude_model, get_model_provider
-        actual_model = get_claude_model() or "(default)"
-        actual_provider = get_model_provider() or "(default)"
+        actual_model = global_model or "(default)"
+        actual_provider = global_provider or "(default)"
 
     logger.info("[Pipeline] Stage '%s' using model=%s, provider=%s",
                 stage_name, actual_model, actual_provider)
 
     def _run(p: str, tag: str) -> Dict:
+        if backend == "openai":
+            return run_via_api(
+                task,
+                prompt_override=p,
+                model_override=actual_model,
+                provider_override="openai",
+            )
         if backend == "claude":
-            # Apply per-stage model override if configured
+            # Apply per-stage model/provider override if configured.
             if stage_model:
-                from config import get_claude_model, get_model_provider, set_claude_model
-                orig_model = get_claude_model()
+                from config import set_claude_model
+                orig_model = global_model
                 orig_provider = get_model_provider()
+                eff_provider = _infer_provider(stage_model, stage_provider)
                 try:
-                    set_claude_model(stage_model, provider=stage_provider)
+                    set_claude_model(stage_model, provider=eff_provider)
+                    if eff_provider == "openai":
+                        return run_via_api(
+                            task,
+                            prompt_override=p,
+                            model_override=stage_model,
+                            provider_override=eff_provider,
+                        )
                     return run_claude(task, attempt_tag=tag, prompt_override=p)
                 finally:
                     set_claude_model(orig_model, provider=orig_provider)
+            if global_provider == "openai":
+                return run_via_api(
+                    task,
+                    prompt_override=p,
+                    model_override=global_model,
+                    provider_override=global_provider,
+                )
             return run_claude(task, attempt_tag=tag, prompt_override=p)
         return run_codex(task, attempt_tag=tag, prompt_override=p)
 
@@ -758,7 +807,12 @@ def _raise_api_error(provider: str, resp) -> None:
     )
 
 
-def run_via_api(task: Dict) -> Dict:
+def run_via_api(
+    task: Dict,
+    prompt_override: Optional[str] = None,
+    model_override: str = "",
+    provider_override: str = "",
+) -> Dict:
     """Call Anthropic or OpenAI chat API directly (no CLI required).
     Provider is determined from the stored model_provider config.
     Returns a run-dict compatible with finalize_codex_task.
@@ -766,9 +820,9 @@ def run_via_api(task: Dict) -> Dict:
     import requests as _req
     from config import get_claude_model, get_model_provider
 
-    model = get_claude_model()
-    provider = get_model_provider()
-    prompt = build_claude_prompt(task)
+    model = (model_override or get_claude_model()).strip()
+    provider = (provider_override or get_model_provider()).strip().lower()
+    prompt = prompt_override if prompt_override is not None else build_claude_prompt(task)
     t0 = time.perf_counter()
 
     try:

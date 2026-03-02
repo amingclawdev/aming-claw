@@ -54,9 +54,10 @@ class TestParsePipelineStages(unittest.TestCase):
         self.assertEqual(_parse_pipeline_stages("   "), [])
 
     def test_case_insensitive(self):
-        stages = _parse_pipeline_stages("PLAN:CLAUDE CODE:CODEX")
+        stages = _parse_pipeline_stages("PLAN:CLAUDE CODE:OPENAI VERIFY:CODEX")
         self.assertEqual(stages[0]["backend"], "claude")
-        self.assertEqual(stages[1]["backend"], "codex")
+        self.assertEqual(stages[1]["backend"], "openai")
+        self.assertEqual(stages[2]["backend"], "codex")
 
 
 class TestFormatPipelineStages(unittest.TestCase):
@@ -88,6 +89,7 @@ class TestKnownBackends(unittest.TestCase):
     def test_stage_backends(self):
         self.assertIn("codex", KNOWN_STAGE_BACKENDS)
         self.assertIn("claude", KNOWN_STAGE_BACKENDS)
+        self.assertIn("openai", KNOWN_STAGE_BACKENDS)
         self.assertNotIn("pipeline", KNOWN_STAGE_BACKENDS)
 
 

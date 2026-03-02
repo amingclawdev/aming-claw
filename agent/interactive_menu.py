@@ -467,6 +467,7 @@ HELP_TEXT = (
     "\u540e\u7aef & \u6a21\u578b:\n"
     "  /switch_backend <codex|claude|pipeline> - \u5207\u6362\u540e\u7aef\n"
     "  /switch_model [\u6a21\u578bID] - \u5207\u6362AI\u6a21\u578b\n"
+    "  /set_role_model <\u89d2\u8272> <\u6a21\u578b|default> [provider] - \u8bbe\u7f6e\u89d2\u8272\u6d41\u6c34\u7ebf\u6a21\u578b\n"
     "  /set_pipeline <\u914d\u7f6e> - \u8bbe\u7f6e\u6d41\u6c34\u7ebf\n"
     "  /show_pipeline - \u67e5\u770b\u6d41\u6c34\u7ebf\u914d\u7f6e\n\n"
     "\u5f52\u6863:\n"
@@ -614,7 +615,7 @@ PENDING_PROMPTS = {
         "\u2699\ufe0f \u81ea\u5b9a\u4e49\u6d41\u6c34\u7ebf\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "\u8bf7\u8f93\u5165\u6d41\u6c34\u7ebf\u914d\u7f6e (stage:backend \u683c\u5f0f)\n\n"
-        "\u793a\u4f8b: plan:claude code:claude verify:codex"
+        "\u793a\u4f8b: plan:openai code:claude verify:codex"
     ),
     "workspace_add": (
         "\u2795 \u6dfb\u52a0\u5de5\u4f5c\u76ee\u5f55\n"

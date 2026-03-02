@@ -1895,6 +1895,18 @@ def parse_pick_workspace_command(text: str) -> Tuple[Optional[int], Optional[str
     return idx, m.group(2).strip()
 
 
+def _infer_provider_from_model(model: str, provider: str = "") -> str:
+    p = (provider or "").strip().lower()
+    if p in {"anthropic", "openai"}:
+        return p
+    m = (model or "").strip().lower()
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith(("gpt-", "o1", "o3", "o4")):
+        return "openai"
+    return ""
+
+
 def verify_risky_operation(chat_id: int, user_id: int, otp: Optional[str], usage: str) -> Tuple[bool, Optional[str]]:
     if not is_ops_allowed(chat_id, user_id):
         return False, "not authorized for {}".format(usage)
@@ -2094,7 +2106,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
                 send_text(
                     chat_id,
                     "后端已切换为: pipeline\n⚠️ 尚未配置流水线阶段，请用 /set_pipeline 配置。\n"
-                    "示例: /set_pipeline plan:claude code:claude verify:codex",
+                    "示例: /set_pipeline plan:openai code:claude verify:codex",
                 )
         else:
             send_text(chat_id, "后端已切换为: {}\n新建任务将使用 {} 执行。".format(backend, backend))
@@ -2148,6 +2160,59 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
+    if t.startswith("/set_role_model"):
+        if not is_ops_allowed(chat_id, user_id):
+            send_text(chat_id, "not authorized for /set_role_model")
+            return True
+        parts = t.split()
+        if len(parts) < 3:
+            send_text(
+                chat_id,
+                "用法: /set_role_model <pm|dev|test|qa> <model|default> [openai|anthropic]\n"
+                "示例:\n"
+                "  /set_role_model pm gpt-4o openai\n"
+                "  /set_role_model qa claude-sonnet-4-6 anthropic\n"
+                "  /set_role_model test default",
+            )
+            return True
+        role_name = parts[1].strip().lower()
+        if role_name not in ROLE_DEFINITIONS:
+            send_text(chat_id, "未知角色: {}，可用: pm|dev|test|qa".format(role_name))
+            return True
+        model_arg = parts[2].strip()
+        if model_arg.lower() in {"default", "none", "clear"}:
+            model_id = ""
+            provider = ""
+        else:
+            model_id = model_arg
+            raw_provider = parts[3].strip().lower() if len(parts) >= 4 else ""
+            if raw_provider and raw_provider not in {"anthropic", "openai"}:
+                send_text(chat_id, "provider 仅支持 openai | anthropic")
+                return True
+            provider = _infer_provider_from_model(model_id, raw_provider)
+        try:
+            set_role_stage_model(role_name, model_id, provider=provider, changed_by=user_id)
+        except ValueError as exc:
+            send_text(chat_id, "设置失败: {}".format(exc))
+            return True
+        role_def = ROLE_DEFINITIONS.get(role_name, {})
+        stages = get_role_pipeline_stages()
+        if model_id:
+            tag = "[C]" if provider == "anthropic" else "[O]" if provider == "openai" else ""
+            summary = "{} {} 已设置为: {} {}".format(
+                role_def.get("emoji", ""), role_def.get("label", role_name), tag, model_id
+            ).strip()
+        else:
+            summary = "{} {} 已恢复为全局模型".format(
+                role_def.get("emoji", ""), role_def.get("label", role_name)
+            ).strip()
+        send_text(
+            chat_id,
+            "{}\n\n当前角色流水线:\n{}".format(summary, format_role_pipeline_stages(stages)),
+            reply_markup=role_pipeline_config_keyboard(stages),
+        )
+        return True
+
     if t.startswith("/set_pipeline"):
         if not is_ops_allowed(chat_id, user_id):
             send_text(chat_id, "not authorized for /set_pipeline")
@@ -2159,9 +2224,10 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             send_text(
                 chat_id,
                 "用法: /set_pipeline <stage:backend ...>\n"
-                "  示例: /set_pipeline plan:claude code:claude verify:codex\n\n"
+                "  示例1: /set_pipeline plan:openai code:claude verify:codex\n"
+                "  示例2: /set_pipeline plan:openai code:openai verify:codex\n\n"
                 "内置预设:\n{}\n\n"
-                "可用 backend: codex | claude\n"
+                "可用 backend: codex | claude | openai\n"
                 "可用 stage: plan, code, implement, verify, test, review, ...".format(preset_list),
             )
             return True
@@ -2203,7 +2269,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
                 chat_id,
                 "当前后端: pipeline，但流水线阶段未配置。\n"
                 "请用 /set_pipeline 配置，例:\n"
-                "/set_pipeline plan:claude code:claude verify:codex",
+                "/set_pipeline plan:openai code:claude verify:codex",
             )
             return True
         lines = ["当前流水线 (后端=pipeline):"]

@@ -310,6 +310,96 @@ class TestPipelineModelLogging(unittest.TestCase):
         self.assertIn("claude-opus-4-6", log_output)
         self.assertIn("anthropic", log_output)
 
+    @patch("backends.run_claude")
+    @patch("backends.run_via_api")
+    @patch("config.set_claude_model")
+    @patch("config.get_model_provider", return_value="")
+    @patch("config.get_claude_model", return_value="")
+    def test_stage_openai_model_uses_api(
+        self, mock_model, mock_provider, mock_set_model, mock_run_api, mock_run_claude
+    ):
+        from backends import run_stage_with_retry
+        mock_run_api.return_value = {
+            "returncode": 0,
+            "stdout": "已执行步骤:\n1) done",
+            "stderr": "",
+            "last_message": "已执行步骤:\n1) done",
+            "elapsed_ms": 100,
+            "cmd": ["api"],
+            "timeout_retries": 0,
+            "workspace": "/tmp",
+            "git_changed_files": ["a.py"],
+            "attempt_tag": "test",
+        }
+        task = {"task_id": "test-123", "text": "test task"}
+        stage = {"name": "dev", "backend": "claude", "model": "gpt-4o", "provider": "openai"}
+
+        run = run_stage_with_retry(task, stage, "prompt for role stage", stage_idx=1)
+
+        self.assertEqual(run["returncode"], 0)
+        mock_run_api.assert_called_once()
+        mock_run_claude.assert_not_called()
+
+    @patch("backends.run_claude")
+    @patch("backends.run_via_api")
+    @patch("config.get_model_provider", return_value="openai")
+    @patch("config.get_claude_model", return_value="gpt-4o")
+    def test_stage_global_openai_uses_api(
+        self, mock_model, mock_provider, mock_run_api, mock_run_claude
+    ):
+        from backends import run_stage_with_retry
+        mock_run_api.return_value = {
+            "returncode": 0,
+            "stdout": "验收标准:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "stderr": "",
+            "last_message": "验收标准:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "elapsed_ms": 100,
+            "cmd": ["api"],
+            "timeout_retries": 0,
+            "workspace": "/tmp",
+            "git_changed_files": [],
+            "attempt_tag": "test",
+        }
+        task = {"task_id": "test-124", "text": "test task"}
+        stage = {"name": "qa", "backend": "claude", "model": "", "provider": ""}
+
+        run = run_stage_with_retry(task, stage, "prompt for qa stage with enough content", stage_idx=1)
+
+        self.assertEqual(run["returncode"], 0)
+        mock_run_api.assert_called_once()
+        mock_run_claude.assert_not_called()
+
+    @patch("backends.run_claude")
+    @patch("backends.run_via_api")
+    @patch("config.get_model_provider", return_value="anthropic")
+    @patch("config.get_claude_model", return_value="claude-sonnet-4-6")
+    def test_stage_backend_openai_uses_api_with_fallback_model(
+        self, mock_model, mock_provider, mock_run_api, mock_run_claude
+    ):
+        from backends import run_stage_with_retry
+        mock_run_api.return_value = {
+            "returncode": 0,
+            "stdout": "验收标准:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "stderr": "",
+            "last_message": "验收标准:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "elapsed_ms": 100,
+            "cmd": ["api", "openai", "gpt-4o"],
+            "timeout_retries": 0,
+            "workspace": "/tmp",
+            "git_changed_files": [],
+            "attempt_tag": "test",
+        }
+        task = {"task_id": "test-125", "text": "test task"}
+        stage = {"name": "plan", "backend": "openai", "model": "", "provider": ""}
+
+        run = run_stage_with_retry(task, stage, "prompt for plan stage with enough content", stage_idx=1)
+
+        self.assertEqual(run["returncode"], 0)
+        mock_run_api.assert_called_once()
+        self.assertEqual(mock_run_api.call_args.kwargs.get("provider_override"), "openai")
+        self.assertEqual(mock_run_api.call_args.kwargs.get("model_override"), "gpt-4o")
+        mock_run_claude.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ from utils import load_json, save_json, tasks_root, utc_iso
 KNOWN_BACKENDS = {"codex", "claude", "pipeline"}
 
 # Valid backends for individual pipeline stages
-KNOWN_STAGE_BACKENDS = {"codex", "claude"}
+KNOWN_STAGE_BACKENDS = {"codex", "claude", "openai"}
 
 # Built-in named pipeline presets (name → stage list)
 PIPELINE_PRESETS: Dict[str, List[Dict]] = {
@@ -69,7 +69,7 @@ def _config_path():
 
 
 def _parse_pipeline_stages(raw: str) -> List[Dict]:
-    """Parse 'plan:claude code:claude verify:codex' into a stage list."""
+    """Parse 'plan:openai code:claude verify:codex' into a stage list."""
     stages = []
     for item in raw.split():
         item = item.strip().lower()
@@ -194,7 +194,7 @@ def get_pipeline_stages() -> List[Dict]:
                 return stages
         except Exception:
             pass
-    # Fall back to env var: TASK_PIPELINE_STAGES="plan:claude code:claude verify:codex"
+    # Fall back to env var: TASK_PIPELINE_STAGES="plan:openai code:claude verify:codex"
     raw = os.getenv("TASK_PIPELINE_STAGES", "").strip()
     if raw:
         return _parse_pipeline_stages(raw)
