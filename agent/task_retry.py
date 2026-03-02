@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 from utils import load_json, save_json, task_file, tasks_root, utc_iso
 from task_state import (
     append_task_event,
+    update_task_lifecycle,
     update_task_runtime,
 )
 from git_rollback import pre_task_checkpoint
@@ -208,6 +209,19 @@ def retry_task(
 
     # ── Update runtime state ──
     update_task_runtime(task, status="pending", stage="pending")
+
+    # ── Clear stale heartbeat to prevent coordinator false timeout on retry ──
+    # Old heartbeat_at/started_at from previous execution must be reset;
+    # otherwise coordinator sees status=processing + old heartbeat and marks timeout.
+    update_task_lifecycle(task, extra={
+        "heartbeat_at": "",
+        "started_at": "",
+        "ended_at": "",
+        "has_end_marker": False,
+        "error": "",
+        "summary": "",
+        "progress": 0,
+    })
 
     # ── AC-8: Event log ──
     append_task_event(task_id, "task_retry", {

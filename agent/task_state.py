@@ -208,7 +208,10 @@ def mark_task_started(task: Dict, stage: str = "processing") -> Dict:
         task,
         status="processing",
         stage=stage,
-        extra={"started_at": str(task.get("started_at") or now) or now},
+        extra={
+            "started_at": str(task.get("started_at") or now) or now,
+            "heartbeat_at": now,
+        },
     )
     append_task_event(
         str(task.get("task_id") or ""),
