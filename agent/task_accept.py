@@ -36,13 +36,101 @@ def acceptance_root() -> Path:
     return p
 
 
+def _build_pipeline_summary(executor: Dict) -> str:
+    """Build a meaningful summary for pipeline tasks from all stage outputs.
+
+    Instead of showing only the last stage (often QA boilerplate), extracts
+    key info from each stage: dev changes, test results, etc.
+    """
+    stages = executor.get("stages") or []
+    if not stages:
+        return str(executor.get("last_message") or "")
+
+    parts = []
+    for s in stages:
+        name = s.get("stage", "?")
+        rc = s.get("returncode", -1)
+        elapsed = s.get("elapsed_ms", 0)
+        noop = s.get("noop_reason")
+        preview = str(s.get("last_message_preview") or "").strip()
+        model = s.get("model", "")
+        status_icon = "\u2705" if rc == 0 and not noop else "\u274c"
+
+        # Stage header
+        time_str = "{:.0f}s".format(elapsed / 1000) if elapsed else "0s"
+        model_str = " ({})".format(model) if model else ""
+        header = "{} {} {}{} {}".format(status_icon, name.upper(), time_str, model_str,
+                                         "- NOOP: {}".format(noop) if noop else "")
+        parts.append(header)
+
+        # Extract the most useful snippet from the stage output
+        if preview:
+            # For dev: look for "修改文件列表" or "已执行步骤"
+            # For test: look for test results
+            # For others: first meaningful lines
+            snippet = _extract_stage_snippet(name, preview)
+            if snippet:
+                parts.append(snippet)
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def _extract_stage_snippet(stage_name: str, preview: str) -> str:
+    """Extract the most relevant snippet from a stage's output."""
+    lines = preview.split("\n")
+    max_lines = 8
+
+    if stage_name == "dev":
+        # Look for file change summary or step summary
+        for markers in ["\u4fee\u6539\u6587\u4ef6\u5217\u8868", "\u5df2\u6267\u884c\u6b65\u9aa4",
+                        "\u5b50\u4efb\u52a1\u5b9e\u73b0\u72b6\u6001", "\u6d4b\u8bd5\u7ed3\u679c"]:
+            for i, line in enumerate(lines):
+                if markers in line:
+                    return "\n".join(lines[i:i + max_lines]).strip()
+        # Fallback: last N lines (usually summary)
+        return "\n".join(lines[-max_lines:]).strip()[:500]
+
+    if stage_name == "test":
+        # Look for test result numbers
+        for markers in ["passed", "failed", "\u901a\u8fc7", "\u5931\u8d25",
+                        "\u7ed3\u8bba", "\u7ed3\u679c"]:
+            for i, line in enumerate(lines):
+                if markers in line.lower():
+                    start = max(0, i - 1)
+                    return "\n".join(lines[start:start + max_lines]).strip()
+        return "\n".join(lines[:max_lines]).strip()[:500]
+
+    if stage_name == "qa":
+        # QA: look for verdict
+        for markers in ["\u9a8c\u6536\u7ed3\u8bba", "\u901a\u8fc7", "\u4e0d\u901a\u8fc7",
+                        "\u6709\u6761\u4ef6\u901a\u8fc7"]:
+            for i, line in enumerate(lines):
+                if markers in line:
+                    start = max(0, i - 1)
+                    return "\n".join(lines[start:start + max_lines]).strip()
+        # If QA just returned boilerplate, skip it
+        if "\u8bf7\u63d0\u4f9b\u4ee5\u4e0b\u6750\u6599" in preview or \
+           "\u5df2\u5207\u6362\u4e3a" in preview:
+            return "(QA\u672a\u4ea7\u51fa\u5b9e\u8d28\u5ba1\u8ba1\u7ed3\u679c)"
+        return "\n".join(lines[:max_lines]).strip()[:500]
+
+    # pm or others: first few lines
+    return "\n".join(lines[:max_lines]).strip()[:500]
+
+
 def build_acceptance_cases(task: Dict, result: Dict) -> List[Dict]:
     exec_status = str(result.get("execution_status") or result.get("status") or "unknown")
     executor = result.get("executor") or {}
     changed = executor.get("git_changed_files")
     changed_count = len(changed) if isinstance(changed, list) else 0
     task_text = str(task.get("text") or "").strip()
-    summary = str(executor.get("last_message") or result.get("error") or "").strip()
+    # For pipeline tasks, build a multi-stage summary instead of just last_message
+    is_pipeline = task.get("action") == "pipeline" and executor.get("stages")
+    if is_pipeline:
+        summary = _build_pipeline_summary(executor)
+    else:
+        summary = str(executor.get("last_message") or result.get("error") or "").strip()
     return [
         {
             "case_id": "AC-000",
@@ -149,7 +237,8 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
         execution_status=exec_status,
         generated_at=utc_iso(),
         task_text=task.get("text", ""),
-        summary=(executor.get("last_message") or result.get("error") or "(见结果文件)")[:1200],
+        summary=(_build_pipeline_summary(executor) if task.get("action") == "pipeline" and executor.get("stages")
+                 else (executor.get("last_message") or result.get("error") or "(见结果文件)"))[:2000],
         workspace=executor.get("workspace", ""),
         elapsed_ms=executor.get("elapsed_ms", 0),
         returncode=executor.get("returncode", ""),
@@ -465,6 +554,11 @@ def _truncate_lines(text: str, max_lines: int = 3) -> str:
 
 def build_task_summary(result: Dict) -> str:
     executor = result.get("executor") or {}
+    # For pipeline tasks, generate multi-stage summary
+    if result.get("action") == "pipeline" and executor.get("stages"):
+        pipeline_summary = _build_pipeline_summary(executor)
+        if pipeline_summary:
+            return pipeline_summary
     summary = (executor.get("last_message") or "").strip()
     if summary:
         return summary
@@ -487,28 +581,33 @@ def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detail
     iteration_tag = "（第{}轮）".format(iteration) if iteration > 1 else ""
     separator = "━━━━━━━━━━━━━━━━"
 
+    # Pipeline tasks get more lines since they have multi-stage info
+    is_pipeline = result.get("action") == "pipeline"
+    max_summary_chars = 2000 if is_pipeline else 500
+    max_summary_lines = 20 if is_pipeline else 3
+
     if execution_status == "failed":
         return (
-            "❌ 任务 [{code}] 执行失败{iter}\n"
-            "耗时: {elapsed}\n"
+            "\u274c \u4efb\u52a1 [{code}] \u6267\u884c\u5931\u8d25{iter}\n"
+            "\u8017\u65f6: {elapsed}\n"
             "{sep}\n"
-            "失败原因: {summary}"
+            "\u5931\u8d25\u539f\u56e0: {summary}"
         ).format(
             code=task_code,
             elapsed=elapsed_str,
-            summary=_truncate_lines(summary[:500], 3),
+            summary=_truncate_lines(summary[:max_summary_chars], max_summary_lines),
             iter=iteration_tag,
             sep=separator,
         )
     return (
-        "✅ 任务 [{code}] 执行完成{iter}\n"
-        "耗时: {elapsed}\n"
+        "\u2705 \u4efb\u52a1 [{code}] \u6267\u884c\u5b8c\u6210{iter}\n"
+        "\u8017\u65f6: {elapsed}\n"
         "{sep}\n"
-        "概要: {summary}"
+        "\u6982\u8981: {summary}"
     ).format(
         code=task_code,
         elapsed=elapsed_str,
-        summary=_truncate_lines(summary[:500], 3),
+        summary=_truncate_lines(summary[:max_summary_chars], max_summary_lines),
         iter=iteration_tag,
         sep=separator,
     )
