@@ -16,6 +16,16 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# ── 前置检查: Git ─────────────────────────────────────────────────────────────
+$gitCmd = Get-Command git -ErrorAction SilentlyContinue
+if (-not $gitCmd) {
+    Write-Host ""
+    Write-Host "  [!]  未检测到 Git！建议先运行 .\init.ps1 进行完整初始化" -ForegroundColor Yellow
+    Write-Host "       或手动安装: winget install Git.Git" -ForegroundColor Yellow
+    Write-Host "       或从 https://git-scm.com/download/win 下载" -ForegroundColor Yellow
+    Write-Host ""
+}
+
 # ── 配置 ───────────────────────────────────────────────────────────────────────
 $PY_VER       = "3.12.8"
 $PY_URL       = "https://www.python.org/ftp/python/$PY_VER/python-$PY_VER-embed-amd64.zip"
