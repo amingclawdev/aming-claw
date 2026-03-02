@@ -1176,6 +1176,12 @@ def handle_callback_query(cb: Dict) -> None:
         if data.startswith("task_doc:"):
             _handle_task_doc_callback(cb_id, data, chat_id, user_id)
             return
+        if data.startswith("task_summary:"):
+            _handle_task_summary_callback(cb_id, data, chat_id, user_id)
+            return
+        if data.startswith("task_log:"):
+            _handle_task_log_callback(cb_id, data, chat_id, user_id)
+            return
         if data.startswith("archive_detail:"):
             _handle_archive_detail_callback(cb_id, data, chat_id, user_id)
             return
@@ -1885,7 +1891,14 @@ def _collect_tasks_by_status(chat_id: int, status_key: str) -> List[Dict]:
     """
     if status_key == "archived":
         from task_state import _read_archive_index
-        return list(reversed(_read_archive_index()))
+        entries = list(reversed(_read_archive_index()))
+        # Ensure critical fields have fallback values for old/incomplete entries
+        for entry in entries:
+            if not entry.get("archive_id"):
+                entry["archive_id"] = str(entry.get("task_id") or entry.get("task_code") or "unknown")
+            if not entry.get("task_code"):
+                entry["task_code"] = str(entry.get("archive_id") or entry.get("task_id") or "-")[:10]
+        return entries
 
     active = list_active_tasks(chat_id=chat_id)
     result: List[Dict] = []
@@ -2025,6 +2038,21 @@ def _handle_tasks_page_callback(cb_id: str, data: str, chat_id: int, user_id: in
     answer_callback_query(cb_id, "\u7b2c {} \u9875".format(page + 1))
 
 
+def _detail_status_emoji(status: str) -> str:
+    """Return status emoji for task detail page header."""
+    mapping = {
+        "pending": "\u23f3",
+        "processing": "\u2699\ufe0f",
+        "pending_acceptance": "\U0001f4cb",
+        "accepted": "\u2705",
+        "completed": "\u2705",
+        "rejected": "\u274c",
+        "failed": "\U0001f4a5",
+        "timeout": "\U0001f4a5",
+    }
+    return mapping.get(str(status or "").strip().lower(), "\U0001f4cb")
+
+
 def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> None:
     """Handle task_detail:{task_code} callback to show task detail page."""
     task_code = data.split(":", 1)[1].strip()
@@ -2035,10 +2063,11 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
         st = task_status_snapshot(resolved_id) if resolved_id else None
         if st:
             status = str(st.get("status") or "unknown").strip().lower()
-            text_preview = str(st.get("text") or "").strip()[:200] or "(\u65e0\u63cf\u8ff0)"
+            emoji = _detail_status_emoji(status)
+            text_preview = str(st.get("text") or "").strip()[:500] or "(\u65e0\u63cf\u8ff0)"
             iteration = int(st.get("attempt") or 0)
             detail = (
-                "\U0001f4cb \u4efb\u52a1\u8be6\u60c5\n"
+                "{emoji} \u4efb\u52a1\u8be6\u60c5\n"
                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 "\u4ee3\u53f7: {code}\n"
                 "\u72b6\u6001: {status}\n"
@@ -2048,12 +2077,13 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
                 "\u63cf\u8ff0: {text}\n"
                 "\u6982\u8981: {summary}"
             ).format(
+                emoji=emoji,
                 code=task_code,
                 status=status_tag(status),
                 created=st.get("created_at", ""),
                 iteration=iteration,
                 text=text_preview,
-                summary=str(st.get("summary") or "").strip()[:200] or "(\u65e0)",
+                summary=str(st.get("summary") or "").strip()[:500] or "(\u65e0)",
             )
             send_text(chat_id, detail, reply_markup=task_detail_keyboard(task_code, status))
             answer_callback_query(cb_id, "\u4efb\u52a1\u8be6\u60c5")
@@ -2064,14 +2094,26 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
 
     found = merge_task_with_status(found)
     status = str(found.get("status") or "unknown").strip().lower()
+    emoji = _detail_status_emoji(status)
     st = found.get("_status_snapshot") if isinstance(found.get("_status_snapshot"), dict) else {}
-    text_preview = str(found.get("text") or "").strip()[:200] or "(\u65e0\u63cf\u8ff0)"
-    summary = str(build_status_summary(found)).strip()[:200]
+    text_preview = str(found.get("text") or "").strip()[:500] or "(\u65e0\u63cf\u8ff0)"
+    summary = str(build_status_summary(found)).strip()[:500]
     iteration = int(st.get("attempt") or found.get("attempt") or 0)
     acceptance = found.get("acceptance") if isinstance(found.get("acceptance"), dict) else {}
 
+    # Read summary from summary file if available
+    task_id = str(found.get("task_id") or "")
+    summary_file = tasks_root() / "logs" / (task_id + ".summary.txt")
+    if summary_file.exists():
+        try:
+            file_summary = summary_file.read_text(encoding="utf-8").strip()[:500]
+            if file_summary:
+                summary = file_summary
+        except Exception:
+            pass
+
     detail = (
-        "\U0001f4cb \u4efb\u52a1\u8be6\u60c5\n"
+        "{emoji} \u4efb\u52a1\u8be6\u60c5\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "\u4ee3\u53f7: {code}\n"
         "\u72b6\u6001: {status}\n"
@@ -2081,6 +2123,7 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
         "\u63cf\u8ff0: {text}\n"
         "\u6267\u884c\u6982\u8981: {summary}"
     ).format(
+        emoji=emoji,
         code=found.get("task_code", task_code),
         status=status_tag(status),
         created=found.get("created_at") or st.get("created_at", ""),
@@ -2089,7 +2132,12 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
         summary=summary or "(\u65e0)",
     )
     if acceptance.get("reason"):
-        detail += "\n\u62d2\u7edd\u539f\u56e0: {}".format(str(acceptance["reason"])[:200])
+        detail += "\n\u62d2\u7edd\u539f\u56e0: {}".format(str(acceptance["reason"])[:500])
+
+    # Show git checkpoint for pending_acceptance tasks
+    ckpt = str(found.get("_git_checkpoint") or "").strip()
+    if ckpt and status == "pending_acceptance":
+        detail += "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nGit\u68c0\u67e5\u70b9: {}".format(ckpt[:12])
 
     # Append pipeline stage execution info if available
     stage_summary = format_stage_execution_summary(found)
@@ -2266,14 +2314,117 @@ def _handle_task_doc_callback(cb_id: str, data: str, chat_id: int, user_id: int)
     answer_callback_query(cb_id, "\u67e5\u770b\u6587\u6863")
 
 
+def _handle_task_summary_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> None:
+    """Handle task_summary:{task_code} callback to show task summary."""
+    ref = data.split(":", 1)[1].strip()
+    task_id = resolve_task_ref(ref) or ref
+
+    # Try reading summary file
+    summary_path = tasks_root() / "logs" / (task_id + ".summary.txt")
+    summary_text = ""
+    if summary_path.exists():
+        try:
+            summary_text = summary_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+
+    # Fallback: read from run log
+    if not summary_text:
+        run_log_path = tasks_root() / "logs" / (task_id + ".run.json")
+        if run_log_path.exists():
+            try:
+                run_data = load_json(run_log_path)
+                summary_text = str(run_data.get("summary") or "").strip()
+            except Exception:
+                pass
+
+    if not summary_text:
+        summary_text = "(\u65e0\u6982\u8981\u4fe1\u606f)"
+
+    send_text(
+        chat_id,
+        "\U0001f4d1 \u4efb\u52a1\u6982\u8981 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(ref, summary_text[:3500]),
+        reply_markup=back_to_menu_keyboard(),
+    )
+    answer_callback_query(cb_id, "\u67e5\u770b\u6982\u8981")
+
+
+def _handle_task_log_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> None:
+    """Handle task_log:{task_code} callback to show full run log."""
+    ref = data.split(":", 1)[1].strip()
+    task_id = resolve_task_ref(ref) or ref
+
+    run_log_path = tasks_root() / "logs" / (task_id + ".run.json")
+    if not run_log_path.exists():
+        send_text(chat_id, "\u65e0\u6267\u884c\u65e5\u5fd7\u6587\u4ef6", reply_markup=back_to_menu_keyboard())
+        answer_callback_query(cb_id, "\u65e0\u65e5\u5fd7")
+        return
+
+    try:
+        log_text = run_log_path.read_text(encoding="utf-8")
+    except Exception:
+        send_text(chat_id, "\u65e0\u6cd5\u8bfb\u53d6\u65e5\u5fd7\u6587\u4ef6", reply_markup=back_to_menu_keyboard())
+        answer_callback_query(cb_id, "\u8bfb\u53d6\u5931\u8d25")
+        return
+
+    # Try sending as document if too large
+    if len(log_text) > 3500:
+        try:
+            send_document(chat_id, run_log_path, caption="\u6267\u884c\u65e5\u5fd7 [{}]".format(ref))
+        except Exception:
+            send_text(chat_id, "\U0001f4dc \u6267\u884c\u65e5\u5fd7 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}...".format(ref, log_text[:3500]),
+                      reply_markup=back_to_menu_keyboard())
+    else:
+        send_text(
+            chat_id,
+            "\U0001f4dc \u6267\u884c\u65e5\u5fd7 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(ref, log_text[:3500]),
+            reply_markup=back_to_menu_keyboard(),
+        )
+    answer_callback_query(cb_id, "\u67e5\u770b\u65e5\u5fd7")
+
+
+def _format_iso_time(iso_str: str) -> str:
+    """Convert ISO format time to YYYY-MM-DD HH:MM."""
+    s = str(iso_str or "").strip()
+    if not s:
+        return ""
+    # Handle common ISO formats: 2024-01-02T03:04:05Z or 2024-01-02T03:04:05.123456Z
+    try:
+        # Strip trailing Z and microseconds
+        clean = s.replace("Z", "").split(".")[0]
+        if "T" in clean:
+            date_part, time_part = clean.split("T", 1)
+            return "{} {}".format(date_part, time_part[:5])
+        return clean[:16]
+    except Exception:
+        return s[:16]
+
+
 def _handle_archive_detail_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> None:
     """Handle archive_detail:{archive_id} callback to show archive detail page."""
     archive_ref = data.split(":", 1)[1].strip()
+    print("[archive_detail] looking up: {}".format(archive_ref))
     entry = find_archive_entry(archive_ref)
     if not entry:
+        print("[archive_detail] not found: {}".format(archive_ref))
         send_text(chat_id, "\u5f52\u6863\u8bb0\u5f55\u672a\u627e\u5230: {}".format(archive_ref), reply_markup=task_mgmt_menu_keyboard())
         answer_callback_query(cb_id, "\u672a\u627e\u5230")
         return
+
+    # Read summary from file if available
+    task_id = str(entry.get("task_id") or "")
+    summary = str(entry.get("summary") or "").strip()
+    if task_id:
+        summary_path = tasks_root() / "logs" / (task_id + ".summary.txt")
+        if summary_path.exists():
+            try:
+                file_summary = summary_path.read_text(encoding="utf-8").strip()
+                if file_summary:
+                    summary = file_summary
+            except Exception:
+                pass
+
+    completed_time = _format_iso_time(entry.get("completed_at") or entry.get("updated_at", ""))
 
     detail = (
         "\U0001f4c1 \u5f52\u6863\u8be6\u60c5\n"
@@ -2291,12 +2442,40 @@ def _handle_archive_detail_callback(cb_id: str, data: str, chat_id: int, user_id
         archive_id=entry.get("archive_id", ""),
         status=status_tag(entry.get("status", "unknown")),
         action=entry.get("action", "unknown"),
-        completed=entry.get("completed_at") or entry.get("updated_at", ""),
-        text=str(entry.get("text") or "").strip()[:200] or "(\u65e0\u63cf\u8ff0)",
-        summary=str(entry.get("summary") or "").strip()[:200] or "(\u65e0)",
+        completed=completed_time,
+        text=str(entry.get("text") or "").strip()[:500] or "(\u65e0\u63cf\u8ff0)",
+        summary=summary[:500] or "(\u65e0)",
     )
 
-    send_text(chat_id, detail, reply_markup=archive_detail_keyboard(entry.get("archive_id", archive_ref)))
+    # Build enhanced keyboard with conditional buttons
+    kbd_rows: List[List[Dict]] = []
+    aid = entry.get("archive_id", archive_ref)
+    kbd_rows.append([
+        {"text": "\U0001f4c4 \u67e5\u770b\u5f52\u6863\u8be6\u60c5", "callback_data": "task_doc:{}".format(aid)},
+    ])
+    # Add log button if run_log_file exists
+    run_log_file = str(entry.get("run_log_file") or "").strip()
+    if run_log_file and Path(run_log_file).exists():
+        task_code = str(entry.get("task_code") or aid)
+        kbd_rows.append([
+            {"text": "\U0001f4dc \u67e5\u770b\u6267\u884c\u65e5\u5fd7", "callback_data": "task_log:{}".format(task_code)},
+        ])
+    # Add acceptance doc button if exists
+    if task_id:
+        from task_accept import acceptance_root
+        acc_doc = acceptance_root() / (task_id + ".acceptance.md")
+        if acc_doc.exists():
+            kbd_rows.append([
+                {"text": "\U0001f4c4 \u67e5\u770b\u9a8c\u6536\u6587\u6863", "callback_data": "task_doc:{}".format(entry.get("task_code", aid))},
+            ])
+    kbd_rows.append([
+        {"text": "\U0001f5d1 \u5220\u9664\u5f52\u6863\u8bb0\u5f55", "callback_data": "archive_delete:{}".format(aid)},
+    ])
+    kbd_rows.append([
+        {"text": "\u00ab \u8fd4\u56de\u5217\u8868", "callback_data": "menu:tasks_archived"},
+    ])
+
+    send_text(chat_id, detail, reply_markup={"inline_keyboard": kbd_rows})
     answer_callback_query(cb_id, "\u5f52\u6863\u8be6\u60c5")
 
 

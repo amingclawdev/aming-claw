@@ -514,9 +514,12 @@ def task_status_list_keyboard(
         if len(text) > 20:
             text = text[:20] + "..."
         label = "[{}] {}".format(code, text)
-        # For archived tasks, use archive_detail callback
+        # For archived tasks, use archive_detail callback with fallback
         if status_key == "archived":
-            cb = "archive_detail:{}".format(t.get("archive_id", code))
+            archive_id = str(t.get("archive_id") or "").strip()
+            if not archive_id:
+                archive_id = str(t.get("task_id") or t.get("task_code") or code).strip()
+            cb = "archive_detail:{}".format(archive_id)
         else:
             cb = "task_detail:{}".format(code)
         rows.append([{"text": label, "callback_data": cb}])
@@ -563,7 +566,10 @@ def task_detail_keyboard(task_code: str, status: str, is_pipeline: bool = False)
         ])
         rows.append([
             {"text": "\U0001f4c4 \u67e5\u770b\u6587\u6863", "callback_data": "task_doc:{}".format(code)},
-            {"text": "\U0001f4dc \u67e5\u770b\u4e8b\u4ef6", "callback_data": "events:{}".format(code)},
+            {"text": "\U0001f4d1 \u67e5\u770b\u6982\u8981", "callback_data": "task_summary:{}".format(code)},
+        ])
+        rows.append([
+            {"text": "\U0001f4dc \u67e5\u770b\u5b8c\u6574\u65e5\u5fd7", "callback_data": "task_log:{}".format(code)},
         ])
         back_cb = "menu:tasks_pending_acceptance"
     elif s == "rejected":
@@ -579,7 +585,10 @@ def task_detail_keyboard(task_code: str, status: str, is_pipeline: bool = False)
     elif s in ("accepted", "completed"):
         rows.append([
             {"text": "\U0001f4c4 \u67e5\u770b\u6587\u6863", "callback_data": "task_doc:{}".format(code)},
-            {"text": "\U0001f4dc \u67e5\u770b\u4e8b\u4ef6", "callback_data": "events:{}".format(code)},
+            {"text": "\U0001f4d1 \u67e5\u770b\u6982\u8981", "callback_data": "task_summary:{}".format(code)},
+        ])
+        rows.append([
+            {"text": "\U0001f4dc \u67e5\u770b\u5b8c\u6574\u65e5\u5fd7", "callback_data": "task_log:{}".format(code)},
         ])
         back_cb = "menu:tasks_accepted"
     elif s in ("failed", "timeout"):
@@ -588,6 +597,7 @@ def task_detail_keyboard(task_code: str, status: str, is_pipeline: bool = False)
             {"text": "\U0001f4c4 \u67e5\u770b\u9519\u8bef", "callback_data": "task_doc:{}".format(code)},
         ])
         rows.append([
+            {"text": "\U0001f4dc \u67e5\u770b\u5b8c\u6574\u65e5\u5fd7", "callback_data": "task_log:{}".format(code)},
             {"text": "\U0001f5d1 \u5220\u9664\u4efb\u52a1", "callback_data": "task_delete:{}".format(code)},
         ])
         back_cb = "menu:tasks_failed"

@@ -188,18 +188,71 @@ def to_pending_acceptance(task: Dict, result: Dict) -> Dict:
 
 
 def task_inline_keyboard(task_code: str, task_id: str) -> Dict:
+    ref = task_code or task_id
     return {
         "inline_keyboard": [
             [
-                {"text": "查看状态", "callback_data": "status:{}".format(task_code or task_id)},
-                {"text": "验收通过", "callback_data": "accept:{}".format(task_code or task_id)},
-                {"text": "验收拒绝", "callback_data": "reject:{}".format(task_code or task_id)},
+                {"text": "验收通过", "callback_data": "accept:{}".format(ref)},
+                {"text": "验收拒绝", "callback_data": "reject:{}".format(ref)},
             ],
             [
-                {"text": "查看事件", "callback_data": "events:{}".format(task_code or task_id)},
+                {"text": "查看文档", "callback_data": "task_doc:{}".format(ref)},
+                {"text": "查看详情", "callback_data": "task_detail:{}".format(ref)},
             ],
         ]
     }
+
+
+def generate_stage_summary(stage_result: Dict) -> str:
+    """Generate a concise Chinese summary (<=200 chars) from a stage execution result.
+
+    Works for both pipeline stage_detail dicts and single-task run dicts.
+    Uses pure text extraction, no external AI calls.
+    """
+    parts: List[str] = []
+
+    last_message = str(stage_result.get("last_message") or "").strip()
+    stdout = str(stage_result.get("stdout") or "").strip()
+    returncode = stage_result.get("returncode")
+    noop_reason = str(stage_result.get("noop_reason") or "").strip()
+    changed_files = stage_result.get("git_changed_files") or []
+    error = str(stage_result.get("error") or "").strip()
+
+    # Primary: extract from last_message or stdout
+    source_text = last_message or stdout
+    if source_text:
+        # Take first meaningful lines
+        lines = [l.strip() for l in source_text.splitlines() if l.strip()]
+        preview = "\n".join(lines[:5])
+        if len(preview) > 150:
+            preview = preview[:150] + "..."
+        parts.append(preview)
+    elif noop_reason:
+        parts.append("未执行: {}".format(noop_reason[:80]))
+    elif error:
+        parts.append("错误: {}".format(error[:80]))
+
+    # Changed files info
+    if isinstance(changed_files, list) and changed_files:
+        file_list = ", ".join(str(f).split("/")[-1] for f in changed_files[:5])
+        if len(changed_files) > 5:
+            file_list += " 等{}个文件".format(len(changed_files))
+        parts.append("变更文件: {}".format(file_list))
+
+    # Return code info (only if error)
+    if returncode and returncode != 0 and not error:
+        parts.append("返回码: {}".format(returncode))
+
+    summary = "; ".join(parts) if parts else "(无执行输出)"
+    return summary[:200]
+
+
+def _write_summary_file(task_id: str, summary_text: str) -> Path:
+    """Write standalone summary file: logs/{task_id}.summary.txt"""
+    summary_path = tasks_root() / "logs" / (task_id + ".summary.txt")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(summary_text, encoding="utf-8")
+    return summary_path
 
 
 def finalize_codex_task(task: Dict, processing: Path, run: Dict, status: str, error: Optional[str] = None) -> Dict:
@@ -227,6 +280,12 @@ def finalize_codex_task(task: Dict, processing: Path, run: Dict, status: str, er
     save_json(processing, result)
     result_hash = json_sha256(result)
 
+    # Generate summary for single-task run
+    summary_input = dict(run)
+    if error:
+        summary_input["error"] = error
+    run_summary = generate_stage_summary(summary_input)
+
     run_data = {
         "task_id": task["task_id"],
         "status": status,
@@ -246,6 +305,7 @@ def finalize_codex_task(task: Dict, processing: Path, run: Dict, status: str, er
         "last_message": run.get("last_message", ""),
         "error": error,
         "result_sha256": result_hash,
+        "summary": run_summary,
     }
     run_log_path = write_run_log(task["task_id"], run_data)
     runlog_hash = json_sha256(run_data)
@@ -254,6 +314,10 @@ def finalize_codex_task(task: Dict, processing: Path, run: Dict, status: str, er
     result["executor"]["runlog_sha256"] = runlog_hash
     result["executor"]["result_sha256"] = result_hash
     save_json(processing, result)
+
+    # Write standalone summary file
+    _write_summary_file(task["task_id"], run_summary)
+
     return result
 
 
@@ -330,25 +394,38 @@ def finalize_pipeline_task(
         "error": error,
         "result_sha256": result_hash,
         "stages": stage_summary,
-        "stage_details": [
-            {
-                "stage": sr["stage"],
-                "backend": sr["backend"],
-                "model": sr.get("model", ""),
-                "provider": sr.get("provider", ""),
-                "stage_index": sr["stage_index"],
-                "returncode": sr["run"].get("returncode"),
-                "elapsed_ms": sr["run"].get("elapsed_ms"),
-                "stdout": (sr["run"].get("stdout") or "")[-6000:],
-                "stderr": (sr["run"].get("stderr") or "")[-2000:],
-                "last_message": (sr["run"].get("last_message") or "")[-6000:],
-                "cmd": sr["run"].get("cmd"),
-                "noop_reason": sr["run"].get("noop_reason"),
-                "attempt_count": sr["run"].get("attempt_count", 1),
-            }
-            for sr in stage_results
-        ],
+        "stage_details": [],
     }
+
+    # Build stage_details with per-stage summary
+    all_stage_summaries: List[str] = []
+    for sr in stage_results:
+        sd = {
+            "stage": sr["stage"],
+            "backend": sr["backend"],
+            "model": sr.get("model", ""),
+            "provider": sr.get("provider", ""),
+            "stage_index": sr["stage_index"],
+            "returncode": sr["run"].get("returncode"),
+            "elapsed_ms": sr["run"].get("elapsed_ms"),
+            "stdout": (sr["run"].get("stdout") or "")[-6000:],
+            "stderr": (sr["run"].get("stderr") or "")[-2000:],
+            "last_message": (sr["run"].get("last_message") or "")[-6000:],
+            "cmd": sr["run"].get("cmd"),
+            "noop_reason": sr["run"].get("noop_reason"),
+            "attempt_count": sr["run"].get("attempt_count", 1),
+        }
+        stage_sum = generate_stage_summary(sr["run"])
+        sd["summary"] = stage_sum
+        all_stage_summaries.append("[{}] {}".format(sr["stage"], stage_sum))
+        run_data["stage_details"].append(sd)
+
+    # Overall pipeline summary
+    pipeline_summary = "\n".join(all_stage_summaries)
+    if len(pipeline_summary) > 200:
+        pipeline_summary = pipeline_summary[:197] + "..."
+    run_data["summary"] = pipeline_summary
+
     run_log_path = write_run_log(task["task_id"], run_data)
     runlog_hash = json_sha256(run_data)
 
@@ -356,7 +433,34 @@ def finalize_pipeline_task(
     result["executor"]["runlog_sha256"] = runlog_hash
     result["executor"]["result_sha256"] = result_hash
     save_json(processing, result)
+
+    # Write standalone summary file
+    _write_summary_file(task["task_id"], pipeline_summary)
+
     return result
+
+
+def format_elapsed(ms) -> str:
+    """Convert milliseconds to human-readable duration (秒/分钟)."""
+    try:
+        total_sec = int(ms or 0) / 1000.0
+    except (TypeError, ValueError):
+        return "未知"
+    if total_sec < 60:
+        return "{:.1f} 秒".format(total_sec) if total_sec >= 1 else "{:.2f} 秒".format(total_sec)
+    minutes = int(total_sec // 60)
+    secs = int(total_sec % 60)
+    if secs == 0:
+        return "{} 分钟".format(minutes)
+    return "{} 分 {} 秒".format(minutes, secs)
+
+
+def _truncate_lines(text: str, max_lines: int = 3) -> str:
+    """Truncate text to max_lines, appending '...' if truncated."""
+    lines = text.strip().splitlines()
+    if len(lines) <= max_lines:
+        return text.strip()
+    return "\n".join(lines[:max_lines]) + "\n..."
 
 
 def build_task_summary(result: Dict) -> str:
@@ -376,59 +480,37 @@ def build_task_summary(result: Dict) -> str:
 def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detailed: bool) -> str:
     execution_status = str(result.get("execution_status") or result.get("status") or "unknown")
     elapsed = (result.get("executor") or {}).get("elapsed_ms", 0)
+    elapsed_str = format_elapsed(elapsed)
     summary = build_task_summary(result)
     acceptance = result.get("acceptance") if isinstance(result.get("acceptance"), dict) else {}
     iteration = int(acceptance.get("iteration_count") or 1)
-    iteration_tag = "（第{}轮迭代）".format(iteration) if iteration > 1 else ""
+    iteration_tag = "（第{}轮）".format(iteration) if iteration > 1 else ""
+    separator = "━━━━━━━━━━━━━━━━"
+
     if execution_status == "failed":
-        if detailed:
-            return (
-                "任务 [{code}] {task_id} 执行失败{iter}，等待验收。\n"
-                "状态: pending_acceptance\n"
-                "执行结果: failed\n"
-                "耗时: {elapsed} ms\n"
-                "失败摘要:\n{summary}\n\n"
-                "通过: /accept {code}\n"
-                "拒绝: /reject {code} <原因>"
-            ).format(code=task_code, task_id=task_id, elapsed=elapsed, summary=summary[:800], iter=iteration_tag)
         return (
-            "任务 [{code}] {task_id} 执行失败{iter}，等待验收。\n"
-            "状态: pending_acceptance\n"
-            "执行结果: failed\n"
-            "失败摘要: {summary}\n"
-            "通过: /accept {code}\n"
-            "拒绝: /reject {code} <原因>"
-        ).format(code=task_code, task_id=task_id, summary=summary[:300], iter=iteration_tag)
-    if detailed:
-        return (
-            "任务 [{code}] {task_id} 执行完成{iter}，等待验收。\n"
-            "状态: pending_acceptance\n"
-            "执行结果: {execution_status}\n"
-            "耗时: {elapsed} ms\n"
-            "摘要:\n{summary}\n\n"
-            "通过: /accept {code}\n"
-            "拒绝: /reject {code} <原因>"
+            "❌ 任务 [{code}] 执行失败{iter}\n"
+            "耗时: {elapsed}\n"
+            "{sep}\n"
+            "失败原因: {summary}"
         ).format(
             code=task_code,
-            task_id=task_id,
-            execution_status=execution_status,
-            elapsed=elapsed,
-            summary=summary[:800],
+            elapsed=elapsed_str,
+            summary=_truncate_lines(summary[:500], 3),
             iter=iteration_tag,
+            sep=separator,
         )
     return (
-        "任务 [{code}] {task_id} 已处理完成{iter}，等待验收。\n"
-        "状态: pending_acceptance\n"
-        "执行结果: {execution_status}\n"
-        "概要: {summary}\n"
-        "通过: /accept {code}\n"
-        "拒绝: /reject {code} <原因>"
+        "✅ 任务 [{code}] 执行完成{iter}\n"
+        "耗时: {elapsed}\n"
+        "{sep}\n"
+        "概要: {summary}"
     ).format(
         code=task_code,
-        task_id=task_id,
-        execution_status=execution_status,
-        summary=summary[:300],
+        elapsed=elapsed_str,
+        summary=_truncate_lines(summary[:500], 3),
         iter=iteration_tag,
+        sep=separator,
     )
 
 

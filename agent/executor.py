@@ -70,6 +70,8 @@ from task_accept import (
     write_run_log,
     acceptance_root,
     json_sha256,
+    generate_stage_summary,
+    format_elapsed,
 )
 
 
@@ -214,12 +216,16 @@ def _handle_task_failure(task: Dict, processing: Path, chat_id: int, exc: Except
         error=str(result.get("error") or error_str),
     )
     task_code = result.get("task_code", "-")
+    # Truncate error to 5 lines max
+    err_lines = error_str[:500].strip().splitlines()
+    if len(err_lines) > 5:
+        err_lines = err_lines[:5] + ["..."]
+    err_display = "\n".join(err_lines)
     send_text(
         chat_id,
-        "任务 [{code}] {task_id} 失败: {err}\n状态: pending_acceptance(待验收)\n通过: /accept {code}\n拒绝: /reject {code} <原因>".format(
+        "\u274c \u4efb\u52a1 [{code}] \u6267\u884c\u5931\u8d25\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u5931\u8d25\u539f\u56e0: {err}".format(
             code=task_code,
-            task_id=task["task_id"],
-            err=error_str[:500],
+            err=err_display,
         ),
         reply_markup=task_inline_keyboard(task_code, task["task_id"]),
     )
@@ -327,45 +333,11 @@ def process_task(path: Path) -> None:
         save_json(result_path, result)
 
         task_code = result.get("task_code", "-")
-        if not silent_mode:
-            send_text(
-                chat_id,
-                acceptance_notice_text(result, task["task_id"], task_code, detailed=True),
-                reply_markup=task_inline_keyboard(task_code, task["task_id"]),
-            )
-        else:
-            send_text(
-                chat_id,
-                acceptance_notice_text(result, task["task_id"], task_code, detailed=False),
-                reply_markup=task_inline_keyboard(task_code, task["task_id"]),
-            )
-
-        # Send acceptance doc TEXT CONTENT directly (not just file paths)
-        doc_file = str(acceptance.get("doc_file") or "")
-        if doc_file:
-            doc_path = Path(doc_file)
-            if doc_path.exists():
-                try:
-                    doc_content = doc_path.read_text(encoding="utf-8")
-                    # Telegram message limit is 4096 chars; split if needed
-                    _MAX_TG_MSG = 4000
-                    if len(doc_content) <= _MAX_TG_MSG:
-                        send_text(chat_id, doc_content)
-                    else:
-                        # Send in chunks
-                        for i in range(0, len(doc_content), _MAX_TG_MSG):
-                            chunk = doc_content[i:i + _MAX_TG_MSG]
-                            send_text(chat_id, chunk)
-                except Exception:
-                    send_text(chat_id, "验收文档: {}".format(doc_file))
-
-        # Add git checkpoint info to notification
-        ckpt = task.get("_git_checkpoint", "")
-        if ckpt:
-            send_text(
-                chat_id,
-                "Git回滚点: {}\n验收通过将commit变更；验收拒绝将回退到此检查点。".format(ckpt[:12]),
-            )
+        send_text(
+            chat_id,
+            acceptance_notice_text(result, task["task_id"], task_code, detailed=not silent_mode),
+            reply_markup=task_inline_keyboard(task_code, task["task_id"]),
+        )
 
         mark_task_completion_notified(task["task_id"])
     except (subprocess.TimeoutExpired, Exception) as exc:
