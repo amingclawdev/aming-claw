@@ -1,0 +1,5 @@
+# 内嵌 Python 运行时 — 由 setup.ps1 自动下载，不纳入版本控制
+python/
+
+# setup 完成标记（含本机路径，不提交）
+setup-done.txt

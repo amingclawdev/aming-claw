@@ -1,0 +1,13 @@
+actions:
+  plan_task:
+    script: executors/plan_task.py
+    timeout_sec: 15
+  code_change:
+    script: executors/code_change.py
+    timeout_sec: 30
+  run_tests:
+    script: executors/run_tests.py
+    timeout_sec: 180
+  take_screenshot:
+    script: executors/take_screenshot.py
+    timeout_sec: 60
