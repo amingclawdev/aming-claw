@@ -359,13 +359,33 @@ def role_pipeline_config_keyboard(stages: List[Dict]) -> Dict:
 
 
 def role_model_select_keyboard(role_name: str, models: List[Dict]) -> Dict:
-    """Build a dynamic keyboard for selecting a model for a specific role."""
+    """Build a dynamic keyboard for selecting a model for a specific role.
+
+    Groups models by provider with section headers. Unavailable models
+    are shown with a warning prefix so users know the key isn't configured.
+    """
     from model_registry import make_label
     rows: List[List[Dict]] = []
+    # Group by provider, preserving order within each group
+    grouped: Dict[str, List[Dict]] = {}
     for m in models:
-        label = make_label(m)
-        cb_data = "role_model:{}:{}:{}".format(role_name, m["provider"], m["id"])
-        rows.append([{"text": label, "callback_data": cb_data}])
+        grouped.setdefault(m.get("provider", "unknown"), []).append(m)
+    provider_labels = {"anthropic": "── Anthropic (Claude) ──", "openai": "── OpenAI (Codex) ──"}
+    for provider in ["anthropic", "openai"]:
+        provider_models = grouped.get(provider)
+        if not provider_models:
+            continue
+        # Section header (non-clickable label shown as a disabled-looking button)
+        rows.append([{"text": provider_labels.get(provider, provider),
+                       "callback_data": "noop:section"}])
+        for m in provider_models:
+            available = m.get("status", "available") == "available"
+            label = make_label(m)
+            if not available:
+                reason = m.get("unavailable_reason", "")
+                label = "\u26a0 {} ({})".format(label, reason[:20]) if reason else "\u26a0 " + label
+            cb_data = "role_model:{}:{}:{}".format(role_name, m["provider"], m["id"])
+            rows.append([{"text": label, "callback_data": cb_data}])
     rows.append([{"text": "\u00ab \u8fd4\u56de\u89d2\u8272\u914d\u7f6e", "callback_data": "menu:role_pipeline_config"}])
     return {"inline_keyboard": rows}
 

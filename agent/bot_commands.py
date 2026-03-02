@@ -729,6 +729,11 @@ def handle_callback_query(cb: Dict) -> None:
         answer_callback_query(cb_id, "无效按钮")
         return
     try:
+        # ---- Noop callbacks (section headers etc.) ----
+        if data.startswith("noop:"):
+            answer_callback_query(cb_id)
+            return
+
         # ---- Main menu callbacks ----
         if data.startswith("menu:"):
             _handle_menu_callback(cb_id, data, chat_id, user_id)
@@ -866,11 +871,11 @@ def handle_callback_query(cb: Dict) -> None:
                 answer_callback_query(cb_id, "未知角色", show_alert=True)
                 return
             all_models = get_available_models()
-            # Only show available models for selection
-            models = [m for m in all_models if m.get("status") == "available"]
-            if not models:
-                # Fallback to known models
-                models = [{"id": m, "provider": "anthropic"} for m in KNOWN_CLAUDE_MODELS]
+            # Show all models (including unavailable) so users can pre-configure
+            # roles even when a provider key isn't set yet.
+            models = all_models if all_models else [
+                {"id": m, "provider": "anthropic"} for m in KNOWN_CLAUDE_MODELS
+            ]
             send_text(
                 chat_id,
                 "选择 {} {} 使用的模型：".format(role_def.get("emoji", ""), role_def.get("label", role_name)),

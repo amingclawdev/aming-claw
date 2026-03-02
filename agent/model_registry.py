@@ -7,6 +7,7 @@ Returns a unified list with metadata:
 Results are in-memory cached for CACHE_TTL seconds per process lifetime.
 """
 import os
+import shutil
 import time
 from typing import Dict, List, Optional
 
@@ -33,13 +34,23 @@ _KNOWN_CONTEXT_LENGTHS: Dict[str, int] = {
     "claude-sonnet-4-6": 200000,
     "claude-haiku-4-5": 200000,
     "claude-haiku-4-5-20251001": 200000,
+    "claude-opus-4-1-20250805": 200000,
+    "claude-opus-4-20250514": 200000,
+    "claude-sonnet-4-20250514": 200000,
+    "claude-sonnet-4-5-20250929": 200000,
+    "claude-opus-4-5-20251101": 200000,
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-nano": 1047576,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
     "gpt-4-turbo": 128000,
     "gpt-4": 8192,
     "gpt-3.5-turbo": 16385,
+    "gpt-5.3-codex": 1047576,
     "o1": 200000,
     "o3": 200000,
+    "o4-mini": 200000,
 }
 
 
@@ -53,6 +64,24 @@ def _lookup_context_length(model_id: str) -> Optional[int]:
     return None
 
 
+# ── CLI detection ─────────────────────────────────────────────────────────────
+
+def _has_codex_cli() -> bool:
+    """Check if Codex CLI binary is available on PATH."""
+    codex_bin = os.getenv("CODEX_BIN", "").strip()
+    if codex_bin and shutil.which(codex_bin):
+        return True
+    return bool(shutil.which("codex.cmd") or shutil.which("codex"))
+
+
+def _has_claude_cli() -> bool:
+    """Check if Claude CLI binary is available on PATH."""
+    claude_bin = os.getenv("CLAUDE_BIN", "").strip()
+    if claude_bin and shutil.which(claude_bin):
+        return True
+    return bool(shutil.which("claude.cmd") or shutil.which("claude"))
+
+
 # ── Anthropic ──────────────────────────────────────────────────────────────────
 
 _ANTHROPIC_PREFER = [
@@ -64,7 +93,10 @@ _ANTHROPIC_PREFER = [
 def fetch_anthropic_models() -> List[Dict]:
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        return _unavailable_anthropic_models("API key未配置")
+        # No API key, but Claude CLI subscription may be available
+        if _has_claude_cli():
+            return _cli_anthropic_models()
+        return _unavailable_anthropic_models("API key未配置且无Claude CLI")
     try:
         resp = requests.get(
             "https://api.anthropic.com/v1/models",
@@ -117,17 +149,46 @@ def _unavailable_anthropic_models(reason: str) -> List[Dict]:
     ]
 
 
+def _cli_anthropic_models() -> List[Dict]:
+    """Return known Anthropic models available via Claude CLI subscription."""
+    return [
+        {
+            "id": mid,
+            "provider": "anthropic",
+            "created": "",
+            "context_length": _lookup_context_length(mid),
+            "status": "available",
+            "unavailable_reason": "",
+            "source": "cli",
+        }
+        for mid in _ANTHROPIC_PREFER
+    ]
+
+
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 
-_OPENAI_PREFIXES = ("gpt-4o", "gpt-4", "o1", "o3", "gpt-3.5-turbo")
+_OPENAI_PREFIXES = ("gpt-5", "gpt-4.1", "gpt-4o", "gpt-4", "o1", "o3", "o4", "gpt-3.5-turbo")
 _OPENAI_SKIP = ("instruct", "vision-preview", "0301", "0314", "0613")
 
 _OPENAI_FALLBACK_MODELS = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
 
+# Models known to be available via Codex CLI subscription
+_CODEX_CLI_MODELS = [
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "o3",
+    "o4-mini",
+    "gpt-4o",
+]
+
 def fetch_openai_models() -> List[Dict]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return _unavailable_openai_models("API key未配置")
+        # No API key, but Codex CLI subscription may be available
+        if _has_codex_cli():
+            return _cli_openai_models()
+        return _unavailable_openai_models("API key未配置且无Codex CLI")
     try:
         resp = requests.get(
             "https://api.openai.com/v1/models",
@@ -172,6 +233,22 @@ def _unavailable_openai_models(reason: str) -> List[Dict]:
             "unavailable_reason": reason,
         }
         for mid in _OPENAI_FALLBACK_MODELS
+    ]
+
+
+def _cli_openai_models() -> List[Dict]:
+    """Return known OpenAI models available via Codex CLI subscription."""
+    return [
+        {
+            "id": mid,
+            "provider": "openai",
+            "created": 0,
+            "context_length": _lookup_context_length(mid),
+            "status": "available",
+            "unavailable_reason": "",
+            "source": "cli",
+        }
+        for mid in _CODEX_CLI_MODELS
     ]
 
 
