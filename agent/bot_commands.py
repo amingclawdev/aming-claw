@@ -328,12 +328,24 @@ def is_screenshot_text(text: str) -> bool:
         low,
     ):
         return False
-    # 3) Common polite-prefix + screenshot verb patterns
+    # 3) Extra guard: texts that start with screenshot words but clearly describe
+    #    engineering work (e.g. "截图上传失败修复") should not trigger screenshot.
+    if re.match(r"^(截图|截屏|screenshot|take\s+a?\s*screenshot|screen\s*shot|screen\s*cap)", low):
+        if re.search(
+            r"(修复|排查|检查|优化|分析|定位|失败|异常|bug|issue|fix|debug|模块|功能|"
+            r"命令|逻辑|流程|报告|日志|任务|上传)",
+            low,
+        ) and not re.search(
+            r"(给我|发我|看下|看看|看一下|一下|当前|现在|please|now|for me|desktop)",
+            low,
+        ):
+            return False
+    # 4) Common polite-prefix + screenshot verb patterns
     if re.match(r"^(请|帮我|请帮我|请帮忙|帮忙)?(截图|截屏|截个图|截个屏)", low):
         return True
     if re.match(r"^(take\s+a?\s*)?(screenshot|screen\s*shot|screen\s*cap)", low):
         return True
-    # 4) Very short text (<= 15 chars) with screen-related keywords
+    # 5) Very short text (<= 15 chars) with screen-related keywords
     if len(low) <= 15:
         keys = ["screen", "屏幕", "多屏", "双屏", "all screens"]
         return any(k in low for k in keys)

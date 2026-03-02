@@ -99,6 +99,12 @@ class TestIsScreenshotText(unittest.TestCase):
     def test_task_starting_with_english_screenshot_command_phrase(self):
         self.assertFalse(is_screenshot_text("screenshot command misclassification fix"))
 
+    def test_task_starting_with_screenshot_upload_failure_fix(self):
+        self.assertFalse(is_screenshot_text("截图上传失败修复"))
+
+    def test_task_starting_with_english_screenshot_upload_failure_fix(self):
+        self.assertFalse(is_screenshot_text("screenshot upload failure fix"))
+
     def test_fix_screenshot_feature(self):
         self.assertFalse(is_screenshot_text("修复截图功能的bug"))
 
