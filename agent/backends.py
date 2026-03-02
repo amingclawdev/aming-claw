@@ -206,7 +206,9 @@ def get_git_changed_files(workspace: Path) -> Optional[List[str]]:
 # ── Backend runners ───────────────────────────────────────────────────────────
 
 def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "", prompt_override: Optional[str] = None) -> Dict:
-    workspace = resolve_workspace()
+    # Use the actual project directory (not the isolated search-workspace)
+    # so Codex can read and modify project source files.
+    workspace = resolve_active_workspace()
     if is_sensitive_path(workspace):
         raise RuntimeError("workspace is sensitive and not allowed: {}".format(workspace))
     if task_touches_sensitive_path(task.get("text", "")):
@@ -243,6 +245,9 @@ def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "", prompt_o
         cmd.insert(2, model)
         cmd.insert(2, "--model")
 
+    # Snapshot git state before execution (to diff against after)
+    before_changed: set = set(get_git_changed_files(workspace) or [])
+
     last_timeout: Optional[str] = None
     proc = None
     t0 = time.perf_counter()
@@ -268,6 +273,10 @@ def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "", prompt_o
         except Exception:
             last_message = ""
 
+    # Only report files newly changed by this task (not pre-existing dirty files)
+    after_changed = get_git_changed_files(workspace) or []
+    new_changed = [f for f in after_changed if f not in before_changed]
+
     return {
         "returncode": proc.returncode,
         "stdout": (proc.stdout or "")[-12000:],
@@ -277,7 +286,7 @@ def run_codex(task: Dict, extra_guard: str = "", attempt_tag: str = "", prompt_o
         "cmd": cmd,
         "timeout_retries": max_retries,
         "workspace": str(workspace),
-        "git_changed_files": get_git_changed_files(workspace),
+        "git_changed_files": new_changed,
         "attempt_tag": attempt_tag,
     }
 
