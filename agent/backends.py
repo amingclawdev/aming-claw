@@ -981,27 +981,65 @@ def _is_role_pipeline(stages: List[Dict]) -> bool:
     return names == ROLE_PIPELINE_ORDER
 
 
+def _load_pipeline_provider_config() -> Dict:
+    """Load pipeline multi-provider config (YAML + env overrides).
+
+    Returns the effective config dict, or empty dict if no config is available.
+    Logs errors but does not raise to avoid breaking pipeline execution.
+    """
+    try:
+        from pipeline_config import get_effective_pipeline_config
+        config = get_effective_pipeline_config()
+        if config:
+            logger.info("[Pipeline] 已加载管线多服务商配置")
+        return config
+    except ValueError as exc:
+        logger.error("[Pipeline] 管线配置加载失败: %s", exc)
+        return {}
+    except Exception as exc:
+        logger.debug("[Pipeline] 未加载管线配置文件 (非错误): %s", exc)
+        return {}
+
+
 def process_pipeline(task: Dict, processing: Path) -> Dict:
     """Execute a multi-stage pipeline: each stage feeds its output as context to the next.
 
     For role pipelines (pm → dev → test → qa), uses structured context passing
     where each role receives targeted context from prior roles.
+
+    Provider/model resolution priority (highest → lowest):
+      1. Environment variable (PIPELINE_ROLE_{ROLE}_PROVIDER/MODEL)
+      2. YAML config file (pipeline_config.yaml)
+      3. Runtime config (agent_config.json role_pipeline_stages)
+      4. Global default provider/model
     """
     from config import get_pipeline_stages, get_role_pipeline_stages  # imported here to avoid circular
 
     stages = get_pipeline_stages()
 
     # If stages form a role pipeline, merge in per-role model/provider config
+    pipeline_routing: Optional[List[Dict]] = None
     if stages and _is_role_pipeline(stages):
-        role_stages = get_role_pipeline_stages()
-        role_config = {s["name"]: s for s in role_stages if "name" in s}
-        for stage in stages:
-            name = stage.get("name", "")
-            if name in role_config:
-                rc = role_config[name]
-                if rc.get("model"):
-                    stage["model"] = rc["model"]
-                    stage["provider"] = rc.get("provider", "")
+        # Try loading pipeline config from YAML + env overrides first
+        pipeline_cfg = _load_pipeline_provider_config()
+        if pipeline_cfg:
+            from pipeline_config import apply_config_to_stages, log_role_routing
+            stages = apply_config_to_stages(stages, pipeline_cfg)
+            pipeline_routing = log_role_routing(stages, pipeline_cfg)
+            logger.info("[Pipeline] 角色路由表: %s",
+                        "; ".join("{role}→{provider}/{model}({source})".format(**r)
+                                  for r in pipeline_routing))
+        else:
+            # Fall back to runtime config (agent_config.json)
+            role_stages = get_role_pipeline_stages()
+            role_config = {s["name"]: s for s in role_stages if "name" in s}
+            for stage in stages:
+                name = stage.get("name", "")
+                if name in role_config:
+                    rc = role_config[name]
+                    if rc.get("model"):
+                        stage["model"] = rc["model"]
+                        stage["provider"] = rc.get("provider", "")
     if not stages:
         # No pipeline configured — fall back to single backend
         backend = task.get("_pipeline_fallback_backend", "codex")
@@ -1068,4 +1106,6 @@ def process_pipeline(task: Dict, processing: Path) -> Dict:
     # Attach model info to result for audit trail
     if isinstance(result, dict):
         result["stages_model_info"] = stages_model_info
+        if pipeline_routing:
+            result["pipeline_routing"] = pipeline_routing
     return result

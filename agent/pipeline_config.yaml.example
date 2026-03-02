@@ -1,0 +1,39 @@
+# Pipeline Multi-Provider Configuration Example
+# 管线多服务商配置示例
+#
+# 将此文件复制为 pipeline_config.yaml 并放置在以下位置之一：
+#   shared-volume/codex-tasks/state/pipeline_config.yaml
+#
+# Provider 支持的值（含别名）:
+#   anthropic (别名: opus, claude)
+#   openai    (别名: codex, gpt)
+#
+# 环境变量覆盖（优先级高于配置文件）:
+#   PIPELINE_DEFAULT_PROVIDER  - 覆盖默认 provider
+#   PIPELINE_DEFAULT_MODEL     - 覆盖默认 model
+#   PIPELINE_ROLE_PM_PROVIDER  - 覆盖 PM 角色的 provider
+#   PIPELINE_ROLE_PM_MODEL     - 覆盖 PM 角色的 model
+#   PIPELINE_ROLE_DEV_PROVIDER / PIPELINE_ROLE_DEV_MODEL
+#   PIPELINE_ROLE_TEST_PROVIDER / PIPELINE_ROLE_TEST_MODEL
+#   PIPELINE_ROLE_QA_PROVIDER  / PIPELINE_ROLE_QA_MODEL
+
+pipeline:
+  # 默认配置 - 未单独配置的角色将使用此配置
+  default:
+    provider: openai
+    model: gpt-4.1
+
+  # 角色级配置 - 覆盖默认配置
+  roles:
+    pm:
+      provider: anthropic
+      model: claude-opus-4-6
+    dev:
+      provider: anthropic
+      model: claude-opus-4-6
+    test:
+      provider: openai
+      model: gpt-4.1
+    qa:
+      provider: openai
+      model: gpt-4.1
