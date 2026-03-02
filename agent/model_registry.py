@@ -28,6 +28,10 @@ def _cached(key: str, ttl: int, fn):
 
 
 # ── Known context lengths (fallback when API doesn't return them) ────────────
+# NOTE: 新增模型时，请同步更新以下三处:
+#   1. _KNOWN_CONTEXT_LENGTHS  (上下文长度)
+#   2. _CODEX_CLI_MODELS       (Codex CLI 可用模型)
+#   3. _OPENAI_FALLBACK_MODELS (无 API key 时的降级列表)
 
 _KNOWN_CONTEXT_LENGTHS: Dict[str, int] = {
     "claude-opus-4-6": 200000,

@@ -94,7 +94,8 @@ class TestFetchAnthropicModels(unittest.TestCase):
     def setUp(self):
         _cache.clear()
 
-    def test_no_api_key_returns_unavailable(self):
+    @patch("model_registry._has_claude_cli", return_value=False)
+    def test_no_api_key_returns_unavailable(self, _mock_cli):
         os.environ.pop("ANTHROPIC_API_KEY", None)
         models = fetch_anthropic_models()
         self.assertTrue(len(models) > 0)
@@ -137,7 +138,8 @@ class TestFetchOpenAIModels(unittest.TestCase):
     def setUp(self):
         _cache.clear()
 
-    def test_no_api_key_returns_unavailable(self):
+    @patch("model_registry._has_codex_cli", return_value=False)
+    def test_no_api_key_returns_unavailable(self, _mock_cli):
         os.environ.pop("OPENAI_API_KEY", None)
         models = fetch_openai_models()
         self.assertTrue(len(models) > 0)
@@ -150,7 +152,9 @@ class TestGetAvailableModels(unittest.TestCase):
     def setUp(self):
         _cache.clear()
 
-    def test_no_api_keys_returns_unavailable_models(self):
+    @patch("model_registry._has_codex_cli", return_value=False)
+    @patch("model_registry._has_claude_cli", return_value=False)
+    def test_no_api_keys_returns_unavailable_models(self, _mock_claude, _mock_codex):
         os.environ.pop("ANTHROPIC_API_KEY", None)
         os.environ.pop("OPENAI_API_KEY", None)
         _cache.clear()
