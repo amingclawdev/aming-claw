@@ -2,7 +2,8 @@
 
 Provides a hierarchical click-to-interact UI organized as:
   Main Dashboard -> Quick Actions (new task, task list, screenshot)
-                 -> Sub-menus (system, archive, ops, security)
+                 -> Sub-menus (system, ops, security, workspace)
+  Task Management -> Status filters + Archive Management sub-menu
 
 Multi-step flows use a pending-action state machine:
   click button -> bot prompts for input -> user sends text -> action completes.
@@ -115,13 +116,10 @@ def main_menu_keyboard() -> Dict:
             # ---- Sub-menu entries ----
             [
                 {"text": "\u2699\ufe0f \u7cfb\u7edf\u8bbe\u7f6e", "callback_data": "menu:sub_system"},
-                {"text": "\U0001f4c2 \u5f52\u6863\u7ba1\u7406", "callback_data": "menu:sub_archive"},
-            ],
-            [
                 {"text": "\U0001f527 \u8fd0\u7ef4\u64cd\u4f5c", "callback_data": "menu:sub_ops"},
-                {"text": "\U0001f512 \u5b89\u5168\u8ba4\u8bc1", "callback_data": "menu:sub_security"},
             ],
             [
+                {"text": "\U0001f512 \u5b89\u5168\u8ba4\u8bc1", "callback_data": "menu:sub_security"},
                 {"text": "\U0001f4c1 \u5de5\u4f5c\u533a\u7ba1\u7406", "callback_data": "menu:sub_workspace"},
             ],
         ]
@@ -173,7 +171,7 @@ def archive_menu_keyboard() -> Dict:
                 {"text": "\U0001f4c4 \u5f52\u6863\u8be6\u60c5", "callback_data": "menu:archive_show"},
             ],
             [
-                {"text": "\u00ab \u8fd4\u56de\u4e3b\u83dc\u5355", "callback_data": "menu:main"},
+                {"text": "\u00ab \u8fd4\u56de\u4efb\u52a1\u7ba1\u7406", "callback_data": "menu:sub_task_mgmt"},
             ],
         ]
     }
@@ -577,6 +575,9 @@ def task_mgmt_menu_keyboard() -> Dict:
             [
                 {"text": "\U0001f4c1 \u5f52\u6863\u4efb\u52a1", "callback_data": "menu:tasks_archived"},
                 {"text": "\U0001f4ca \u5168\u90e8\u6982\u89c8", "callback_data": "menu:tasks_overview"},
+            ],
+            [
+                {"text": "\U0001f4c2 \u5f52\u6863\u7ba1\u7406", "callback_data": "menu:sub_archive"},
             ],
             [
                 {"text": "\u00ab \u8fd4\u56de\u4e3b\u83dc\u5355", "callback_data": "menu:main"},

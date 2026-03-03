@@ -54,16 +54,17 @@ class TestTaskMgmtMenuKeyboard(unittest.TestCase):
             "menu:tasks_failed",
             "menu:tasks_archived",
             "menu:tasks_overview",
+            "menu:sub_archive",
             "menu:main",
         ]
         for cb in expected:
             self.assertIn(cb, all_data, "Missing callback: {}".format(cb))
 
-    def test_has_9_buttons(self):
-        """8 status categories + 1 back button = 9 total buttons."""
+    def test_has_10_buttons(self):
+        """8 status categories + 1 archive mgmt + 1 back button = 10 total buttons."""
         kb = task_mgmt_menu_keyboard()
         all_btns = [btn for row in kb["inline_keyboard"] for btn in row]
-        self.assertEqual(len(all_btns), 9)
+        self.assertEqual(len(all_btns), 10)
 
 
 class TestMainMenuHasTaskMgmt(unittest.TestCase):
