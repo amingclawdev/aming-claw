@@ -160,7 +160,7 @@ def retry_task(
     current_iteration = int(acceptance.get("iteration_count") or 1)
     max_iterations = get_max_retry_iterations()
     if current_iteration >= max_iterations:
-        return False, "已达最大迭代次数({})，请手动创建新任务".format(max_iterations), None
+        return False, t("retry.max_iterations", max=max_iterations), None
 
     # ── AC-4: Record rejection history ──
     _append_rejection_history(acceptance, current_iteration)
@@ -178,11 +178,11 @@ def retry_task(
         ckpt = pre_task_checkpoint(task_id=task_id)
         if ckpt.get("checkpoint_commit"):
             task["_git_checkpoint"] = ckpt["checkpoint_commit"]
-            git_checkpoint_msg = "新检查点: {}".format(ckpt["checkpoint_commit"][:12])
+            git_checkpoint_msg = t("retry.git_checkpoint", commit=ckpt["checkpoint_commit"][:12])
         if ckpt.get("error"):
-            git_checkpoint_msg = "Git检查点警告: {}".format(ckpt["error"][:200])
+            git_checkpoint_msg = t("retry.git_warning", err=ckpt["error"][:200])
     except Exception as exc:
-        git_checkpoint_msg = "Git检查点异常: {}".format(str(exc)[:200])
+        git_checkpoint_msg = t("retry.git_error", err=str(exc)[:200])
 
     # ── Re-infer action from original task text ──
     # If the action was wrong (e.g. screenshot for a code task), fix it on retry
@@ -243,11 +243,7 @@ def retry_task(
         "git_checkpoint": git_checkpoint_msg,
     })
 
-    msg = (
-        "任务 [{code}] {task_id} 已重新提交开发（第{iter}轮）\n"
-        "状态: pending\n"
-        "增强prompt已注入拒绝原因摘要"
-    ).format(code=task_code, task_id=task_id, iter=new_iteration)
+    msg = t("retry.submitted", code=task_code, task_id=task_id, iter=new_iteration)
     if git_checkpoint_msg:
         msg += "\n{}".format(git_checkpoint_msg)
 
