@@ -46,7 +46,7 @@ def load_locale(lang: str) -> Dict:
     if not path.exists():
         logger.warning("[i18n] locale file not found: %s", path)
         _locales[lang] = {}
-        return {}
+        return _locales[lang]
     try:
         with open(str(path), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -55,7 +55,7 @@ def load_locale(lang: str) -> Dict:
     except Exception as exc:
         logger.error("[i18n] failed to load locale %s: %s", lang, exc)
         _locales[lang] = {}
-        return {}
+        return _locales[lang]
 
 
 def reload_locale(lang: str) -> Dict:
