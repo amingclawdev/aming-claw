@@ -310,7 +310,7 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
             preview = str(s.get("last_message_preview") or "").strip()
             if preview:
                 if name == "qa" and _is_qa_boilerplate(preview):
-                    stage_lines.append("QA 未产出实质审计结论（模型响应被截断）\n")
+                    stage_lines.append("QA 未产出实质审计结论（输入上下文过长被截断，QA 仅收到角色设定）\n")
                 else:
                     snippet = _extract_stage_snippet(name, preview)
                     if snippet:
