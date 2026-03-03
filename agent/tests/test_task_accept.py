@@ -139,7 +139,7 @@ class TestWriteAcceptanceDocuments(unittest.TestCase):
 
         # Check doc content
         content = Path(docs["doc_file"]).read_text(encoding="utf-8")
-        self.assertIn("验收门禁规则", content)
+        self.assertIn("验收结论", content)
         self.assertIn("task-doc-1", content)
 
         # Check cases content

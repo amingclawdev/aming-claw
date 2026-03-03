@@ -36,6 +36,76 @@ def acceptance_root() -> Path:
     return p
 
 
+def _is_qa_boilerplate(text: str) -> bool:
+    """Detect QA boilerplate responses that don't contain actual audit results."""
+    if not text:
+        return True
+    markers = [
+        "请提供以下材料",
+        "已切换为",
+        "把材料发来后",
+        "收到后我会输出",
+        "收到后我将",
+        "我将按",
+        "请提供",
+        "我直接开始审计",
+    ]
+    for m in markers:
+        if m in text:
+            # Check if the text also has real verdict content
+            verdict_markers = ["验收结论", "✓通过", "✗未通过", "⚠部分通过",
+                               "总体结论", "通过", "不通过"]
+            has_verdict = any(v in text for v in verdict_markers
+                             if v not in ("通过", "不通过")  # avoid matching boilerplate "通过/不通过"
+                             or text.count(v) > 1)
+            if not has_verdict:
+                return True
+    return False
+
+
+def _generate_auto_verdict(stages: list) -> str:
+    """Generate an automatic verdict summary when QA fails to produce one.
+
+    Uses dev and test stage results to create a basic pass/fail assessment.
+    """
+    parts = []
+    all_passed = True
+
+    for s in stages:
+        name = s.get("stage", "?")
+        rc = s.get("returncode", -1)
+        noop = s.get("noop_reason")
+        preview = str(s.get("last_message_preview") or "").strip()
+
+        if name == "test":
+            if rc == 0 and not noop:
+                # Extract test count from preview
+                import re
+                m = re.search(r"(\d+)\s*(passed|tests?.*OK|通过)", preview)
+                if m:
+                    parts.append("测试: {} 通过".format(m.group(0)))
+                else:
+                    parts.append("测试: 通过 (returncode=0)")
+            else:
+                parts.append("测试: 失败")
+                all_passed = False
+        elif name == "dev":
+            if rc == 0 and not noop:
+                parts.append("开发: 完成")
+            else:
+                parts.append("开发: 失败")
+                all_passed = False
+        elif name == "pm":
+            if rc == 0 and not noop:
+                parts.append("需求: 已产出")
+        elif name == "qa":
+            if rc != 0 or noop:
+                all_passed = False
+
+    verdict = "自动判定: {}".format("通过" if all_passed else "待人工验收")
+    return "{}\n{}".format(verdict, "\n".join(parts))
+
+
 def _build_pipeline_summary(executor: Dict) -> str:
     """Build a meaningful summary for pipeline tasks from all stage outputs.
 
@@ -47,6 +117,7 @@ def _build_pipeline_summary(executor: Dict) -> str:
         return str(executor.get("last_message") or "")
 
     parts = []
+    qa_was_boilerplate = False
     for s in stages:
         name = s.get("stage", "?")
         rc = s.get("returncode", -1)
@@ -59,19 +130,26 @@ def _build_pipeline_summary(executor: Dict) -> str:
         # Stage header
         time_str = "{:.0f}s".format(elapsed / 1000) if elapsed else "0s"
         model_str = " ({})".format(model) if model else ""
-        header = "{} {} {}{} {}".format(status_icon, name.upper(), time_str, model_str,
-                                         "- NOOP: {}".format(noop) if noop else "")
+        noop_tag = " - NOOP: {}".format(noop) if noop else ""
+        header = "{} {} {}{}{}".format(status_icon, name.upper(), time_str, model_str, noop_tag)
         parts.append(header)
 
         # Extract the most useful snippet from the stage output
         if preview:
-            # For dev: look for "修改文件列表" or "已执行步骤"
-            # For test: look for test results
-            # For others: first meaningful lines
-            snippet = _extract_stage_snippet(name, preview)
-            if snippet:
-                parts.append(snippet)
+            if name == "qa" and _is_qa_boilerplate(preview):
+                qa_was_boilerplate = True
+                parts.append("(QA 未产出实质审计，已自动生成判定)")
+            else:
+                snippet = _extract_stage_snippet(name, preview)
+                if snippet:
+                    parts.append(snippet)
         parts.append("")
+
+    # If QA returned boilerplate, add auto-verdict based on other stages
+    if qa_was_boilerplate:
+        auto_verdict = _generate_auto_verdict(stages)
+        parts.append("━━ 自动验收判定 ━━")
+        parts.append(auto_verdict)
 
     return "\n".join(parts).strip()
 
@@ -83,36 +161,35 @@ def _extract_stage_snippet(stage_name: str, preview: str) -> str:
 
     if stage_name == "dev":
         # Look for file change summary or step summary
-        for markers in ["\u4fee\u6539\u6587\u4ef6\u5217\u8868", "\u5df2\u6267\u884c\u6b65\u9aa4",
-                        "\u5b50\u4efb\u52a1\u5b9e\u73b0\u72b6\u6001", "\u6d4b\u8bd5\u7ed3\u679c"]:
+        for marker in ["修改文件列表", "已执行步骤", "变更说明",
+                        "子任务实现状态", "修改文件", "| 文件"]:
             for i, line in enumerate(lines):
-                if markers in line:
+                if marker in line:
                     return "\n".join(lines[i:i + max_lines]).strip()
         # Fallback: last N lines (usually summary)
         return "\n".join(lines[-max_lines:]).strip()[:500]
 
     if stage_name == "test":
         # Look for test result numbers
-        for markers in ["passed", "failed", "\u901a\u8fc7", "\u5931\u8d25",
-                        "\u7ed3\u8bba", "\u7ed3\u679c"]:
+        for marker in ["passed", "failed", "通过", "失败",
+                        "结论", "结果", "Ran ", "OK"]:
             for i, line in enumerate(lines):
-                if markers in line.lower():
+                if marker in line.lower() or marker in line:
                     start = max(0, i - 1)
                     return "\n".join(lines[start:start + max_lines]).strip()
         return "\n".join(lines[:max_lines]).strip()[:500]
 
     if stage_name == "qa":
         # QA: look for verdict
-        for markers in ["\u9a8c\u6536\u7ed3\u8bba", "\u901a\u8fc7", "\u4e0d\u901a\u8fc7",
-                        "\u6709\u6761\u4ef6\u901a\u8fc7"]:
+        for marker in ["验收结论", "总体结论", "✓通过", "✗未通过",
+                        "⚠部分通过", "有条件通过"]:
             for i, line in enumerate(lines):
-                if markers in line:
+                if marker in line:
                     start = max(0, i - 1)
                     return "\n".join(lines[start:start + max_lines]).strip()
-        # If QA just returned boilerplate, skip it
-        if "\u8bf7\u63d0\u4f9b\u4ee5\u4e0b\u6750\u6599" in preview or \
-           "\u5df2\u5207\u6362\u4e3a" in preview:
-            return "(QA\u672a\u4ea7\u51fa\u5b9e\u8d28\u5ba1\u8ba1\u7ed3\u679c)"
+        # If QA returned boilerplate, the caller handles it
+        if _is_qa_boilerplate(preview):
+            return ""
         return "\n".join(lines[:max_lines]).strip()[:500]
 
     # pm or others: first few lines
@@ -197,31 +274,64 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
                 status=c.get("status", ""),
             )
         )
+    is_pipeline = task.get("action") == "pipeline" and executor.get("stages")
+    if is_pipeline:
+        summary_text = _build_pipeline_summary(executor)[:2000]
+    else:
+        summary_text = (executor.get("last_message") or result.get("error") or "(见结果文件)")[:2000]
+
+    # Build pipeline stages section for document
+    pipeline_section = ""
+    if is_pipeline:
+        stages = executor.get("stages") or []
+        stage_lines = ["## 流水线执行详情\n"]
+        for s in stages:
+            name = s.get("stage", "?")
+            rc = s.get("returncode", -1)
+            noop = s.get("noop_reason")
+            elapsed_s = s.get("elapsed_ms", 0)
+            model = s.get("model", "")
+            icon = "\u2705" if rc == 0 and not noop else "\u274c"
+            time_s = format_elapsed(elapsed_s)
+            model_s = " ({})".format(model) if model else ""
+            stage_lines.append("### {} {}{} - {} {}".format(
+                icon, name.upper(), model_s, time_s,
+                "NOOP: {}".format(noop) if noop else ""))
+            preview = str(s.get("last_message_preview") or "").strip()
+            if preview:
+                if name == "qa" and _is_qa_boilerplate(preview):
+                    stage_lines.append("QA 未产出实质审计结论（模型响应被截断）\n")
+                else:
+                    snippet = _extract_stage_snippet(name, preview)
+                    if snippet:
+                        stage_lines.append("```\n{}\n```\n".format(snippet[:800]))
+        # Auto-verdict if QA was boilerplate
+        qa_stages = [s for s in stages if s.get("stage") == "qa"]
+        if qa_stages:
+            qa_preview = str(qa_stages[0].get("last_message_preview") or "")
+            if _is_qa_boilerplate(qa_preview):
+                verdict = _generate_auto_verdict(stages)
+                stage_lines.append("### 自动验收判定")
+                stage_lines.append("```\n{}\n```\n".format(verdict))
+        pipeline_section = "\n".join(stage_lines) + "\n\n"
+
     doc = (
         "# 任务测试与验收文档\n\n"
         "## 基本信息\n"
-        "- task_id: {task_id}\n"
         "- task_code: {task_code}\n"
         "- action: {action}\n"
         "- execution_status: {execution_status}\n"
+        "- elapsed: {elapsed}\n"
         "- generated_at: {generated_at}\n\n"
         "## 任务内容\n"
         "{task_text}\n\n"
         "## 执行摘要\n"
         "{summary}\n\n"
-        "## 运行环境\n"
-        "- workspace: {workspace}\n"
-        "- elapsed_ms: {elapsed_ms}\n"
-        "- returncode: {returncode}\n\n"
+        "{pipeline_section}"
         "## 功能测试/验收用例\n"
         "| 用例ID | 标题 | 步骤 | 预期结果 | 实际结果 | 结论 |\n"
         "| --- | --- | --- | --- | --- | --- |\n"
         "{case_table}\n\n"
-        "## 验收门禁规则\n"
-        "- 规则1: 任务完成后必须先进入待验收，禁止直接归档\n"
-        "- 规则2: 仅在用户执行 `/accept {task_code}` 后才允许归档\n"
-        "- 规则3: 用户执行 `/reject {task_code} <原因>` 后任务保留在结果区，可继续迭代\n"
-        "- 规则4: 可随时通过 `/status {task_code}` 查询当前状态与验收标识\n\n"
         "## 证据清单\n"
         "- result_file: `shared-volume/codex-tasks/results/{task_id}.json`\n"
         "- runlog_file: `{runlog_file}`\n"
@@ -235,13 +345,11 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
         task_code=result.get("task_code", "-"),
         action=task.get("action", "codex"),
         execution_status=exec_status,
+        elapsed=format_elapsed(executor.get("elapsed_ms", 0)),
         generated_at=utc_iso(),
         task_text=task.get("text", ""),
-        summary=(_build_pipeline_summary(executor) if task.get("action") == "pipeline" and executor.get("stages")
-                 else (executor.get("last_message") or result.get("error") or "(见结果文件)"))[:2000],
-        workspace=executor.get("workspace", ""),
-        elapsed_ms=executor.get("elapsed_ms", 0),
-        returncode=executor.get("returncode", ""),
+        summary=summary_text,
+        pipeline_section=pipeline_section,
         case_table="\n".join(case_lines),
         runlog_file=str(executor.get("runlog_file") or ""),
         cases_file=str(case_path),
@@ -571,46 +679,108 @@ def build_task_summary(result: Dict) -> str:
     return "(见日志文件)"
 
 
+def _format_pipeline_stage_line(s: Dict) -> str:
+    """Format a single pipeline stage as a concise one-line summary."""
+    name = s.get("stage", "?")
+    rc = s.get("returncode", -1)
+    noop = s.get("noop_reason")
+    elapsed = s.get("elapsed_ms", 0)
+    model = s.get("model", "")
+    icon = "\u2705" if rc == 0 and not noop else "\u274c"
+    time_str = format_elapsed(elapsed) if elapsed else "0s"
+    model_str = " ({})".format(model) if model else ""
+    noop_tag = " NOOP" if noop else ""
+    return "  {} {}{} {}{}".format(icon, name.upper(), model_str, time_str, noop_tag)
+
+
 def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detailed: bool) -> str:
     execution_status = str(result.get("execution_status") or result.get("status") or "unknown")
-    elapsed = (result.get("executor") or {}).get("elapsed_ms", 0)
+    executor = result.get("executor") or {}
+    elapsed = executor.get("elapsed_ms", 0)
     elapsed_str = format_elapsed(elapsed)
-    summary = build_task_summary(result)
     acceptance = result.get("acceptance") if isinstance(result.get("acceptance"), dict) else {}
     iteration = int(acceptance.get("iteration_count") or 1)
     iteration_tag = "（第{}轮）".format(iteration) if iteration > 1 else ""
-    separator = "━━━━━━━━━━━━━━━━"
+    separator = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Pipeline tasks get more lines since they have multi-stage info
     is_pipeline = result.get("action") == "pipeline"
-    max_summary_chars = 2000 if is_pipeline else 500
-    max_summary_lines = 20 if is_pipeline else 3
+    stages = executor.get("stages") or []
 
     if execution_status == "failed":
-        return (
-            "\u274c \u4efb\u52a1 [{code}] \u6267\u884c\u5931\u8d25{iter}\n"
-            "\u8017\u65f6: {elapsed}\n"
-            "{sep}\n"
-            "\u5931\u8d25\u539f\u56e0: {summary}"
-        ).format(
-            code=task_code,
-            elapsed=elapsed_str,
-            summary=_truncate_lines(summary[:max_summary_chars], max_summary_lines),
-            iter=iteration_tag,
-            sep=separator,
-        )
-    return (
-        "\u2705 \u4efb\u52a1 [{code}] \u6267\u884c\u5b8c\u6210{iter}\n"
-        "\u8017\u65f6: {elapsed}\n"
-        "{sep}\n"
-        "\u6982\u8981: {summary}"
-    ).format(
-        code=task_code,
-        elapsed=elapsed_str,
-        summary=_truncate_lines(summary[:max_summary_chars], max_summary_lines),
-        iter=iteration_tag,
-        sep=separator,
-    )
+        error_msg = str(result.get("error") or executor.get("noop_reason") or "").strip()
+        lines = [
+            "\u274c 任务 [{code}] 执行失败{iter}".format(code=task_code, iter=iteration_tag),
+            "耗时: {}".format(elapsed_str),
+            separator,
+        ]
+        if is_pipeline and stages:
+            lines.append("流水线阶段:")
+            for s in stages:
+                lines.append(_format_pipeline_stage_line(s))
+            lines.append(separator)
+        if error_msg:
+            lines.append("失败原因: {}".format(_truncate_lines(error_msg[:500], 3)))
+        return "\n".join(lines)
+
+    # ── Success ──
+    lines = [
+        "\u2705 任务 [{code}] 执行完成{iter}".format(code=task_code, iter=iteration_tag),
+        "耗时: {}".format(elapsed_str),
+        separator,
+    ]
+
+    if is_pipeline and stages:
+        lines.append("流水线阶段:")
+        for s in stages:
+            lines.append(_format_pipeline_stage_line(s))
+        lines.append(separator)
+
+        # Build concise verdict
+        test_stage = next((s for s in stages if s.get("stage") == "test"), None)
+        qa_stage = next((s for s in stages if s.get("stage") == "qa"), None)
+
+        # Test result summary
+        if test_stage:
+            test_preview = str(test_stage.get("last_message_preview") or "").strip()
+            test_rc = test_stage.get("returncode", -1)
+            if test_rc == 0 and not test_stage.get("noop_reason"):
+                import re
+                m = re.search(r"(\d+)\s*(passed|tests?.*OK|通过)", test_preview)
+                if m:
+                    lines.append("测试结果: \u2705 {}".format(m.group(0)))
+                else:
+                    lines.append("测试结果: \u2705 通过")
+            else:
+                lines.append("测试结果: \u274c 失败")
+
+        # QA verdict or auto-verdict
+        if qa_stage:
+            qa_preview = str(qa_stage.get("last_message_preview") or "").strip()
+            if _is_qa_boilerplate(qa_preview):
+                lines.append("QA审计: \u26a0 未产出（已自动判定）")
+            else:
+                # Try extracting actual verdict
+                snippet = _extract_stage_snippet("qa", qa_preview)
+                if snippet:
+                    lines.append("QA审计: {}".format(_truncate_lines(snippet, 3)))
+
+        if detailed:
+            # Dev changes summary
+            dev_stage = next((s for s in stages if s.get("stage") == "dev"), None)
+            if dev_stage:
+                dev_preview = str(dev_stage.get("last_message_preview") or "").strip()
+                if dev_preview:
+                    snippet = _extract_stage_snippet("dev", dev_preview)
+                    if snippet:
+                        lines.append(separator)
+                        lines.append("开发摘要:")
+                        lines.append(_truncate_lines(snippet, 5))
+    else:
+        # Non-pipeline task
+        summary = build_task_summary(result)
+        lines.append("概要: {}".format(_truncate_lines(summary[:500], 3)))
+
+    return "\n".join(lines)
 
 
 def run_post_acceptance_tests(workspace: Path) -> Dict:

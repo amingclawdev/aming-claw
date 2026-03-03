@@ -183,6 +183,16 @@ def retry_task(
     except Exception as exc:
         git_checkpoint_msg = "Git检查点异常: {}".format(str(exc)[:200])
 
+    # ── Re-infer action from original task text ──
+    # If the action was wrong (e.g. screenshot for a code task), fix it on retry
+    original_action = task.get("action", "")
+    original_text = str(task.get("text") or "").strip()
+    if original_action == "screenshot" and original_text:
+        from bot_commands import is_screenshot_text
+        if not is_screenshot_text(original_text):
+            from config import get_agent_backend
+            task["action"] = get_agent_backend()
+
     # ── AC-4: Reset task state ──
     # Clear execution artifacts but preserve history
     task["status"] = "pending"

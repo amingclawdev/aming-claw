@@ -61,9 +61,9 @@ class AcceptanceFlowTests(unittest.TestCase):
         self.assertTrue(cases_file.exists())
 
         doc_text = doc_file.read_text(encoding="utf-8")
-        self.assertIn("验收门禁规则", doc_text)
+        self.assertIn("验收结论", doc_text)
         self.assertIn("/accept T0001", doc_text)
-        self.assertIn("/status T0001", doc_text)
+        self.assertIn("/reject T0001", doc_text)
 
         cases = json.loads(cases_file.read_text(encoding="utf-8"))
         case_ids = {x.get("case_id") for x in cases.get("cases", [])}

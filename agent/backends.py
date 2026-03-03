@@ -934,12 +934,75 @@ def process_claude(task: Dict, processing: Path) -> Dict:
     return finalize_codex_task(task, processing, run, status, error=error)
 
 
+def _summarize_stage_for_qa(stage_name: str, output: str, max_chars: int = 1500) -> str:
+    """Extract compact summary from a stage output for QA context.
+
+    Instead of passing the full raw output (up to 6000 chars per stage),
+    extract the most relevant sections to keep the QA prompt concise
+    enough for Codex CLI exec mode.
+    """
+    if not output or not output.strip():
+        return "(无输出)"
+    lines = output.strip().splitlines()
+
+    if stage_name == "pm":
+        # Extract acceptance criteria / verification items
+        result_lines = []
+        in_section = False
+        for line in lines:
+            # Look for acceptance criteria sections
+            if any(kw in line for kw in ["验收条件", "验收标准", "子任务", "需求", "具体改动"]):
+                in_section = True
+            if in_section:
+                result_lines.append(line)
+            # Also grab section headers
+            elif line.strip().startswith(("##", "###", "T", "- ")):
+                result_lines.append(line)
+        if result_lines:
+            text = "\n".join(result_lines)[:max_chars]
+            return text
+        # Fallback: last portion (usually has summary)
+        return "\n".join(lines[-30:])[:max_chars]
+
+    if stage_name == "dev":
+        # Extract: file change list, completion status
+        result_lines = []
+        for i, line in enumerate(lines):
+            if any(kw in line for kw in ["修改文件", "变更说明", "已执行步骤",
+                                          "子任务", "实现状态", "文件", "| ---"]):
+                # Grab this line and following context
+                result_lines.extend(lines[i:i + 20])
+                break
+        if not result_lines:
+            # Fallback: last lines (usually summary)
+            result_lines = lines[-20:]
+        return "\n".join(result_lines)[:max_chars]
+
+    if stage_name == "test":
+        # Extract: pass/fail results, key numbers
+        result_lines = []
+        for i, line in enumerate(lines):
+            low = line.lower()
+            if any(kw in low for kw in ["passed", "failed", "error", "ok",
+                                         "通过", "失败", "结论", "结果",
+                                         "ran ", "test"]):
+                start = max(0, i - 1)
+                result_lines.extend(lines[start:start + 5])
+        if result_lines:
+            return "\n".join(result_lines)[:max_chars]
+        return "\n".join(lines[-10:])[:max_chars]
+
+    # Generic fallback
+    return "\n".join(lines[:20])[:max_chars]
+
+
 def _build_role_context(stage_name: str, stage_outputs: Dict[str, str]) -> str:
     """Build role-aware context for a pipeline stage.
 
     PM output is base context for all subsequent stages.
     Dev output is added for test and qa.
     Test output is added for qa.
+    For QA: uses summarized versions to keep prompt concise for Codex CLI.
     """
     from config import ROLE_DEFINITIONS
     parts = []
@@ -957,15 +1020,19 @@ def _build_role_context(stage_name: str, stage_outputs: Dict[str, str]) -> str:
             parts.append("【{} 产出 - 代码变更】\n{}".format(
                 role_label_map.get("dev", "Dev"), stage_outputs["dev"]))
     elif stage_name == "qa":
+        # QA gets summarized context to avoid Codex CLI prompt truncation
         if "pm" in stage_outputs:
-            parts.append("【{} 产出 - 需求文档】\n{}".format(
-                role_label_map.get("pm", "PM"), stage_outputs["pm"]))
+            pm_summary = _summarize_stage_for_qa("pm", stage_outputs["pm"])
+            parts.append("【{} 产出 - 需求与验收标准】\n{}".format(
+                role_label_map.get("pm", "PM"), pm_summary))
         if "dev" in stage_outputs:
-            parts.append("【{} 产出 - 代码变更】\n{}".format(
-                role_label_map.get("dev", "Dev"), stage_outputs["dev"]))
+            dev_summary = _summarize_stage_for_qa("dev", stage_outputs["dev"])
+            parts.append("【{} 产出 - 代码变更摘要】\n{}".format(
+                role_label_map.get("dev", "Dev"), dev_summary))
         if "test" in stage_outputs:
+            test_summary = _summarize_stage_for_qa("test", stage_outputs["test"])
             parts.append("【{} 产出 - 测试结果】\n{}".format(
-                role_label_map.get("test", "Test"), stage_outputs["test"]))
+                role_label_map.get("test", "Test"), test_summary))
 
     return "\n\n".join(parts)
 
