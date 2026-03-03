@@ -1480,7 +1480,7 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             SUBMENU_TEXTS["archive"],
             reply_markup=archive_menu_keyboard(),
         )
-        answer_callback_query(cb_id, t("callback.submitted"))
+        answer_callback_query(cb_id, t("submenu.archive_mgmt"))
         return
 
     # -- Sub-menu: Task Management --
@@ -1491,7 +1491,7 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             SUBMENU_TEXTS["task_mgmt"].format(active_count=active_count),
             reply_markup=task_mgmt_menu_keyboard(),
         )
-        answer_callback_query(cb_id, "\u4efb\u52a1\u7ba1\u7406")
+        answer_callback_query(cb_id, t("submenu.task_mgmt_label"))
         return
 
     # -- Task Management: status-filtered lists --
@@ -1576,7 +1576,7 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             send_text(chat_id, t("msg.no_active_tasks"), reply_markup=back_to_menu_keyboard())
             answer_callback_query(cb_id, t("callback.submitted"))
             return
-        running = [t for t in active if str(t.get("status") or "").strip().lower() == "processing"]
+        running = [tsk for tsk in active if str(tsk.get("status") or "").strip().lower() == "processing"]
         clearable = len(active) - len(running)
         if clearable <= 0:
             send_text(chat_id, t("msg.all_tasks_running"), reply_markup=back_to_menu_keyboard())
@@ -2027,11 +2027,11 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             ws = _get_ws_q(ws_id)
             ws_label = ws.get("label", ws_id) if ws else ws_id
             lines.append("\n{} ({}\u4e2a\u6392\u961f):".format(ws_label, len(tasks)))
-            for i, t in enumerate(tasks, 1):
+            for i, tsk in enumerate(tasks, 1):
                 lines.append("  {}. [{}] {}".format(
                     i,
-                    t.get("task_code", "-"),
-                    (t.get("text", "") or "")[:60],
+                    tsk.get("task_code", "-"),
+                    (tsk.get("text", "") or "")[:60],
                 ))
         send_text(chat_id, "\n".join(lines), reply_markup=back_to_menu_keyboard())
         answer_callback_query(cb_id, "\u961f\u5217\u72b6\u6001")
@@ -3230,7 +3230,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
                 task_code = task.get("task_code", "-")
                 send_text(
                     chat_id,
-                    t("msg.task_created", code="{code}", task_id="{task_id}", text="{text}").format(
+                    t("msg.screenshot_as_task_created",
                         code=task_code,
                         task_id=task_id,
                         text=txt[:200],
@@ -4344,7 +4344,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         st = found.get("_status_snapshot") if isinstance(found.get("_status_snapshot"), dict) else {}
         send_text(
             chat_id,
-            "Task [{code}] {task_id} Status: {status}({status_tag})\nAcceptance: {acceptance_tag}\naction={action}\nstage={stage}\nupdated_at={updated}\nstarted_at={started}\nended_at={ended}\nend_marker={end_marker}\nelapsed_ms={elapsed}\nsummary: {summary}\nnext: {next_action}\ndoc: {doc_file}\ncases: {cases_file}".format(
+            t("msg.status_detail",
                 code=code,
                 task_id=found.get("task_id", ""),
                 status=found.get("status", "unknown"),
@@ -4410,7 +4410,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             return True
         send_text(
             chat_id,
-            t("msg.archive_detail", archive_id="{archive_id}", code="{code}", task_id="{task_id}", action="{action}", status="{status}", completed_at="{completed_at}", summary="{summary}").format(
+            t("msg.archive_detail",
                 archive_id=item.get("archive_id", ""),
                 code=item.get("task_code", "-"),
                 task_id=item.get("task_id", ""),

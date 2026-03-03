@@ -188,6 +188,7 @@
   },
   "msg": {
     "task_created": "📝 任务已创建\n━━━━━━━━━━━━━━━━━━━━━━━━\n代号: [{code}]\n任务ID: {task_id}\n状态: pending\n内容: {text}",
+    "screenshot_as_task_created": "检测到该输入更像任务描述，已按任务创建: [{code}] {task_id}\n状态: pending\n内容: {text}",
     "unknown_command": "未知命令。发送 /help 查看可用命令。",
     "screenshot_failed": "截图失败: {err}",
     "chat_failed": "对话失败: {err}",
@@ -358,7 +359,8 @@
     "stopped": "已停止",
     "busy": "忙碌({task})",
     "idle": "空闲",
-    "worker_stats": "  {busy} | 队列: {queue} | 完成: {done} | 失败: {fail}"
+    "worker_stats": "  {busy} | 队列: {queue} | 完成: {done} | 失败: {fail}",
+    "status_detail": "任务 [{code}] {task_id} 状态: {status}({status_tag})\n验收标识: {acceptance_tag}\naction={action}\nstage={stage}\nupdated_at={updated}\nstarted_at={started}\nended_at={ended}\n结束标记={end_marker}\nelapsed_ms={elapsed}\n概要: {summary}\n下一步: {next_action}\n验收文档: {doc_file}\n验收用例: {cases_file}"
   },
   "welcome": {
     "title": "Aming Claw 控制面板\n━━━━━━━━━━━━━━━━━━━━━━━━\n后端: {backend}  |  2FA: {auth}\n模型: {model}\n工作区: {workspace}\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n点击按钮操作，或直接发文字与AI对话\n发送 /help 查看所有支持的命令"
@@ -373,7 +375,9 @@
     "security": "🔒 安全认证\n━━━━━━━━━━━━━━━━━━━━━━━━\n2FA设置、身份验证和安全管理\n━━━━━━━━━━━━━━━━━━━━━━━━\n选择要执行的操作:",
     "workspace": "📁 工作区管理\n━━━━━━━━━━━━━━━━━━━━━━━━\n管理工作目录：添加、删除、设置默认\n查看任务队列和调度器状态\n━━━━━━━━━━━━━━━━━━━━━━━━\n选择要执行的操作:",
     "skills": "🧩 技能管理\n━━━━━━━━━━━━━━━━━━━━━━━━\n可用技能列表：\n📷 截图 - 对当前工作区进行截图\n📊 项目总结 - AI 分析最近提交，生成项目概况\n━━━━━━━━━━━━━━━━━━━━━━━━\n选择要执行的操作:",
-    "task_mgmt": "📋 任务管理\n━━━━━━━━━━━━━━━━━━━━━━━━\n当前共 {active_count} 个活跃任务\n━━━━━━━━━━━━━━━━━━━━━━━━\n选择要查看的任务状态:"
+    "task_mgmt": "📋 任务管理\n━━━━━━━━━━━━━━━━━━━━━━━━\n当前共 {active_count} 个活跃任务\n━━━━━━━━━━━━━━━━━━━━━━━━\n选择要查看的任务状态:",
+    "archive_mgmt": "归档管理",
+    "task_mgmt_label": "任务管理"
   },
   "prompt": {
     "new_task": "📝 新建任务\n━━━━━━━━━━━━━━━━━━━━━━━━\n请输入任务详细描述，发送文字即可创建:\n\n示例: 在 src/utils.py 中添加日志功能",

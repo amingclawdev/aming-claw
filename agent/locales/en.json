@@ -188,6 +188,7 @@
   },
   "msg": {
     "task_created": "📝 Task Created\n━━━━━━━━━━━━━━━━━━━━━━━━\nCode: [{code}]\nTask ID: {task_id}\nStatus: pending\nContent: {text}",
+    "screenshot_as_task_created": "Detected task description, created as task: [{code}] {task_id}\nStatus: pending\nContent: {text}",
     "unknown_command": "Unknown command. Send /help to see available commands.",
     "screenshot_failed": "Screenshot failed: {err}",
     "chat_failed": "Chat failed: {err}",
@@ -358,7 +359,8 @@
     "stopped": "Stopped",
     "busy": "Busy({task})",
     "idle": "Idle",
-    "worker_stats": "  {busy} | Queue: {queue} | Done: {done} | Failed: {fail}"
+    "worker_stats": "  {busy} | Queue: {queue} | Done: {done} | Failed: {fail}",
+    "status_detail": "Task [{code}] {task_id} Status: {status}({status_tag})\nAcceptance: {acceptance_tag}\naction={action}\nstage={stage}\nupdated_at={updated}\nstarted_at={started}\nended_at={ended}\nend_marker={end_marker}\nelapsed_ms={elapsed}\nsummary: {summary}\nnext: {next_action}\ndoc: {doc_file}\ncases: {cases_file}"
   },
   "welcome": {
     "title": "Aming Claw Dashboard\n━━━━━━━━━━━━━━━━━━━━━━━━\nBackend: {backend}  |  2FA: {auth}\nModel: {model}\nWorkspace: {workspace}\n━━━━━━━━━━━━━━━━━━━━━━━━\n\nClick buttons or send text to chat with AI\nSend /help for all commands"
@@ -373,7 +375,9 @@
     "security": "🔒 Security\n━━━━━━━━━━━━━━━━━━━━━━━━\n2FA setup, identity verification\n━━━━━━━━━━━━━━━━━━━━━━━━\nSelect an operation:",
     "workspace": "📁 Workspace\n━━━━━━━━━━━━━━━━━━━━━━━━\nManage workspaces: add, remove, set default\nView task queue and dispatcher status\n━━━━━━━━━━━━━━━━━━━━━━━━\nSelect an operation:",
     "skills": "🧩 Skills\n━━━━━━━━━━━━━━━━━━━━━━━━\nAvailable skills:\n📷 Screenshot - Capture workspace\n📊 Summary - AI project analysis\n━━━━━━━━━━━━━━━━━━━━━━━━\nSelect an operation:",
-    "task_mgmt": "📋 Task Management\n━━━━━━━━━━━━━━━━━━━━━━━━\n{active_count} active tasks\n━━━━━━━━━━━━━━━━━━━━━━━━\nSelect task status:"
+    "task_mgmt": "📋 Task Management\n━━━━━━━━━━━━━━━━━━━━━━━━\n{active_count} active tasks\n━━━━━━━━━━━━━━━━━━━━━━━━\nSelect task status:",
+    "archive_mgmt": "Archive Management",
+    "task_mgmt_label": "Task Management"
   },
   "prompt": {
     "new_task": "📝 New Task\n━━━━━━━━━━━━━━━━━━━━━━━━\nDescribe the task and send:\n\nExample: Add logging to src/utils.py",

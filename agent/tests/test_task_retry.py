@@ -828,7 +828,7 @@ class TestRejectKeyboard(unittest.TestCase):
                     for btn in row:
                         if "retry:" in str(btn.get("callback_data", "")):
                             retry_button_found = True
-                            self.assertEqual(btn["text"], "重新开发")
+                            self.assertIn("重新开发", btn["text"])
         self.assertTrue(retry_button_found, "Reject response should include retry button")
 
 
