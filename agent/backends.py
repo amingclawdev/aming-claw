@@ -738,8 +738,18 @@ def run_stage_with_retry(task: Dict, stage: Dict, prompt: str, stage_idx: int) -
     logger.info("[Pipeline] Stage '%s' using model=%s, provider=%s",
                 stage_name, actual_model, actual_provider)
 
+    # Analysis stages (verify/test/qa/plan) should use Claude CLI, not Codex exec.
+    # Codex CLI 'exec' mode is designed for code execution and returns ACK-only
+    # for analysis prompts. Claude CLI handles analysis tasks properly.
+    is_analysis = stage_name in _ANALYSIS_STAGES
+
     def _run(p: str, tag: str) -> Dict:
-        # Route to the correct CLI based on the effective provider.
+        # For analysis stages: prefer Claude CLI which handles analysis well.
+        # Codex CLI 'exec' mode only acknowledges analysis prompts.
+        if is_analysis:
+            return run_claude(task, attempt_tag=tag, prompt_override=p)
+
+        # Code execution stages: route based on provider/backend.
         # openai provider -> Codex CLI (uses subscription, no API key needed)
         # anthropic provider -> Claude CLI (uses Max subscription)
         if backend == "openai":

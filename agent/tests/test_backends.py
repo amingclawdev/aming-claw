@@ -348,24 +348,25 @@ class TestPipelineModelLogging(unittest.TestCase):
     def test_stage_global_openai_uses_api(
         self, mock_model, mock_provider, mock_run_codex, mock_run_claude
     ):
-        """Global openai model routes to run_codex."""
+        """Global openai model routes to run_codex for code stages."""
         from backends import run_stage_with_retry
         mock_run_codex.return_value = {
             "returncode": 0,
-            "stdout": "\u9a8c\u6536\u6807\u51c6:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "stdout": "\u5df2\u6267\u884c\u6b65\u9aa4:\n1) \u4fee\u6539 main.py",
             "stderr": "",
-            "last_message": "\u9a8c\u6536\u6807\u51c6:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "last_message": "\u5df2\u6267\u884c\u6b65\u9aa4:\n1) \u4fee\u6539 main.py",
             "elapsed_ms": 100,
             "cmd": ["codex"],
             "timeout_retries": 0,
             "workspace": "/tmp",
-            "git_changed_files": [],
+            "git_changed_files": ["main.py"],
             "attempt_tag": "test",
         }
         task = {"task_id": "test-124", "text": "test task"}
-        stage = {"name": "qa", "backend": "claude", "model": "", "provider": ""}
+        # Use "code" (non-analysis stage) to test openai routing logic
+        stage = {"name": "code", "backend": "claude", "model": "", "provider": ""}
 
-        run = run_stage_with_retry(task, stage, "prompt for qa stage with enough content", stage_idx=1)
+        run = run_stage_with_retry(task, stage, "prompt for code stage with enough content", stage_idx=1)
 
         self.assertEqual(run["returncode"], 0)
         mock_run_codex.assert_called_once()
@@ -382,20 +383,21 @@ class TestPipelineModelLogging(unittest.TestCase):
         from backends import run_stage_with_retry
         mock_run_codex.return_value = {
             "returncode": 0,
-            "stdout": "\u9a8c\u6536\u6807\u51c6:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "stdout": "\u5df2\u6267\u884c\u6b65\u9aa4:\n1) \u4fee\u6539 app.py",
             "stderr": "",
-            "last_message": "\u9a8c\u6536\u6807\u51c6:\n" + "\n".join("{}. item".format(i) for i in range(1, 10)),
+            "last_message": "\u5df2\u6267\u884c\u6b65\u9aa4:\n1) \u4fee\u6539 app.py",
             "elapsed_ms": 100,
             "cmd": ["codex", "openai", "gpt-4o"],
             "timeout_retries": 0,
             "workspace": "/tmp",
-            "git_changed_files": [],
+            "git_changed_files": ["app.py"],
             "attempt_tag": "test",
         }
         task = {"task_id": "test-125", "text": "test task"}
-        stage = {"name": "plan", "backend": "openai", "model": "", "provider": ""}
+        # Use "code" (non-analysis stage) to test openai backend routing
+        stage = {"name": "code", "backend": "openai", "model": "", "provider": ""}
 
-        run = run_stage_with_retry(task, stage, "prompt for plan stage with enough content", stage_idx=1)
+        run = run_stage_with_retry(task, stage, "prompt for code stage with enough content", stage_idx=1)
 
         self.assertEqual(run["returncode"], 0)
         mock_run_codex.assert_called_once()
