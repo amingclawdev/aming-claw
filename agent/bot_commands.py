@@ -819,10 +819,6 @@ def task_inline_keyboard(task_ref: str) -> Dict:
         "inline_keyboard": [
             [
                 {"text": t("task.view_progress"), "callback_data": "status:{}".format(ref)},
-                {"text": t("task.accept"), "callback_data": "accept:{}".format(ref)},
-                {"text": t("task.reject"), "callback_data": "reject:{}".format(ref)},
-            ],
-            [
                 {"text": t("task.view_events"), "callback_data": "events:{}".format(ref)},
             ],
         ]
