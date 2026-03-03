@@ -68,6 +68,7 @@ from interactive_menu import (
     archive_menu_keyboard,
     ops_menu_keyboard,
     security_menu_keyboard,
+    skills_menu_keyboard,
     workspace_menu_keyboard,
     workspace_select_keyboard,
     fuzzy_workspace_add_keyboard,
@@ -1503,6 +1504,16 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             reply_markup=security_menu_keyboard(),
         )
         answer_callback_query(cb_id, "安全认证")
+        return
+
+    # -- Sub-menu: Skills Management --
+    if action == "sub_skills":
+        send_text(
+            chat_id,
+            SUBMENU_TEXTS["skills"],
+            reply_markup=skills_menu_keyboard(),
+        )
+        answer_callback_query(cb_id, "技能管理")
         return
 
     # -- Sub-menu: Workspace Management --

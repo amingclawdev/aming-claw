@@ -207,6 +207,20 @@ def ops_menu_keyboard() -> Dict:
     }
 
 
+def skills_menu_keyboard() -> Dict:
+    """Sub-menu: skills management."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "\U0001f9e9 技能管理", "callback_data": "menu:sub_skills"},
+            ],
+            [
+                {"text": "\u00ab 返回主菜单", "callback_data": "menu:main"},
+            ],
+        ]
+    }
+
+
 def workspace_menu_keyboard() -> Dict:
     """Sub-menu: workspace management."""
     return {
@@ -906,6 +920,13 @@ SUBMENU_TEXTS = {
         "\u67e5\u770b\u4efb\u52a1\u961f\u5217\u548c\u8c03\u5ea6\u5668\u72b6\u6001\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "\u9009\u62e9\u8981\u6267\u884c\u7684\u64cd\u4f5c:"
+    ),
+    "skills": (
+        "\U0001f9e9 技能管理\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "可用技能列表：\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "选择要执行的操作:"
     ),
     "task_mgmt": (
         "\U0001f4cb \u4efb\u52a1\u7ba1\u7406\n"

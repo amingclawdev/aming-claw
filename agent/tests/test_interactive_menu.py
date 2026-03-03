@@ -33,6 +33,7 @@ from interactive_menu import (  # noqa: E402
     search_roots_keyboard,
     security_menu_keyboard,
     set_pending_action,
+    skills_menu_keyboard,
     system_menu_keyboard,
     task_detail_keyboard,
     task_list_action_keyboard,
@@ -175,6 +176,57 @@ class TestKeyboardBuilders(unittest.TestCase):
         self.assertTrue(any("sub_workspace" in d for d in all_data))
 
 
+class TestSkillsMenu(unittest.TestCase):
+    """Tests for skills menu keyboard and main menu integration."""
+
+    def _assert_valid_keyboard(self, kb):
+        self.assertIn("inline_keyboard", kb)
+        for row in kb["inline_keyboard"]:
+            self.assertIsInstance(row, list)
+            for btn in row:
+                self.assertIn("text", btn)
+                self.assertIn("callback_data", btn)
+
+    def test_skills_menu_valid_structure(self):
+        kb = skills_menu_keyboard()
+        self._assert_valid_keyboard(kb)
+
+    def test_skills_menu_has_screenshot(self):
+        kb = skills_menu_keyboard()
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("menu:screenshot", all_data)
+        all_text = [btn["text"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertTrue(any("\U0001f4f7" in t and "截图" in t for t in all_text))
+
+    def test_skills_menu_has_back_button(self):
+        kb = skills_menu_keyboard()
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("menu:main", all_data)
+        all_text = [btn["text"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertTrue(any("返回主菜单" in t for t in all_text))
+
+    def test_main_menu_has_skills_entry(self):
+        kb = main_menu_keyboard()
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertIn("menu:sub_skills", all_data)
+        all_text = [btn["text"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertTrue(any("技能管理" in t for t in all_text))
+
+    def test_main_menu_no_screenshot_button(self):
+        kb = main_menu_keyboard()
+        all_data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        self.assertNotIn("menu:screenshot", all_data)
+
+    def test_main_menu_first_row_layout(self):
+        kb = main_menu_keyboard()
+        first_row = kb["inline_keyboard"][0]
+        texts = [btn["text"] for btn in first_row]
+        self.assertEqual(len(first_row), 3)
+        self.assertIn("新建任务", texts[0])
+        self.assertIn("任务管理", texts[1])
+        self.assertIn("技能管理", texts[2])
+
+
 class TestTextConstants(unittest.TestCase):
     def test_welcome_has_placeholders(self):
         self.assertIn("{backend}", WELCOME_TEXT)
@@ -193,6 +245,7 @@ class TestTextConstants(unittest.TestCase):
         self.assertIn("ops", SUBMENU_TEXTS)
         self.assertIn("security", SUBMENU_TEXTS)
         self.assertIn("workspace", SUBMENU_TEXTS)
+        self.assertIn("skills", SUBMENU_TEXTS)
 
     def test_pending_prompts(self):
         self.assertIn("new_task", PENDING_PROMPTS)
