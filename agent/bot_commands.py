@@ -3895,7 +3895,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         return True
 
     if txt.startswith("/reject"):
-        raw_reject = t[len("/reject"):].strip()
+        raw_reject = txt[len("/reject"):].strip()
         reject_parts = raw_reject.split(None, 2)
         if not reject_parts:
             # No args: show pending_acceptance tasks as interactive list
@@ -4045,7 +4045,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         return True
 
     if txt.startswith("/retry"):
-        raw_retry = t[len("/retry"):].strip()
+        raw_retry = txt[len("/retry"):].strip()
         retry_parts = raw_retry.split(None, 1)
         if not retry_parts:
             # No args: show rejected tasks as interactive list
