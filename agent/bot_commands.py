@@ -30,6 +30,7 @@ from config import (
     set_role_pipeline_stages, set_role_stage_model,
     add_workspace_search_root, get_workspace_search_roots,
     remove_workspace_search_root, set_workspace_search_roots,
+    set_config_language,
 )
 from model_registry import get_available_models, make_label, format_model_list_text, find_model
 from auth import debug_verify_otp, get_auth_state, init_authenticator, verify_otp
@@ -92,6 +93,7 @@ from interactive_menu import (
     task_detail_keyboard,
     tasks_overview_keyboard,
     archive_detail_keyboard,
+    language_select_keyboard,
     safe_callback_data,
     TASK_STATUS_LABELS,
     TASK_STATUS_EMPTY_LABELS,
@@ -1522,6 +1524,27 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             chat_id,
             SUBMENU_TEXTS["workspace"],
             reply_markup=workspace_menu_keyboard(),
+        )
+        answer_callback_query(cb_id, t("callback.submitted"))
+        return
+
+    # -- Switch Language --
+    if action == "switch_language":
+        send_text(
+            chat_id,
+            t("msg.select_language"),
+            reply_markup=language_select_keyboard(),
+        )
+        answer_callback_query(cb_id, t("callback.submitted"))
+        return
+
+    if action in ("lang_zh", "lang_en"):
+        lang = action.split("_", 1)[1]
+        set_config_language(lang, changed_by=user_id)
+        send_text(
+            chat_id,
+            t("msg.language_switched"),
+            reply_markup=back_to_menu_keyboard(),
         )
         answer_callback_query(cb_id, t("callback.submitted"))
         return

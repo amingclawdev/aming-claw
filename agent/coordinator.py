@@ -22,8 +22,8 @@ from utils import (
 )
 from config import (
     KNOWN_BACKENDS, PIPELINE_PRESETS,
-    format_pipeline_stages, get_agent_backend, get_pipeline_stages,
-    set_agent_backend, set_pipeline_stages,
+    format_pipeline_stages, get_agent_backend, get_config_language,
+    get_pipeline_stages, set_agent_backend, set_pipeline_stages,
 )
 from auth import debug_verify_otp, get_auth_state, init_authenticator, verify_otp
 from i18n import t
@@ -212,6 +212,11 @@ def run() -> None:
     if lock is None:
         print("[coordinator] another coordinator instance is already running; exit")
         return
+    # Load persisted language setting
+    from i18n import set_language
+    persisted_lang = get_config_language()
+    set_language(persisted_lang)
+    print("[coordinator] language={}".format(persisted_lang))
     register_bot_commands()
     interval_sec = float(os.getenv("COORDINATOR_POLL_INTERVAL_SEC", "1"))
     reconcile_interval_sec = float(os.getenv("COORDINATOR_RECONCILE_SEC", "5"))

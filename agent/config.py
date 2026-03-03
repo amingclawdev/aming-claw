@@ -133,6 +133,47 @@ def set_agent_backend(backend: str, changed_by: Optional[int] = None) -> None:
     save_json(p, existing)
 
 
+# ── Language ──────────────────────────────────────────────────────────────────
+
+_SUPPORTED_LANGUAGES = {"zh", "en"}
+
+
+def get_config_language() -> str:
+    """Return persisted language from agent_config.json, or 'zh' default."""
+    p = _config_path()
+    if p.exists():
+        try:
+            data = load_json(p)
+            lang = str(data.get("language", "")).strip()
+            if lang in _SUPPORTED_LANGUAGES:
+                return lang
+        except Exception:
+            pass
+    return os.getenv("AGENT_LANGUAGE", "zh")
+
+
+def set_config_language(lang: str, changed_by: Optional[int] = None) -> None:
+    """Persist language to agent_config.json and update i18n runtime."""
+    if lang not in _SUPPORTED_LANGUAGES:
+        lang = "zh"
+    p = _config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if p.exists():
+        try:
+            existing = load_json(p)
+        except Exception:
+            pass
+    existing["language"] = lang
+    existing["updated_at"] = utc_iso()
+    if changed_by is not None:
+        existing["changed_by"] = changed_by
+    save_json(p, existing)
+    # Update runtime i18n state
+    from i18n import set_language
+    set_language(lang)
+
+
 # ── AI model (provider + model id) ────────────────────────────────────────────
 
 # Fallback list used when APIs are unreachable

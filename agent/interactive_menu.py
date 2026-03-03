@@ -239,7 +239,25 @@ def system_menu_keyboard() -> Dict:
                 {"text": t("menu.role_pipeline_config"), "callback_data": "menu:role_pipeline_config"},
             ],
             [
+                {"text": t("menu.switch_language"), "callback_data": "menu:switch_language"},
+            ],
+            [
                 {"text": t("menu.back_main"), "callback_data": "menu:main"},
+            ],
+        ]
+    }
+
+
+def language_select_keyboard() -> Dict:
+    """Language selection keyboard."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": t("language.zh"), "callback_data": "menu:lang_zh"},
+                {"text": t("language.en"), "callback_data": "menu:lang_en"},
+            ],
+            [
+                {"text": t("menu.back_system"), "callback_data": "menu:sub_system"},
             ],
         ]
     }
