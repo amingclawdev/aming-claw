@@ -673,7 +673,7 @@ def format_stage_execution_summary(task: Dict) -> str:
     model_info = task.get("stages_model_info") or []
     model_map = {m["stage"]: m for m in model_info if isinstance(m, dict) and "stage" in m}
 
-    lines = ["\u2699\ufe0f \u6d41\u6c34\u7ebf\u6267\u884c\u8be6\u60c5:"]
+    lines = [t("msg.pipeline_exec_header")]
     for s in stages:
         stage_name = s.get("stage", "?")
         idx = s.get("stage_index", "?")
@@ -697,19 +697,19 @@ def format_stage_execution_summary(task: Dict) -> str:
 
         # Status icon
         if elapsed is None and rc is None:
-            status_icon = "(\u672a\u6267\u884c)"
+            status_icon = t("status.icon_not_executed")
             time_str = ""
         elif noop:
-            status_icon = "\u274c"
+            status_icon = t("status.icon_fail")
             time_str = " {:.1f}s".format(elapsed / 1000.0) if elapsed else ""
         elif rc == 0 or rc is None:
-            status_icon = "\u2705"
+            status_icon = t("status.icon_pass")
             time_str = " {:.1f}s".format(elapsed / 1000.0) if elapsed else ""
         else:
-            status_icon = "\u274c"
+            status_icon = t("status.icon_fail")
             time_str = " {:.1f}s".format(elapsed / 1000.0) if elapsed else ""
 
-        line = "  {}. {} {} \u2192 {} {}{}".format(idx, emoji, label, model_display, status_icon, time_str)
+        line = t("msg.stage_line", idx=idx, emoji=emoji, label=label, model_display=model_display, status_icon=status_icon, time_str=time_str)
         if noop:
             line += " (noop: {})".format(noop[:40])
         lines.append(line)
@@ -988,7 +988,7 @@ def handle_callback_query(cb: Dict) -> None:
             if m and m.get("status") == "unavailable":
                 reason = m.get("unavailable_reason", t("msg.not_available"))
                 answer_callback_query(cb_id, t("callback.model_unavailable"), show_alert=True)
-                send_text(chat_id, "\u274c \u8bbe\u7f6e\u5931\u8d25\uff1a\u6a21\u578b {} \u5f53\u524d\u4e0d\u53ef\u7528\uff08{}）".format(model_id, reason),
+                send_text(chat_id, t("msg.set_failed", model=model_id, reason=reason),
                           reply_markup=back_to_menu_keyboard())
                 return
             set_claude_model(model_id, provider=provider, changed_by=user_id)
@@ -1094,10 +1094,7 @@ def handle_callback_query(cb: Dict) -> None:
             stages = get_role_pipeline_stages()
             send_text(
                 chat_id,
-                t("msg.role_pipeline_config") + "\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                + t("msg.role_set", emoji=role_def.get("emoji", ""), label=role_def.get("label", role_name), tag=tag, model=model_id) + "\n\n"
-                + t("msg.role_config_current", config=format_role_pipeline_stages(stages)),
+                t("msg.role_pipeline_panel", title=t("msg.role_pipeline_config"), role_set=t("msg.role_set", emoji=role_def.get("emoji", ""), label=role_def.get("label", role_name), tag=tag, model=model_id), config=t("msg.role_config_current", config=format_role_pipeline_stages(stages))),
                 reply_markup=role_pipeline_config_keyboard(stages),
             )
             return
@@ -1226,7 +1223,7 @@ def handle_callback_query(cb: Dict) -> None:
                     tag = "[C]" if prov == "anthropic" else "[O]" if prov == "openai" else ""
                     summary_lines.append("  {}: {} {}".format(name, model, tag).rstrip())
                 else:
-                    summary_lines.append("  {}: \uff08\u9ed8\u8ba4\uff09".format(name))
+                    summary_lines.append("  {}: {}".format(name, t("task.stage_default")))
             summary = "\n".join(summary_lines)
             send_text(
                 chat_id,
@@ -1633,11 +1630,8 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
         text = format_model_list_text(models)
         current_default = get_claude_model()
         # Telegram message limit: 4096 chars
-        header = (
-            "\U0001f4cb \u6a21\u578b\u6e05\u5355\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        )
-        footer = "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u9ed8\u8ba4\u6a21\u578b: {}".format(current_default or t("msg.not_set"))
+        header = t("msg.model_list_header")
+        footer = t("msg.model_list_footer", default_model=current_default or t("msg.not_set"))
         full_text = header + text + footer
         if len(full_text) > 4000:
             full_text = full_text[:3990] + "\n..."
@@ -1668,16 +1662,13 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
                         if rc.get("model"):
                             stage["model"] = rc["model"]
                             stage["provider"] = rc.get("provider", "")
-                preset_lines.append("  {} \u2192\n{}".format(k, format_role_pipeline_stages(display_stages)))
+                preset_lines.append(t("msg.preset_arrow", key=k, value=format_role_pipeline_stages(display_stages)))
             else:
-                preset_lines.append("  {} \u2192 {}".format(k, format_pipeline_stages(v)))
+                preset_lines.append(t("msg.preset_arrow_inline", key=k, value=format_pipeline_stages(v)))
         preset_info = "\n".join(preset_lines)
         send_text(
             chat_id,
-            "\u2699\ufe0f \u6d41\u6c34\u7ebf\u914d\u7f6e\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u70b9\u51fb\u9884\u8bbe\u76f4\u63a5\u5e94\u7528\uff0c\u6216\u9009\u62e9\u81ea\u5b9a\u4e49:\n\n"
-            "{}".format(preset_info),
+            t("msg.pipeline_config_panel", preset_info=preset_info),
             reply_markup=pipeline_preset_keyboard(),
         )
         answer_callback_query(cb_id, t("callback.submitted"))
@@ -1726,9 +1717,7 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
         stages = get_role_pipeline_stages()
         send_text(
             chat_id,
-            t("msg.role_pipeline_config") + "\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            + t("msg.role_config_current", config=format_role_pipeline_stages(stages)),
+            t("msg.role_pipeline_view", title=t("msg.role_pipeline_config"), config=t("msg.role_config_current", config=format_role_pipeline_stages(stages))),
             reply_markup=role_pipeline_config_keyboard(stages),
         )
         answer_callback_query(cb_id, t("callback.submitted"))
@@ -1935,7 +1924,7 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             return
         send_text(
             chat_id,
-            "\u2796 \u5220\u9664\u5de5\u4f5c\u76ee\u5f55\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u8bf7\u9009\u62e9\u8981\u5220\u9664\u7684\u5de5\u4f5c\u76ee\u5f55:",
+            t("msg.ws_remove_panel"),
             reply_markup=workspace_select_keyboard(workspaces, "ws_remove"),
         )
         answer_callback_query(cb_id, t("msg.select_ws_remove"))
@@ -1951,7 +1940,7 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
             return
         send_text(
             chat_id,
-            "\u2b50 \u8bbe\u7f6e\u9ed8\u8ba4\u5de5\u4f5c\u76ee\u5f55\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u8bf7\u9009\u62e9\u8981\u8bbe\u7f6e\u4e3a\u9ed8\u8ba4\u7684\u5de5\u4f5c\u76ee\u5f55:",
+            t("msg.ws_set_default_panel"),
             reply_markup=workspace_select_keyboard(workspaces, "ws_default"),
         )
         answer_callback_query(cb_id, t("msg.select_ws_default"))
@@ -1961,21 +1950,12 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
     if action == "workspace_search_roots":
         roots = get_workspace_search_roots()
         if roots:
-            lines = ["\U0001f50d \u641c\u7d22\u6839\u76ee\u5f55"]
-            lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+            items_lines = []
             for idx, r in enumerate(roots, 1):
-                lines.append("{}. {}".format(idx, r))
-            lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
-            lines.append("\u70b9\u51fb \u2796 \u5220\u9664\uff0c\u6216\u70b9 \u2795 \u6dfb\u52a0\u65b0\u6839\u76ee\u5f55")
-            text = "\n".join(lines)
+                items_lines.append("{}. {}".format(idx, r))
+            text = t("msg.search_roots_has_items", items="\n".join(items_lines))
         else:
-            text = (
-                "\U0001f50d \u641c\u7d22\u6839\u76ee\u5f55\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u5c1a\u672a\u914d\u7f6e\u641c\u7d22\u6839\u76ee\u5f55\u3002\n"
-                "\u9ed8\u8ba4\u4f7f\u7528\u5f53\u524d\u6d3b\u8dc3\u5de5\u4f5c\u76ee\u5f55\u53ca\u5176\u7236\u76ee\u5f55\u3002\n\n"
-                "\u70b9\u51fb \u2795 \u6dfb\u52a0\u641c\u7d22\u6839\u76ee\u5f55\uff0c\u6269\u5927\u6a21\u7cca\u641c\u7d22\u8303\u56f4\u3002"
-            )
+            text = t("msg.search_roots_empty")
         send_text(chat_id, text, reply_markup=search_roots_keyboard(roots))
         answer_callback_query(cb_id, t("msg.search_roots_label"))
         return
@@ -1997,19 +1977,19 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
         if not all_queues or all(len(q) == 0 for q in all_queues.values()):
             send_text(
                 chat_id,
-                "\u5f53\u524d\u6240\u6709\u5de5\u4f5c\u533a\u57df\u65e0\u6392\u961f\u4efb\u52a1\u3002",
+                t("msg.no_queued_tasks_all"),
                 reply_markup=back_to_menu_keyboard(),
             )
             answer_callback_query(cb_id, t("msg.no_queued_tasks"))
             return
         from workspace_registry import get_workspace as _get_ws_q
-        lines = ["\U0001f4ca \u5de5\u4f5c\u533a\u57df\u4efb\u52a1\u961f\u5217:"]
+        lines = [t("msg.ws_queue_header")]
         for ws_id, tasks in all_queues.items():
             if not tasks:
                 continue
             ws = _get_ws_q(ws_id)
             ws_label = ws.get("label", ws_id) if ws else ws_id
-            lines.append("\n{} ({}\u4e2a\u6392\u961f):".format(ws_label, len(tasks)))
+            lines.append(t("msg.ws_queue_section", label=ws_label, count=len(tasks)))
             for i, tsk in enumerate(tasks, 1):
                 lines.append("  {}. [{}] {}".format(
                     i,
@@ -2222,11 +2202,7 @@ def _handle_task_status_menu(cb_id: str, action: str, chat_id: int, user_id: int
         total_active = sum(v for k, v in counts.items() if k != "archived")
         send_text(
             chat_id,
-            "\U0001f4ca \u4efb\u52a1\u6982\u89c8\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u6d3b\u8dc3\u4efb\u52a1\u603b\u6570: {}\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\u67e5\u770b\u5bf9\u5e94\u7c7b\u522b:".format(total_active),
+            t("msg.task_overview_panel", total=total_active),
             reply_markup=tasks_overview_keyboard(counts),
         )
         answer_callback_query(cb_id, t("msg.task_overview_label"))
@@ -2239,13 +2215,13 @@ def _handle_task_status_menu(cb_id: str, action: str, chat_id: int, user_id: int
     if not tasks:
         send_text(
             chat_id,
-            "\u5f53\u524d\u65e0{}\u4efb\u52a1\u3002".format(empty_label),
+            t("msg.no_tasks_in_category", label=empty_label),
             reply_markup=task_status_list_keyboard([], status_key),
         )
         answer_callback_query(cb_id, t("msg.no_tasks_label"))
         return
 
-    header = "{}\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u5171 {} \u4e2a\u4efb\u52a1\uff0c\u70b9\u51fb\u67e5\u770b\u8be6\u60c5:".format(label, len(tasks))
+    header = t("msg.task_list_header", label=label, count=len(tasks))
     send_text(
         chat_id,
         header,
@@ -2273,7 +2249,7 @@ def _handle_tasks_page_callback(cb_id: str, data: str, chat_id: int, user_id: in
     if not tasks:
         send_text(
             chat_id,
-            "\u5f53\u524d\u65e0\u4efb\u52a1\u3002",
+            t("msg.no_tasks_current"),
             reply_markup=task_status_list_keyboard([], status_key),
         )
         answer_callback_query(cb_id, t("msg.no_tasks_label"))
@@ -2281,7 +2257,7 @@ def _handle_tasks_page_callback(cb_id: str, data: str, chat_id: int, user_id: in
 
     send_text(
         chat_id,
-        "{}\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u5171 {} \u4e2a\u4efb\u52a1\uff08\u7b2c {} \u9875\uff09:".format(label, len(tasks), page + 1),
+        t("msg.task_list_paged", label=label, count=len(tasks), page=page + 1),
         reply_markup=task_status_list_keyboard(tasks, status_key, page=page),
     )
     answer_callback_query(cb_id, t("msg.page_num", num=page + 1))
@@ -2315,17 +2291,7 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
             emoji = _detail_status_emoji(status)
             text_preview = str(st.get("text") or "").strip()[:500] or t("msg.no_description")
             iteration = int(st.get("attempt") or 0)
-            detail = (
-                "{emoji} \u4efb\u52a1\u8be6\u60c5\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u4ee3\u53f7: {code}\n"
-                "\u72b6\u6001: {status}\n"
-                "\u521b\u5efa\u65f6\u95f4: {created}\n"
-                "\u8fed\u4ee3\u6b21\u6570: {iteration}\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u63cf\u8ff0: {text}\n"
-                "\u6982\u8981: {summary}"
-            ).format(
+            detail = t("msg.task_detail_snapshot",
                 emoji=emoji,
                 code=task_code,
                 status=status_tag(status),
@@ -2361,17 +2327,7 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
         except Exception:
             pass
 
-    detail = (
-        "{emoji} \u4efb\u52a1\u8be6\u60c5\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u4ee3\u53f7: {code}\n"
-        "\u72b6\u6001: {status}\n"
-        "\u521b\u5efa\u65f6\u95f4: {created}\n"
-        "\u8fed\u4ee3\u6b21\u6570: {iteration}\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u63cf\u8ff0: {text}\n"
-        "\u6267\u884c\u6982\u8981: {summary}"
-    ).format(
+    detail = t("msg.task_detail_full",
         emoji=emoji,
         code=found.get("task_code", task_code),
         status=status_tag(status),
@@ -2381,17 +2337,17 @@ def _handle_task_detail_callback(cb_id: str, data: str, chat_id: int, user_id: i
         summary=summary or t("msg.none_short"),
     )
     if acceptance.get("reason"):
-        detail += "\n\u62d2\u7edd\u539f\u56e0: {}".format(str(acceptance["reason"])[:500])
+        detail += t("msg.rejection_reason_append", reason=str(acceptance["reason"])[:500])
 
     # Show git checkpoint for pending_acceptance tasks
     ckpt = str(found.get("_git_checkpoint") or "").strip()
     if ckpt and status == "pending_acceptance":
-        detail += "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nGit\u68c0\u67e5\u70b9: {}".format(ckpt[:12])
+        detail += t("msg.git_checkpoint_append", ckpt=ckpt[:12])
 
     # Append pipeline stage execution info if available
     stage_summary = format_stage_execution_summary(found)
     if stage_summary:
-        detail += "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n" + stage_summary
+        detail += t("msg.separator_line") + stage_summary
 
     # Determine if this is a pipeline task for keyboard
     is_pipeline = bool((found.get("executor") or {}).get("action") == "pipeline")
@@ -2424,7 +2380,7 @@ def _handle_stage_detail_callback(cb_id: str, data: str, chat_id: int, user_id: 
         answer_callback_query(cb_id, t("msg.no_records"))
         return
 
-    lines = ["\U0001f50d \u9636\u6bb5\u8be6\u60c5 [{}]".format(task_code), "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+    lines = [t("msg.stage_detail_header", code=task_code), "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
     for sd in stage_details:
         stage_name = sd.get("stage", "?")
         role_def = ROLE_DEFINITIONS.get(stage_name, {})
@@ -2446,8 +2402,8 @@ def _handle_stage_detail_callback(cb_id: str, data: str, chat_id: int, user_id: 
         else:
             model_display = sd.get("backend", t("msg.unknown"))
 
-        status_icon = "\u274c" if noop or (rc and rc != 0) else "\u2705"
-        lines.append("\n{} {}. {} {} \u2192 {}{}".format(emoji, idx, label, status_icon, model_display, time_str))
+        status_icon = t("status.icon_fail") if noop or (rc and rc != 0) else t("status.icon_pass")
+        lines.append(t("msg.stage_detail_line", emoji=emoji, idx=idx, label=label, status_icon=status_icon, model_display=model_display, time_str=time_str))
         if noop:
             lines.append("  noop: {}".format(noop[:100]))
         # Show output preview (last_message preferred, fallback stdout)
@@ -2455,15 +2411,15 @@ def _handle_stage_detail_callback(cb_id: str, data: str, chat_id: int, user_id: 
         if output:
             preview = output[:800]
             if len(output) > 800:
-                preview += "\n... (\u5df2\u622a\u65ad)"
+                preview += "\n" + t("msg.truncated")
             lines.append(preview)
         else:
-            lines.append("  (\u65e0\u8f93\u51fa)")
+            lines.append("  " + t("msg.no_output"))
 
     text = "\n".join(lines)
     # Telegram message limit: 4096 chars
     if len(text) > 4000:
-        text = text[:4000] + "\n... (\u5df2\u622a\u65ad)"
+        text = text[:4000] + "\n" + t("msg.truncated")
     send_text(chat_id, text, reply_markup=back_to_menu_keyboard())
     answer_callback_query(cb_id, t("msg.stage_detail_label"))
 
@@ -2489,7 +2445,7 @@ def _handle_task_doc_callback(cb_id: str, data: str, chat_id: int, user_id: int)
             doc_text = t("msg.no_doc_content")
         send_text(
             chat_id,
-            "\U0001f4c4 \u4efb\u52a1\u6587\u6863 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(ref, doc_text[:3500]),
+            t("msg.task_doc_panel", ref=ref, content=doc_text[:3500]),
             reply_markup=back_to_menu_keyboard(),
         )
         answer_callback_query(cb_id, t("msg.view_doc_label"))
@@ -2506,7 +2462,7 @@ def _handle_task_doc_callback(cb_id: str, data: str, chat_id: int, user_id: int)
                 doc_text = t("msg.no_doc_content")
             send_text(
                 chat_id,
-                "\U0001f4c4 \u4efb\u52a1\u6587\u6863 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(ref, doc_text[:3500]),
+                t("msg.task_doc_panel", ref=ref, content=doc_text[:3500]),
                 reply_markup=back_to_menu_keyboard(),
             )
             answer_callback_query(cb_id, t("msg.view_doc_label"))
@@ -2545,19 +2501,17 @@ def _handle_task_doc_callback(cb_id: str, data: str, chat_id: int, user_id: int)
     if not doc_text:
         doc_text = str(build_status_summary(found)).strip()[:3000]
         if acceptance.get("reason"):
-            doc_text += "\n\n\u62d2\u7edd\u539f\u56e0: {}".format(str(acceptance["reason"])[:500])
+            doc_text += t("msg.rejection_reason_doc", reason=str(acceptance["reason"])[:500])
         error = str(found.get("error") or "").strip()
         if error:
-            doc_text += "\n\n\u9519\u8bef\u4fe1\u606f: {}".format(error[:500])
+            doc_text += t("msg.error_info_doc", err=error[:500])
 
     if not doc_text:
         doc_text = t("msg.no_doc_content")
 
     send_text(
         chat_id,
-        "\U0001f4c4 \u4efb\u52a1\u6587\u6863 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(
-            found.get("task_code", ref), doc_text[:3500]
-        ),
+        t("msg.task_doc_panel", ref=found.get("task_code", ref), content=doc_text[:3500]),
         reply_markup=back_to_menu_keyboard(),
     )
     answer_callback_query(cb_id, t("msg.view_doc_label"))
@@ -2592,7 +2546,7 @@ def _handle_task_summary_callback(cb_id: str, data: str, chat_id: int, user_id: 
 
     send_text(
         chat_id,
-        "\U0001f4d1 \u4efb\u52a1\u6982\u8981 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(ref, summary_text[:3500]),
+        t("msg.task_summary_panel", ref=ref, content=summary_text[:3500]),
         reply_markup=back_to_menu_keyboard(),
     )
     answer_callback_query(cb_id, t("msg.view_summary_label"))
@@ -2619,14 +2573,14 @@ def _handle_task_log_callback(cb_id: str, data: str, chat_id: int, user_id: int)
     # Try sending as document if too large
     if len(log_text) > 3500:
         try:
-            send_document(chat_id, run_log_path, caption="\u6267\u884c\u65e5\u5fd7 [{}]".format(ref))
+            send_document(chat_id, run_log_path, caption=t("msg.task_log_caption", ref=ref))
         except Exception:
-            send_text(chat_id, "\U0001f4dc \u6267\u884c\u65e5\u5fd7 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}...".format(ref, log_text[:3500]),
+            send_text(chat_id, t("msg.task_log_panel", ref=ref, content=log_text[:3500] + "..."),
                       reply_markup=back_to_menu_keyboard())
     else:
         send_text(
             chat_id,
-            "\U0001f4dc \u6267\u884c\u65e5\u5fd7 [{}]\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{}".format(ref, log_text[:3500]),
+            t("msg.task_log_panel", ref=ref, content=log_text[:3500]),
             reply_markup=back_to_menu_keyboard(),
         )
     answer_callback_query(cb_id, t("msg.view_log_label"))
@@ -2675,18 +2629,7 @@ def _handle_archive_detail_callback(cb_id: str, data: str, chat_id: int, user_id
 
     completed_time = _format_iso_time(entry.get("completed_at") or entry.get("updated_at", ""))
 
-    detail = (
-        "\U0001f4c1 \u5f52\u6863\u8be6\u60c5\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u4efb\u52a1\u4ee3\u53f7: {code}\n"
-        "\u5f52\u6863ID: {archive_id}\n"
-        "\u72b6\u6001: {status}\n"
-        "\u7c7b\u578b: {action}\n"
-        "\u5b8c\u6210\u65f6\u95f4: {completed}\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u63cf\u8ff0: {text}\n"
-        "\u6982\u8981: {summary}"
-    ).format(
+    detail = t("msg.archive_detail_panel",
         code=entry.get("task_code", "-"),
         archive_id=entry.get("archive_id", ""),
         status=status_tag(entry.get("status", "unknown")),
@@ -2700,14 +2643,14 @@ def _handle_archive_detail_callback(cb_id: str, data: str, chat_id: int, user_id
     kbd_rows: List[List[Dict]] = []
     aid = entry.get("archive_id", archive_ref)
     kbd_rows.append([
-        {"text": "\U0001f4c4 \u67e5\u770b\u5f52\u6863\u8be6\u60c5", "callback_data": safe_callback_data("task_doc", aid)},
+        {"text": t("msg.btn_view_archive_detail"), "callback_data": safe_callback_data("task_doc", aid)},
     ])
     # Add log button if run_log_file exists
     run_log_file = str(entry.get("run_log_file") or "").strip()
     if run_log_file and Path(run_log_file).exists():
         task_code = str(entry.get("task_code") or aid)
         kbd_rows.append([
-            {"text": "\U0001f4dc \u67e5\u770b\u6267\u884c\u65e5\u5fd7", "callback_data": "task_log:{}".format(task_code)},
+            {"text": t("msg.btn_view_log"), "callback_data": "task_log:{}".format(task_code)},
         ])
     # Add acceptance doc button if exists
     if task_id:
@@ -2715,13 +2658,13 @@ def _handle_archive_detail_callback(cb_id: str, data: str, chat_id: int, user_id
         acc_doc = acceptance_root() / (task_id + ".acceptance.md")
         if acc_doc.exists():
             kbd_rows.append([
-                {"text": "\U0001f4c4 \u67e5\u770b\u9a8c\u6536\u6587\u6863", "callback_data": safe_callback_data("task_doc", entry.get("task_code", aid))},
+                {"text": t("msg.btn_view_accept_doc"), "callback_data": safe_callback_data("task_doc", entry.get("task_code", aid))},
             ])
     kbd_rows.append([
-        {"text": "\U0001f5d1 \u5220\u9664\u5f52\u6863\u8bb0\u5f55", "callback_data": safe_callback_data("archive_delete", aid)},
+        {"text": t("msg.btn_delete_archive"), "callback_data": safe_callback_data("archive_delete", aid)},
     ])
     kbd_rows.append([
-        {"text": "\u00ab \u8fd4\u56de\u5217\u8868", "callback_data": "menu:tasks_archived"},
+        {"text": t("msg.btn_back_list"), "callback_data": "menu:tasks_archived"},
     ])
 
     send_text(chat_id, detail, reply_markup={"inline_keyboard": kbd_rows})
@@ -2810,11 +2753,7 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
         task_code = task.get("task_code", "-")
         send_text(
             chat_id,
-            "\u4efb\u52a1\u5df2\u521b\u5efa: [{code}] {task_id}\n\u72b6\u6001: pending\n\u5185\u5bb9: {text}".format(
-                code=task_code,
-                task_id=task_id,
-                text=txt[:200],
-            ),
+            t("msg.task_created_simple", code=task_code, task_id=task_id, text=txt[:200]),
             reply_markup=task_inline_keyboard(task_code),
         )
         return True
@@ -2834,10 +2773,10 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
                     ws_label = fallback.get("label", ws_id)
                     send_text(
                         chat_id,
-                        "\u26a0\ufe0f \u6240\u9009\u5de5\u4f5c\u533a\u5df2\u88ab\u5220\u9664\uff0c\u5df2\u56de\u9000\u5230\u9ed8\u8ba4\u5de5\u4f5c\u533a: {}".format(ws_label),
+                        t("msg.ws_deleted_fallback", label=ws_label),
                     )
                 else:
-                    send_text(chat_id, "\u274c \u6240\u9009\u5de5\u4f5c\u533a\u5df2\u88ab\u5220\u9664\uff0c\u4e14\u65e0\u53ef\u7528\u5de5\u4f5c\u533a\u3002", reply_markup=back_to_menu_keyboard())
+                    send_text(chat_id, t("msg.ws_deleted_no_fallback"), reply_markup=back_to_menu_keyboard())
                     return True
         if ws_id and should_queue_task(ws_id):
             # Workspace has active task, queue this one
@@ -2855,14 +2794,7 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
             pos = enqueue_task(ws_id, q_info)
             send_text(
                 chat_id,
-                "\u5de5\u4f5c\u533a [{ws}] \u5f53\u524d\u6709\u4efb\u52a1\u6267\u884c\u4e2d\uff0c\u5df2\u52a0\u5165\u961f\u5217\u3002\n"
-                "\u961f\u5217\u4f4d\u7f6e: \u7b2c{pos}\u4e2a\n"
-                "\u5185\u5bb9: {text}\n\n"
-                "\u524d\u4e00\u4efb\u52a1\u9a8c\u6536\u901a\u8fc7\u540e\u5c06\u81ea\u52a8\u542f\u52a8\u3002".format(
-                    ws=ws_label,
-                    pos=pos,
-                    text=txt[:200],
-                ),
+                t("msg.task_queued_ws", ws=ws_label, pos=pos, text=txt[:200]),
                 reply_markup=back_to_menu_keyboard(),
             )
         else:
@@ -2872,12 +2804,7 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
             task_code = task.get("task_code", "-")
             send_text(
                 chat_id,
-                "\u4efb\u52a1\u5df2\u521b\u5efa: [{code}] {task_id}\n\u5de5\u4f5c\u533a: {ws}\n\u72b6\u6001: pending\n\u5185\u5bb9: {text}".format(
-                    code=task_code,
-                    task_id=task_id,
-                    ws=ws_label,
-                    text=txt[:200],
-                ),
+                t("msg.task_created_ws", code=task_code, task_id=task_id, ws=ws_label, text=txt[:200]),
                 reply_markup=task_inline_keyboard(task_code),
             )
         return True
@@ -3144,9 +3071,7 @@ def _do_summary_command(chat_id: int, user_id: int) -> None:
     if len(workspaces) > 1:
         send_text(
             chat_id,
-            "\U0001f4ca \u9879\u76ee\u603b\u7ed3\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u8bf7\u9009\u62e9\u5de5\u4f5c\u533a:",
+            t("msg.summary_panel"),
             reply_markup=workspace_select_keyboard(workspaces, "summary_ws"),
         )
     else:
@@ -3172,7 +3097,7 @@ def _generate_and_send_summary(chat_id: int, workspace_path: Path) -> None:
 
     # Telegram message limit: 4096 chars
     if len(report) > 4096:
-        report = report[:4090] + "\n... (\u5185\u5bb9\u5df2\u622a\u65ad)"
+        report = report[:4090] + "\n" + t("msg.content_truncated")
 
     send_text(chat_id, report, reply_markup=back_to_menu_keyboard())
 
@@ -3279,9 +3204,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         if len(workspaces) > 1:
             send_text(
                 chat_id,
-                "\U0001f4dd \u65b0\u5efa\u4efb\u52a1\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u8bf7\u9009\u62e9\u4efb\u52a1\u6267\u884c\u7684\u5de5\u4f5c\u533a\u57df:",
+                t("msg.new_task_ws_panel"),
                 reply_markup=workspace_select_keyboard(workspaces, "ws_task_select"),
             )
         else:
@@ -3373,18 +3296,14 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             # No args: show backend selection inline keyboard
             send_text(
                 chat_id,
-                "\U0001f504 \u5207\u6362\u540e\u7aef\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u5f53\u524d\u540e\u7aef: {}\n\u8bf7\u9009\u62e9\u65b0\u7684\u540e\u7aef\uff1a".format(get_agent_backend()),
+                t("msg.switch_backend_panel", backend=get_agent_backend()),
                 reply_markup=backend_select_keyboard(),
             )
             return True
         if backend not in KNOWN_BACKENDS:
             send_text(
                 chat_id,
-                "\u672a\u77e5\u540e\u7aef: {}\n\u53ef\u7528: {}".format(
-                    backend, "|".join(sorted(KNOWN_BACKENDS))
-                ),
+                t("msg.unknown_backend", backend=backend, available="|".join(sorted(KNOWN_BACKENDS))),
             )
             return True
         set_agent_backend(backend, changed_by=user_id)
@@ -3561,14 +3480,14 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
                 if model:
                     from config import _provider_tag
                     tag = _provider_tag(provider)
-                    lines.append("  {}. {} {} \u2192 {} {}".format(i, emoji, label, model, tag).rstrip())
+                    lines.append("  {}. {} {} {} {} {}".format(i, emoji, label, t("msg.pipeline_arrow"), model, tag).rstrip())
                 else:
-                    lines.append("  {}. {} {} \u2192 ({})".format(i, emoji, label, s.get("backend", "?")))
+                    lines.append("  {}. {} {} {} ({})".format(i, emoji, label, t("msg.pipeline_arrow"), s.get("backend", "?")))
             else:
                 if model:
                     from config import _provider_tag
                     tag = _provider_tag(provider)
-                    lines.append("  {}. {} \u2192 {} {}".format(i, name, model, tag).rstrip())
+                    lines.append("  {}. {} {} {} {}".format(i, name, t("msg.pipeline_arrow"), model, tag).rstrip())
                 else:
                     lines.append("  {}. {}({})".format(i, name, s.get("backend", "?")))
         lines.append("\n" + t("msg.builtin_presets") + " " + ", ".join(PIPELINE_PRESETS.keys()))
@@ -3723,15 +3642,13 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             if not tasks:
                 send_text(
                     chat_id,
-                    "\U0001f4ed \u5f53\u524d\u6ca1\u6709\u5f85\u9a8c\u6536\u7684\u4efb\u52a1\u3002",
+                    t("msg.no_accept_tasks"),
                     reply_markup=back_to_menu_keyboard(),
                 )
                 return True
             send_text(
                 chat_id,
-                "\u2705 \u5f85\u9a8c\u6536\u4efb\u52a1\uff08\u5171 {} \u4e2a\uff09\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u8bf7\u9009\u62e9\u8981\u9a8c\u6536\u7684\u4efb\u52a1\uff1a".format(len(tasks)),
+                t("msg.accept_list_header", count=len(tasks)),
                 reply_markup=pending_tasks_keyboard(tasks, "accept"),
             )
             return True
@@ -3886,15 +3803,13 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             if not tasks:
                 send_text(
                     chat_id,
-                    "\U0001f4ed \u5f53\u524d\u6ca1\u6709\u53ef\u62d2\u7edd\u7684\u4efb\u52a1\u3002",
+                    t("msg.no_reject_tasks"),
                     reply_markup=back_to_menu_keyboard(),
                 )
                 return True
             send_text(
                 chat_id,
-                "\u274c \u53ef\u62d2\u7edd\u4efb\u52a1\uff08\u5171 {} \u4e2a\uff09\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u8bf7\u9009\u62e9\u8981\u62d2\u7edd\u7684\u4efb\u52a1\uff1a".format(len(tasks)),
+                t("msg.reject_list_header", count=len(tasks)),
                 reply_markup=pending_tasks_keyboard(tasks, "reject"),
             )
             return True
@@ -4036,15 +3951,13 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             if not tasks:
                 send_text(
                     chat_id,
-                    "\U0001f4ed \u5f53\u524d\u6ca1\u6709\u53ef\u91cd\u8bd5\u7684\u4efb\u52a1\u3002",
+                    t("msg.no_retry_tasks"),
                     reply_markup=back_to_menu_keyboard(),
                 )
                 return True
             send_text(
                 chat_id,
-                "\U0001f504 \u53ef\u91cd\u8bd5\u4efb\u52a1\uff08\u5171 {} \u4e2a\uff09\n"
-                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                "\u8bf7\u9009\u62e9\u8981\u91cd\u8bd5\u7684\u4efb\u52a1\uff1a".format(len(tasks)),
+                t("msg.retry_list_header", count=len(tasks)),
                 reply_markup=pending_tasks_keyboard(tasks, "retry"),
             )
             return True
@@ -4197,15 +4110,13 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         if not all_cancellable:
             send_text(
                 chat_id,
-                "\U0001f4ed \u5f53\u524d\u6ca1\u6709\u53ef\u53d6\u6d88\u7684\u4efb\u52a1\u3002",
+                t("msg.no_cancel_tasks"),
                 reply_markup=back_to_menu_keyboard(),
             )
             return True
         send_text(
             chat_id,
-            "\u26d4 \u53ef\u53d6\u6d88\u4efb\u52a1\uff08\u5171 {} \u4e2a\uff09\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u8bf7\u9009\u62e9\u8981\u53d6\u6d88\u7684\u4efb\u52a1\uff1a".format(len(all_cancellable)),
+            t("msg.cancel_list_header", count=len(all_cancellable)),
             reply_markup=pending_tasks_keyboard(all_cancellable, "cmd_cancel"),
         )
         return True
@@ -4604,20 +4515,15 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         if len(parts) < 2:
             roots = get_workspace_search_roots()
             if roots:
-                lines = ["\U0001f50d \u641c\u7d22\u6839\u76ee\u5f55:"]
+                lines = [t("msg.search_roots_cmd_header")]
                 for idx, r in enumerate(roots, 1):
                     lines.append("{}. {}".format(idx, r))
-                lines.append("\n\u7528\u6cd5:")
-                lines.append("  /workspace_search_roots add <\u8def\u5f84>")
-                lines.append("  /workspace_search_roots remove <\u5e8f\u53f7>")
-                lines.append("  /workspace_search_roots clear")
+                lines.append(t("msg.search_roots_usage"))
                 send_text(chat_id, "\n".join(lines), reply_markup=back_to_menu_keyboard())
             else:
                 send_text(
                     chat_id,
-                    "\u5c1a\u672a\u914d\u7f6e\u641c\u7d22\u6839\u76ee\u5f55\u3002\n"
-                    "\u9ed8\u8ba4\u4f7f\u7528\u5f53\u524d\u6d3b\u8dc3\u5de5\u4f5c\u76ee\u5f55\u53ca\u5176\u7236\u76ee\u5f55\u3002\n\n"
-                    "\u7528\u6cd5: /workspace_search_roots add <\u8def\u5f84>",
+                    t("msg.search_roots_not_configured"),
                     reply_markup=back_to_menu_keyboard(),
                 )
             return True
@@ -4625,7 +4531,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         # /workspace_search_roots add <path>[;path2;...]
         if sub == "add":
             if len(parts) < 3:
-                send_text(chat_id, "\u7528\u6cd5: /workspace_search_roots add <\u8def\u5f84>")
+                send_text(chat_id, t("msg.usage_search_roots_add"))
                 return True
             raw_paths = parts[2].strip()
             added = []
@@ -4641,51 +4547,51 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
                     failed.append(msg)
             lines = []
             if added:
-                lines.append("\u2705 \u5df2\u6dfb\u52a0:")
+                lines.append(t("msg.search_root_added"))
                 for a in added:
                     lines.append("  {}".format(a))
             if failed:
-                lines.append("\u274c \u5931\u8d25:")
+                lines.append(t("msg.search_root_add_failed"))
                 for f in failed:
                     lines.append("  {}".format(f))
             roots = get_workspace_search_roots()
             send_text(
                 chat_id,
-                "\n".join(lines) if lines else "\u65e0\u6709\u6548\u8def\u5f84",
+                "\n".join(lines) if lines else t("msg.no_valid_paths"),
                 reply_markup=search_roots_keyboard(roots),
             )
             return True
         # /workspace_search_roots remove <index>
         if sub == "remove":
             if len(parts) < 3:
-                send_text(chat_id, "\u7528\u6cd5: /workspace_search_roots remove <\u5e8f\u53f7>")
+                send_text(chat_id, t("msg.usage_search_roots_remove"))
                 return True
             try:
                 idx = int(parts[2].strip())
             except ValueError:
-                send_text(chat_id, "\u5e8f\u53f7\u5fc5\u987b\u662f\u6570\u5b57")
+                send_text(chat_id, t("msg.index_must_be_number"))
                 return True
             ok, msg = remove_workspace_search_root(idx, changed_by=user_id)
             if ok:
                 roots = get_workspace_search_roots()
                 send_text(
                     chat_id,
-                    "\u2705 \u5df2\u5220\u9664: {}".format(msg),
+                    t("msg.search_root_removed", msg=msg),
                     reply_markup=search_roots_keyboard(roots),
                 )
             else:
-                send_text(chat_id, "\u5220\u9664\u5931\u8d25: {}".format(msg))
+                send_text(chat_id, t("msg.search_root_remove_failed", msg=msg))
             return True
         # /workspace_search_roots clear
         if sub == "clear":
             set_workspace_search_roots([], changed_by=user_id)
             send_text(
                 chat_id,
-                "\u2705 \u5df2\u6e05\u7a7a\u6240\u6709\u641c\u7d22\u6839\u76ee\u5f55\u3002\n\u5c06\u56de\u9000\u5230\u9ed8\u8ba4\u641c\u7d22\u8303\u56f4\u3002",
+                t("msg.search_roots_cleared"),
                 reply_markup=back_to_menu_keyboard(),
             )
             return True
-        send_text(chat_id, "\u672a\u77e5\u5b50\u547d\u4ee4: {}\n\u7528\u6cd5: add / remove / clear".format(sub))
+        send_text(chat_id, t("msg.unknown_subcommand", sub=sub))
         return True
 
     if txt.startswith("/workspace_list") or txt == "/workspaces":
@@ -4846,13 +4752,7 @@ def _auto_launch_queued_task(accepted_task: Dict, chat_id: int) -> None:
 
     send_text(
         chat_id,
-        "\U0001f504 \u961f\u5217\u4efb\u52a1\u81ea\u52a8\u542f\u52a8\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        "\u5de5\u4f5c\u533a: {ws}\n"
-        "\u4efb\u52a1: [{code}] {task_id}\n"
-        "\u5185\u5bb9: {text}\n"
-        "\u72b6\u6001: pending (\u5df2\u52a0\u5165\u6267\u884c\u961f\u5217)\n"
-        "\u5269\u4f59\u6392\u961f: {remaining}\u4e2a".format(
+        t("msg.queue_auto_start",
             ws=ws_label_str,
             code=promoted.get("task_code", "-"),
             task_id=promoted.get("task_id", ""),
