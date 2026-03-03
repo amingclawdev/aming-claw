@@ -190,5 +190,81 @@ class TestQueuePersistence(unittest.TestCase):
         self.assertEqual(data["queues"]["ws-p"][0]["task_id"], "t-persist")
 
 
+class TestPromoteNextQueuedTask(unittest.TestCase):
+    """T4-AC3/AC6: promote_next_queued_task dequeues and creates pending task."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_promote_creates_pending_task(self):
+        from workspace_queue import promote_next_queued_task
+        from utils import tasks_root
+
+        enqueue_task("ws-promote", {
+            "task_id": "original-task",
+            "task_code": "T0001",
+            "chat_id": 100,
+            "user_id": 200,
+            "text": "fix bug",
+            "action": "codex",
+        })
+        self.assertEqual(queue_length("ws-promote"), 1)
+
+        promoted = promote_next_queued_task("ws-promote")
+        self.assertIsNotNone(promoted)
+        self.assertEqual(promoted["status"], "pending")
+        self.assertEqual(promoted["target_workspace_id"], "ws-promote")
+        self.assertEqual(promoted["text"], "fix bug")
+        self.assertIn("task_code", promoted)
+        self.assertEqual(promoted["queued_task_id"], "original-task")
+        self.assertEqual(promoted["queued_task_code"], "T0001")
+
+        # Queue should be empty after promotion
+        self.assertEqual(queue_length("ws-promote"), 0)
+
+        # Pending task file should exist
+        pending_file = tasks_root() / "pending" / (promoted["task_id"] + ".json")
+        self.assertTrue(pending_file.exists())
+
+    def test_promote_empty_queue_returns_none(self):
+        from workspace_queue import promote_next_queued_task
+        result = promote_next_queued_task("ws-empty")
+        self.assertIsNone(result)
+
+    def test_promote_preserves_fifo_order(self):
+        from workspace_queue import promote_next_queued_task
+
+        enqueue_task("ws-fifo", {"task_id": "t1", "text": "first", "chat_id": 10, "user_id": 20})
+        enqueue_task("ws-fifo", {"task_id": "t2", "text": "second", "chat_id": 10, "user_id": 20})
+        enqueue_task("ws-fifo", {"task_id": "t3", "text": "third", "chat_id": 10, "user_id": 20})
+
+        p1 = promote_next_queued_task("ws-fifo")
+        self.assertEqual(p1["text"], "first")
+        self.assertEqual(queue_length("ws-fifo"), 2)
+
+        p2 = promote_next_queued_task("ws-fifo")
+        self.assertEqual(p2["text"], "second")
+        self.assertEqual(queue_length("ws-fifo"), 1)
+
+    def test_independent_workspace_queues(self):
+        """T4-AC4: queues of different workspaces are independent."""
+        enqueue_task("ws-x", {"task_id": "x1", "text": "x-task"})
+        enqueue_task("ws-y", {"task_id": "y1", "text": "y-task"})
+        enqueue_task("ws-y", {"task_id": "y2", "text": "y-task-2"})
+
+        self.assertEqual(queue_length("ws-x"), 1)
+        self.assertEqual(queue_length("ws-y"), 2)
+
+        # Dequeue from ws-x should not affect ws-y
+        dequeue_task("ws-x")
+        self.assertEqual(queue_length("ws-x"), 0)
+        self.assertEqual(queue_length("ws-y"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

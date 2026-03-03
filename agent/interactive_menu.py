@@ -255,18 +255,32 @@ def search_roots_keyboard(roots: list) -> Dict:
 def workspace_select_keyboard(workspaces: List[Dict], callback_prefix: str = "ws_select") -> Dict:
     """Build a dynamic keyboard for workspace selection.
 
-    Each workspace gets a button with callback_data: <prefix>:<ws_id>
+    Each workspace gets a button showing 'label (path)' format.
+    Default workspace is marked with ⭐, inactive with ⛔.
+    callback_data: <prefix>:<ws_id>
     """
     rows: List[List[Dict]] = []
     for ws in workspaces:
         label = ws.get("label", ws.get("id", "?"))
         ws_id = ws.get("id", "")
+        ws_path = ws.get("path", "")
         flags = []
         if ws.get("is_default"):
             flags.append("\u2b50")
         if not ws.get("active", True):
             flags.append("\u26d4")
-        display = "{}{}".format(" ".join(flags) + " " if flags else "", label)
+        flag_str = " ".join(flags) + " " if flags else ""
+        # Show label (path) format; truncate path if too long for Telegram button
+        if ws_path:
+            display = "{}{} ({})".format(flag_str, label, ws_path)
+            if len(display) > 60:
+                max_path = 60 - len(flag_str) - len(label) - 6
+                if max_path > 10:
+                    display = "{}{} ({}...)".format(flag_str, label, ws_path[:max_path])
+                else:
+                    display = "{}{}".format(flag_str, label)
+        else:
+            display = "{}{}".format(flag_str, label)
         rows.append([{"text": display, "callback_data": "{}:{}".format(callback_prefix, ws_id)}])
     rows.append([{"text": "\u00ab \u53d6\u6d88", "callback_data": "menu:cancel"}])
     return {"inline_keyboard": rows}

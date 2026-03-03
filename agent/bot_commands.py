@@ -2805,6 +2805,22 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
     if action == "new_task_with_workspace":
         ws_id = context.get("ws_id", "")
         ws_label = context.get("ws_label", ws_id)
+        # Fallback: verify workspace still exists; if deleted, use default
+        if ws_id:
+            from workspace_registry import get_workspace as _get_ws_verify, get_default_workspace as _get_def_ws
+            ws_check = _get_ws_verify(ws_id)
+            if not ws_check:
+                fallback = _get_def_ws()
+                if fallback:
+                    ws_id = fallback["id"]
+                    ws_label = fallback.get("label", ws_id)
+                    send_text(
+                        chat_id,
+                        "\u26a0\ufe0f \u6240\u9009\u5de5\u4f5c\u533a\u5df2\u88ab\u5220\u9664\uff0c\u5df2\u56de\u9000\u5230\u9ed8\u8ba4\u5de5\u4f5c\u533a: {}".format(ws_label),
+                    )
+                else:
+                    send_text(chat_id, "\u274c \u6240\u9009\u5de5\u4f5c\u533a\u5df2\u88ab\u5220\u9664\uff0c\u4e14\u65e0\u53ef\u7528\u5de5\u4f5c\u533a\u3002", reply_markup=back_to_menu_keyboard())
+                    return True
         if ws_id and should_queue_task(ws_id):
             # Workspace has active task, queue this one
             from task_state import register_task_created as _reg_task, load_runtime_state
