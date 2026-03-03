@@ -176,7 +176,8 @@ class TestDetectStageNoop(unittest.TestCase):
         self.assertIsNotNone(reason)
 
     def test_analysis_stage_short_content(self):
-        run = {"last_message": "ok", "stdout": "", "returncode": 0}
+        # "ok" is now detected as ack-only; use a non-ack short string instead
+        run = {"last_message": "some brief note", "stdout": "", "returncode": 0}
         reason = detect_stage_noop(run, {"name": "verify"})
         self.assertIsNotNone(reason)
         self.assertIn("too short", reason)

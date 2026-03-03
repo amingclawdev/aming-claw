@@ -21,8 +21,9 @@ from config import (  # noqa: E402
     set_role_pipeline_stages,
     set_role_stage_model,
 )
+from i18n import t  # noqa: E402
 from backends import (  # noqa: E402
-    _STAGE_ROLE_PROMPTS,
+    _STAGE_ROLE_PROMPT_KEYS,
     _ANALYSIS_STAGES,
     _is_role_pipeline,
     _build_role_context,
@@ -282,21 +283,22 @@ class TestFormatPipelineStagesWithModel(unittest.TestCase):
 
 class TestRolePrompts(unittest.TestCase):
     def test_pm_prompt_exists(self):
-        self.assertIn("pm", _STAGE_ROLE_PROMPTS)
-        self.assertIn("产品经理", _STAGE_ROLE_PROMPTS["pm"])
-        self.assertIn("需求文档", _STAGE_ROLE_PROMPTS["pm"])
+        self.assertIn("pm", _STAGE_ROLE_PROMPT_KEYS)
+        prompt = t(_STAGE_ROLE_PROMPT_KEYS["pm"])
+        self.assertTrue(len(prompt) > 50, "PM prompt should be non-trivial")
 
     def test_dev_prompt_exists(self):
-        self.assertIn("dev", _STAGE_ROLE_PROMPTS)
-        self.assertIn("开发", _STAGE_ROLE_PROMPTS["dev"])
+        self.assertIn("dev", _STAGE_ROLE_PROMPT_KEYS)
+        prompt = t(_STAGE_ROLE_PROMPT_KEYS["dev"])
+        self.assertTrue(len(prompt) > 50, "Dev prompt should be non-trivial")
 
     def test_qa_prompt_exists(self):
-        self.assertIn("qa", _STAGE_ROLE_PROMPTS)
-        self.assertIn("验收", _STAGE_ROLE_PROMPTS["qa"])
+        self.assertIn("qa", _STAGE_ROLE_PROMPT_KEYS)
+        prompt = t(_STAGE_ROLE_PROMPT_KEYS["qa"])
+        self.assertTrue(len(prompt) > 50, "QA prompt should be non-trivial")
 
     def test_test_prompt_exists(self):
-        # "test" was already in the original _STAGE_ROLE_PROMPTS
-        self.assertIn("test", _STAGE_ROLE_PROMPTS)
+        self.assertIn("test", _STAGE_ROLE_PROMPT_KEYS)
 
     def test_analysis_stages_include_roles(self):
         self.assertIn("pm", _ANALYSIS_STAGES)
@@ -563,12 +565,20 @@ class TestQaPromptForbidsTools(unittest.TestCase):
     """Verify QA prompt includes tool-prohibition instructions."""
 
     def test_qa_prompt_forbids_tools(self):
-        prompt = _STAGE_ROLE_PROMPTS["qa"]
-        self.assertIn("禁止使用工具", prompt)
+        prompt = t(_STAGE_ROLE_PROMPT_KEYS["qa"])
+        # Chinese: "禁止使用工具" or English: "Do not use tools"
+        self.assertTrue(
+            "禁止使用工具" in prompt or "do not use tools" in prompt.lower(),
+            "QA prompt should forbid tool usage",
+        )
 
     def test_qa_prompt_context_based(self):
-        prompt = _STAGE_ROLE_PROMPTS["qa"]
-        self.assertIn("仅基于已提供的上下文", prompt)
+        prompt = t(_STAGE_ROLE_PROMPT_KEYS["qa"])
+        # Chinese: "仅基于已提供的上下文" or English: "based solely on the provided context"
+        self.assertTrue(
+            "仅基于已提供的上下文" in prompt or "based solely on the provided context" in prompt.lower(),
+            "QA prompt should be context-based",
+        )
 
 
 class TestQaNoopRetryCount(unittest.TestCase):
