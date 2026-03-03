@@ -26,6 +26,7 @@ from config import (
     set_agent_backend, set_pipeline_stages,
 )
 from auth import debug_verify_otp, get_auth_state, init_authenticator, verify_otp
+from i18n import t
 from workspace import (
     clear_workspace_override,
     resolve_active_workspace,
@@ -122,14 +123,10 @@ def maybe_timeout_stale_tasks() -> None:
             if chat_id:
                 send_text(
                     chat_id,
-                    "\u26a0\ufe0f \u4efb\u52a1\u8d85\u65f6\n"
-                    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    "\u4efb\u52a1: [{code}] {task_id}\n"
-                    "\u539f\u56e0: >{timeout}s \u65e0\u5fc3\u8df3".format(
-                        code=task_code,
-                        task_id=task_id,
-                        timeout=task_timeout_sec,
-                    ),
+                    t("msg.task_timeout",
+                      code=task_code,
+                      task_id=task_id,
+                      timeout=task_timeout_sec),
                     reply_markup=task_inline_keyboard(task_code),
                 )
         except Exception as exc:
@@ -155,19 +152,13 @@ def maybe_push_completion_notifications() -> None:
         task_code = str(st.get("task_code") or "-")
         send_text(
             chat_id,
-            "\u2705 \u4efb\u52a1\u5b8c\u6210\u901a\u77e5\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            "\u4efb\u52a1: [{code}] {task_id}\n"
-            "\u72b6\u6001: {status}({status_tag})\n"
-            "\u9636\u6bb5: {stage}\n"
-            "\u6982\u8981: {summary}".format(
-                code=task_code,
-                task_id=task_id,
-                status=status,
-                status_tag=status_tag(status),
-                stage=stage,
-                summary=summary[:300] if summary else "(\u65e0\u6982\u8981)",
-            ),
+            t("msg.task_completed",
+              code=task_code,
+              task_id=task_id,
+              status=status,
+              status_tag=status_tag(status),
+              stage=stage,
+              summary=summary[:300] if summary else t("msg.no_summary")),
             reply_markup=task_inline_keyboard(task_code),
         )
         mark_task_completion_notified(task_id)
@@ -192,22 +183,22 @@ def register_bot_commands() -> None:
     """Register aming-claw commands with Telegram via setMyCommands."""
     from utils import tg_post
     commands = [
-        {"command": "menu", "description": "打开主菜单"},
-        {"command": "help", "description": "显示命令列表"},
-        {"command": "task", "description": "创建新任务"},
-        {"command": "status", "description": "查看任务列表或单个任务"},
-        {"command": "accept", "description": "验收任务"},
-        {"command": "reject", "description": "拒绝任务"},
-        {"command": "retry", "description": "重新开发任务"},
-        {"command": "info", "description": "查看系统信息"},
-        {"command": "switch_backend", "description": "切换后端"},
-        {"command": "switch_model", "description": "切换AI模型"},
-        {"command": "show_pipeline", "description": "查看流水线配置"},
-        {"command": "archive", "description": "归档概览/搜索"},
-        {"command": "screenshot", "description": "截图"},
-        {"command": "clear_tasks", "description": "清空任务列表"},
-        {"command": "auth_init", "description": "初始化2FA"},
-        {"command": "workspace_list", "description": "查看工作目录列表"},
+        {"command": "menu", "description": t("bot_cmd.menu")},
+        {"command": "help", "description": t("bot_cmd.help")},
+        {"command": "task", "description": t("bot_cmd.task")},
+        {"command": "status", "description": t("bot_cmd.status")},
+        {"command": "accept", "description": t("bot_cmd.accept")},
+        {"command": "reject", "description": t("bot_cmd.reject")},
+        {"command": "retry", "description": t("bot_cmd.retry")},
+        {"command": "info", "description": t("bot_cmd.info")},
+        {"command": "switch_backend", "description": t("bot_cmd.switch_backend")},
+        {"command": "switch_model", "description": t("bot_cmd.switch_model")},
+        {"command": "show_pipeline", "description": t("bot_cmd.show_pipeline")},
+        {"command": "archive", "description": t("bot_cmd.archive")},
+        {"command": "screenshot", "description": t("bot_cmd.screenshot")},
+        {"command": "clear_tasks", "description": t("bot_cmd.clear_tasks")},
+        {"command": "auth_init", "description": t("bot_cmd.auth_init")},
+        {"command": "workspace_list", "description": t("bot_cmd.workspace_list")},
     ]
     try:
         tg_post("setMyCommands", {"commands": commands})
@@ -265,36 +256,30 @@ def run() -> None:
                     task_code = task.get("task_code", "-")
                     send_text(
                         chat_id,
-                        "\U0001f4dd \u4efb\u52a1\u5df2\u521b\u5efa\n"
-                        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                        "\u4ee3\u53f7: [{code}]\n"
-                        "\u4efb\u52a1ID: {task_id}\n"
-                        "\u72b6\u6001: pending\n"
-                        "\u5185\u5bb9: {text}".format(
-                            code=task_code,
-                            task_id=task_id,
-                            text=task_text[:200],
-                        ),
+                        t("msg.task_created",
+                          code=task_code,
+                          task_id=task_id,
+                          text=task_text[:200]),
                         reply_markup=task_inline_keyboard(task_code),
                     )
                     continue
 
                 if text.startswith("/"):
-                    send_text(chat_id, "未知命令。发送 /help 查看可用命令。")
+                    send_text(chat_id, t("msg.unknown_command"))
                     continue
 
                 if is_screenshot_text(text):
                     try:
                         run_screenshot_once(chat_id, text)
                     except Exception as exc:
-                        send_text(chat_id, "截图失败: {}".format(str(exc)[:1000]))
+                        send_text(chat_id, t("msg.screenshot_failed", err=str(exc)[:1000]))
                     continue
 
                 try:
                     reply = run_chat(text)
                     send_text(chat_id, reply)
                 except Exception as exc:
-                    send_text(chat_id, "对话失败: {}".format(str(exc)[:1000]))
+                    send_text(chat_id, t("msg.chat_failed", err=str(exc)[:1000]))
 
             now_ts = time.time()
             if now_ts - last_reconcile_ts >= reconcile_interval_sec:

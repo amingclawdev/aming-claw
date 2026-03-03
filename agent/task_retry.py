@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from utils import load_json, save_json, task_file, tasks_root, utc_iso
+from i18n import t
 from task_state import (
     append_task_event,
     update_task_lifecycle,
@@ -49,7 +50,7 @@ def get_max_retry_iterations() -> int:
 def _build_rejection_record(acceptance: Dict, iteration: int) -> Dict:
     """Build a single rejection history entry from acceptance fields."""
     return {
-        "reason": str(acceptance.get("reason") or "(未提供)"),
+        "reason": str(acceptance.get("reason") or t("retry.no_reason")),
         "rejected_at": str(acceptance.get("rejected_at") or ""),
         "rejected_by": acceptance.get("rejected_by"),
         "iteration": iteration,
@@ -82,45 +83,45 @@ def build_retry_summary(task: Dict, extra_instruction: str = "") -> str:
 
     lines = []
     lines.append("=" * 40)
-    lines.append("上一轮验收未通过摘要（第{}轮重新开发）".format(iteration_count + 1))
+    lines.append(t("retry.prev_summary_title", n=iteration_count + 1))
     lines.append("=" * 40)
 
     # Original task description
     original_text = str(task.get("text") or "").strip()
     if original_text:
-        lines.append("\n原始任务描述:\n{}".format(original_text[:500]))
+        lines.append("\n{}\n{}".format(t("retry.original_task"), original_text[:500]))
 
     # All rejection reasons (accumulated)
     if history:
-        lines.append("\n历史验收不通过记录:")
+        lines.append("\n{}".format(t("retry.rejection_history")))
         # Limit to recent entries to control length
         recent = history[-5:] if len(history) > 5 else history
         for rec in recent:
-            lines.append("  第{}轮 - 验收未通过原因: {}".format(
-                rec.get("iteration", "?"),
-                str(rec.get("reason", "(未提供)"))[:300],
-            ))
+            lines.append("  {}".format(t("retry.rejection_round",
+                n=rec.get("iteration", "?"),
+                reason=str(rec.get("reason", t("retry.no_reason")))[:300],
+            )))
     else:
         # Single rejection (first time retry)
-        reason = str(acceptance.get("reason") or "(未提供)")
-        lines.append("\n验收未通过原因: {}".format(reason[:500]))
+        reason = str(acceptance.get("reason") or t("retry.no_reason"))
+        lines.append("\n{}".format(t("retry.rejection_reason", reason=reason[:500])))
 
     # Last execution output summary
     executor = task.get("executor") if isinstance(task.get("executor"), dict) else {}
     last_msg = str(executor.get("last_message") or "").strip()
     if last_msg:
-        lines.append("\n上轮执行产出摘要:\n{}".format(last_msg[:400]))
+        lines.append("\n{}\n{}".format(t("retry.prev_output"), last_msg[:400]))
 
     # User supplement
     if extra_instruction:
-        lines.append("\n用户补充说明: {}".format(extra_instruction.strip()[:300]))
+        lines.append("\n{}".format(t("retry.user_supplement", text=extra_instruction.strip()[:300])))
 
     lines.append("=" * 40)
 
     summary = "\n".join(lines)
     # Enforce max length
     if len(summary) > _SUMMARY_MAX_CHARS:
-        summary = summary[:_SUMMARY_MAX_CHARS] + "\n...(摘要已截断)"
+        summary = summary[:_SUMMARY_MAX_CHARS] + "\n" + t("retry.summary_truncated")
     return summary
 
 
@@ -148,11 +149,11 @@ def retry_task(
 
     # ── AC-2: State validation ──
     if status == "accepted":
-        return False, "任务已验收通过并归档，无法重新开发", None
+        return False, t("retry.already_accepted"), None
     if status not in ("rejected", "pending_acceptance"):
-        return False, "只能对验收拒绝或待验收的任务重新开发（当前状态: {}）".format(status), None
+        return False, t("retry.invalid_status", status=status), None
     if stage != "results":
-        return False, "任务不在results阶段，无法重新开发（当前stage: {}）".format(stage), None
+        return False, t("retry.invalid_stage", stage=stage), None
 
     # ── AC-7: Iteration limit ──
     acceptance = task.get("acceptance") if isinstance(task.get("acceptance"), dict) else {}

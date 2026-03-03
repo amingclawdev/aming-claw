@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from i18n import t
 from utils import save_json, tasks_root, utc_iso
 
 
@@ -93,26 +94,27 @@ def _generate_auto_verdict(stages: list) -> str:
                 import re
                 m = re.search(r"(\d+)\s*(passed|tests?.*OK|通过)", preview)
                 if m:
-                    parts.append("测试: {} 通过".format(m.group(0)))
+                    parts.append(t("accept_doc.test_passed", detail=m.group(0)))
                 else:
-                    parts.append("测试: 通过 (returncode=0)")
+                    parts.append(t("accept_doc.test_pass_rc0"))
             else:
-                parts.append("测试: 失败")
+                parts.append(t("accept_doc.test_failed"))
                 all_passed = False
         elif name == "dev":
             if rc == 0 and not noop:
-                parts.append("开发: 完成")
+                parts.append(t("accept_doc.dev_done"))
             else:
-                parts.append("开发: 失败")
+                parts.append(t("accept_doc.dev_failed"))
                 all_passed = False
         elif name == "pm":
             if rc == 0 and not noop:
-                parts.append("需求: 已产出")
+                parts.append(t("accept_doc.requirement_done"))
         elif name == "qa":
             if rc != 0 or noop:
                 all_passed = False
 
-    verdict = "自动判定: {}".format("通过" if all_passed else "待人工验收")
+    verdict = t("accept_doc.auto_verdict",
+                result=t("accept_doc.verdict_pass") if all_passed else t("accept_doc.verdict_manual"))
     return "{}\n{}".format(verdict, "\n".join(parts))
 
 
@@ -148,7 +150,7 @@ def _build_pipeline_summary(executor: Dict) -> str:
         if preview:
             if name == "qa" and _is_qa_boilerplate(preview):
                 qa_was_boilerplate = True
-                parts.append("(QA 未产出实质审计，已自动生成判定)")
+                parts.append(t("accept_doc.qa_no_audit_short"))
             else:
                 snippet = _extract_stage_snippet(name, preview)
                 if snippet:
@@ -158,7 +160,7 @@ def _build_pipeline_summary(executor: Dict) -> str:
     # If QA returned boilerplate, add auto-verdict based on other stages
     if qa_was_boilerplate:
         auto_verdict = _generate_auto_verdict(stages)
-        parts.append("━━ 自动验收判定 ━━")
+        parts.append(t("accept_doc.auto_verdict_section"))
         parts.append(auto_verdict)
 
     return "\n".join(parts).strip()
@@ -221,42 +223,42 @@ def build_acceptance_cases(task: Dict, result: Dict) -> List[Dict]:
     return [
         {
             "case_id": "AC-000",
-            "title": "任务描述可测试",
-            "steps": ["读取任务文本", "确认目标、范围、约束可用于验收"],
-            "expected": "任务目标清晰，具备可验证结果",
-            "actual": (task_text or "(空任务文本)")[:600],
+            "title": t("accept_doc.case_task_testable"),
+            "steps": t("accept_doc.case_task_testable_steps").split(";"),
+            "expected": t("accept_doc.case_task_testable_expected"),
+            "actual": (task_text or t("accept_doc.empty_task_text"))[:600],
             "status": "passed" if bool(task_text) else "failed",
         },
         {
             "case_id": "AC-001",
-            "title": "任务执行结果可核对",
-            "steps": ["查看 result JSON", "核对任务目标与执行摘要是否一致"],
-            "expected": "执行摘要完整，且能说明任务处理结果",
-            "actual": (summary or "(无执行摘要)")[:600],
+            "title": t("accept_doc.case_result_verifiable"),
+            "steps": t("accept_doc.case_result_verifiable_steps").split(";"),
+            "expected": t("accept_doc.case_result_verifiable_expected"),
+            "actual": (summary or t("accept_doc.no_exec_summary"))[:600],
             "status": "passed" if exec_status == "completed" else "failed",
         },
         {
             "case_id": "AC-002",
-            "title": "运行日志可追溯",
-            "steps": ["查看 runlog 文件", "核对命令、耗时、returncode、stdout/stderr"],
-            "expected": "runlog 字段完整，可用于审计",
+            "title": t("accept_doc.case_log_traceable"),
+            "steps": t("accept_doc.case_log_traceable_steps").split(";"),
+            "expected": t("accept_doc.case_log_traceable_expected"),
             "actual": "runlog_file={}".format(str(executor.get("runlog_file") or "")),
             "status": "passed" if bool(executor.get("runlog_file")) else "failed",
         },
         {
             "case_id": "AC-003",
-            "title": "变更范围可核验",
-            "steps": ["检查 git_changed_files", "确认变更是否符合任务范围"],
-            "expected": "存在合理变更，或任务类型允许无代码变更",
+            "title": t("accept_doc.case_changes_verifiable"),
+            "steps": t("accept_doc.case_changes_verifiable_steps").split(";"),
+            "expected": t("accept_doc.case_changes_verifiable_expected"),
             "actual": "git_changed_files_count={}".format(changed_count),
             "status": "passed" if (changed_count > 0 or task.get("action") != "codex") else "failed",
         },
         {
             "case_id": "UAT-001",
-            "title": "用户验收确认",
-            "steps": ["业务方查看结果、日志、测试用例", "业务方执行 /accept 或 /reject"],
-            "expected": "用户明确给出通过或拒绝结论",
-            "actual": "等待用户执行验收命令",
+            "title": t("accept_doc.case_user_accept"),
+            "steps": t("accept_doc.case_user_accept_steps").split(";"),
+            "expected": t("accept_doc.case_user_accept_expected"),
+            "actual": t("accept_doc.case_user_accept_actual"),
             "status": "pending",
         },
     ]
@@ -288,13 +290,13 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
     if is_pipeline:
         summary_text = _build_pipeline_summary(executor)[:2000]
     else:
-        summary_text = (executor.get("last_message") or result.get("error") or "(见结果文件)")[:2000]
+        summary_text = (executor.get("last_message") or result.get("error") or t("accept_doc.see_result_file"))[:2000]
 
     # Build pipeline stages section for document
     pipeline_section = ""
     if is_pipeline:
         stages = executor.get("stages") or []
-        stage_lines = ["## 流水线执行详情\n"]
+        stage_lines = [t("accept_doc.pipeline_detail") + "\n"]
         for s in stages:
             name = s.get("stage", "?")
             rc = s.get("returncode", -1)
@@ -310,7 +312,7 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
             preview = str(s.get("last_message_preview") or "").strip()
             if preview:
                 if name == "qa" and _is_qa_boilerplate(preview):
-                    stage_lines.append("QA 未产出实质审计结论（输入上下文过长被截断，QA 仅收到角色设定）\n")
+                    stage_lines.append(t("accept_doc.qa_no_audit") + "\n")
                 else:
                     snippet = _extract_stage_snippet(name, preview)
                     if snippet:
@@ -321,38 +323,50 @@ def write_acceptance_documents(task: Dict, result: Dict) -> Dict:
             qa_preview = str(qa_stages[0].get("last_message_preview") or "")
             if _is_qa_boilerplate(qa_preview):
                 verdict = _generate_auto_verdict(stages)
-                stage_lines.append("### 自动验收判定")
+                stage_lines.append(t("accept_doc.auto_verdict_heading"))
                 stage_lines.append("```\n{}\n```\n".format(verdict))
         pipeline_section = "\n".join(stage_lines) + "\n\n"
 
+    task_code_val = result.get("task_code", "-")
     doc = (
-        "# 任务测试与验收文档\n\n"
-        "## 基本信息\n"
+        "{title}\n\n"
+        "{basic_info}\n"
         "- task_code: {task_code}\n"
         "- action: {action}\n"
         "- execution_status: {execution_status}\n"
         "- elapsed: {elapsed}\n"
         "- generated_at: {generated_at}\n\n"
-        "## 任务内容\n"
+        "{task_content}\n"
         "{task_text}\n\n"
-        "## 执行摘要\n"
+        "{exec_summary}\n"
         "{summary}\n\n"
         "{pipeline_section}"
-        "## 功能测试/验收用例\n"
-        "| 用例ID | 标题 | 步骤 | 预期结果 | 实际结果 | 结论 |\n"
+        "{test_cases}\n"
+        "{table_header}\n"
         "| --- | --- | --- | --- | --- | --- |\n"
         "{case_table}\n\n"
-        "## 证据清单\n"
+        "{evidence_list}\n"
         "- result_file: `shared-volume/codex-tasks/results/{task_id}.json`\n"
         "- runlog_file: `{runlog_file}`\n"
         "- cases_file: `{cases_file}`\n\n"
-        "## 验收结论\n"
-        "- 当前状态: 待用户验收\n"
-        "- 通过命令: /accept {task_code}\n"
-        "- 拒绝命令: /reject {task_code} <原因>\n"
+        "{conclusion}\n"
+        "{status_awaiting}\n"
+        "{accept_cmd}\n"
+        "{reject_cmd}\n"
     ).format(
+        title=t("accept_doc.title"),
+        basic_info=t("accept_doc.basic_info"),
+        task_content=t("accept_doc.task_content"),
+        exec_summary=t("accept_doc.exec_summary"),
+        test_cases=t("accept_doc.test_cases"),
+        table_header=t("accept_doc.table_header"),
+        evidence_list=t("accept_doc.evidence_list"),
+        conclusion=t("accept_doc.conclusion"),
+        status_awaiting=t("accept_doc.status_awaiting"),
+        accept_cmd=t("accept_doc.accept_cmd", code=task_code_val),
+        reject_cmd=t("accept_doc.reject_cmd", code=task_code_val),
         task_id=task_id,
-        task_code=result.get("task_code", "-"),
+        task_code=task_code_val,
         action=task.get("action", "codex"),
         execution_status=exec_status,
         elapsed=format_elapsed(executor.get("elapsed_ms", 0)),
@@ -399,12 +413,12 @@ def task_inline_keyboard(task_code: str, task_id: str) -> Dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "验收通过", "callback_data": "accept:{}".format(ref)},
-                {"text": "验收拒绝", "callback_data": "reject:{}".format(ref)},
+                {"text": t("acceptance.accept_btn"), "callback_data": "accept:{}".format(ref)},
+                {"text": t("acceptance.reject_btn"), "callback_data": "reject:{}".format(ref)},
             ],
             [
-                {"text": "查看文档", "callback_data": "task_doc:{}".format(ref)},
-                {"text": "查看详情", "callback_data": "task_detail:{}".format(ref)},
+                {"text": t("acceptance.view_doc_btn"), "callback_data": "task_doc:{}".format(ref)},
+                {"text": t("acceptance.view_detail_btn"), "callback_data": "task_detail:{}".format(ref)},
             ],
         ]
     }
@@ -435,22 +449,22 @@ def generate_stage_summary(stage_result: Dict) -> str:
             preview = preview[:150] + "..."
         parts.append(preview)
     elif noop_reason:
-        parts.append("未执行: {}".format(noop_reason[:80]))
+        parts.append(t("summary.not_executed", reason=noop_reason[:80]))
     elif error:
-        parts.append("错误: {}".format(error[:80]))
+        parts.append(t("summary.error", err=error[:80]))
 
     # Changed files info
     if isinstance(changed_files, list) and changed_files:
         file_list = ", ".join(str(f).split("/")[-1] for f in changed_files[:5])
         if len(changed_files) > 5:
-            file_list += " 等{}个文件".format(len(changed_files))
-        parts.append("变更文件: {}".format(file_list))
+            file_list += " " + t("summary.n_files", count=len(changed_files))
+        parts.append(t("summary.changed_files", files=file_list))
 
     # Return code info (only if error)
     if returncode and returncode != 0 and not error:
-        parts.append("返回码: {}".format(returncode))
+        parts.append(t("summary.return_code", code=returncode))
 
-    summary = "; ".join(parts) if parts else "(无执行输出)"
+    summary = "; ".join(parts) if parts else t("summary.no_output")
     return summary[:200]
 
 
@@ -648,18 +662,19 @@ def finalize_pipeline_task(
 
 
 def format_elapsed(ms) -> str:
-    """Convert milliseconds to human-readable duration (秒/分钟)."""
+    """Convert milliseconds to human-readable duration."""
     try:
         total_sec = int(ms or 0) / 1000.0
     except (TypeError, ValueError):
-        return "未知"
+        return t("time.unknown")
     if total_sec < 60:
-        return "{:.1f} 秒".format(total_sec) if total_sec >= 1 else "{:.2f} 秒".format(total_sec)
+        val = "{:.1f}".format(total_sec) if total_sec >= 1 else "{:.2f}".format(total_sec)
+        return t("time.seconds", val=val)
     minutes = int(total_sec // 60)
     secs = int(total_sec % 60)
     if secs == 0:
-        return "{} 分钟".format(minutes)
-    return "{} 分 {} 秒".format(minutes, secs)
+        return t("time.minutes", val=minutes)
+    return t("time.min_sec", min=minutes, sec=secs)
 
 
 def _truncate_lines(text: str, max_lines: int = 3) -> str:
@@ -682,11 +697,11 @@ def build_task_summary(result: Dict) -> str:
         return summary
     noop_reason = (executor.get("noop_reason") or "").strip()
     if noop_reason:
-        return "失败原因: {}".format(noop_reason)
+        return t("summary.failure_reason", reason=noop_reason)
     error = (result.get("error") or "").strip()
     if error:
-        return "错误: {}".format(error)
-    return "(见日志文件)"
+        return t("summary.error_prefix", err=error)
+    return t("summary.see_log")
 
 
 def _format_pipeline_stage_line(s: Dict) -> str:
@@ -710,7 +725,7 @@ def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detail
     elapsed_str = format_elapsed(elapsed)
     acceptance = result.get("acceptance") if isinstance(result.get("acceptance"), dict) else {}
     iteration = int(acceptance.get("iteration_count") or 1)
-    iteration_tag = "（第{}轮）".format(iteration) if iteration > 1 else ""
+    iteration_tag = t("notice.iteration_tag", n=iteration) if iteration > 1 else ""
     separator = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
     is_pipeline = result.get("action") == "pipeline"
@@ -719,28 +734,28 @@ def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detail
     if execution_status == "failed":
         error_msg = str(result.get("error") or executor.get("noop_reason") or "").strip()
         lines = [
-            "\u274c 任务 [{code}] 执行失败{iter}".format(code=task_code, iter=iteration_tag),
-            "耗时: {}".format(elapsed_str),
+            t("notice.task_failed", code=task_code, iter=iteration_tag),
+            t("notice.elapsed", time=elapsed_str),
             separator,
         ]
         if is_pipeline and stages:
-            lines.append("流水线阶段:")
+            lines.append(t("notice.pipeline_stages"))
             for s in stages:
                 lines.append(_format_pipeline_stage_line(s))
             lines.append(separator)
         if error_msg:
-            lines.append("失败原因: {}".format(_truncate_lines(error_msg[:500], 3)))
+            lines.append(t("notice.failure_reason", reason=_truncate_lines(error_msg[:500], 3)))
         return "\n".join(lines)
 
     # ── Success ──
     lines = [
-        "\u2705 任务 [{code}] 执行完成{iter}".format(code=task_code, iter=iteration_tag),
-        "耗时: {}".format(elapsed_str),
+        t("notice.task_completed", code=task_code, iter=iteration_tag),
+        t("notice.elapsed", time=elapsed_str),
         separator,
     ]
 
     if is_pipeline and stages:
-        lines.append("流水线阶段:")
+        lines.append(t("notice.pipeline_stages"))
         for s in stages:
             lines.append(_format_pipeline_stage_line(s))
         lines.append(separator)
@@ -757,22 +772,22 @@ def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detail
                 import re
                 m = re.search(r"(\d+)\s*(passed|tests?.*OK|通过)", test_preview)
                 if m:
-                    lines.append("测试结果: \u2705 {}".format(m.group(0)))
+                    lines.append(t("notice.test_result", detail=m.group(0)))
                 else:
-                    lines.append("测试结果: \u2705 通过")
+                    lines.append(t("notice.test_passed"))
             else:
-                lines.append("测试结果: \u274c 失败")
+                lines.append(t("notice.test_failed"))
 
         # QA verdict or auto-verdict
         if qa_stage:
             qa_preview = str(qa_stage.get("last_message_preview") or "").strip()
             if _is_qa_boilerplate(qa_preview):
-                lines.append("QA审计: \u26a0 未产出（已自动判定）")
+                lines.append(t("notice.qa_no_audit"))
             else:
                 # Try extracting actual verdict
                 snippet = _extract_stage_snippet("qa", qa_preview)
                 if snippet:
-                    lines.append("QA审计: {}".format(_truncate_lines(snippet, 3)))
+                    lines.append(t("notice.qa_audit", detail=_truncate_lines(snippet, 3)))
 
         if detailed:
             # Dev changes summary
@@ -783,12 +798,12 @@ def acceptance_notice_text(result: Dict, task_id: str, task_code: str, *, detail
                     snippet = _extract_stage_snippet("dev", dev_preview)
                     if snippet:
                         lines.append(separator)
-                        lines.append("开发摘要:")
+                        lines.append(t("notice.dev_summary"))
                         lines.append(_truncate_lines(snippet, 5))
     else:
         # Non-pipeline task
         summary = build_task_summary(result)
-        lines.append("概要: {}".format(_truncate_lines(summary[:500], 3)))
+        lines.append(t("notice.summary", text=_truncate_lines(summary[:500], 3)))
 
     return "\n".join(lines)
 
@@ -825,6 +840,6 @@ def run_post_acceptance_tests(workspace: Path) -> Dict:
         output = (proc.stdout or "")[-3000:] + "\n" + (proc.stderr or "")[-1000:]
         return {"passed": passed, "output": output.strip(), "error": ""}
     except subprocess.TimeoutExpired:
-        return {"passed": False, "output": "", "error": "测试超时 ({}s)".format(timeout)}
+        return {"passed": False, "output": "", "error": t("time.test_timeout", sec=timeout)}
     except Exception as exc:
         return {"passed": False, "output": "", "error": str(exc)[:500]}

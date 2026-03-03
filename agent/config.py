@@ -17,6 +17,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 from utils import load_json, save_json, tasks_root, utc_iso
+from i18n import t
 
 # Valid top-level backends (pipeline = multi-stage mode)
 KNOWN_BACKENDS = {"codex", "claude", "pipeline"}
@@ -251,7 +252,7 @@ def format_pipeline_stages(stages: List[Dict]) -> str:
                 global_provider = get_model_provider()
                 tag = _provider_tag(global_provider)
                 display = "{} {}".format(global_model, tag).rstrip() if tag else global_model
-                parts.append("{}(全局: {})".format(name, display))
+                parts.append("{}({})".format(name, t("config.global_prefix", model=display)))
             else:
                 parts.append("{}({})".format(name, backend))
     return " → ".join(parts)
@@ -317,8 +318,8 @@ def set_role_stage_model(role_name: str, model: str, provider: str = "",
         from model_registry import get_available_models, find_model
         m = find_model(model)
         if m and m.get("status") == "unavailable":
-            reason = m.get("unavailable_reason", "不可用")
-            raise ValueError("模型 {} 当前不可用（{}）".format(model, reason))
+            reason = m.get("unavailable_reason", "")
+            raise ValueError(t("config.model_unavailable", model=model, reason=reason))
     stages = get_role_pipeline_stages()
     for stage in stages:
         if stage.get("name") == role_name:
@@ -334,13 +335,13 @@ def set_role_stage_model(role_name: str, model: str, provider: str = "",
 def format_role_pipeline_stages(stages: List[Dict]) -> str:
     """Human-readable role pipeline display."""
     if not stages:
-        return "(未配置)"
+        return t("config.not_configured")
     lines = []
     for s in stages:
         name = s.get("name", "?")
         role_def = ROLE_DEFINITIONS.get(name, {})
         emoji = role_def.get("emoji", "")
-        label = role_def.get("label", name)
+        label = t("role." + name) if name in ROLE_DEFINITIONS else name
         model = s.get("model", "")
         provider = s.get("provider", "")
         if model:
@@ -352,9 +353,9 @@ def format_role_pipeline_stages(stages: List[Dict]) -> str:
                 global_provider = get_model_provider()
                 tag = _provider_tag(global_provider)
                 display = "{} {}".format(global_model, tag).rstrip() if tag else global_model
-                lines.append("{} {} \u2192 \u5168\u5c40: {}".format(emoji, label, display))
+                lines.append("{} {} \u2192 {}".format(emoji, label, t("config.global_label", display=display)))
             else:
-                lines.append("{} {} \u2192 (\u4f7f\u7528\u5168\u5c40\u6a21\u578b)".format(emoji, label))
+                lines.append("{} {} \u2192 {}".format(emoji, label, t("config.use_global_model")))
     return "\n".join(lines)
 
 
@@ -398,17 +399,17 @@ def add_workspace_search_root(root: str,
     from pathlib import Path as _P
     root = root.strip().strip('"').strip("'")
     if not root:
-        return False, "路径不能为空"
+        return False, t("config.path_empty")
     p = _P(root).expanduser()
     if not p.exists():
-        return False, "路径不存在: {}".format(root)
+        return False, t("config.path_not_exist", path=root)
     if not p.is_dir():
-        return False, "路径不是目录: {}".format(root)
+        return False, t("config.path_not_dir", path=root)
     resolved = str(p.resolve())
     current = get_workspace_search_roots()
     # Dedup (case-insensitive on Windows)
     if any(resolved.lower() == c.lower() for c in current):
-        return False, "已存在: {}".format(resolved)
+        return False, t("config.already_exists", path=resolved)
     current.append(resolved)
     set_workspace_search_roots(current, changed_by=changed_by)
     return True, resolved
@@ -419,7 +420,7 @@ def remove_workspace_search_root(index: int,
     """Remove a search root by 1-based index. Returns (success, message)."""
     current = get_workspace_search_roots()
     if index < 1 or index > len(current):
-        return False, "无效索引: {}（共{}项）".format(index, len(current))
+        return False, t("config.invalid_index", idx=index, total=len(current))
     removed = current.pop(index - 1)
     set_workspace_search_roots(current, changed_by=changed_by)
     return True, removed

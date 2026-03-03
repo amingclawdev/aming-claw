@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
+from i18n import t
 from utils import (
     answer_callback_query,
     load_json,
@@ -365,12 +366,12 @@ def is_screenshot_text(text: str) -> bool:
 
 
 def parse_task_text(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    if not t:
+    txt = (text or "").strip()
+    if not txt:
         return None
-    if t.startswith("/task "):
-        return t[6:].strip()
-    if t.startswith("/task"):
+    if txt.startswith("/task "):
+        return txt[6:].strip()
+    if txt.startswith("/task"):
         return None
     return None
 
@@ -2838,14 +2839,14 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
 
     action = pending.get("action", "")
     context = pending.get("context") or {}
-    t = (text or "").strip()
+    txt = (text or "").strip()
 
-    if not t:
+    if not txt:
         return False
 
     # -- New Task --
     if action == "new_task":
-        task_id = create_task(chat_id, user_id, "/task {}".format(t))
+        task_id = create_task(chat_id, user_id, "/task {}".format(txt))
         task = load_json(task_file("pending", task_id))
         task_code = task.get("task_code", "-")
         send_text(
@@ -2853,7 +2854,7 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
             "\u4efb\u52a1\u5df2\u521b\u5efa: [{code}] {task_id}\n\u72b6\u6001: pending\n\u5185\u5bb9: {text}".format(
                 code=task_code,
                 task_id=task_id,
-                text=t[:200],
+                text=txt[:200],
             ),
             reply_markup=task_inline_keyboard(task_code),
         )
@@ -2901,7 +2902,7 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
                 "\u524d\u4e00\u4efb\u52a1\u9a8c\u6536\u901a\u8fc7\u540e\u5c06\u81ea\u52a8\u542f\u52a8\u3002".format(
                     ws=ws_label,
                     pos=pos,
-                    text=t[:200],
+                    text=txt[:200],
                 ),
                 reply_markup=back_to_menu_keyboard(),
             )
@@ -2916,7 +2917,7 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
                     code=task_code,
                     task_id=task_id,
                     ws=ws_label,
-                    text=t[:200],
+                    text=txt[:200],
                 ),
                 reply_markup=task_inline_keyboard(task_code),
             )
@@ -2925,44 +2926,44 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
     # -- Screenshot --
     if action == "screenshot":
         try:
-            run_screenshot_once(chat_id, t or "请截图")
+            run_screenshot_once(chat_id, txt or "请截图")
         except Exception as exc:
             send_text(chat_id, "截图失败: {}".format(str(exc)[:1000]))
         return True
 
     # -- Archive Search --
     if action == "archive_search":
-        handle_command(chat_id, user_id, "/archive {}".format(t))
+        handle_command(chat_id, user_id, "/archive {}".format(txt))
         return True
 
     # -- Pipeline Config --
     if action == "pipeline_config":
-        handle_command(chat_id, user_id, "/set_pipeline {}".format(t))
+        handle_command(chat_id, user_id, "/set_pipeline {}".format(txt))
         return True
 
     # -- Mgr Restart (needs OTP) --
     if action == "mgr_restart":
-        handle_command(chat_id, user_id, "/mgr_restart {}".format(t))
+        handle_command(chat_id, user_id, "/mgr_restart {}".format(txt))
         return True
 
     # -- Mgr Reinit (needs OTP) --
     if action == "mgr_reinit":
-        handle_command(chat_id, user_id, "/mgr_reinit {}".format(t))
+        handle_command(chat_id, user_id, "/mgr_reinit {}".format(txt))
         return True
 
     # -- Ops Restart (needs OTP) --
     if action == "ops_restart":
-        handle_command(chat_id, user_id, "/ops_restart {}".format(t))
+        handle_command(chat_id, user_id, "/ops_restart {}".format(txt))
         return True
 
     # -- Set Workspace (path + OTP) --
     if action == "set_workspace":
-        handle_command(chat_id, user_id, "/ops_set_workspace {}".format(t))
+        handle_command(chat_id, user_id, "/ops_set_workspace {}".format(txt))
         return True
 
     # -- Reset Workspace (needs OTP) --
     if action == "reset_workspace":
-        handle_command(chat_id, user_id, "/ops_set_workspace default {}".format(t))
+        handle_command(chat_id, user_id, "/ops_set_workspace default {}".format(txt))
         return True
 
     # -- Accept with OTP --
@@ -2991,42 +2992,42 @@ def handle_pending_action(chat_id: int, user_id: int, text: str) -> bool:
 
     # -- Archive Show --
     if action == "archive_show":
-        handle_command(chat_id, user_id, "/archive_show {}".format(t))
+        handle_command(chat_id, user_id, "/archive_show {}".format(txt))
         return True
 
     # -- Archive Log --
     if action == "archive_log":
-        handle_command(chat_id, user_id, "/archive_log {}".format(t))
+        handle_command(chat_id, user_id, "/archive_log {}".format(txt))
         return True
 
     # -- Auth Debug --
     if action == "auth_debug":
-        handle_command(chat_id, user_id, "/auth_debug {}".format(t))
+        handle_command(chat_id, user_id, "/auth_debug {}".format(txt))
         return True
 
     # -- Pipeline Config Custom --
     if action == "pipeline_config_custom":
-        handle_command(chat_id, user_id, "/set_pipeline {}".format(t))
+        handle_command(chat_id, user_id, "/set_pipeline {}".format(txt))
         return True
 
     # -- Workspace Add --
     if action == "workspace_add":
-        handle_command(chat_id, user_id, "/workspace_add {}".format(t))
+        handle_command(chat_id, user_id, "/workspace_add {}".format(txt))
         return True
 
     # -- Workspace Remove (text input fallback) --
     if action == "workspace_remove":
-        handle_command(chat_id, user_id, "/workspace_remove {}".format(t))
+        handle_command(chat_id, user_id, "/workspace_remove {}".format(txt))
         return True
 
     # -- Workspace Set Default (text input fallback) --
     if action == "workspace_set_default":
-        handle_command(chat_id, user_id, "/workspace_default {}".format(t))
+        handle_command(chat_id, user_id, "/workspace_default {}".format(txt))
         return True
 
     # -- Search Root Add --
     if action == "search_root_add":
-        handle_command(chat_id, user_id, "/workspace_search_roots add {}".format(t))
+        handle_command(chat_id, user_id, "/workspace_search_roots add {}".format(txt))
         return True
 
     return False
@@ -3218,8 +3219,8 @@ def _generate_and_send_summary(chat_id: int, workspace_path: Path) -> None:
 
 
 def handle_command(chat_id: int, user_id: int, text: str) -> bool:
-    t = (text or "").strip()
-    if t.startswith("/menu") or t.startswith("/start"):
+    txt = (text or "").strip()
+    if txt.startswith("/menu") or txt.startswith("/start"):
         active_workspace = resolve_active_workspace()
         auth_ready = "已启用" if get_auth_state() else "未初始化"
         backend = get_agent_backend()
@@ -3236,7 +3237,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/help"):
+    if txt.startswith("/help"):
         send_text(
             chat_id,
             HELP_TEXT,
@@ -3244,9 +3245,9 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/screenshot"):
+    if txt.startswith("/screenshot"):
         try:
-            body = t[12:].strip() if len(t) > 11 else ""
+            body = txt[12:].strip() if len(txt) > 11 else ""
             if body and _looks_like_screenshot_task_tail(body):
                 task_id = create_task(chat_id, user_id, "/task {}".format(t))
                 task = load_json(task_file("pending", task_id))
@@ -3266,7 +3267,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             send_text(chat_id, "截图失败: {}".format(str(exc)[:1000]))
         return True
 
-    if t.startswith("/ops_whoami"):
+    if txt.startswith("/ops_whoami"):
         active_workspace = resolve_active_workspace()
         send_text(
             chat_id,
@@ -3287,7 +3288,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/info"):
+    if txt.startswith("/info"):
         backend = get_agent_backend()
         model = get_claude_model() or "(未设置)"
         provider = get_model_provider() or "(未设置)"
@@ -3307,12 +3308,12 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\n".join(lines), reply_markup=back_to_menu_keyboard())
         return True
 
-    if t.startswith("/summary"):
+    if txt.startswith("/summary"):
         _do_summary_command(chat_id, user_id)
         return True
 
     # -- /task (no args): interactive workspace selection + task input --
-    if t == "/task":
+    if txt == "/task":
         from workspace_registry import ensure_current_workspace_registered, list_workspaces as _list_ws_cmd
         ensure_current_workspace_registered()
         workspaces = _list_ws_cmd()
@@ -3333,7 +3334,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             )
         return True
 
-    if t.startswith("/auth_init"):
+    if txt.startswith("/auth_init"):
         st = init_authenticator(issuer="aming-claw", account_name="telegram-ops")
         secret_line = (
             "secret(base32)={}".format(st.get("secret_b32", ""))
@@ -3361,7 +3362,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/auth_status"):
+    if txt.startswith("/auth_status"):
         st = get_auth_state()
         if not st:
             send_text(
@@ -3382,7 +3383,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/auth_debug"):
+    if txt.startswith("/auth_debug"):
         if not is_ops_allowed(chat_id, user_id):
             send_text(chat_id, "not authorized for /auth_debug")
             return True
@@ -3409,8 +3410,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\n".join(lines))
         return True
 
-    if t.startswith("/switch_backend"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/switch_backend"):
+        parts = txt.split(maxsplit=1)
         backend = parts[1].strip().lower() if len(parts) >= 2 else ""
         if not is_ops_allowed(chat_id, user_id):
             send_text(chat_id, "not authorized for /switch_backend")
@@ -3451,11 +3452,11 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             send_text(chat_id, "后端已切换为: {}\n新建任务将使用 {} 执行。".format(backend, backend))
         return True
 
-    if t.startswith("/switch_model"):
+    if txt.startswith("/switch_model"):
         if not is_ops_allowed(chat_id, user_id):
             send_text(chat_id, "not authorized for /switch_model")
             return True
-        parts = t.split(maxsplit=1)
+        parts = txt.split(maxsplit=1)
         arg = parts[1].strip() if len(parts) >= 2 else ""
         current_model = get_claude_model() or "(默认)"
         current_provider = get_model_provider() or "claude-cli"
@@ -3499,11 +3500,11 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/set_role_model"):
+    if txt.startswith("/set_role_model"):
         if not is_ops_allowed(chat_id, user_id):
             send_text(chat_id, "not authorized for /set_role_model")
             return True
-        parts = t.split()
+        parts = txt.split()
         if len(parts) < 3:
             send_text(
                 chat_id,
@@ -3552,11 +3553,11 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/set_pipeline"):
+    if txt.startswith("/set_pipeline"):
         if not is_ops_allowed(chat_id, user_id):
             send_text(chat_id, "not authorized for /set_pipeline")
             return True
-        parts = t.split(maxsplit=1)
+        parts = txt.split(maxsplit=1)
         raw = parts[1].strip().lower() if len(parts) >= 2 else ""
         if not raw:
             preset_list = "\n".join("  {} → {}".format(k, format_pipeline_stages(v)) for k, v in PIPELINE_PRESETS.items())
@@ -3590,7 +3591,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/show_pipeline"):
+    if txt.startswith("/show_pipeline"):
         backend = get_agent_backend()
         stages = get_pipeline_stages()
         if backend != "pipeline":
@@ -3637,7 +3638,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\n".join(lines))
         return True
 
-    if t.startswith("/mgr_status"):
+    if txt.startswith("/mgr_status"):
         status = read_manager_status()
         if not status:
             send_text(chat_id, "manager 未运行或状态文件不存在。\n可通过 start.ps1 启动 manager 服务。")
@@ -3651,7 +3652,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\n".join(lines))
         return True
 
-    if t.startswith("/mgr_restart"):
+    if txt.startswith("/mgr_restart"):
         otp = parse_otp(t)
         ok, msg = verify_risky_operation(chat_id, user_id, otp, "/mgr_restart <6位OTP>")
         if not ok:
@@ -3668,7 +3669,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/mgr_reinit"):
+    if txt.startswith("/mgr_reinit"):
         otp = parse_otp(t)
         ok, msg = verify_risky_operation(chat_id, user_id, otp, "/mgr_reinit <6位OTP>")
         if not ok:
@@ -3684,7 +3685,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/ops_restart"):
+    if txt.startswith("/ops_restart"):
         otp = parse_otp(t)
         ok, msg = verify_risky_operation(chat_id, user_id, otp, "/ops_restart <6位OTP>")
         if not ok:
@@ -3699,7 +3700,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/ops_set_workspace_pick"):
+    if txt.startswith("/ops_set_workspace_pick"):
         idx, otp = parse_pick_workspace_command(t)
         ok, msg = verify_risky_operation(
             chat_id,
@@ -3729,7 +3730,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "workspace 已切换为: {}".format(str(target)))
         return True
 
-    if t.startswith("/ops_set_workspace"):
+    if txt.startswith("/ops_set_workspace"):
         raw_path, otp = parse_set_workspace_command(t)
         ok, msg = verify_risky_operation(
             chat_id,
@@ -3782,8 +3783,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\n".join(lines[:25]))
         return True
 
-    if t.startswith("/accept"):
-        parts = t.split(maxsplit=2)
+    if txt.startswith("/accept"):
+        parts = txt.split(maxsplit=2)
         if len(parts) < 2:
             # No args: show pending_acceptance tasks as interactive list
             tasks = _collect_tasks_by_status(chat_id, "pending_acceptance")
@@ -3944,7 +3945,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
 
         return True
 
-    if t.startswith("/reject"):
+    if txt.startswith("/reject"):
         raw_reject = t[len("/reject"):].strip()
         reject_parts = raw_reject.split(None, 2)
         if not reject_parts:
@@ -4097,7 +4098,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/retry"):
+    if txt.startswith("/retry"):
         raw_retry = t[len("/retry"):].strip()
         retry_parts = raw_retry.split(None, 1)
         if not retry_parts:
@@ -4210,8 +4211,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         return True
 
     # -- /cancel: cancel processing/queued tasks --
-    if t.startswith("/cancel"):
-        cancel_parts = t.split(maxsplit=1)
+    if txt.startswith("/cancel"):
+        cancel_parts = txt.split(maxsplit=1)
         cancel_arg = cancel_parts[1].strip() if len(cancel_parts) >= 2 else ""
         if cancel_arg:
             # Direct cancel by ref
@@ -4282,7 +4283,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/clear_tasks"):
+    if txt.startswith("/clear_tasks"):
         active = list_active_tasks(chat_id=chat_id)
         if not active:
             send_text(chat_id, "当前没有活动任务，无需清空。", reply_markup=back_to_menu_keyboard())
@@ -4298,8 +4299,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             )
         return True
 
-    if t.startswith("/status"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/status"):
+        parts = txt.split(maxsplit=1)
         if len(parts) < 2:
             active = list_active_tasks(chat_id=chat_id)
             # Read full task data (with acceptance dict) for accurate status display.
@@ -4423,8 +4424,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             send_text(chat_id, build_events_text(task_id, str(found.get("task_code") or "-"), limit=8))
         return True
 
-    if t.startswith("/events"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/events"):
+        parts = txt.split(maxsplit=1)
         if len(parts) < 2:
             send_text(chat_id, "用法: /events <task_id|代号>")
             return True
@@ -4449,8 +4450,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, build_events_text(str(st.get("task_id") or task_id), str(st.get("task_code") or "-")))
         return True
 
-    if t.startswith("/archive_show"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/archive_show"):
+        parts = txt.split(maxsplit=1)
         if len(parts) < 2:
             send_text(chat_id, "用法: /archive_show <archive_id|task_id|代号>")
             return True
@@ -4485,8 +4486,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
                 send_text(chat_id, "{} 文件: {}".format(caption, str(p)))
         return True
 
-    if t.startswith("/archive_log"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/archive_log"):
+        parts = txt.split(maxsplit=1)
         if len(parts) < 2:
             send_text(chat_id, "用法: /archive_log <语意关键词|archive_id|task_id|代号>")
             return True
@@ -4528,8 +4529,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/archive"):
-        query = t[8:].strip() if len(t) > 8 else ""
+    if txt.startswith("/archive"):
+        query = txt[8:].strip() if len(txt) > 8 else ""
         if not query:
             grouped = grouped_archive_overview(limit_per_group=3)
             if not grouped:
@@ -4574,8 +4575,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
 
     # ── Workspace registry commands ──────────────────────────────────────────
 
-    if t.startswith("/workspace_add"):
-        parts = t.split(maxsplit=2)
+    if txt.startswith("/workspace_add"):
+        parts = txt.split(maxsplit=2)
         if len(parts) < 2:
             send_text(chat_id, "用法: /workspace_add <路径|关键词> [标签]")
             return True
@@ -4658,8 +4659,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         )
         return True
 
-    if t.startswith("/workspace_remove"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/workspace_remove"):
+        parts = txt.split(maxsplit=1)
         if len(parts) < 2:
             send_text(chat_id, "用法: /workspace_remove <工作目录ID>")
             return True
@@ -4671,8 +4672,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             send_text(chat_id, "工作目录未找到: {}".format(ws_id))
         return True
 
-    if t.startswith("/workspace_default"):
-        parts = t.split(maxsplit=1)
+    if txt.startswith("/workspace_default"):
+        parts = txt.split(maxsplit=1)
         if len(parts) < 2:
             send_text(chat_id, "用法: /workspace_default <工作目录ID>")
             return True
@@ -4689,8 +4690,8 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
             send_text(chat_id, "工作目录未找到: {}".format(ws_id))
         return True
 
-    if t.startswith("/workspace_search_roots"):
-        parts = t.split(maxsplit=2)
+    if txt.startswith("/workspace_search_roots"):
+        parts = txt.split(maxsplit=2)
         # /workspace_search_roots — show current
         if len(parts) < 2:
             roots = get_workspace_search_roots()
@@ -4779,7 +4780,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\u672a\u77e5\u5b50\u547d\u4ee4: {}\n\u7528\u6cd5: add / remove / clear".format(sub))
         return True
 
-    if t.startswith("/workspace_list") or t == "/workspaces":
+    if txt.startswith("/workspace_list") or txt == "/workspaces":
         from workspace_registry import list_workspaces as _list_ws
         workspaces = _list_ws(include_inactive=True)
         if not workspaces:
@@ -4809,7 +4810,7 @@ def handle_command(chat_id: int, user_id: int, text: str) -> bool:
         send_text(chat_id, "\n\n".join(lines), reply_markup=back_to_menu_keyboard())
         return True
 
-    if t.startswith("/workspace_status") or t == "/dispatch_status":
+    if txt.startswith("/workspace_status") or txt == "/dispatch_status":
         from parallel_dispatcher import get_dispatcher_status
         status = get_dispatcher_status()
         workers = status.get("workers", {})

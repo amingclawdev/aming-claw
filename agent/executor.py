@@ -44,6 +44,7 @@ from task_state import (
     update_task_runtime,
 )
 from config import get_agent_backend
+from i18n import t
 from backends import (
     process_codex,
     process_claude,
@@ -134,18 +135,17 @@ def process_screenshot(task: Dict, processing: Path) -> Dict:
             send_document(chat_id, p, caption="screenshot: {}".format(p.name))
             sent.append(str(p))
 
-    send_text(chat_id, "截图完成，已回传 {} 张图片。".format(len(sent)))
+    send_text(chat_id, t("msg.screenshot_done", count=len(sent)))
 
     timings = details.get("timings_ms") or {}
     if wants_timing(task):
         send_text(
             chat_id,
-            "截图耗时: total={}ms, capture={}ms, copy={}ms, gateway={}ms".format(
-                timings.get("total_ms", 0),
-                timings.get("capture_ms", 0),
-                timings.get("copy_ms", 0),
-                gateway.get("_elapsed_ms", 0),
-            ),
+            t("msg.screenshot_timing_gw",
+              total=timings.get("total_ms", 0),
+              capture=timings.get("capture_ms", 0),
+              copy=timings.get("copy_ms", 0),
+              gateway=gateway.get("_elapsed_ms", 0)),
         )
 
     result = {
@@ -223,10 +223,7 @@ def _handle_task_failure(task: Dict, processing: Path, chat_id: int, exc: Except
     err_display = "\n".join(err_lines)
     send_text(
         chat_id,
-        "\u274c \u4efb\u52a1 [{code}] \u6267\u884c\u5931\u8d25\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u5931\u8d25\u539f\u56e0: {err}".format(
-            code=task_code,
-            err=err_display,
-        ),
+        t("msg.task_failed", code=task_code, err=err_display),
         reply_markup=task_inline_keyboard(task_code, task["task_id"]),
     )
     mark_task_completion_notified(task["task_id"])
