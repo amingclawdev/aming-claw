@@ -1,10 +1,183 @@
-# aming_claw
+# Aming Claw
 
-A Telegram-controlled AI task runner that wraps the Codex CLI with a robust pipeline: state machine, heartbeat monitoring, two-factor acceptance gates, and automatic archiving.
+[English](#english) | [中文](#中文)
 
 ---
 
-## Quick Start
+<a name="english"></a>
+## English
+
+### A Self-Evolving AI Development Tool
+
+Aming Claw is a self-evolving AI development tool that manages its own codebase through a Telegram-driven task pipeline. Rather than being a passive assistant, Aming Claw operates as an autonomous development team: a product manager writes requirements, a developer codes the solution, a tester validates the output, and a QA auditor reviews quality -- all powered by AI models, all orchestrated through a single Telegram chat.
+
+The core idea is **iterative self-improvement**. Every task submitted through Telegram flows through a multi-stage AI pipeline, producing code changes that are reviewed by a human gatekeeper. Accepted changes are committed and archived. Rejected changes are rolled back, and the feedback loop starts again. Over time, the system improves itself -- updating its own code, fixing its own bugs, and extending its own capabilities.
+
+### Key Capabilities
+
+- **Multi-stage AI pipeline** -- Configurable stage sequences (plan, code, verify) or role-based pipelines (PM, Dev, Test, QA) where each stage builds on accumulated context from prior stages
+- **Multiple AI backends** -- Anthropic Claude, OpenAI GPT, and Codex CLI as interchangeable backends with per-stage model binding
+- **Human-in-the-loop acceptance gates** -- Every task result requires explicit human approval before changes are committed; optional TOTP-based 2FA for critical operations
+- **Git checkpoint and rollback** -- Automatic pre-task checkpointing with full rollback on rejection, ensuring the codebase stays clean
+- **Self-update via `/mgr_reinit`** -- The system can pull its own latest code and restart itself, closing the self-evolution loop
+- **Workspace management** -- Multiple project workspaces with per-workspace task queuing and parallel dispatch
+- **Internationalization (i18n)** -- Full English and Chinese language support throughout the Telegram UI, powered by a lightweight locale system (`agent/i18n.py` with `agent/locales/en.json` and `agent/locales/zh.json`)
+- **Interactive Telegram menus** -- Hierarchical button-based UI for task management, system configuration, workspace selection, and security settings
+- **Screenshot capabilities** -- Host-level screenshots via the executor gateway for visual verification
+- **Automatic timeout and retry** -- Heartbeat monitoring, configurable timeouts, and automatic retries for noop/ack-only responses
+
+### How Self-Evolution Works
+
+```
+  Developer sends task via Telegram
+        |
+        v
+  [ AI Pipeline Executes ]
+  PM -> Dev -> Test -> QA   (or plan -> code -> verify)
+        |
+        v
+  [ Human Review ]
+  Accept: changes committed, task archived
+  Reject: git rollback, feedback incorporated, cycle restarts
+        |
+        v
+  [ /mgr_reinit ]
+  System pulls its own updates and restarts
+        |
+        v
+  Aming Claw is now running its own improved code
+```
+
+The acceptance/rejection loop is the engine of self-evolution. Each rejected task carries feedback that informs the next attempt. Each accepted task permanently advances the codebase. The system can modify any file in its own repository -- including its pipeline logic, its backend integrations, and its Telegram interface.
+
+---
+
+### Architecture
+
+```
+Telegram User
+     | sends message
+     v
++-----------------+
+|   Coordinator   |  coordinator.py -- Telegram polling, command handling,
+|                 |  acceptance gates, timeout detection, archiving
++--------+--------+
+         | writes task file to shared-volume/codex-tasks/pending/
+         v
++-----------------+
+|    Executor     |  executor.py -- picks up pending tasks, invokes AI backend,
+|                 |  streams output, writes results, updates heartbeat
++--------+--------+
+         | optional screenshot / file ops via HTTP
+         v
++-----------------+
+| Executor Gateway|  executor-gateway/ (FastAPI) -- REST API for screenshots
+|  (host process) |  and file operations on the host machine, port 8090
++-----------------+
+
+Service Manager (service_manager.py):
+  - Monitors coordinator + executor processes (auto-restart on crash)
+  - Handles /mgr_reinit (git pull + restart) and /mgr_restart signals
+  - Writes live status to state/manager_status.json
+
+Parallel Dispatcher (parallel_dispatcher.py):
+  - Worker-pool model: each registered workspace gets its own worker thread
+  - Tasks routed to workspace based on explicit targeting or default assignment
+  - Sequential execution within a workspace, parallel across workspaces
+
+Shared storage: shared-volume/codex-tasks/
+  pending/      -- task queue (JSON files)
+  processing/   -- tasks currently running
+  results/      -- completed tasks awaiting acceptance
+  archive/      -- accepted tasks (permanent)
+  state/        -- status.json, events.jsonl per task
+  logs/         -- run logs
+  acceptance/   -- acceptance documents and test cases
+```
+
+---
+
+### Task Lifecycle
+
+```
+User sends message
+       |
+       v
+  [ pending ]  -------- task file written to pending/
+       |
+       v  Executor picks up task
+  [ processing ]  -----  heartbeat updated every 30s
+       |
+       +- AI returns ACK-only? --> retry (TASK_NOOP_RETRIES) --> [ failed ]
+       |
+       v  AI produces output
+  [ pending_acceptance ]  ---  Telegram notification with Accept/Reject buttons
+       |
+       +---- User rejects (+ OTP if 2FA on) -------> [ rejected ]
+       |                                                   |
+       |                                       git rollback to checkpoint
+       |                                       (stays in results/, iterable)
+       |
+       +---- User accepts (+ OTP if 2FA on) --> [ accepted ] --> [ archived ]
+                                                     |
+                                             git commit of changes
+```
+
+#### Status fields in `state/task_state/{task_id}/status.json`
+
+| Field | Description |
+|---|---|
+| `task_id` | Unique ID (`task-<ts>-<hex>`) |
+| `task_code` | Short human-readable alias (e.g. `AB1`) |
+| `status` | Current state (see lifecycle above) |
+| `started_at` | When executor began processing |
+| `ended_at` | When task reached terminal state |
+| `progress` | 0-100 progress hint from executor |
+| `worker_id` | Hostname of executor that ran the task |
+| `attempt` | Number of execution attempts |
+| `heartbeat_at` | Last heartbeat timestamp (updated every 30s) |
+| `completion_notified_at` | When Telegram notification was sent |
+
+---
+
+### Pipeline Modes
+
+Aming Claw supports three execution backends and two pipeline strategies.
+
+#### Backends
+
+| Backend | Description |
+|---|---|
+| `claude` | Direct Anthropic Claude API calls |
+| `codex` | OpenAI Codex CLI wrapper |
+| `pipeline` | Multi-stage pipeline combining multiple backends |
+
+#### Stage-based Pipeline (plan / code / verify)
+
+Each stage runs a different AI backend and passes accumulated context forward:
+
+| Preset | Stages |
+|---|---|
+| `plan_code_verify` | plan (Claude) -> code (Claude) -> verify (Codex) |
+| `plan_code` | plan (Claude) -> code (Claude) |
+| `code_verify` | code (Claude) -> verify (Codex) |
+
+#### Role-based Pipeline (PM / Dev / Test / QA)
+
+A software team simulation where each role has a defined responsibility:
+
+| Role | Responsibility |
+|---|---|
+| PM | Analyze requirements, write specifications |
+| Dev | Implement the solution based on PM's spec |
+| Test | Validate the implementation, write test cases |
+| QA | Audit code quality, check for edge cases |
+
+Per-role model binding is configurable via `pipeline_config.yaml` or environment variables, allowing different AI models for different roles.
+
+---
+
+### Quick Start
 
 ```powershell
 # 1. Download Python 3.12 + install all dependencies (one-time)
@@ -18,90 +191,15 @@ notepad .env          # fill in TELEGRAM_BOT_TOKEN_CODEX and EXECUTOR_API_TOKEN
 .\start.ps1
 ```
 
-> **Requirements:** Windows 10/11. No Python installation needed — `setup.ps1` downloads an embedded Python 3.12 runtime into `runtime/python/`.
+> **Requirements:** Windows 10/11. No Python installation needed -- `setup.ps1` downloads an embedded Python 3.12 runtime into `runtime/python/`.
 
 ---
 
-## Architecture
+### Two-Factor Authentication (2FA)
 
-```
-Telegram User
-     │ sends message
-     ▼
-┌─────────────────┐
-│   Coordinator   │  coordinator.py — Telegram polling, command handling,
-│  (codex-team)   │  acceptance gates, timeout detection, archiving
-└────────┬────────┘
-         │ writes task file to shared-volume/codex-tasks/pending/
-         ▼
-┌─────────────────┐
-│    Executor     │  executor.py — picks up pending tasks, invokes Codex CLI,
-│  (codex-team)   │  streams output, writes results, updates heartbeat
-└────────┬────────┘
-         │ optional screenshot / file ops via HTTP
-         ▼
-┌─────────────────┐
-│ Executor Gateway│  executor-gateway/ (FastAPI) — REST API for screenshots
-│  (host process) │  and file operations on the host machine, port 8090
-└─────────────────┘
+Aming Claw uses TOTP (RFC 6238) to protect irreversible operations. Task acceptance is a destructive action -- once accepted, the task is permanently archived and changes committed. Enabling 2FA ensures no accidental clicks can commit that action.
 
-Shared storage: shared-volume/codex-tasks/
-  pending/      — task queue (JSON files)
-  processing/   — tasks currently running
-  results/      — completed tasks awaiting acceptance
-  archive/      — accepted tasks (permanent)
-  state/        — status.json, events.jsonl per task
-  logs/         — run logs
-  acceptance/   — acceptance documents and test cases
-```
-
----
-
-## Task Lifecycle
-
-```
-User sends message
-       │
-       ▼
-  [ pending ]  ──────── task file written to pending/
-       │
-       ▼ Executor picks up task
-  [ processing ]  ─────  heartbeat updated every 30s
-       │
-       ├─ Codex returns ACK-only? ──► retry (TASK_NOOP_RETRIES) ──► [ failed ]
-       │
-       ▼ Codex produces output
-  [ pending_acceptance ]  ───  Telegram notification with Accept/Reject buttons
-       │
-       ├──── User rejects ──────────────────────► [ rejected ]
-       │                                               │
-       │                                   (stays in results/, iterable)
-       │
-       └──── User accepts (+ OTP if 2FA on) ──► [ accepted ] ──► [ archived ]
-```
-
-### Status fields in `state/task_state/{task_id}/status.json`
-
-| Field | Description |
-|---|---|
-| `task_id` | Unique ID (`task-<ts>-<hex>`) |
-| `task_code` | Short human-readable alias (e.g. `AB1`) |
-| `status` | Current state (see lifecycle above) |
-| `started_at` | When executor began processing |
-| `ended_at` | When task reached terminal state |
-| `progress` | 0–100 progress hint from executor |
-| `worker_id` | Hostname of executor that ran the task |
-| `attempt` | Number of execution attempts |
-| `heartbeat_at` | Last heartbeat timestamp (updated every 30s) |
-| `completion_notified_at` | When Telegram notification was sent |
-
----
-
-## Two-Factor Authentication (2FA)
-
-aming_claw uses TOTP (RFC 6238) to protect irreversible operations. Task acceptance is a destructive action — once accepted, the task is permanently archived. Enabling 2FA ensures no accidental clicks can commit that action.
-
-### Setup
+#### Setup
 
 1. In Telegram, send `/auth_init` to the bot.
 2. The bot replies with a base32 secret and an `otpauth://` URI. Scan it with any authenticator app (Google Authenticator, Authy, 1Password, etc.).
@@ -113,7 +211,7 @@ aming_claw uses TOTP (RFC 6238) to protect irreversible operations. Task accepta
 
 > **Note:** 2FA for acceptance is only enforced when **both** `TASK_STRICT_ACCEPTANCE=1` **and** the authenticator has been initialized via `/auth_init`. If either condition is missing, acceptance works without OTP.
 
-### TOTP settings
+#### TOTP Settings
 
 | Variable | Default | Description |
 |---|---|---|
@@ -123,71 +221,65 @@ aming_claw uses TOTP (RFC 6238) to protect irreversible operations. Task accepta
 
 ---
 
-## Task Acceptance Flow
+### Task Acceptance Flow
 
-### Without 2FA (`TASK_STRICT_ACCEPTANCE=0`)
-
-```
-Task completes
-    │
-    ▼
-Telegram: "Task [AB1] complete. Awaiting acceptance."
-          [✅ Accept]  [❌ Reject]  [📊 Status]  [📋 Events]
-    │
-    ├── Click [✅ Accept]  →  Task immediately accepted and archived
-    └── Click [❌ Reject]  →  Bot prompts: /reject AB1 <reason>
-```
-
-### With 2FA enabled (`TASK_STRICT_ACCEPTANCE=1` + `/auth_init` done)
+#### Without 2FA (`TASK_STRICT_ACCEPTANCE=0`)
 
 ```
 Task completes
-    │
-    ▼
+    |
+    v
 Telegram: "Task [AB1] complete. Awaiting acceptance."
-          [✅ Accept]  [❌ Reject]  [📊 Status]  [📋 Events]
-    │
-    ├── Click [✅ Accept]
-    │       │
-    │       ▼
-    │   Bot: "2FA required to accept task [AB1].
-    │         Send: /accept AB1 <6-digit OTP>"
-    │       │
-    │       ▼
-    │   User sends: /accept AB1 123456
-    │       │
-    │       ├── OTP valid   →  Task accepted and archived ✅
-    │       └── OTP invalid →  "2FA failed: OTP invalid or expired." ❌
-    │
-    └── Click [❌ Reject]
-            │
-            ▼
+          [Accept]  [Reject]  [Status]  [Events]
+    |
+    +-- Click [Accept]  ->  Task immediately accepted, changes committed, archived
+    +-- Click [Reject]  ->  Git rollback to checkpoint; bot prompts: /reject AB1 <reason>
+```
+
+#### With 2FA enabled (`TASK_STRICT_ACCEPTANCE=1` + `/auth_init` done)
+
+```
+Task completes
+    |
+    v
+Telegram: "Task [AB1] complete. Awaiting acceptance."
+          [Accept]  [Reject]  [Status]  [Events]
+    |
+    +-- Click [Accept]
+    |       |
+    |       v
+    |   Bot: "2FA required to accept task [AB1].
+    |         Send: /accept AB1 <6-digit OTP>"
+    |       |
+    |       +-- OTP valid   ->  Task accepted, changes committed, archived
+    |       +-- OTP invalid ->  "2FA failed: OTP invalid or expired."
+    |
+    +-- Click [Reject]
+            |
+            v
         Bot: "2FA required to reject task [AB1].
               Send: /reject AB1 <6-digit OTP> [reason]"
-            │
-            ▼
-        User sends: /reject AB1 123456 Implementation does not handle edge case
-            │
-            ├── OTP valid   →  Task rejected, stays in results/ for iteration ✅
-            └── OTP invalid →  "2FA failed: OTP invalid or expired." ❌
+            |
+            +-- OTP valid   ->  Git rollback; task stays in results/ for iteration
+            +-- OTP invalid ->  "2FA failed: OTP invalid or expired."
 ```
 
 ---
 
-## Command Reference
+### Command Reference
 
-### Task commands
+#### Task Commands
 
 | Command | Description |
 |---|---|
-| `<any text>` | Create and queue a new Codex task |
+| `<any text>` | Create and queue a new task |
 | `/status` | List all active tasks (pending + in-progress + awaiting acceptance) |
 | `/status <ref>` | Show detailed status for a task by ID or short code |
 | `/accept <ref> [OTP]` | Accept task result and archive it (OTP required if 2FA enabled) |
-| `/reject <ref> [OTP] [reason]` | Reject task result (OTP required if 2FA enabled) |
+| `/reject <ref> [OTP] [reason]` | Reject task result with optional feedback (OTP required if 2FA enabled) |
 | `/events <ref>` | Show recent events for a task |
 
-### Archive commands
+#### Archive Commands
 
 | Command | Description |
 |---|---|
@@ -195,7 +287,7 @@ Telegram: "Task [AB1] complete. Awaiting acceptance."
 | `/archive_show <archive_id>` | Show details of an archived task |
 | `/archive_search <keyword>` | Search archive by keyword |
 
-### 2FA commands
+#### 2FA Commands
 
 | Command | Description |
 |---|---|
@@ -203,39 +295,67 @@ Telegram: "Task [AB1] complete. Awaiting acceptance."
 | `/auth_status` | Show current 2FA configuration |
 | `/auth_debug <OTP>` | Debug OTP verification (ops-only) |
 
-### Ops commands (require OTP + whitelist)
+#### Management Commands
+
+| Command | Description |
+|---|---|
+| `/mgr_reinit <OTP>` | Git pull + restart all services (self-update) |
+| `/mgr_restart <OTP>` | Restart all services |
+| `/mgr_status` | Show service manager status |
+
+#### Ops Commands (require OTP + whitelist)
 
 | Command | Description |
 |---|---|
 | `/ops_restart <OTP>` | Restart all services |
-| `/ops_set_workspace <path\|default> <OTP>` | Switch Codex working directory |
+| `/ops_set_workspace <path\|default> <OTP>` | Switch working directory |
 | `/ops_set_workspace_pick <n> <OTP>` | Pick from candidate workspaces |
+
+#### Interactive Menu
+
+Send `/menu` to open the interactive button-based dashboard with sub-menus for:
+- Task management (create, status, accept/reject)
+- System configuration (backend, pipeline, model selection)
+- Workspace management (add/remove/default/queue status)
+- Security settings (2FA setup, auth status)
+- Ops controls (restart, reinit)
 
 ---
 
-## Configuration Reference
+### Configuration Reference
 
 Copy `.env.example` to `.env` and fill in the required values.
 
-### Required
+#### Required
 
 | Variable | Description |
 |---|---|
 | `TELEGRAM_BOT_TOKEN_CODEX` | Telegram bot token (dedicated bot recommended) |
 | `EXECUTOR_API_TOKEN` | Shared secret for executor-gateway authentication |
 
-### Execution
+#### Execution
 
 | Variable | Default | Description |
 |---|---|---|
 | `CODEX_BIN` | `codex.cmd` | Codex CLI binary name |
-| `CODEX_WORKSPACE` | cwd | Directory Codex operates in |
-| `CODEX_TIMEOUT_SEC` | `900` | Max seconds for a single Codex run |
+| `CODEX_WORKSPACE` | cwd | Directory the AI operates in |
+| `CODEX_TIMEOUT_SEC` | `900` | Max seconds for a single execution run |
 | `CODEX_TIMEOUT_RETRIES` | `1` | Retry count on timeout |
-| `CODEX_MODEL` | | Override Codex model (leave blank for default) |
-| `CODEX_DANGEROUS` | `1` | Pass `--dangerously-auto-approve` to Codex |
+| `CODEX_MODEL` | | Override model (leave blank for default) |
+| `CODEX_DANGEROUS` | `1` | Pass `--dangerously-auto-approve` to Codex CLI |
 
-### Acceptance & 2FA
+#### AI Backend & Pipeline
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_BACKEND` | `pipeline` | Active backend: `codex`, `claude`, or `pipeline` |
+| `PIPELINE_DEFAULT_PROVIDER` | `anthropic` | Default provider for pipeline stages |
+| `PIPELINE_ROLE_PM_MODEL` | | Override model for PM role |
+| `PIPELINE_ROLE_DEV_MODEL` | | Override model for Dev role |
+| `PIPELINE_ROLE_TEST_MODEL` | | Override model for Test role |
+| `PIPELINE_ROLE_QA_MODEL` | | Override model for QA role |
+
+#### Acceptance & 2FA
 
 | Variable | Default | Description |
 |---|---|---|
@@ -244,17 +364,17 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `AUTH_ALLOW_30_FALLBACK` | `1` | Try 30s TOTP period as fallback |
 | `AUTH_AUTO_INIT` | `0` | Auto-initialize 2FA seed on first run |
 
-### Timeouts & polling
+#### Timeouts & Polling
 
 | Variable | Default | Description |
 |---|---|---|
 | `TASK_TIMEOUT_SEC` | `1800` | Seconds before a stuck task is marked `timeout` |
 | `EXECUTOR_HEARTBEAT_SEC` | `30` | Heartbeat interval in seconds |
-| `TASK_NOOP_RETRIES` | `1` | Retries when Codex returns acknowledgement-only output |
+| `TASK_NOOP_RETRIES` | `1` | Retries when AI returns acknowledgement-only output |
 | `COORDINATOR_POLL_INTERVAL_SEC` | `1` | Telegram update polling interval |
 | `EXECUTOR_POLL_SEC` | `1` | Task queue polling interval |
 
-### Storage paths
+#### Storage Paths
 
 | Variable | Default | Description |
 |---|---|---|
@@ -262,51 +382,521 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `WORKSPACE_PATH` | cwd | Host workspace path for executor-gateway |
 | `EXECUTOR_BASE_URL` | `http://127.0.0.1:8090` | Gateway URL used by coordinator |
 
+#### Internationalization
+
+| Variable | Default | Description |
+|---|---|---|
+| `LANGUAGE` | `zh` | UI language: `zh` (Chinese) or `en` (English) |
+
 ---
 
-## File Structure
+### File Structure
 
 ```
 aming_claw/
-├── setup.ps1                  # One-time: download Python + install deps
-├── start.ps1                  # Launch all three services
-├── .env.example               # Configuration template
-├── codex-team/
-│   ├── coordinator.py         # Telegram bot + task lifecycle management
-│   ├── executor.py            # Task runner (invokes Codex CLI)
-│   ├── task_runtime.py        # State machine, events, heartbeat functions
-│   ├── common.py              # Shared utilities (atomic JSON, Telegram API)
-│   ├── auth_executor.py       # TOTP-based 2FA implementation
-│   └── requirements.txt
-├── executor-gateway/
-│   ├── app/main.py            # FastAPI service for screenshots & file ops
-│   └── requirements.txt
-├── scripts/
-│   ├── _get_python.ps1        # Returns bundled python.exe path
-│   ├── run-codex-coordinator.ps1
-│   ├── run-codex-executor.ps1
-│   └── run-executor-host.ps1
-└── runtime/
-    └── python/                # Downloaded by setup.ps1, excluded from git
++-- setup.ps1                  # One-time: download Python + install deps
++-- start.ps1                  # Launch all services
++-- init.ps1                   # Initialize environment
++-- .env.example               # Configuration template
++-- agent/
+|   +-- coordinator.py         # Telegram bot + task lifecycle management
+|   +-- executor.py            # Task runner (invokes AI backends)
+|   +-- bot_commands.py        # Command handlers and routing
+|   +-- config.py              # Runtime backend/pipeline configuration
+|   +-- task_state.py          # State machine, events, heartbeat
+|   +-- task_accept.py         # Post-acceptance test runner
+|   +-- task_retry.py          # Retry logic for failed tasks
+|   +-- backends.py            # AI backend integrations (Claude, Codex, OpenAI)
+|   +-- pipeline_config.py     # Per-role provider/model binding
+|   +-- model_registry.py      # Fetch available models from Anthropic/OpenAI APIs
+|   +-- auth.py                # TOTP-based 2FA implementation
+|   +-- workspace.py           # Workspace resolution and switching
+|   +-- workspace_registry.py  # Multi-workspace registration
+|   +-- workspace_queue.py     # Per-workspace FIFO task queue
+|   +-- parallel_dispatcher.py # Parallel task dispatch across workspaces
+|   +-- git_rollback.py        # Git checkpoint, rollback, and commit
+|   +-- service_manager.py     # Process monitoring, reinit, restart
+|   +-- interactive_menu.py    # Telegram button-based UI
+|   +-- i18n.py                # Internationalization engine
+|   +-- utils.py               # Shared utilities (atomic JSON, Telegram API)
+|   +-- locales/
+|   |   +-- zh.json            # Chinese translations
+|   |   +-- en.json            # English translations
+|   +-- tests/                 # 213 test cases covering all modules
+|   +-- requirements.txt
++-- executor-gateway/
+|   +-- app/main.py            # FastAPI service for screenshots & file ops
+|   +-- requirements.txt
++-- scripts/
+|   +-- _get_python.ps1        # Returns bundled python.exe path
+|   +-- start-coordinator.ps1
+|   +-- start-executor.ps1
+|   +-- start-gateway.ps1
+|   +-- start-manager.ps1
+|   +-- restart-all.ps1
+|   +-- restart-agent.ps1
+|   +-- restart-from-telegram.ps1
+|   +-- reload-after-executor-change.ps1
++-- runtime/
+    +-- python/                # Downloaded by setup.ps1, excluded from git
 ```
 
 ---
 
-## Troubleshooting
+### Troubleshooting
 
-**Bot doesn't respond to messages**
+**Bot does not respond to messages**
 - Check `TELEGRAM_BOT_TOKEN_CODEX` is set correctly in `.env`
 - Ensure the coordinator service is running (check the coordinator terminal window)
+- Verify the service manager is running: `.\scripts\start-manager.ps1`
 
 **Tasks stuck in `processing`**
 - The coordinator auto-marks tasks as `timeout` after `TASK_TIMEOUT_SEC` seconds without a heartbeat
 - Check executor terminal for errors; verify `CODEX_BIN` is accessible
+- Try increasing `CODEX_TIMEOUT_SEC` for long-running tasks
 
 **"2FA failed: OTP invalid or expired"**
 - Ensure your device clock is synchronized (NTP)
 - Increase `AUTH_OTP_WINDOW` (e.g. `AUTH_OTP_WINDOW=3`) to tolerate clock skew
 - Run `/auth_debug <OTP>` to see detailed verification info
 
-**Codex returns acknowledgement without acting**
+**AI returns acknowledgement without acting**
 - This is a model behavior issue. The pipeline detects ACK-only messages and retries once (`TASK_NOOP_RETRIES=1`)
 - If it persists, the task is marked `failed`; retry by sending the task again
+- Consider switching to a different model via the interactive menu
+
+**Git rollback fails on rejection**
+- Ensure the workspace is a valid git repository with at least one commit
+- Check that the pre-task checkpoint was created (look for `[aming-claw checkpoint]` commits)
+
+**Language not switching**
+- Set `LANGUAGE=en` or `LANGUAGE=zh` in `.env` and restart services
+- Or use the interactive menu to switch language at runtime
+
+---
+
+---
+
+<a name="中文"></a>
+## 中文
+
+### 自我迭代的AI开发工具
+
+Aming Claw 是一个自我迭代的AI开发工具，通过 Telegram 驱动的任务流水线管理自己的代码库。它不是一个被动的助手，而是一个自主运作的开发团队：产品经理撰写需求、开发者编写代码、测试者验证输出、QA审计质量——全部由AI模型驱动，全部通过一个 Telegram 对话进行协调。
+
+核心理念是**迭代式自我进化**。通过 Telegram 提交的每个任务都会经过多阶段AI流水线，产生代码变更，由人类把关者审查。接受的变更被提交并归档。拒绝的变更被回滚，反馈循环重新开始。随着时间推移，系统不断改进自身——更新自己的代码，修复自己的缺陷，扩展自己的能力。
+
+### 核心能力
+
+- **多阶段AI流水线** -- 可配置的阶段序列（计划、编码、验证）或基于角色的流水线（PM、Dev、Test、QA），每个阶段基于前序阶段的累积上下文构建
+- **多AI后端** -- Anthropic Claude、OpenAI GPT 和 Codex CLI 作为可互换的后端，支持每阶段独立绑定模型
+- **人在回路的验收门** -- 每个任务结果都需要明确的人工批准才能提交变更；关键操作可选 TOTP 双因素认证
+- **Git 检查点与回滚** -- 任务执行前自动创建检查点，拒绝时完全回滚，确保代码库始终干净
+- **通过 `/mgr_reinit` 自我更新** -- 系统可以拉取自己的最新代码并重启，形成自我进化闭环
+- **工作区管理** -- 多项目工作区，支持每工作区任务队列和并行调度
+- **国际化 (i18n)** -- 完整的中英文界面支持，由轻量级多语言系统驱动（`agent/i18n.py` 配合 `agent/locales/en.json` 和 `agent/locales/zh.json`）
+- **交互式 Telegram 菜单** -- 层级化按钮界面，用于任务管理、系统配置、工作区选择和安全设置
+- **截图能力** -- 通过执行器网关在宿主机上截屏，用于可视化验证
+- **自动超时与重试** -- 心跳监控、可配置超时时间、对空回复/确认式响应自动重试
+
+### 自我进化机制
+
+```
+  开发者通过 Telegram 发送任务
+        |
+        v
+  [ AI 流水线执行 ]
+  PM -> Dev -> Test -> QA   (或 plan -> code -> verify)
+        |
+        v
+  [ 人工审查 ]
+  接受: 变更提交, 任务归档
+  拒绝: git 回滚, 纳入反馈, 循环重启
+        |
+        v
+  [ /mgr_reinit ]
+  系统拉取自身更新并重启
+        |
+        v
+  Aming Claw 已在运行自己改进后的代码
+```
+
+验收/拒绝循环是自我进化的引擎。每次拒绝都附带反馈信息，为下一次尝试提供改进方向。每次接受都永久地推进代码库。系统可以修改自身仓库中的任何文件——包括流水线逻辑、后端集成和 Telegram 界面。
+
+---
+
+### 架构
+
+```
+Telegram 用户
+     | 发送消息
+     v
++-----------------+
+|   协调器        |  coordinator.py -- Telegram 轮询、命令处理、
+|  Coordinator    |  验收门控、超时检测、归档
++--------+--------+
+         | 将任务文件写入 shared-volume/codex-tasks/pending/
+         v
++-----------------+
+|   执行器        |  executor.py -- 提取待处理任务、调用AI后端、
+|   Executor      |  流式输出、写入结果、更新心跳
++--------+--------+
+         | 可选: 通过 HTTP 截图/文件操作
+         v
++-----------------+
+| 执行器网关      |  executor-gateway/ (FastAPI) -- 截图与文件操作的
+| Executor Gateway|  REST API，端口 8090
++-----------------+
+
+服务管理器 (service_manager.py):
+  - 监控协调器 + 执行器进程（崩溃自动重启）
+  - 处理 /mgr_reinit (git pull + 重启) 和 /mgr_restart 信号
+  - 将实时状态写入 state/manager_status.json
+
+并行调度器 (parallel_dispatcher.py):
+  - 工作池模型：每个注册的工作区拥有独立的工作线程
+  - 任务根据显式指定或默认分配路由到工作区
+  - 工作区内顺序执行，跨工作区并行执行
+
+共享存储: shared-volume/codex-tasks/
+  pending/      -- 任务队列（JSON 文件）
+  processing/   -- 正在执行的任务
+  results/      -- 已完成待验收的任务
+  archive/      -- 已接受的任务（永久存储）
+  state/        -- 每个任务的 status.json、events.jsonl
+  logs/         -- 运行日志
+  acceptance/   -- 验收文档和测试用例
+```
+
+---
+
+### 任务生命周期
+
+```
+用户发送消息
+       |
+       v
+  [ pending 待处理 ]  -------- 任务文件写入 pending/
+       |
+       v  执行器提取任务
+  [ processing 处理中 ]  -----  每 30 秒更新心跳
+       |
+       +- AI 返回仅确认? --> 重试 (TASK_NOOP_RETRIES) --> [ failed 失败 ]
+       |
+       v  AI 产生输出
+  [ pending_acceptance 待验收 ]  ---  Telegram 通知，附带接受/拒绝按钮
+       |
+       +---- 用户拒绝 (+ OTP 若启用 2FA) -------> [ rejected 已拒绝 ]
+       |                                                   |
+       |                                         git 回滚到检查点
+       |                                         (保留在 results/，可迭代)
+       |
+       +---- 用户接受 (+ OTP 若启用 2FA) --> [ accepted 已接受 ] --> [ archived 已归档 ]
+                                                     |
+                                               git 提交变更
+```
+
+#### `state/task_state/{task_id}/status.json` 中的状态字段
+
+| 字段 | 说明 |
+|---|---|
+| `task_id` | 唯一ID (`task-<ts>-<hex>`) |
+| `task_code` | 简短可读别名 (如 `AB1`) |
+| `status` | 当前状态 (见上方生命周期) |
+| `started_at` | 执行器开始处理的时间 |
+| `ended_at` | 任务到达终态的时间 |
+| `progress` | 0-100 进度提示 |
+| `worker_id` | 执行任务的执行器主机名 |
+| `attempt` | 执行尝试次数 |
+| `heartbeat_at` | 最近一次心跳时间戳 (每 30 秒更新) |
+| `completion_notified_at` | Telegram 通知发送时间 |
+
+---
+
+### 流水线模式
+
+Aming Claw 支持三种执行后端和两种流水线策略。
+
+#### 后端
+
+| 后端 | 说明 |
+|---|---|
+| `claude` | 直接调用 Anthropic Claude API |
+| `codex` | OpenAI Codex CLI 封装 |
+| `pipeline` | 多阶段流水线，组合多个后端 |
+
+#### 阶段式流水线 (plan / code / verify)
+
+每个阶段运行不同的AI后端，并传递累积上下文：
+
+| 预设 | 阶段 |
+|---|---|
+| `plan_code_verify` | plan (Claude) -> code (Claude) -> verify (Codex) |
+| `plan_code` | plan (Claude) -> code (Claude) |
+| `code_verify` | code (Claude) -> verify (Codex) |
+
+#### 角色式流水线 (PM / Dev / Test / QA)
+
+模拟软件团队，每个角色有明确的职责：
+
+| 角色 | 职责 |
+|---|---|
+| PM (产品经理) | 分析需求，撰写规格说明 |
+| Dev (开发) | 根据PM的规格实现方案 |
+| Test (测试) | 验证实现，编写测试用例 |
+| QA (质量保证) | 审计代码质量，检查边界情况 |
+
+可通过 `pipeline_config.yaml` 或环境变量为每个角色配置不同的AI模型。
+
+---
+
+### 快速开始
+
+```powershell
+# 1. 下载 Python 3.12 + 安装所有依赖（首次运行）
+.\setup.ps1
+
+# 2. 配置环境
+copy .env.example .env
+notepad .env          # 填入 TELEGRAM_BOT_TOKEN_CODEX 和 EXECUTOR_API_TOKEN
+
+# 3. 启动所有服务
+.\start.ps1
+```
+
+> **系统要求：** Windows 10/11。无需预装 Python —— `setup.ps1` 会自动下载嵌入式 Python 3.12 运行时到 `runtime/python/`。
+
+---
+
+### 双因素认证 (2FA)
+
+Aming Claw 使用 TOTP (RFC 6238) 保护不可逆操作。任务接受是破坏性操作——一旦接受，任务将永久归档且变更被提交。启用 2FA 可防止误操作。
+
+#### 设置步骤
+
+1. 在 Telegram 中向机器人发送 `/auth_init`。
+2. 机器人会回复 base32 密钥和 `otpauth://` URI。用任何认证器应用扫描（Google Authenticator、Authy、1Password 等）。
+3. 在 `.env` 中启用严格验收：
+   ```
+   TASK_STRICT_ACCEPTANCE=1
+   ```
+4. 重启服务：`.\start.ps1 -Restart`
+
+> **注意：** 只有当 `TASK_STRICT_ACCEPTANCE=1` **且** 已通过 `/auth_init` 初始化认证器时，验收才会要求 OTP。如果缺少任一条件，验收将不需要 OTP。
+
+#### TOTP 设置
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `AUTH_OTP_WINDOW` | `2` | 当前时间两侧接受的时间窗口数 |
+| `AUTH_ALLOW_30_FALLBACK` | `1` | 60秒周期失败时回退到30秒 TOTP |
+| `AUTH_AUTO_INIT` | `0` | 首次运行时自动初始化 2FA 种子（不建议在生产环境使用） |
+
+---
+
+### 命令参考
+
+#### 任务命令
+
+| 命令 | 说明 |
+|---|---|
+| `<任意文本>` | 创建并排队新任务 |
+| `/status` | 列出所有活跃任务（待处理 + 进行中 + 待验收） |
+| `/status <ref>` | 按 ID 或短码显示任务详细状态 |
+| `/accept <ref> [OTP]` | 接受任务结果并归档（启用 2FA 时需要 OTP） |
+| `/reject <ref> [OTP] [原因]` | 拒绝任务结果，附带可选反馈（启用 2FA 时需要 OTP） |
+| `/events <ref>` | 显示任务的最近事件 |
+
+#### 归档命令
+
+| 命令 | 说明 |
+|---|---|
+| `/archive` | 列出最近归档的任务 |
+| `/archive_show <archive_id>` | 显示归档任务详情 |
+| `/archive_search <关键词>` | 按关键词搜索归档 |
+
+#### 2FA 命令
+
+| 命令 | 说明 |
+|---|---|
+| `/auth_init` | 初始化 TOTP 认证器（生成密钥 + QR URI） |
+| `/auth_status` | 显示当前 2FA 配置状态 |
+| `/auth_debug <OTP>` | 调试 OTP 验证（仅运维） |
+
+#### 管理命令
+
+| 命令 | 说明 |
+|---|---|
+| `/mgr_reinit <OTP>` | Git pull + 重启所有服务（自我更新） |
+| `/mgr_restart <OTP>` | 重启所有服务 |
+| `/mgr_status` | 显示服务管理器状态 |
+
+#### 运维命令（需要 OTP + 白名单）
+
+| 命令 | 说明 |
+|---|---|
+| `/ops_restart <OTP>` | 重启所有服务 |
+| `/ops_set_workspace <路径\|default> <OTP>` | 切换工作目录 |
+| `/ops_set_workspace_pick <n> <OTP>` | 从候选工作区中选择 |
+
+#### 交互式菜单
+
+发送 `/menu` 打开交互式按钮仪表板，包含以下子菜单：
+- 任务管理（创建、状态、接受/拒绝）
+- 系统配置（后端、流水线、模型选择）
+- 工作区管理（添加/删除/默认/队列状态）
+- 安全设置（2FA 设置、认证状态）
+- 运维控制（重启、重新初始化）
+
+---
+
+### 配置参考
+
+将 `.env.example` 复制为 `.env` 并填入必填值。
+
+#### 必填项
+
+| 变量 | 说明 |
+|---|---|
+| `TELEGRAM_BOT_TOKEN_CODEX` | Telegram 机器人令牌（建议使用专用机器人） |
+| `EXECUTOR_API_TOKEN` | 执行器网关认证的共享密钥 |
+
+#### 执行配置
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `CODEX_BIN` | `codex.cmd` | Codex CLI 可执行文件名 |
+| `CODEX_WORKSPACE` | 当前目录 | AI 操作的目录 |
+| `CODEX_TIMEOUT_SEC` | `900` | 单次执行运行的最大秒数 |
+| `CODEX_TIMEOUT_RETRIES` | `1` | 超时重试次数 |
+| `CODEX_MODEL` | | 覆盖模型（留空使用默认值） |
+| `CODEX_DANGEROUS` | `1` | 向 Codex CLI 传递 `--dangerously-auto-approve` |
+
+#### AI 后端与流水线
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `AGENT_BACKEND` | `pipeline` | 活跃后端：`codex`、`claude` 或 `pipeline` |
+| `PIPELINE_DEFAULT_PROVIDER` | `anthropic` | 流水线阶段的默认供应商 |
+| `PIPELINE_ROLE_PM_MODEL` | | 覆盖 PM 角色的模型 |
+| `PIPELINE_ROLE_DEV_MODEL` | | 覆盖 Dev 角色的模型 |
+| `PIPELINE_ROLE_TEST_MODEL` | | 覆盖 Test 角色的模型 |
+| `PIPELINE_ROLE_QA_MODEL` | | 覆盖 QA 角色的模型 |
+
+#### 验收与 2FA
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `TASK_STRICT_ACCEPTANCE` | `1` | 归档前需要明确 `/accept` |
+| `AUTH_OTP_WINDOW` | `2` | OTP 时间窗口容差（周期数） |
+| `AUTH_ALLOW_30_FALLBACK` | `1` | 回退尝试 30 秒 TOTP 周期 |
+| `AUTH_AUTO_INIT` | `0` | 首次运行时自动初始化 2FA 种子 |
+
+#### 超时与轮询
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `TASK_TIMEOUT_SEC` | `1800` | 卡住的任务标记为 `timeout` 的秒数 |
+| `EXECUTOR_HEARTBEAT_SEC` | `30` | 心跳间隔秒数 |
+| `TASK_NOOP_RETRIES` | `1` | AI 返回仅确认输出时的重试次数 |
+| `COORDINATOR_POLL_INTERVAL_SEC` | `1` | Telegram 更新轮询间隔 |
+| `EXECUTOR_POLL_SEC` | `1` | 任务队列轮询间隔 |
+
+#### 存储路径
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `SHARED_VOLUME_PATH` | `<cwd>/shared-volume` | 任务存储根目录 |
+| `WORKSPACE_PATH` | 当前目录 | 执行器网关的宿主工作区路径 |
+| `EXECUTOR_BASE_URL` | `http://127.0.0.1:8090` | 协调器使用的网关URL |
+
+#### 国际化
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LANGUAGE` | `zh` | 界面语言：`zh`（中文）或 `en`（英文） |
+
+---
+
+### 文件结构
+
+```
+aming_claw/
++-- setup.ps1                  # 首次运行：下载 Python + 安装依赖
++-- start.ps1                  # 启动所有服务
++-- init.ps1                   # 初始化环境
++-- .env.example               # 配置模板
++-- agent/
+|   +-- coordinator.py         # Telegram 机器人 + 任务生命周期管理
+|   +-- executor.py            # 任务执行器（调用AI后端）
+|   +-- bot_commands.py        # 命令处理器和路由
+|   +-- config.py              # 运行时后端/流水线配置
+|   +-- task_state.py          # 状态机、事件、心跳
+|   +-- task_accept.py         # 验收后测试执行器
+|   +-- task_retry.py          # 失败任务重试逻辑
+|   +-- backends.py            # AI 后端集成（Claude、Codex、OpenAI）
+|   +-- pipeline_config.py     # 按角色绑定供应商/模型
+|   +-- model_registry.py      # 从 Anthropic/OpenAI API 获取可用模型
+|   +-- auth.py                # 基于 TOTP 的双因素认证实现
+|   +-- workspace.py           # 工作区解析和切换
+|   +-- workspace_registry.py  # 多工作区注册
+|   +-- workspace_queue.py     # 每工作区 FIFO 任务队列
+|   +-- parallel_dispatcher.py # 跨工作区并行任务调度
+|   +-- git_rollback.py        # Git 检查点、回滚和提交
+|   +-- service_manager.py     # 进程监控、重新初始化、重启
+|   +-- interactive_menu.py    # Telegram 按钮式界面
+|   +-- i18n.py                # 国际化引擎
+|   +-- utils.py               # 共享工具（原子JSON、Telegram API）
+|   +-- locales/
+|   |   +-- zh.json            # 中文翻译
+|   |   +-- en.json            # 英文翻译
+|   +-- tests/                 # 213 个测试用例覆盖所有模块
+|   +-- requirements.txt
++-- executor-gateway/
+|   +-- app/main.py            # FastAPI 截图与文件操作服务
+|   +-- requirements.txt
++-- scripts/
+|   +-- _get_python.ps1        # 返回捆绑的 python.exe 路径
+|   +-- start-coordinator.ps1
+|   +-- start-executor.ps1
+|   +-- start-gateway.ps1
+|   +-- start-manager.ps1
+|   +-- restart-all.ps1
+|   +-- restart-agent.ps1
+|   +-- restart-from-telegram.ps1
+|   +-- reload-after-executor-change.ps1
++-- runtime/
+    +-- python/                # setup.ps1 下载，已排除在 git 之外
+```
+
+---
+
+### 故障排除
+
+**机器人不响应消息**
+- 检查 `.env` 中的 `TELEGRAM_BOT_TOKEN_CODEX` 是否正确设置
+- 确保协调器服务正在运行（检查协调器终端窗口）
+- 验证服务管理器正在运行：`.\scripts\start-manager.ps1`
+
+**任务卡在 `processing` 状态**
+- 协调器会在 `TASK_TIMEOUT_SEC` 秒无心跳后自动将任务标记为 `timeout`
+- 检查执行器终端是否有错误；验证 `CODEX_BIN` 是否可访问
+- 对于长时间运行的任务，尝试增大 `CODEX_TIMEOUT_SEC`
+
+**"2FA failed: OTP invalid or expired"**
+- 确保设备时钟已同步（NTP）
+- 增大 `AUTH_OTP_WINDOW`（如 `AUTH_OTP_WINDOW=3`）以容忍时钟偏差
+- 运行 `/auth_debug <OTP>` 查看详细验证信息
+
+**AI 返回确认但未执行操作**
+- 这是模型行为问题。流水线会检测仅确认消息并重试一次（`TASK_NOOP_RETRIES=1`）
+- 如果持续出现，任务将被标记为 `failed`；重新发送任务即可重试
+- 考虑通过交互式菜单切换到不同的模型
+
+**拒绝时 Git 回滚失败**
+- 确保工作区是一个有效的 git 仓库，且至少有一次提交
+- 检查任务前检查点是否已创建（查找 `[aming-claw checkpoint]` 提交）
+
+**语言未切换**
+- 在 `.env` 中设置 `LANGUAGE=en` 或 `LANGUAGE=zh` 并重启服务
+- 或通过交互式菜单在运行时切换语言
