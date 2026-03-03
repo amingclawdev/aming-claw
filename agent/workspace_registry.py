@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from i18n import t
 from utils import load_json, save_json, tasks_root, utc_iso
 
 
@@ -118,13 +119,13 @@ def add_workspace(
     """Register a new workspace directory. Returns the new workspace entry."""
     resolved = path.resolve()
     if is_blocked_workspace(resolved):
-        raise ValueError("路径包含敏感目录，禁止注册: {}".format(resolved))
+        raise ValueError(t("workspace_reg.path_sensitive", path=resolved))
     if not resolved.exists() or not resolved.is_dir():
-        raise ValueError("路径不存在或不是目录: {}".format(resolved))
+        raise ValueError(t("workspace_reg.path_not_exist", path=resolved))
 
     existing = find_workspace_by_path(resolved)
     if existing:
-        raise ValueError("该路径已注册为工作目录: {} (id={})".format(resolved, existing["id"]))
+        raise ValueError(t("workspace_reg.path_already_registered", path=resolved, id=existing["id"]))
 
     ws_id = _new_ws_id()
     if not label:

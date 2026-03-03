@@ -8,10 +8,17 @@ Results are in-memory cached for CACHE_TTL seconds per process lifetime.
 """
 import os
 import shutil
+import sys
 import time
 from typing import Dict, List, Optional
 
 import requests
+
+agent_dir = os.path.dirname(os.path.abspath(__file__))
+if agent_dir not in sys.path:
+    sys.path.insert(0, agent_dir)
+
+from i18n import t
 
 CACHE_TTL = 300  # 5 minutes
 
@@ -100,7 +107,7 @@ def fetch_anthropic_models() -> List[Dict]:
         # No API key, but Claude CLI subscription may be available
         if _has_claude_cli():
             return _cli_anthropic_models()
-        return _unavailable_anthropic_models("API key未配置且无Claude CLI")
+        return _unavailable_anthropic_models(t("model_reg.no_api_no_cli_anthropic"))
     try:
         resp = requests.get(
             "https://api.anthropic.com/v1/models",
@@ -110,7 +117,7 @@ def fetch_anthropic_models() -> List[Dict]:
         resp.raise_for_status()
         data = resp.json().get("data", [])
     except Exception as exc:
-        return _unavailable_anthropic_models("请求失败: {}".format(str(exc)[:80]))
+        return _unavailable_anthropic_models(t("model_reg.request_failed", err=str(exc)[:80]))
 
     models = []
     for m in data:
@@ -193,7 +200,7 @@ def fetch_openai_models() -> List[Dict]:
         # No API key, but Codex CLI subscription may be available
         if _has_codex_cli():
             return _cli_openai_models()
-        return _unavailable_openai_models("API key未配置且无Codex CLI")
+        return _unavailable_openai_models(t("model_reg.no_api_no_cli_openai"))
     try:
         resp = requests.get(
             "https://api.openai.com/v1/models",
@@ -203,7 +210,7 @@ def fetch_openai_models() -> List[Dict]:
         resp.raise_for_status()
         data = resp.json().get("data", [])
     except Exception as exc:
-        return _unavailable_openai_models("请求失败: {}".format(str(exc)[:80]))
+        return _unavailable_openai_models(t("model_reg.request_failed", err=str(exc)[:80]))
 
     models = []
     for m in data:
@@ -282,7 +289,7 @@ def make_label(m: Dict) -> str:
 def format_model_list_text(models: List[Dict]) -> str:
     """Format model list for Telegram display, grouped by provider."""
     if not models:
-        return "(无可用模型)"
+        return t("model_reg.no_models")
 
     # Group by provider
     grouped: Dict[str, List[Dict]] = {}
@@ -308,8 +315,8 @@ def format_model_list_text(models: List[Dict]) -> str:
                 ctx_str = " | {}K ctx".format(ctx // 1000) if ctx else ""
                 lines.append("✅ {} {}{}".format(tag, m["id"], ctx_str))
             else:
-                reason = m.get("unavailable_reason", "不可用")
-                lines.append("⛔ {} {} | 不可用: {}".format(tag, m["id"], reason))
+                reason = m.get("unavailable_reason", t("model_reg.unavailable"))
+                lines.append("⛔ {} {} | {}".format(tag, m["id"], t("model_reg.unavailable_prefix", reason=reason)))
         lines.append("")
 
     return "\n".join(lines).strip()

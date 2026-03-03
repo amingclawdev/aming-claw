@@ -54,13 +54,40 @@ PIPELINE_PRESETS: Dict[str, List[Dict]] = {
 
 # ── Role pipeline definitions ────────────────────────────────────────────────
 
-# Standard role definitions for the role pipeline
+class _TranslatedRoleDef(dict):
+    """A dict that resolves 'label' dynamically via i18n t()."""
+    def get(self, key, default=None):
+        if key == "label":
+            label_key = super().get("_label_key", "")
+            return t(label_key) if label_key else default
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        if key == "label":
+            label_key = super().get("_label_key", "")
+            return t(label_key) if label_key else key
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        if key == "label":
+            return "_label_key" in self
+        return super().__contains__(key)
+
+
+# Standard role definitions for the role pipeline.
+# The 'label' key is dynamically resolved via i18n t() to respect current language.
 ROLE_DEFINITIONS: Dict[str, Dict] = {
-    "pm":   {"label": "产品经理", "emoji": "\U0001f4cb", "default_backend": "claude"},
-    "dev":  {"label": "开发",     "emoji": "\U0001f4bb", "default_backend": "claude"},
-    "test": {"label": "测试",     "emoji": "\U0001f9ea", "default_backend": "claude"},
-    "qa":   {"label": "QA",       "emoji": "\u2705",     "default_backend": "claude"},
+    "pm":   _TranslatedRoleDef({"_label_key": "role.pm",   "emoji": "\U0001f4cb", "default_backend": "claude"}),
+    "dev":  _TranslatedRoleDef({"_label_key": "role.dev",  "emoji": "\U0001f4bb", "default_backend": "claude"}),
+    "test": _TranslatedRoleDef({"_label_key": "role.test", "emoji": "\U0001f9ea", "default_backend": "claude"}),
+    "qa":   _TranslatedRoleDef({"_label_key": "role.qa",   "emoji": "\u2705",     "default_backend": "claude"}),
 }
+
+
+def get_role_label(role_name: str) -> str:
+    """Get the translated label for a role name."""
+    role_def = ROLE_DEFINITIONS.get(role_name, {})
+    return role_def.get("label", role_name)
 
 ROLE_PIPELINE_ORDER = ["pm", "dev", "test", "qa"]
 

@@ -21,6 +21,7 @@ if agent_dir not in sys.path:
     sys.path.insert(0, agent_dir)
 
 from config import get_claude_model, get_model_provider
+from i18n import t
 
 # Directories to skip during file scanning
 SKIP_DIRS = {
@@ -321,29 +322,28 @@ def _build_summary_prompt(workspace: Path, commit_diffs: List[Dict]) -> str:
     tech_stack = _detect_tech_stack(workspace)
 
     parts = []
-    parts.append("你是一位资深开发者，请根据以下项目信息和最近的 Git 提交变动，生成一份简洁的中文项目总结。")
+    parts.append(t("project_summary.prompt_intro"))
     parts.append("")
-    parts.append("要求：")
-    parts.append("1. 先用一小段话概括这个项目是做什么的（基于目录结构、技术栈和代码变动推断）")
-    parts.append("2. 然后按 commit 逐条说明每次提交实现或修改了什么功能")
-    parts.append("3. 用中文，简洁明了，以文字段落为主，不要用表格或代码块")
-    parts.append("4. 不要输出任何前缀标题如\"项目总结\"，直接输出内容")
+    parts.append(t("project_summary.prompt_req1"))
+    parts.append(t("project_summary.prompt_req2"))
+    parts.append(t("project_summary.prompt_req3"))
+    parts.append(t("project_summary.prompt_req4"))
     parts.append("")
 
     if tech_stack:
-        parts.append("【技术栈】{}".format(", ".join(tech_stack)))
+        parts.append(t("project_summary.section_tech", tech=", ".join(tech_stack)))
     if top_dirs:
-        parts.append("【目录结构】{}".format(", ".join(d.strip() for d in top_dirs[:15])))
+        parts.append(t("project_summary.section_dirs", dirs=", ".join(d.strip() for d in top_dirs[:15])))
     parts.append("")
 
     for i, cd in enumerate(commit_diffs, 1):
-        parts.append("===== 提交 {} =====".format(i))
-        parts.append("Hash: {}  日期: {}  作者: {}".format(cd["hash"], cd["date"], cd["author"]))
+        parts.append(t("project_summary.commit_header", idx=i))
+        parts.append(t("project_summary.commit_info", hash=cd["hash"], date=cd["date"], author=cd["author"]))
         parts.append("Message: {}".format(cd["message"]))
         if cd["diff_stat"]:
-            parts.append("变更文件统计:\n{}".format(cd["diff_stat"]))
+            parts.append("{}\n{}".format(t("project_summary.diff_stat_label"), cd["diff_stat"]))
         if cd["diff_content"]:
-            parts.append("代码变动:\n{}".format(cd["diff_content"]))
+            parts.append("{}\n{}".format(t("project_summary.diff_content_label"), cd["diff_content"]))
         parts.append("")
 
     return "\n".join(parts)
@@ -411,12 +411,12 @@ def _build_fallback_summary(workspace: Path, commit_diffs: List[Dict]) -> str:
     lines = []
     name = workspace.name
     tech = _detect_tech_stack(workspace)
-    lines.append("\U0001f4ca 项目总结: {}".format(name))
+    lines.append(t("project_summary.fallback_title", name=name))
     lines.append("\u2501" * 24)
     if tech:
-        lines.append("\U0001f527 技术栈: {}".format(", ".join(tech)))
+        lines.append(t("project_summary.fallback_tech", tech=", ".join(tech)))
     lines.append("")
-    lines.append("\U0001f4dd 最近 {} 条提交:".format(len(commit_diffs)))
+    lines.append(t("project_summary.fallback_commits", count=len(commit_diffs)))
     for cd in commit_diffs:
         lines.append("")
         lines.append("[{}] {} - {}".format(cd["hash"], cd["date"], cd["message"]))
@@ -424,7 +424,7 @@ def _build_fallback_summary(workspace: Path, commit_diffs: List[Dict]) -> str:
             for sl in cd["diff_stat"].splitlines()[-3:]:
                 lines.append("  {}".format(sl.strip()))
     lines.append("")
-    lines.append("(AI 分析不可用，仅展示提交记录)")
+    lines.append(t("project_summary.fallback_ai_unavailable"))
     return "\n".join(lines)
 
 
@@ -436,17 +436,17 @@ def generate_ai_summary(workspace_path, commit_count: int = 3) -> str:
         commit_count: Number of recent commits to analyse (1-10).
 
     Returns:
-        A Chinese text summary string.
+        A text summary string.
     """
     workspace = Path(workspace_path).resolve()
     commit_count = max(1, min(commit_count, 10))
 
     if not _is_git_repo(workspace):
-        return "当前工作区非 Git 仓库，无法生成提交分析。"
+        return t("project_summary.not_git_repo")
 
     commit_diffs = _collect_commit_diffs(workspace, commit_count)
     if not commit_diffs:
-        return "当前仓库无提交记录。"
+        return t("project_summary.no_commits")
 
     # Build prompt and call AI
     prompt = _build_summary_prompt(workspace, commit_diffs)
@@ -455,7 +455,7 @@ def generate_ai_summary(workspace_path, commit_count: int = 3) -> str:
     if ai_response:
         # Format with header
         lines = []
-        lines.append("\U0001f4ca 项目总结")
+        lines.append("\U0001f4ca " + t("project_summary.title"))
         lines.append("\u2501" * 24)
         lines.append("")
         lines.append(ai_response.strip())
@@ -469,37 +469,37 @@ def format_summary_text(info: Dict, commits: List[Dict]) -> str:
     """Format project info and commits into a human-readable plain text report."""
     lines = []
     name = info.get("name", "unknown")
-    lines.append("\U0001f4ca \u9879\u76ee\u603b\u7ed3: {}".format(name))
+    lines.append(t("project_summary.format_title", name=name))
     lines.append("\u2501" * 24)
 
     # Path
-    lines.append("\U0001f4c1 \u8def\u5f84: {}".format(info.get("path", "")))
+    lines.append(t("project_summary.format_path", path=info.get("path", "")))
 
     # Git info
     git = info.get("git", {})
     if git.get("is_repo"):
         branch = git.get("branch", "")
         commit = git.get("commit", "")
-        lines.append("\U0001f33f \u5206\u652f: {} ({})".format(branch, commit))
+        lines.append(t("project_summary.format_branch", branch=branch, commit=commit))
         if git.get("has_uncommitted"):
-            lines.append("\u26a0\ufe0f \u672a\u63d0\u4ea4\u53d8\u66f4: {} \u4e2a\u6587\u4ef6".format(git.get("uncommitted_count", 0)))
+            lines.append(t("project_summary.format_uncommitted", count=git.get("uncommitted_count", 0)))
         else:
-            lines.append("\u2705 \u5de5\u4f5c\u533a\u5e72\u51c0")
+            lines.append(t("project_summary.format_clean"))
     else:
-        lines.append("\U0001f4c2 \u975e Git \u4ed3\u5e93")
+        lines.append(t("project_summary.format_not_repo"))
 
     # Tech stack
     tech = info.get("tech_stack", [])
     if tech:
         lines.append("")
-        lines.append("\U0001f527 \u6280\u672f\u6808: {}".format(", ".join(tech)))
+        lines.append(t("project_summary.format_tech", tech=", ".join(tech)))
 
     # File stats
     file_stats = info.get("file_stats", {})
     total = file_stats.get("total_files", 0)
     by_ext = file_stats.get("by_extension", {})
     lines.append("")
-    lines.append("\U0001f4c4 \u6587\u4ef6\u7edf\u8ba1 (\u5171 {} \u4e2a):".format(total))
+    lines.append(t("project_summary.format_file_stats", total=total))
     # Show top 10 extensions
     sorted_ext = sorted(by_ext.items(), key=lambda x: x[1], reverse=True)
     shown = 0
@@ -511,20 +511,20 @@ def format_summary_text(info: Dict, commits: List[Dict]) -> str:
         else:
             other_count += cnt
     if other_count > 0:
-        lines.append("  {:<8s} \u2014 {}".format("\u5176\u4ed6", other_count))
+        lines.append("  {:<8s} \u2014 {}".format(t("project_summary.format_other"), other_count))
 
     # Directory structure
     top_dirs = info.get("top_dirs", [])
     if top_dirs:
         lines.append("")
-        lines.append("\U0001f4c2 \u76ee\u5f55\u7ed3\u6784:")
+        lines.append(t("project_summary.format_dirs"))
         for d in top_dirs:
             lines.append("  {}".format(d))
 
     # Recent commits
     if commits:
         lines.append("")
-        lines.append("\U0001f4dd \u6700\u8fd1\u63d0\u4ea4 (\u5171 {} \u6761):".format(len(commits)))
+        lines.append(t("project_summary.format_commits", count=len(commits)))
         for c in commits:
             lines.append("  {} | {} | {}".format(
                 c.get("sha", ""),

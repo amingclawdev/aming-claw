@@ -46,6 +46,7 @@ def _is_qa_boilerplate(text: str) -> bool:
     if not text:
         return True
     boilerplate_markers = [
+        # Chinese
         "请提供以下材料",
         "已切换为",
         "把材料发来后",
@@ -53,20 +54,34 @@ def _is_qa_boilerplate(text: str) -> bool:
         "收到后我将",
         "我将按",
         "我直接开始审计",
+        # English
+        "please provide the following",
+        "switched to",
+        "send me the materials",
+        "once received i will",
+        "i will proceed",
+        "i will start the audit",
     ]
-    has_boilerplate = any(m in text for m in boilerplate_markers)
+    text_lower = text.lower()
+    has_boilerplate = any(m in text or m in text_lower for m in boilerplate_markers)
     if not has_boilerplate:
         return False
     # Check if there's an actual verdict WITH a concrete value
     # (not template options like "通过 / 有条件通过 / 不通过")
     import re
     real_verdict_patterns = [
-        r"验收结论[：:]\s*(通过|不通过|有条件通过)(?!\s*/)",  # actual verdict, not "通过 / 不通过"
+        # Chinese verdicts
+        r"验收结论[：:]\s*(通过|不通过|有条件通过)(?!\s*/)",
         r"总体结论[：:]\s*(通过|不通过|有条件通过)(?!\s*/)",
-        r"✓通过\s+\w",             # actual checkmark with item reference
-        r"✗未通过\s+\w",           # actual X mark with item reference
-        r"⚠部分通过\s+\w",        # actual warning with item reference
-        r"AC-\d+.*[✓✗⚠]",        # "AC-001 ✓通过" acceptance case items
+        r"✓通过\s+\w",
+        r"✗未通过\s+\w",
+        r"⚠部分通过\s+\w",
+        r"AC-\d+.*[✓✗⚠]",
+        # English verdicts
+        r"(?i)acceptance\s+(?:conclusion|verdict)[：:]\s*(pass|fail|conditional)",
+        r"(?i)overall\s+(?:conclusion|verdict)[：:]\s*(pass|fail|conditional)",
+        r"(?i)✓\s*pass(?:ed)?\s+\w",
+        r"(?i)✗\s*fail(?:ed)?\s+\w",
     ]
     for pattern in real_verdict_patterns:
         if re.search(pattern, text, re.MULTILINE):
@@ -174,9 +189,11 @@ def _extract_stage_snippet(stage_name: str, preview: str) -> str:
     if stage_name == "dev":
         # Look for file change summary or step summary
         for marker in ["修改文件列表", "已执行步骤", "变更说明",
-                        "子任务实现状态", "修改文件", "| 文件"]:
+                        "子任务实现状态", "修改文件", "| 文件",
+                        "modified files", "steps executed", "change description",
+                        "subtask implementation", "changed files"]:
             for i, line in enumerate(lines):
-                if marker in line:
+                if marker in line.lower():
                     return "\n".join(lines[i:i + max_lines]).strip()
         # Fallback: last N lines (usually summary)
         return "\n".join(lines[-max_lines:]).strip()[:500]
@@ -184,7 +201,8 @@ def _extract_stage_snippet(stage_name: str, preview: str) -> str:
     if stage_name == "test":
         # Look for test result numbers
         for marker in ["passed", "failed", "通过", "失败",
-                        "结论", "结果", "Ran ", "OK"]:
+                        "结论", "结果", "Ran ", "OK",
+                        "conclusion", "result"]:
             for i, line in enumerate(lines):
                 if marker in line.lower() or marker in line:
                     start = max(0, i - 1)
@@ -194,9 +212,11 @@ def _extract_stage_snippet(stage_name: str, preview: str) -> str:
     if stage_name == "qa":
         # QA: look for verdict
         for marker in ["验收结论", "总体结论", "✓通过", "✗未通过",
-                        "⚠部分通过", "有条件通过"]:
+                        "⚠部分通过", "有条件通过",
+                        "acceptance conclusion", "overall conclusion",
+                        "overall verdict", "acceptance verdict"]:
             for i, line in enumerate(lines):
-                if marker in line:
+                if marker in line.lower():
                     start = max(0, i - 1)
                     return "\n".join(lines[start:start + max_lines]).strip()
         # If QA returned boilerplate, the caller handles it

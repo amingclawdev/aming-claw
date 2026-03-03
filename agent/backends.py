@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+from i18n import t
 from utils import tasks_root
 from workspace import resolve_active_workspace
 from task_accept import finalize_codex_task, finalize_pipeline_task
@@ -128,11 +129,7 @@ def run_deterministic_wait_file_task(task: Dict) -> Optional[Dict]:
     with target.open("a", encoding="utf-8") as f:
         f.write(parsed["append_line"] + "\n")
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    summary = (
-        "已执行步骤: 创建文件并写入时间，等待 {sec} 秒后追加内容。\n"
-        "修改文件列表: {file}\n"
-        "后续建议: 可用 /status 查看状态，或直接检查文件内容。"
-    ).format(sec=parsed["wait_sec"], file=str(target))
+    summary = t("ai_prompt.wait_file_summary", sec=parsed["wait_sec"], file=str(target))
     return {
         "returncode": 0,
         "stdout": summary,
@@ -158,29 +155,12 @@ def _get_task_text(task: Dict) -> str:
 
 def build_codex_prompt(task: Dict) -> str:
     text = _get_task_text(task)
-    return (
-        "你是 Codex 执行器，必须直接执行任务，不要复述角色，不要请求用户再补充。\n"
-        "如果任务存在歧义，做最合理假设并继续执行。\n"
-        "要求：\n"
-        "1) 直接在工作目录修改文件/运行命令；\n"
-        "2) 禁止访问任何敏感目录/文件（如 .ssh、.aws、.gnupg、私钥、系统凭据目录）；\n"
-        "3) 最终输出包含：已执行步骤、修改文件列表、后续建议；\n"
-        "4) 中文回复。\n\n"
-        "任务ID: {task_id}\n"
-        "任务内容: {text}\n"
-    ).format(task_id=task["task_id"], text=text)
+    return t("ai_prompt.codex_system", task_id=task["task_id"], text=text)
 
 
 def build_claude_prompt(task: Dict) -> str:
     text = _get_task_text(task)
-    return (
-        "请立即执行以下任务（禁止回复确认语，禁止请求补充信息，直接动手）：\n\n"
-        "{text}\n\n"
-        "任务ID: {task_id}\n"
-        "要求：直接在工作目录修改文件或运行命令；"
-        "禁止访问敏感目录（.ssh/.aws/.gnupg/私钥）；"
-        "完成后输出：1) 已执行步骤 2) 修改文件列表 3) 后续建议。中文回复。"
-    ).format(task_id=task["task_id"], text=text)
+    return t("ai_prompt.claude_system", task_id=task["task_id"], text=text)
 
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
@@ -452,21 +432,26 @@ def is_ack_only_message(message: str) -> bool:
         return True
     if len(msg) > 160:
         return False
-    # If message contains structured execution evidence (已执行步骤 + 修改文件 + 后续建议),
+    # If message contains structured execution evidence,
     # it is NOT ack-only — it's the expected output contract from task execution.
     if has_execution_evidence(msg):
         return False
     lowered = msg.lower()
+    # Chinese ack patterns
     if ("后续" in msg and "执行" in msg) or ("直接告诉我" in msg) or ("请告诉我" in msg):
         return True
     if ("直接执行模式" in msg) or ("进入直接执行模式" in msg):
         return True
+    # English ack patterns
     if "i will" in lowered and "execute" in lowered:
+        return True
+    if "please send" in lowered or "send me the task" in lowered or "provide the task" in lowered:
         return True
     # Asking user to send/provide the task — model hasn't seen or acted on it.
     if "请发送" in msg or "发送任务" in msg or "请提供任务" in msg:
         return True
     patterns = [
+        # Chinese ack patterns
         r"^明白[。.!]?$",
         r"^收到[。.!]?$",
         r"^好的[。.!]?$",
@@ -482,23 +467,42 @@ def is_ack_only_message(message: str) -> bool:
         r"^已切换为直接执行模式[。.!]?$",
         r"^收到。接下来我会直接执行你给的具体任务[，,]不复述[，,]不反问[。.!]?$",
         r"^请直接告诉我(你)?(的)?问题[。.!]?$",
+        # English ack patterns
+        r"^understood[.!]?$",
+        r"^got it[.!]?$",
+        r"^received[.!]?$",
+        r"^ok[.!]?$",
+        r"^okay[.!]?$",
+        r"^sure[.!]?$",
+        r"^will do[.!]?$",
+        r"^ready to execute[.!]?$",
+        r"^i('m| am) ready[.!]?$",
+        r"^acknowledged[.!]?$",
     ]
-    return any(re.match(p, msg) for p in patterns)
+    return any(re.match(p, msg, re.IGNORECASE) for p in patterns)
 
 
 def has_execution_evidence(text: str) -> bool:
     msg = (text or "").strip()
     if not msg:
         return False
-    # Preferred structured evidence from prompt contract.
+    # Preferred structured evidence from prompt contract (Chinese).
     if ("已执行步骤" in msg and "修改文件" in msg and "后续建议" in msg):
         return True
-    # Fallback evidence: explicit command/file modification markers.
+    # Preferred structured evidence from prompt contract (English).
+    low = msg.lower()
+    if ("steps executed" in low and "modified files" in low and "follow-up" in low):
+        return True
+    # Fallback evidence: explicit command/file modification markers (bilingual).
     markers = [
         "执行了",
         "已完成以下",
         "修改了",
         "创建了",
+        "executed",
+        "completed the following",
+        "modified",
+        "created",
         "apply_patch",
         "git diff",
         "pytest",
@@ -546,15 +550,7 @@ def run_codex_with_retry(task: Dict) -> Dict:
 
     last_reason = noop_reason
     for retry_idx in range(1, max_noop_retries + 1):
-        guard = (
-            "上一次输出被判定为无效（仅确认语或无执行证据）。\n"
-            "禁止回复\"收到/明白/后续执行\"等确认语。\n"
-            "你必须立即执行任务，并在最终回复中包含：\n"
-            "1) 已执行步骤（包含实际命令）\n"
-            "2) 修改文件列表（若无文件改动，明确说明原因）\n"
-            "3) 后续建议\n"
-            "若仍不执行，将判定任务失败。"
-        )
+        guard = t("ai_prompt.retry_guard")
         run = run_codex(task, extra_guard=guard, attempt_tag="retry{}".format(retry_idx))
         noop_reason = detect_noop_execution(run)
         if not noop_reason:
@@ -580,15 +576,7 @@ def run_claude_with_retry(task: Dict) -> Dict:
 
     last_reason = noop_reason
     for retry_idx in range(1, max_noop_retries + 1):
-        guard = (
-            "上一次输出被判定为无效（仅确认语或无执行证据）。\n"
-            "禁止回复\"收到/明白/后续执行\"等确认语。\n"
-            "你必须立即执行任务，并在最终回复中包含：\n"
-            "1) 已执行步骤（包含实际命令）\n"
-            "2) 修改文件列表（若无文件改动，明确说明原因）\n"
-            "3) 后续建议\n"
-            "若仍不执行，将判定任务失败。"
-        )
+        guard = t("ai_prompt.retry_guard")
         run = run_claude(task, extra_guard=guard, attempt_tag="retry{}".format(retry_idx))
         noop_reason = detect_noop_execution(run)
         if not noop_reason:
@@ -610,132 +598,30 @@ _ANALYSIS_STAGES = {"plan", "planning", "verify", "verification", "test", "testi
                     "review", "check", "analyse", "analysis", "audit",
                     "pm", "qa"}
 
-_STAGE_ROLE_PROMPTS = {
-    "plan": (
-        "你是任务规划专家，必须直接输出可测试的验收标准，不要请求用户补充。\n"
-        "如果任务存在歧义，做最合理假设并继续。\n"
-        "【输出要求】\n"
-        "1) 逐条列出验收标准（每条必须可独立验证，使用编号）；\n"
-        "2) 列出测试用例（至少3条，含步骤/预期输出）；\n"
-        "3) 指出实现的关键约束和边界条件；\n"
-        "4) 中文回复，使用清晰的编号格式。\n"
-    ),
-    "code": (
-        "你是代码实现专家，必须直接编写并执行代码，不要请求用户补充。\n"
-        "如果有验收标准请严格遵守；如无则做最合理实现。\n"
-        "【输出要求】\n"
-        "1) 直接在工作目录修改文件/运行命令；\n"
-        "2) 禁止访问敏感目录（.ssh、.aws、私钥等）；\n"
-        "3) 最终输出：已执行步骤、修改文件列表、后续建议；\n"
-        "4) 中文回复。\n"
-    ),
-    "implement": (
-        "你是代码实现专家，必须直接编写并执行代码，不要请求用户补充。\n"
-        "如果有验收标准请严格遵守；如无则做最合理实现。\n"
-        "【输出要求】\n"
-        "1) 直接在工作目录修改文件/运行命令；\n"
-        "2) 禁止访问敏感目录（.ssh、.aws、私钥等）；\n"
-        "3) 最终输出：已执行步骤、修改文件列表、后续建议；\n"
-        "4) 中文回复。\n"
-    ),
-    "verify": (
-        "你是质量验收专家，必须对照验收标准逐项检查，不要请求用户补充。\n"
-        "如果没有明确验收标准，根据常见工程质量标准自行评估。\n"
-        "【输出要求】\n"
-        "1) 逐条列出验收标准及检查结果（✓通过 / ✗失败 / ⚠部分通过）；\n"
-        "2) 运行相关测试/检查命令，记录输出；\n"
-        "3) 输出总体验收结论：通过 / 部分通过 / 失败；\n"
-        "4) 如有问题，列出具体问题和修复建议；\n"
-        "5) 中文回复。\n"
-    ),
-    "test": (
-        "你是测试专家，必须执行具体的测试操作，不要请求用户补充。\n"
-        "【输出要求】\n"
-        "1) 运行所有相关测试，记录每个测试的结果（通过/失败）；\n"
-        "2) 输出测试覆盖率（如可获取）；\n"
-        "3) 汇总测试结果和发现的问题；\n"
-        "4) 中文回复。\n"
-    ),
-    "review": (
-        "你是代码审查专家，必须对代码质量和实现进行专业评估，不要请求用户补充。\n"
-        "【输出要求】\n"
-        "1) 评估代码质量（可读性、维护性、性能）；\n"
-        "2) 指出潜在问题和改进点；\n"
-        "3) 给出总体评分和结论；\n"
-        "4) 中文回复。\n"
-    ),
-    # ── Role pipeline prompts ──────────────────────────────────────────────
-    "pm": (
-        "你是产品经理（PM），负责解析用户原始需求，拆分为结构化子任务，定义验收标准。\n"
-        "禁止回复确认语，禁止请求用户补充信息，直接输出需求文档。\n"
-        "如果任务存在歧义，做最合理假设并继续。\n\n"
-        "【输出要求 - 需求文档】\n"
-        "1) 需求概述：一句话描述核心目标；\n"
-        "2) 子任务列表：逐条拆分，每条包含：\n"
-        "   - 编号和标题\n"
-        "   - 具体描述（做什么、改哪里、涉及哪些文件）\n"
-        "   - 验收条件（可独立验证的具体标准）\n"
-        "3) 技术方案：\n"
-        "   - 关键实现思路（算法、数据结构、设计模式）\n"
-        "   - 接口/数据模型变更说明\n"
-        "   - 依赖关系和兼容性约束\n"
-        "4) UI/交互设计（如涉及）：\n"
-        "   - 界面布局描述（按钮、菜单、消息格式）\n"
-        "   - 用户操作流程（步骤1→2→3）\n"
-        "   - 异常/边界情况处理\n"
-        "5) 安全与质量约束：\n"
-        "   - 输入校验、权限控制要求\n"
-        "   - 性能/并发注意事项\n"
-        "   - 向后兼容性要求\n"
-        "6) 预期影响范围（涉及的文件/模块）；\n"
-        "7) 中文回复，使用清晰的编号格式。\n"
-    ),
-    "dev": (
-        "你是开发工程师（Dev），根据产品经理产出的需求文档逐项实现代码变更。\n"
-        "禁止回复确认语，禁止请求用户补充信息，直接编写和执行代码。\n"
-        "严格按照需求文档中的子任务和验收标准进行实现。\n\n"
-        "【输出要求】\n"
-        "1) 直接在工作目录修改文件/运行命令；\n"
-        "2) 禁止访问敏感目录（.ssh、.aws、私钥等）；\n"
-        "3) 逐项实现需求文档中的子任务；\n"
-        "4) 最终输出：\n"
-        "   - 已执行步骤（含实际命令）\n"
-        "   - 修改文件列表及变更说明\n"
-        "   - 每个子任务的实现状态\n"
-        "5) 中文回复。\n"
-    ),
-    "qa": (
-        "你是QA验收专家，负责对照需求文档中的验收标准，审计代码变更和测试结果。\n"
-        "所有分析所需上下文（PM需求、Dev变更、Test结果）已在【前序阶段输出】中完整提供，必须仅基于已提供的上下文进行分析。\n"
-        "禁止使用工具（禁止读文件、执行命令、查看git记录），直接基于已有信息输出验收报告。\n"
-        "禁止回复确认语，禁止请求用户补充信息，直接输出验收报告。\n\n"
-        "【输出要求 - 验收报告】\n"
-        "1) 逐项对照验收标准检查：\n"
-        "   - 编号对应需求文档中的子任务\n"
-        "   - 每项标注：✓通过 / ✗未通过 / ⚠部分通过\n"
-        "   - 附上判断依据和证据\n"
-        "2) 代码变更审查结果（质量、安全、规范）；\n"
-        "3) 测试结果审查（覆盖率、遗漏场景）；\n"
-        "4) 总体结论：通过 / 有条件通过 / 不通过；\n"
-        "5) 如不通过，列出具体问题和修复建议；\n"
-        "6) 中文回复。\n"
-    ),
+_STAGE_ROLE_PROMPT_KEYS = {
+    "plan": "ai_prompt.stage_plan",
+    "code": "ai_prompt.stage_code",
+    "implement": "ai_prompt.stage_implement",
+    "verify": "ai_prompt.stage_verify",
+    "test": "ai_prompt.stage_test",
+    "review": "ai_prompt.stage_review",
+    "pm": "ai_prompt.stage_pm",
+    "dev": "ai_prompt.stage_dev",
+    "qa": "ai_prompt.stage_qa",
 }
-
-_DEFAULT_STAGE_PROMPT = (
-    "你是AI执行器，必须直接执行任务，不要请求用户补充。\n"
-    "最终输出包含：已执行步骤、修改文件列表、后续建议。\n"
-)
 
 
 def build_pipeline_stage_prompt(task: Dict, stage_name: str, context: str) -> str:
     """Build a stage-specific prompt incorporating accumulated context from prior stages."""
-    role_intro = _STAGE_ROLE_PROMPTS.get(stage_name.lower(), _DEFAULT_STAGE_PROMPT)
+    key = _STAGE_ROLE_PROMPT_KEYS.get(stage_name.lower())
+    role_intro = t(key) if key else t("ai_prompt.stage_default")
     parts = [role_intro.rstrip()]
     if context.strip():
-        parts.append("【前序阶段输出】\n" + context.strip()[:6000])
+        parts.append(t("ai_prompt.prior_stages") + "\n" + context.strip()[:6000])
     parts.append(
-        "【任务ID】: {}\n【任务内容】: {}".format(task["task_id"], _get_task_text(task))
+        "{}: {}\n{}: {}".format(
+            t("ai_prompt.task_id_label"), task["task_id"],
+            t("ai_prompt.task_content_label"), _get_task_text(task))
     )
     return "\n\n".join(parts)
 
@@ -864,12 +750,7 @@ def run_stage_with_retry(task: Dict, stage: Dict, prompt: str, stage_idx: int) -
 
     last_reason = noop_reason
     for retry_idx in range(1, max_noop_retries + 1):
-        guard = (
-            "上一次输出被判定为无效（仅确认语或无实质内容）。\n"
-            "禁止回复\"收到/明白/后续执行\"等确认语。\n"
-            "你必须立即完成当前阶段任务并输出具体内容。\n"
-            "若仍不执行，将判定任务失败。"
-        )
+        guard = t("ai_prompt.stage_retry_guard")
         run = _run(prompt + "\n\n" + guard, base_tag + "_r{}".format(retry_idx))
         noop_reason = detect_stage_noop(run, stage)
         if not noop_reason:
@@ -1030,7 +911,7 @@ def _summarize_stage_for_qa(stage_name: str, output: str, max_chars: int = 1500)
     enough for Codex CLI exec mode.
     """
     if not output or not output.strip():
-        return "(无输出)"
+        return t("ai_prompt.no_output")
     lines = output.strip().splitlines()
 
     if stage_name == "pm":
@@ -1092,35 +973,36 @@ def _build_role_context(stage_name: str, stage_outputs: Dict[str, str]) -> str:
     Test output is added for qa.
     For QA: uses summarized versions to keep prompt concise for Codex CLI.
     """
-    from config import ROLE_DEFINITIONS
     parts = []
-    role_label_map = {k: v.get("label", k) for k, v in ROLE_DEFINITIONS.items()}
+    pm_label = t("role.pm")
+    dev_label = t("role.dev")
+    test_label = t("role.test")
 
     if stage_name == "dev":
         if "pm" in stage_outputs:
-            parts.append("【{} 产出 - 需求文档】\n{}".format(
-                role_label_map.get("pm", "PM"), stage_outputs["pm"]))
+            parts.append("{}\n{}".format(
+                t("ai_prompt.role_pm_requirements", label=pm_label), stage_outputs["pm"]))
     elif stage_name == "test":
         if "pm" in stage_outputs:
-            parts.append("【{} 产出 - 需求文档】\n{}".format(
-                role_label_map.get("pm", "PM"), stage_outputs["pm"]))
+            parts.append("{}\n{}".format(
+                t("ai_prompt.role_pm_requirements", label=pm_label), stage_outputs["pm"]))
         if "dev" in stage_outputs:
-            parts.append("【{} 产出 - 代码变更】\n{}".format(
-                role_label_map.get("dev", "Dev"), stage_outputs["dev"]))
+            parts.append("{}\n{}".format(
+                t("ai_prompt.role_dev_code", label=dev_label), stage_outputs["dev"]))
     elif stage_name == "qa":
         # QA gets summarized context to avoid Codex CLI prompt truncation
         if "pm" in stage_outputs:
             pm_summary = _summarize_stage_for_qa("pm", stage_outputs["pm"])
-            parts.append("【{} 产出 - 需求与验收标准】\n{}".format(
-                role_label_map.get("pm", "PM"), pm_summary))
+            parts.append("{}\n{}".format(
+                t("ai_prompt.role_pm_acceptance", label=pm_label), pm_summary))
         if "dev" in stage_outputs:
             dev_summary = _summarize_stage_for_qa("dev", stage_outputs["dev"])
-            parts.append("【{} 产出 - 代码变更摘要】\n{}".format(
-                role_label_map.get("dev", "Dev"), dev_summary))
+            parts.append("{}\n{}".format(
+                t("ai_prompt.role_dev_summary", label=dev_label), dev_summary))
         if "test" in stage_outputs:
             test_summary = _summarize_stage_for_qa("test", stage_outputs["test"])
-            parts.append("【{} 产出 - 测试结果】\n{}".format(
-                role_label_map.get("test", "Test"), test_summary))
+            parts.append("{}\n{}".format(
+                t("ai_prompt.role_test_result", label=test_label), test_summary))
 
     return "\n\n".join(parts)
 
@@ -1142,13 +1024,13 @@ def _load_pipeline_provider_config() -> Dict:
         from pipeline_config import get_effective_pipeline_config
         config = get_effective_pipeline_config()
         if config:
-            logger.info("[Pipeline] 已加载管线多服务商配置")
+            logger.info("[Pipeline] %s", t("log.pipeline_config_loaded"))
         return config
     except ValueError as exc:
-        logger.error("[Pipeline] 管线配置加载失败: %s", exc)
+        logger.error("[Pipeline] %s", t("log.pipeline_config_failed", err=exc))
         return {}
     except Exception as exc:
-        logger.debug("[Pipeline] 未加载管线配置文件 (非错误): %s", exc)
+        logger.debug("[Pipeline] %s", t("log.pipeline_config_debug", err=exc))
         return {}
 
 
@@ -1245,7 +1127,8 @@ def process_pipeline(task: Dict, processing: Path) -> Dict:
         if output:
             if is_role:
                 stage_outputs[stage_name] = output[:6000]
-            context += "【{} 阶段 ({})】\n{}\n\n".format(stage_name, backend, output[:4000])
+            context += "{}\n{}\n\n".format(
+                t("ai_prompt.stage_section", name=stage_name, backend=backend), output[:4000])
 
         # Abort pipeline on stage failure
         if run.get("returncode", 1) != 0 or run.get("noop_reason"):
