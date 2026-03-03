@@ -507,6 +507,50 @@ class TestLocaleKeyParity(unittest.TestCase):
                 sorted(missing_in_zh))
         )
 
+
+class TestLanguageSwitchRegistersCommands(unittest.TestCase):
+    """Switching language via callback should re-register bot commands."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        state_dir = Path(self.tmp.name) / "codex-tasks" / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        _reset_i18n()
+
+    def tearDown(self):
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+        _reset_i18n()
+
+    @patch("coordinator.register_bot_commands")
+    @patch("bot_commands.answer_callback_query")
+    @patch("bot_commands.send_text")
+    def test_lang_en_registers_commands(self, mock_send, mock_answer, mock_register):
+        from bot_commands import handle_callback_query
+        cb = {
+            "id": "cb1",
+            "data": "menu:lang_en",
+            "message": {"chat": {"id": 100}},
+            "from": {"id": 200},
+        }
+        handle_callback_query(cb)
+        mock_register.assert_called_once()
+
+    @patch("coordinator.register_bot_commands")
+    @patch("bot_commands.answer_callback_query")
+    @patch("bot_commands.send_text")
+    def test_lang_zh_registers_commands(self, mock_send, mock_answer, mock_register):
+        from bot_commands import handle_callback_query
+        cb = {
+            "id": "cb2",
+            "data": "menu:lang_zh",
+            "message": {"chat": {"id": 100}},
+            "from": {"id": 200},
+        }
+        handle_callback_query(cb)
+        mock_register.assert_called_once()
+
     def test_all_leaf_values_are_strings(self):
         """All leaf values in locale files should be strings."""
         locales_dir = AGENT_DIR / "locales"

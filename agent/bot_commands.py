@@ -1622,6 +1622,8 @@ def _handle_menu_callback(cb_id: str, data: str, chat_id: int, user_id: int) -> 
     if action in ("lang_zh", "lang_en"):
         lang = action.split("_", 1)[1]
         set_config_language(lang, changed_by=user_id)
+        from coordinator import register_bot_commands
+        register_bot_commands()
         send_text(
             chat_id,
             t("msg.language_switched"),
