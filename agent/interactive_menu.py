@@ -111,7 +111,7 @@ def main_menu_keyboard() -> Dict:
             [
                 {"text": "\u270f\ufe0f \u65b0\u5efa\u4efb\u52a1", "callback_data": "menu:new_task"},
                 {"text": "\U0001f4cb \u4efb\u52a1\u7ba1\u7406", "callback_data": "menu:sub_task_mgmt"},
-                {"text": "\U0001f4f7 \u622a\u56fe", "callback_data": "menu:screenshot"},
+                {"text": "\U0001f9e9 \u6280\u80fd\u7ba1\u7406", "callback_data": "menu:sub_skills"},
             ],
             # ---- Sub-menu entries ----
             [
@@ -212,7 +212,7 @@ def skills_menu_keyboard() -> Dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "\U0001f9e9 技能管理", "callback_data": "menu:sub_skills"},
+                {"text": "\U0001f4f7 截图", "callback_data": "menu:screenshot"},
             ],
             [
                 {"text": "\u00ab 返回主菜单", "callback_data": "menu:main"},
