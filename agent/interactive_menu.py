@@ -27,18 +27,52 @@ class _LazyTranslation:
 
     Supports ``.format(**kwargs)`` so that callers that do
     ``WELCOME_TEXT.format(backend=..., ...)`` keep working transparently.
+    Also supports ``in`` checks, iteration, and other common str operations
+    so that code like ``"/menu" in HELP_TEXT`` works correctly.
     """
     def __init__(self, key):
         self._key = key
 
-    def __str__(self):
+    def _resolve(self):
         return t(self._key)
+
+    def __str__(self):
+        return self._resolve()
 
     def __repr__(self):
         return "_LazyTranslation({!r})".format(self._key)
 
     def format(self, **kwargs):
         return t(self._key, **kwargs)
+
+    def __contains__(self, item):
+        return item in self._resolve()
+
+    def __iter__(self):
+        return iter(self._resolve())
+
+    def __len__(self):
+        return len(self._resolve())
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self._resolve() == other
+        if isinstance(other, _LazyTranslation):
+            return self._resolve() == other._resolve()
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self._resolve())
+
+    def __add__(self, other):
+        return self._resolve() + str(other)
+
+    def __radd__(self, other):
+        return str(other) + self._resolve()
+
+    def __getattr__(self, name):
+        # Delegate any other attribute access (splitlines, strip, etc.) to the resolved string
+        return getattr(self._resolve(), name)
 
 
 class _TranslatedDict:
