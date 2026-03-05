@@ -117,6 +117,19 @@ def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bo
     )
 
 
+def _guess_image_ext(data: bytes) -> str:
+    """Guess image extension from magic bytes. Returns '.jpg' as default."""
+    if data[:3] == b'\xff\xd8\xff':
+        return '.jpg'
+    if data[:4] == b'\x89PNG':
+        return '.png'
+    if data[:4] == b'GIF8':
+        return '.gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return '.webp'
+    return '.jpg'
+
+
 def download_telegram_file(file_id: str, dest_dir: Path) -> Path:
     """Download a Telegram file by file_id to dest_dir, return local Path."""
     if not file_id or not file_id.strip():
@@ -137,10 +150,15 @@ def download_telegram_file(file_id: str, dest_dir: Path) -> Path:
     if dl_resp.status_code != 200:
         raise RuntimeError("file download failed: HTTP {}".format(dl_resp.status_code))
     content_type = dl_resp.headers.get("Content-Type", "")
-    if content_type and not content_type.startswith("image/"):
-        raise RuntimeError("unexpected content type: {}".format(content_type))
+    ct_lower = content_type.split(";")[0].strip().lower()
+    _BLOCKED_CONTENT_TYPES = ("text/html", "application/json", "text/xml")
+    if ct_lower and not ct_lower.startswith("image/") and ct_lower != "application/octet-stream":
+        if ct_lower in _BLOCKED_CONTENT_TYPES:
+            raise RuntimeError("unexpected content type: {}".format(content_type))
     # Determine extension from file_path
-    ext = Path(file_path).suffix or ".jpg"
+    ext = Path(file_path).suffix
+    if not ext:
+        ext = _guess_image_ext(dl_resp.content)
     dest_dir.mkdir(parents=True, exist_ok=True)
     local_name = uuid.uuid4().hex[:12] + ext
     local_path = dest_dir / local_name

@@ -129,6 +129,92 @@ class TestDownloadTelegramFile(unittest.TestCase):
         with self.assertRaises(ValueError):
             download_telegram_file("  ", Path("/tmp"))
 
+    @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_CODEX": "test-token-123"})
+    @patch("utils.requests.get")
+    def test_octet_stream_content_type_succeeds(self, mock_get):
+        """application/octet-stream should be accepted."""
+        get_file_resp = MagicMock()
+        get_file_resp.status_code = 200
+        get_file_resp.json.return_value = {
+            "ok": True,
+            "result": {"file_path": "photos/file_0.jpg"},
+        }
+        dl_resp = MagicMock()
+        dl_resp.status_code = 200
+        dl_resp.headers = {"Content-Type": "application/octet-stream"}
+        dl_resp.content = b"\xff\xd8\xff\xe0fake-jpeg-data"
+        mock_get.side_effect = [get_file_resp, dl_resp]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from utils import download_telegram_file
+            result = download_telegram_file("test_file_id", Path(tmpdir))
+            self.assertTrue(result.exists())
+            self.assertEqual(result.suffix, ".jpg")
+
+    @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_CODEX": "test-token-123"})
+    @patch("utils.requests.get")
+    def test_text_html_content_type_raises(self, mock_get):
+        """text/html should be rejected."""
+        get_file_resp = MagicMock()
+        get_file_resp.status_code = 200
+        get_file_resp.json.return_value = {
+            "ok": True,
+            "result": {"file_path": "photos/file_0.jpg"},
+        }
+        dl_resp = MagicMock()
+        dl_resp.status_code = 200
+        dl_resp.headers = {"Content-Type": "text/html"}
+        dl_resp.content = b"<html></html>"
+        mock_get.side_effect = [get_file_resp, dl_resp]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from utils import download_telegram_file
+            with self.assertRaises(RuntimeError) as ctx:
+                download_telegram_file("test_file_id", Path(tmpdir))
+            self.assertIn("unexpected content type", str(ctx.exception))
+
+    @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_CODEX": "test-token-123"})
+    @patch("utils.requests.get")
+    def test_octet_stream_no_ext_jpeg_magic(self, mock_get):
+        """octet-stream + no extension + JPEG magic bytes -> .jpg"""
+        get_file_resp = MagicMock()
+        get_file_resp.status_code = 200
+        get_file_resp.json.return_value = {
+            "ok": True,
+            "result": {"file_path": "photos/file_0"},
+        }
+        dl_resp = MagicMock()
+        dl_resp.status_code = 200
+        dl_resp.headers = {"Content-Type": "application/octet-stream"}
+        dl_resp.content = b"\xff\xd8\xff\xe0fake-jpeg"
+        mock_get.side_effect = [get_file_resp, dl_resp]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from utils import download_telegram_file
+            result = download_telegram_file("test_file_id", Path(tmpdir))
+            self.assertEqual(result.suffix, ".jpg")
+
+    @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_CODEX": "test-token-123"})
+    @patch("utils.requests.get")
+    def test_octet_stream_no_ext_png_magic(self, mock_get):
+        """octet-stream + no extension + PNG magic bytes -> .png"""
+        get_file_resp = MagicMock()
+        get_file_resp.status_code = 200
+        get_file_resp.json.return_value = {
+            "ok": True,
+            "result": {"file_path": "photos/file_0"},
+        }
+        dl_resp = MagicMock()
+        dl_resp.status_code = 200
+        dl_resp.headers = {"Content-Type": "application/octet-stream"}
+        dl_resp.content = b"\x89PNG\r\n\x1a\nfake-png"
+        mock_get.side_effect = [get_file_resp, dl_resp]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from utils import download_telegram_file
+            result = download_telegram_file("test_file_id", Path(tmpdir))
+            self.assertEqual(result.suffix, ".png")
+
 
 class TestCreateTaskWithImages(unittest.TestCase):
     """Test create_task includes images field."""
