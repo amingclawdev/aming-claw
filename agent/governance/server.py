@@ -170,31 +170,24 @@ class RequestContext:
 # ROUTES
 # ============================================================
 
-# --- Bootstrap ---
+# --- Init (one-time project initialization) ---
 
-@route("POST", "/api/bootstrap")
-def handle_bootstrap(ctx: RequestContext):
-    result = project_service.bootstrap(
-        project_id=ctx.body.get("project_id", ""),
-        project_name=ctx.body.get("project_name", ""),
+@route("POST", "/api/init")
+def handle_init(ctx: RequestContext):
+    """Human calls this once to create project + get coordinator token.
+    Repeat call without password → 403.
+    Repeat call with correct password → reset coordinator token.
+    """
+    result = project_service.init_project(
+        project_id=ctx.body.get("project_id", ctx.body.get("project", "")),
+        password=ctx.body.get("password", ""),
+        project_name=ctx.body.get("project_name", ctx.body.get("name", "")),
         workspace_path=ctx.body.get("workspace_path", ""),
-        graph_source=ctx.body.get("graph_source"),
-        coordinator_principal=ctx.body.get("coordinator", {}).get("principal_id", ""),
-        admin_secret=ctx.body.get("coordinator", {}).get("admin_secret", ""),
     )
     return 201, result
 
 
 # --- Project ---
-
-@route("POST", "/api/project/register")
-def handle_project_register(ctx: RequestContext):
-    result = project_service.register_project(
-        ctx.body.get("project_id", ""),
-        ctx.body.get("name", ""),
-        ctx.body.get("workspace_path", ""),
-    )
-    return 201, result
 
 
 @route("GET", "/api/project/list")
@@ -202,22 +195,34 @@ def handle_project_list(ctx: RequestContext):
     return {"projects": project_service.list_projects()}
 
 
-# --- Role ---
+# --- Role (coordinator assigns roles to other agents) ---
 
-@route("POST", "/api/role/register")
-def handle_role_register(ctx: RequestContext):
+@route("POST", "/api/role/assign")
+def handle_role_assign(ctx: RequestContext):
+    """Coordinator assigns a role+token to another agent."""
     project_id = ctx.body.get("project_id", "")
     with DBContext(project_id) as conn:
-        result = role_service.register(
-            conn,
+        session = ctx.require_auth(conn)
+        result = project_service.assign_role(
+            conn, project_id, session,
             principal_id=ctx.body.get("principal_id", ""),
-            project_id=project_id,
             role=ctx.body.get("role", ""),
             scope=ctx.body.get("scope"),
-            metadata=ctx.body.get("metadata"),
-            admin_secret=ctx.body.get("admin_secret"),
         )
     return 201, result
+
+
+@route("POST", "/api/role/revoke")
+def handle_role_revoke(ctx: RequestContext):
+    """Coordinator revokes an agent's session."""
+    project_id = ctx.body.get("project_id", "")
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        result = project_service.revoke_role(
+            conn, project_id, session,
+            session_id=ctx.body.get("session_id", ""),
+        )
+    return result
 
 
 @route("POST", "/api/role/heartbeat")
@@ -261,6 +266,24 @@ def handle_list_sessions(ctx: RequestContext):
 
 # --- Workflow ---
 
+@route("POST", "/api/wf/{project_id}/import-graph")
+def handle_import_graph(ctx: RequestContext):
+    """Import acceptance graph from a markdown file. Coordinator only."""
+    project_id = ctx.get_project_id()
+    md_path = ctx.body.get("md_path", ctx.body.get("graph_source", ""))
+    if not md_path:
+        from .errors import ValidationError
+        raise ValidationError("md_path is required")
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        if session.get("role") != "coordinator":
+            from .errors import PermissionDeniedError
+            raise PermissionDeniedError(session.get("role", ""), "import-graph",
+                                        {"detail": "Only coordinator can import graphs"})
+    result = project_service.import_graph(project_id, md_path)
+    return result
+
+
 @route("POST", "/api/wf/{project_id}/verify-update")
 def handle_verify_update(ctx: RequestContext):
     project_id = ctx.get_project_id()
@@ -288,6 +311,21 @@ def handle_verify_update(ctx: RequestContext):
         if ctx.idem_key:
             rc.store_idempotency(ctx.idem_key, result)
 
+    return result
+
+
+@route("POST", "/api/wf/{project_id}/baseline")
+def handle_baseline(ctx: RequestContext):
+    """Coordinator batch-sets historical node states, bypassing checks."""
+    project_id = ctx.get_project_id()
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        result = state_service.set_baseline(
+            conn, project_id,
+            node_statuses=ctx.body.get("nodes", {}),
+            session=session,
+            reason=ctx.body.get("reason", ""),
+        )
     return result
 
 
@@ -459,6 +497,15 @@ def create_server(port: int = None) -> HTTPServer:
 
 
 def main():
+    # Enable Redis Pub/Sub bridge for EventBus
+    from .event_bus import get_event_bus
+    redis = get_redis()
+    if redis.available:
+        get_event_bus().enable_redis_bridge()
+        print("EventBus: Redis Pub/Sub bridge enabled")
+    else:
+        print("EventBus: Redis unavailable, in-process only")
+
     server = create_server()
     print(f"Governance service listening on port {PORT}")
     try:

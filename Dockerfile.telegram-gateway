@@ -6,12 +6,12 @@ WORKDIR /app
 COPY agent/requirements.txt agent/requirements.txt
 RUN pip install --no-cache-dir -r agent/requirements.txt
 
-# Copy agent source
+# Copy agent source (coordinator, bot_commands, utils, etc.)
 COPY agent/ agent/
 
 # Create shared-volume directory structure
-RUN mkdir -p /app/shared-volume/codex-tasks/state/governance
+RUN mkdir -p /app/shared-volume/codex-tasks/state
 
-EXPOSE 30006
+WORKDIR /app/agent
 
-CMD ["python", "-m", "agent.governance.server"]
+CMD ["python", "-m", "telegram_gateway.gateway"]

@@ -1,0 +1,37 @@
+services:
+  governance-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.governance
+    ports:
+      - "30007:30006"
+    volumes:
+      - governance-dev-data:/app/shared-volume/codex-tasks/state/governance
+      - .:/workspace:ro
+    environment:
+      - GOVERNANCE_PORT=30006
+      - REDIS_URL=redis://redis-dev:6379/0
+      - SHARED_VOLUME_PATH=/app/shared-volume
+    depends_on:
+      redis-dev:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:30006/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  redis-dev:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  governance-dev-data:
+    driver: local

@@ -26,7 +26,11 @@ def _utc_iso() -> str:
 
 
 def init_node_states(conn: sqlite3.Connection, project_id: str, graph) -> int:
-    """Initialize node_state rows from graph. Returns count of nodes initialized."""
+    """Initialize node_state rows from graph.
+
+    Reads parsed_verify_status and parsed_build_status from graph node data
+    (set during markdown import). Falls back to 'pending'/'impl:missing'.
+    """
     count = 0
     now = _utc_iso()
     for node_id in graph.list_nodes():
@@ -36,14 +40,93 @@ def init_node_states(conn: sqlite3.Connection, project_id: str, graph) -> int:
         ).fetchone()
         if not existing:
             node_data = graph.get_node(node_id)
+            verify = node_data.get("parsed_verify_status", "pending")
+            build = node_data.get("parsed_build_status",
+                                  node_data.get("build_status", "impl:missing"))
             conn.execute(
                 """INSERT INTO node_state
                    (project_id, node_id, verify_status, build_status, updated_at, version)
-                   VALUES (?, ?, 'pending', ?, ?, 1)""",
-                (project_id, node_id, node_data.get("build_status", "impl:missing"), now),
+                   VALUES (?, ?, ?, ?, ?, 1)""",
+                (project_id, node_id, verify, build, now),
             )
             count += 1
     return count
+
+
+def set_baseline(
+    conn: sqlite3.Connection,
+    project_id: str,
+    node_statuses: dict[str, str],
+    session: dict,
+    reason: str = "",
+) -> dict:
+    """Coordinator batch-sets historical node states, bypassing permission/evidence checks.
+
+    Used for one-time import of verified state from legacy acceptance graphs.
+    Only coordinator can call this. All changes are audited as 'baseline_import'.
+
+    Args:
+        node_statuses: {"L0.1": "qa_pass", "L0.2": "t2_pass", "L3.7": "pending"}
+        reason: Human-readable reason for the baseline import.
+
+    Returns: {updated: int, skipped: int, details: [...]}
+    """
+    if session.get("role") != "coordinator":
+        from .errors import PermissionDeniedError
+        raise PermissionDeniedError(session.get("role", ""), "set_baseline",
+                                    {"detail": "Only coordinator can set baseline"})
+
+    now = _utc_iso()
+    updated = 0
+    skipped = 0
+    details = []
+
+    for node_id, target_status_str in node_statuses.items():
+        target = VerifyStatus.from_str(target_status_str)
+
+        current = get_node_status(conn, project_id, node_id)
+        if current is None:
+            details.append({"node": node_id, "action": "skipped", "reason": "not in graph"})
+            skipped += 1
+            continue
+
+        current_status = current["verify_status"]
+        if current_status == target.value:
+            details.append({"node": node_id, "action": "skipped", "reason": "already at target"})
+            skipped += 1
+            continue
+
+        new_version = current["version"] + 1
+        conn.execute(
+            """UPDATE node_state
+               SET verify_status = ?, updated_by = ?, updated_at = ?, version = ?
+               WHERE project_id = ? AND node_id = ?""",
+            (target.value, session.get("session_id", ""), now, new_version,
+             project_id, node_id),
+        )
+
+        # History
+        conn.execute(
+            """INSERT INTO node_history
+               (project_id, node_id, from_status, to_status, role, evidence_json,
+                session_id, ts, version)
+               VALUES (?, ?, ?, ?, 'coordinator', '{"type":"baseline_import"}', ?, ?, ?)""",
+            (project_id, node_id, current_status, target.value,
+             session.get("session_id", ""), now, new_version),
+        )
+
+        details.append({"node": node_id, "action": "updated", "from": current_status, "to": target.value})
+        updated += 1
+
+    # Audit
+    audit_service.record(
+        conn, project_id, "baseline_import",
+        actor=session.get("principal_id", ""),
+        nodes_updated=updated, nodes_skipped=skipped,
+        reason=reason,
+    )
+
+    return {"updated": updated, "skipped": skipped, "details": details}
 
 
 def get_node_status(conn: sqlite3.Connection, project_id: str, node_id: str) -> dict | None:

@@ -51,9 +51,21 @@ class Evidence:
         return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Evidence":
+    def from_dict(cls, d) -> "Evidence":
         if not d:
             return cls(type="unknown")
+        if isinstance(d, str):
+            from .errors import ValidationError
+            raise ValidationError(
+                'evidence must be a dict, not a string. '
+                'Example: {"type": "test_report", "summary": {"passed": 162, "exit_code": 0}}'
+            )
+        if not isinstance(d, dict):
+            from .errors import ValidationError
+            raise ValidationError(
+                f'evidence must be a dict, got {type(d).__name__}. '
+                'Example: {"type": "test_report", "summary": {"passed": 162, "exit_code": 0}}'
+            )
         return cls(
             type=d.get("type", "unknown"),
             producer=d.get("producer", ""),

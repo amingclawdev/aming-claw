@@ -16,7 +16,6 @@ class TestRoleService(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
-        os.environ["GOVERNANCE_ADMIN_SECRET"] = "test-secret"
         reset_redis()
 
         self.project_id = "test-project"
@@ -25,7 +24,6 @@ class TestRoleService(unittest.TestCase):
     def tearDown(self):
         close_connection(self.conn)
         os.environ.pop("SHARED_VOLUME_PATH", None)
-        os.environ.pop("GOVERNANCE_ADMIN_SECRET", None)
         self.tmp.cleanup()
 
     def test_register_dev(self):
@@ -38,16 +36,9 @@ class TestRoleService(unittest.TestCase):
         self.assertEqual(result["role"], "dev")
         self.assertTrue(result["token"].startswith("gov-"))
 
-    def test_register_coordinator_requires_secret(self):
-        with self.assertRaises(AuthError):
-            role_service.register(
-                self.conn, "coord-001", self.project_id, "coordinator",
-            )
-
-    def test_register_coordinator_with_secret(self):
+    def test_register_coordinator(self):
         result = role_service.register(
             self.conn, "coord-001", self.project_id, "coordinator",
-            admin_secret="test-secret",
         )
         self.conn.commit()
         self.assertEqual(result["role"], "coordinator")
@@ -91,7 +82,7 @@ class TestRoleService(unittest.TestCase):
         self.conn.commit()
         hb = role_service.heartbeat(self.conn, result["session_id"])
         self.assertEqual(hb["status"], "active")
-        self.assertIn("next_heartbeat_before", hb)
+        self.assertIn("server_time", hb)
 
     def test_deregister(self):
         result = role_service.register(self.conn, "agent-001", self.project_id, "dev")

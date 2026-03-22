@@ -116,9 +116,8 @@ class Role(Enum):
 
 class SessionStatus(Enum):
     ACTIVE       = "active"
-    STALE        = "stale"        # Heartbeat overdue, warning
-    EXPIRED      = "expired"      # Past expiry, rejected
-    DEREGISTERED = "deregistered"  # Explicitly unregistered
+    EXPIRED      = "expired"      # Past TTL (non-coordinator) or manually expired
+    DEREGISTERED = "deregistered"  # Explicitly unregistered by coordinator
 
 
 class GateMode(Enum):

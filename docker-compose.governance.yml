@@ -1,29 +1,100 @@
-version: "3.8"
-
 services:
+  # --- Reverse Proxy ---
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "30000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      governance:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # --- Governance Service (Production) ---
   governance:
     build:
       context: .
       dockerfile: Dockerfile.governance
-    ports:
-      - "30006:30006"
+    # No host port mapping - accessed via nginx
+    expose:
+      - "30006"
     volumes:
       - governance-data:/app/shared-volume/codex-tasks/state/governance
-      - ${WORKSPACE_PATH:-./}:/workspace:ro
+      - .:/workspace:ro
     environment:
       - GOVERNANCE_PORT=30006
       - REDIS_URL=redis://redis:6379/0
       - SHARED_VOLUME_PATH=/app/shared-volume
-      - GOVERNANCE_ADMIN_SECRET=${GOVERNANCE_ADMIN_SECRET:-default-dev-secret}
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:30006/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
+  # --- Governance Service (Development) ---
+  governance-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.governance
+    expose:
+      - "30007"
+    volumes:
+      - governance-dev-data:/app/shared-volume/codex-tasks/state/governance
+      - .:/workspace:ro
+    environment:
+      - GOVERNANCE_PORT=30007
+      - REDIS_URL=redis://redis:6379/1
+      - SHARED_VOLUME_PATH=/app/shared-volume
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:30007/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    profiles:
+      - dev
+
+  # --- Telegram Gateway ---
+  telegram-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.telegram-gateway
+    volumes:
+      - task-data:/app/shared-volume/codex-tasks
+    env_file:
+      - .env
+    environment:
+      - GOVERNANCE_URL=http://governance:30006
+      - REDIS_URL=redis://redis:6379/0
+      - SHARED_VOLUME_PATH=/app/shared-volume
+      - TELEGRAM_ADMIN_CHAT_ID=${TELEGRAM_ADMIN_CHAT_ID:-7848961760}
+    depends_on:
+      governance:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Redis ---
   redis:
     image: redis:7-alpine
+    expose:
+      - "6379"
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
@@ -37,5 +108,9 @@ services:
 volumes:
   governance-data:
     driver: local
+  governance-dev-data:
+    driver: local
   redis-data:
+    driver: local
+  task-data:
     driver: local

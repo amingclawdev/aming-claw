@@ -1,7 +1,12 @@
-"""Role service — Principal + Session model with heartbeat and auth.
+"""Role service — Principal + Session model with token auth.
 
 Dual-write: SQLite (truth) + Redis (cache).
 Auth flow: X-Gov-Token header → token_hash → session lookup → role extraction.
+
+Token lifetime:
+  - Coordinator: never expires (human-controlled trust anchor)
+  - Other roles: 24h TTL (coordinator re-assigns as needed)
+  - No heartbeat requirement (agents are task-based, not long-running)
 """
 
 import hashlib
@@ -18,12 +23,9 @@ from .errors import (
 from .redis_client import get_redis
 from . import audit_service
 
-# Default timeouts (overridable via env)
 import os
 SESSION_TTL_HOURS = int(os.environ.get("GOVERNANCE_SESSION_TTL_HOURS", "24"))
-HEARTBEAT_INTERVAL_SEC = int(os.environ.get("GOVERNANCE_HEARTBEAT_INTERVAL_SEC", "60"))
-STALE_TIMEOUT_SEC = int(os.environ.get("GOVERNANCE_STALE_TIMEOUT_SEC", "180"))
-EXPIRE_TIMEOUT_SEC = int(os.environ.get("GOVERNANCE_EXPIRE_TIMEOUT_SEC", "600"))
+COORDINATOR_TTL_YEARS = 10  # effectively never expires
 
 
 def _utc_iso() -> str:
@@ -36,6 +38,17 @@ def _hash_token(token: str) -> str:
 
 def _generate_token() -> str:
     return "gov-" + secrets.token_hex(32)
+
+
+def _ttl_for_role(role: Role) -> tuple[timedelta, int]:
+    """Return (timedelta, redis_ttl_sec) for a role.
+    Coordinator: 10 years (never expires). Others: SESSION_TTL_HOURS.
+    """
+    if role == Role.COORDINATOR:
+        td = timedelta(days=365 * COORDINATOR_TTL_YEARS)
+        return td, int(td.total_seconds())
+    td = timedelta(hours=SESSION_TTL_HOURS)
+    return td, int(td.total_seconds())
 
 
 def register(
@@ -54,12 +67,6 @@ def register(
     # Validate role
     role_enum = Role.from_str(role)
 
-    # Coordinator requires admin_secret
-    if role_enum == Role.COORDINATOR:
-        expected = os.environ.get("GOVERNANCE_ADMIN_SECRET", "")
-        if not expected or admin_secret != expected:
-            raise AuthError("Coordinator registration requires valid admin_secret", "auth_required")
-
     # Check for duplicate active session with different role in same project
     existing = conn.execute(
         "SELECT session_id, role FROM sessions WHERE principal_id = ? AND project_id = ? AND status = 'active'",
@@ -74,18 +81,19 @@ def register(
         token = _generate_token()
         token_hash = _hash_token(token)
         now = _utc_iso()
-        expires = (datetime.now(timezone.utc) + timedelta(hours=SESSION_TTL_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ttl_delta, redis_ttl = _ttl_for_role(role_enum)
+        expires = (datetime.now(timezone.utc) + ttl_delta).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn.execute(
-            "UPDATE sessions SET token_hash = ?, expires_at = ?, last_heartbeat = ? WHERE session_id = ?",
-            (token_hash, expires, now, existing["session_id"]),
+            "UPDATE sessions SET token_hash = ?, expires_at = ? WHERE session_id = ?",
+            (token_hash, expires, existing["session_id"]),
         )
         # Update Redis cache
         rc = get_redis()
         session_data = dict(conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?", (existing["session_id"],)
         ).fetchone())
-        rc.cache_session(existing["session_id"], session_data, SESSION_TTL_HOURS * 3600)
-        rc.cache_token_session(token_hash, existing["session_id"], SESSION_TTL_HOURS * 3600)
+        rc.cache_session(existing["session_id"], session_data, redis_ttl)
+        rc.cache_token_session(token_hash, existing["session_id"], redis_ttl)
 
         return {
             "session_id": existing["session_id"],
@@ -100,7 +108,8 @@ def register(
     token = _generate_token()
     token_hash = _hash_token(token)
     now = _utc_iso()
-    expires = (datetime.now(timezone.utc) + timedelta(hours=SESSION_TTL_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ttl_delta, redis_ttl = _ttl_for_role(role_enum)
+    expires = (datetime.now(timezone.utc) + ttl_delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     import uuid, time
     session_id = f"ses-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
@@ -136,10 +145,9 @@ def register(
         "status": "active",
         "created_at": now,
         "expires_at": expires,
-        "last_heartbeat": now,
     }
-    rc.cache_session(session_id, session_data, SESSION_TTL_HOURS * 3600)
-    rc.cache_token_session(token_hash, session_id, SESSION_TTL_HOURS * 3600)
+    rc.cache_session(session_id, session_data, redis_ttl)
+    rc.cache_token_session(token_hash, session_id, redis_ttl)
 
     return {
         "session_id": session_id,
@@ -206,20 +214,17 @@ def authenticate(conn: sqlite3.Connection, token: str) -> dict:
 
 
 def heartbeat(conn: sqlite3.Connection, session_id: str, status: str = "idle", current_task: str = None) -> dict:
-    """Update session heartbeat."""
+    """Optional heartbeat — updates last_heartbeat timestamp.
+    Not required for session validity (no stale/expire based on heartbeat).
+    """
     now = _utc_iso()
     conn.execute(
         "UPDATE sessions SET last_heartbeat = ? WHERE session_id = ? AND status = 'active'",
         (now, session_id),
     )
-    rc = get_redis()
-    rc.update_heartbeat(session_id, EXPIRE_TIMEOUT_SEC)
-
-    next_before = (datetime.now(timezone.utc) + timedelta(seconds=HEARTBEAT_INTERVAL_SEC)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "session_id": session_id,
         "status": "active",
-        "next_heartbeat_before": next_before,
         "server_time": now,
     }
 
@@ -238,8 +243,8 @@ def deregister(conn: sqlite3.Connection, session_id: str) -> dict:
 def list_sessions(conn: sqlite3.Connection, project_id: str) -> list[dict]:
     """List all active sessions for a project."""
     rows = conn.execute(
-        "SELECT session_id, principal_id, role, status, last_heartbeat, created_at "
-        "FROM sessions WHERE project_id = ? AND status IN ('active', 'stale') ORDER BY created_at",
+        "SELECT session_id, principal_id, role, status, created_at, expires_at "
+        "FROM sessions WHERE project_id = ? AND status = 'active' ORDER BY created_at",
         (project_id,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -267,23 +272,15 @@ def check_role_available(conn: sqlite3.Connection, project_id: str, role: str) -
 
 
 def cleanup_expired(conn: sqlite3.Connection, project_id: str) -> int:
-    """Mark expired/stale sessions. Returns count of affected sessions."""
+    """Expire sessions past their TTL. Returns count of affected sessions.
+    Note: coordinator sessions have 10-year TTL (effectively never expire).
+    """
     now = _utc_iso()
-    # Expire sessions past their expiry time
     cursor = conn.execute(
-        "UPDATE sessions SET status = 'expired' WHERE project_id = ? AND status IN ('active', 'stale') AND expires_at < ?",
+        "UPDATE sessions SET status = 'expired' WHERE project_id = ? AND status = 'active' AND expires_at < ?",
         (project_id, now),
     )
-    count = cursor.rowcount
-
-    # Mark stale sessions (heartbeat too old but not expired)
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=STALE_TIMEOUT_SEC)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cursor2 = conn.execute(
-        "UPDATE sessions SET status = 'stale' WHERE project_id = ? AND status = 'active' AND last_heartbeat < ?",
-        (project_id, stale_cutoff),
-    )
-    count += cursor2.rowcount
-    return count
+    return cursor.rowcount
 
 
 def _expire_session(conn: sqlite3.Connection, session_id: str):

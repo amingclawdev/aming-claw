@@ -166,10 +166,22 @@ class AcceptanceGraph:
         version_match = re.search(r'v(\d+[\.\d]*)', first_line)
         version = f"v{version_match.group(1)}" if version_match else ""
 
+        # Normalize verify_status to enum values
+        from .enums import VerifyStatus, BuildStatus
+        try:
+            parsed_vs = VerifyStatus.from_str(verify_status).value
+        except ValueError:
+            parsed_vs = "pending"
+        try:
+            parsed_bs = f"impl:{build}" if not build.startswith("impl:") else build
+            BuildStatus.from_str(parsed_bs)  # validate
+        except ValueError:
+            parsed_bs = "impl:missing"
+
         # Build gate requirements
         gate_reqs = [{"node_id": g, "min_status": "qa_pass", "policy": "default"} for g in gates_raw]
 
-        return NodeDef(
+        node_def = NodeDef(
             id=node_id, title=title, layer=layer,
             verify_level=verify_level, gate_mode=gate_mode,
             test_coverage=test_coverage,
@@ -177,6 +189,10 @@ class AcceptanceGraph:
             propagation=propagation, guard=guard, version=version,
             gates=gate_reqs,
         )
+        # Store parsed statuses for init_node_states to read
+        node_def._parsed_verify_status = parsed_vs
+        node_def._parsed_build_status = parsed_bs
+        return node_def
 
     def _extract_field(self, text: str, patterns: list[str], default=None) -> str | None:
         for p in patterns:
@@ -200,11 +216,15 @@ class AcceptanceGraph:
         """Add a parsed node to both graphs."""
         attrs = node_def.to_dict()
         deps = attrs.pop("gates", [])  # gates handled separately
-        node_deps = attrs.get("_deps", [])
 
         self.G.add_node(node_def.id, **attrs)
 
-        # We need to store deps so we can add edges after all nodes are parsed
+        # Carry parsed statuses from markdown into node data
+        if hasattr(node_def, "_parsed_verify_status"):
+            self.G.nodes[node_def.id]["parsed_verify_status"] = node_def._parsed_verify_status
+        if hasattr(node_def, "_parsed_build_status"):
+            self.G.nodes[node_def.id]["parsed_build_status"] = node_def._parsed_build_status
+
         self.G.nodes[node_def.id]["_deps"] = []
         self.G.nodes[node_def.id]["_gates_raw"] = deps
 

@@ -144,3 +144,30 @@ class GovernanceClient:
 
     def heartbeat(self, status: str = "idle") -> dict:
         return self._post("/api/role/heartbeat", {"status": status})
+
+    # --- Session Persistence ---
+
+    def connect_from_env(self, role: str = "", project_id: str = "") -> dict:
+        """Connect using token from environment variable.
+
+        Trust chain: human sets GOV_{ROLE}_TOKEN in .env → agent reads at startup.
+
+        Returns: {token, session, connected, team_status}
+        """
+        from .session_persistence import connect_from_env, check_team_status
+
+        result = connect_from_env(
+            governance_url=self.base_url,
+            role=role,
+            project_id=project_id,
+        )
+
+        if result.get("connected"):
+            self.token = result["token"]
+            team = check_team_status(project_id, self.token, self.base_url)
+            result["team_status"] = team
+        elif result.get("token"):
+            # Offline mode: have token but service unreachable
+            self.token = result["token"]
+
+        return result
