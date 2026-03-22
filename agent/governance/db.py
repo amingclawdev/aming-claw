@@ -1,0 +1,215 @@
+"""SQLite database layer for governance runtime state.
+
+Manages:
+  - Connection lifecycle (per-project databases)
+  - Schema creation and migration
+  - WAL mode for concurrent read/write
+"""
+
+import os
+import sys
+import sqlite3
+from pathlib import Path
+
+_agent_dir = str(Path(__file__).resolve().parents[1])
+if _agent_dir not in sys.path:
+    sys.path.insert(0, _agent_dir)
+
+from utils import tasks_root
+
+
+SCHEMA_VERSION = 1
+
+SCHEMA_SQL = """
+-- Node runtime state
+CREATE TABLE IF NOT EXISTS node_state (
+    project_id    TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    verify_status TEXT NOT NULL DEFAULT 'pending',
+    build_status  TEXT NOT NULL DEFAULT 'impl:missing',
+    evidence_json TEXT,
+    updated_by    TEXT,
+    updated_at    TEXT NOT NULL,
+    version       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project_id, node_id)
+);
+
+-- Node state history (event sourcing auxiliary)
+CREATE TABLE IF NOT EXISTS node_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    from_status   TEXT,
+    to_status     TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    evidence_json TEXT,
+    session_id    TEXT,
+    ts            TEXT NOT NULL,
+    version       INTEGER NOT NULL
+);
+
+-- Session management
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id    TEXT PRIMARY KEY,
+    principal_id  TEXT NOT NULL,
+    project_id    TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    scope_json    TEXT,
+    token_hash    TEXT NOT NULL UNIQUE,
+    status        TEXT NOT NULL DEFAULT 'active',
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    last_heartbeat TEXT,
+    metadata_json TEXT
+);
+
+-- Task tracking
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id       TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'created',
+    related_nodes TEXT,
+    created_by    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+-- Idempotency keys
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    idem_key      TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL
+);
+
+-- Audit index (raw events in JSONL, this is the query index)
+CREATE TABLE IF NOT EXISTS audit_index (
+    event_id      TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL,
+    event         TEXT NOT NULL,
+    actor         TEXT,
+    ok            INTEGER NOT NULL DEFAULT 1,
+    ts            TEXT NOT NULL,
+    node_ids      TEXT
+);
+
+-- Version snapshots (for rollback)
+CREATE TABLE IF NOT EXISTS snapshots (
+    project_id    TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    created_by    TEXT,
+    PRIMARY KEY (project_id, version)
+);
+
+-- Schema version tracking
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_session_principal ON sessions(principal_id, project_id);
+CREATE INDEX IF NOT EXISTS idx_session_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_session_token ON sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_audit_project_ts ON audit_index(project_id, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_ok ON audit_index(ok);
+CREATE INDEX IF NOT EXISTS idx_idem_expires ON idempotency_keys(expires_at);
+CREATE INDEX IF NOT EXISTS idx_node_history_project ON node_history(project_id, node_id, ts);
+"""
+
+
+def _governance_root() -> Path:
+    """Root directory for governance data."""
+    return Path(tasks_root()) / "state" / "governance"
+
+
+def _project_db_path(project_id: str) -> Path:
+    """Path to the SQLite database for a specific project."""
+    project_dir = _governance_root() / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    return project_dir / "governance.db"
+
+
+def get_connection(project_id: str) -> sqlite3.Connection:
+    """Get a SQLite connection for a project, creating/migrating if needed.
+
+    Returns a connection with:
+      - WAL mode for concurrent readers
+      - Foreign keys enabled
+      - Row factory for dict-like access
+    """
+    db_path = _project_db_path(project_id)
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    _ensure_schema(conn)
+    return conn
+
+
+def _ensure_schema(conn: sqlite3.Connection):
+    """Create tables if they don't exist, run migrations if needed."""
+    conn.executescript(SCHEMA_SQL)
+
+    # Check and set schema version
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        current_version = int(row["value"]) if row else 0
+    except sqlite3.OperationalError:
+        current_version = 0
+
+    if current_version < SCHEMA_VERSION:
+        _run_migrations(conn, current_version, SCHEMA_VERSION)
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            ("schema_version", str(SCHEMA_VERSION)),
+        )
+        conn.commit()
+
+
+def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int):
+    """Run incremental migrations between versions.
+
+    Add migration functions as the schema evolves:
+        MIGRATIONS = {
+            1: _migrate_v0_to_v1,
+            2: _migrate_v1_to_v2,
+        }
+    """
+    MIGRATIONS = {}
+    for version in range(from_version + 1, to_version + 1):
+        if version in MIGRATIONS:
+            MIGRATIONS[version](conn)
+
+
+def close_connection(conn: sqlite3.Connection):
+    """Close a database connection."""
+    if conn:
+        conn.close()
+
+
+class DBContext:
+    """Context manager for database connections with automatic commit/rollback."""
+
+    def __init__(self, project_id: str):
+        self.project_id = project_id
+        self.conn = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        self.conn = get_connection(self.project_id)
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            close_connection(self.conn)
+        return False  # Don't suppress exceptions

@@ -1,0 +1,153 @@
+"""Policy-based impact analysis.
+
+Given file changes, determines which nodes need re-verification,
+what tests to run, and in what order.
+"""
+
+from .enums import VerifyStatus, VerifyLevel
+from .models import FileHitPolicy, PropagationPolicy, VerificationPolicy, ImpactAnalysisRequest
+
+
+class ImpactAnalyzer:
+    """Analyzes the impact of file changes on the acceptance graph."""
+
+    def __init__(self, graph, get_node_status_fn):
+        """
+        Args:
+            graph: AcceptanceGraph instance.
+            get_node_status_fn: callable(node_id) -> VerifyStatus
+        """
+        self.graph = graph
+        self.get_status = get_node_status_fn
+
+    def analyze(self, request: ImpactAnalysisRequest) -> dict:
+        file_policy = request.file_policy or FileHitPolicy()
+        prop_policy = request.propagation_policy or PropagationPolicy()
+        ver_policy = request.verification_policy or VerificationPolicy()
+
+        # Step 1: File → direct hit nodes
+        direct_hit = self._file_match(request.changed_files, file_policy)
+
+        # Step 2: Propagation
+        affected = set(direct_hit)
+        if prop_policy.follow_deps:
+            for nid in list(direct_hit):
+                try:
+                    affected |= self.graph.descendants(nid)
+                except Exception:
+                    pass
+
+        # Step 3: Pruning
+        skipped = []
+        if ver_policy.skip_already_passed:
+            for nid in list(affected):
+                try:
+                    status = self.get_status(nid)
+                    if status == VerifyStatus.QA_PASS and nid not in direct_hit:
+                        affected.discard(nid)
+                except Exception:
+                    pass
+
+        if ver_policy.respect_gates:
+            for nid in list(affected):
+                try:
+                    gates = self.graph.get_gates(nid)
+                    for gate in gates:
+                        gate_nid = gate.node_id if hasattr(gate, 'node_id') else gate.get("node_id", "")
+                        gate_status = self.get_status(gate_nid)
+                        if gate_status in (VerifyStatus.FAILED, VerifyStatus.PENDING):
+                            affected.discard(nid)
+                            skipped.append({"node": nid, "reason": f"gate {gate_nid} is {gate_status.value}"})
+                            break
+                except Exception:
+                    pass
+
+        # Step 4: Group by verify level + topological sort
+        by_phase = {"T1": [], "T2": [], "T3": [], "T4": []}
+        level_map = {1: "T1", 2: "T2", 3: "T3", 4: "T4", 5: "T4"}
+
+        for nid in affected:
+            try:
+                node_data = self.graph.get_node(nid)
+                vl = node_data.get("verify_level", 1)
+                if isinstance(vl, str):
+                    try:
+                        vl = int(vl)
+                    except ValueError:
+                        vl = 1
+                phase = level_map.get(vl, "T4")
+                by_phase[phase].append(nid)
+            except Exception:
+                by_phase["T4"].append(nid)
+
+        # Topological order filtered to affected
+        try:
+            topo = self.graph.topological_order()
+            ordered = [n for n in topo if n in affected]
+        except Exception:
+            ordered = sorted(affected)
+
+        # Collect test files
+        test_files = set()
+        for nid in affected:
+            try:
+                node_data = self.graph.get_node(nid)
+                for tf in node_data.get("test", []):
+                    if tf and tf != "TBD" and tf != "[TBD]":
+                        test_files.add(tf)
+            except Exception:
+                pass
+
+        # Max verify level
+        max_vl = 1
+        for nid in direct_hit:
+            try:
+                max_vl = max(max_vl, self.graph.max_verify_level(nid))
+            except Exception:
+                pass
+
+        return {
+            "direct_hit": sorted(direct_hit),
+            "total_affected": len(affected),
+            "verification_order": ordered,
+            "by_phase": {k: sorted(v) for k, v in by_phase.items()},
+            "skipped": skipped,
+            "test_files": sorted(test_files),
+            "max_verify": max_vl,
+        }
+
+    def _file_match(self, changed_files: list[str], policy: FileHitPolicy) -> set[str]:
+        """Match changed files to graph nodes."""
+        import fnmatch as _fnmatch
+
+        changed_set = set(changed_files)
+        hits = set()
+
+        for nid in self.graph.list_nodes():
+            try:
+                node_data = self.graph.get_node(nid)
+            except Exception:
+                continue
+
+            if policy.match_primary:
+                primary = set(node_data.get("primary", []))
+                if primary & changed_set:
+                    hits.add(nid)
+                    continue
+
+            if policy.match_secondary:
+                secondary = set(node_data.get("secondary", []))
+                if secondary & changed_set:
+                    hits.add(nid)
+                    continue
+
+            if policy.match_config_glob:
+                for pattern in policy.match_config_glob:
+                    for cf in changed_files:
+                        if _fnmatch.fnmatch(cf, pattern):
+                            # Check if this file is in any of the node's file lists
+                            all_files = set(node_data.get("primary", [])) | set(node_data.get("secondary", []))
+                            if cf in all_files:
+                                hits.add(nid)
+
+        return hits
