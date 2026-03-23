@@ -230,13 +230,16 @@ class TaskOrchestrator:
 
         # 8. Auto-trigger Tester if eval approved
         eval_status = eval_decision.get("status", "")
+        parent_chain_depth = int(ai_report.get("_chain_depth", 0))
         if eval_status in ("approved", "pass", "success", ""):
-            self._trigger_tester(task_id, project_id, token, chat_id, evidence)
+            self._trigger_tester(task_id, project_id, token, chat_id, evidence,
+                                 parent_chain_depth=parent_chain_depth)
 
         return {"reply": reply, "evidence": evidence.to_dict()}
 
     def _trigger_tester(self, parent_task_id: str, project_id: str,
-                        token: str, chat_id: int, evidence) -> None:
+                        token: str, chat_id: int, evidence,
+                        parent_chain_depth: int = 0) -> None:
         """Auto-trigger Tester after Dev eval passes."""
         log.info("Auto-triggering Tester for %s", parent_task_id)
         task_id = f"test-{int(time.time())}-{uuid.uuid4().hex[:6]}"
@@ -247,7 +250,9 @@ class TaskOrchestrator:
             "target_files": changed,
             "parent_task_id": parent_task_id,
         }
-        self._write_task_file(task_id, action, project_id, token, "test_task", chat_id)
+        child_depth = parent_chain_depth + 1
+        self._write_task_file(task_id, action, project_id, token, "test_task", chat_id,
+                              chain_depth=child_depth)
         self._gateway_reply(chat_id, f"Tester 已启动 ({task_id[-8:]})", token)
 
     def handle_test_complete(self, task_id: str, project_id: str,
@@ -429,8 +434,12 @@ class TaskOrchestrator:
 
     def _write_task_file(self, task_id: str, action: dict,
                          project_id: str, token: str, task_type: str,
-                         chat_id: int = 0):
-        """Write task: DB first (source of truth), then file (secondary)."""
+                         chat_id: int = 0, chain_depth: int = 0):
+        """Write task: DB first (source of truth), then file (secondary).
+
+        chain_depth: depth of this task in the auto-chain (0 = top-level).
+        Stored as _chain_depth in the task file so Executor can enforce limits.
+        """
         from datetime import datetime, timezone
         import requests as _req
 
@@ -481,6 +490,7 @@ class TaskOrchestrator:
             "chat_id": chat_id,
             "_gov_token": token,
             "_branch": branch_name,
+            "_chain_depth": chain_depth,
             "created_at": created_at,
         }
 
@@ -558,9 +568,56 @@ class TaskOrchestrator:
         except Exception:
             log.exception("Failed to update context")
 
+    def _classify_archive_category(self, entry_type: str, eval_decision: dict,
+                                    evidence=None, trigger_reason: str = None) -> str:
+        """Derive a semantic category for the archive refId.
+
+        Returns one of:
+          dev_noop_retry   — dev ran but produced no file changes
+          dev_complete     — dev ran and produced changes
+          test_noop_retry  — tester ran but nothing changed / tests were skipped
+          test_complete    — tester ran and verified changes
+          eval_skip        — eval was explicitly skipped (e.g. noop task)
+          chain_limit      — eval skipped because _chain_depth >= 3
+          coordinator_eval — generic coordinator evaluation record
+        """
+        # Direct trigger reason takes precedence
+        if trigger_reason in ("chain_limit", "eval_skip"):
+            return trigger_reason
+
+        status = eval_decision.get("status", "")
+        if status in ("chain_limit", "eval_skip"):
+            return status
+
+        is_noop = (
+            eval_decision.get("is_noop", False)
+            or status in ("noop", "no_change", "skipped")
+        )
+
+        if entry_type == "dev_summary":
+            has_changes = (
+                hasattr(evidence, "changed_files") and bool(evidence.changed_files)
+            )
+            if not has_changes or is_noop:
+                return "dev_noop_retry"
+            return "dev_complete"
+
+        if entry_type == "test_summary":
+            if is_noop:
+                return "test_noop_retry"
+            return "test_complete"
+
+        # fallback for decision / other types
+        return "coordinator_eval"
+
     def _auto_archive(self, project_id: str, task_id: str,
-                      evidence, eval_decision: dict):
-        """Automatic archival after task completion. Uses MemoryWriteGuard."""
+                      evidence, eval_decision: dict,
+                      trigger_reason: str = None):
+        """Automatic archival after task completion. Uses MemoryWriteGuard.
+
+        trigger_reason: optional semantic override (e.g. 'chain_limit', 'eval_skip').
+        When provided, all refIds use that category instead of inferring from evidence.
+        """
         try:
             from memory_write_guard import MemoryWriteGuard
             guard = MemoryWriteGuard()
@@ -568,8 +625,11 @@ class TaskOrchestrator:
             # Archive decisions (with guard)
             ctx_update = eval_decision.get("context_update", {})
             for decision in ctx_update.get("decisions", []):
+                category = self._classify_archive_category(
+                    "decision", eval_decision, evidence, trigger_reason
+                )
                 entry = {
-                    "refId": f"auto:{project_id}:{task_id}:{uuid.uuid4().hex[:6]}",
+                    "refId": f"auto:{project_id}:{category}",
                     "type": "decision",
                     "content": decision[:500],
                     "scope": project_id,
@@ -578,13 +638,27 @@ class TaskOrchestrator:
                 guard.guarded_write(entry, project_id)
 
             # Archive dev summary (with guard)
-            if hasattr(evidence, 'changed_files') and evidence.changed_files:
+            if evidence is not None and hasattr(evidence, 'changed_files') and evidence.changed_files:
+                category = self._classify_archive_category(
+                    "dev_summary", eval_decision, evidence, trigger_reason
+                )
                 entry = {
-                    "refId": f"auto:{project_id}:{task_id}:dev_summary",
+                    "refId": f"auto:{project_id}:{category}",
                     "type": "pattern",
                     "content": f"Task {task_id}: modified {', '.join(evidence.changed_files[:5])}",
                     "scope": project_id,
                     "tags": ["auto_archive", "dev_output"],
+                }
+                guard.guarded_write(entry, project_id)
+
+            # Archive trigger-reason-only events (e.g. chain_limit with no evidence)
+            elif trigger_reason in ("chain_limit", "eval_skip"):
+                entry = {
+                    "refId": f"auto:{project_id}:{trigger_reason}",
+                    "type": "decision",
+                    "content": f"Task {task_id}: {trigger_reason}",
+                    "scope": project_id,
+                    "tags": ["auto_archive", trigger_reason],
                 }
                 guard.guarded_write(entry, project_id)
 

@@ -671,7 +671,28 @@ def _trigger_coordinator_eval(task: Dict, result: Dict) -> None:
     """Auto-trigger coordinator eval after dev/test task completes.
 
     v6: Executor code creates eval task. AI doesn't control this flow.
+
+    Chain-depth guard: if _chain_depth >= 3 in the task file, skip eval and
+    archive a 'chain_limit' event instead to prevent infinite auto-chains.
     """
+    chain_depth = int(task.get("_chain_depth", 0))
+
+    if chain_depth >= 3:
+        print(f"[executor] chain_depth={chain_depth} >= 3, skipping eval (chain_limit)")
+        try:
+            from task_orchestrator import TaskOrchestrator
+            orchestrator = TaskOrchestrator()
+            orchestrator._auto_archive(
+                task.get("project_id", ""),
+                task["task_id"],
+                None,
+                {},
+                trigger_reason="chain_limit",
+            )
+        except Exception as e:
+            print(f"[executor] chain_limit archive failed: {e}")
+        return
+
     try:
         from task_orchestrator import TaskOrchestrator
         orchestrator = TaskOrchestrator()
@@ -685,6 +706,7 @@ def _trigger_coordinator_eval(task: Dict, result: Dict) -> None:
                 "changed_files": result.get("executor", {}).get("git_changed_files", []),
                 "test_results": {},
                 "_before_snapshot": {"commit": task.get("_git_checkpoint", "HEAD~1")},
+                "_chain_depth": chain_depth,
             },
         )
     except ImportError:
