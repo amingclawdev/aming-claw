@@ -1577,4 +1577,84 @@ L20.3  E2E Dev链路验证  [impl:pending] [verify:pending] v6.2
       secondary:[]
       test:[]
       description: 端到端测试：Coordinator派dev task→Dev在分支改代码→证据采集→Coordinator eval→回复。验证完整v6 dev链路
+
+L20.4  Dev task chat_id 注入  [impl:pending] [verify:pending] v6.2
+      deps:[L20.1]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/task_orchestrator.py, agent/executor.py]
+      secondary:[]
+      test:[]
+      description: Coordinator创建dev task时自动注入chat_id到task文件。Executor process_dev_task_v6不再因KeyError崩溃。完成通知发回原chat
+
+L20.5  任务重试限制 (max_retry+dead_letter)  [impl:pending] [verify:pending] v6.2
+      deps:[L15.6, L20.1]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/executor.py]
+      secondary:[agent/task_state_machine.py]
+      test:[]
+      description: task失败时检查attempt_count。超过max_retry(默认3)→移到dead_letter目录→标记failed_terminal→不再重试。防止无限循环
+
+L20.6  Orphan 进程实际清理  [impl:pending] [verify:pending] v6.2
+      deps:[L14.4, L20.1]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/executor.py]
+      secondary:[]
+      test:[]
+      description: Executor巡检时检查processing/里的task→读worker_pid→检查进程是否存活→死进程的task重排队或标记failed→清理stale文件
+
+L20.7  通知改 Gateway API  [impl:pending] [verify:pending] v6.2
+      deps:[L20.1, L14.8]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/executor.py]
+      secondary:[]
+      test:[]
+      description: Executor所有通知改为调Gateway API(POST /gateway/reply)而非直接send_text。统一通知通道。Gateway处理markdown转义
+
+L20.8  Dev→Tester→QA→Gatekeeper 自动触发链  [impl:pending] [verify:pending] v6.2
+      deps:[L16.2, L17.3, L20.2]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/task_orchestrator.py, agent/executor.py]
+      secondary:[agent/governance/gatekeeper.py]
+      test:[]
+      description: Dev完成→eval通过→Executor代码创建test_task→Tester完成→创建qa_task→QA完成→触发Gatekeeper检查→通知用户审批。全链路代码驱动不靠AI
+
+L20.9  AI 任务日志系统  [impl:pending] [verify:pending] v6.2
+      deps:[L15.1, L20.1]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/executor.py, agent/ai_lifecycle.py]
+      secondary:[]
+      test:[]
+      description: 每个task创建独立日志目录shared-volume/codex-tasks/logs/task-xxx/。记录:prompt.txt(输入)、stdout.txt(AI输出)、evidence.json(证据)、validator.json(校验结果)、timeline.jsonl(时间线)。观察者可实时tail
+
+L20.10  Dev task 统一走 v6 链路  [impl:pending] [verify:pending] v6.2
+      deps:[L20.1, L15.9]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/executor.py]
+      secondary:[agent/task_orchestrator.py]
+      test:[]
+      description: 所有dev_task统一走process_dev_task_v6而非旧process_claude。修复parallel dispatcher走旧路径的问题。完成后调handle_dev_complete触发自动链
+
+L20.11  PM 日志可观测  [impl:pending] [verify:pending] v6.2
+      deps:[L20.9, L17.7]
+      gate_mode: auto
+      verify: L4
+      test_coverage: none
+      primary:[agent/task_orchestrator.py]
+      secondary:[agent/ai_lifecycle.py]
+      test:[]
+      description: PM session执行时写日志到logs/目录。失败时记录原因。handle_user_message增加PM执行日志方便观察者排查
 ```

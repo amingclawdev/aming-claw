@@ -11,6 +11,7 @@ Heavy lifting is delegated to:
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import json as _json
 import shutil
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional
+from datetime import datetime, timezone
 
 import requests
 
@@ -76,6 +78,32 @@ from task_accept import (
 )
 
 
+class TaskLogger:
+    """Per-task structured logging for observer monitoring."""
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.log_dir = tasks_root() / "logs" / task_id
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.timeline_path = self.log_dir / "timeline.jsonl"
+
+    def log_event(self, event: str, data: dict = None) -> None:
+        entry = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "event": event,
+            **(data or {}),
+        }
+        with open(self.timeline_path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def write_file(self, name: str, content: str) -> None:
+        (self.log_dir / name).write_text(content, encoding="utf-8")
+
+    def write_json(self, name: str, data) -> None:
+        with open(self.log_dir / name, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def pick_pending_task() -> Optional[Path]:
     pending_dir = tasks_root() / "pending"
     # Only scan real .json files (not .tmp)
@@ -130,7 +158,7 @@ def process_screenshot(task: Dict, processing: Path) -> Dict:
 
     details = gateway.get("details") or {}
     files = details.get("files") or []
-    chat_id = int(task["chat_id"])
+    chat_id = int(task.get("chat_id") or 0)
 
     sent = []
     for path in files:
@@ -350,6 +378,20 @@ def process_task(path: Path) -> None:
     task["updated_at"] = utc_iso()
     task["worker_id"] = _worker_id()
     task["attempt"] = int(task.get("attempt") or 0) + 1
+    max_attempts = int(task.get("max_attempts") or 3)
+
+    # Dead letter: too many retries
+    if task["attempt"] > max_attempts:
+        dead_letter_dir = tasks_root() / "dead_letter"
+        dead_letter_dir.mkdir(parents=True, exist_ok=True)
+        dead_path = dead_letter_dir / processing.name
+        task["status"] = "failed_terminal"
+        task["failure_reason"] = f"exceeded max_attempts ({max_attempts})"
+        save_json(processing, task)
+        processing.rename(dead_path)
+        print(f"[executor] task {task_id} moved to dead_letter after {max_attempts} attempts")
+        return
+
     task.setdefault("action", get_agent_backend())
     save_json(processing, task)
 
@@ -365,7 +407,7 @@ def process_task(path: Path) -> None:
     _hb_thread = threading.Thread(target=_heartbeat_loop, args=(task_id, _hb_stop, _hb_interval), daemon=True)
     _hb_thread.start()
 
-    chat_id = int(task["chat_id"])
+    chat_id = int(task.get("chat_id") or 0)
     silent_mode = os.getenv("TASK_SILENT_MODE", "1").strip().lower() not in {"0", "false", "no"}
     log_path: Optional[Path] = None
 
@@ -417,43 +459,52 @@ def process_task(path: Path) -> None:
                 "action": task.get("action", "codex"),
             },
         )
-        if task.get("action") in ("codex", "claude", "pipeline"):
-            log_path = tasks_root() / "logs" / (task["task_id"] + ".run.json")
-        result = to_pending_acceptance(task, result)
-        save_json(processing, result)
-        result_path = move_task(processing, "results")
-        update_task_runtime(result, status="pending_acceptance", stage="results")
-        acceptance = result.get("acceptance") if isinstance(result.get("acceptance"), dict) else {}
-        mark_task_finished(
-            result,
-            status="pending_acceptance",
-            stage="results",
-            result_file=str(result_path),
-            runlog_file=str(log_path) if log_path and log_path.exists() else "",
-            summary=build_task_summary(result),
-            error=str(result.get("error") or ""),
-        )
-        # Store git checkpoint info in result for accept/reject
-        result["_git_checkpoint"] = task.get("_git_checkpoint", "")
-        save_json(result_path, result)
+        # v6 path: dev_task/coordinator_chat with project_id → skip old finalize
+        is_v6 = task.get("project_id") and task.get("type") in ("dev_task", "test_task", "qa_task", "coordinator_chat")
 
-        task_code = result.get("task_code", "-")
-        send_text(
-            chat_id,
-            acceptance_notice_text(result, task["task_id"], task_code, detailed=not silent_mode),
-            reply_markup=task_inline_keyboard(task_code, task["task_id"]),
-        )
+        if is_v6:
+            # v6: Save result, move to results, trigger next step
+            result_path = move_task(processing, "results")
+            save_json(result_path, result)
+            _registry_complete(task, "succeeded")
 
-        mark_task_completion_notified(task["task_id"])
-        # Registry: mark succeeded
-        _registry_complete(task, "succeeded")
+            # Auto-trigger coordinator eval for dev/test tasks
+            if task.get("type") in ("dev_task", "test_task"):
+                try:
+                    _trigger_coordinator_eval(task, result)
+                except Exception as eval_err:
+                    print(f"[executor] coordinator eval trigger failed: {eval_err}")
+                    if chat_id:
+                        _gateway_notify(chat_id, f"Eval 触发失败: {str(eval_err)[:200]}")
+        else:
+            # Legacy path: old finalize → pending_acceptance → send_text
+            if task.get("action") in ("codex", "claude", "pipeline"):
+                log_path = tasks_root() / "logs" / (task["task_id"] + ".run.json")
+            result = to_pending_acceptance(task, result)
+            save_json(processing, result)
+            result_path = move_task(processing, "results")
+            update_task_runtime(result, status="pending_acceptance", stage="results")
+            acceptance = result.get("acceptance") if isinstance(result.get("acceptance"), dict) else {}
+            mark_task_finished(
+                result,
+                status="pending_acceptance",
+                stage="results",
+                result_file=str(result_path),
+                runlog_file=str(log_path) if log_path and log_path.exists() else "",
+                summary=build_task_summary(result),
+                error=str(result.get("error") or ""),
+            )
+            result["_git_checkpoint"] = task.get("_git_checkpoint", "")
+            save_json(result_path, result)
 
-        # v6: Auto-trigger coordinator eval for dev/test tasks
-        if task.get("type") in ("dev_task", "test_task") and task.get("project_id"):
-            try:
-                _trigger_coordinator_eval(task, result)
-            except Exception as eval_err:
-                print(f"[executor] coordinator eval trigger failed: {eval_err}")
+            task_code = result.get("task_code", "-")
+            send_text(
+                chat_id,
+                acceptance_notice_text(result, task["task_id"], task_code, detailed=not silent_mode),
+                reply_markup=task_inline_keyboard(task_code, task["task_id"]),
+            )
+            mark_task_completion_notified(task["task_id"])
+            _registry_complete(task, "succeeded")
 
     except (subprocess.TimeoutExpired, Exception) as exc:
         error_msg = _handle_task_failure(task, processing, chat_id, exc)
@@ -492,6 +543,11 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
     token = task.get("_gov_token", os.getenv("GOV_COORDINATOR_TOKEN", ""))
     branch = task.get("_branch", "")
 
+    # Task logger
+    tlog = TaskLogger(task_id)
+    tlog.log_event("dev_task_start", {"project_id": project_id, "prompt": prompt[:200]})
+    tlog.write_file("prompt.txt", prompt)
+
     try:
         from ai_lifecycle import AILifecycleManager
         from evidence_collector import EvidenceCollector
@@ -501,6 +557,7 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         ai_mgr = AILifecycleManager()
         evidence = EvidenceCollector()
         ctx_asm = ContextAssembler()
+        tlog.log_event("v6_modules_loaded")
 
         # 1. Git branch
         workspace = str(resolve_workspace())
@@ -534,18 +591,30 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         )
 
         raw = ai_mgr.wait_for_output(session.session_id)
+        tlog.log_event("ai_session_complete", {"status": raw.get("status")})
+        tlog.write_file("stdout.txt", raw.get("stdout", ""))
+        if raw.get("stderr"):
+            tlog.write_file("stderr.txt", raw.get("stderr", ""))
 
         if raw.get("status") != "completed":
+            tlog.log_event("ai_session_failed", {"status": raw.get("status")})
             raise RuntimeError(f"Dev AI failed: {raw.get('status')} {raw.get('stderr','')[:200]}")
 
         # 5. Parse dev output
         dev_output = parse_ai_output(raw.get("stdout", ""), role="dev")
+        tlog.log_event("output_parsed", {"keys": list(dev_output.keys())})
 
         # 6. Collect real evidence (independent, don't trust AI)
         real_evidence = evidence.collect_after_dev(before)
+        tlog.write_json("evidence.json", real_evidence.to_dict() if hasattr(real_evidence, 'to_dict') else {})
+        tlog.log_event("evidence_collected", {
+            "changed_files": real_evidence.changed_files if hasattr(real_evidence, 'changed_files') else [],
+            "test_passed": real_evidence.test_results.get("passed") if hasattr(real_evidence, 'test_results') else None,
+        })
 
         # 7. Compare AI report vs real evidence
         comparison = evidence.compare_with_ai_report(real_evidence, dev_output)
+        tlog.write_json("validator.json", comparison)
         if comparison.get("has_discrepancies"):
             print(f"[executor-v6] evidence discrepancy: {comparison['discrepancies']}")
 
@@ -572,8 +641,8 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         if chat_id:
             summary = dev_output.get("summary", "Dev 完成")
             files = ", ".join(real_evidence.changed_files[:5])
-            test_ok = "✅" if real_evidence.test_results.get("passed") else "❌"
-            send_text(chat_id,
+            test_ok = "pass" if real_evidence.test_results.get("passed") else "fail"
+            _gateway_notify(chat_id,
                 f"Dev 完成 ({branch})\n"
                 f"改动: {files}\n"
                 f"测试: {test_ok}\n"
@@ -582,13 +651,17 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         return result
 
     except ImportError as e:
-        # v6 modules not available, fallback to old process_claude
-        print(f"[executor-v6] fallback to old pipeline: {e}")
-        return process_claude(task, processing)
+        # v6 modules import failed — log and fail, don't silently fallback
+        error_msg = f"v6 module import failed: {e}"
+        print(f"[executor-v6] {error_msg}")
+        tlog.log_event("v6_import_error", {"error": str(e)})
+        result = {**task, "status": "failed", "error": error_msg, "completed_at": utc_iso()}
+        save_json(processing, result)
+        return result
     except Exception as e:
         error_msg = str(e)[:500]
         if chat_id:
-            send_text(chat_id, f"Dev v6 执行失败: {error_msg[:200]}")
+            _gateway_notify(chat_id, f"Dev v6 执行失败: {error_msg[:200]}")
         result = {**task, "status": "failed", "error": error_msg, "completed_at": utc_iso()}
         save_json(processing, result)
         return result
@@ -634,10 +707,14 @@ def process_coordinator_chat(task: Dict, processing: Path) -> Dict:
     project_id = task.get("project_id", "")
     chat_id = int(task.get("chat_id", 0))
     token = task.get("_gov_token", os.getenv("GOV_COORDINATOR_TOKEN", ""))
+    tlog = TaskLogger(task.get("task_id", "coord-unknown"))
+    tlog.log_event("coordinator_chat_start", {"prompt": prompt_text[:200], "project_id": project_id})
+    tlog.write_file("prompt.txt", prompt_text)
 
     try:
         from task_orchestrator import TaskOrchestrator
         orchestrator = TaskOrchestrator()
+        tlog.log_event("orchestrator_loaded")
 
         # Use TaskOrchestrator — handles context, validation, reply, history
         api_result = orchestrator.handle_user_message(
@@ -648,6 +725,12 @@ def process_coordinator_chat(task: Dict, processing: Path) -> Dict:
         )
 
         reply = api_result.get("reply", "处理完成")
+        tlog.log_event("coordinator_reply", {
+            "reply_len": len(reply),
+            "actions_executed": api_result.get("actions_executed", 0),
+            "actions_rejected": api_result.get("actions_rejected", 0),
+        })
+        tlog.write_file("reply.txt", reply)
 
         # Send reply to Telegram via Gateway
         if chat_id:
@@ -680,10 +763,27 @@ def process_coordinator_chat(task: Dict, processing: Path) -> Dict:
     except Exception as e:
         error_msg = str(e)[:500]
         if chat_id:
-            send_text(chat_id, f"Coordinator 处理失败: {error_msg[:200]}")
+            _gateway_notify(chat_id, f"Coordinator 处理失败: {error_msg[:200]}")
         result = {**task, "status": "failed", "error": error_msg, "completed_at": utc_iso()}
         save_json(processing, result)
         return result
+
+
+def _gateway_notify(chat_id: int, text: str) -> None:
+    """Send notification via Gateway API (not direct Telegram)."""
+    if not chat_id:
+        return
+    try:
+        import requests
+        gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+        token = os.getenv("GOV_COORDINATOR_TOKEN", "")
+        text = _escape_telegram(text)
+        requests.post(f"{gov_url}/gateway/reply",
+            headers={"Content-Type": "application/json", "X-Gov-Token": token},
+            json={"chat_id": chat_id, "text": text[:4000]},
+            timeout=10)
+    except Exception:
+        pass  # Non-critical
 
 
 def _escape_telegram(text: str) -> str:
@@ -720,6 +820,21 @@ def _recover_stale_tasks() -> int:
                         continue  # Still fresh, might be running
                 except Exception:
                     pass
+            # Check if worker process is alive
+            worker_pid = task.get("worker_pid")
+            if worker_pid:
+                try:
+                    os.kill(int(worker_pid), 0)  # signal 0 = check alive
+                    continue  # Process alive, skip
+                except (OSError, ProcessLookupError):
+                    # Process dead → kill its tree just in case
+                    try:
+                        import subprocess
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(worker_pid)],
+                                     capture_output=True, timeout=5)
+                    except Exception:
+                        pass
+
             # Re-queue: move back to pending
             pending_path = tasks_root() / "pending" / f.name
             shutil.move(str(f), str(pending_path))

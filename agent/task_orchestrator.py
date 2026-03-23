@@ -61,8 +61,15 @@ class TaskOrchestrator:
         """
         # 0. Check if this needs PM analysis first (new feature / complex request)
         pm_prd = None
-        if self._needs_pm_analysis(text):
-            pm_prd = self._run_pm_analysis(text, project_id, chat_id)
+        needs_pm = self._needs_pm_analysis(text)
+        log.info("PM check: needs_pm=%s for: %s", needs_pm, text[:60])
+        if needs_pm:
+            try:
+                pm_prd = self._run_pm_analysis(text, project_id, chat_id)
+                log.info("PM analysis result: %s", "PRD generated" if pm_prd else "empty/failed")
+            except Exception as e:
+                log.exception("PM analysis failed: %s", e)
+                pm_prd = None
 
         # 1. Assemble context (include PRD if PM ran)
         extra = {"prd": pm_prd} if pm_prd else None
@@ -135,7 +142,7 @@ class TaskOrchestrator:
         # 7. Execute approved actions
         executed = 0
         for action in validation.approved_actions:
-            success = self._execute_action(action, project_id, token)
+            success = self._execute_action(action, project_id, token, chat_id)
             if success:
                 executed += 1
 
@@ -221,9 +228,136 @@ class TaskOrchestrator:
         # 7. Archive
         self._auto_archive(project_id, task_id, evidence, eval_decision)
 
+        # 8. Auto-trigger Tester if eval approved
+        eval_status = eval_decision.get("status", "")
+        if eval_status in ("approved", "pass", "success", ""):
+            self._trigger_tester(task_id, project_id, token, chat_id, evidence)
+
         return {"reply": reply, "evidence": evidence.to_dict()}
 
-    def _execute_action(self, action: dict, project_id: str, token: str = "") -> bool:
+    def _trigger_tester(self, parent_task_id: str, project_id: str,
+                        token: str, chat_id: int, evidence) -> None:
+        """Auto-trigger Tester after Dev eval passes."""
+        log.info("Auto-triggering Tester for %s", parent_task_id)
+        task_id = f"test-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        changed = evidence.changed_files if hasattr(evidence, 'changed_files') else []
+        action = {
+            "type": "create_test_task",
+            "prompt": f"运行测试验证 {parent_task_id} 的代码变更。changed_files: {changed}",
+            "target_files": changed,
+            "parent_task_id": parent_task_id,
+        }
+        self._write_task_file(task_id, action, project_id, token, "test_task", chat_id)
+        self._gateway_reply(chat_id, f"Tester 已启动 ({task_id[-8:]})", token)
+
+    def handle_test_complete(self, task_id: str, project_id: str,
+                             token: str, chat_id: int, test_report: dict) -> dict:
+        """Handle Tester completion: verify-update t2_pass, then trigger QA."""
+        log.info("Test complete: %s", task_id)
+
+        # 1. Submit verify-update: testing → t2_pass
+        related_nodes = test_report.get("related_nodes", [])
+        if related_nodes:
+            try:
+                import requests
+                gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+                t = token or os.getenv("GOV_COORDINATOR_TOKEN", "")
+                requests.post(f"{gov_url}/api/wf/{project_id}/verify-update",
+                    headers={"Content-Type": "application/json", "X-Gov-Token": t},
+                    json={
+                        "nodes": related_nodes,
+                        "status": "t2_pass",
+                        "evidence": {
+                            "type": "test_report",
+                            "producer": f"tester-{task_id}",
+                            "tool": "pytest",
+                            "summary": test_report.get("summary", {}),
+                        },
+                    }, timeout=10)
+            except Exception:
+                log.exception("Failed to verify-update t2_pass")
+
+        # 2. Auto-trigger QA
+        self._trigger_qa(task_id, project_id, token, chat_id, test_report)
+
+        return {"status": "test_passed", "triggered_qa": True}
+
+    def _trigger_qa(self, parent_task_id: str, project_id: str,
+                    token: str, chat_id: int, test_report: dict) -> None:
+        """Auto-trigger QA after Tester passes."""
+        log.info("Auto-triggering QA for %s", parent_task_id)
+        task_id = f"qa-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        action = {
+            "type": "create_qa_task",
+            "prompt": f"QA 审查 {parent_task_id} 的测试结果和代码变更。test_report: {test_report}",
+            "parent_task_id": parent_task_id,
+        }
+        self._write_task_file(task_id, action, project_id, token, "qa_task", chat_id)
+        self._gateway_reply(chat_id, f"QA 已启动 ({task_id[-8:]})", token)
+
+    def handle_qa_complete(self, task_id: str, project_id: str,
+                           token: str, chat_id: int, qa_report: dict) -> dict:
+        """Handle QA completion: verify-update qa_pass, then trigger Gatekeeper."""
+        log.info("QA complete: %s", task_id)
+
+        # 1. Submit verify-update: t2_pass → qa_pass
+        related_nodes = qa_report.get("related_nodes", [])
+        if related_nodes:
+            try:
+                import requests
+                gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+                t = token or os.getenv("GOV_COORDINATOR_TOKEN", "")
+                requests.post(f"{gov_url}/api/wf/{project_id}/verify-update",
+                    headers={"Content-Type": "application/json", "X-Gov-Token": t},
+                    json={
+                        "nodes": related_nodes,
+                        "status": "qa_pass",
+                        "evidence": {
+                            "type": "e2e_report",
+                            "producer": f"qa-{task_id}",
+                            "tool": "review",
+                            "summary": qa_report.get("summary", {}),
+                        },
+                    }, timeout=10)
+            except Exception:
+                log.exception("Failed to verify-update qa_pass")
+
+        # 2. Trigger Gatekeeper
+        gate_result = self._trigger_gatekeeper(project_id, token, chat_id)
+
+        return {"status": "qa_passed", "gatekeeper": gate_result}
+
+    def _trigger_gatekeeper(self, project_id: str, token: str, chat_id: int) -> dict:
+        """Trigger Gatekeeper checks after QA passes. Code-driven, not AI."""
+        log.info("Triggering Gatekeeper for %s", project_id)
+        try:
+            import requests
+            gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+            t = token or os.getenv("GOV_COORDINATOR_TOKEN", "")
+
+            # Gatekeeper checks via governance API
+            gate = requests.get(f"{gov_url}/api/wf/{project_id}/release-gate",
+                headers={"X-Gov-Token": t}, timeout=15).json()
+
+            release_ok = gate.get("release", False)
+            gatekeeper_ok = gate.get("gatekeeper", {}).get("pass", False)
+
+            if release_ok and gatekeeper_ok:
+                self._gateway_reply(chat_id,
+                    f"Gatekeeper PASS\n所有检查通过，可以部署。\n是否批准？回复 '部署' 确认", token)
+                return {"pass": True}
+            else:
+                blockers = gate.get("blockers", [])
+                gk_errors = gate.get("gatekeeper", {}).get("errors", [])
+                self._gateway_reply(chat_id,
+                    f"Gatekeeper BLOCKED\nblockers: {blockers}\nerrors: {gk_errors}", token)
+                return {"pass": False, "blockers": blockers, "errors": gk_errors}
+        except Exception as e:
+            log.exception("Gatekeeper check failed")
+            return {"pass": False, "error": str(e)}
+
+    def _execute_action(self, action: dict, project_id: str, token: str = "",
+                        chat_id: int = 0) -> bool:
         """Execute a validated action. Code-controlled."""
         action_type = action.get("type", "")
         gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
@@ -235,13 +369,13 @@ class TaskOrchestrator:
             if action_type == "create_dev_task":
                 # Write task file for executor
                 task_id = f"task-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-                self._write_task_file(task_id, action, project_id, t, "dev_task")
+                self._write_task_file(task_id, action, project_id, t, "dev_task", chat_id)
                 log.info("Created dev task: %s", task_id)
                 return True
 
             elif action_type == "create_test_task":
                 task_id = f"task-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-                self._write_task_file(task_id, action, project_id, t, "test_task")
+                self._write_task_file(task_id, action, project_id, t, "test_task", chat_id)
                 return True
 
             elif action_type == "query_governance":
@@ -294,7 +428,8 @@ class TaskOrchestrator:
             return False
 
     def _write_task_file(self, task_id: str, action: dict,
-                         project_id: str, token: str, task_type: str):
+                         project_id: str, token: str, task_type: str,
+                         chat_id: int = 0):
         """Write task: DB first (source of truth), then file (secondary)."""
         from datetime import datetime, timezone
         import requests as _req
@@ -343,6 +478,7 @@ class TaskOrchestrator:
             "type": task_type,
             "target_files": action.get("target_files", []),
             "related_nodes": action.get("related_nodes", []),
+            "chat_id": chat_id,
             "_gov_token": token,
             "_branch": branch_name,
             "created_at": created_at,
@@ -475,6 +611,7 @@ class TaskOrchestrator:
 
     def _run_pm_analysis(self, text: str, project_id: str, chat_id: int) -> dict:
         """Run PM AI to analyze requirements and generate PRD."""
+        log.info("Starting PM analysis for: %s", text[:60])
         pm_context = self.context_assembler.assemble(
             project_id=project_id,
             chat_id=chat_id,
