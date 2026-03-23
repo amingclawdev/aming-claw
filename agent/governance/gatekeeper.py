@@ -2,6 +2,13 @@
 
 Stores check results in SQLite. release-gate reads latest results to decide.
 
+Key design (Gap 1 - memory isolation):
+  - Each GATE check = new GatekeeperSession instance (never resume)
+  - Session only receives: acceptance-graph + task-log + original instruction
+  - Session does NOT receive: debug context, code diff, multi-round history
+  - FAIL → fix → must spawn NEW session (cannot resume old one)
+  - Why: prevents cognitive drift from "close enough" compromises
+
 Checks:
   - coverage_check: All changed files have acceptance graph nodes
   - (future: security_scan, dependency_audit, etc.)
@@ -11,8 +18,76 @@ import json
 import logging
 import sqlite3
 import time
+import uuid
 
 log = logging.getLogger(__name__)
+
+
+class GatekeeperSession:
+    """Isolated gatekeeper instance — one per GATE check.
+
+    Each instance gets a unique session_id and only sees:
+    - acceptance graph summary (node statuses)
+    - task log (what was done)
+    - original gate instruction
+    No debug context, no code diff, no conversation history.
+    """
+
+    def __init__(self, project_id: str, gate_id: str = ""):
+        self.session_id = f"gk-{uuid.uuid4().hex[:12]}"
+        self.project_id = project_id
+        self.gate_id = gate_id or f"gate-{int(time.time())}"
+        self.created_at = _utc_iso()
+        self._context = {}  # Minimal context only
+        log.info("GatekeeperSession created: %s (gate: %s)", self.session_id, self.gate_id)
+
+    def set_context(self, acceptance_summary: dict, task_log: list, instruction: str):
+        """Set the ONLY context this session can see.
+
+        Args:
+            acceptance_summary: {total_nodes, by_status, ...} — NO code diffs
+            task_log: [{task_id, status, type}] — NO debug output
+            instruction: Original gate instruction text
+        """
+        self._context = {
+            "session_id": self.session_id,
+            "gate_id": self.gate_id,
+            "acceptance_summary": acceptance_summary,
+            "task_log": task_log,
+            "instruction": instruction,
+        }
+
+    def run_checks(self, conn: sqlite3.Connection, required_checks: list[str] = None,
+                   max_age_sec: int = 3600) -> dict:
+        """Run all gatekeeper checks in this isolated session.
+
+        Returns same format as verify_pre_release but with session metadata.
+        """
+        result = verify_pre_release(conn, self.project_id, required_checks, max_age_sec)
+        result["gatekeeper_session"] = self.session_id
+        result["gate_id"] = self.gate_id
+        result["isolation"] = "new_instance"
+
+        # Record that this check was done by an isolated session
+        record_check(
+            conn, self.project_id,
+            check_type=f"gate_session:{self.gate_id}",
+            passed=result["pass"],
+            result={"session_id": self.session_id, "checks": result["checks"]},
+            created_by=self.session_id,
+        )
+
+        log.info("GatekeeperSession %s completed: pass=%s", self.session_id, result["pass"])
+        return result
+
+
+def create_gate_session(project_id: str, gate_id: str = "") -> GatekeeperSession:
+    """Factory: create a new isolated gatekeeper session.
+
+    MUST be called for each GATE check. Never reuse sessions.
+    After FAIL + fix, call this again (don't resume old session).
+    """
+    return GatekeeperSession(project_id, gate_id)
 
 # Table created via migration or on first use
 GATEKEEPER_TABLE_SQL = """

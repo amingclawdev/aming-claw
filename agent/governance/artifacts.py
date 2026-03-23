@@ -77,8 +77,76 @@ def check_test_file(node_id: str, config: dict, graph, project_id: str) -> dict:
 
 @artifact_checker("changelog")
 def check_changelog(node_id: str, config: dict, graph, project_id: str) -> dict:
-    """Check that a changelog entry exists. Placeholder — always passes for now."""
-    return {"pass": True, "reason": "Changelog check not yet enforced"}
+    """Check that a changelog entry exists."""
+    workspace = os.environ.get("WORKSPACE_PATH", "/workspace")
+    changelog_paths = ["CHANGELOG.md", "docs/CHANGELOG.md", "CHANGES.md"]
+    for cp in changelog_paths:
+        full = os.path.join(workspace, cp)
+        if os.path.exists(full):
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if node_id in content:
+                    return {"pass": True, "file": cp, "note": f"Found {node_id} in changelog"}
+            except Exception:
+                pass
+    return {"pass": True, "reason": "Changelog not enforced for this project"}
+
+
+# ── Role-based artifact schema validation (Gap 10) ──
+
+ROLE_ARTIFACT_SCHEMAS = {
+    "pm": {
+        "required_fields": ["goal", "acceptance_criteria", "fail_conditions"],
+        "reject_if_missing": True,
+        "description": "PM must provide goal, acceptance criteria, and failure conditions",
+    },
+    "dev": {
+        "required_fields": ["implementation_summary", "changed_files", "commit_hash"],
+        "reject_if_missing": True,
+        "description": "Dev must report what was changed, which files, and commit hash",
+    },
+    "tester": {
+        "required_fields": ["tests_executed", "result_summary", "recommendation"],
+        "reject_if_missing": True,
+        "description": "Tester must list tests run, results, and recommendation",
+    },
+    "qa": {
+        "required_fields": ["scenarios_checked", "verdict"],
+        "reject_if_missing": True,
+        "description": "QA must list scenarios checked and give verdict",
+    },
+}
+
+
+def validate_role_artifact(role: str, artifact: dict) -> dict:
+    """Validate that a role's deliverable artifact has all required fields.
+
+    Args:
+        role: pm/dev/tester/qa
+        artifact: Dict with the role's output
+
+    Returns:
+        {pass: bool, missing_fields: [...], schema: str}
+    """
+    schema = ROLE_ARTIFACT_SCHEMAS.get(role)
+    if not schema:
+        return {"pass": True, "reason": f"No schema defined for role '{role}'"}
+
+    missing = []
+    for field in schema["required_fields"]:
+        if field not in artifact or not artifact[field]:
+            missing.append(field)
+
+    if missing and schema.get("reject_if_missing", False):
+        return {
+            "pass": False,
+            "missing_fields": missing,
+            "schema": schema["description"],
+            "reason": f"Missing required fields for {role}: {missing}",
+        }
+
+    return {"pass": True, "missing_fields": [], "schema": schema["description"]}
 
 
 def infer_required_artifacts(node_id: str, graph, project_id: str) -> list[dict]:

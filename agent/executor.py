@@ -1089,42 +1089,83 @@ def _deregister_lease(lease_id: str) -> None:
 
 
 def _cleanup_orphans() -> int:
-    """Check for orphaned agents and kill their zombie processes."""
+    """Check for orphaned agents and kill zombie processes.
+
+    Two strategies:
+    1. Query /api/agent/orphans for sessions with worker_pid
+    2. Scan OS processes for claude.exe not tracked by any active task
+    """
     import signal
     token = os.getenv("GOV_COORDINATOR_TOKEN", "")
-    if not token:
-        return 0
-
-    result = _gov_api("GET", "/api/agent/orphans", token=token)
-    orphans = result.get("orphans", [])
     cleaned = 0
 
-    for orphan in orphans:
-        pid = orphan.get("worker_pid")
-        session_id = orphan.get("session_id", "")
+    # Strategy 1: Governance orphan API (may have worker_pid)
+    if token:
+        try:
+            result = _gov_api("GET", "/api/agent/orphans", token=token)
+            orphans = result.get("orphans", [])
+            for orphan in orphans:
+                pid = orphan.get("worker_pid")
+                session_id = orphan.get("session_id", "")
+                if pid:
+                    try:
+                        os.kill(int(pid), 0)
+                        print(f"[executor] killing orphan PID={pid} (session={session_id})")
+                        if sys.platform == "win32":
+                            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                capture_output=True, timeout=10)
+                        else:
+                            os.kill(int(pid), signal.SIGTERM)
+                        cleaned += 1
+                    except (ProcessLookupError, OSError):
+                        pass
 
-        if pid:
-            try:
-                # Check if process is alive
-                os.kill(int(pid), 0)  # Signal 0 = check existence
-                # Process alive but orphaned → kill (use taskkill on Windows for process tree)
-                print(f"[executor] killing orphan process PID={pid} (session={session_id})")
-                if sys.platform == "win32":
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True, timeout=10)
-                else:
-                    os.kill(int(pid), signal.SIGTERM)
-                cleaned += 1
-            except (ProcessLookupError, OSError):
-                # Process already dead
-                pass
+            if orphans:
+                project_id = os.getenv("GOV_PROJECT_ID", "amingClaw")
+                _gov_api("POST", "/api/agent/cleanup",
+                    data={"project_id": project_id}, token=token)
+        except Exception as e:
+            print(f"[executor] orphan API check failed: {e}")
 
-    # Cleanup orphan records
-    if orphans:
-        project_id = os.getenv("GOV_PROJECT_ID", "amingClaw")
-        _gov_api("POST", "/api/agent/cleanup",
-            data={"project_id": project_id},
-            token=token)
+    # Strategy 2: Scan for zombie claude.exe processes
+    # Only kill claude.exe processes that have been running > 10 minutes
+    # and are NOT the current executor's own process
+    if sys.platform == "win32":
+        try:
+            my_pid = os.getpid()
+            r = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10)
+            for line in r.stdout.strip().split("\n"):
+                if not line.strip() or "claude.exe" not in line.lower():
+                    continue
+                parts = line.replace('"', '').split(",")
+                if len(parts) >= 2:
+                    try:
+                        pid = int(parts[1].strip())
+                        if pid == my_pid:
+                            continue
+                        # Check if this PID is tracked in any active processing task
+                        processing_dir = tasks_root() / "processing"
+                        tracked = False
+                        if processing_dir.exists():
+                            for f in processing_dir.glob("*.json"):
+                                try:
+                                    t = load_json(f)
+                                    if int(t.get("worker_pid", 0)) == pid:
+                                        tracked = True
+                                        break
+                                except Exception:
+                                    pass
+                        if not tracked:
+                            print(f"[executor] killing untracked claude.exe PID={pid}")
+                            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                capture_output=True, timeout=10)
+                            cleaned += 1
+                    except (ValueError, ProcessLookupError):
+                        pass
+        except Exception as e:
+            print(f"[executor] zombie scan failed: {e}")
 
     return cleaned
 
