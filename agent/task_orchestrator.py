@@ -204,35 +204,48 @@ class TaskOrchestrator:
             },
         )
 
-        # 4. Start eval session
-        eval_session = self.ai_manager.create_session(
-            role="coordinator",
-            prompt="Dev 任务完成，请评估结果并决定下一步",
-            context=eval_context,
-            project_id=project_id,
-        )
+        # 4. Code-driven eval (AI eval is optional enhancement)
+        has_changes = bool(evidence.changed_files) if hasattr(evidence, 'changed_files') else False
+        critical_discrepancies = [d for d in comparison.get("discrepancies", [])
+                                  if d.get("issue") not in ("test_count_mismatch",)]
+        auto_approve = has_changes and not critical_discrepancies
 
-        eval_output = self.ai_manager.wait_for_output(eval_session.session_id)
-        eval_decision = self._parse(eval_output.get("stdout", ""), role="coordinator")
-        eval_validation = self.decision_validator.validate(
-            "coordinator", eval_decision, project_id
-        )
+        eval_decision = {}
+        eval_status = ""
 
-        # 5. Execute
-        for action in eval_validation.approved_actions:
-            self._execute_action(action, project_id, token)
+        if auto_approve:
+            eval_status = "approved"
+            reply = f"Dev {task_id} 自动评估通过: {len(evidence.changed_files)} files changed"
+            eval_decision = {"status": "approved", "reply": reply}
+            log.info("Eval auto-approved: %s (%d files)", task_id, len(evidence.changed_files))
+        else:
+            # Try AI eval (optional, failure = manual review needed)
+            try:
+                eval_session = self.ai_manager.create_session(
+                    role="coordinator",
+                    prompt="Dev 任务完成，请评估结果并决定下一步",
+                    context=eval_context,
+                    project_id=project_id,
+                )
+                eval_output = self.ai_manager.wait_for_output(eval_session.session_id)
+                eval_decision = self._parse(eval_output.get("stdout", ""), role="coordinator")
+                eval_status = eval_decision.get("status", "")
+                reply = eval_decision.get("reply", f"任务 {task_id} 评估完成")
+            except Exception as e:
+                log.warning("AI eval failed, marking for manual review: %s", e)
+                eval_status = "needs_review"
+                reply = f"Dev {task_id} 需要人工审查 (AI eval 失败: {str(e)[:100]})"
+                eval_decision = {"status": "needs_review", "reply": reply}
 
-        # 6. Reply
-        reply = eval_decision.get("reply", f"任务 {task_id} 评估完成")
+        # 5. Reply
         self._gateway_reply(chat_id, reply, token)
 
-        # 7. Archive
+        # 6. Archive
         self._auto_archive(project_id, task_id, evidence, eval_decision)
 
-        # 8. Auto-trigger Tester if eval approved
-        eval_status = eval_decision.get("status", "")
+        # 7. Auto-trigger Tester if approved
         parent_chain_depth = int(ai_report.get("_chain_depth", 0))
-        if eval_status in ("approved", "pass", "success", ""):
+        if eval_status in ("approved", "pass", "success"):
             self._trigger_tester(task_id, project_id, token, chat_id, evidence,
                                  parent_chain_depth=parent_chain_depth)
 
