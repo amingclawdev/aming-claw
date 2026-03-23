@@ -846,7 +846,7 @@ def _trigger_coordinator_eval(task: Dict, result: Dict) -> None:
             chat_id=int(task.get("chat_id", 0)),
             ai_report={
                 "summary": result.get("acceptance", {}).get("summary", ""),
-                "changed_files": result.get("executor", {}).get("git_changed_files", []),
+                "changed_files": result.get("executor", {}).get("changed_files", result.get("executor", {}).get("git_changed_files", [])),
                 "test_results": {},
                 "_before_snapshot": {"commit": task.get("_git_checkpoint", "HEAD~1")},
                 "_chain_depth": chain_depth,

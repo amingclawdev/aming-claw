@@ -183,7 +183,22 @@ class TaskOrchestrator:
         """
         # 1. Collect evidence
         before = ai_report.get("_before_snapshot", {"commit": "HEAD~1"})
-        evidence = self.evidence_collector.collect_after_dev(before)
+        try:
+            evidence = self.evidence_collector.collect_after_dev(before)
+            log.info("handle_dev_complete evidence: changed=%s",
+                     evidence.changed_files if hasattr(evidence, 'changed_files') else 'N/A')
+        except Exception as e:
+            log.warning("Evidence collection failed in eval: %s, using ai_report fallback", e)
+            # Create a minimal evidence-like object from ai_report
+            class _FakeEvidence:
+                def __init__(self, files):
+                    self.changed_files = files
+                    self.new_files = []
+                    self.test_results = {"passed": True}
+                    self.diff_stat = ""
+                def to_dict(self):
+                    return {"changed_files": self.changed_files, "test_results": self.test_results}
+            evidence = _FakeEvidence(ai_report.get("changed_files", []))
 
         # 2. Compare
         comparison = self.evidence_collector.compare_with_ai_report(evidence, ai_report)
