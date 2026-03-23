@@ -51,7 +51,7 @@ from backends import (
     process_codex,
     process_claude,
     process_pipeline,
-    resolve_workspace,
+    resolve_workspace as _backends_resolve_workspace,
     # Re-exports for backward compatibility (tests import from executor)
     build_codex_prompt,
     build_claude_prompt,
@@ -257,7 +257,7 @@ def _handle_task_failure(task: Dict, processing: Path, chat_id: int, exc: Except
         "elapsed_ms": None,
         "cmd": None,
         "timeout_retries": int(os.getenv(_timeout_env, "1")),
-        "workspace": str(resolve_workspace()) if is_timeout else None,
+        "workspace": str(_backends_resolve_workspace()) if is_timeout else None,
         "git_changed_files": None,
         "noop_reason": None,
         "stdout": "",
@@ -543,6 +543,26 @@ def process_task(path: Path) -> None:
         _hb_stop.set()
 
 
+DEFAULT_WORKSPACE_MAP = {
+    "amingClaw": "C:/Users/z5866/Documents/amingclaw/aming_claw",
+    "toolboxClient": "C:/Users/z5866/Documents/Toolbox/toolBoxClient",
+}
+
+
+def resolve_workspace(task: dict) -> str:
+    """Resolve the main workspace path for a task.
+
+    Priority:
+      1. task['_workspace'] if present
+      2. DEFAULT_WORKSPACE_MAP[task['project_id']] if project_id is known
+      3. DEFAULT_WORKSPACE_MAP['amingClaw'] as fallback
+    """
+    if task.get("_workspace"):
+        return task["_workspace"]
+    project_id = task.get("project_id", "")
+    return DEFAULT_WORKSPACE_MAP.get(project_id, DEFAULT_WORKSPACE_MAP["amingClaw"])
+
+
 def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
     """Process dev_task through v6 pipeline.
 
@@ -578,7 +598,7 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         tlog.log_event("v6_modules_loaded")
 
         # 1. Git worktree: create isolated directory for dev work
-        main_workspace = str(resolve_workspace())
+        main_workspace = resolve_workspace(task)
         worktree_dir = ""
         if not branch:
             branch = f"dev/{task_id}"
