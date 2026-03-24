@@ -1678,3 +1678,52 @@ L20.13  记忆删除审核  [impl:pending] [verify:pending] v6.2
       test:[]
       description: Dev不能直接删除记忆,只能propose_memory_cleanup。Executor拦截delete操作→创建approval→QA审核后执行。amingclaw:arch和pitfall前缀需人工批准
 ```
+
+## L22 — v7 Context Service (P0)
+
+```
+L22.1  ContextStore + Session 状态机  [impl:pending] [verify:pending] v7.0
+      deps:[L15.1]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/context_store.py]
+      secondary:[]
+      test:[agent/tests/test_context_store.py]
+      description: Session 8态状态机(CAS迁移) + SQLite真源 + Redis缓存 + 幂等键 + PromptRenderer
+
+L22.2  AILifecycleManager system-prompt-file  [impl:pending] [verify:pending] v7.0
+      deps:[L22.1]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/ai_lifecycle.py]
+      secondary:[]
+      test:[]
+      description: 改用 --system-prompt-file 传入 context，不再 stdin 塞 prompt
+
+L22.3  统一任务入口 /executor/task  [impl:pending] [verify:pending] v7.0
+      deps:[L22.1, L22.2]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/executor_api.py, agent/task_orchestrator.py]
+      secondary:[]
+      test:[]
+      description: POST /executor/task 替代 /coordinator/chat，自动注册 observer，返回 observer_token
+
+L22.4  Context Budget 角色裁剪  [impl:pending] [verify:pending] v7.0
+      deps:[L22.1]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/context_assembler.py]
+      secondary:[]
+      test:[]
+      description: 按角色限制 token budget + 字段优先级裁剪
+
+L22.5  DecisionValidator 硬规则  [impl:pending] [verify:pending] v7.0
+      deps:[L22.1]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/decision_validator.py]
+      secondary:[]
+      test:[]
+      description: dev_task必须有target_files + session必须有snapshot + evidence必须完整
+```
