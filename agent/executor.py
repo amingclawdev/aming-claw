@@ -11,6 +11,7 @@ Heavy lifting is delegated to:
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import http.server
 import json as _json
 import shutil
 import socket
@@ -1002,6 +1003,83 @@ def _escape_telegram(text: str) -> str:
     return text
 
 
+# ── Health Check Server ───────────────────────────────────────────────────────
+
+_HEALTH_DEGRADED_THRESHOLD = int(os.getenv("EXECUTOR_HEALTH_DEGRADED_THRESHOLD", "10"))
+_executor_start_time: float = time.time()
+
+
+class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP handler for GET /health.
+
+    _base_path and _start_time are set per-server via a subclass created in
+    start_health_server(), so requests always use the correct task directories.
+    """
+    _base_path: Path = None  # overridden by start_health_server
+    _start_time: float = 0.0  # overridden by start_health_server
+
+    def do_GET(self) -> None:
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            base = self._base_path
+            processing_dir = base / "processing"
+            pending_dir = base / "pending"
+            active = len(list(processing_dir.glob("*.json"))) if processing_dir.exists() else 0
+            queued = len(
+                [p for p in pending_dir.glob("*.json") if not p.name.endswith(".tmp.json")]
+            ) if pending_dir.exists() else 0
+        except Exception:
+            active, queued = 0, 0
+        threshold = int(os.getenv("EXECUTOR_HEALTH_DEGRADED_THRESHOLD", str(_HEALTH_DEGRADED_THRESHOLD)))
+        status = "degraded" if active > threshold else "ok"
+        body = _json.dumps({
+            "status": status,
+            "active_count": active,
+            "queued_count": queued,
+            "uptime_seconds": int(time.time() - self._start_time),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args) -> None:  # noqa: A002
+        pass  # Suppress default access log noise
+
+
+def start_health_server() -> None:
+    """Start HTTP health check server in a background daemon thread.
+
+    Port: EXECUTOR_HEALTH_PORT env var (default 40020).
+    Captures tasks_root() at call time so the handler always uses the correct
+    path even after env vars change.  Exceptions are isolated — a failure here
+    never crashes the main executor.
+    """
+    global _executor_start_time
+    _executor_start_time = time.time()
+    port = int(os.getenv("EXECUTOR_HEALTH_PORT", "40020"))
+    base = tasks_root()  # Capture at startup; not re-evaluated per request
+    # Create a per-server handler subclass with bound path and start time
+    handler_cls = type("_BoundHealthHandler", (_HealthHandler,), {
+        "_base_path": base,
+        "_start_time": _executor_start_time,
+    })
+    try:
+        server = http.server.HTTPServer(("0.0.0.0", port), handler_cls)
+        t = threading.Thread(target=server.serve_forever, daemon=True, name="health-check")
+        t.start()
+        print(f"[executor] health check server started on port {port}")
+    except OSError as e:
+        print(f"[executor] health check server port {port} conflict: {e}")
+    except Exception as e:
+        print(f"[executor] health check server failed to start: {e}")
+
+
 def _recover_stale_tasks() -> int:
     """Startup recovery: scan processing/ for stale tasks and re-queue or mark failed."""
     processing_dir = tasks_root() / "processing"
@@ -1210,6 +1288,9 @@ def run() -> None:
     except Exception as e:
         print(f"[executor] API server failed to start: {e}")
 
+    # Start health check HTTP server
+    start_health_server()
+
     print("[executor] started (serial mode)")
     try:
         while True:
@@ -1292,6 +1373,9 @@ def run_parallel() -> None:
     poll_sec = float(os.getenv("EXECUTOR_POLL_SEC", "1"))
     refresh_interval = float(os.getenv("DISPATCHER_REFRESH_SEC", "30"))
     last_refresh = time.time()
+
+    # Start health check HTTP server
+    start_health_server()
 
     print("[executor] started (parallel mode, {} workspaces)".format(len(workspaces)))
 
