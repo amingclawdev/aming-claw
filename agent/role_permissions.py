@@ -212,12 +212,12 @@ ROLE_PROMPTS = {
     "estimated_effort": "预估工作量"
   },
   "proposed_nodes": [
-    {"id": "L22.1", "title": "节点标题", "deps": ["L15.1"], "primary": ["agent/governance/xxx.py"], "description": "描述"}
-  注意: id 必须是 L数字.数字 格式（如 L22.1, L22.2），数字从当前最大层+1开始。或者用 kebab-case（如 context-store-1）
+    {"parent_layer": 22, "title": "节点标题", "deps": ["L15.1"], "primary": ["agent/governance/xxx.py"], "description": "描述"}
+  注意: 只需提供 parent_layer（数字）和 title，系统会自动分配 node ID（如 L22.1, L22.2）。primary 必须包含该节点覆盖的文件路径。
   ],
   "target_files": ["agent/governance/xxx.py", "agent/yyy.py"],
   "actions": [
-    {"type": "propose_node", "node": {...}},
+    {"type": "propose_node", "node": {"parent_layer": 22, "title": "...", "primary": ["agent/xxx.py"]}},
     {"type": "reply_only"}
   ],
   "reply": "给用户的需求分析摘要"
