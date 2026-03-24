@@ -178,10 +178,30 @@ def _normalize_id(pid: str) -> str:
     return s.lower().strip('-')
 
 
+def _resolve_project_dir(project_id: str) -> Path:
+    """Resolve the actual project directory, handling normalize mismatch.
+
+    Tries normalized ID first, then raw ID as fallback. This handles the case
+    where data was created with the raw ID (e.g., 'amingClaw') before normalize
+    was enforced (P0-1), so the directory on disk doesn't match the normalized
+    form ('aming-claw').
+    """
+    root = _governance_root()
+    normalized = _normalize_id(project_id) if project_id else project_id
+    normalized_dir = root / normalized
+    if normalized_dir.exists():
+        return normalized_dir
+    # Fallback: try raw project_id (handles pre-normalize data)
+    raw_dir = root / project_id
+    if raw_dir.exists():
+        return raw_dir
+    # Neither exists — use normalized (will be created)
+    return normalized_dir
+
+
 def _project_db_path(project_id: str) -> Path:
     """Path to the SQLite database for a specific project."""
-    project_id = _normalize_id(project_id) if project_id else project_id
-    project_dir = _governance_root() / project_id
+    project_dir = _resolve_project_dir(project_id)
     project_dir.mkdir(parents=True, exist_ok=True)
     return project_dir / "governance.db"
 

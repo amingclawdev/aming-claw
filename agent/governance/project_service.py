@@ -346,8 +346,9 @@ def import_graph(project_id: str, md_path: str) -> dict:
 
 
 def load_project_graph(project_id: str) -> AcceptanceGraph:
-    project_id = _normalize_project_id(project_id) if project_id else project_id
-    graph_path = _governance_root() / project_id / "graph.json"
+    from .db import _resolve_project_dir
+    project_dir = _resolve_project_dir(project_id)
+    graph_path = project_dir / "graph.json"
     if not graph_path.exists():
         raise ValidationError(f"No graph found for project {project_id!r}. Run import-graph first.")
     graph = AcceptanceGraph()

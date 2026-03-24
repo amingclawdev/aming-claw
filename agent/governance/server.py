@@ -646,6 +646,7 @@ def handle_node_create(ctx: RequestContext):
         # P0-2 fix: also add node to in-memory graph + persist graph.json
         try:
             from .models import NodeDef
+            from .db import _resolve_project_dir
             graph = project_service.load_project_graph(project_id)
             node_def = NodeDef(
                 id=display_id,
@@ -657,10 +658,10 @@ def handle_node_create(ctx: RequestContext):
             # Filter deps to only existing graph nodes
             valid_deps = [d for d in deps if graph.has_node(d)]
             graph.add_node(node_def, deps=valid_deps)
-            from .db import _governance_root
-            graph.save(_governance_root() / project_id / "graph.json")
-        except Exception:
-            pass  # Graph update is best-effort; DB is source of truth
+            graph.save(_resolve_project_dir(project_id) / "graph.json")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("node-create graph update failed: %s", e)
 
     return {
         "node_id": display_id,
