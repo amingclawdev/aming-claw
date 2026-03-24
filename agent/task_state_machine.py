@@ -25,6 +25,9 @@ class TaskStatus(str, Enum):
     FAILED_TERMINAL = "failed_terminal"
     CANCELLED = "cancelled"
 
+    # Observer intervention
+    MANUAL_OVERRIDE = "manual_override"
+
     # Evaluation
     EVAL_PENDING = "eval_pending"
     EVAL_APPROVED = "eval_approved"
@@ -41,9 +44,9 @@ class TaskStatus(str, Enum):
 # Valid state transitions
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "created":           {"queued", "cancelled"},
-    "queued":            {"claimed", "cancelled", "blocked_by_dep"},
-    "claimed":           {"running", "queued"},
-    "running":           {"succeeded", "failed_retryable", "failed_terminal", "cancelled"},
+    "queued":            {"claimed", "cancelled", "blocked_by_dep", "manual_override"},
+    "claimed":           {"running", "queued", "manual_override"},
+    "running":           {"succeeded", "failed_retryable", "failed_terminal", "cancelled", "manual_override"},
     "waiting_retry":     {"queued"},
     "waiting_human":     {"queued", "cancelled"},
     "blocked_by_dep":    {"queued"},
@@ -56,13 +59,14 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "notify_pending":    {"notified"},
     "notified":          {"archived"},
     "cancelled":         {"archived"},
+    "manual_override":   {"archived"},
 }
 
 # Terminal states — no further transitions allowed
 TERMINAL_STATES = {"archived"}
 
 # States that indicate task is "done" (no more execution needed)
-COMPLETION_STATES = {"succeeded", "failed_terminal", "cancelled",
+COMPLETION_STATES = {"succeeded", "failed_terminal", "cancelled", "manual_override",
                      "eval_approved", "eval_rejected", "notified", "archived"}
 
 # States that allow retry

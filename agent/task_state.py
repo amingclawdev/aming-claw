@@ -284,6 +284,28 @@ def update_task_heartbeat(task_id: str, progress: int = 0) -> None:
     save_json(task_status_file(task_id), existing)
 
 
+def mark_manual_override(task_id: str, reason: str = "", operator: str = "observer") -> Dict:
+    """Mark a task as taken over by manual/observer intervention.
+
+    Intentionally bypasses validate_transition() — observer force-override is
+    valid from any non-terminal state and does not require state machine approval.
+    """
+    existing = load_task_status(task_id) or _default_task_status({"task_id": task_id})
+    old_status = existing.get("status", "")
+    existing["status"] = "manual_override"
+    existing["ended_at"] = utc_iso()
+    existing["has_end_marker"] = True
+    existing["error"] = ""
+    existing["summary"] = f"manual override by {operator}: {reason}" if reason else f"manual override by {operator}"
+    obj = save_task_status(task_id, existing)
+    append_task_event(task_id, "manual_override", {
+        "reason": reason,
+        "operator": operator,
+        "previous_status": old_status,
+    })
+    return obj
+
+
 def mark_task_timeout(task_id: str, chat_id: int) -> Dict:
     existing = load_task_status(task_id) or _default_task_status({"task_id": task_id, "chat_id": chat_id})
     existing["status"] = "timeout"

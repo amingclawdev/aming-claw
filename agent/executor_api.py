@@ -246,6 +246,19 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             self._handle_task_retry(task_id)
         elif path == "/cleanup-orphans":
             self._handle_cleanup_orphans()
+        elif path == "/cleanup-stale":
+            self._handle_cleanup_stale(body)
+
+        # ── Observer Takeover ──
+
+        elif path.endswith("/takeover"):
+            task_id = path.split("/task/")[1].replace("/takeover", "")
+            self._handle_task_takeover(task_id, body)
+        elif path == "/observer/manual-fix":
+            self._handle_observer_manual_fix(body)
+        elif path.startswith("/observer/manual-fix/") and path.endswith("/complete"):
+            fix_id = path[len("/observer/manual-fix/"):-len("/complete")]
+            self._handle_observer_manual_fix_complete(fix_id, body)
 
         # ── Direct Chat (L18.4) ──
 
@@ -494,6 +507,186 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             self._json_response(500, {"error": str(e)[:200]})
             return
         self._json_response(200, {"cleaned": cleaned})
+
+    # ── Stale Cleanup Handler ──
+
+    def _handle_cleanup_stale(self, body):
+        """POST /cleanup-stale — Move stale processing tasks to dead_letter (terminal)."""
+        from pathlib import Path
+        import shutil
+        max_age_min = int(body.get("max_age_min", 10))
+        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
+        ) / "codex-tasks"
+        processing_dir = tasks_dir / "processing"
+        dead_letter_dir = tasks_dir / "dead_letter"
+        dead_letter_dir.mkdir(parents=True, exist_ok=True)
+
+        cleaned = []
+        if processing_dir.exists():
+            import datetime as _dt
+            now = _dt.datetime.utcnow()
+            for f in processing_dir.glob("*.json"):
+                try:
+                    task = json.loads(f.read_text(encoding="utf-8"))
+                    started = task.get("started_at", "")
+                    if started:
+                        try:
+                            ts = _dt.datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
+                            if (now - ts).total_seconds() / 60 < max_age_min:
+                                continue
+                        except Exception:
+                            pass
+                    task_id = task.get("task_id", f.stem)
+                    if _ai_manager:
+                        for session in list(_ai_manager._sessions.values()):
+                            if session.prompt and task_id in session.prompt:
+                                _ai_manager.kill_session(session.session_id, "stale cleanup")
+                    shutil.move(str(f), str(dead_letter_dir / f.name))
+                    cleaned.append(task_id)
+                except Exception as e:
+                    log.warning("cleanup-stale: error on %s: %s", f.name, e)
+
+        self._json_response(200, {"cleaned_count": len(cleaned), "task_ids": cleaned})
+
+    # ── Observer Takeover Handlers ──
+
+    def _handle_task_takeover(self, task_id, body):
+        """POST /task/{id}/takeover — Observer claims manual ownership of a task."""
+        from pathlib import Path
+        import shutil
+        reason = body.get("reason", "")
+        operator = body.get("operator", "observer")
+        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
+        ) / "codex-tasks"
+
+        killed_session = None
+        if _ai_manager:
+            for session in list(_ai_manager._sessions.values()):
+                if session.prompt and task_id in session.prompt:
+                    _ai_manager.kill_session(session.session_id, f"takeover by {operator}")
+                    killed_session = session.session_id
+                    break
+
+        task_data = None
+        was_in = None
+        for stage in ["processing", "pending"]:
+            filepath = tasks_dir / stage / f"{task_id}.json"
+            if filepath.exists():
+                task_data = json.loads(filepath.read_text(encoding="utf-8"))
+                was_in = stage
+                results_dir = tasks_dir / "results"
+                results_dir.mkdir(parents=True, exist_ok=True)
+                task_data["status"] = "manual_override"
+                task_data["manual_override_reason"] = reason
+                task_data["manual_override_by"] = operator
+                task_data["manual_override_at"] = datetime.now(_tz.utc).isoformat()
+                dst = results_dir / f"{task_id}.json"
+                dst.write_text(json.dumps(task_data, ensure_ascii=False, default=str), encoding="utf-8")
+                filepath.unlink()
+                break
+
+        if task_data is None:
+            self._json_response(404, {"error": f"task {task_id} not found in pending/processing"})
+            return
+
+        try:
+            from task_state import mark_manual_override
+            mark_manual_override(task_id, reason=reason, operator=operator)
+        except Exception as e:
+            log.warning("takeover: task_state update failed: %s", e)
+
+        self._json_response(200, {
+            "takeover": True, "task_id": task_id, "was_in": was_in,
+            "killed_session": killed_session,
+            "task_prompt": task_data.get("prompt", "")[:500],
+        })
+
+    def _handle_observer_manual_fix(self, body):
+        """POST /observer/manual-fix — Declare intent to manually fix a bug."""
+        from pathlib import Path
+        project_id = body.get("project_id", "")
+        bug_id = body.get("bug_id", "")
+        reason = body.get("reason", "")
+        related_ids = body.get("related_task_ids", [])
+
+        if not bug_id:
+            self._json_response(400, {"error": "bug_id is required"})
+            return
+
+        fix_id = f"fix-{bug_id}-{_uuid.uuid4().hex[:8]}"
+        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
+        ) / "codex-tasks"
+
+        cancelled_tasks = []
+        for stage in ["pending", "processing"]:
+            stage_dir = tasks_dir / stage
+            if not stage_dir.exists():
+                continue
+            for f in stage_dir.glob("*.json"):
+                try:
+                    task = json.loads(f.read_text(encoding="utf-8"))
+                    task_id = task.get("task_id", f.stem)
+                    is_related = (
+                        task_id in related_ids
+                        or (project_id and project_id.lower() in (task.get("prompt", "") or "").lower())
+                    )
+                    if is_related:
+                        results_dir = tasks_dir / "results"
+                        results_dir.mkdir(parents=True, exist_ok=True)
+                        task["status"] = "manual_override"
+                        task["manual_override_reason"] = f"observer fix {fix_id}: {reason}"
+                        task["manual_override_at"] = datetime.now(_tz.utc).isoformat()
+                        (results_dir / f"{task_id}.json").write_text(
+                            json.dumps(task, ensure_ascii=False, default=str), encoding="utf-8")
+                        f.unlink()
+                        cancelled_tasks.append({"task_id": task_id, "was_in": stage})
+                        if _ai_manager:
+                            for session in list(_ai_manager._sessions.values()):
+                                if session.prompt and task_id in session.prompt:
+                                    _ai_manager.kill_session(session.session_id, f"manual-fix {fix_id}")
+                except Exception as e:
+                    log.warning("manual-fix scan error for %s: %s", f.name, e)
+
+        # Persist fix record to disk
+        fixes_dir = tasks_dir / "observer_fixes"
+        fixes_dir.mkdir(parents=True, exist_ok=True)
+        fix_record = {
+            "fix_id": fix_id, "project_id": project_id, "bug_id": bug_id,
+            "reason": reason, "cancelled_tasks": cancelled_tasks,
+            "started_at": datetime.now(_tz.utc).isoformat(), "status": "in_progress",
+        }
+        (fixes_dir / f"{fix_id}.json").write_text(
+            json.dumps(fix_record, ensure_ascii=False, default=str), encoding="utf-8")
+
+        self._json_response(200, {
+            "fix_id": fix_id, "cancelled_tasks": cancelled_tasks,
+            "cancelled_count": len(cancelled_tasks), "status": "in_progress",
+        })
+
+    def _handle_observer_manual_fix_complete(self, fix_id, body):
+        """POST /observer/manual-fix/{fix_id}/complete — Record manual fix completion."""
+        from pathlib import Path
+        tasks_dir = Path(os.getenv("SHARED_VOLUME_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
+        ) / "codex-tasks"
+        fix_path = tasks_dir / "observer_fixes" / f"{fix_id}.json"
+
+        if not fix_path.exists():
+            self._json_response(404, {"error": f"fix {fix_id} not found"})
+            return
+
+        fix_record = json.loads(fix_path.read_text(encoding="utf-8"))
+        fix_record["status"] = "completed"
+        fix_record["completed_at"] = datetime.now(_tz.utc).isoformat()
+        fix_record["outcome"] = body.get("outcome", "fixed")
+        fix_record["commit_hash"] = body.get("commit_hash", "")
+        fix_record["notes"] = body.get("notes", "")
+        fix_path.write_text(json.dumps(fix_record, ensure_ascii=False, default=str), encoding="utf-8")
+
+        self._json_response(200, {"fix_id": fix_id, "status": "completed", "record": fix_record})
 
     # ── L18.4 Direct Chat Handler ──
 

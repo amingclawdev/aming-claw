@@ -421,7 +421,8 @@ def process_task(path: Path) -> None:
     # ── Git checkpoint: auto-commit uncommitted changes before task execution ──
     checkpoint_info: Dict = {}
     try:
-        checkpoint_info = pre_task_checkpoint(task_id=task_id)
+        checkpoint_info = pre_task_checkpoint(
+            workspace=Path(resolve_workspace(task)), task_id=task_id)
         if checkpoint_info.get("auto_committed"):
             append_task_event(task_id, "git_checkpoint_created", {
                 "checkpoint_commit": checkpoint_info.get("checkpoint_commit", ""),
@@ -1151,6 +1152,9 @@ def _recover_stale_tasks() -> int:
         try:
             task = load_json(f)
             task_id = task.get("task_id", "")
+            # Skip tasks taken over by observer
+            if task.get("status") == "manual_override":
+                continue
             # Check if stale (no heartbeat for > 5 minutes)
             import datetime
             started = task.get("started_at", "")
