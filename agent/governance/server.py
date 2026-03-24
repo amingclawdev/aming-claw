@@ -630,14 +630,17 @@ def handle_node_create(ctx: RequestContext):
             (project_id, display_id, now)
         )
 
-        # Record in history
-        conn.execute(
-            """INSERT INTO node_history (project_id, node_id, from_status, to_status, changed_by, evidence_json, created_at)
-               VALUES (?, ?, 'none', 'pending', ?, ?, ?)""",
-            (project_id, display_id, session.get("principal_id", "system"),
-             json.dumps({"title": title, "deps": node.get("deps", []), "primary": node.get("primary", [])}),
-             now)
-        )
+        # Record in history (use role field which exists in all schema versions)
+        try:
+            conn.execute(
+                """INSERT INTO node_history (project_id, node_id, from_status, to_status, role, evidence_json, created_at)
+                   VALUES (?, ?, 'none', 'pending', ?, ?, ?)""",
+                (project_id, display_id, session.get("role", "coordinator"),
+                 json.dumps({"title": title, "deps": node.get("deps", []), "primary": node.get("primary", [])}),
+                 now)
+            )
+        except Exception:
+            pass  # History is nice-to-have, don't block node creation
 
     return {
         "node_id": display_id,
