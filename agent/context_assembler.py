@@ -11,7 +11,17 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Token budget per role (approximate, 1 token ≈ 4 chars)
+# Total token budget per role.
+# Token estimation method: len(text) // 4  (1 token ≈ 4 chars, see _estimate_tokens)
+ROLE_BUDGETS = {
+    "coordinator": 8000,
+    "pm": 6000,
+    "dev": 4000,
+    "tester": 3000,
+    "qa": 3000,
+}
+
+# Per-layer sub-budgets per role (approximate, 1 token ≈ 4 chars)
 CONTEXT_BUDGET = {
     "pm": {
         "hard_context": 3000,      # project overview, node structure
@@ -47,13 +57,20 @@ CONTEXT_BUDGET = {
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: 1 token ≈ 4 chars for mixed CJK/English."""
-    return len(text) // 3
+    """Rough token estimate: 1 token ≈ 4 chars for mixed CJK/English.
+
+    Estimation method: token_count = len(text) // 4
+    This is an approximation; actual tokenisation varies by model.
+    """
+    return len(text) // 4
 
 
 def _truncate_to_budget(text: str, max_tokens: int) -> str:
-    """Truncate text to fit token budget."""
-    max_chars = max_tokens * 3
+    """Truncate text to fit token budget.
+
+    Uses the same 1 token ≈ 4 chars approximation as _estimate_tokens.
+    """
+    max_chars = max_tokens * 4
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n...(truncated)"
@@ -75,14 +92,33 @@ class ContextAssembler:
         Args:
             project_id: Project identifier
             chat_id: Telegram chat ID (for conversation history)
-            role: coordinator / dev / tester / qa
+            role: coordinator / dev / tester / qa / pm
             prompt: The user message or task prompt
             extra: Additional context (e.g., dev_result for eval)
 
         Returns:
-            Context dict ready for injection into system prompt
+            Context dict ready for injection into system prompt.
+            Over-budget sections are trimmed in priority order:
+            conversation_history (lowest) -> memories -> runtime -> git_status.
         """
-        budget = CONTEXT_BUDGET.get(role, CONTEXT_BUDGET["coordinator"])
+        # Look up total token budget from ROLE_BUDGETS.
+        # Token estimation: len(text) // 4  (1 token ≈ 4 chars)
+        if role in ROLE_BUDGETS:
+            total_budget = ROLE_BUDGETS[role]
+        else:
+            log.warning(
+                "Role '%s' not found in ROLE_BUDGETS; using default budget of 4000 tokens.",
+                role,
+            )
+            total_budget = 4000
+
+        # Per-layer sub-budgets (for internal layer sizing)
+        layer_budget = CONTEXT_BUDGET.get(role, CONTEXT_BUDGET["coordinator"])
+        # Sync total_max with the authoritative ROLE_BUDGETS value
+        layer_budget = dict(layer_budget)
+        layer_budget["total_max"] = total_budget
+
+        budget = layer_budget
         context = {}
         used_tokens = 0
 
@@ -93,7 +129,7 @@ class ContextAssembler:
         context["project_status"] = hard
         used_tokens += _estimate_tokens(hard_truncated)
 
-        # Layer 2: Conversation history (coordinator only)
+        # Layer 2: Conversation history (coordinator / pm)
         if "conversation" in budget and budget["conversation"] > 0:
             conv = self._fetch_conversation(project_id, chat_id)
             conv_str = json.dumps(conv, ensure_ascii=False)
@@ -125,9 +161,68 @@ class ContextAssembler:
                 git = self._fetch_git_context()
                 context["git_status"] = git
 
-        context["_token_budget"] = budget["total_max"]
+        context["_token_budget"] = total_budget
         context["_tokens_used"] = used_tokens
 
+        # Enforce total budget: trim low-priority sections first when over limit
+        context = self._enforce_budget(context, total_budget)
+
+        return context
+
+    def _enforce_budget(self, context: dict, total_budget: int) -> dict:
+        """Trim low-priority context sections to stay within total_budget.
+
+        Token estimation: len(serialised_text) // 4  (1 token ≈ 4 chars)
+
+        Priority order — lowest priority is trimmed/removed first:
+          1. conversation_history   (lowest — trimmed first)
+          2. memories               (medium-low)
+          3. runtime                (medium)
+          4. git_status             (medium-high)
+          5. project_status         (highest — never removed)
+        """
+        # Keys not in trim_order (e.g. project_status, _token_budget) are protected.
+        trim_order = ["conversation_history", "memories", "runtime", "git_status"]
+
+        def _total_tokens() -> int:
+            # Token estimation: chars // 4 (1 token ≈ 4 chars)
+            return len(json.dumps(context, ensure_ascii=False)) // 4
+
+        for key in trim_order:
+            if _total_tokens() <= total_budget:
+                break
+            if key not in context:
+                continue
+
+            section_str = json.dumps(context[key], ensure_ascii=False)
+            section_tokens = len(section_str) // 4
+            excess = _total_tokens() - total_budget
+
+            if excess >= section_tokens:
+                # Remove the section entirely
+                log.debug(
+                    "_enforce_budget: removing '%s' (%d tokens) to fit budget %d",
+                    key, section_tokens, total_budget,
+                )
+                del context[key]
+            else:
+                # Partially truncate the section
+                keep_tokens = section_tokens - excess
+                if isinstance(context[key], list):
+                    # Drop items from the end of lists
+                    while context[key] and _total_tokens() > total_budget:
+                        context[key].pop()
+                elif isinstance(context[key], str):
+                    keep_chars = keep_tokens * 4
+                    context[key] = context[key][:keep_chars] + "\n...(truncated)"
+                elif isinstance(context[key], dict):
+                    # Serialise -> truncate -> replace with marker
+                    keep_chars = keep_tokens * 4
+                    truncated = section_str[:keep_chars] + "\n...(truncated)"
+                    context[key] = {"_truncated": truncated}
+
+        # Update _tokens_used to reflect post-trim state
+        context["_tokens_used"] = _total_tokens()
         return context
 
     def _fetch_hard_context(self, project_id: str, role: str,
