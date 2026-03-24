@@ -83,10 +83,9 @@ class AILifecycleManager:
         claude_bin = os.getenv("CLAUDE_BIN", "claude")
         cwd = workspace or os.getenv("CODEX_WORKSPACE", os.getcwd())
 
-        # v7: Write system prompt to file, use --system-prompt-file + -p
-        # This gives Claude full tool access (Write/Edit/Bash) while still
-        # capturing structured output via stdout.
-        import tempfile
+        # v7.2: Write system prompt to file, use --system-prompt-file + -p
+        # AI only gets read-only tools. All writes go through Executor /file/* API.
+        # This prevents AI from writing to main workspace or arbitrary paths.
         prompt_file = os.path.join(tempfile.gettempdir(), f"ctx-{session_id}.md")
         try:
             with open(prompt_file, "w", encoding="utf-8") as f:
@@ -95,10 +94,15 @@ class AILifecycleManager:
         except Exception as e:
             log.error("Failed to write prompt file: %s", e)
 
+        # AI tools: read-only only. Write/Edit/Bash are denied.
+        # AI must output structured JSON describing changes,
+        # Executor code applies them via /file/* API with path validation.
+        allowed_tools = "Read,Grep,Glob"
+
         cmd = [
             claude_bin,
-            "-p",                              # Print mode (structured output)
-            "--dangerously-skip-permissions",   # Skip permission prompts
+            "-p",                              # Print mode (structured output via stdout)
+            "--allowedTools", allowed_tools,    # Read-only tools only
             "--system-prompt-file", prompt_file, # Context via file (no stdin truncation)
             prompt,                             # User message as positional arg
         ]

@@ -672,6 +672,13 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         # Use worktree dir if available, otherwise main workspace
         workspace = worktree_dir if worktree_dir else main_workspace
 
+        # L24.4: Register worktree root for file API path validation
+        try:
+            from executor_api import register_worktree, unregister_worktree
+            register_worktree(task_id, workspace)
+        except ImportError:
+            pass
+
         # 2. Before snapshot
         before = evidence.collect_before_snapshot()
 
@@ -750,6 +757,13 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
                 f"摘要: {summary[:200]}")
 
         # 10. Cleanup worktree or checkout main
+        # L24.4: Unregister worktree from file API
+        try:
+            from executor_api import unregister_worktree
+            unregister_worktree(task_id)
+        except ImportError:
+            pass
+
         try:
             if worktree_dir and os.path.exists(worktree_dir):
                 # Worktree mode: remove worktree (branch stays for review)

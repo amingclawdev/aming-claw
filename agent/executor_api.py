@@ -268,6 +268,20 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             session_id = path[len("/ctx/"):-len("/replay")]
             self._handle_ctx_replay(session_id)
 
+        # ── L24.2: File Write API (path-validated) ──
+        elif path == "/file/write":
+            self._handle_file_write(body)
+        elif path == "/file/patch":
+            self._handle_file_patch(body)
+        elif path == "/file/mkdir":
+            self._handle_file_mkdir(body)
+
+        # ── L24.3: Controlled Command API ──
+        elif path == "/test/run":
+            self._handle_test_run(body)
+        elif path == "/lint/run":
+            self._handle_lint_run(body)
+
         else:
             self._json_response(404, {"error": f"not found: {path}"})
 
@@ -1036,6 +1050,238 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             "wrong_file_rate": round(wrong_file_count / total, 4),
             "manual_downgrade_rate": round(manual_downgrade_count / total, 4),
         })
+
+
+    # ── L24.2: File Write API Handlers ──
+
+    def _validate_file_path(self, path: str, task_id: str = "") -> tuple[bool, str, str]:
+        """Validate file path is within allowed worktree.
+
+        Returns (ok, resolved_path, error_message).
+        Checks:
+          1. Path is absolute after resolution
+          2. realpath is within worktree_root (not main workspace)
+          3. Not in .git, system dirs, or sensitive paths
+        """
+        import pathlib
+
+        if not path:
+            return False, "", "empty path"
+
+        # Get worktree root for this task
+        worktree_root = _active_worktree_roots.get(task_id, "")
+        if not worktree_root:
+            # Fallback: use main workspace (for coordinator tasks without worktree)
+            worktree_root = os.getenv("CODEX_WORKSPACE",
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+        # Resolve to absolute path within worktree
+        if not os.path.isabs(path):
+            path = os.path.join(worktree_root, path)
+
+        # Resolve symlinks and normalize
+        try:
+            resolved = str(pathlib.Path(path).resolve())
+        except Exception as e:
+            return False, "", f"path resolution failed: {e}"
+
+        # Must be within worktree root
+        worktree_resolved = str(pathlib.Path(worktree_root).resolve())
+        if not resolved.startswith(worktree_resolved):
+            return False, "", f"path {resolved} is outside worktree {worktree_resolved}"
+
+        # Block sensitive paths
+        rel = os.path.relpath(resolved, worktree_resolved)
+        blocked = [".git", ".env", "node_modules", "__pycache__"]
+        for b in blocked:
+            if rel == b or rel.startswith(b + os.sep):
+                return False, "", f"blocked path: {rel}"
+
+        return True, resolved, ""
+
+    def _handle_file_write(self, body: dict):
+        """POST /file/write — Write entire file (new or overwrite).
+
+        Body: {path, content, task_id, expected_hash (optional)}
+        Validates path is in worktree, records audit.
+        """
+        path = body.get("path", "")
+        content = body.get("content", "")
+        task_id = body.get("task_id", "")
+        expected_hash = body.get("expected_hash", "")
+
+        ok, resolved, err = self._validate_file_path(path, task_id)
+        if not ok:
+            self._json_response(403, {"error": f"path rejected: {err}"})
+            return
+
+        # Check expected hash (optimistic concurrency)
+        if expected_hash and os.path.exists(resolved):
+            import hashlib
+            actual = hashlib.sha256(open(resolved, "rb").read()).hexdigest()[:16]
+            if actual != expected_hash:
+                self._json_response(409, {
+                    "error": "hash mismatch",
+                    "expected": expected_hash,
+                    "actual": actual,
+                })
+                return
+
+        # Write file
+        try:
+            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+            old_hash = ""
+            if os.path.exists(resolved):
+                import hashlib
+                old_hash = hashlib.sha256(open(resolved, "rb").read()).hexdigest()[:16]
+
+            with open(resolved, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            import hashlib
+            new_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+
+            log.info("[file/write] %s (task=%s old=%s new=%s)", resolved, task_id, old_hash, new_hash)
+            self._json_response(200, {
+                "ok": True, "path": resolved,
+                "old_hash": old_hash, "new_hash": new_hash,
+            })
+        except Exception as e:
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_file_patch(self, body: dict):
+        """POST /file/patch — Apply old→new text replacement.
+
+        Body: {path, old_text, new_text, task_id, expected_hash (optional)}
+        """
+        path = body.get("path", "")
+        old_text = body.get("old_text", "")
+        new_text = body.get("new_text", "")
+        task_id = body.get("task_id", "")
+        expected_hash = body.get("expected_hash", "")
+
+        ok, resolved, err = self._validate_file_path(path, task_id)
+        if not ok:
+            self._json_response(403, {"error": f"path rejected: {err}"})
+            return
+
+        if not os.path.exists(resolved):
+            self._json_response(404, {"error": f"file not found: {resolved}"})
+            return
+
+        try:
+            import hashlib
+            current = open(resolved, "r", encoding="utf-8").read()
+            old_hash = hashlib.sha256(current.encode()).hexdigest()[:16]
+
+            if expected_hash and old_hash != expected_hash:
+                self._json_response(409, {"error": "hash mismatch", "expected": expected_hash, "actual": old_hash})
+                return
+
+            if old_text not in current:
+                self._json_response(400, {"error": "old_text not found in file"})
+                return
+
+            updated = current.replace(old_text, new_text, 1)
+            with open(resolved, "w", encoding="utf-8") as f:
+                f.write(updated)
+
+            new_hash = hashlib.sha256(updated.encode()).hexdigest()[:16]
+            log.info("[file/patch] %s (task=%s old=%s new=%s)", resolved, task_id, old_hash, new_hash)
+            self._json_response(200, {"ok": True, "path": resolved, "old_hash": old_hash, "new_hash": new_hash})
+        except Exception as e:
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_file_mkdir(self, body: dict):
+        """POST /file/mkdir — Create directory."""
+        path = body.get("path", "")
+        task_id = body.get("task_id", "")
+
+        ok, resolved, err = self._validate_file_path(path, task_id)
+        if not ok:
+            self._json_response(403, {"error": f"path rejected: {err}"})
+            return
+
+        try:
+            os.makedirs(resolved, exist_ok=True)
+            log.info("[file/mkdir] %s (task=%s)", resolved, task_id)
+            self._json_response(200, {"ok": True, "path": resolved})
+        except Exception as e:
+            self._json_response(500, {"error": str(e)})
+
+    # ── L24.3: Controlled Command API ──
+
+    def _handle_test_run(self, body: dict):
+        """POST /test/run — Run tests in controlled environment."""
+        import subprocess
+        task_id = body.get("task_id", "")
+        test_cmd = body.get("command", "python -m pytest -q")
+        worktree = _active_worktree_roots.get(task_id, "")
+        cwd = worktree or os.getenv("CODEX_WORKSPACE", os.getcwd())
+
+        # Whitelist test commands
+        allowed_prefixes = ["python -m pytest", "python -m unittest", "npm test", "npm run test"]
+        if not any(test_cmd.startswith(p) for p in allowed_prefixes):
+            self._json_response(403, {"error": f"test command not allowed: {test_cmd}"})
+            return
+
+        try:
+            result = subprocess.run(
+                test_cmd.split(), cwd=cwd, capture_output=True, text=True, timeout=120)
+            self._json_response(200, {
+                "exit_code": result.returncode,
+                "stdout": result.stdout[-2000:],
+                "stderr": result.stderr[-1000:],
+                "passed": result.returncode == 0,
+            })
+        except subprocess.TimeoutExpired:
+            self._json_response(408, {"error": "test timeout (120s)"})
+        except Exception as e:
+            self._json_response(500, {"error": str(e)})
+
+    def _handle_lint_run(self, body: dict):
+        """POST /lint/run — Run linter in controlled environment."""
+        import subprocess
+        task_id = body.get("task_id", "")
+        lint_cmd = body.get("command", "python -m py_compile")
+        target = body.get("target", "")
+        worktree = _active_worktree_roots.get(task_id, "")
+        cwd = worktree or os.getenv("CODEX_WORKSPACE", os.getcwd())
+
+        allowed_prefixes = ["python -m py_compile", "python -m flake8", "npx eslint"]
+        if not any(lint_cmd.startswith(p) for p in allowed_prefixes):
+            self._json_response(403, {"error": f"lint command not allowed: {lint_cmd}"})
+            return
+
+        cmd_parts = lint_cmd.split()
+        if target:
+            cmd_parts.append(target)
+
+        try:
+            result = subprocess.run(
+                cmd_parts, cwd=cwd, capture_output=True, text=True, timeout=30)
+            self._json_response(200, {
+                "exit_code": result.returncode,
+                "stdout": result.stdout[-1000:],
+                "stderr": result.stderr[-500:],
+                "passed": result.returncode == 0,
+            })
+        except Exception as e:
+            self._json_response(500, {"error": str(e)})
+
+
+# Active worktree roots per task (set by Executor when creating dev sessions)
+_active_worktree_roots: dict[str, str] = {}
+
+
+def register_worktree(task_id: str, worktree_root: str) -> None:
+    """Register a worktree root for a task (called by Executor)."""
+    _active_worktree_roots[task_id] = worktree_root
+
+
+def unregister_worktree(task_id: str) -> None:
+    """Unregister worktree when task completes."""
+    _active_worktree_roots.pop(task_id, None)
 
 
 def start_api_server():

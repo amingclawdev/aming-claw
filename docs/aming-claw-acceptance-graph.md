@@ -1727,3 +1727,35 @@ L22.5  DecisionValidator 硬规则  [impl:pending] [verify:pending] v7.0
       test:[]
       description: dev_task必须有target_files + session必须有snapshot + evidence必须完整
 ```
+
+## L24 — 文件写入安全层 (v7.2)
+
+```
+L24.1  AI去权限(allowedTools只读)  [impl:pending] [verify:pending] v7.2
+      deps:[L22.2]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/ai_lifecycle.py]
+      description: 去掉dangerously-skip-permissions,改为allowedTools Read,Grep,Glob只读
+
+L24.2  Executor文件写API  [impl:pending] [verify:pending] v7.2
+      deps:[L24.1]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/executor_api.py]
+      description: /file/patch(带expected_old_hash)+/file/write+/file/mkdir,路径校验realpath在worktree内
+
+L24.3  受控命令API  [impl:pending] [verify:pending] v7.2
+      deps:[L24.2]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/executor_api.py]
+      description: /test/run+/lint/run替代通用/bash,白名单命令
+
+L24.4  Task绑定worktree  [impl:pending] [verify:pending] v7.2
+      deps:[L24.1]
+      gate_mode: auto
+      verify: L4
+      primary:[agent/task_orchestrator.py,agent/executor.py]
+      description: 每个task/session带worktree_root+allowed_prefixes+base_commit
+```
