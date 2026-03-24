@@ -111,6 +111,7 @@ class AILifecycleManager:
         try:
             proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,  # No stdin — prompt via file + arg
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
