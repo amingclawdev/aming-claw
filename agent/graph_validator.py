@@ -171,6 +171,11 @@ class GraphValidator:
         import re
         node = proposal.get("node", {})
         node_id = node.get("id", "")
+        parent_layer = node.get("parent_layer") or proposal.get("parent_layer")
+
+        # v7.1: If parent_layer provided, node-create auto-allocates ID — skip ID check
+        if not node_id and parent_layer:
+            return True, "ok (ID will be auto-allocated by node-create)"
 
         # ID format: L数字.数字 or kebab-case (e.g., context-store-1)
         if not node_id or not re.match(r"^(L\d+\.\d+|[a-zA-Z][\w-]+)$", node_id):

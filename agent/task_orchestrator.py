@@ -451,6 +451,9 @@ class TaskOrchestrator:
                 parent_layer = node.get("parent_layer") or action.get("parent_layer")
                 title = node.get("title", "")
 
+                if not parent_layer:
+                    return _fail("propose_node requires parent_layer")
+
                 # v7.1: System allocates node ID — AI only provides parent_layer + title
                 r = requests.post(
                     f"{gov_url}/api/wf/{project_id}/node-create",
@@ -608,7 +611,7 @@ class TaskOrchestrator:
             # 2. Load current context, append to recent_messages, save back
             ctx_resp = requests.get(f"{gov_url}/api/context/{project_id}/load",
                 headers={"X-Gov-Token": token}, timeout=5)
-            ctx = ctx_resp.json().get("context", {})
+            ctx = ctx_resp.json().get("context") or {}
 
             recent = ctx.get("recent_messages", [])
             if not isinstance(recent, list):
