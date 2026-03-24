@@ -1027,50 +1027,185 @@ HARD_RULES = {
 }
 ```
 
-## 八、修订后的实施路线
+## 八、迭代复盘 — 缺陷报告（codex 评审 R3）
 
-### P0：状态机 + 真源 + 最小审计
+### 8.1 核心发现
 
-| 步骤 | 内容 | 文件 | codex 对应 |
-|------|------|------|-----------|
-| 1 | Session 状态机（8 态） | agent/context_store.py | 评审 #1 |
-| 2 | ContextStore (SQLite 真源 + Redis 缓存) | agent/context_store.py | 评审 #1 |
-| 3 | PromptRenderer (结构化→prompt file) | agent/context_store.py | 评审 #2 |
-| 4 | AILifecycleManager 改用 system-prompt-file | agent/ai_lifecycle.py | — |
-| 5 | TaskOrchestrator 集成 ContextStore | agent/task_orchestrator.py | — |
+| 类别 | 缺陷 | 严重度 | 根因 |
+|------|------|--------|------|
+| **架构** | Node ID 由 AI 生成 | 🔴 | 把确定性元数据交给概率模型 |
+| **架构** | "创建新文件"不是一等执行操作 | 🔴 | Executor 主要消费 stdout/diff |
+| **架构** | PM 触发靠关键词碰运气 | 🟡 | 没有硬规则，只有 SOP |
+| **流程** | 手动修改没走 workflow (5次) | 🔴 | "紧急情况"心态 |
+| **流程** | 手动修改污染自动实验 | 🟡 | 未 commit 就开新任务 |
+| **分析** | 5 Whys 过早归因（上下文污染） | 🟡 | 先解释后验证 |
+| **分析** | "AI 不能创建新文件"结论过大 | 🟡 | 系统锅≠AI 能力边界 |
+| **运行** | worktree 基线不干净 | 🟡 | 手动改动和自动任务混在一起 |
 
-### P0.5：Budget + 硬规则
+### 8.2 Node ID 系统分配方案
 
-| 步骤 | 内容 | 文件 | codex 对应 |
-|------|------|------|-----------|
-| 6 | Context budget 按角色裁剪 | agent/context_assembler.py | 评审 #5 |
-| 7 | dev_task_must_have_target_files 硬规则 | agent/decision_validator.py | 评审 #6 |
-| 8 | session_must_have_snapshot 硬规则 | agent/context_store.py | 评审 #6 |
+**问题：** AI 反复生成空 ID / 占位符 ID，被 validator 拒绝。
 
-### P1：审计 + 权限 + 观察
+**根因：** 治理图的 node ID 是系统内部主键，本质是确定性元数据，不应由概率模型生成。
 
-| 步骤 | 内容 | 文件 | codex 对应 |
-|------|------|------|-----------|
-| 9 | context_audit 表 + replay bundle | agent/context_store.py | 评审 #3 |
-| 10 | 四级权限模型 | agent/executor_api.py | 评审 #4 |
-| 11 | /ctx/{sid}/trace 完整链路 | agent/executor_api.py | — |
-| 12 | /ctx/list 观察者查询 | agent/executor_api.py | — |
+**方案：分离 node_uid 和 display_id**
+
+```
+数据模型:
+  node_uid:     n_8f3a2c...   (系统生成，永不变，内部引用用)
+  display_id:   L22.1         (系统分配，给人看，可调整)
+  parent_uid:   n_ab12...     (父节点引用)
+  order_index:  3             (同级排序)
+  title:        "ContextStore"
+
+AI 输出（propose_node）:
+  {
+    "parent_display_id": "L22",     ← AI 只说"挂哪里"
+    "title": "ContextStore",         ← AI 说"做什么"
+    "description": "...",
+    "acceptance_criteria": [...],
+    "target_files": [...]
+  }
+  不输出 node_id / display_id / node_uid
+
+系统处理:
+  1. 解析 parent_display_id → 找到 parent_uid
+  2. 查该父节点现有子节点最大序号
+  3. 分配 display_id = L22.3 (auto-increment)
+  4. 生成 node_uid = n_{uuid}
+  5. 落库 + 审计
+```
+
+### 8.3 Dev Task 显式文件契约
+
+**问题：** Dev AI 不知道该创建新文件还是修改已有文件。
+
+**方案：** create_dev_task 必须包含显式文件契约：
+
+```json
+{
+  "type": "create_dev_task",
+  "target_files": ["agent/executor.py"],       // 允许修改的已有文件
+  "create_files": ["agent/context_store.py"],   // 必须创建的新文件
+  "forbidden_files": ["agent/governance/*"],    // 禁止修改的文件
+  "expected_artifacts": ["test_file"]           // 预期产出
+}
+```
+
+DecisionValidator 检查：
+- `target_files` 全部存在 → 否则拒绝
+- `create_files` 全部不存在 → 否则拒绝（防覆盖）
+- Dev 完成后 EvidenceCollector 检查：
+  - `create_files` 里的文件确实被创建了
+  - 没有改动 `forbidden_files`
+  - `expected_artifacts` 已生成
+
+### 8.4 观察者纪律约束
+
+**问题：** 观察者（我）5 次手动修改没走 workflow。
+
+**硬规则（补充到观察者 SOP）：**
+
+```
+手动修改前 checklist（必须全部完成才能动代码）:
+  □ executor 已停止（防并发污染）
+  □ git status clean（无未 commit 改动）
+  □ 节点存在（没有就先建）
+  □ 改完后: coverage-check + verify-update + verify_loop + commit
+  □ 启动 executor 前确认 worktree 干净
+
+自动实验前 checklist:
+  □ main 分支 clean（git status 无改动）
+  □ 基线 commit 固定（记录 commit hash）
+  □ 无残留 dev 分支
+  □ executor 重启（加载最新代码）
+```
+
+### 8.5 分析纪律
+
+**5 Whys 正确顺序：**
+
+```
+1. 看原始输出 JSON（不是推理）
+2. 看 PM 是否触发（检查日志，不是猜）
+3. 看 validator 拒绝/通过了什么（检查 trace）
+4. 看 Dev AI 实际做了什么（检查 git diff）
+5. 最后才考虑上下文污染/AI 能力边界
+
+不要:
+  ❌ 看到相关现象就先解释
+  ❌ 一次失败就下"AI 不能 xxx"的结论
+  ❌ 不区分系统锅/实验污染/AI 边界
+```
+
+## 九、修订后的实施路线（v7.1）
+
+基于迭代复盘，重新排优先级。**核心原则：先修执行契约，再加审计能力。**
+
+### P-1：执行契约修正（最高优先级，手动）
+
+必须先手动完成，否则自动修复链路不可靠。
+
+**共同模式：全部是"自举悖论"——修的是 AI 运行所依赖的基础设施，AI 不能通过自己来修自己的运行环境。** 类似操作系统不能在运行时重写自己的内核。
+
+| 步骤 | 内容 | 文件 | 不能自动修的原因 |
+|------|------|------|----------------|
+| 0 | **Node ID 系统分配** | graph_validator.py, governance/server.py | 自动修需要 propose_node → propose_node 依赖 ID 生成 → **循环依赖** |
+| 1 | **Dev task 文件契约** | decision_validator.py, task_orchestrator.py | 需要改 validator 的校验逻辑 → Dev AI 被 validator 校验 → **自己改不了审判自己的规则** |
+| 2 | **PM 硬规则** | task_orchestrator.py | 自动修 PM 时 Dev AI 改错文件 → PM 不触发时无法通过 PM 产出正确路径 → **鸡生蛋问题** |
+| 3 | **worktree 强制 clean** | executor.py | 需要改 executor 的任务处理逻辑 → Dev AI 通过 executor 被调用 → **自己改不了运行自己的代码** |
+
+### P0：Context Store 基础（已完成 ✅）
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| 4 | ContextStore + Session 状态机 | ✅ L22.1 自动完成 |
+| 5 | AILifecycleManager system-prompt-file | ✅ L22.2 手动完成 |
+| 6 | 统一入口 /executor/task | ✅ L22.3 自动完成 |
+
+### P0.5：Budget + 硬规则（已完成 ✅）
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| 7 | Context budget 角色裁剪 | ✅ L22.4 自动完成 |
+| 8 | DecisionValidator 硬规则 | ✅ L22.5 自动完成 |
+
+### P1：审计 + 权限 + Observer
+
+| 步骤 | 内容 | 文件 | 方式 |
+|------|------|------|------|
+| 9 | context_audit 表 + replay bundle | agent/context_store.py | 自动 |
+| 10 | 四级权限模型 | agent/executor_api.py | 自动 |
+| 11 | /ctx/{sid}/trace 完整链路 | agent/executor_api.py | 自动 |
+| 12 | Observer 系统 (attach/detach/report) | agent/executor_api.py | 自动 |
+| 13 | KPI 自动采集 | agent/executor_api.py | 自动 |
 
 ### P2：增强
 
 | 步骤 | 内容 | 文件 |
 |------|------|------|
-| 13 | /ctx/{sid}/replay 完整重现 | agent/executor_api.py |
-| 14 | /ctx/diff 对比 | agent/executor_api.py |
-| 15 | 图片路径 + 多模态 | agent/context_store.py |
-| 16 | AI 进度上报 | agent/executor_api.py |
+| 14 | /ctx/{sid}/replay 完整重现 | agent/executor_api.py |
+| 15 | /ctx/diff 对比 | agent/executor_api.py |
+| 16 | 图片路径 + 多模态 | agent/context_store.py |
+| 17 | AI 进度上报 | agent/executor_api.py |
 
-## 九、与 v6 的兼容
+### 实施顺序
+
+```
+1. P-1（手动）→ 修执行契约，让自动修复可靠
+2. P1（自动尝试）→ 审计+Observer
+3. P2（自动尝试）→ 增强
+4. 每轮自动修后评估 KPI
+```
+
+## 十、与 v6 的兼容
 
 v7 是 v6 的增量升级，不破坏现有功能：
 - v6 的 CLI `-p` stdin 方式保留作为 fallback
 - ContextStore 不可用时退化为 v6 模式
 - 所有新增端点是只读查询，不影响执行链路
 - 审计表独立于 governance SQLite，不影响节点状态
-- **SQLite 是唯一真源，Redis 是缓存层**（评审 #1 修正）
-- **AI session 只读 /prompt，不读完整 /input**（评审 #4 修正）
+- **SQLite 是唯一真源，Redis 是缓存层**
+- **AI session 只读 /prompt，不读完整 /input**
+- **Node ID 由系统分配，AI 只提供 parent + title**（R3 修正）
+- **Dev task 必须有显式文件契约**（R3 修正）
