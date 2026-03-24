@@ -104,7 +104,6 @@ class AILifecycleManager:
             "-p",                              # Print mode (structured output via stdout)
             "--allowedTools", allowed_tools,    # Read-only tools only
             "--system-prompt-file", prompt_file, # Context via file (no stdin truncation)
-            prompt,                             # User message as positional arg
         ]
 
         # Strip env vars that cause nested Claude issues
@@ -115,13 +114,16 @@ class AILifecycleManager:
         try:
             proc = subprocess.Popen(
                 cmd,
-                stdin=subprocess.DEVNULL,  # No stdin — prompt via file + arg
+                stdin=subprocess.PIPE,         # Prompt via stdin pipe
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=cwd,
                 env=env,
             )
+            # Write prompt to stdin and close to signal EOF
+            proc.stdin.write(prompt)
+            proc.stdin.close()
         except FileNotFoundError:
             session = AISession(
                 session_id=session_id, role=role, pid=0,
