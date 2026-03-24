@@ -209,6 +209,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             session_id = path[len("/ctx/"):-len("/trace")]
             self._handle_ctx_trace(session_id)
 
+        # ── KPI ──
+        elif path == "/kpi":
+            self._handle_kpi()
+
         # ── Health ──
         elif path == "/health":
             self._json_response(200, {
@@ -258,6 +262,11 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             self._handle_observer_detach()
         elif path == "/observer/downgrade":
             self._handle_observer_downgrade()
+
+        # ── Context Audit Replay ──
+        elif path.startswith("/ctx/") and path.endswith("/replay"):
+            session_id = path[len("/ctx/"):-len("/replay")]
+            self._handle_ctx_replay(session_id)
 
         else:
             self._json_response(404, {"error": f"not found: {path}"})
@@ -833,6 +842,200 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             self._json_response(500, {
                 "error": f"failed to retrieve trace: {str(exc)[:300]}"
             })
+
+
+    # ── Context Audit Replay Handler ──
+
+    def _handle_ctx_replay(self, session_id: str):
+        """POST /ctx/{session_id}/replay — Replay a session with its original input.
+
+        Looks up the audit record(s) for *session_id*, extracts the original
+        prompt and project_id from the first record, then creates a new task
+        through the normal submission flow.
+
+        Returns::
+
+            {"new_session_id": "...", "status": "pending", "replayed_from": "<session_id>"}
+
+        Error responses:
+            404 {"error": "session not found"}        — session_id unknown
+            404 {"error": "audit record not found"}   — no audit records for session
+            500 {"error": "..."}                      — unexpected failure
+        """
+        import uuid as _uuid_mod
+        from datetime import datetime, timezone
+
+        try:
+            # ── 1. Verify session existence ──────────────────────────────────
+            # A session is known if it appears in ObserverManager or the
+            # task-observer registry (keyed by task_id / session_id).
+            session_known = (
+                session_id in ObserverManager._sessions
+                or session_id in _observer_sessions
+            )
+            if not session_known:
+                self._json_response(404, {"error": "session not found"})
+                return
+
+            # ── 2. Fetch audit records ───────────────────────────────────────
+            if _query_audit_by_session is None:
+                raise RuntimeError("context_store.query_audit_by_session is not available")
+
+            records = _query_audit_by_session(session_id)
+            if not records:
+                self._json_response(404, {"error": "audit record not found"})
+                return
+
+            # ── 3. Extract original input ────────────────────────────────────
+            first = records[0]
+            original_prompt = first.get("prompt") or ""
+            project_id = first.get("project_id") or "amingClaw"
+
+            # ── 4. Create new task via normal flow ───────────────────────────
+            new_task_id = f"task-replay-{_uuid_mod.uuid4().hex[:12]}"
+            observer_token = _uuid_mod.uuid4().hex
+
+            ObserverManager.auto_register(new_task_id)
+
+            _observer_sessions[new_task_id] = {
+                "token": observer_token,
+                "status": "accepted",
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "source": "replay",
+                "session_type": "task",
+                "project_id": project_id,
+                "replayed_from": session_id,
+            }
+
+            payload = {
+                "source": "replay",
+                "session_type": "task",
+                "message": original_prompt,
+                "project_id": project_id,
+                "chat_id": 0,
+                "replayed_from": session_id,
+            }
+
+            if _orchestrator:
+                import threading as _threading
+                t = _threading.Thread(
+                    target=_orchestrator.handle_task_from_api,
+                    args=(new_task_id, payload),
+                    daemon=True,
+                    name=f"replay-{new_task_id[:20]}",
+                )
+                t.start()
+                _observer_sessions[new_task_id]["status"] = "pending"
+            else:
+                log.warning(
+                    "POST /ctx/%s/replay: orchestrator not initialized, "
+                    "task %s accepted but not dispatched",
+                    session_id, new_task_id,
+                )
+
+            self._json_response(200, {
+                "new_session_id": new_task_id,
+                "status": _observer_sessions[new_task_id]["status"],
+                "replayed_from": session_id,
+            })
+
+        except Exception as exc:
+            log.exception("POST /ctx/%s/replay failed", session_id)
+            self._json_response(500, {
+                "error": f"replay failed: {str(exc)[:300]}"
+            })
+
+
+    # ── KPI Handler ──
+
+    def _handle_kpi(self):
+        """GET /kpi — Aggregate KPI metrics from archive/ and results/ task files.
+
+        Iterates over every task status JSON in ``codex-tasks/archive/`` and
+        ``codex-tasks/results/``, reads the following optional fields from each
+        file, and computes per-metric ratios (4 decimal places):
+
+        * ``retry_count``        — int, defaults to 0
+        * ``validator_result``   — str, "rejected" counts as validator reject
+        * ``wrong_file``         — bool/truthy, task modified a non-target file
+        * ``manual_downgrade``   — bool/truthy, task was manually downgraded
+        * ``observer_report``    — dict; may contain any of the above keys as
+                                   fallback when top-level keys are absent
+
+        Returns ``total_tasks: 0`` with all metrics ``null`` when no task files
+        are found.
+        """
+        from pathlib import Path
+
+        tasks_root = Path(os.getenv(
+            "SHARED_VOLUME_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "shared-volume"),
+        )) / "codex-tasks"
+
+        total = 0
+        first_pass_count = 0          # retry_count == 0
+        retry_rounds_sum = 0          # sum of retry_count values
+        validator_reject_count = 0    # validator_result == "rejected"
+        wrong_file_count = 0          # wrong_file truthy
+        manual_downgrade_count = 0    # manual_downgrade truthy
+
+        for stage in ("archive", "results"):
+            stage_dir = tasks_root / stage
+            if not stage_dir.exists():
+                continue
+            for filepath in stage_dir.glob("*.json"):
+                try:
+                    with open(filepath, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except Exception:
+                    continue
+
+                # observer_report acts as a fallback source for any missing top-level field
+                obs = data.get("observer_report") or {}
+
+                def _field(key, default=None):
+                    """Return top-level field, falling back to observer_report."""
+                    val = data.get(key)
+                    if val is None:
+                        val = obs.get(key)
+                    return val if val is not None else default
+
+                total += 1
+
+                retry = int(_field("retry_count", 0))
+                retry_rounds_sum += retry
+                if retry == 0:
+                    first_pass_count += 1
+
+                v_result = _field("validator_result", "")
+                if str(v_result).lower() == "rejected":
+                    validator_reject_count += 1
+
+                if _field("wrong_file", False):
+                    wrong_file_count += 1
+
+                if _field("manual_downgrade", False):
+                    manual_downgrade_count += 1
+
+        if total == 0:
+            self._json_response(200, {
+                "total_tasks": 0,
+                "first_pass_rate": None,
+                "avg_retry_rounds": None,
+                "validator_reject_rate": None,
+                "wrong_file_rate": None,
+                "manual_downgrade_rate": None,
+            })
+            return
+
+        self._json_response(200, {
+            "total_tasks": total,
+            "first_pass_rate": round(first_pass_count / total, 4),
+            "avg_retry_rounds": round(retry_rounds_sum / total, 4),
+            "validator_reject_rate": round(validator_reject_count / total, 4),
+            "wrong_file_rate": round(wrong_file_count / total, 4),
+            "manual_downgrade_rate": round(manual_downgrade_count / total, 4),
+        })
 
 
 def start_api_server():
