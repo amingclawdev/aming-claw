@@ -44,6 +44,12 @@ def utc_iso() -> str:
 
 
 def shared_root() -> Path:
+    """Return the shared volume root Path, creating it if necessary.
+
+    Resolves the path from the SHARED_VOLUME_PATH environment variable when
+    set; otherwise defaults to <repo_root>/shared-volume. The directory is
+    always created (parents included) before returning.
+    """
     root = os.getenv("SHARED_VOLUME_PATH", "").strip()
     if not root:
         # Use repository-relative default, not process cwd, to avoid
