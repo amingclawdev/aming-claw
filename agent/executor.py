@@ -44,6 +44,9 @@ from git_rollback import (
 # NEVER kill arbitrary claude.exe processes — they may be user Claude Code sessions.
 _EXECUTOR_SPAWNED_PIDS: set = set()
 
+# Service manager process started by this executor (for cleanup on shutdown).
+_service_manager_proc: Optional[subprocess.Popen] = None
+
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 _shutdown_requested: threading.Event = threading.Event()
 _GRACEFUL_SHUTDOWN_TIMEOUT_SEC: int = int(os.getenv("EXECUTOR_SHUTDOWN_TIMEOUT_SEC", "120"))
@@ -1786,6 +1789,60 @@ def process_task_in_workspace(task_path: Path, workspace_info: Dict) -> None:
         process_task(task_path)
 
 
+_MANAGER_SINGLETON_PORT: int = int(os.getenv("MANAGER_SINGLETON_PORT", "39103"))
+
+
+def _is_service_manager_running() -> bool:
+    """Return True if service_manager's singleton port is bound (i.e. already running)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", _MANAGER_SINGLETON_PORT))
+        # We could bind → port is free → service_manager is NOT running
+        sock.close()
+        return False
+    except OSError:
+        # Port already bound → service_manager IS running
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return True
+
+
+def _ensure_service_manager_running() -> None:
+    """Start service_manager subprocess if it is not already running."""
+    global _service_manager_proc
+    if _is_service_manager_running():
+        print("[executor] service_manager already running")
+        return
+    agent_dir = os.path.dirname(os.path.abspath(__file__))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "service_manager"],
+        cwd=agent_dir,
+    )
+    _service_manager_proc = proc
+    print(f"[executor] service_manager started (PID={proc.pid})")
+
+
+def _cleanup_service_manager() -> None:
+    """Terminate the service_manager subprocess started by this executor, if any."""
+    global _service_manager_proc
+    if _service_manager_proc is None:
+        return
+    proc = _service_manager_proc
+    _service_manager_proc = None
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    print(f"[executor] service_manager (PID={proc.pid}) stopped")
+
+
 def run_parallel() -> None:
     """Parallel executor: dispatches tasks to workspace-specific worker threads."""
     lock = acquire_single_instance_lock()
@@ -1806,6 +1863,9 @@ def run_parallel() -> None:
 
     # Ensure at least the current workspace is registered
     ensure_current_workspace_registered()
+
+    # Ensure service_manager is running so it can restart executor after code merges
+    _ensure_service_manager_running()
 
     workspaces = list_workspaces()
     if not workspaces:
@@ -1899,6 +1959,7 @@ def run_parallel() -> None:
     finally:
         _wait_for_idle_or_timeout()
         shutdown_dispatcher()
+        _cleanup_service_manager()
         print("[executor] stopped")
 
 
