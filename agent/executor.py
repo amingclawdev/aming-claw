@@ -1624,22 +1624,33 @@ def run_parallel() -> None:
 
     print("[executor] started (parallel mode, {} workspaces)".format(len(workspaces)))
 
+    _skipped_tasks: set = set()  # Tasks we already tried to dispatch but queue was full
+
     try:
         while True:
             try:
                 pending = pick_pending_task()
                 if pending is not None:
+                    task_id = pending.stem  # filename without .json
+                    if task_id in _skipped_tasks:
+                        # Already tried, queue was full — don't spin, wait
+                        time.sleep(poll_sec)
+                        continue
                     if not dispatcher.dispatch(pending):
-                        # Fallback: process in main thread if dispatch fails
-                        print("[executor] dispatch failed, processing in main thread")
-                        process_task(pending)
+                        # Queue full — remember and skip on next poll
+                        _skipped_tasks.add(task_id)
+                        print(f"[executor] dispatch failed for {task_id}, will retry later")
+                        time.sleep(poll_sec)
                 else:
                     time.sleep(poll_sec)
+                    # Clear skipped set periodically — workers may have freed up
+                    _skipped_tasks.clear()
 
                 # Periodically refresh workers from registry
                 now = time.time()
                 if now - last_refresh >= refresh_interval:
                     dispatcher.refresh_workers()
+                    _skipped_tasks.clear()  # Re-check skipped tasks after refresh
                     last_refresh = now
 
             except KeyboardInterrupt:
