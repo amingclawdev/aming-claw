@@ -1123,9 +1123,10 @@ def _trigger_coordinator_eval(task: Dict, result: Dict) -> None:
             ai_report={
                 "summary": result.get("acceptance", {}).get("summary", ""),
                 "changed_files": result.get("executor", {}).get("changed_files", result.get("executor", {}).get("git_changed_files", [])),
-                "test_results": {},
+                "test_results": result.get("executor", {}).get("test_results", {}),
                 "_before_snapshot": {"commit": task.get("_git_checkpoint", "HEAD~1")},
                 "_chain_depth": chain_depth,
+                "_evidence": result.get("executor", {}).get("evidence", {}),
             },
         )
     except ImportError:
