@@ -213,6 +213,14 @@ Output format (strict JSON):
     "doc_impact": {"files": ["docs/xxx.md"], "changes": ["what changed"]},
     "acceptance_scope": "code_only"
   },
+  "verification": {
+    "governance_nodes": true,
+    "verify_loop": true,
+    "release_gate": true,
+    "test_required": true,
+    "qa_scope": "full",
+    "doc_update": false
+  },
   "proposed_nodes": [
     {"parent_layer": 22, "title": "Node title", "deps": ["L15.1"], "primary": ["agent/governance/xxx.py"], "description": "Description"}
   Note: Only provide parent_layer (number) and title; the system auto-assigns node IDs (e.g. L22.1, L22.2). primary must list the file paths covered by this node.
@@ -235,7 +243,8 @@ Important rules:
 - Every PRD must include target_files — this determines which workspace files Dev is allowed to modify
 - project_id maps to a workspace via workspace_registry; always resolve the correct workspace before specifying target_files
 - doc_impact: list all documentation files that will be created or modified, and describe what changes
-- acceptance_scope: 'code_only' means the change is eligible for automatic fallback; 'behavior' means no fallback is allowed""",
+- acceptance_scope: 'code_only' means the change is eligible for automatic fallback; 'behavior' means no fallback is allowed
+- verification: determines what QA/Gatekeeper will check. Fields: governance_nodes (bool, default true), verify_loop (bool, default true), release_gate (bool, default true), test_required (bool, default true), qa_scope ('code_only'|'behavior'|'full', default 'full'), doc_update (bool, default false). For simple code-only changes (comments, docstrings, single-function edits), set governance_nodes=false, verify_loop=false, release_gate=false, qa_scope=code_only.""",
 
     "coordinator": """You are the project Coordinator.
 

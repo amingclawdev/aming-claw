@@ -1058,33 +1058,55 @@ def process_qa_task_v6(task: Dict, processing: Path) -> Dict:
     workspace = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parent.parent))
 
     try:
+        # Read task-level verification config (set by PM); missing = run all checks
+        verification = task.get("_verification", {})
+        skipped_checks = []
+
         # 1. Try governance verify_loop
         verify_pass = False
         verify_unavailable = False
-        tlog.log_event("running_verify_loop")
-        try:
-            vl = subprocess.run(["bash", "scripts/verify_loop.sh", token, project_id],
-                cwd=workspace, capture_output=True, text=True, timeout=60)
-            tlog.write_file("verify_loop.txt", vl.stdout + vl.stderr)
-            verify_pass = "0 fail" in vl.stdout
-            tlog.log_event("verify_loop_complete", {"passed": verify_pass})
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            verify_unavailable = True
-            tlog.log_event("verify_loop_unavailable", {"error": str(e)[:200]})
+        if verification.get("verify_loop") is False:
+            verify_pass = True
+            skipped_checks.append("verify_loop")
+            tlog.log_event("verify_loop_skipped", {"reason": "verification.verify_loop=false"})
+        else:
+            tlog.log_event("running_verify_loop")
+            try:
+                vl = subprocess.run(["bash", "scripts/verify_loop.sh", token, project_id],
+                    cwd=workspace, capture_output=True, text=True, timeout=60)
+                tlog.write_file("verify_loop.txt", vl.stdout + vl.stderr)
+                verify_pass = "0 fail" in vl.stdout
+                tlog.log_event("verify_loop_complete", {"passed": verify_pass})
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                verify_unavailable = True
+                tlog.log_event("verify_loop_unavailable", {"error": str(e)[:200]})
 
         # 2. Try governance gatekeeper
         gate_pass = False
         gate_unavailable = False
-        tlog.log_event("running_gatekeeper")
         gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
-        try:
-            gate = requests.get(f"{gov_url}/api/wf/{project_id}/release-gate",
-                headers={"X-Gov-Token": token}, timeout=15).json()
-            gate_pass = gate.get("release", False) and gate.get("gatekeeper", {}).get("pass", False)
-            tlog.log_event("gatekeeper_complete", {"passed": gate_pass})
-        except Exception as e:
-            gate_unavailable = True
-            tlog.log_event("gatekeeper_unavailable", {"error": str(e)[:200]})
+        if verification.get("release_gate") is False:
+            gate_pass = True
+            skipped_checks.append("release_gate")
+            tlog.log_event("release_gate_skipped", {"reason": "verification.release_gate=false"})
+        else:
+            tlog.log_event("running_gatekeeper")
+            try:
+                gate = requests.get(f"{gov_url}/api/wf/{project_id}/release-gate",
+                    headers={"X-Gov-Token": token}, timeout=15).json()
+                gate_pass = gate.get("release", False) and gate.get("gatekeeper", {}).get("pass", False)
+                tlog.log_event("gatekeeper_complete", {"passed": gate_pass})
+            except Exception as e:
+                gate_unavailable = True
+                tlog.log_event("gatekeeper_unavailable", {"error": str(e)[:200]})
+
+        # Governance node checks (skipped if explicitly disabled)
+        if verification.get("governance_nodes") is False:
+            skipped_checks.append("governance_nodes")
+            tlog.log_event("governance_nodes_skipped", {"reason": "verification.governance_nodes=false"})
+
+        if skipped_checks:
+            tlog.log_event("checks_skipped", {"skipped": skipped_checks})
 
         # 3. Determine QA result with fallback
         # If governance is unavailable, fallback to parent test results (Codex advice: mark explicitly)
@@ -1115,6 +1137,7 @@ def process_qa_task_v6(task: Dict, processing: Path) -> Dict:
                       "verify_unavailable": verify_unavailable,
                       "gate_unavailable": gate_unavailable,
                       "fallback_used": fallback_used,
+                      "skipped_checks": skipped_checks,
                   }}
         save_json(processing, result)
 

@@ -237,8 +237,10 @@ class TaskOrchestrator:
             key = f"{task_id}:test"
             if not self._check_idempotent(key):
                 parent_chain_depth = int(ai_report.get("_chain_depth", 0))
+                parent_verification = ai_report.get("_verification")
                 self._trigger_tester(task_id, project_id, token, chat_id, evidence,
-                                     parent_chain_depth=parent_chain_depth)
+                                     parent_chain_depth=parent_chain_depth,
+                                     verification=parent_verification)
                 self._record_idempotent(key)
             self._log_stage_transition(task_id, "dev", "test", "gate_passed")
             reply = f"Dev {task_id} checkpoint 通过，Tester 已启动"
@@ -310,7 +312,8 @@ class TaskOrchestrator:
 
     def _trigger_tester(self, parent_task_id: str, project_id: str,
                         token: str, chat_id: int, evidence,
-                        parent_chain_depth: int = 0) -> None:
+                        parent_chain_depth: int = 0,
+                        verification: dict = None) -> None:
         """Auto-trigger Tester after Dev eval passes."""
         log.info("Auto-triggering Tester for %s", parent_task_id)
         task_id = f"test-{int(time.time())}-{uuid.uuid4().hex[:6]}"
@@ -321,6 +324,8 @@ class TaskOrchestrator:
             "target_files": changed,
             "parent_task_id": parent_task_id,
         }
+        if verification is not None:
+            action["_verification"] = verification
         child_depth = parent_chain_depth + 1
         self._write_task_file(task_id, action, project_id, token, "test_task", chat_id,
                               chain_depth=child_depth)
@@ -357,7 +362,9 @@ class TaskOrchestrator:
         key = f"{task_id}:qa"
         triggered_qa = False
         if not self._check_idempotent(key):
-            self._trigger_qa(task_id, project_id, token, chat_id, test_report)
+            parent_verification = test_report.get("_verification")
+            self._trigger_qa(task_id, project_id, token, chat_id, test_report,
+                             verification=parent_verification)
             self._record_idempotent(key)
             triggered_qa = True
         self._log_stage_transition(task_id, "test", "qa", "test_passed")
@@ -365,7 +372,8 @@ class TaskOrchestrator:
         return {"status": "test_passed", "triggered_qa": triggered_qa}
 
     def _trigger_qa(self, parent_task_id: str, project_id: str,
-                    token: str, chat_id: int, test_report: dict) -> None:
+                    token: str, chat_id: int, test_report: dict,
+                    verification: dict = None) -> None:
         """Auto-trigger QA after Tester passes."""
         log.info("Auto-triggering QA for %s", parent_task_id)
         task_id = f"qa-{int(time.time())}-{uuid.uuid4().hex[:6]}"
@@ -374,6 +382,8 @@ class TaskOrchestrator:
             "prompt": f"QA 审查 {parent_task_id} 的测试结果和代码变更。test_report: {test_report}",
             "parent_task_id": parent_task_id,
         }
+        if verification is not None:
+            action["_verification"] = verification
         self._write_task_file(task_id, action, project_id, token, "qa_task", chat_id)
         self._gateway_reply(chat_id, f"QA 已启动 ({task_id[-8:]})", token)
 
@@ -610,6 +620,11 @@ class TaskOrchestrator:
             "_chain_depth": chain_depth,
             "created_at": created_at,
         }
+        # Copy verification config from action (set by PM) into task metadata
+        if "verification" in action:
+            task_data["_verification"] = action["verification"]
+        elif "_verification" in action:
+            task_data["_verification"] = action["_verification"]
 
         # Write pending file via Executor API (correct path, idempotent).
         # Fallback to direct file write if API unavailable.
