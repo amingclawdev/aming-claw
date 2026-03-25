@@ -1,10 +1,13 @@
 import json
+import logging
 import re
 import time
 import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from utils import load_json, save_json, tasks_root, utc_iso
 
@@ -277,6 +280,7 @@ def update_task_heartbeat(task_id: str, progress: int = 0) -> None:
     heartbeat_at to detect stuck tasks and mark them as timeout."""
     existing = load_task_status(task_id)
     if existing is None:
+        logger.warning("[task_state] update_task_heartbeat called for unknown task_id=%s", task_id)
         return
     existing["heartbeat_at"] = utc_iso()
     if progress:

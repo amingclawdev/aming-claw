@@ -631,7 +631,7 @@ def process_task(path: Path) -> None:
                         token=task.get("_gov_token", ""), chat_id=chat_id,
                         qa_report=result.get("executor", {}))
             except Exception as chain_err:
-                print(f"[executor] chain trigger failed: {chain_err}")
+                print(f"[executor] task {task_id} chain trigger ({task_type}) failed: {chain_err}")
                 if chat_id:
                     _gateway_notify(chat_id, f"链路触发失败: {str(chain_err)[:200]}")
         else:

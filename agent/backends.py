@@ -898,7 +898,11 @@ def run_via_api(
             )
             if resp.status_code >= 400:
                 _raise_api_error("OpenAI", resp)
-            content = resp.json()["choices"][0]["message"]["content"]
+            _resp_data = resp.json()
+            _choices = _resp_data.get("choices") or []
+            if not _choices:
+                raise RuntimeError(f"OpenAI response missing choices: {_resp_data}")
+            content = _choices[0].get("message", {}).get("content", "")
         else:
             # Default: Anthropic Messages API
             api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -919,7 +923,11 @@ def run_via_api(
             )
             if resp.status_code >= 400:
                 _raise_api_error("Anthropic", resp)
-            content = resp.json()["content"][0]["text"]
+            _resp_data = resp.json()
+            _content_blocks = _resp_data.get("content") or []
+            if not _content_blocks:
+                raise RuntimeError(f"Anthropic response missing content blocks: {_resp_data}")
+            content = _content_blocks[0].get("text", "")
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         workspace = resolve_workspace()

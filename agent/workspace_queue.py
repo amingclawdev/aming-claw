@@ -150,6 +150,8 @@ def has_active_task_in_workspace(ws_id: str) -> bool:
             continue
         # Check if this task targets the workspace
         task_ws_id = str(entry.get("target_workspace_id", "")).strip()
+        if not task_ws_id:
+            continue  # Skip entries with no workspace id to avoid false matches
         if task_ws_id == ws_id:
             return True
     return False
@@ -170,6 +172,8 @@ def should_queue_task(ws_id: str) -> bool:
         if status not in ("processing", "pending_acceptance"):
             continue
         task_ws_id = str(entry.get("target_workspace_id", "")).strip()
+        if not task_ws_id:
+            continue  # Skip entries with no workspace id to avoid false matches
         if task_ws_id == ws_id:
             return True
     return False
