@@ -639,7 +639,7 @@ def process_task(path: Path) -> None:
             result = process_coordinator_chat(task, processing)
         elif task.get("action") == "screenshot":
             result = process_screenshot(task, processing)
-        elif task.get("action") == "claude" and task.get("type") == "dev_task" and task.get("project_id"):
+        elif task.get("type") == "dev_task" and task.get("project_id"):
             result = process_dev_task_v6(task, processing)
         elif task.get("type") == "test_task" and task.get("project_id"):
             result = process_test_task_v6(task, processing)
