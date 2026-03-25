@@ -995,3 +995,106 @@ class TaskOrchestrator:
                 _eapi._observer_sessions[task_id]["status"] = "queued"
         except Exception:
             pass  # executor_api may not be loaded in all deployment contexts
+
+    # ── Pipeline infrastructure ──────────────────────────────────────
+
+    RETRY_BUDGET = 6
+
+    def _shared_vol(self) -> str:
+        return os.getenv(
+            "SHARED_VOLUME_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "shared-volume"),
+        )
+
+    def _state_dir(self) -> str:
+        d = os.path.join(self._shared_vol(), "codex-tasks", "state")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _logs_dir(self) -> str:
+        d = os.path.join(self._shared_vol(), "codex-tasks", "logs")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    # -- idempotency -------------------------------------------------
+
+    def _check_idempotent(self, key: str) -> bool:
+        """Return True if *key* was already recorded (skip), False otherwise."""
+        path = os.path.join(self._state_dir(), "pipeline_idempotency.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        return key in data
+
+    def _record_idempotent(self, key: str) -> None:
+        """Record *key* so future _check_idempotent calls return True."""
+        path = os.path.join(self._state_dir(), "pipeline_idempotency.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        data[key] = True
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    # -- retry budget ------------------------------------------------
+
+    def _get_retry_count(self, parent_task_id: str) -> int:
+        """Return how many retries have been consumed for *parent_task_id*."""
+        path = os.path.join(self._state_dir(), "pipeline_retry_budget.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        return data.get(parent_task_id, 0)
+
+    def _consume_retry(self, parent_task_id: str) -> bool:
+        """Increment retry count and return True if budget remains (< RETRY_BUDGET)."""
+        path = os.path.join(self._state_dir(), "pipeline_retry_budget.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        count = data.get(parent_task_id, 0) + 1
+        data[parent_task_id] = count
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return count < self.RETRY_BUDGET
+
+    # -- failure memory ----------------------------------------------
+
+    def _write_failure_memory(self, parent_task_id: str, stage: str, reason: str) -> None:
+        """Write a failure record; skip if refId already exists."""
+        ref_id = f"pipeline:{parent_task_id}:{stage}"
+        path = os.path.join(self._state_dir(), "pipeline_failure_memory.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        if ref_id in data:
+            return
+        data[ref_id] = {"parent_task_id": parent_task_id, "stage": stage, "reason": reason}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    # -- audit log ---------------------------------------------------
+
+    def _log_stage_transition(self, parent_task_id: str, from_stage: str,
+                              to_stage: str, result: str) -> None:
+        """Append one JSONL line to the pipeline audit log."""
+        path = os.path.join(self._logs_dir(), "pipeline_audit.jsonl")
+        entry = json.dumps({
+            "ts": time.time(),
+            "parent_task_id": parent_task_id,
+            "from": from_stage,
+            "to": to_stage,
+            "result": result,
+        }, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
