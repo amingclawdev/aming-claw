@@ -97,11 +97,13 @@ class AILifecycleManager:
         except Exception as e:
             log.error("Failed to write prompt file: %s", e)
 
-        # AI tools: Read + Write + Edit for code changes in worktree.
-        # Worktree isolation ensures AI can only modify its own branch,
-        # not main workspace. Governance chain (gatekeeper → test → QA)
-        # verifies changes before merge.
-        allowed_tools = "Read,Grep,Glob,Write,Edit,Bash"
+        # Tool access by role:
+        # - dev: Read + Write + Edit + Bash (worktree isolation protects main)
+        # - coordinator/pm/tester/qa: Read-only (must delegate code changes to dev)
+        if role == "dev":
+            allowed_tools = "Read,Grep,Glob,Write,Edit,Bash"
+        else:
+            allowed_tools = "Read,Grep,Glob"
 
         cmd = [
             claude_bin,
