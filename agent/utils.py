@@ -93,6 +93,18 @@ def task_file(stage: str, task_id: str) -> Path:
 
 
 def new_task_id() -> str:
+    """Generate a unique task identifier.
+
+    Combines the current UTC timestamp (milliseconds since Unix epoch) with a
+    random 6-character hex suffix to produce a globally unique, time-sortable
+    string suitable for use as a task filename stem.
+
+    Returns:
+        str: A task ID of the form ``"task-<timestamp_ms>-<hex6>"``, e.g.
+            ``"task-1711234567890-a1b2c3"``, where ``<timestamp_ms>`` is the
+            number of milliseconds since the Unix epoch and ``<hex6>`` is a
+            random 6-character lowercase hexadecimal string.
+    """
     return "task-" + str(utc_ts_ms()) + "-" + uuid.uuid4().hex[:6]
 
 
