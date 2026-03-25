@@ -109,11 +109,6 @@ def _find_matching_nodes(file_path: str, file_to_nodes: dict) -> list[str]:
     for tracked_path, node_ids in file_to_nodes.items():
         if tracked_path.endswith("/") and file_path.startswith(tracked_path):
             nodes.update(node_ids)
-        elif file_path == tracked_path:
-            nodes.update(node_ids)
-        # Glob-like: "dbservice/" matches "dbservice/index.js"
-        elif tracked_path.endswith("/") and file_path.startswith(tracked_path):
-            nodes.update(node_ids)
 
     return sorted(nodes)
 
