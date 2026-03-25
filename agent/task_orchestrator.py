@@ -445,14 +445,17 @@ class TaskOrchestrator:
             except Exception:
                 log.exception("Failed to verify-update qa_pass")
 
-        # 2. Conditionally trigger Gatekeeper based on release_gate
+        # 2. Conditionally trigger Gatekeeper based on release_gate / governance_nodes
         verification = verification or {}
-        release_gate = verification.get("release_gate", True)
+        skip_deploy = (
+            verification.get("release_gate") is False
+            or verification.get("governance_nodes") is False
+        )
 
         key = f"{task_id}:gate"
         gate_result = {}
         if not self._check_idempotent(key):
-            if release_gate:
+            if not skip_deploy:
                 gate_result = self._trigger_gatekeeper(project_id, token, chat_id)
             else:
                 self._gateway_reply(chat_id, "✅ Merged to main (deploy not required for this task)", token)
@@ -462,8 +465,17 @@ class TaskOrchestrator:
 
         return {"status": "qa_passed", "gatekeeper": gate_result}
 
-    def _trigger_gatekeeper(self, project_id: str, token: str, chat_id: int) -> dict:
+    def _trigger_gatekeeper(self, project_id: str, token: str, chat_id: int,
+                            verification: dict = None) -> dict:
         """Trigger Gatekeeper checks after QA passes. Code-driven, not AI."""
+        # Defensive: if release_gate/governance_nodes disabled, skip even if called unexpectedly
+        verification = verification or {}
+        if (verification.get("release_gate") is False
+                or verification.get("governance_nodes") is False):
+            log.info("Gatekeeper skipped (defensive): release_gate/governance_nodes disabled")
+            self._gateway_reply(chat_id, "✅ Merged to main (deploy not required for this task)", token)
+            return {"skipped": True, "reason": "release_gate_false"}
+
         log.info("Triggering Gatekeeper for %s", project_id)
         try:
             import requests

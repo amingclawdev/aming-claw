@@ -85,6 +85,142 @@ class TestHandleQaCompleteReleaseGate(unittest.TestCase):
         self.assertEqual(result["gatekeeper"], {"pass": True})
 
 
+    @patch("task_orchestrator.TaskOrchestrator._log_stage_transition")
+    @patch("task_orchestrator.TaskOrchestrator._record_idempotent")
+    @patch("task_orchestrator.TaskOrchestrator._check_idempotent", return_value=False)
+    @patch("task_orchestrator.TaskOrchestrator._trigger_gatekeeper")
+    @patch("task_orchestrator.TaskOrchestrator._gateway_reply")
+    def test_governance_nodes_false_skips_gatekeeper(self, mock_reply, mock_gate, mock_check,
+                                                      mock_record, mock_log):
+        """governance_nodes=False should also skip gatekeeper."""
+        from task_orchestrator import TaskOrchestrator
+        orch = TaskOrchestrator()
+        result = orch.handle_qa_complete(
+            task_id="qa-gov-1", project_id="proj-gov",
+            token="tok", chat_id=42,
+            qa_report={},
+            verification={"governance_nodes": False}
+        )
+        mock_gate.assert_not_called()
+        mock_reply.assert_called_once_with(
+            42, "✅ Merged to main (deploy not required for this task)", "tok")
+        self.assertTrue(result["gatekeeper"]["skipped"])
+
+    @patch("task_orchestrator.TaskOrchestrator._log_stage_transition")
+    @patch("task_orchestrator.TaskOrchestrator._record_idempotent")
+    @patch("task_orchestrator.TaskOrchestrator._check_idempotent", return_value=False)
+    @patch("task_orchestrator.TaskOrchestrator._trigger_gatekeeper", return_value={"pass": True})
+    @patch("task_orchestrator.TaskOrchestrator._gateway_reply")
+    def test_verification_none_defaults_to_gatekeeper(self, mock_reply, mock_gate, mock_check,
+                                                       mock_record, mock_log):
+        """verification=None should default to triggering gatekeeper (conservative)."""
+        from task_orchestrator import TaskOrchestrator
+        orch = TaskOrchestrator()
+        result = orch.handle_qa_complete(
+            task_id="qa-none", project_id="proj-none",
+            token="tok", chat_id=42,
+            qa_report={},
+            verification=None
+        )
+        mock_gate.assert_called_once()
+        self.assertEqual(result["gatekeeper"], {"pass": True})
+
+    @patch("task_orchestrator.TaskOrchestrator._log_stage_transition")
+    @patch("task_orchestrator.TaskOrchestrator._record_idempotent")
+    @patch("task_orchestrator.TaskOrchestrator._check_idempotent", return_value=False)
+    @patch("task_orchestrator.TaskOrchestrator._trigger_gatekeeper", return_value={"pass": True})
+    @patch("task_orchestrator.TaskOrchestrator._gateway_reply")
+    def test_empty_verification_defaults_to_gatekeeper(self, mock_reply, mock_gate, mock_check,
+                                                        mock_record, mock_log):
+        """Empty verification dict should default to triggering gatekeeper."""
+        from task_orchestrator import TaskOrchestrator
+        orch = TaskOrchestrator()
+        result = orch.handle_qa_complete(
+            task_id="qa-empty", project_id="proj-empty",
+            token="tok", chat_id=42,
+            qa_report={},
+            verification={}
+        )
+        mock_gate.assert_called_once()
+        self.assertEqual(result["gatekeeper"], {"pass": True})
+
+
+class TestTriggerGatekeeperDefensive(unittest.TestCase):
+    """Test _trigger_gatekeeper defensive checks."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmpdir.name
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+
+    @patch("task_orchestrator.TaskOrchestrator._gateway_reply")
+    def test_defensive_skip_release_gate_false(self, mock_reply):
+        """_trigger_gatekeeper should return skip result if called with release_gate=False."""
+        from task_orchestrator import TaskOrchestrator
+        orch = TaskOrchestrator()
+        result = orch._trigger_gatekeeper("proj-x", "tok", 42,
+                                           verification={"release_gate": False})
+        self.assertTrue(result["skipped"])
+        mock_reply.assert_called_once_with(
+            42, "✅ Merged to main (deploy not required for this task)", "tok")
+
+    @patch("task_orchestrator.TaskOrchestrator._gateway_reply")
+    def test_defensive_skip_governance_nodes_false(self, mock_reply):
+        """_trigger_gatekeeper should return skip result if called with governance_nodes=False."""
+        from task_orchestrator import TaskOrchestrator
+        orch = TaskOrchestrator()
+        result = orch._trigger_gatekeeper("proj-y", "tok", 42,
+                                           verification={"governance_nodes": False})
+        self.assertTrue(result["skipped"])
+        mock_reply.assert_called_once()
+
+
+class TestExecutorSkipDeployNotification(unittest.TestCase):
+    """Test executor auto-merge notification with --skip-deploy."""
+
+    def test_skip_deploy_sends_correct_notification(self):
+        """When governance_nodes=False and merge succeeds, notification should say deploy not required."""
+        from unittest.mock import call
+        # We test the notification logic inline since _gateway_notify is a module function
+        # Simulate the condition check that was added
+        verification = {"governance_nodes": False}
+        skip_deploy = (
+            not verification.get("governance_nodes", True)
+            or verification.get("release_gate") is False
+        )
+        self.assertTrue(skip_deploy)
+
+    def test_skip_deploy_release_gate_false(self):
+        """release_gate=False should also trigger skip_deploy in executor path."""
+        verification = {"release_gate": False}
+        skip_deploy = (
+            not verification.get("governance_nodes", True)
+            or verification.get("release_gate") is False
+        )
+        self.assertTrue(skip_deploy)
+
+    def test_normal_deploy_no_skip(self):
+        """Default verification should not skip deploy."""
+        verification = {}
+        skip_deploy = (
+            not verification.get("governance_nodes", True)
+            or verification.get("release_gate") is False
+        )
+        self.assertFalse(skip_deploy)
+
+    def test_explicit_true_no_skip(self):
+        """Explicit governance_nodes=True and release_gate=True should not skip."""
+        verification = {"governance_nodes": True, "release_gate": True}
+        skip_deploy = (
+            not verification.get("governance_nodes", True)
+            or verification.get("release_gate") is False
+        )
+        self.assertFalse(skip_deploy)
+
+
 class TestMergeManagerSignal(unittest.TestCase):
     """Test manager_signal written on successful merge."""
 

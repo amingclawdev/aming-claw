@@ -1219,7 +1219,14 @@ def process_qa_task_v6(task: Dict, processing: Path) -> Dict:
                     except Exception as sig_err:
                         print(f"[executor] Failed to write manager_signal: {sig_err}")
                 if chat_id:
-                    _gateway_notify(chat_id, f"Auto-merge {'OK' if mr.returncode==0 else 'FAIL'}: {branch}")
+                    skip_deploy = (
+                        not verification.get("governance_nodes", True)
+                        or verification.get("release_gate") is False
+                    )
+                    if mr.returncode == 0 and skip_deploy:
+                        _gateway_notify(chat_id, f"✅ Merged to main (deploy not required for this task)")
+                    else:
+                        _gateway_notify(chat_id, f"Auto-merge {'OK' if mr.returncode==0 else 'FAIL'}: {branch}")
 
         if chat_id:
             status_label = {"completed": "PASS", "passed_with_fallback": "PASS (fallback)", "failed": "FAIL"}
