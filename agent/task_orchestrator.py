@@ -72,8 +72,11 @@ class TaskOrchestrator:
                 log.exception("PM analysis failed: %s", e)
                 pm_prd = None
 
-        # 1. Assemble context (include PRD if PM ran)
-        extra = {"prd": pm_prd} if pm_prd else None
+        # 1. Assemble context (include PRD + verification if PM ran)
+        # pm_prd is now the full pm_decision dict (prd + verification + …)
+        prd_dict = pm_prd.get("prd", {}) if pm_prd else {}
+        pm_verification = pm_prd.get("verification", {}) if pm_prd else {}
+        extra = {"prd": prd_dict, "verification": pm_verification} if pm_prd else None
         context = self.context_assembler.assemble(
             project_id=project_id,
             chat_id=chat_id,
@@ -144,6 +147,33 @@ class TaskOrchestrator:
         executed = 0
         exec_results = []
         for action in validation.approved_actions:
+            action_type = action.get("type", "")
+
+            # Gate 1: Pre-dispatch validation for task-creation actions
+            if action_type in ("create_dev_task", "create_pm_task"):
+                action = dict(action)  # mutable copy — do not mutate original
+                if not (action.get("prompt") or "").strip():
+                    log.warning(
+                        "Gate1: prompt missing in %s — auto-filling from user message text",
+                        action_type,
+                    )
+                    action["prompt"] = text
+                if not action.get("target_files"):
+                    log.warning(
+                        "Gate1: target_files missing in %s — cannot auto-fill from user message",
+                        action_type,
+                    )
+                valid, reason = self._validate_coordinator_action(action)
+                if not valid:
+                    log.warning("Gate1 SKIP action %s: %s", action_type, reason)
+                    exec_results.append({
+                        "success": False,
+                        "action_type": action_type,
+                        "detail": "",
+                        "error": f"Gate1 rejected: {reason}",
+                    })
+                    continue
+
             result = self._execute_action(action, project_id, token, chat_id)
             exec_results.append(result)
             if result.get("success"):
@@ -858,8 +888,80 @@ class TaskOrchestrator:
         ]
         return any(kw in lower for kw in pm_keywords)
 
+    def _validate_coordinator_action(self, action: dict) -> tuple[bool, str]:
+        """Gate 1: Validate coordinator create_dev_task / create_pm_task actions.
+
+        Checks:
+          - target_files is a non-empty list
+          - prompt is a non-empty string
+
+        Returns:
+            (valid: bool, reason: str)
+        """
+        action_type = action.get("type", "")
+        if action_type not in ("create_dev_task", "create_pm_task"):
+            return True, "ok"  # only gate these two types
+
+        target_files = action.get("target_files")
+        if not target_files or not isinstance(target_files, list):
+            return False, "target_files must be a non-empty list"
+
+        prompt = (action.get("prompt") or "").strip()
+        if not prompt:
+            return False, "prompt must be a non-empty string"
+
+        return True, "ok"
+
+    def _validate_pm_output(self, pm_output: dict) -> dict:
+        """Gate 2: Ensure PM output contains a complete 'verification' block.
+
+        If 'verification' is absent entirely, injects default values.
+        If 'verification' is present but missing sub-fields, fills in defaults
+        for the missing ones.  Logs every auto-filled field.
+
+        Returns:
+            pm_output dict with 'verification' guaranteed to be present and complete.
+        """
+        _DEFAULT_VERIFICATION: dict = {
+            "governance_nodes": False,
+            "verify_loop": False,
+            "release_gate": False,
+            "test_required": True,
+            "qa_scope": "code_only",
+            "doc_update": False,
+        }
+        required_fields = set(_DEFAULT_VERIFICATION.keys())
+
+        verification = pm_output.get("verification")
+        if verification is None:
+            log.warning(
+                "Gate2: PM output missing 'verification' field — injecting defaults: %s",
+                _DEFAULT_VERIFICATION,
+            )
+            pm_output = dict(pm_output)
+            pm_output["verification"] = dict(_DEFAULT_VERIFICATION)
+            return pm_output
+
+        # Present but possibly incomplete
+        missing = required_fields - set(verification.keys())
+        if missing:
+            log.warning("Gate2: PM 'verification' missing fields %s — filling defaults", sorted(missing))
+            pm_output = dict(pm_output)
+            verification = dict(verification)
+            for field in sorted(missing):
+                default_val = _DEFAULT_VERIFICATION[field]
+                verification[field] = default_val
+                log.info("Gate2: auto-filled verification.%s = %r", field, default_val)
+            pm_output["verification"] = verification
+
+        return pm_output
+
     def _run_pm_analysis(self, text: str, project_id: str, chat_id: int) -> dict:
-        """Run PM AI to analyze requirements and generate PRD."""
+        """Run PM AI to analyze requirements and generate PRD.
+
+        Returns the full pm_decision dict (including 'prd' and 'verification')
+        so that downstream coordinator context includes the complete PM output.
+        """
         print(f"[PM] Starting PM analysis for: {text[:60]}")
         log.info("Starting PM analysis for: %s", text[:60])
         pm_context = self.context_assembler.assemble(
@@ -885,6 +987,9 @@ class TaskOrchestrator:
 
         pm_decision = self._parse(pm_output.get("stdout", ""), role="pm")
 
+        # Gate 2: validate and complete PM output verification block
+        pm_decision = self._validate_pm_output(pm_decision)
+
         # Validate PM decisions (propose_node)
         pm_validation = self.decision_validator.validate("pm", pm_decision, project_id)
 
@@ -893,7 +998,8 @@ class TaskOrchestrator:
             if action.get("type") == "propose_node":
                 self._execute_action(action, project_id)
 
-        return pm_decision.get("prd", {})
+        # Return full pm_decision so coordinator receives prd + verification context
+        return pm_decision
 
     # ── L17.2: Multi-role parallel ──
 
