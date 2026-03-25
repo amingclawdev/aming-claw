@@ -725,7 +725,8 @@ def process_dev_task_v6(task: Dict, processing: Path) -> Dict:
         except ImportError:
             pass
 
-        # 2. Before snapshot
+        # 2. Before snapshot — evidence must use the worktree, not main workspace
+        evidence.workspace = workspace
         before = evidence.collect_before_snapshot()
 
         # 3. Assemble dev context (with workspace + target_files for prompt injection)
