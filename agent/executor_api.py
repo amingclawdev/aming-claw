@@ -855,6 +855,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             "_gov_token": body.get("_gov_token", ""),
             "_branch": body.get("_branch", ""),
             "_chain_depth": body.get("_chain_depth", 0),
+            "_verification": body.get("_verification", {}),
             "created_at": body.get("created_at", utc_iso()),
             "status": "pending",
         }
