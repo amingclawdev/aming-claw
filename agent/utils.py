@@ -35,6 +35,7 @@ def normalize_project_id(raw: str) -> str:
 
 
 def utc_ts_ms() -> int:
+    """Return the current UTC time as Unix epoch milliseconds (int)."""
     return int(time.time() * 1000)
 
 
