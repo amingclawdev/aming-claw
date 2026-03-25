@@ -271,6 +271,10 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         elif path == "/coordinator/chat":
             self._handle_coordinator_chat(body)
 
+        # ── Idempotent task file creation ──
+        elif path == "/tasks/create":
+            self._handle_tasks_create(body)
+
         # ── L22.3: Unified Task Submit ──
 
         elif path == "/executor/task":
@@ -795,6 +799,72 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             "elapsed_sec": round(time.time() - session.started_at, 1),
         })
 
+
+    # ── Idempotent task file creation ──
+
+    def _handle_tasks_create(self, body):
+        """POST /tasks/create — Write a task JSON file to pending/.
+
+        Idempotent: if task_id already exists in pending/ or results/, returns
+        already_exists=true without creating a duplicate.
+
+        Called by orchestrator after governance DB insert to ensure the pending
+        file is created by the executor process (correct SHARED_VOLUME_PATH).
+        """
+        from utils import tasks_root, save_json, utc_iso
+
+        task_id = body.get("task_id", "")
+        if not task_id:
+            self._json_response(400, {"error": "task_id is required"})
+            return
+
+        root = tasks_root()
+        pending_file = root / "pending" / f"{task_id}.json"
+        results_file = root / "results" / f"{task_id}.json"
+        processing_file = root / "processing" / f"{task_id}.json"
+
+        # Idempotent: skip if already exists anywhere
+        if pending_file.exists():
+            self._json_response(200, {
+                "task_id": task_id, "file_path": str(pending_file),
+                "created": False, "already_exists": True, "location": "pending"})
+            return
+        if results_file.exists():
+            self._json_response(200, {
+                "task_id": task_id, "file_path": str(results_file),
+                "created": False, "already_exists": True, "location": "results"})
+            return
+        if processing_file.exists():
+            self._json_response(200, {
+                "task_id": task_id, "file_path": str(processing_file),
+                "created": False, "already_exists": True, "location": "processing"})
+            return
+
+        # Build task data with defaults
+        task_data = {
+            "task_id": task_id,
+            "project_id": body.get("project_id", ""),
+            "target_workspace": body.get("target_workspace", ""),
+            "text": body.get("text", body.get("prompt", "")),
+            "prompt": body.get("prompt", ""),
+            "action": body.get("action", "claude"),
+            "type": body.get("type", "dev_task"),
+            "target_files": body.get("target_files", []),
+            "related_nodes": body.get("related_nodes", []),
+            "chat_id": body.get("chat_id", 0),
+            "_gov_token": body.get("_gov_token", ""),
+            "_branch": body.get("_branch", ""),
+            "_chain_depth": body.get("_chain_depth", 0),
+            "created_at": body.get("created_at", utc_iso()),
+            "status": "pending",
+        }
+
+        save_json(pending_file, task_data)
+        log.info("Task file created: %s -> %s", task_id, pending_file)
+
+        self._json_response(201, {
+            "task_id": task_id, "file_path": str(pending_file),
+            "created": True, "already_exists": False})
 
     # ── L22.3: Task Submit / Observe Handlers ──
 

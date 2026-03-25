@@ -611,14 +611,27 @@ class TaskOrchestrator:
             "created_at": created_at,
         }
 
+        # Write pending file via Executor API (correct path, idempotent).
+        # Fallback to direct file write if API unavailable.
+        executor_url = os.getenv("EXECUTOR_API_URL", "http://localhost:40100")
+        try:
+            resp = _req.post(f"{executor_url}/tasks/create",
+                json=task_data, timeout=5)
+            if resp.status_code in (200, 201):
+                result = resp.json()
+                log.info("Task file via API: %s (created=%s)", task_id, result.get("created"))
+                return
+            log.warning("Executor /tasks/create returned %d, falling back to direct write", resp.status_code)
+        except Exception as e:
+            log.warning("Executor API unavailable (%s), falling back to direct write", e)
+
+        # Fallback: direct file write
         shared_vol = os.getenv("SHARED_VOLUME_PATH",
                                os.path.join(os.path.dirname(__file__), "..", "shared-volume"))
         pending_dir = os.path.join(shared_vol, "codex-tasks", "pending")
         os.makedirs(pending_dir, exist_ok=True)
-
         tmp = os.path.join(pending_dir, f"{task_id}.tmp.json")
         final = os.path.join(pending_dir, f"{task_id}.json")
-
         with open(tmp, "w") as f:
             json.dump(task_data, f, ensure_ascii=False)
             f.flush()
