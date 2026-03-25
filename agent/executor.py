@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import http.server
 import json as _json
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -42,6 +43,10 @@ from git_rollback import (
 # Only these PIDs are eligible for orphan cleanup.
 # NEVER kill arbitrary claude.exe processes — they may be user Claude Code sessions.
 _EXECUTOR_SPAWNED_PIDS: set = set()
+
+# ── Graceful shutdown ──────────────────────────────────────────────────────
+_shutdown_requested: threading.Event = threading.Event()
+_GRACEFUL_SHUTDOWN_TIMEOUT_SEC: int = int(os.getenv("EXECUTOR_SHUTDOWN_TIMEOUT_SEC", "120"))
 from task_state import (
     append_task_event,
     load_task_status,
@@ -214,6 +219,52 @@ def _heartbeat_loop(task_id: str, stop_event: threading.Event, interval_sec: flo
 def _worker_id() -> str:
     # chain v4
     return "executor-{}".format(socket.gethostname())
+
+
+def is_idle() -> bool:
+    """Return True when no tasks are actively being processed (active_count == 0)."""
+    processing_dir = tasks_root() / "processing"
+    if not processing_dir.exists():
+        return True
+    active = sum(1 for _ in processing_dir.glob("*.json"))
+    return active == 0
+
+
+def _request_shutdown(signum: int, frame) -> None:
+    """Signal handler: request graceful shutdown on SIGTERM or SIGINT."""
+    sig_name = "SIGTERM" if signum == getattr(signal, "SIGTERM", 15) else "SIGINT"
+    print(f"[executor] received {sig_name}, requesting graceful shutdown...")
+    _shutdown_requested.set()
+
+
+def _wait_for_idle_or_timeout(
+    timeout_sec: int = _GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
+) -> None:
+    """Block until all active tasks finish or timeout_sec elapses.
+
+    Also flushes workspace_queue state to disk (best-effort) before returning.
+    The workspace_queue module persists every mutation, so this is a no-op
+    in practice — it just ensures the in-memory references are released cleanly.
+    """
+    if not is_idle():
+        print(
+            f"[executor] waiting up to {timeout_sec}s for active tasks to complete..."
+        )
+        deadline = time.monotonic() + timeout_sec
+        while not is_idle():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("[executor] shutdown timeout reached, exiting with active tasks")
+                break
+            time.sleep(1.0)
+        if is_idle():
+            print("[executor] all tasks completed, shutting down cleanly")
+
+    # Best-effort: ensure workspace_queue state is flushed to disk.
+    try:
+        from workspace_queue import list_all_queues  # noqa: F401 — triggers module-level _save_queue via import
+    except Exception:
+        pass
 
 
 # ── Tool Policy ────────────────────────────────────────────────────────────
@@ -1629,6 +1680,14 @@ def run() -> None:
         print("[executor] another executor instance is already running; exit")
         return
 
+    # Register graceful-shutdown signal handlers
+    _shutdown_requested.clear()
+    try:
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+    except (OSError, ValueError):
+        pass  # Signal registration may fail in non-main threads or on some platforms
+
     # Startup recovery
     recovered = _recover_stale_tasks()
     if recovered:
@@ -1667,7 +1726,7 @@ def run() -> None:
 
     print("[executor] started (serial mode)")
     try:
-        while True:
+        while not _shutdown_requested.is_set():
             try:
                 # Periodic orphan check + lease heartbeat
                 now = time.time()
@@ -1683,14 +1742,14 @@ def run() -> None:
                     _heartbeat_lease(lease_id, status="idle")
                 else:
                     time.sleep(poll_sec)
-            except KeyboardInterrupt:
-                raise
             except Exception as exc:
+                if _shutdown_requested.is_set():
+                    break
                 print("[executor] error:", exc)
                 time.sleep(max(1.0, poll_sec))
-    except KeyboardInterrupt:
-        print("[executor] stopped by keyboard")
+        print("[executor] stopped by shutdown request")
     finally:
+        _wait_for_idle_or_timeout()
         _deregister_lease(lease_id)
 
 
@@ -1714,6 +1773,14 @@ def run_parallel() -> None:
     if lock is None:
         print("[executor] another executor instance is already running; exit")
         return
+
+    # Register graceful-shutdown signal handlers
+    _shutdown_requested.clear()
+    try:
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+    except (OSError, ValueError):
+        pass  # Signal registration may fail in non-main threads or on some platforms
 
     from parallel_dispatcher import get_dispatcher, shutdown_dispatcher
     from workspace_registry import list_workspaces, ensure_current_workspace_registered
@@ -1771,7 +1838,7 @@ def run_parallel() -> None:
     _skipped_tasks: set = set()  # Tasks we already tried to dispatch but queue was full
 
     try:
-        while True:
+        while not _shutdown_requested.is_set():
             try:
                 pending = pick_pending_task()
                 if pending is not None:
@@ -1797,14 +1864,14 @@ def run_parallel() -> None:
                     _skipped_tasks.clear()  # Re-check skipped tasks after refresh
                     last_refresh = now
 
-            except KeyboardInterrupt:
-                raise
             except Exception as exc:
+                if _shutdown_requested.is_set():
+                    break
                 print("[executor] error:", exc)
                 time.sleep(max(1.0, poll_sec))
-    except KeyboardInterrupt:
         print("[executor] stopping parallel dispatcher...")
     finally:
+        _wait_for_idle_or_timeout()
         shutdown_dispatcher()
         print("[executor] stopped")
 
