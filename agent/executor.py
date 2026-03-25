@@ -1207,10 +1207,14 @@ def process_qa_task_v6(task: Dict, processing: Path) -> Dict:
                 branches = [b.strip().lstrip("* ") for b in br.stdout.strip().split("\n") if b.strip()]
                 branch = branches[0] if branches else ""
             if branch:
-                # When verification says no governance nodes, skip deploy checks
+                # When verification says no governance nodes or release_gate is False, skip deploy checks
                 verification = task.get("_verification", {})
+                skip_deploy = (
+                    not verification.get("governance_nodes", True)
+                    or verification.get("release_gate") is False
+                )
                 merge_args = ["bash", "scripts/merge-and-deploy.sh", branch]
-                if not verification.get("governance_nodes", True):
+                if skip_deploy:
                     merge_args.append("--skip-deploy")
                 mr = subprocess.run(merge_args,
                     cwd=workspace, capture_output=True, text=True, timeout=180,
@@ -1224,10 +1228,6 @@ def process_qa_task_v6(task: Dict, processing: Path) -> Dict:
                     except Exception as sig_err:
                         print(f"[executor] Failed to write manager_signal: {sig_err}")
                 if chat_id:
-                    skip_deploy = (
-                        not verification.get("governance_nodes", True)
-                        or verification.get("release_gate") is False
-                    )
                     if mr.returncode == 0 and skip_deploy:
                         _gateway_notify(chat_id, f"✅ Merged to main (deploy not required for this task)")
                     else:
