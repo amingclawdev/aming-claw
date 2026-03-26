@@ -165,8 +165,24 @@ class ImpactAnalyzer:
         # Step 5: Doc consistency — which docs should be reviewed
         related_docs = get_related_docs(request.changed_files)
 
+        # Build affected_nodes list with node details
+        affected_nodes = []
+        for nid in ordered:
+            try:
+                nd = self.graph.get_node(nid)
+                affected_nodes.append({
+                    "node_id": nid,
+                    "title": nd.get("title", ""),
+                    "primary": nd.get("primary", []),
+                    "verify_level": nd.get("verify_level", 1),
+                    "is_direct": nid in direct_hit,
+                })
+            except Exception:
+                affected_nodes.append({"node_id": nid, "is_direct": nid in direct_hit})
+
         return {
             "direct_hit": sorted(direct_hit),
+            "affected_nodes": affected_nodes,
             "total_affected": len(affected),
             "verification_order": ordered,
             "by_phase": {k: sorted(v) for k, v in by_phase.items()},
