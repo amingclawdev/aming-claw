@@ -677,12 +677,22 @@ def process_task(path: Path) -> None:
             try:
                 if task_type == "dev_task":
                     _trigger_coordinator_eval(task, result)
-                elif task_type == "test_task" and exec_status == "succeeded":
-                    from task_orchestrator import TaskOrchestrator
-                    TaskOrchestrator().handle_test_complete(
-                        task_id=task["task_id"], project_id=task.get("project_id", ""),
-                        token=task.get("_gov_token", ""), chat_id=chat_id,
-                        test_report=result.get("executor", {}))
+                elif task_type == "test_task":
+                    if exec_status == "succeeded":
+                        from task_orchestrator import TaskOrchestrator
+                        TaskOrchestrator().handle_test_complete(
+                            task_id=task["task_id"], project_id=task.get("project_id", ""),
+                            token=task.get("_gov_token", ""), chat_id=chat_id,
+                            test_report=result.get("executor", {}))
+                    else:
+                        # Log test failure to audit for observability
+                        from task_orchestrator import TaskOrchestrator
+                        TaskOrchestrator()._log_stage_transition(
+                            task["task_id"], "test", "failed", "test_failed")
+                        if chat_id:
+                            failed_count = result.get("executor", {}).get("failed", "?")
+                            _gateway_notify(chat_id,
+                                f"❌ Tests failed ({failed_count} failures). Chain stopped.")
                 elif task_type == "qa_task" and exec_status == "succeeded":
                     from task_orchestrator import TaskOrchestrator
                     TaskOrchestrator().handle_qa_complete(
@@ -1255,13 +1265,19 @@ def process_qa_task_v6(task: Dict, processing: Path) -> Dict:
                         def _run_deploy_bg(files: list, cid: int) -> None:
                             try:
                                 deploy_result = run_deploy(files, cid)
-                                tlog.log_event("deploy_chain_complete", {"result": deploy_result})
+                                try:
+                                    tlog.log_event("deploy_chain_complete", {"result": deploy_result})
+                                except Exception:
+                                    pass  # Log dir may not exist in tests
                                 if cid:
                                     services = deploy_result.get("services_restarted", []) if isinstance(deploy_result, dict) else []
                                     svc_label = ", ".join(services) if services else "none"
                                     _gateway_notify(cid, f"🚀 Deploy complete — services restarted: {svc_label}")
                             except Exception as dep_err:
-                                tlog.log_event("deploy_chain_error", {"error": str(dep_err)[:300]})
+                                try:
+                                    tlog.log_event("deploy_chain_error", {"error": str(dep_err)[:300]})
+                                except Exception:
+                                    pass
                                 if cid:
                                     _gateway_notify(cid, f"⚠️ Deploy chain error: {str(dep_err)[:200]}")
 
