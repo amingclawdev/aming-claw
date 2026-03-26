@@ -1,3 +1,4 @@
+# Verified: executor self-fix bootstrap successful.
 """Executor Worker — polls Governance API for tasks and executes them via Claude CLI.
 
 This is the missing link between:
@@ -209,6 +210,9 @@ class ExecutorWorker:
 
         return "\n".join(parts)
 
+    # Files/patterns to ignore in git diff (Claude CLI artifacts, not real changes)
+    _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock"}
+
     def _get_git_changed_files(self) -> list:
         """Run git diff --name-only to detect files changed since last commit."""
         try:
@@ -239,6 +243,10 @@ class ExecutorWorker:
                 if f not in seen:
                     files.append(f)
                     seen.add(f)
+
+            # Filter out Claude artifacts and non-code files
+            files = [f for f in files
+                     if not any(p in f for p in self._IGNORE_PATTERNS)]
 
             return files
         except Exception as e:
