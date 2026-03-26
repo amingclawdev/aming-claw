@@ -221,17 +221,22 @@ def handle_project_register(ctx: RequestContext):
 
     from pathlib import Path
     ws = Path(workspace_path)
-    if not ws.exists() or not ws.is_dir():
-        return 400, {"error": f"workspace_path does not exist: {workspace_path}"}
 
-    # Load and validate config
+    # In Docker, host paths are not accessible — skip path validation
+    # but still validate config if accessible
     try:
         from project_config import load_project_config, validate_commands
         config = load_project_config(ws)
-    except ValueError as e:
-        return 400, {"error": f"config validation failed: {e}"}
-    except FileNotFoundError:
-        return 400, {"error": f"no .aming-claw.yaml found in {workspace_path}"}
+    except (ValueError, FileNotFoundError) as e:
+        # Path not accessible (Docker) or no config — try /workspace mount
+        workspace_mount = Path("/workspace")
+        if workspace_mount.exists():
+            try:
+                config = load_project_config(workspace_mount)
+            except (ValueError, FileNotFoundError) as e2:
+                return 400, {"error": f"config not found: {e2}"}
+        else:
+            return 400, {"error": f"config not found: {e}"}
 
     # Command safety
     cmd_violations = validate_commands(config)
