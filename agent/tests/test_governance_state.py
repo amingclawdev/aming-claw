@@ -6,8 +6,15 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+try:
+    import networkx  # noqa: F401
+    _has_networkx = True
+except ImportError:
+    _has_networkx = False
+
 from governance.db import get_connection, close_connection
-from governance.graph import AcceptanceGraph
+if _has_networkx:
+    from governance.graph import AcceptanceGraph
 from governance.models import NodeDef
 from governance import state_service
 from governance.enums import VerifyStatus
@@ -18,6 +25,7 @@ from governance.errors import (
 from governance.redis_client import reset_redis
 
 
+@unittest.skipUnless(_has_networkx, "networkx not installed")
 class TestStateService(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
