@@ -433,30 +433,38 @@ def _find_config_file(workspace_path: Path) -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_workspace_path(project_id: str) -> Path:
+    """Resolve workspace path from governance projects.json."""
+    from utils import normalize_project_id  # noqa: PLC0415
+    normalized = normalize_project_id(project_id)
+    # Read governance projects.json directly
+    import json
+    state_dir = os.path.join(
+        os.environ.get("SHARED_VOLUME_PATH",
+                        os.path.join(os.path.dirname(__file__), "..", "shared-volume")),
+        "codex-tasks", "state", "governance", "projects.json")
+    try:
+        with open(state_dir) as f:
+            data = json.load(f)
+        projects = data.get("projects", {})
+        proj = projects.get(normalized, {})
+        wp = proj.get("workspace_path", "")
+        if wp:
+            return Path(wp)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    raise LookupError(f"No workspace registered for project_id={normalized!r}")
+
+
 def resolve_project_config(project_id: str) -> ProjectConfig:
-    """Look up *project_id* in the workspace registry, then load its config.
+    """Look up *project_id* in governance projects, then load its config.
 
     Falls back to DEFAULT_CONFIG when the project is 'aming-claw' and no
     config file exists.
 
     Raises LookupError when the workspace cannot be found.
     """
-    try:
-        from utils import normalize_project_id  # noqa: PLC0415
-        from workspace_registry import find_workspace_by_project_id  # noqa: PLC0415
-    except ImportError as exc:
-        raise ImportError(
-            f"Cannot import registry utilities; ensure agent/ is on sys.path: {exc}"
-        ) from exc
-
-    normalized = normalize_project_id(project_id)
-    ws = find_workspace_by_project_id(normalized)
-    if ws is None:
-        raise LookupError(
-            f"No workspace registered for project_id={normalized!r}"
-        )
-
-    workspace_path = Path(ws.get("path", ws.get("workspace_path", "")))
+    workspace_path = _resolve_workspace_path(project_id)
     return load_project_config(workspace_path)
 
 
@@ -465,22 +473,7 @@ def get_project_config(project_id: str) -> ProjectConfig:
 
     Cache key = (workspace_path, config_file_path, md5_of_config_content).
     """
-    try:
-        from utils import normalize_project_id  # noqa: PLC0415
-        from workspace_registry import find_workspace_by_project_id  # noqa: PLC0415
-    except ImportError as exc:
-        raise ImportError(
-            f"Cannot import registry utilities; ensure agent/ is on sys.path: {exc}"
-        ) from exc
-
-    normalized = normalize_project_id(project_id)
-    ws = find_workspace_by_project_id(normalized)
-    if ws is None:
-        raise LookupError(
-            f"No workspace registered for project_id={normalized!r}"
-        )
-
-    workspace_path = Path(ws.get("path", ws.get("workspace_path", "")))
+    workspace_path = _resolve_workspace_path(project_id)
     config_file = _find_config_file(workspace_path)
     key = _config_cache_key(workspace_path, config_file)
 

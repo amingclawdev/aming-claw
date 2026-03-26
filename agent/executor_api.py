@@ -508,15 +508,7 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_cleanup_orphans(self):
         """POST /cleanup-orphans — Kill orphan processes and clean stale tasks."""
-        cleaned = 0
-        try:
-            from executor import _cleanup_orphans, _recover_stale_tasks
-            cleaned += _cleanup_orphans()
-            cleaned += _recover_stale_tasks()
-        except Exception as e:
-            self._json_response(500, {"error": str(e)[:200]})
-            return
-        self._json_response(200, {"cleaned": cleaned})
+        self._json_response(200, {"cleaned": 0, "note": "legacy executor removed, use governance API"})
 
     # ── Stale Cleanup Handler ──
 
@@ -601,11 +593,8 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
             self._json_response(404, {"error": f"task {task_id} not found in pending/processing"})
             return
 
-        try:
-            from task_state import mark_manual_override
-            mark_manual_override(task_id, reason=reason, operator=operator)
-        except Exception as e:
-            log.warning("takeover: task_state update failed: %s", e)
+        # task_state module removed — takeover still works via file move above
+        log.info("takeover: task %s moved to results (legacy task_state skipped)", task_id)
 
         self._json_response(200, {
             "takeover": True, "task_id": task_id, "was_in": was_in,
@@ -1255,12 +1244,9 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
     def _handle_workspaces(self):
         """GET /workspaces — List all registered workspaces with project_id."""
-        try:
-            from workspace_registry import list_workspaces
-            workspaces = list_workspaces(include_inactive=True)
-            self._json_response(200, {"workspaces": workspaces, "count": len(workspaces)})
-        except Exception as e:
-            self._json_response(500, {"error": str(e)})
+        # workspace_registry removed — use governance project API instead
+        self._json_response(200, {"workspaces": [], "count": 0,
+                                  "note": "use GET /api/project/list on governance service"})
 
     def _handle_workspace_resolve(self, qs):
         """GET /workspaces/resolve?project_id=X — Resolve workspace for a project."""
@@ -1268,15 +1254,9 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
         if not project_id:
             self._json_response(400, {"error": "project_id query param required"})
             return
-        try:
-            from workspace_registry import find_workspace_by_project_id
-            ws = find_workspace_by_project_id(project_id)
-            if ws:
-                self._json_response(200, {"workspace": ws, "matched_by": "project_id"})
-            else:
-                self._json_response(404, {"error": f"no workspace for project_id={project_id}"})
-        except Exception as e:
-            self._json_response(500, {"error": str(e)})
+        # workspace_registry removed — use governance project API instead
+        self._json_response(200, {"workspace": None, "matched_by": "none",
+                                  "note": "use GET /api/projects/{project_id}/config on governance service"})
 
     def _handle_kpi(self):
         """GET /kpi — Aggregate KPI metrics from archive/ and results/ task files.

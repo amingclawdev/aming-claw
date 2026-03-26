@@ -1,5 +1,16 @@
 # Aming Claw 架构方案 v6 — Executor 驱动架构
 
+> **⚠ 2026-03-26 重大变更：旧 Telegram bot 系统已完全移除。**
+> 以下 20 个 agent/ 模块已删除：bot_commands.py, coordinator.py, executor.py, interactive_menu.py, task_accept.py, service_manager.py, backends.py, config.py, task_state.py, auth.py, model_registry.py, git_rollback.py, workspace.py, workspace_registry.py, workspace_queue.py, parallel_dispatcher.py, project_summary.py, task_retry.py, task_orchestrator.py, approval_manager.py。
+>
+> 当前系统统一使用：
+> - **governance server** (port 40006) — 任务注册、workflow、审计
+> - **telegram_gateway** (port 40010) — Telegram 消息路由
+> - **executor-gateway** (FastAPI port 8090) — 任务执行
+> - **executor_api.py** (port 40100) — 监控 API
+>
+> 本文档中引用旧模块的设计仅作历史参考，实际架构流程为：Gateway → Governance API → Task Registry → executor-gateway。
+
 > 核心原则：**代码管流程，AI 管决策。** 所有 AI 调用由 Executor 代码控制，AI 不能直接操作系统。
 > AI 进程生命周期由 Executor 管理，Coordinator 指挥 Executor 分派上下文和记忆。
 >
@@ -658,22 +669,24 @@ Coordinator 重新输出:
 
 ## 五、文件结构
 
+> **注意 (2026-03-26)：** executor.py、backends.py、task_orchestrator.py 等旧模块已删除。以下为历史设计参考，当前实际结构以 governance/ 和 telegram_gateway/ 为主。
+
 ```
-agent/
-├── executor.py                    # 现有，增加 orchestrator 入口
+agent/                             # ⚠ 以下标注 [已删除] 的模块已于 2026-03-26 移除
+├── executor.py                    # [已删除] 原 orchestrator 入口
 ├── ai_lifecycle.py                # NEW: AI Lifecycle Manager
 ├── decision_validator.py          # NEW: 决策校验器
-├── task_orchestrator.py           # NEW: 任务编排器
+├── task_orchestrator.py           # [已删除] 原任务编排器
 ├── context_assembler.py           # NEW: 上下文组装器
 ├── ai_output_parser.py            # NEW: AI 输出解析 (JSON extraction)
 ├── role_permissions.py            # NEW: 角色权限矩阵
-├── backends.py                    # 现有: run_claude / run_codex
+├── backends.py                    # [已删除] 原 run_claude / run_codex
 ├── telegram_gateway/
-│   └── gateway.py                 # 简化: 只写 task 文件
+│   └── gateway.py                 # 保留: Telegram 消息路由 (:40010)
 └── governance/
-    ├── server.py                  # 现有
-    ├── task_registry.py           # 现有
-    ├── session_context.py         # 现有
+    ├── server.py                  # 保留: 规则引擎 (:40006)
+    ├── task_registry.py           # 保留
+    ├── session_context.py         # 保留
     └── ...
 ```
 
@@ -754,16 +767,18 @@ agent/
 
 ## 八、与现有系统的兼容性
 
-| 现有组件 | 保留/修改/废弃 |
+> **2026-03-26 更新：** 旧 Executor run loop、process_task、process_coordinator_chat 等组件已随模块删除而移除。当前任务执行由 executor-gateway (port 8090) 承担。
+
+| 现有组件 | 状态 (2026-03-26) |
 |---------|---------------|
-| Gateway 消息收发 | **保留** — 继续做 Telegram polling + task 文件写入 |
-| Gateway 消息分类器 | **废弃** — 不再分类，全部转 Executor |
-| Gateway handle_task_dispatch | **废弃** — 不再直接创建 task |
-| Executor run loop | **修改** — 加入 TaskOrchestrator |
-| Executor process_task | **修改** — 区分 coordinator_chat / dev_task |
-| process_coordinator_chat | **重构** — 改用 AILifecycleManager |
-| Governance API | **保留** — 被 Executor 代码调用 |
-| Task Registry | **保留** — 被 TaskOrchestrator 调用 |
+| Gateway 消息收发 (telegram_gateway) | **保留** — Telegram 消息路由 (:40010) |
+| Gateway 消息分类器 | **已删除** — 随旧系统移除 |
+| Gateway handle_task_dispatch | **已删除** — 随旧系统移除 |
+| Executor run loop (executor.py) | **已删除** — 由 executor-gateway (:8090) 替代 |
+| Executor process_task | **已删除** — 由 executor-gateway 替代 |
+| process_coordinator_chat | **已删除** — 由 executor-gateway 替代 |
+| Governance API | **保留** — 规则引擎 (:40006) |
+| Task Registry | **保留** — 被 Governance 管理 |
 | Session Context | **保留** — 被 ContextAssembler 调用 |
 | dbservice | **保留** — 被自动归档调用 |
 | verify_loop | **保留** — 作为事后检查的补充 |
@@ -1630,3 +1645,6 @@ Executor API (:40100) 新增两个只读端点：
 | `GET /traces?project_id=amingClaw&limit=20` | 列出最近的 trace，支持按 project_id 过滤 |
 
 数据源：`shared-volume/codex-tasks/processing/` 和 `results/` 的 JSON 文件。
+
+## 变更记录
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

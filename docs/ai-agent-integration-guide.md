@@ -55,13 +55,16 @@ Returns: `{project_id, config_hash, registered: true, test_command, deploy_strat
 ### 3. Submit tasks
 
 ```bash
-# Via API
-curl -X POST http://localhost:40100/coordinator/chat \
+# Via governance API (task create) — 不需要 X-Gov-Token
+curl -X POST http://localhost:40006/api/task/create \
+  -H "Content-Type: application/json" \
   -d '{"message":"Fix the login bug","project_id":"my-project"}'
 
 # Via Telegram
-# Just send the message — coordinator routes by project_id
+# Send message — telegram_gateway (port 40010) routes to governance server
 ```
+
+> **注意：** Task create/claim/complete 操作不再需要 `X-Gov-Token`。Token 仅用于角色管理和 verify-update 等权限敏感操作。
 
 ### 4. Query config
 
@@ -79,15 +82,33 @@ POST /api/projects/my-project/explain
 
 ## Auto-Chain Flow
 
-Every task follows this pipeline automatically:
+Every task follows this pipeline automatically. `auto_chain.py` (`agent/governance/auto_chain.py`) wires task completion to next-stage task creation。当一个任务以 `succeeded` 状态完成时，`task_registry.complete_task()` 自动调用 `auto_chain.on_task_completed()`，按以下链路推进：
 
 ```
-Message → Coordinator → PM → Dev → Checkpoint Gate → Tester → QA → Merge → Deploy
+Message → Governance API → PM → Dev → Checkpoint Gate → Tester → QA → Merge → Deploy
 ```
+
+> 注意：旧的 coordinator.py / backends.py 等模块已完全移除。任务路由现在通过 governance server (port 40006) 的 task_registry 完成。
+
+### 自动链路触发
+
+当你完成一个 type=pm/dev/test/qa/merge 的任务时，auto_chain 会自动创建下一阶段的任务。每个阶段转换前会执行 gate 检查：
+
+| 当前阶段 (task_type) | Gate 检查 | 通过后自动创建 |
+|---------------------|----------|-------------|
+| `pm` | Post-PM: PRD 包含 target_files, verification, acceptance_criteria | `dev` 任务 |
+| `dev` | Checkpoint: 文件已变更、无 scope 外修改 | `test` 任务 |
+| `test` | T2 Pass: 测试全部通过 | `qa` 任务 |
+| `qa` | QA Pass: 推荐 qa_pass | `merge` 任务 |
+| `merge` | Release: 信任 merge 结果 | 自动触发 `deploy_chain.run_deploy()` |
+
+Gate 失败时返回 `{"gate_blocked": True, "stage": "...", "reason": "..."}`，Observer 可查看原因并修复后重新提交。
+
+### 各阶段详情
 
 | Stage | What happens | Config used |
 |-------|-------------|-------------|
-| Coordinator | Routes message to PM, creates dev_task | project_id routing |
+| Governance | Routes message, creates task via task_registry | project_id routing |
 | PM | Outputs PRD with target_files + `_verification` | — |
 | Dev | Code changes in isolated git worktree | — |
 | Checkpoint Gate | Fast check: files changed? syntax valid? | — |
@@ -95,7 +116,7 @@ Message → Coordinator → PM → Dev → Checkpoint Gate → Tester → QA →
 | QA | Runs governance checks (if `_verification` says so) | `_verification` |
 | Merge | Rebases dev branch onto main | — |
 | Release Checks | Runs `build.release_checks` from config | `.aming-claw.yaml` |
-| Deploy | Detects affected services, restarts them | `deploy.service_rules` |
+| Deploy | Detects affected services, restarts them（非 Docker 环境使用 `restart_local_governance()` 回退） | `deploy.service_rules` |
 | Smoke Test | Checks health endpoints | `deploy.smoke_test` |
 
 ---
@@ -559,3 +580,7 @@ POST /api/wf/my-app/release-gate
 | mem/query | 返回空，不阻塞工作 |
 
 **永远不要在治理服务不可达时自行标记节点状态。**
+
+## 变更记录
+- 2026-03-26: auto_chain.py 实现完成，全链路 PM→Dev→Test→QA→Merge→Deploy 自动调度，含 gate 验证
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

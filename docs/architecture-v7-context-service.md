@@ -4,11 +4,12 @@
 
 ## 一、问题分析
 
-### 当前（v6）的 CLI -p 模式
+### 旧架构的问题（已移除）
 
-```
-Executor → claude -p "你是dev...\n上下文...\n用户消息..." → stdout
-```
+> 注意：旧的 Telegram bot 系统（bot_commands, coordinator, executor 等 20 个模块）已完全移除。
+> 上下文管理现在完全由 governance API (`/api/context/*`) 负责。
+
+以下是旧 CLI `-p` 模式曾存在的问题（已解决）：
 
 | 问题 | 影响 |
 |------|------|
@@ -28,36 +29,32 @@ Executor → 写 Context 到 Redis → 启动 Claude CLI → Claude 从 API 读 
 
 ## 二、系统架构
 
+> 注意：旧的 `TaskOrchestrator`（在已删除的 executor.py 中）已被替换。
+> 现在由 governance server (port 40006) + executor-gateway (port 8090) + executor_api (port 40100) 协作完成。
+
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                     Executor (宿主机)                           │
+│                     当前架构                                     │
 │                                                                │
-│  TaskOrchestrator                                              │
+│  governance server (port 40006)                                │
+│    │  task registry, workflow, audit, context API               │
 │    │                                                           │
-│    ├── 1. 组装 Context                                         │
-│    │     ContextAssembler.assemble()                           │
-│    │     → 结构化 context dict                                 │
+│  telegram_gateway (port 40010)                                 │
+│    │  Telegram 消息路由                                         │
 │    │                                                           │
-│    ├── 2. 存储 Context                                         │
-│    │     ContextStore.save(session_id, context)                │
-│    │     → Redis HASH: ctx:{session_id}                        │
-│    │     → 同时写 SQLite 审计表（持久化）                       │
+│  executor-gateway (FastAPI port 8090)                          │
+│    │  实际任务执行                                              │
 │    │                                                           │
-│    ├── 3. 启动 AI Session                                      │
-│    │     claude --system-prompt-file /tmp/ctx-{session_id}.md  │
-│    │     或                                                    │
-│    │     claude -p "读取 http://localhost:40100/ctx/{sid}"     │
+│  executor_api (port 40100)                                     │
+│    │  监控 API                                                  │
 │    │                                                           │
-│    ├── 4. AI 输出回写                                          │
-│    │     ContextStore.save_output(session_id, output)          │
-│    │     → Redis + SQLite                                      │
-│    │                                                           │
-│    ├── 5. 校验 + 执行                                          │
-│    │     DecisionValidator → 执行 approved actions              │
-│    │                                                           │
-│    └── 6. 归档                                                 │
-│          ContextStore.archive(session_id)                      │
-│          → 完整 input+output+validation 写入审计                │
+│  Context 管理流程:                                              │
+│    ├── 1. 组装 Context → governance API /api/context/*          │
+│    ├── 2. 存储 Context → Redis + SQLite 审计表                  │
+│    ├── 3. 启动 AI Session → executor-gateway 调度               │
+│    ├── 4. AI 输出回写 → governance API                          │
+│    ├── 5. 校验 + 执行 → governance workflow                     │
+│    └── 6. 归档 → governance audit                              │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -185,18 +182,11 @@ Body: {"phase": "coding", "percent": 50, "message": "修改了2个文件"}
 
 ## 五、CLI 调用方式变更
 
-### 当前（v6）
-```python
-# 所有内容塞进 stdin
-process = subprocess.Popen(
-    [claude_bin, "-p", "--output-format", "json"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-)
-stdout, _ = process.communicate(input=huge_prompt_string)
-```
+### 旧方式（已移除）
 
-### v7 方案 A: system-prompt-file（推荐）
+> 旧的 executor.py 中的 CLI `-p` stdin 模式已随整个 bot 系统删除。
+
+### 当前方案: system-prompt-file（通过 executor-gateway）
 ```python
 # 1. 写 context 到临时文件
 ctx_file = f"/tmp/ctx-{session_id}.md"
@@ -1148,12 +1138,12 @@ DecisionValidator 检查：
 
 **共同模式：全部是"自举悖论"——修的是 AI 运行所依赖的基础设施，AI 不能通过自己来修自己的运行环境。** 类似操作系统不能在运行时重写自己的内核。
 
-| 步骤 | 内容 | 文件 | 不能自动修的原因 |
+| 步骤 | 内容 | 位置 | 不能自动修的原因 |
 |------|------|------|----------------|
-| 0 | **Node ID 系统分配** | graph_validator.py, governance/server.py | 自动修需要 propose_node → propose_node 依赖 ID 生成 → **循环依赖** |
-| 1 | **Dev task 文件契约** | decision_validator.py, task_orchestrator.py | 需要改 validator 的校验逻辑 → Dev AI 被 validator 校验 → **自己改不了审判自己的规则** |
-| 2 | **PM 硬规则** | task_orchestrator.py | 自动修 PM 时 Dev AI 改错文件 → PM 不触发时无法通过 PM 产出正确路径 → **鸡生蛋问题** |
-| 3 | **worktree 强制 clean** | executor.py | 需要改 executor 的任务处理逻辑 → Dev AI 通过 executor 被调用 → **自己改不了运行自己的代码** |
+| 0 | **Node ID 系统分配** | governance server | 自动修需要 propose_node → propose_node 依赖 ID 生成 → **循环依赖** |
+| 1 | **Dev task 文件契约** | governance server (decision validation) | 需要改 validator 的校验逻辑 → Dev AI 被 validator 校验 → **自己改不了审判自己的规则** |
+| 2 | **PM 硬规则** | governance server (task_registry) | 自动修 PM 时 Dev AI 改错文件 → PM 不触发时无法通过 PM 产出正确路径 → **鸡生蛋问题** |
+| 3 | **worktree 强制 clean** | executor-gateway | 需要改执行逻辑 → Dev AI 通过 executor-gateway 被调用 → **自己改不了运行自己的代码** |
 
 ### P0：Context Store 基础（已完成 ✅）
 
@@ -1174,20 +1164,20 @@ DecisionValidator 检查：
 
 | 步骤 | 内容 | 文件 | 方式 |
 |------|------|------|------|
-| 9 | context_audit 表 + replay bundle | agent/context_store.py | 自动 |
-| 10 | 四级权限模型 | agent/executor_api.py | 自动 |
-| 11 | /ctx/{sid}/trace 完整链路 | agent/executor_api.py | 自动 |
-| 12 | Observer 系统 (attach/detach/report) | agent/executor_api.py | 自动 |
-| 13 | KPI 自动采集 | agent/executor_api.py | 自动 |
+| 9 | context_audit 表 + replay bundle | governance server | 自动 |
+| 10 | 四级权限模型 | executor_api (port 40100) | 自动 |
+| 11 | /ctx/{sid}/trace 完整链路 | executor_api (port 40100) | 自动 |
+| 12 | Observer 系统 (attach/detach/report) | executor_api (port 40100) | 自动 |
+| 13 | KPI 自动采集 | executor_api (port 40100) | 自动 |
 
 ### P2：增强
 
 | 步骤 | 内容 | 文件 |
 |------|------|------|
-| 14 | /ctx/{sid}/replay 完整重现 | agent/executor_api.py |
-| 15 | /ctx/diff 对比 | agent/executor_api.py |
-| 16 | 图片路径 + 多模态 | agent/context_store.py |
-| 17 | AI 进度上报 | agent/executor_api.py |
+| 14 | /ctx/{sid}/replay 完整重现 | executor_api (port 40100) |
+| 15 | /ctx/diff 对比 | executor_api (port 40100) |
+| 16 | 图片路径 + 多模态 | governance server |
+| 17 | AI 进度上报 | executor_api (port 40100) |
 
 ### 实施顺序
 
@@ -1198,14 +1188,19 @@ DecisionValidator 检查：
 4. 每轮自动修后评估 KPI
 ```
 
-## 十、与 v6 的兼容
+## 十、当前架构说明
 
-v7 是 v6 的增量升级，不破坏现有功能：
-- v6 的 CLI `-p` stdin 方式保留作为 fallback
-- ContextStore 不可用时退化为 v6 模式
-- 所有新增端点是只读查询，不影响执行链路
-- 审计表独立于 governance SQLite，不影响节点状态
+> 旧的 Telegram bot 系统（v6 及更早的 20 个 agent/ 模块）已完全移除。不再有 v6 fallback。
+
+当前架构要点：
+- Context 管理完全通过 governance API (`/api/context/*`)
+- 任务执行通过 executor-gateway (port 8090)
+- 监控通过 executor_api (port 40100)
+- Telegram 消息路由通过 telegram_gateway (port 40010)
 - **SQLite 是唯一真源，Redis 是缓存层**
 - **AI session 只读 /prompt，不读完整 /input**
 - **Node ID 由系统分配，AI 只提供 parent + title**（R3 修正）
 - **Dev task 必须有显式文件契约**（R3 修正）
+
+## 变更记录
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

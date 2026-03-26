@@ -138,7 +138,7 @@ def _apply_env_overrides(config: Dict) -> Dict:
       PIPELINE_ROLE_{ROLE}_PROVIDER - Override provider for specific role (e.g. PIPELINE_ROLE_PM_PROVIDER)
       PIPELINE_ROLE_{ROLE}_MODEL    - Override model for specific role (e.g. PIPELINE_ROLE_PM_MODEL)
     """
-    from config import ROLE_PIPELINE_ORDER
+    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa"]
 
     result = dict(config)
 
@@ -212,14 +212,15 @@ def validate_pipeline_config(config: Dict) -> List[str]:
             errors.append("默认配置指定了 provider '{}' 但未指定 model".format(provider))
         if model and not provider:
             # Try to infer
-            from backends import _infer_provider
-            inferred = _infer_provider(model, "")
+            # Infer provider from model name
+            inferred = ("anthropic" if "claude" in model.lower()
+                        else "openai" if "gpt" in model.lower() else "")
             if not inferred:
                 errors.append("默认配置的模型 '{}' 无法推断 provider，"
                               "请显式指定 provider".format(model))
 
     # Validate roles
-    from config import ROLE_PIPELINE_ORDER
+    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa"]
     roles = config.get("roles", {})
     for role_name, role_cfg in roles.items():
         if role_name not in ROLE_PIPELINE_ORDER:
@@ -236,8 +237,9 @@ def validate_pipeline_config(config: Dict) -> List[str]:
             errors.append("角色 '{}' 指定了 provider '{}' 但未指定 model".format(
                 role_name, provider))
         if model and not provider:
-            from backends import _infer_provider
-            inferred = _infer_provider(model, "")
+            # Infer provider from model name
+            inferred = ("anthropic" if "claude" in model.lower()
+                        else "openai" if "gpt" in model.lower() else "")
             if not inferred:
                 errors.append("角色 '{}' 的模型 '{}' 无法推断 provider，"
                               "请显式指定 provider".format(role_name, model))
@@ -325,7 +327,7 @@ def log_role_routing(stages: List[Dict], config: Dict) -> List[Dict]:
     Returns a list of dicts: [{"role": "pm", "provider": "anthropic",
                                 "model": "claude-opus-4-6", "source": "config_file"}]
     """
-    from config import ROLE_PIPELINE_ORDER, get_claude_model, get_model_provider
+    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa"], get_claude_model, get_model_provider
     routing: List[Dict] = []
 
     for role in ROLE_PIPELINE_ORDER:

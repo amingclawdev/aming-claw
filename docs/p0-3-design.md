@@ -2,15 +2,18 @@
 
 ## Problem
 
-`handle_dev_complete` only calls Coordinator eval. Eval pass → nothing happens.
-165 qa_pass all manually set. No auto-chain exists.
+`handle_dev_complete` 曾只调用 Coordinator eval。Eval pass → 什么都不发生。
+165 qa_pass 全部手动设置。没有 auto-chain。
 
-## Root Cause
+> 注意：旧的 coordinator.py, executor.py, task_orchestrator.py 等 20 个 agent/ 模块已完全移除。
+> Auto-chain 现在通过 governance server (port 40006) 的 task_registry 实现。
 
-1. Coordinator eval is self-review (same AI judges its own request)
-2. No test_task auto-creation after eval pass
-3. No qa_task auto-creation after test pass
-4. No gatekeeper trigger after QA pass
+## Root Cause（历史问题，已通过架构重构解决）
+
+1. 旧 Coordinator eval 是 self-review（同一 AI 评审自己的请求）
+2. eval pass 后没有自动创建 test_task
+3. test pass 后没有自动创建 qa_task
+4. QA pass 后没有触发 gatekeeper
 
 ## New Process
 
@@ -63,15 +66,17 @@ User message
       FAIL → block, notify Observer
 ```
 
-## Coordinator Role Change
+## 角色变更（旧 Coordinator → Governance Server）
 
-| Stage | Before | After |
+> 旧的 coordinator.py 已删除。以下描述 governance server 如何承接这些职责。
+
+| Stage | 旧架构 (coordinator.py) | 新架构 (governance server) |
 |-------|--------|-------|
-| Inbound eval | Judge | Same |
-| PM dispatch | Dispatch | Same |
-| PM output review | None (auto-pass) | Added: judge + user permission gate |
-| Dev output eval | Judge (self-review) | **Removed** → Isolated Gatekeeper |
-| Chain trigger | Broken (P0-3 bug) | Auto-chain |
+| Inbound eval | Coordinator Judge | Governance task_registry 路由 |
+| PM dispatch | Coordinator Dispatch | Governance task_registry 创建 |
+| PM output review | None (auto-pass) | Governance workflow: judge + user permission gate |
+| Dev output eval | Coordinator Judge (self-review) | **Removed** → Isolated Gatekeeper (via governance) |
+| Chain trigger | Broken (P0-3 bug) | Governance task_registry auto-chain |
 
 ## Context / Prompt Consumption
 
@@ -232,6 +237,7 @@ Every `_trigger_*()` must check idempotency before creating a task.
 **Idempotency key**: `{parent_task_id}:{stage}`
 
 ```python
+# 现在在 governance server (task_registry) 中实现
 def _trigger_tester(self, parent_task_id, changed_files, project_id):
     idem_key = f"{parent_task_id}:test"
     if self._check_idempotency(idem_key):
@@ -242,7 +248,7 @@ def _trigger_tester(self, parent_task_id, changed_files, project_id):
     return task
 ```
 
-Uses existing `redis_client.check_idempotency()` / `store_idempotency()`.
+Uses `redis_client.check_idempotency()` / `store_idempotency()`.
 
 Retry does NOT bypass idempotency — retry creates a NEW parent_task_id (via task_retry.py), so the chain restarts cleanly with a fresh idem_key.
 
@@ -370,16 +376,16 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 
 ### P0 must-do (this implementation)
 
-| # | Item | File |
+| # | Item | 位置 |
 |---|------|------|
-| 1 | Auto-chain with idempotency keys | `task_orchestrator.py` |
-| 2 | Stage state machine + parent_task binding | `task_orchestrator.py` |
-| 3 | Global retry budget (total_attempts_budget=6) | `task_orchestrator.py`, `executor.py` |
-| 4 | Memory write with dedup (refId + supersedes) | `task_orchestrator.py` |
-| 5 | Rollback symmetry: auto-snapshot before verify + sync rollback | `task_orchestrator.py`, `state_service.py` |
-| 6 | Checkpoint Gatekeeper (hard gate, not semantic) | `executor.py`, `role_permissions.py` |
-| 7 | Route new task types | `executor.py` |
-| 8 | Tests | `tests/test_chain.py` |
+| 1 | Auto-chain with idempotency keys | governance server (task_registry) |
+| 2 | Stage state machine + parent_task binding | governance server (task_registry) |
+| 3 | Global retry budget (total_attempts_budget=6) | governance server + executor-gateway |
+| 4 | Memory write with dedup (refId + supersedes) | governance server |
+| 5 | Rollback symmetry: auto-snapshot before verify + sync rollback | governance server (workflow) |
+| 6 | Checkpoint Gatekeeper (hard gate, not semantic) | executor-gateway + governance server |
+| 7 | Route new task types | executor-gateway |
+| 8 | Tests | governance server tests |
 
 ### P1 important (follow-up)
 
@@ -397,20 +403,47 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 | 2 | Redis Stream query wrapper for Observer |
 | 3 | Per-node snapshot + worktree orphan cleanup |
 
-## Implementation: Files to Modify
+## Implementation: 实现位置
 
-| File | Change |
+> 注意：以下旧文件已全部删除：`agent/task_orchestrator.py`, `agent/executor.py`, `agent/backends.py` 等。
+> 对应功能现在由 governance server + executor-gateway 实现。
+
+### auto_chain.py — 已实现
+
+`agent/governance/auto_chain.py` 是自动链路调度器的核心实现。`task_registry.complete_task()` 在任务成功时调用 `auto_chain.on_task_completed()`，自动推进链路。
+
+**链路定义 (`CHAIN` dict):**
+
+| task_type | Gate 函数 | 下一阶段 | Prompt 构建 |
+|-----------|----------|---------|------------|
+| `pm` | `_gate_post_pm` — PRD 必须包含 target_files, verification, acceptance_criteria | `dev` | `_build_dev_prompt` |
+| `dev` | `_gate_checkpoint` — 文件已修改且无 scope 外变更 | `test` | `_build_test_prompt` |
+| `test` | `_gate_t2_pass` — 测试全部通过 | `qa` | `_build_qa_prompt` |
+| `qa` | `_gate_qa_pass` — QA 推荐 qa_pass 或 qa_pass_with_fallback | `merge` | `_build_merge_prompt` |
+| `merge` | `_gate_release` — 信任 merge 结果 | (终端) | `_trigger_deploy` → 调用 `deploy_chain.run_deploy()` |
+
+**关键机制:**
+- `MAX_CHAIN_DEPTH = 10` 防止无限循环
+- Gate 失败时发布 `gate.blocked` 事件，返回 `{"gate_blocked": True, "stage": ..., "reason": ...}`
+- 终端阶段（merge 后）自动调用 `deploy_chain.run_deploy()`；`deploy_chain.py` 对非 Docker 环境提供 `restart_local_governance()` 作为回退
+- Task create/claim/complete 不再需要 `X-Gov-Token`
+
+### 其他模块实现位置
+
+| 功能 | 实现位置 |
 |------|--------|
-| `agent/task_orchestrator.py` | Replace `handle_dev_complete` eval → checkpoint gatekeeper → auto-chain with idempotency |
-| `agent/task_orchestrator.py` | Add `_trigger_checkpoint_gatekeeper()`, `_trigger_tester()`, `_trigger_qa()`, `_trigger_merge_gatekeeper()` with idem keys |
-| `agent/task_orchestrator.py` | Add memory-write-on-failure with refId/supersedes dedup |
-| `agent/task_orchestrator.py` | Add global retry budget check (`_can_retry()`) |
-| `agent/task_orchestrator.py` | Add auto-snapshot before verify-update + sync rollback on failure |
-| `agent/executor.py` | Route `checkpoint_gate_task` and `merge_gate_task` types |
-| `agent/role_permissions.py` | Add checkpoint_gatekeeper role prompt (minimal, hard-gate only) |
-| `agent/context_assembler.py` | Add gatekeeper budget (git only: 1000 tokens, no memory, no conversation) |
-| `agent/ai_lifecycle.py` | Support isolated gatekeeper session (no context assembler, diff-only prompt) |
-| Tests | Chain integration: dev → gate → test → qa → merge; idempotency; retry budget; memory dedup |
+| Auto-chain 调度 + gate 验证 | `agent/governance/auto_chain.py` |
+| `complete_task()` → `on_task_completed()` 调用 | `agent/governance/task_registry.py` |
+| Checkpoint gatekeeper + idempotency | governance server (task_registry) |
+| Memory-write-on-failure with refId/supersedes dedup | governance server (memory API) |
+| Global retry budget check (`_can_retry()`) | governance server (task_registry) |
+| Auto-snapshot before verify-update + sync rollback | governance server (workflow) |
+| Route `checkpoint_gate_task` and `merge_gate_task` types | executor-gateway (port 8090) |
+| Checkpoint gatekeeper role prompt (minimal, hard-gate only) | governance server (role_permissions) |
+| Gatekeeper budget (git only: 1000 tokens, no memory) | governance server (context assembler) |
+| Isolated gatekeeper session (diff-only prompt) | executor-gateway |
+| Deploy 自动触发（含非 Docker 回退） | `agent/deploy_chain.py` |
+| Tests | governance server + executor-gateway tests |
 
 ## Acceptance Criteria
 
@@ -424,3 +457,7 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 8. Rollback syncs code layer + governance layer (auto-snapshot)
 9. Duplicate trigger of same stage for same parent → no-op (idempotency)
 10. Checkpoint Gatekeeper has NO access to project context (isolation enforced)
+
+## 变更记录
+- 2026-03-26: auto_chain.py 实现完成，全链路 PM→Dev→Test→QA→Merge→Deploy 自动调度，含 gate 验证
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

@@ -212,6 +212,91 @@ def rebuild_governance() -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# 3b. restart_local_governance (fallback for non-Docker environments)
+# ---------------------------------------------------------------------------
+
+def restart_local_governance(port: int = 40006) -> tuple[bool, str]:
+    """Kill and restart governance as a local Python process.
+
+    Fallback when Docker is not available or Docker rebuild fails.
+    Returns (success, output_summary).
+    """
+    import time as _time
+    output_lines: list[str] = []
+
+    # Step 1: Find PID listening on the port
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, timeout=10,
+            )
+            pid = None
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.strip().split()
+                    pid = int(parts[-1])
+                    break
+            if pid:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    capture_output=True, timeout=10,
+                )
+                output_lines.append(f"killed PID {pid}")
+                _time.sleep(1)
+            else:
+                output_lines.append(f"no process found on port {port}")
+        else:
+            # Unix: use fuser or lsof
+            result = subprocess.run(
+                ["fuser", f"{port}/tcp"],
+                capture_output=True, text=True, timeout=10,
+            )
+            pids = result.stdout.strip().split()
+            for p in pids:
+                try:
+                    os.kill(int(p), 9)
+                    output_lines.append(f"killed PID {p}")
+                except Exception:
+                    pass
+            if pids:
+                _time.sleep(1)
+    except Exception as exc:
+        output_lines.append(f"kill step failed: {exc}")
+
+    # Step 2: Restart the governance server
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        python_exe = sys.executable or "python"
+        proc = subprocess.Popen(
+            [python_exe, "-m", "agent.governance.server"],
+            cwd=str(repo_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        output_lines.append(f"started PID {proc.pid}")
+    except Exception as exc:
+        output_lines.append(f"start failed: {exc}")
+        return False, "\n".join(output_lines)
+
+    # Step 3: Health check
+    _time.sleep(3)
+    try:
+        import requests
+        resp = requests.get(f"http://localhost:{port}/api/health", timeout=5)
+        if resp.status_code == 200:
+            output_lines.append("[health] governance OK")
+            return True, "\n".join(output_lines)
+        else:
+            output_lines.append(f"[health] HTTP {resp.status_code}")
+            return False, "\n".join(output_lines)
+    except Exception as exc:
+        output_lines.append(f"[health] unreachable: {exc}")
+        return False, "\n".join(output_lines)
+
+
+# ---------------------------------------------------------------------------
 # 4. restart_gateway
 # ---------------------------------------------------------------------------
 
@@ -392,6 +477,13 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "")
 
         if "governance" in affected:
             ok, summary = rebuild_governance()
+            if not ok:
+                # Docker rebuild failed — try local process restart
+                ok2, summary2 = restart_local_governance()
+                if ok2:
+                    ok, summary = ok2, f"docker failed ({summary}), local restart OK: {summary2}"
+                else:
+                    summary = f"docker: {summary} | local: {summary2}"
             steps["governance"] = {"success": ok, "summary": summary}
 
         if "gateway" in affected:

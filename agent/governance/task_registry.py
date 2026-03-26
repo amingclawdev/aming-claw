@@ -158,6 +158,7 @@ def complete_task(
     result: dict = None,
     error_message: str = "",
     fence_token: str = "",
+    project_id: str = "",
 ) -> dict:
     """Mark a task as completed (succeeded/failed). Dual-field update."""
     if status not in ("succeeded", "failed", "timed_out"):
@@ -215,12 +216,35 @@ def complete_task(
          error_message, task_id),
     )
 
-    return {
+    response = {
         "task_id": task_id,
         "status": exec_status,
         "retrying": exec_status == "queued",
         "completed_at": now,
     }
+
+    # Auto-chain: dispatch next stage on success
+    if exec_status == "succeeded" and project_id:
+        try:
+            from . import auto_chain
+            meta = json.loads(row["metadata_json"] or "{}")
+            type_row = conn.execute(
+                "SELECT type FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            chain_result = auto_chain.on_task_completed(
+                conn, project_id, task_id,
+                task_type=type_row["type"] if type_row else "task",
+                status=exec_status,
+                result=result or {},
+                metadata=meta,
+            )
+            if chain_result:
+                response["auto_chain"] = chain_result
+        except Exception:
+            import traceback as _tb
+            _tb.print_exc()
+
+    return response
 
 
 def cancel_task(conn: sqlite3.Connection, task_id: str) -> dict:

@@ -1,5 +1,7 @@
 # Workflow Governance Service — 架构设计 v2
 
+> **2026-03-26 更新：** Governance 现在是唯一的任务管理系统。旧的基于文件的 coordinator/executor pipeline（coordinator.py, executor.py, backends.py, task_state.py 等 20 个模块）已完全移除。所有任务生命周期管理、workflow 编排、审计均通过 Governance API 完成。
+
 ## Context
 
 AI Agent 协作开发中反复出现流程违规。核心结论：规则必须写在代码里，由 API 强制执行。
@@ -1160,3 +1162,6 @@ curl http://localhost:30006/api/wf/toolbox-client/summary
 curl "http://localhost:30006/api/wf/toolbox-client/impact?files=stateService.js"
 curl "http://localhost:30006/api/wf/toolbox-client/export?format=mermaid"
 ```
+
+## 变更记录
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

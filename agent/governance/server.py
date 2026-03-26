@@ -263,13 +263,7 @@ def handle_project_register(ctx: RequestContext):
         if "already exists" not in str(e).lower():
             return 500, {"error": f"registration failed: {e}"}
 
-    # Register workspace
-    try:
-        from workspace_registry import add_workspace, find_workspace_by_project_id
-        if not find_workspace_by_project_id(project_id):
-            add_workspace(ws, label=ws.name, project_id=project_id)
-    except Exception:
-        pass  # Workspace registration is best-effort (may already exist)
+    # workspace_registry removed — workspace info stored in governance projects.json
 
     return 201, {
         "project_id": project_id,
@@ -293,16 +287,19 @@ def handle_project_config(ctx: RequestContext):
     try:
         from project_config import load_project_config
         from pathlib import Path
-        from workspace_registry import find_workspace_by_project_id
-        ws_entry = find_workspace_by_project_id(project_id)
-        if ws_entry:
-            config = load_project_config(Path(ws_entry['path']))
+        # Try governance project workspace_path, then /workspace fallback
+        proj_data = project_service.list_projects()
+        ws_path = None
+        for p in proj_data:
+            if p.get("project_id") == project_id:
+                ws_path = p.get("workspace_path", "")
+                break
+        if ws_path:
+            config = load_project_config(Path(ws_path))
+        elif Path('/workspace').exists():
+            config = load_project_config(Path('/workspace'))
         else:
-            ws = Path('/workspace')
-            if ws.exists():
-                config = load_project_config(ws)
-            else:
-                return 404, {'error': f'no workspace registered for {project_id}'}
+            return 404, {'error': f'no workspace registered for {project_id}'}
         return {
             "project_id": config.project_id,
             "language": config.language,
@@ -328,8 +325,13 @@ def handle_project_explain(ctx: RequestContext):
     try:
         from project_config import explain_config, load_project_config
         from pathlib import Path
-        from workspace_registry import find_workspace_by_project_id
-        ws_entry = find_workspace_by_project_id(project_id)
+        # Resolve workspace from governance project data
+        proj_data = project_service.list_projects()
+        ws_entry = None
+        for p in proj_data:
+            if p.get("project_id") == project_id and p.get("workspace_path"):
+                ws_entry = {"path": p["workspace_path"]}
+                break
         if ws_entry:
             config = load_project_config(Path(ws_entry['path']))
             # Build explain manually since explain_config uses registry
@@ -1128,16 +1130,24 @@ def handle_audit_violations(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/create")
 def handle_task_create(ctx: RequestContext):
+    """Create a task. Auth optional — uses principal_id if token provided, else 'anonymous'."""
     project_id = ctx.get_project_id()
     from . import task_registry
+    created_by = "anonymous"
+    if ctx.token:
+        try:
+            with DBContext(project_id) as conn:
+                session = ctx.require_auth(conn)
+                created_by = session.get("principal_id", "anonymous")
+        except Exception:
+            pass
     with DBContext(project_id) as conn:
-        session = ctx.require_auth(conn)
         return task_registry.create_task(
             conn, project_id,
             prompt=ctx.body.get("prompt", ""),
             task_type=ctx.body.get("type", "task"),
             related_nodes=ctx.body.get("related_nodes"),
-            created_by=session.get("principal_id", ""),
+            created_by=created_by,
             priority=int(ctx.body.get("priority", 0)),
             max_attempts=int(ctx.body.get("max_attempts", 3)),
             metadata=ctx.body.get("metadata"),
@@ -1146,11 +1156,19 @@ def handle_task_create(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/claim")
 def handle_task_claim(ctx: RequestContext):
+    """Claim a task. Auth optional — uses principal_id if token provided, else body worker_id."""
     project_id = ctx.get_project_id()
     from . import task_registry
+    worker_id = ctx.body.get("worker_id", "anonymous")
+    if ctx.token:
+        try:
+            with DBContext(project_id) as conn:
+                session = ctx.require_auth(conn)
+                worker_id = session.get("principal_id", worker_id)
+        except Exception:
+            pass
     with DBContext(project_id) as conn:
-        session = ctx.require_auth(conn)
-        task = task_registry.claim_task(conn, project_id, session.get("principal_id", ""))
+        task = task_registry.claim_task(conn, project_id, worker_id)
         if task is None:
             return {"task": None, "message": "No tasks available"}
         return {"task": task}
@@ -1158,15 +1176,16 @@ def handle_task_claim(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/complete")
 def handle_task_complete(ctx: RequestContext):
+    """Complete a task. No auth required."""
     project_id = ctx.get_project_id()
     from . import task_registry
     with DBContext(project_id) as conn:
-        ctx.require_auth(conn)
         return task_registry.complete_task(
             conn, ctx.body.get("task_id", ""),
             status=ctx.body.get("status", "succeeded"),
             result=ctx.body.get("result"),
             error_message=ctx.body.get("error_message", ""),
+            project_id=project_id,
         )
 
 

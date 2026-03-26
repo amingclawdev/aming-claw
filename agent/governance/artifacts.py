@@ -36,12 +36,17 @@ def _resolve_workspace(project_id: str) -> str:
             return proj["workspace_path"]
     except Exception:
         pass
-    # 2. Workspace registry
+    # 2. Governance project config (workspace_registry removed)
     try:
-        from workspace_registry import find_workspace_by_project_id
-        ws = find_workspace_by_project_id(project_id)
-        if ws:
-            return ws["path"]
+        import requests
+        resp = requests.get(
+            f"http://127.0.0.1:{os.environ.get('GOV_PORT', '40006')}/api/projects/{project_id}/config",
+            timeout=3)
+        if resp.ok:
+            cfg = resp.json()
+            wp = cfg.get("workspace_path", "")
+            if wp:
+                return wp
     except Exception:
         pass
     # 3. Env fallback

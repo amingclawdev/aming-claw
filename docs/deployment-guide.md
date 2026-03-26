@@ -1,5 +1,7 @@
 # Aming Claw 部署指南 — 开发→生产切换
 
+> **2026-03-26 更新：** 旧 Telegram bot 系统（coordinator.py, executor.py, backends.py 等 20 个模块）已完全移除。部署流程统一使用 governance + gateway + executor-gateway。
+
 ## 一、服务架构
 
 ```
@@ -11,7 +13,7 @@ Docker 容器 (docker-compose.governance.yml)
 └── redis          :40079  缓存/队列
 
 宿主机
-└── executor       :39101  任务执行 (Claude/Codex CLI)
+└── executor-gateway :8090  任务执行 (FastAPI)
 ```
 
 ## 二、完整部署流程
@@ -41,8 +43,9 @@ curl -X POST http://localhost:40000/api/wf/{project_id}/import-graph \
   -H "X-Gov-Token: {token}" \
   -d '{"md_path":"/workspace/docs/aming-claw-acceptance-graph.md"}'
 
-# 6. 启动宿主机 Executor
-cd agent && python -m executor &
+# 6. 启动 executor-gateway (宿主机)
+cd agent && python -m executor_gateway &
+# executor-gateway 监听 :8090，executor_api.py 监听 :40100
 
 # 7. Telegram 绑定
 # 在 Telegram 给 bot 发: /bind {coordinator_token}
@@ -87,7 +90,7 @@ docker compose -f docker-compose.governance.yml up -d --build telegram-gateway
 
 ## 工作区路由配置
 
-Executor 通过 **workspace_registry** 将任务路由到正确的项目目录。每个工作区可绑定一个 `project_id`。
+> **注意 (2026-03-26)：** 旧 workspace_registry.py 已删除。以下工作区路由说明仅作历史参考，当前由 governance API 统一管理项目路由。
 
 ### project_id 归一化
 
@@ -115,16 +118,18 @@ curl http://localhost:40100/workspaces
 curl "http://localhost:40100/workspaces/resolve?project_id=amingClaw"
 ```
 
-或通过 Python：
+或通过 Python（**已废弃**，workspace_registry.py 已删除）：
 
 ```python
-cd agent
-python -c "
-from pathlib import Path
-from workspace_registry import add_workspace
-add_workspace(Path('C:/Users/z5866/Documents/Toolbox/toolBoxClient'),
-              label='toolBoxClient', project_id='toolbox-client')
-"
+# ⚠ 以下代码已不可用，workspace_registry.py 已于 2026-03-26 删除
+# 工作区管理现通过 governance API 完成
+# cd agent
+# python -c "
+# from pathlib import Path
+# from workspace_registry import add_workspace
+# add_workspace(Path('C:/Users/z5866/Documents/Toolbox/toolBoxClient'),
+#               label='toolBoxClient', project_id='toolbox-client')
+# "
 ```
 
 ### 路由优先级
@@ -167,14 +172,10 @@ curl -s -X POST http://localhost:40002/knowledge/register-pack \
   -H "Content-Type: application/json" \
   -d '{"domain":"development","types":{"architecture":{"durability":"permanent","conflictPolicy":"replace","description":"Architecture decisions"},"pitfall":{"durability":"permanent","conflictPolicy":"append","description":"Known pitfalls"},"pattern":{"durability":"permanent","conflictPolicy":"replace","description":"Code patterns"},"workaround":{"durability":"durable","conflictPolicy":"replace","description":"Workarounds"},"session_summary":{"durability":"durable","conflictPolicy":"replace","description":"Session summaries"},"verify_decision":{"durability":"permanent","conflictPolicy":"append","description":"Verify decisions"}}}'
 
-# 5. 启动宿主机 Executor
-cd agent && python -m executor &
+# 5. 启动 executor-gateway (宿主机)
+cd agent && python -m executor_gateway &
 
-# 6. 验证工作区注册
-curl -s http://localhost:40100/workspaces
-# 确认 project_id 已正确映射
-
-# 7. 验证服务
+# 6. 验证服务
 curl -s http://localhost:40000/api/health     # governance
 curl -s http://localhost:40002/health          # dbservice
 curl -s http://localhost:40000/nginx-health    # nginx
@@ -192,7 +193,7 @@ curl -s http://localhost:40100/health          # executor
 | Redis 缓存 | Docker volume: redis-data (AOF) | ✅ 保留 |
 | Coordinator token | 不过期 | ✅ 有效 |
 | **dbservice domain pack** | **内存** | **❌ 需要重新注册** |
-| **Executor 进程** | **宿主机** | **❌ 需要手动启动** |
+| **executor-gateway 进程** | **宿主机** | **❌ 需要手动启动** |
 | **Telegram chat route** | **Redis** | **✅ 保留 (AOF)** |
 
 ## 五、回滚
@@ -227,7 +228,7 @@ curl http://localhost:40000/api/audit/amingClaw/log?limit=20 -H "X-Gov-Token: {t
 
 ## 七、Executor API (:40100)
 
-Executor 在宿主机运行时暴露 HTTP API，支持监控和介入：
+executor_api.py 在宿主机运行时暴露 HTTP API，支持监控和介入（注意：不再依赖旧 executor.py 或 workspace_registry.py）：
 
 ```
 GET  /health              — 健康检查
@@ -300,8 +301,8 @@ bash scripts/merge-and-deploy.sh dev/task-xxx
 
 1. **dbservice domain pack 不持久化** — 容器重启后丢失，startup.sh 中自动注册。
 2. **nginx healthcheck 偶尔 unhealthy** — 重启 nginx 解决。
-3. **Executor 是宿主机进程** — 不在 Docker 里，需要手动管理生命周期。
-4. **观察者和 Executor 并行操作** — 使用 git worktree 隔离，编辑前无需停 Executor。
+3. **executor-gateway 是宿主机进程** — 不在 Docker 里，需要手动管理生命周期。
+4. **观察者和 executor-gateway 并行操作** — 使用 git worktree 隔离。
 
 ## 十一、Executor Safety & Reliability Mechanisms
 
@@ -348,3 +349,6 @@ export AI_SESSION_TIMEOUT=1200
 # Example: Executor running on alternate port
 export EXECUTOR_API_URL=http://localhost:40200
 ```
+
+## 变更记录
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

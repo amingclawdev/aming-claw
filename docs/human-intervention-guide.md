@@ -10,7 +10,7 @@ Dev → Gate → Tester → QA → Merge → Deploy
 
 Each stage is triggered automatically by the preceding stage's success signal. The Observer's default stance is **hands-off**. Do not interrupt a running chain without a confirmed, specific reason from the criteria in Section 2.
 
-> **Rule:** If you are considering manual intervention, ask yourself: "Has the coordinator already been given a chance to handle this?" If the answer is no, submit via the coordinator first.
+> **Rule:** If you are considering manual intervention, ask yourself: "Has the system already been given a chance to handle this?" If the answer is no, submit via governance API (`POST /api/task/create`) first.
 
 ---
 
@@ -25,7 +25,7 @@ Manual intervention is allowed **only** when one of the following four condition
 | **Credential change** | Password reset, token rotation, OAuth revocation, or any secret that must not pass through the AI pipeline | Any secret/credential operation |
 | **Large-scope change** | A single task touches more than 10 files | `changed_files > 10` detected at Gate |
 
-If your situation does not match one of these four conditions, **do not intervene manually.** Re-submit the task through the coordinator and let the auto-chain resolve it.
+If your situation does not match one of these four conditions, **do not intervene manually.** Re-submit the task through governance API (`POST /api/task/create`) and let the auto-chain resolve it.
 
 ---
 
@@ -48,9 +48,9 @@ If your situation does not match one of these four conditions, **do not interven
 
 | Operation | Reason | How to Confirm |
 |-----------|--------|----------------|
-| New node / module creation | Architectural decision | Observer reviews proposal in Telegram, replies "confirm" |
-| Bulk baseline state change | Wide blast radius | AI lists change set → human confirms in Telegram |
-| Cross-project operation | Affects other projects | Telegram notification → human confirms |
+| New node / module creation | Architectural decision | Observer reviews proposal via governance API, confirms through `/api/wf/{pid}/verify-update` |
+| Bulk baseline state change | Wide blast radius | AI lists change set → human confirms via governance API |
+| Cross-project operation | Affects other projects | Notification via telegram_gateway → human confirms via governance API |
 
 ### 3.3 Must Be Executed Manually (Human Only)
 
@@ -58,8 +58,8 @@ If your situation does not match one of these four conditions, **do not interven
 |-----------|--------|--------|
 | Password / token reset | Security-sensitive | Human runs `init_project.py` |
 | `refresh_token` revoke / rotate | Credential operation | Human calls `/api/token/revoke` |
-| Release-gate final sign-off | Release decision | Human confirms in Telegram |
-| Rollback execution | Irreversible, high risk | Human confirms in Telegram |
+| Release-gate final sign-off | Release decision | Human confirms via governance API (`POST /api/wf/{pid}/release-gate`) |
+| Rollback execution | Irreversible, high risk | Human confirms via governance API (`POST /api/wf/{pid}/rollback`) |
 | Node / project deletion | Irreversible | Human operates directly |
 | Scheduled Task permission grant | Platform restriction | Human clicks "Always allow" |
 | **New project registration** | Requires `.aming-claw.yaml` review | Human creates yaml, calls `POST /api/projects/register` |
@@ -77,13 +77,13 @@ The Observer monitors the auto-chain health. The Observer does **not** drive tas
 - Executor heartbeats and stale-claim counts
 - verify-update cycles (`t2_pass` / `t2_fail`)
 
-### 4.2 Decision Flow: Coordinator First
+### 4.2 Decision Flow: Governance API First
 
 ```
 Issue detected
       │
       ▼
-Submit issue description to coordinator via normal task submission
+Submit issue description via governance API (POST /api/task/create)
       │
       ▼
 Does the auto-chain resolve it within one full cycle?
@@ -104,7 +104,7 @@ Does the root cause confirm a self-bootstrap paradox?
 Proceed to 10-Step Manual Fix SOP (Section 4.4)
 ```
 
-> **Key rule:** Manual intervention is only unlocked **after** the coordinator has been given at least one attempt AND the 5-Whys confirms a self-bootstrap condition. Skipping the coordinator step is a protocol violation.
+> **Key rule:** Manual intervention is only unlocked **after** the system has been given at least one attempt (via governance API) AND the 5-Whys confirms a self-bootstrap condition. Skipping the governance submission step is a protocol violation.
 
 ### 4.3 5-Whys Analysis
 
@@ -138,7 +138,7 @@ If at layer 3 (or deeper) you confirm a **self-bootstrap paradox** — the execu
 
 | ❌ Do NOT | Reason |
 |-----------|--------|
-| Intervene without first submitting to coordinator | Bypasses the auto-chain; wastes human time on problems the system can self-heal |
+| Intervene without first submitting via governance API | Bypasses the auto-chain; wastes human time on problems the system can self-heal |
 | Intervene without completing 5-Whys (≥3 layers) | Root cause unknown; fix will likely recur |
 | Start executor from inside an active Claude/dev-AI session | Creates a child process owned by the session; orphaned when session exits |
 | `curl` verify-update directly without evidence | Bypasses evidence-validation gate; produces false `t2_pass`, corrupts audit trail |
@@ -152,15 +152,47 @@ If at layer 3 (or deeper) you confirm a **self-bootstrap paradox** — the execu
 
 When the system detects conditions that **may** require intervention (not confirmed yet), it sends a notification and pauses — it does not request manual action immediately.
 
-### 5.1 Notification Format
+### 5.1 Gate Blocked 事件
+
+当 auto_chain 的 gate 检查失败时（`gate.blocked` 事件），链路暂停，`complete_task()` 的响应中包含阻塞信息：
+
+```json
+{
+  "task_id": "task-xxx",
+  "status": "succeeded",
+  "auto_chain": {
+    "gate_blocked": true,
+    "stage": "dev",
+    "reason": "Unrelated files modified: ['config.py']"
+  }
+}
+```
+
+**Observer 处理 gate blocked 的流程：**
+
+1. 通过 task list API 查看阻塞原因（`GET /api/task/list?project_id=xxx`）
+2. 根据 `reason` 定位问题（如 PRD 缺字段、scope 外文件修改、测试失败等）
+3. 修复问题后，重新提交该阶段的任务（`POST /api/task/create`），auto_chain 会从该阶段重新推进
+
+各 gate 可能的阻塞原因：
+
+| Gate | 典型 reason |
+|------|-----------|
+| Post-PM | `PRD missing mandatory fields: ['target_files']` |
+| Checkpoint | `No files changed` / `Unrelated files modified: [...]` / `Dev tests failed` |
+| T2 Pass | `Tests failed: N failures` |
+| QA Pass | `QA did not pass: recommendation=reject` |
+
+### 5.2 Notification Format
 
 ```
-[Auto-chain paused — coordinator review requested]
+[Auto-chain paused — governance review requested]
 Reason: Detected potential large-scope change (14 files modified)
 Task ID: task-20260326-001
-Suggested action: Coordinator evaluates scope; if >10 files confirmed, human approval required.
+Suggested action: Governance evaluates scope; if >10 files confirmed, human approval required.
 
-Reply "approve-large-scope" to continue, or "reject" to cancel.
+Approve via: POST /api/wf/{pid}/verify-update with approval evidence
+Or reject via: POST /api/wf/{pid}/verify-update with status "failed"
 ```
 
 ### 5.2 Pause-and-Wait Flow
@@ -169,15 +201,14 @@ Reply "approve-large-scope" to continue, or "reject" to cancel.
 Auto-chain detects pause condition
       │
       ▼
-Telegram notification sent (not ACKed — stays in queue)
+Notification sent via telegram_gateway (port 40010)
       │
       ▼
-Next scheduled Task trigger:
-  Check queue → find un-ACKed message → check for human reply
+Governance server waits for human decision:
       │
-      ├── Human replies "approve-*" → chain resumes → ACK both messages
-      ├── Human replies "reject"    → task cancelled → ACK both messages
-      └── No reply                  → re-notify (max 3 times, then auto-cancel)
+      ├── Human approves via governance API → chain resumes
+      ├── Human rejects via governance API  → task cancelled
+      └── No response within timeout        → re-notify (max 3 times, then auto-cancel)
 ```
 
 ---
@@ -190,8 +221,8 @@ Next scheduled Task trigger:
 |-----------|-------------|-------------------|
 | Has unit tests | ✅ Tester auto | QA auto if e2e_report present |
 | Infrastructure change | ✅ Tester auto | QA needs human to confirm service health |
-| Scheduled Task behavior | ❌ | Human: send message → observe reply → confirm ACK |
-| UI / Telegram interaction | ❌ | Human: review screenshot → confirm |
+| Scheduled Task behavior | ❌ | Human: verify via governance API → confirm via verify-update |
+| UI / Telegram interaction | ❌ | Human: review via executor_api (port 40100) → confirm |
 | Security-related (token/auth) | ❌ | Human verification required |
 
 ### 6.2 Manual Acceptance Evidence Format
@@ -220,21 +251,20 @@ When human verification is required, the verify-update `evidence` must include `
 AI completes implementation
       │
       ▼
-AI notifies human via Telegram:
+AI notifies human via telegram_gateway (port 40010):
   "Node X implemented. Manual acceptance required:
-   1. Send a test message in Telegram.
-   2. Wait 1 minute and check for reply.
-   3. Confirm reply content is correct.
-   4. Confirm no duplicate messages.
-   5. Reply 'accepted' or 'rejected: <reason>'."
+   1. Verify functionality.
+   2. Confirm correct behavior.
+   3. Submit decision via governance API."
       │
       ▼
-Human tests and replies
+Human tests and submits decision
       │
-      ├── "accepted"        → AI submits verify-update (qa_pass)
-      │                        evidence: { manual_verified: true, verified_by: "human" }
+      ├── Approved → Human calls POST /api/wf/{pid}/verify-update
+      │               with evidence: { manual_verified: true, verified_by: "human" }
       │
-      └── "rejected: <reason>" → AI fixes issue → requests acceptance again
+      └── Rejected → Human calls verify-update with status "failed"
+                      → AI fixes issue → requests acceptance again
 ```
 
 ---
@@ -289,7 +319,11 @@ Human execution required (no auto option):
   Token/credential management  |  Release sign-off  |  Scheduled Task authorization
 
 Manual intervention unlocked only when:
-  (1) Coordinator was given at least one attempt, AND
+  (1) System was given at least one attempt (via governance API), AND
   (2) 5-Whys (≥3 layers) confirms a self-bootstrap paradox
       OR an architectural / credential / large-scope condition applies
 ```
+
+## 变更记录
+- 2026-03-26: auto_chain.py 实现完成，全链路 PM→Dev→Test→QA→Merge→Deploy 自动调度，含 gate 验证
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

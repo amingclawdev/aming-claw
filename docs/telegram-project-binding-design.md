@@ -1,5 +1,7 @@
 # Telegram 对话绑定项目运行时方案
 
+> **2026-03-26 确认：** telegram_gateway (port 40010) 是唯一的 Telegram 入口。旧 coordinator.py 的 Telegram polling 机制已完全移除（连同 bot_commands.py、interactive_menu.py 等 20 个模块）。所有 Telegram 消息路由均通过 Gateway → Governance API 完成。
+
 ## 问题
 
 当前 Telegram 聊天只有一个 chat_id，但可能绑定到不同项目。切换项目时：
@@ -246,3 +248,6 @@ def build_project_button(route):
 | 2 | /menu 显示项目状态 + 切换自动保存 | 低 |
 | 3 | Task 启动时查路由 + 加载 context | 已有 |
 | 4 | 跨项目查询 | 中 |
+
+## 变更记录
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API

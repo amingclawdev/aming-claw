@@ -1,7 +1,9 @@
 # Executor API 接入指南
 
-> Executor HTTP API (端口 40100) 运行在宿主机，与 task 处理循环并行。
-> 用于 Claude Code session 直接监控、介入、调试 Executor 和 AI 执行链路。
+> **2026-03-26 更新：** executor_api.py 不再依赖旧 executor.py 或 workspace_registry.py（已删除）。`/cleanup-orphans`、`/workspaces`、`/workspaces/resolve` 端点现为 stub，返回 degraded 响应。`/coordinator/chat` 端点已废弃。
+
+> Executor HTTP API (端口 40100) 运行在宿主机。
+> 用于 Claude Code session 直接监控、调试执行链路。
 
 ## 快速开始
 
@@ -12,10 +14,10 @@ curl http://localhost:40100/health
 # 查看整体状态
 curl http://localhost:40100/status
 
-# 直接和 Coordinator 对话（绕过 Telegram）
-curl -X POST http://localhost:40100/coordinator/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "当前项目状态", "project_id": "amingClaw"}'
+# ⚠ /coordinator/chat 已废弃（旧 coordinator.py 已删除）
+# curl -X POST http://localhost:40100/coordinator/chat \
+#   -H "Content-Type: application/json" \
+#   -d '{"message": "当前项目状态", "project_id": "amingClaw"}'
 ```
 
 ## 端点列表
@@ -30,8 +32,8 @@ curl -X POST http://localhost:40100/coordinator/chat \
 | `/tasks?project_id=X&status=Y` | 任务列表 | `{tasks: [...], count}` |
 | `/task/{task_id}` | 单任务详情 | 任务 JSON + `_stage` + `_file` |
 | `/trace/{trace_id}` | 链路追踪 | `{trace_id, entries: [...]}` |
-| `/workspaces` | 工作区注册表 | `{workspaces: [...], count}` |
-| `/workspaces/resolve?project_id=X` | 按项目ID解析工作区 | `{workspace, matched_by}` |
+| `/workspaces` | ~~工作区注册表~~ **stub，返回 degraded** | `{workspaces: [], count: 0, degraded: true}` |
+| `/workspaces/resolve?project_id=X` | ~~按项目ID解析工作区~~ **stub，返回 degraded** | `{degraded: true}` |
 
 ### 介入 (POST)
 
@@ -40,7 +42,7 @@ curl -X POST http://localhost:40100/coordinator/chat \
 | `/task/{id}/pause` | 暂停运行中的任务 | 无 |
 | `/task/{id}/cancel` | 取消任务 | 无 |
 | `/task/{id}/retry` | 重试失败的任务 | 无 |
-| `/cleanup-orphans` | 清理僵尸进程和卡住的任务 | 无 |
+| `/cleanup-orphans` | ~~清理僵尸进程~~ **stub，返回 degraded** | 无 |
 | `/tasks/create` | Idempotent task file creation (used by Orchestrator) | JSON task object |
 
 ### POST /tasks/create — Idempotency Guarantees
@@ -76,11 +78,11 @@ If a match is found in **any** of these stages, the endpoint returns the existin
 {"status": "exists",  "task_id": "task-abc123", "stage": "processing"}
 ```
 
-### 直接对话 (POST)
+### 直接对话 (POST) — **已废弃**
 
 | 端点 | 说明 | Body |
 |------|------|------|
-| `/coordinator/chat` | 直接启动 Coordinator session | `{message, project_id, chat_id?}` |
+| `/coordinator/chat` | ~~直接启动 Coordinator session~~ **已废弃，旧 coordinator.py 已删除** | `{message, project_id, chat_id?}` |
 
 ### 调试 (GET)
 
@@ -90,9 +92,9 @@ If a match is found in **any** of these stages, the endpoint returns the existin
 | `/context/{project_id}` | 当前上下文组装结果 | `{project_id, context: {...}}` |
 | `/ai-session/{id}/output` | AI 原始输出 | `{stdout, stderr, exit_code, elapsed_sec}` |
 
-## 工作区路由
+## 工作区路由（已废弃）
 
-任务通过 `project_id` 自动路由到正确的工作区。路由优先级：
+> **注意 (2026-03-26)：** workspace_registry.py 已删除。以下路由逻辑仅作历史参考。`/workspaces` 和 `/workspaces/resolve` 现返回 degraded 响应。
 
 1. `target_workspace_id` — 精确 ID 匹配
 2. `target_workspace` — 标签匹配
@@ -121,13 +123,14 @@ curl "http://localhost:40100/workspaces/resolve?project_id=amingClaw"
 # → {"workspace": {"id":"ws-xxx", "path":"C:/...", "project_id":"aming-claw"}, "matched_by":"project_id"}
 ```
 
-### 注册工作区
+### 注册工作区（已废弃）
 
-工作区在 Executor 启动时自动注册当前目录。也可通过 `workspace_registry.add_workspace()` 手动注册：
+> workspace_registry.py 已于 2026-03-26 删除，以下代码不再可用。
 
 ```python
-from workspace_registry import add_workspace
-add_workspace(Path("/path/to/repo"), label="my-project", project_id="my-project")
+# ⚠ 已废弃
+# from workspace_registry import add_workspace
+# add_workspace(Path("/path/to/repo"), label="my-project", project_id="my-project")
 ```
 
 ### Redis Stream 审计
@@ -168,7 +171,7 @@ curl -X POST http://localhost:40100/task/task-xxx/cancel
 curl -X POST http://localhost:40100/cleanup-orphans
 ```
 
-### 3. 调试 Coordinator 回复不对
+### 3. 调试回复不对（旧 Coordinator 已移除，以下仅供参考）
 
 ```bash
 # 看最近的 validator 决策
@@ -181,7 +184,7 @@ curl http://localhost:40100/context/amingClaw
 curl http://localhost:40100/ai-session/ai-coordinator-xxx/output
 ```
 
-### 4. 直接和 Coordinator 对话（不经过 Telegram）
+### 4. 直接和 Coordinator 对话（已废弃，旧 coordinator.py 已删除）
 
 ```bash
 curl -X POST http://localhost:40100/coordinator/chat \
@@ -215,13 +218,9 @@ curl http://localhost:40100/trace/trace-1774230000-abcdef12
 Claude Code Session (开发者)
     │ curl localhost:40100/...
     ▼
-Executor API (:40100)  ← 本文档描述的接口
+Executor API (:40100)  ← 本文档描述的接口（监控层）
     │
-    ├── AILifecycleManager  → 管理 AI 进程
-    ├── TaskOrchestrator    → 任务编排
-    ├── DecisionValidator   → 校验决策
-    ├── ContextAssembler    → 组装上下文
-    └── EvidenceCollector   → 采集证据
+    └── executor-gateway (:8090) → 实际任务执行
 
 Telegram 用户
     │ 消息
@@ -306,6 +305,9 @@ end of full scan cycle → _skipped_tasks.clear()
 
 - Executor API 只在宿主机上可访问（localhost:40100）
 - 不经过 nginx，不需要 governance token
-- `/coordinator/chat` 是同步的，会等 AI 完成后返回（最多 120s）
+- `/coordinator/chat` 已废弃（旧 coordinator.py 已删除）
 - `/task/{id}/cancel` 会终止 AI 进程，谨慎使用
-- `/cleanup-orphans` 会 kill 所有超时进程（仅限 `_EXECUTOR_SPAWNED_PIDS` 中追踪的进程，不会误杀用户 Claude session）
+- `/cleanup-orphans` 现为 stub（旧 executor.py 的 `_EXECUTOR_SPAWNED_PIDS` 机制已移除）
+
+## 变更记录
+- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
