@@ -118,25 +118,39 @@ def restart_executor() -> bool:
 # ---------------------------------------------------------------------------
 
 def rebuild_governance() -> tuple[bool, str]:
-    """Run scripts/deploy-governance.sh then health-check governance.
+    """Rebuild + restart governance Docker container, then health-check.
 
+    Uses docker compose build + up directly (Windows-compatible).
     Returns (success, output_summary).
     """
-    script = Path(__file__).resolve().parent.parent / "scripts" / "deploy-governance.sh"
+    repo_root = Path(__file__).resolve().parent.parent
+    compose_file = repo_root / "docker-compose.governance.yml"
     output_lines: list[str] = []
     try:
-        result = subprocess.run(
-            ["bash", str(script)],
-            capture_output=True,
-            text=True,
-            timeout=300,
+        # Step 1: docker compose build governance
+        build = subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "build", "governance"],
+            capture_output=True, text=True, timeout=300, cwd=str(repo_root),
         )
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+        if build.returncode != 0:
+            return False, f"build failed: {build.stderr[:300]}"
+        output_lines.append("build OK")
+
+        # Step 2: docker compose up -d governance
+        up = subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "up", "-d", "governance"],
+            capture_output=True, text=True, timeout=60, cwd=str(repo_root),
+        )
+        if up.returncode != 0:
+            return False, f"up failed: {up.stderr[:300]}"
+        output_lines.append("container restarted")
+
+        stdout = build.stdout.strip()
+        stderr = build.stderr.strip()
         if stdout:
-            output_lines.append(stdout)
+            output_lines.append(stdout[-200:])
         if stderr:
-            output_lines.append(f"[stderr] {stderr}")
+            output_lines.append(f"[stderr] {stderr[-200:]}")
         if result.returncode != 0:
             output_lines.append(f"[exit {result.returncode}] deploy script failed")
             return False, "\n".join(output_lines)
