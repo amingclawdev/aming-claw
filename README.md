@@ -151,40 +151,37 @@ User sends message
 
 ---
 
-### Pipeline Modes
+### Roles & Auto-Chain
 
-Aming Claw supports three execution backends and two pipeline strategies.
+Aming Claw uses a role-based auto-chain where each role is an isolated AI
+session with specific permissions. Tasks flow automatically through the chain.
 
-#### Backends
+#### Roles
 
-| Backend | Description |
-|---|---|
-| `claude` | Direct Anthropic Claude API calls |
-| `codex` | OpenAI Codex CLI wrapper |
-| `pipeline` | Multi-stage pipeline combining multiple backends |
+| Role | Responsibility | Tools |
+|---|---|---|
+| **Coordinator** | Dispatch only. Routes messages to PM, creates dev_tasks. Never writes code. | Read-only |
+| **PM** | Analyze requirements, output PRD with target_files, acceptance_criteria, `_verification` config. | Read-only |
+| **Dev** | Implement code in isolated git worktree. | Read, Write, Edit, Bash, Glob, Grep |
+| **Checkpoint Gatekeeper** | Fast isolated check (~10s): files changed? syntax valid? no unrelated changes? | Diff only |
+| **Tester** | Run unit tests (1200+). Pass/fail decides chain continuation. | Bash (pytest) |
+| **QA** | Verify in real environment. Honors `_verification` config (skip governance when not needed). | Read, Bash |
+| **Observer** | Human or automated watcher. Can `/takeover`, `/pause`, `/cancel`. | All |
 
-#### Stage-based Pipeline (plan / code / verify)
+#### Auto-Chain Flow
 
-Each stage runs a different AI backend and passes accumulated context forward:
+```
+Message → Coordinator → PM → Dev → Gate → Tester → QA → Merge → Deploy
+                                     ↑ fail: retry Dev (max 3)
+                                              ↑ fail: stop chain, notify
+```
 
-| Preset | Stages |
-|---|---|
-| `plan_code_verify` | plan (Claude) -> code (Claude) -> verify (Codex) |
-| `plan_code` | plan (Claude) -> code (Claude) |
-| `code_verify` | code (Claude) -> verify (Codex) |
-
-#### Role-based Pipeline (PM / Dev / Test / QA)
-
-A software team simulation where each role has a defined responsibility:
-
-| Role | Responsibility |
-|---|---|
-| PM | Analyze requirements, write specifications |
-| Dev | Implement the solution based on PM's spec |
-| Test | Validate the implementation, write test cases |
-| QA | Audit code quality, check for edge cases |
-
-Per-role model binding is configurable via `pipeline_config.yaml` or environment variables, allowing different AI models for different roles.
+- **`_verification` config**: PM decides what QA checks to run. Flows through
+  entire chain. `governance_nodes: false` skips governance checks for simple tasks.
+- **Idempotent triggers**: Each stage uses `parent_task_id:stage` as idempotency
+  key. Safe to retry without duplicate tasks.
+- **Deploy chain**: After merge, auto-detects affected services and restarts
+  (executor signal, governance Docker rebuild, gateway restart).
 
 ---
 
@@ -504,7 +501,7 @@ aming_claw/
 |   +-- task_accept.py         # Post-acceptance test runner
 |   +-- task_retry.py          # Retry logic for failed tasks
 |   +-- backends.py            # AI backend integrations (Claude, Codex, OpenAI)
-|   +-- pipeline_config.py     # Per-role provider/model binding
+|   +-- deploy_chain.py        # Post-merge auto-deploy orchestration
 |   +-- model_registry.py      # Fetch available models from Anthropic/OpenAI APIs
 |   +-- auth.py                # TOTP-based 2FA implementation
 |   +-- workspace.py           # Workspace resolution and switching
@@ -735,40 +732,21 @@ Telegram 用户
 
 ---
 
-### 流水线模式
+### 角色与自动链 (Roles & Auto-Chain)
 
-Aming Claw 支持三种执行后端和两种流水线策略。
+Aming Claw 使用角色隔离的自动链，每个角色是独立的 AI session。
 
-#### 后端
+| 角色 | 职责 | 工具权限 |
+|---|---|---|
+| **Coordinator** | 纯调度：路由消息到 PM，创建 dev_task | 只读 |
+| **PM** | 需求分析，输出 PRD + target_files + `_verification` 配置 | 只读 |
+| **Dev** | 在 git worktree 中实现代码 | Read, Write, Edit, Bash |
+| **Checkpoint Gatekeeper** | 快速隔离检查（~10s）：文件是否变更？语法？ | Diff only |
+| **Tester** | 运行单元测试（1200+） | Bash (pytest) |
+| **QA** | 真实环境验证，遵循 `_verification` 配置 | Read, Bash |
+| **Observer** | 人工或自动监控，可 /takeover, /pause, /cancel | 全部 |
 
-| 后端 | 说明 |
-|---|---|
-| `claude` | 直接调用 Anthropic Claude API |
-| `codex` | OpenAI Codex CLI 封装 |
-| `pipeline` | 多阶段流水线，组合多个后端 |
-
-#### 阶段式流水线 (plan / code / verify)
-
-每个阶段运行不同的AI后端，并传递累积上下文：
-
-| 预设 | 阶段 |
-|---|---|
-| `plan_code_verify` | plan (Claude) -> code (Claude) -> verify (Codex) |
-| `plan_code` | plan (Claude) -> code (Claude) |
-| `code_verify` | code (Claude) -> verify (Codex) |
-
-#### 角色式流水线 (PM / Dev / Test / QA)
-
-模拟软件团队，每个角色有明确的职责：
-
-| 角色 | 职责 |
-|---|---|
-| PM (产品经理) | 分析需求，撰写规格说明 |
-| Dev (开发) | 根据PM的规格实现方案 |
-| Test (测试) | 验证实现，编写测试用例 |
-| QA (质量保证) | 审计代码质量，检查边界情况 |
-
-可通过 `pipeline_config.yaml` 或环境变量为每个角色配置不同的AI模型。
+自动链流程：`消息 → Coordinator → PM → Dev → Gate → Tester → QA → Merge → Deploy`
 
 ---
 
