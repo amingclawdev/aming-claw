@@ -7,11 +7,20 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from governance.graph import AcceptanceGraph
+try:
+    import networkx  # noqa: F401
+    _has_networkx = True
+except ImportError:
+    _has_networkx = False
+
 from governance.models import NodeDef
 from governance.errors import NodeNotFoundError, DAGError
 
+if _has_networkx:
+    from governance.graph import AcceptanceGraph
 
+
+@unittest.skipUnless(_has_networkx, "networkx not installed")
 class TestAcceptanceGraph(unittest.TestCase):
     def setUp(self):
         self.graph = AcceptanceGraph()
@@ -119,6 +128,7 @@ class TestAcceptanceGraph(unittest.TestCase):
         self.assertEqual(gates[0].min_status, "t2_pass")
 
 
+@unittest.skipUnless(_has_networkx, "networkx not installed")
 class TestMarkdownImport(unittest.TestCase):
     def test_import_simple(self):
         md_content = """# Test Graph
