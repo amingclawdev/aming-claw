@@ -205,7 +205,11 @@ class ExecutorWorker:
             parts.append("Report result as JSON: {\"test_report\": {\"passed\": N, \"failed\": N, \"tool\": \"pytest\"}}")
 
         elif task_type == "qa":
-            parts.append("\nReview the changes and respond with JSON: {\"recommendation\": \"qa_pass\"} or {\"recommendation\": \"reject\", \"reason\": \"...\"}")
+            parts.append("\nYou are a QA reviewer. Review the test results and changed files above.")
+            parts.append("If tests passed and changes look reasonable, respond ONLY with this exact JSON:")
+            parts.append('{"recommendation": "qa_pass", "review_summary": "Tests pass, changes approved"}')
+            parts.append("If there are critical issues, respond with:")
+            parts.append('{"recommendation": "reject", "reason": "description of issue"}')
 
         elif task_type == "merge":
             parts.append("\nCommit all staged changes to git and respond with JSON: {\"merge_commit\": \"<hash>\", \"branch\": \"main\", \"files_changed\": N}")

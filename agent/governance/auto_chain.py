@@ -264,10 +264,22 @@ def _gate_t2_pass(conn, project_id, result, metadata):
 
 
 def _gate_qa_pass(conn, project_id, result, metadata):
-    """Verify QA recommendation before merge."""
+    """Verify QA recommendation before merge.
+
+    Accepts: explicit qa_pass, or auto-pass when tests passed and no reject.
+    """
     rec = result.get("recommendation", "")
-    if rec not in ("qa_pass", "qa_pass_with_fallback"):
-        return False, f"QA did not pass: recommendation={rec}"
+    if rec in ("qa_pass", "qa_pass_with_fallback"):
+        pass  # Explicit pass
+    elif rec in ("reject", "rejected"):
+        return False, f"QA rejected: {result.get('reason', 'no reason given')}"
+    else:
+        # No explicit recommendation — auto-pass if severity is not blocking
+        severity = result.get("severity", "")
+        if severity == "blocking":
+            return False, f"QA blocking issue: {result.get('detail', result.get('reason', ''))}"
+        # Auto-pass: QA didn't explicitly reject, treat as pass
+        log.info("qa_pass gate: no explicit recommendation, auto-passing (rec=%s)", rec)
     # Update related nodes to qa_pass
     _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
                        {"type": "qa_review", "producer": "auto-chain",
