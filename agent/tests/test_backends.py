@@ -115,6 +115,23 @@ class TestHasExecutionEvidence(unittest.TestCase):
         self.assertTrue(has_execution_evidence("更新了 main.py 的逻辑"))
         self.assertTrue(has_execution_evidence("修改了 index.ts"))
 
+    def test_extended_chinese_action_verbs(self):
+        self.assertTrue(has_execution_evidence("添加了新的路由处理函数"))
+        self.assertTrue(has_execution_evidence("删除了多余的日志输出"))
+        self.assertTrue(has_execution_evidence("替换了旧版依赖"))
+        self.assertTrue(has_execution_evidence("重写了认证模块"))
+        self.assertTrue(has_execution_evidence("重构了数据处理逻辑"))
+        self.assertTrue(has_execution_evidence("安装了 requests 库"))
+        self.assertTrue(has_execution_evidence("写入了配置文件"))
+
+    def test_extended_english_action_verbs(self):
+        self.assertTrue(has_execution_evidence("updated the authentication handler"))
+        self.assertTrue(has_execution_evidence("added a new route for /api/users"))
+        self.assertTrue(has_execution_evidence("deleted unused imports"))
+        self.assertTrue(has_execution_evidence("replaced the old logging module"))
+        self.assertTrue(has_execution_evidence("refactored the data pipeline"))
+        self.assertTrue(has_execution_evidence("installed the dependency"))
+
 
 class TestDetectNoopExecution(unittest.TestCase):
     def test_successful_with_changes(self):

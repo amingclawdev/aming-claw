@@ -522,14 +522,31 @@ def has_execution_evidence(text: str) -> bool:
         return True
     # Fallback evidence: explicit command/file modification markers (bilingual).
     markers = [
+        # Chinese action verbs indicating execution
         "执行了",
         "已完成以下",
         "修改了",
         "创建了",
+        "更新了",
+        "添加了",
+        "删除了",
+        "替换了",
+        "重写了",
+        "重构了",
+        "安装了",
+        "写入了",
+        # English action verbs indicating execution
         "executed",
         "completed the following",
         "modified",
         "created",
+        "updated",
+        "added",
+        "deleted",
+        "replaced",
+        "refactored",
+        "installed",
+        # Tool/command markers
         "apply_patch",
         "git diff",
         "pytest",
