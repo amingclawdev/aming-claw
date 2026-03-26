@@ -1,12 +1,12 @@
-# Aming Claw 架构方案 v5 — Session Runtime
+# Aming Claw Architecture v5 — Session Runtime
 
-> v4 → v5 核心变更：去掉 Scheduled Task 轮询，Gateway 直接驱动 CLI 执行。引入 Session Runtime 状态服务管理 Coordinator + 角色生命周期。
+> v4 → v5 core change: Remove Scheduled Task polling, Gateway directly drives CLI execution. Introduce Session Runtime state service to manage Coordinator + role lifecycle.
 
-## 一、系统全景
+## 1. System Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        人类用户 (Telegram)                       │
+│                        Human User (Telegram)                     │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                     ┌──────────▼──────────┐
@@ -16,102 +16,102 @@
           ┌────────────▼──┐ ┌──▼────▼───────────┐
           │  Governance   │ │  Telegram Gateway  │
           │  (:40006)     │ │  (:40010)          │
-          │  规则+事件源   │ │  消息+路由+派发     │
+          │  Rules+Events │ │  Messages+Routing  │
           └──────┬────────┘ └──────┬─────────────┘
                  │                 │
           ┌──────▼─────────────────▼───────┐
           │          Redis (:6379)          │
-          │  Streams / Pub-Sub / 缓存 / 锁  │
+          │  Streams / Pub-Sub / Cache / Lock│
           └──────┬─────────────────────────┘
                  │
           ┌──────▼──────────┐
           │   dbservice     │
           │   (:40002)      │
-          │   记忆层         │
+          │   Memory Layer  │
           └─────────────────┘
 
-─ ─ ─ ─ ─ ─ Docker 内网 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+─ ─ ─ ─ ─ ─ Docker Internal ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 
           ┌─────────────────────────────────┐
-          │         宿主机                   │
+          │         Host Machine             │
           │                                 │
-          │  Executor (常驻)                 │
-          │    ├── 监听 task 文件            │
+          │  Executor (resident)             │
+          │    ├── Watch task files          │
           │    ├── run_claude / run_codex   │
-          │    └── 结果写回 + 通知           │
+          │    └── Write results + notify   │
           │                                 │
           │  Claude Code CLI               │
           │  Codex CLI                      │
           └─────────────────────────────────┘
 ```
 
-## 二、v4 → v5 变更
+## 2. v4 → v5 Changes
 
-| 模块 | v4 | v5 | 原因 |
-|------|----|----|------|
-| 消息消费 | Scheduled Task 每分钟轮询 Redis Stream | **Gateway 收到消息直接派发** | 去掉延迟和复杂度 |
-| 任务执行 | 无（消息处理=回复） | **Gateway 写 task 文件 → Executor 调 CLI** | 任务类消息需要实际执行 |
-| Session 管理 | 无 | **Session Runtime 状态服务** | 管理 Coordinator + 角色生命周期 |
-| 角色系统 | token 分配但无实际管理 | **角色有独立上下文 + 任务 + 生命周期** | 多角色协作 |
-| Scheduled Task | 3 个定时任务 | **全部关闭** | 不再需要 |
+| Module | v4 | v5 | Reason |
+|--------|----|----|--------|
+| Message consumption | Scheduled Task polls Redis Stream every minute | **Gateway dispatches on message receipt** | Remove latency and complexity |
+| Task execution | None (message handling = reply) | **Gateway writes task file → Executor calls CLI** | Task messages need actual execution |
+| Session management | None | **Session Runtime state service** | Manage Coordinator + role lifecycle |
+| Role system | Token assigned but no actual management | **Roles have independent context + tasks + lifecycle** | Multi-role collaboration |
+| Scheduled Task | 3 scheduled tasks | **All disabled** | No longer needed |
 
-## 三、消息处理流程（v5.1 修正）
+## 3. Message Processing Flow (v5.1 Correction)
 
-> **v5.1 关键修正**：Gateway 不再直接派发任务。所有非命令消息转给 Coordinator。
-> Coordinator 负责对话、决策、任务编排。Gateway 只做消息收发。
+> **v5.1 key correction**: Gateway no longer dispatches tasks directly. All non-command messages forwarded to Coordinator.
+> Coordinator handles conversation, decisions, task orchestration. Gateway only does message send/receive.
 
 ```
-用户 Telegram 消息: "帮我给 L1.3 写测试"
+User Telegram message: "Help me write tests for L1.3"
     │
     ▼
-Gateway (Docker, 实时 polling)
-    │  1. getUpdates 收到消息
-    │  2. 查路由表: chat_id → project_id + token
-    │  3. 判断消息类型:
+Gateway (Docker, real-time polling)
+    │  1. getUpdates receives message
+    │  2. Look up routing table: chat_id → project_id + token
+    │  3. Determine message type:
     │
-    ├── 命令 (/menu /status /bind /help)
-    │     → Gateway 直接处理 → 回复
+    ├── Command (/menu /status /bind /help)
+    │     → Gateway handles directly → reply
     │
-    └── 非命令 (任何文本)
+    └── Non-command (any text)
           │
           ▼
-    Gateway 启动 Coordinator Session:
-      run claude CLI + 注入 context (项目状态/记忆/活跃任务)
+    Gateway starts Coordinator Session:
+      run claude CLI + inject context (project status/memory/active tasks)
           │
           ▼
     Coordinator (Claude CLI session):
-      1. 理解用户意图
-      2. 查询 governance API (节点状态/记忆)
-      3. 决策:
-         ├── 直接回答 → 通过 Gateway 回复用户
-         ├── 需要执行代码 → 创建 task {role:"dev"} → 通知用户
-         └── 需要确认 → 追问用户
-      4. 如创建了 task:
+      1. Understand user intent
+      2. Query governance API (node status/memory)
+      3. Decision:
+         ├── Direct answer → reply to user via Gateway
+         ├── Need code execution → create task {role:"dev"} → notify user
+         └── Need confirmation → ask user follow-up
+      4. If task was created:
           │
           ▼
-    Executor (宿主机, 常驻进程):
-      监听 pending/ → claim → run_claude/run_codex
-      → 结果写回 + Redis 通知
+    Executor (host machine, resident process):
+      Watch pending/ → claim → run_claude/run_codex
+      → Write results + Redis notification
           │
           ▼
-    Gateway 收到通知 → 启动新 Coordinator session 评估结果 → 回复用户
+    Gateway receives notification → start new Coordinator session to evaluate results → reply to user
 
-角色职责边界:
-  Gateway:     消息收发 + 命令处理 (不做决策、不创建task)
-  Coordinator: 对话 + 决策 + 任务编排 (不自己写代码)
-  Dev/Executor: 代码执行 (不和用户对话)
+Role responsibility boundaries:
+  Gateway:     Message send/receive + command handling (no decisions, no creating tasks)
+  Coordinator: Conversation + decisions + task orchestration (no writing code itself)
+  Dev/Executor: Code execution (no user conversation)
 ```
 
-## 四、Session Runtime 状态服务
+## 4. Session Runtime State Service
 
-### 4.1 为什么需要
+### 4.1 Why It's Needed
 
-Coordinator 不再是一个持续运行的 session，而是：
-- 每条消息可以触发一个新的处理流程
-- 多个角色（dev/tester/qa）可能同时在执行任务
-- 需要知道"谁在做什么"来决定下一步
+Coordinator is no longer a continuously running session, but rather:
+- Each message can trigger a new processing flow
+- Multiple roles (dev/tester/qa) may be executing tasks simultaneously
+- Need to know "who is doing what" to decide next steps
 
-### 4.2 数据模型
+### 4.2 Data Model
 
 ```json
 // Redis key: runtime:{project_id}
@@ -121,7 +121,7 @@ Coordinator 不再是一个持续运行的 session，而是：
     {
       "task_id": "task-xxx",
       "role": "dev",
-      "prompt": "为 L1.3 写测试",
+      "prompt": "Write tests for L1.3",
       "status": "running",
       "started_at": "2026-03-22T...",
       "backend": "claude"
@@ -136,7 +136,7 @@ Coordinator 不再是一个持续运行的 session，而是：
     }
   ],
   "context": {
-    "current_focus": "L1.3 测试补全",
+    "current_focus": "L1.3 test completion",
     "recent_messages": ["...last 20..."],
     "decisions": []
   },
@@ -148,70 +148,70 @@ Coordinator 不再是一个持续运行的 session，而是：
 
 ```
 GET  /api/runtime/{project_id}
-  → 完整运行时状态（活跃任务、待通知结果、上下文）
+  → Full runtime state (active tasks, pending notification results, context)
 
 POST /api/runtime/{project_id}/dispatch
-  → 派发任务（写 task 文件 + 更新 runtime 状态）
+  → Dispatch task (write task file + update runtime state)
   Body: {prompt, role, backend}
 
 POST /api/runtime/{project_id}/complete
-  → 标记任务完成（executor 回调）
+  → Mark task complete (executor callback)
   Body: {task_id, status, result}
 
 POST /api/runtime/{project_id}/notify
-  → 标记已通知用户（Gateway 回调）
+  → Mark user notified (Gateway callback)
   Body: {task_id}
 ```
 
-### 4.4 与现有组件的关系
+### 4.4 Relationship with Existing Components
 
 ```
-Session Runtime (新)
+Session Runtime (new)
     │
-    ├── 读写 Redis (runtime:{pid})     ← 实时状态
+    ├── Read/write Redis (runtime:{pid})     ← Real-time state
     │
-    ├── 调用 Task Registry (已有)       ← 持久化任务记录
+    ├── Calls Task Registry (existing)       ← Persistent task records
     │     create / claim / complete
     │
-    ├── 调用 Session Context (已有)     ← 跨消息上下文
+    ├── Calls Session Context (existing)     ← Cross-message context
     │     save / load
     │
-    ├── 调用 Agent Lifecycle (已有)     ← 角色租约管理
+    ├── Calls Agent Lifecycle (existing)     ← Role lease management
     │     register / heartbeat
     │
-    └── 被 Gateway + Executor 调用      ← 消息入口 + 执行出口
+    └── Called by Gateway + Executor         ← Message entry + execution exit
 ```
 
-## 五、Gateway 改造（v5.1 修正）
+## 5. Gateway Refactoring (v5.1 Correction)
 
-> **v5.1 关键修正**：Gateway 不再分类 query/task/chat。
-> 所有非命令消息统一转给 Coordinator 处理。
+> **v5.1 key correction**: Gateway no longer classifies query/task/chat.
+> All non-command messages uniformly forwarded to Coordinator for processing.
 
-### 5.1 消息路由（简化）
+### 5.1 Message Routing (Simplified)
 
 ```python
 def handle_message(chat_id, text, route):
-    """Gateway 消息路由 — 只区分命令和非命令"""
+    """Gateway message routing — only distinguishes commands from non-commands"""
     if text.startswith("/"):
-        handle_command(chat_id, text)  # /menu /status /bind 等
+        handle_command(chat_id, text)  # /menu /status /bind etc.
         return
 
-    # 非命令 → 全部转给 Coordinator
+    # Non-command → all forwarded to Coordinator
     forward_to_coordinator(chat_id, text, route)
 ```
 
-### 5.2 Coordinator 触发
+### 5.2 Coordinator Triggering
 
 ```python
 def forward_to_coordinator(chat_id, text, route):
-    """启动 Coordinator CLI session 处理用户消息"""
+    """Start Coordinator CLI session to process user message"""
     project_id = route["project_id"]
     token = route["token"]
 
-    # 1. 组装 context
-    context = assemble_context(project_id, token)  # 项目状态+记忆+活跃任务
+    # 1. Assemble context
+    context = assemble_context(project_id, token)  # Project status+memory+active tasks
 
-    # 2. 启动 Claude CLI session
+    # 2. Start Claude CLI session
     result = run_coordinator_session(
         message=text,
         context=context,
@@ -219,33 +219,33 @@ def forward_to_coordinator(chat_id, text, route):
         token=token,
     )
 
-    # 3. 回复用户
+    # 3. Reply to user
     send_text(chat_id, result["reply"])
 
-    # 注意: Coordinator 内部可能创建了 task
-    # task 完成后由 Executor 通知 → Gateway → 新 Coordinator session 评估
+    # Note: Coordinator may have created tasks internally
+    # After task completion, Executor notifies → Gateway → new Coordinator session evaluates
 ```
 
-### 5.3 职责边界（硬约束）
+### 5.3 Responsibility Boundary (Hard Constraints)
 
 ```
-Gateway 可以做:
-  ✅ 处理 /command
-  ✅ 转发消息给 Coordinator
-  ✅ 发送 Coordinator 的回复
-  ✅ 发送 task 完成通知
+Gateway CAN do:
+  ✅ Handle /command
+  ✅ Forward messages to Coordinator
+  ✅ Send Coordinator's replies
+  ✅ Send task completion notifications
 
-Gateway 不可以做:
-  ❌ 分类消息为 query/task/chat
-  ❌ 直接创建 task 文件
-  ❌ 直接调 governance API 回答查询
-  ❌ 做任何决策
+Gateway CANNOT do:
+  ❌ Classify messages as query/task/chat
+  ❌ Directly create task files
+  ❌ Directly call governance API to answer queries
+  ❌ Make any decisions
 ```
 
-### 5.3 结果通知
+### 5.3 Result Notification
 
 ```python
-# Gateway 订阅 Redis Pub/Sub: task.completed
+# Gateway subscribes to Redis Pub/Sub: task.completed
 def on_task_completed(payload):
     task_id = payload["task_id"]
     project_id = payload["project_id"]
@@ -254,38 +254,38 @@ def on_task_completed(payload):
     route = get_route_by_project(project_id)
     if route:
         chat_id = route["chat_id"]
-        send_text(chat_id, f"任务完成: {result}")
+        send_text(chat_id, f"Task completed: {result}")
 
-    # 更新 runtime
+    # Update runtime
     update_runtime(project_id, complete_task=task_id)
 ```
 
-## 六、Executor 改造
+## 6. Executor Refactoring
 
-### 6.1 现有能力（直接复用）
+### 6.1 Existing Capabilities (Direct Reuse)
 
 ```
-agent/executor.py        → 监听 pending/ 目录
+agent/executor.py        → Watch pending/ directory
 agent/backends.py         → run_claude / run_codex / run_pipeline
-agent/task_state.py       → 任务状态追踪
-agent/task_accept.py      → 结果处理
+agent/task_state.py       → Task state tracking
+agent/task_accept.py      → Result processing
 
-已解决的坑:
-  - Windows stdin 传 prompt (不用命令行参数)
-  - 剥离 CLAUDECODE 环境变量防嵌套拒绝
-  - 剥离 ANTHROPIC_API_KEY 防 OAuth 失效
-  - git diff 执行前快照
-  - noop 检测 + 重试
-  - 超时处理 + 重试
+Resolved issues:
+  - Windows stdin passes prompt (not command line args)
+  - Strip CLAUDECODE env var to prevent nested rejection
+  - Strip ANTHROPIC_API_KEY to prevent OAuth failure
+  - git diff snapshot before execution
+  - Noop detection + retry
+  - Timeout handling + retry
 ```
 
-### 6.2 新增：执行完成通知
+### 6.2 New: Execution Completion Notification
 
 ```python
-# executor.py 完成任务后，发 Redis 通知
+# After executor.py completes task, send Redis notification
 def on_task_done(task_id, result):
-    # 已有: 写结果到 results/
-    # 新增: 发 Redis 通知
+    # Existing: write results to results/
+    # New: send Redis notification
     redis.publish("task:completed", {
         "task_id": task_id,
         "project_id": result.get("project_id"),
@@ -294,127 +294,127 @@ def on_task_done(task_id, result):
     })
 ```
 
-## 七、项目绑定与切换
+## 7. Project Binding and Switching
 
 ```
-用户 /menu:
-┌──────────────────────────┐
-│ 当前: amingClaw           │
-│ 运行中: 1 个任务          │  ← 从 runtime 读取
-│                          │
-│ [>> amingClaw (1任务)]    │
-│ [   toolboxClient (空闲)] │
-│                          │
-│ [项目状态] [切换]         │
-└──────────────────────────┘
+User /menu:
+┌─────────────────────────────────┐
+│ Current: amingClaw               │
+│ Running: 1 task                  │  ← Read from runtime
+│                                  │
+│ [>> amingClaw (1 task)]          │
+│ [   toolboxClient (idle)]        │
+│                                  │
+│ [Project Status] [Switch]        │
+└─────────────────────────────────┘
 
-切换流程:
-  1. 保存 amingClaw 上下文
-  2. 更新路由 → toolboxClient
-  3. 加载 toolboxClient 上下文 + runtime
-  4. amingClaw 的运行中任务不中断
-     → 完成后通知 amingClaw 的 runtime
-     → 但用户在 toolboxClient，暂不推送
-     → 切回 amingClaw 时看到 "有 1 个任务已完成"
+Switch flow:
+  1. Save amingClaw context
+  2. Update route → toolboxClient
+  3. Load toolboxClient context + runtime
+  4. amingClaw's running tasks are not interrupted
+     → After completion, notify amingClaw's runtime
+     → But user is on toolboxClient, don't push yet
+     → When switching back to amingClaw, see "1 task completed"
 ```
 
-## 八、角色上下文隔离
+## 8. Role Context Isolation
 
 ```
-每个角色独立上下文:
+Each role has independent context:
 
-context:snapshot:amingClaw              → Coordinator 上下文
-context:snapshot:amingClaw:dev          → Dev 工作上下文
-context:snapshot:amingClaw:tester       → Tester 上下文
-context:snapshot:amingClaw:qa           → QA 上下文
+context:snapshot:amingClaw              → Coordinator context
+context:snapshot:amingClaw:dev          → Dev work context
+context:snapshot:amingClaw:tester       → Tester context
+context:snapshot:amingClaw:qa           → QA context
 
-Coordinator 上下文:
+Coordinator context:
   {focus, active_tasks, recent_messages, decisions}
 
-Dev 上下文:
+Dev context:
   {current_task, files_modified, code_decisions, blocked_on}
 
-Tester 上下文:
+Tester context:
   {test_results, coverage_data, failed_tests}
 
-QA 上下文:
+QA context:
   {verified_nodes, review_notes, blocked_nodes}
 ```
 
-## 九、Docker Compose (v5)
+## 9. Docker Compose (v5)
 
 ```yaml
 services:
-  nginx:             # 反向代理 (:40000)
-  governance:        # 规则+事件+runtime (:40006)
-  telegram-gateway:  # 消息+路由+分类+派发 (:40010)
-  dbservice:         # 记忆层 (:40002)
-  redis:             # 缓存/通信 (:6379→40079)
+  nginx:             # Reverse proxy (:40000)
+  governance:        # Rules+events+runtime (:40006)
+  telegram-gateway:  # Messages+routing+classification+dispatch (:40010)
+  dbservice:         # Memory layer (:40002)
+  redis:             # Cache/communication (:6379→40079)
 
-# 不在 Docker 里:
-#   executor         → 宿主机常驻，监听 task 文件
-#   claude/codex CLI → 宿主机，executor 调用
+# Not in Docker:
+#   executor         → Host machine resident, watches task files
+#   claude/codex CLI → Host machine, called by executor
 ```
 
-**去掉的组件：**
-- ~~Scheduled Task (telegram-handler-*)~~ → Gateway 直接处理
-- ~~Message Worker~~ → 不需要
-- ~~ChatProxy~~ → 不需要（Gateway 直接 polling）
+**Removed components:**
+- ~~Scheduled Task (telegram-handler-*)~~ → Gateway handles directly
+- ~~Message Worker~~ → Not needed
+- ~~ChatProxy~~ → Not needed (Gateway polls directly)
 
-## 十、端到端流程示例
+## 10. End-to-End Flow Examples
 
-### 示例 1：查询
+### Example 1: Query
 
 ```
-用户: "amingClaw 多少个节点？"
-  → Gateway 收到 → classify: query
+User: "How many nodes does amingClaw have?"
+  → Gateway receives → classify: query
   → GET /api/wf/amingClaw/summary
-  → 回复: "68 节点, 68 qa_pass"
-  → 耗时: <1秒
+  → Reply: "68 nodes, 68 qa_pass"
+  → Duration: <1 second
 ```
 
-### 示例 2：短任务
+### Example 2: Short Task
 
 ```
-用户: "跑一下测试"
-  → Gateway 收到 → classify: task
-  → 写 task 文件 → 回复 "执行中..."
+User: "Run the tests"
+  → Gateway receives → classify: task
+  → Write task file → reply "Executing..."
   → Executor: run_claude("python -m unittest discover...")
-  → 30秒后完成 → Redis notify
-  → Gateway: "测试完成: 1038 ran, 1031 passed"
+  → Completes after 30 seconds → Redis notify
+  → Gateway: "Tests complete: 1038 ran, 1031 passed"
 ```
 
-### 示例 3：长任务
+### Example 3: Long Task
 
 ```
-用户: "帮我实现 L9.7 deploy 前置检查"
-  → Gateway: task 文件 → "执行中..."
-  → Executor: run_claude(prompt) → 可能跑 5-10 分钟
-  → 期间用户发新消息: "当前任务进度？"
-    → Gateway: 查 runtime → "task-xxx 运行中 (5分钟)"
-  → 任务完成 → "实现完成: deploy-governance.sh 已更新"
+User: "Help me implement L9.7 deploy pre-check"
+  → Gateway: task file → "Executing..."
+  → Executor: run_claude(prompt) → may run 5-10 minutes
+  → Meanwhile user sends new message: "Current task progress?"
+    → Gateway: query runtime → "task-xxx running (5 minutes)"
+  → Task complete → "Implementation done: deploy-governance.sh updated"
 ```
 
-### 示例 4：人工介入
+### Example 4: Human Intervention
 
 ```
-用户: "帮我发布 amingClaw"
-  → Gateway: classify: task + 危险关键词 "发布"
-  → 回复: "[需要人工确认] 发布操作需要确认，请回复'确认发布'"
-  → 用户: "确认发布"
+User: "Help me release amingClaw"
+  → Gateway: classify: task + dangerous keyword "release"
+  → Reply: "[Human confirmation needed] Release operation requires confirmation, reply 'confirm release'"
+  → User: "confirm release"
   → Gateway: POST /api/wf/amingClaw/release-gate
-  → 通过 → "发布门禁通过 ✅"
+  → Passed → "Release gate passed ✅"
 ```
 
-## 十一、实施路线
+## 11. Implementation Roadmap
 
-| 步骤 | 内容 | 依赖 |
-|------|------|------|
-| 1 | Gateway 消息分类器 | 无 |
-| 2 | Gateway 任务派发 (写 task 文件) | 1 |
-| 3 | Runtime 状态 API | governance |
-| 4 | Executor 完成通知 (Redis pub) | executor.py |
-| 5 | Gateway 结果通知监听 | 4 |
-| 6 | /menu 显示运行时状态 | 3 |
-| 7 | 项目切换 context 自动保存/加载 | session_context |
-| 8 | 角色上下文隔离 | 7 |
+| Step | Content | Dependencies |
+|------|---------|-------------|
+| 1 | Gateway message classifier | None |
+| 2 | Gateway task dispatch (write task files) | 1 |
+| 3 | Runtime state API | governance |
+| 4 | Executor completion notification (Redis pub) | executor.py |
+| 5 | Gateway result notification listener | 4 |
+| 6 | /menu display runtime status | 3 |
+| 7 | Project switch context auto save/load | session_context |
+| 8 | Role context isolation | 7 |

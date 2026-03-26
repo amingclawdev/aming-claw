@@ -1,128 +1,128 @@
-# Aming Claw 部署指南 — 开发→生产切换
+# Aming Claw Deployment Guide — Development to Production Switch
 
-> **2026-03-26 更新：** 旧 Telegram bot 系统（coordinator.py, executor.py, backends.py 等 20 个模块）已完全移除。部署流程统一使用 governance + gateway + executor-gateway。
+> **2026-03-26 Update:** The legacy Telegram bot system (coordinator.py, executor.py, backends.py and 20 other modules) has been completely removed. Deployment now uses governance + gateway + executor-gateway exclusively.
 
-## 一、服务架构
+## 1. Service Architecture
 
 ```
-Docker 容器 (docker-compose.governance.yml)
-├── nginx          :40000  反代
-├── governance     :40006  规则引擎
-├── telegram-gw    :40010  消息网关
-├── dbservice      :40002  记忆服务
-└── redis          :40079  缓存/队列
+Docker Containers (docker-compose.governance.yml)
+├── nginx          :40000  Reverse proxy
+├── governance     :40006  Rule engine
+├── telegram-gw    :40010  Message gateway
+├── dbservice      :40002  Memory service
+└── redis          :40079  Cache/queue
 
-宿主机
-└── executor-gateway :8090  任务执行 (FastAPI)
+Host Machine
+└── executor-gateway :8090  Task execution (FastAPI)
 ```
 
-## 二、完整部署流程
+## 2. Complete Deployment Process
 
-### 2.1 首次部署
+### 2.1 First-Time Deployment
 
 ```bash
 cd C:\Users\z5866\Documents\amingclaw\aming_claw
 
-# 1. 启动所有 Docker 服务
+# 1. Start all Docker services
 docker compose -f docker-compose.governance.yml up -d
 
-# 2. 等待所有服务 healthy
+# 2. Wait for all services to become healthy
 docker compose -f docker-compose.governance.yml ps
 
-# 3. 注册 dbservice domain pack (不持久化，每次重启需要)
+# 3. Register dbservice domain pack (not persisted, required after every restart)
 curl -s -X POST http://localhost:40002/knowledge/register-pack \
   -H "Content-Type: application/json" \
   -d '{"domain":"development","types":{"architecture":{"durability":"permanent","conflictPolicy":"replace","description":"Architecture decisions"},"pitfall":{"durability":"permanent","conflictPolicy":"append","description":"Known pitfalls"},"pattern":{"durability":"permanent","conflictPolicy":"replace","description":"Code patterns"},"workaround":{"durability":"durable","conflictPolicy":"replace","description":"Workarounds"},"session_summary":{"durability":"durable","conflictPolicy":"replace","description":"Session summaries"},"verify_decision":{"durability":"permanent","conflictPolicy":"append","description":"Verify decisions"}}}'
 
-# 4. 初始化项目 (首次)
+# 4. Initialize project (first time)
 python init_project.py
-# 输入项目名和密码 → 拿到 coordinator token
+# Enter project name and password → Obtain coordinator token
 
-# 5. 导入验收图
+# 5. Import acceptance graph
 curl -X POST http://localhost:40000/api/wf/{project_id}/import-graph \
   -H "X-Gov-Token: {token}" \
   -d '{"md_path":"/workspace/docs/aming-claw-acceptance-graph.md"}'
 
-# 6. 启动 executor-gateway (宿主机)
+# 6. Start executor-gateway (host machine)
 cd agent && python -m executor_gateway &
-# executor-gateway 监听 :8090，executor_api.py 监听 :40100
+# executor-gateway listens on :8090, executor_api.py listens on :40100
 
-# 7. Telegram 绑定
-# 在 Telegram 给 bot 发: /bind {coordinator_token}
+# 7. Telegram binding
+# Send to bot in Telegram: /bind {coordinator_token}
 ```
 
-### 2.2 代码更新部署 (日常)
+### 2.2 Code Update Deployment (Routine)
 
 ```bash
-# 方式 A: 快速部署 (5-10s 停机，Agent 自动重试)
+# Method A: Quick deploy (5-10s downtime, Agent auto-retries)
 docker compose -f docker-compose.governance.yml up -d --build
 docker compose -f docker-compose.governance.yml restart nginx
 
-# 方式 B: 零停机部署 (通过脚本)
+# Method B: Zero-downtime deploy (via script)
 GOV_COORDINATOR_TOKEN=gov-xxx ./deploy-governance.sh
 
-# 方式 C: 只更新单个服务
+# Method C: Update a single service only
 docker compose -f docker-compose.governance.yml up -d --build governance
 docker compose -f docker-compose.governance.yml up -d --build telegram-gateway
 ```
 
-### 2.3 开发环境 → 生产环境切换
+### 2.3 Development Environment to Production Switch
 
 ```
-开发流程:
-  1. 修改代码
-  2. 建验收节点 (如果是新功能)
-  3. 导入验收图
-  4. 运行测试
-  5. 跑 coverage-check
+Development Flow:
+  1. Modify code
+  2. Create acceptance node (if new feature)
+  3. Import acceptance graph
+  4. Run tests
+  5. Run coverage-check
   6. verify-update (testing → t2_pass → qa_pass)
-  7. verify_loop 自检
-  8. 部署
+  7. verify_loop self-check
+  8. Deploy
 
-部署检查清单:
-  □ verify_loop 全绿 (7/7 pass)
+Deployment Checklist:
+  □ verify_loop all green (7/7 pass)
   □ coverage-check pass
-  □ 所有新节点 qa_pass
-  □ 文档已更新 (/api/docs)
-  □ 记忆已写入 (dbservice)
+  □ All new nodes qa_pass
+  □ Documentation updated (/api/docs)
+  □ Memory written (dbservice)
   □ git commit
 ```
 
-## 工作区路由配置
+## Workspace Routing Configuration
 
-> **注意 (2026-03-26)：** 旧 workspace_registry.py 已删除。以下工作区路由说明仅作历史参考，当前由 governance API 统一管理项目路由。
+> **Note (2026-03-26):** The legacy workspace_registry.py has been deleted. The following workspace routing documentation is for historical reference only; project routing is now managed uniformly by the governance API.
 
-### project_id 归一化
+### project_id Normalization
 
-所有 project_id 变体自动归一化为 kebab-case：
+All project_id variants are automatically normalized to kebab-case:
 
-| 输入 | 归一化 |
+| Input | Normalized |
 |------|--------|
 | `amingClaw` | `aming-claw` |
 | `aming_claw` | `aming-claw` |
 | `toolBoxClient` | `tool-box-client` |
 
-### 自动注册
+### Auto-Registration
 
-Executor 启动时自动注册当前工作目录，并对已有条目补全 `project_id`（从 label 归一化）。
+On startup, the Executor automatically registers the current working directory and backfills `project_id` for existing entries (normalized from label).
 
-### 手动注册额外工作区
+### Manually Registering Additional Workspaces
 
-如果需要管理多个项目（如 toolBoxClient + amingClaw），在 Executor 启动后注册：
+If you need to manage multiple projects (e.g., toolBoxClient + amingClaw), register after Executor startup:
 
 ```bash
-# 查看当前注册表
+# View current registry
 curl http://localhost:40100/workspaces
 
-# 查询某项目对应的工作区
+# Query the workspace for a specific project
 curl "http://localhost:40100/workspaces/resolve?project_id=amingClaw"
 ```
 
-或通过 Python（**已废弃**，workspace_registry.py 已删除）：
+Or via Python (**deprecated**, workspace_registry.py has been deleted):
 
 ```python
-# ⚠ 以下代码已不可用，workspace_registry.py 已于 2026-03-26 删除
-# 工作区管理现通过 governance API 完成
+# ⚠ The following code is no longer available; workspace_registry.py was deleted on 2026-03-26
+# Workspace management is now done via the governance API
 # cd agent
 # python -c "
 # from pathlib import Path
@@ -132,114 +132,114 @@ curl "http://localhost:40100/workspaces/resolve?project_id=amingClaw"
 # "
 ```
 
-### 路由优先级
+### Routing Priority
 
-任务路由到工作区的优先级：
+Priority for routing tasks to workspaces:
 
-1. `target_workspace_id` — 精确 ID
-2. `target_workspace` — 标签匹配
-3. **`project_id`** — 归一化项目 ID（推荐）
-4. `@workspace:<label>` 前缀
-5. 默认工作区 fallback
+1. `target_workspace_id` — Exact ID
+2. `target_workspace` — Label match
+3. **`project_id`** — Normalized project ID (recommended)
+4. `@workspace:<label>` prefix
+5. Default workspace fallback
 
-### Redis Stream 审计
+### Redis Stream Audit
 
-每次 AI session 的 prompt + result 记录在 Redis Stream：
+Each AI session's prompt + result is recorded in a Redis Stream:
 
 ```bash
-# 查看某 session 的完整审计
+# View the full audit for a specific session
 redis-cli -p 40079 XRANGE ai:prompt:ai-dev-xxx - +
 ```
 
-## 三、重启恢复清单
+## 3. Restart Recovery Checklist
 
-电脑重启后需要恢复的步骤：
+Steps to restore after a computer restart:
 
 ```bash
-# 1. 启动 Docker 服务
+# 1. Start Docker services
 cd C:\Users\z5866\Documents\amingclaw\aming_claw
 docker compose -f docker-compose.governance.yml up -d
 
-# 2. 等待 healthy
+# 2. Wait for healthy status
 docker compose -f docker-compose.governance.yml ps
-# 确认所有服务 healthy
+# Confirm all services are healthy
 
-# 3. 重启 nginx (解决 upstream 解析问题)
+# 3. Restart nginx (resolve upstream resolution issues)
 docker compose -f docker-compose.governance.yml restart nginx
 
-# 4. 注册 dbservice domain pack
+# 4. Register dbservice domain pack
 curl -s -X POST http://localhost:40002/knowledge/register-pack \
   -H "Content-Type: application/json" \
   -d '{"domain":"development","types":{"architecture":{"durability":"permanent","conflictPolicy":"replace","description":"Architecture decisions"},"pitfall":{"durability":"permanent","conflictPolicy":"append","description":"Known pitfalls"},"pattern":{"durability":"permanent","conflictPolicy":"replace","description":"Code patterns"},"workaround":{"durability":"durable","conflictPolicy":"replace","description":"Workarounds"},"session_summary":{"durability":"durable","conflictPolicy":"replace","description":"Session summaries"},"verify_decision":{"durability":"permanent","conflictPolicy":"append","description":"Verify decisions"}}}'
 
-# 5. 启动 executor-gateway (宿主机)
+# 5. Start executor-gateway (host machine)
 cd agent && python -m executor_gateway &
 
-# 6. 验证服务
+# 6. Verify services
 curl -s http://localhost:40000/api/health     # governance
 curl -s http://localhost:40002/health          # dbservice
 curl -s http://localhost:40000/nginx-health    # nginx
 curl -s http://localhost:40100/health          # executor
 ```
 
-## 四、数据持久化
+## 4. Data Persistence
 
-| 数据 | 位置 | 重启后 |
-|------|------|--------|
-| 项目/节点状态 | Docker volume: governance-data (SQLite) | ✅ 保留 |
-| DAG 图 | Docker volume: governance-data (graph.json) | ✅ 保留 |
-| 审计日志 | Docker volume: governance-data (JSONL) | ✅ 保留 |
-| 记忆数据 | Docker volume: memory-data (SQLite) | ✅ 保留 |
-| Redis 缓存 | Docker volume: redis-data (AOF) | ✅ 保留 |
-| Coordinator token | 不过期 | ✅ 有效 |
-| **dbservice domain pack** | **内存** | **❌ 需要重新注册** |
-| **executor-gateway 进程** | **宿主机** | **❌ 需要手动启动** |
-| **Telegram chat route** | **Redis** | **✅ 保留 (AOF)** |
+| Data | Location | After Restart |
+|------|----------|---------------|
+| Project/node state | Docker volume: governance-data (SQLite) | ✅ Retained |
+| DAG graph | Docker volume: governance-data (graph.json) | ✅ Retained |
+| Audit logs | Docker volume: governance-data (JSONL) | ✅ Retained |
+| Memory data | Docker volume: memory-data (SQLite) | ✅ Retained |
+| Redis cache | Docker volume: redis-data (AOF) | ✅ Retained |
+| Coordinator token | Does not expire | ✅ Valid |
+| **dbservice domain pack** | **In-memory** | **❌ Must re-register** |
+| **executor-gateway process** | **Host machine** | **❌ Must start manually** |
+| **Telegram chat route** | **Redis** | **✅ Retained (AOF)** |
 
-## 五、回滚
+## 5. Rollback
 
 ```bash
-# 回滚到上一个版本
+# Roll back to the previous version
 docker tag aming_claw-governance:rollback aming_claw-governance:latest
 docker compose -f docker-compose.governance.yml up -d governance
 docker compose -f docker-compose.governance.yml restart nginx
 
-# 查看回滚审计
+# View rollback audit
 curl -s http://localhost:40000/api/audit/amingClaw/log?limit=10
 ```
 
-## 六、监控
+## 6. Monitoring
 
 ```bash
-# 服务健康
+# Service health
 curl http://localhost:40000/api/health
 curl http://localhost:40000/nginx-health
 curl http://localhost:40002/health
 
-# 节点状态
+# Node status
 curl http://localhost:40000/api/wf/amingClaw/summary -H "X-Gov-Token: {token}"
 
-# 运行时
+# Runtime
 curl http://localhost:40000/api/runtime/amingClaw -H "X-Gov-Token: {token}"
 
-# 审计日志
+# Audit logs
 curl http://localhost:40000/api/audit/amingClaw/log?limit=20 -H "X-Gov-Token: {token}"
 ```
 
-## 七、Executor API (:40100)
+## 7. Executor API (:40100)
 
-executor_api.py 在宿主机运行时暴露 HTTP API，支持监控和介入（注意：不再依赖旧 executor.py 或 workspace_registry.py）：
+executor_api.py exposes an HTTP API when running on the host machine, supporting monitoring and intervention (note: no longer depends on the legacy executor.py or workspace_registry.py):
 
 ```
-GET  /health              — 健康检查
-GET  /status              — 运行状态 (pending/processing/sessions)
-GET  /sessions            — 活跃 AI sessions
-GET  /tasks               — 任务列表 (支持 ?project_id=&status= 过滤)
-GET  /trace/{trace_id}    — 完整 trace 链路
-GET  /traces              — 最近 trace 列表 (支持 ?project_id=&limit=)
-POST /coordinator/chat    — 直接对话 Coordinator (绕过 Telegram)
-POST /cleanup-orphans     — 清理僵尸 AI 进程
-POST /tasks/create        — 幂等创建任务文件 (由 Orchestrator 调用)
+GET  /health              — Health check
+GET  /status              — Runtime status (pending/processing/sessions)
+GET  /sessions            — Active AI sessions
+GET  /tasks               — Task list (supports ?project_id=&status= filtering)
+GET  /trace/{trace_id}    — Full trace chain
+GET  /traces              — Recent trace list (supports ?project_id=&limit=)
+POST /coordinator/chat    — Direct conversation with Coordinator (bypasses Telegram)
+POST /cleanup-orphans     — Clean up orphaned AI processes
+POST /tasks/create        — Idempotent task file creation (called by Orchestrator)
 ```
 
 ### POST /tasks/create — Idempotent Task Creation
@@ -264,47 +264,47 @@ curl -X POST http://localhost:40100/tasks/create \
 # {"status": "exists", "task_id": "task-abc123", "stage": "processing"}
 ```
 
-## 八、Git Worktree 工作流
+## 8. Git Worktree Workflow
 
-Dev AI 在隔离 worktree 中工作，不影响主工作目录：
+Dev AI works in an isolated worktree without affecting the main working directory:
 
 ```bash
-# Executor 自动执行:
+# Executor auto-executes:
 git worktree add -b dev/task-xxx .worktrees/dev-task-xxx
-# Dev AI 在 .worktrees/dev-task-xxx/ 内操作
-# 完成后:
+# Dev AI operates inside .worktrees/dev-task-xxx/
+# After completion:
 git worktree remove .worktrees/dev-task-xxx --force
-# 分支保留: dev/task-xxx (供 review)
+# Branch retained: dev/task-xxx (for review)
 
-# 合并到 main:
+# Merge to main:
 git merge dev/task-xxx --no-ff
 git branch -d dev/task-xxx
 ```
 
-## 九、merge-and-deploy 流程
+## 9. merge-and-deploy Flow
 
 ```bash
 bash scripts/merge-and-deploy.sh dev/task-xxx
 
-# 自动执行:
+# Auto-executes:
 # 1. git merge dev/task-xxx → main
-# 2. pre-deploy-check.sh (节点/coverage/docs/gatekeeper)
+# 2. pre-deploy-check.sh (nodes/coverage/docs/gatekeeper)
 # 3. docker compose up -d --build
 # 4. restart nginx
 # 5. health check
 # 6. sync governance data: prod → dev
 # 7. restart executor
-# 8. gateway 通知
+# 8. gateway notification
 ```
 
-## 十、已知问题
+## 10. Known Issues
 
-1. **dbservice domain pack 不持久化** — 容器重启后丢失，startup.sh 中自动注册。
-2. **nginx healthcheck 偶尔 unhealthy** — 重启 nginx 解决。
-3. **executor-gateway 是宿主机进程** — 不在 Docker 里，需要手动管理生命周期。
-4. **观察者和 executor-gateway 并行操作** — 使用 git worktree 隔离。
+1. **dbservice domain pack is not persisted** — Lost after container restart; auto-registered in startup.sh.
+2. **nginx healthcheck occasionally unhealthy** — Restart nginx to resolve.
+3. **executor-gateway is a host machine process** — Not inside Docker; lifecycle must be managed manually.
+4. **Observer and executor-gateway operate in parallel** — Isolated via git worktree.
 
-## 十一、Executor Safety & Reliability Mechanisms
+## 11. Executor Safety & Reliability Mechanisms
 
 ### Orphan Cleanup Safety: `_EXECUTOR_SPAWNED_PIDS`
 
@@ -343,12 +343,12 @@ Task finishes → git worktree remove .worktrees/dev-task-xxx --force
 | `EXECUTOR_API_URL` | `http://localhost:40100` | Base URL for the Executor HTTP API. Used by Orchestrator and other internal callers to reach the Executor. Override when running Executor on a non-default port. |
 
 ```bash
-# Example: extend timeout for large refactor tasks
+# Example: Extend timeout for large refactor tasks
 export AI_SESSION_TIMEOUT=1200
 
-# Example: Executor running on alternate port
+# Example: Executor running on an alternate port
 export EXECUTOR_API_URL=http://localhost:40200
 ```
 
-## 变更记录
-- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
+## Changelog
+- 2026-03-26: Legacy Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules); now using governance API exclusively

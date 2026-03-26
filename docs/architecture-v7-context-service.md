@@ -1,102 +1,102 @@
-# Aming Claw 架构方案 v7 — Context Service + 观察者 SOP
+# Aming Claw Architecture v7 — Context Service + Observer SOP
 
-> v6 → v7 核心变更：去掉 CLI `-p` 直传上下文，改为 Context Service 服务化。所有 AI session 的输入/输出通过结构化存储，实现全链路可审计、可 replay、可观察。
+> v6 → v7 core change: Removed CLI `-p` direct context passing, replaced with Context Service. All AI session input/output goes through structured storage, enabling full-chain auditing, replay, and observability.
 
-## 一、问题分析
+## 1. Problem Analysis
 
-### 旧架构的问题（已移除）
+### Problems with the Legacy Architecture (Removed)
 
-> 注意：旧的 Telegram bot 系统（bot_commands, coordinator, executor 等 20 个模块）已完全移除。
-> 上下文管理现在完全由 governance API (`/api/context/*`) 负责。
+> Note: The legacy Telegram bot system (bot_commands, coordinator, executor and 20 other modules) has been completely removed.
+> Context management is now entirely handled by the governance API (`/api/context/*`).
 
-以下是旧 CLI `-p` 模式曾存在的问题（已解决）：
+The following problems existed with the legacy CLI `-p` mode (now resolved):
 
-| 问题 | 影响 |
-|------|------|
-| 超长 prompt 被 shell 截断 | 复杂任务信息丢失 |
-| 上下文全塞一个字符串 | AI 容易忽略关键信息（如 target_files） |
-| 图片无法传递 | 多模态任务不可能 |
-| 过程不可审计 | 只有最终 stdout，中间推理丢失 |
-| 观察者看不到中间状态 | 失败时排查困难 |
-| 失败不可 replay | 输入没存，无法重现 |
+| Problem | Impact |
+|---------|--------|
+| Overly long prompts truncated by shell | Information loss on complex tasks |
+| All context stuffed into one string | AI easily ignores key info (e.g., target_files) |
+| Images cannot be passed | Multimodal tasks impossible |
+| Process not auditable | Only final stdout, intermediate reasoning lost |
+| Observer cannot see intermediate state | Difficult to debug failures |
+| Failures not replayable | Input not saved, cannot reproduce |
 
-### v7 方案：Context Service
+### v7 Solution: Context Service
 
 ```
-Executor → 写 Context 到 Redis → 启动 Claude CLI → Claude 从 API 读 Context
-         → AI 输出写回 Redis → Executor 读取 → 校验 → 执行
+Executor → Write Context to Redis → Start Claude CLI → Claude reads Context from API
+         → AI output written back to Redis → Executor reads → Validates → Executes
 ```
 
-## 二、系统架构
+## 2. System Architecture
 
-> 注意：旧的 `TaskOrchestrator`（在已删除的 executor.py 中）已被替换。
-> 现在由 governance server (port 40006) + executor-gateway (port 8090) + executor_api (port 40100) 协作完成。
+> Note: The legacy `TaskOrchestrator` (in the deleted executor.py) has been replaced.
+> Now handled collaboratively by governance server (port 40006) + executor-gateway (port 8090) + executor_api (port 40100).
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                     当前架构                                     │
+│                     Current Architecture                          │
 │                                                                │
 │  governance server (port 40006)                                │
 │    │  task registry, workflow, audit, context API               │
 │    │                                                           │
 │  telegram_gateway (port 40010)                                 │
-│    │  Telegram 消息路由                                         │
+│    │  Telegram message routing                                  │
 │    │                                                           │
 │  executor-gateway (FastAPI port 8090)                          │
-│    │  实际任务执行                                              │
+│    │  Actual task execution                                     │
 │    │                                                           │
 │  executor_api (port 40100)                                     │
-│    │  监控 API                                                  │
+│    │  Monitoring API                                            │
 │    │                                                           │
-│  Context 管理流程:                                              │
-│    ├── 1. 组装 Context → governance API /api/context/*          │
-│    ├── 2. 存储 Context → Redis + SQLite 审计表                  │
-│    ├── 3. 启动 AI Session → executor-gateway 调度               │
-│    ├── 4. AI 输出回写 → governance API                          │
-│    ├── 5. 校验 + 执行 → governance workflow                     │
-│    └── 6. 归档 → governance audit                              │
+│  Context management flow:                                       │
+│    ├── 1. Assemble Context → governance API /api/context/*      │
+│    ├── 2. Store Context → Redis + SQLite audit table            │
+│    ├── 3. Start AI Session → executor-gateway scheduling        │
+│    ├── 4. AI output writeback → governance API                  │
+│    ├── 5. Validate + execute → governance workflow              │
+│    └── 6. Archive → governance audit                           │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-## 三、Context Store 数据模型
+## 3. Context Store Data Model
 
-### Redis 结构（热数据，实时查询）
+### Redis Structure (Hot Data, Real-Time Queries)
 
 ```
-# Context 输入
+# Context input
 ctx:input:{session_id} = HASH {
     "role": "dev",
     "project_id": "amingClaw",
-    "prompt": "修改 gatekeeper.py...",
+    "prompt": "Modify gatekeeper.py...",
     "target_files": '["agent/governance/gatekeeper.py"]',
-    "prd": '{...}',                          # PM 的 PRD（如有）
-    "conversation_history": '[...]',          # 最近对话
-    "governance_summary": '{...}',            # 节点状态
-    "memories": '[...]',                      # 相关记忆
-    "git_status": '{...}',                   # 当前 git 状态
-    "image_paths": '[]',                      # 图片文件路径
-    "file_contents": '{...}',                # 关键文件内容片段
+    "prd": '{...}',                          # PM's PRD (if any)
+    "conversation_history": '[...]',          # Recent conversations
+    "governance_summary": '{...}',            # Node status
+    "memories": '[...]',                      # Related memories
+    "git_status": '{...}',                   # Current git status
+    "image_paths": '[]',                      # Image file paths
+    "file_contents": '{...}',                # Key file content snippets
     "created_at": "2026-03-23T..."
 }
 
-# Context 输出
+# Context output
 ctx:output:{session_id} = HASH {
     "status": "completed|failed|timeout",
     "stdout": "...",
     "stderr": "...",
-    "parsed_decision": '{...}',              # 解析后的结构化决策
-    "validation_result": '{...}',            # validator 结果
-    "executed_actions": '[...]',             # 实际执行的 actions
-    "rejected_actions": '[...]',             # 被拒绝的 actions
-    "evidence": '{...}',                     # 独立采集的证据
+    "parsed_decision": '{...}',              # Parsed structured decision
+    "validation_result": '{...}',            # Validator result
+    "executed_actions": '[...]',             # Actually executed actions
+    "rejected_actions": '[...]',             # Rejected actions
+    "evidence": '{...}',                     # Independently collected evidence
     "completed_at": "2026-03-23T..."
 }
 
-# TTL: 24h（活跃 session），归档后删除
+# TTL: 24h (active session), deleted after archiving
 ```
 
-### SQLite 审计表（冷数据，持久化）
+### SQLite Audit Table (Cold Data, Persistent)
 
 ```sql
 CREATE TABLE context_audit (
@@ -110,21 +110,21 @@ CREATE TABLE context_audit (
     prompt          TEXT NOT NULL,
     target_files    TEXT,            -- JSON array
     prd_json        TEXT,            -- PM PRD
-    context_json    TEXT NOT NULL,   -- 完整 context 快照
+    context_json    TEXT NOT NULL,   -- Complete context snapshot
     image_paths     TEXT,            -- JSON array
 
     -- Output
     ai_stdout       TEXT,
     ai_stderr       TEXT,
-    parsed_json     TEXT,            -- 解析后的决策
+    parsed_json     TEXT,            -- Parsed decision
 
     -- Validation
-    validation_json TEXT,            -- validator 结果
+    validation_json TEXT,            -- Validator result
     approved_actions TEXT,           -- JSON array
     rejected_actions TEXT,           -- JSON array
 
     -- Evidence
-    evidence_json   TEXT,            -- 独立采集的证据
+    evidence_json   TEXT,            -- Independently collected evidence
 
     -- Metadata
     status          TEXT NOT NULL,   -- pending|running|completed|failed
@@ -138,383 +138,385 @@ CREATE INDEX idx_ctx_session ON context_audit(session_id);
 CREATE INDEX idx_ctx_task ON context_audit(task_id);
 ```
 
-## 四、Executor API 新增端点
+## 4. Executor API New Endpoints
 
-### 观察者可查询的接口
+### Observer-Queryable Endpoints
 
 ```
-# 实时查看 AI session 的输入
+# View AI session input in real time
 GET /ctx/{session_id}/input
-返回: Context 输入的完整结构
+Returns: Complete structure of Context input
 
-# 实时查看 AI session 的输出
+# View AI session output in real time
 GET /ctx/{session_id}/output
-返回: AI 输出 + 校验结果
+Returns: AI output + validation results
 
-# 查看 session 完整链路
+# View complete session chain
 GET /ctx/{session_id}/trace
-返回: input → output → validation → execution → evidence 完整链路
+Returns: input → output → validation → execution → evidence full chain
 
-# 列出最近的 context sessions
+# List recent context sessions
 GET /ctx/list?project_id=amingClaw&role=dev&limit=10
-返回: 最近 session 列表
+Returns: Recent session list
 
-# Replay: 用同样的 input 重新运行
+# Replay: Re-run with the same input
 POST /ctx/{session_id}/replay
-返回: 新 session_id（用旧 input 重跑）
+Returns: New session_id (re-run with old input)
 
-# 对比两次运行
+# Compare two runs
 GET /ctx/diff?a={session_id_1}&b={session_id_2}
-返回: 两次运行的 input/output 差异
+Returns: Input/output differences between two runs
 ```
 
-### AI Session 可调用的接口
+### AI Session Callable Endpoints
 
 ```
-# AI 从 Context Service 读取完整上下文（替代 CLI -p）
+# AI reads full context from Context Service (replaces CLI -p)
 GET /ctx/{session_id}/prompt
-返回: 组装好的 prompt 文本（含角色指令+上下文+用户消息）
+Returns: Assembled prompt text (with role instructions + context + user message)
 
-# AI 上报中间状态（可选）
+# AI reports intermediate state (optional)
 POST /ctx/{session_id}/progress
-Body: {"phase": "coding", "percent": 50, "message": "修改了2个文件"}
+Body: {"phase": "coding", "percent": 50, "message": "Modified 2 files"}
 ```
 
-## 五、CLI 调用方式变更
+## 5. CLI Invocation Changes
 
-### 旧方式（已移除）
+### Legacy Method (Removed)
 
-> 旧的 executor.py 中的 CLI `-p` stdin 模式已随整个 bot 系统删除。
+> The CLI `-p` stdin mode from the old executor.py was deleted along with the entire bot system.
 
-### 当前方案: system-prompt-file（通过 executor-gateway）
+### Current Approach: system-prompt-file (via executor-gateway)
 ```python
-# 1. 写 context 到临时文件
+# 1. Write context to temporary file
 ctx_file = f"/tmp/ctx-{session_id}.md"
 with open(ctx_file, "w") as f:
     f.write(assembled_prompt)
 
-# 2. 同时存 Redis + SQLite（审计）
+# 2. Store in both Redis + SQLite (audit)
 context_store.save_input(session_id, context)
 
-# 3. 用 --system-prompt-file 传入
+# 3. Pass via --system-prompt-file
 process = subprocess.Popen(
     [claude_bin, "-p",
      "--system-prompt-file", ctx_file,
      "--output-format", "json",
-     prompt],  # 只传用户消息作为 prompt arg
+     prompt],  # Only pass user message as prompt arg
     stdout=subprocess.PIPE,
 )
 
-# 4. 收集输出
+# 4. Collect output
 stdout, _ = process.communicate(timeout=timeout_sec)
 
-# 5. 存输出到 Redis + SQLite
+# 5. Store output in Redis + SQLite
 context_store.save_output(session_id, stdout)
 ```
 
-### v7 方案 B: append-system-prompt（备选）
+### v7 Approach B: append-system-prompt (alternative)
 ```python
 process = subprocess.Popen(
     [claude_bin, "-p",
-     "--append-system-prompt", f"上下文已存储在 {session_id}，关键文件: {target_files}",
+     "--append-system-prompt", f"Context stored at {session_id}, key files: {target_files}",
      "--output-format", "json",
      prompt],
     stdout=subprocess.PIPE,
 )
 ```
 
-### v7 方案 C: API 读取（最完整但依赖网络）
+### v7 Approach C: API Read (most complete but depends on network)
 ```python
-# AI session 启动时在 prompt 里告诉它从 API 读上下文
+# Tell the AI session in its prompt to read context from the API on startup
 prompt = f"""
-请先调用 curl http://localhost:40100/ctx/{session_id}/prompt 获取完整上下文，
-然后根据上下文执行任务。
+First call curl http://localhost:40100/ctx/{session_id}/prompt to get the full context,
+then execute the task based on that context.
 """
 ```
 
-**推荐方案 A**：system-prompt-file 最稳定，不依赖网络，文件内容完整。同时将文件内容复制到 Redis/SQLite 做审计。
+**Recommended: Approach A**: system-prompt-file is most stable, does not depend on the network, and file contents are complete. File contents are also copied to Redis/SQLite for auditing.
 
-## 六、观察者系统
+## 6. Observer System
 
-### 6.1 角色定义
+### 6.1 Role Definition
 
 ```
-观察者 = 任务执行的全程监控者 + 报告生成者
-职责: 监控 → 根因分析 → 记录 → 生成报告 → 转译给用户
-不做: 直接改代码（除非系统无法自修时降级到手动模式）
+Observer = Full-process monitor of task execution + report generator
+Responsibilities: Monitor → Root cause analysis → Record → Generate report → Translate for user
+Does not: Directly modify code (unless system cannot self-repair, then downgrade to manual mode)
 ```
 
-### 6.2 两种观察者模式
+### 6.2 Two Observer Modes
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ 模式 A: 自动观察者（Executor 内置）                           │
+│ Mode A: Automatic Observer (built into Executor)            │
 │                                                             │
-│ 任务创建 → Executor 自动启动 observer session                │
-│   → 监控每个 phase (PM/Coord/Dev/Tester/QA/Gatekeeper)     │
-│   → 记录时间戳、输入输出、异常                               │
-│   → 任务完成 → 自动生成报告写入 dbservice                    │
-│   → 适合: 后台任务、无人值守                                 │
+│ Task created → Executor auto-starts observer session        │
+│   → Monitors each phase (PM/Coord/Dev/Tester/QA/Gatekeeper)│
+│   → Records timestamps, input/output, exceptions           │
+│   → Task completed → Auto-generates report to dbservice     │
+│   → Suitable for: background tasks, unattended operation    │
 │                                                             │
-│ 生命周期 = 任务生命周期                                      │
-│ 任务结束 → observer session 关闭                            │
+│ Lifecycle = task lifecycle                                   │
+│ Task ends → observer session closes                         │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
-│ 模式 B: 人工观察者（Claude Code session 接管）               │
+│ Mode B: Manual Observer (Claude Code session takeover)      │
 │                                                             │
-│ 用户开 Claude Code session                                  │
+│ User opens Claude Code session                              │
 │   → POST /observer/attach {task_id}                         │
-│   → 接管自动观察者（或新建）                                 │
-│   → 实时查看 context/trace/validation                       │
-│   → 可干预: 暂停/取消/重试 task                              │
-│   → 可分析: 5 Whys、质量评分                                │
-│   → 任务完成 → 补充人工分析到报告                            │
-│   → 适合: 重要任务、调试、迭代                               │
+│   → Takes over auto-observer (or creates new)               │
+│   → Real-time view of context/trace/validation              │
+│   → Can intervene: pause/cancel/retry task                  │
+│   → Can analyze: 5 Whys, quality scoring                    │
+│   → Task completed → Add manual analysis to report          │
+│   → Suitable for: critical tasks, debugging, iteration      │
 │                                                             │
-│ 生命周期 = Claude Code session 存续期间                      │
-│ 可监控多个任务，可跨任务对比                                  │
+│ Lifecycle = Duration of Claude Code session                  │
+│ Can monitor multiple tasks, compare across tasks            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 观察者注册 + 权限
+### 6.3 Observer Registration + Permissions
 
 ```
-观察者注册流程:
+Observer registration flow:
 
-自动模式:
-  Executor 启动任务时自动注册
+Auto mode:
+  Executor auto-registers when starting a task
   POST /api/role/assign {
     role: "observer",
     principal_id: "auto-observer-{task_id}",
     scope: ["read_ctx", "write_report"]
   }
 
-人工模式 (Claude Code session):
+Manual mode (Claude Code session):
   POST /observer/attach {task_id, session_type: "human"}
-  → 验证: 用户必须有 coordinator token
-  → 返回: observer_token + task 当前状态
-  → 接管: 自动观察者暂停，人工观察者接管
+  → Verify: user must have coordinator token
+  → Returns: observer_token + current task status
+  → Takeover: auto-observer pauses, manual observer takes over
 
-权限矩阵:
+Permission matrix:
   ┌──────────────────┬────────┬────────┬────────────────────────────────┐
-  │ 操作             │ 自动   │ 人工   │ 说明                           │
+  │ Operation        │ Auto   │ Manual │ Description                    │
   ├──────────────────┼────────┼────────┼────────────────────────────────┤
-  │ 读 /ctx/*        │ ✅     │ ✅     │ read + report + control        │
-  │ 读 /status       │ ✅     │ ✅     │                                │
-  │ 读 /traces       │ ✅     │ ✅     │                                │
-  │ 写 /report       │ ✅     │ ✅     │                                │
-  │ 暂停/取消 task   │ ❌     │ ✅     │ control（干预但不执行）         │
-  │ 下发新任务       │ ❌     │ ✅*    │ 通过 coordinator，不直接创建   │
-  │ 降级到手动模式   │ ❌     │ ✅**   │ 需要显式声明，审计记录         │
-  │ 修改代码         │ ❌     │ ❌***  │ 只在降级模式下按 workflow 执行  │
+  │ Read /ctx/*       │ ✅     │ ✅     │ read + report + control        │
+  │ Read /status      │ ✅     │ ✅     │                                │
+  │ Read /traces      │ ✅     │ ✅     │                                │
+  │ Write /report     │ ✅     │ ✅     │                                │
+  │ Pause/cancel task │ ❌     │ ✅     │ control (intervene, not exec)  │
+  │ Create new task   │ ❌     │ ✅*    │ Via coordinator, not directly   │
+  │ Downgrade to      │ ❌     │ ✅**   │ Requires explicit declaration, │
+  │  manual mode      │        │        │  audit recorded                │
+  │ Modify code       │ ❌     │ ❌***  │ Only in downgrade mode per     │
+  │                   │        │        │  workflow                      │
   └──────────────────┴────────┴────────┴────────────────────────────────┘
 
-  核心原则（codex 评审 R2 #3）:
-  观察者默认只做 read + report + control，不做 domain execution。
-  Coordinator 不该自己写代码，Observer 也不该默认自己修代码。
+  Core principle (codex review R2 #3):
+  Observer defaults to read + report + control only, no domain execution.
+  Coordinator should not write code itself, Observer should not default to fixing code itself.
 
-  * 下发任务: 观察者通过 /coordinator/chat 间接下发，
-    不直接创建 task 文件。保持角色分层。
-  ** 降级: 必须显式调用 POST /observer/downgrade
-    → 审计记录 "observer downgraded to manual"
-    → 从此刻起按 workflow 流程操作
-    → 任务完成后自动恢复为观察者模式
-  *** 修改代码: 降级后才允许，且必须:
-    1. 停 executor（防并发）
-    2. 建节点（如果没有）
-    3. 改代码
-    4. commit
+  * Create new task: Observer creates indirectly via /coordinator/chat,
+    does not create task files directly. Maintains role separation.
+  ** Downgrade: Must explicitly call POST /observer/downgrade
+    → Audit records "observer downgraded to manual"
+    → From this point, operates per workflow process
+    → Auto-restores to observer mode after task completion
+  *** Modify code: Only allowed after downgrade, and must:
+    1. Stop executor (prevent concurrency)
+    2. Create node (if none exists)
+    3. Modify code
+    4. Commit
     5. coverage-check + verify + verify_loop
-    6. 恢复观察者模式
+    6. Restore to observer mode
 ```
 
-### 6.3.1 系统 KPI（codex 评审 R2 #4）
+### 6.3.1 System KPIs (codex review R2 #4)
 
-观察者报告中必须包含以下核心指标，用于衡量"系统是否在变强"：
+Observer reports must include the following core metrics to measure "whether the system is getting stronger":
 
 ```
-系统健康 KPI:
+System Health KPIs:
 
-  首次通过率 (first_pass_rate):
-    = 不需要重试就通过的 task 数 / 总 task 数
-    目标: > 70%
+  First pass rate (first_pass_rate):
+    = Tasks that pass without retry / total tasks
+    Target: > 70%
 
-  平均重试轮数 (avg_retry_rounds):
-    = sum(retry_round) / 总 task 数
-    目标: < 1.5
+  Average retry rounds (avg_retry_rounds):
+    = sum(retry_round) / total tasks
+    Target: < 1.5
 
-  Validator 拦截率 (validator_reject_rate):
+  Validator rejection rate (validator_reject_rate):
     = rejected_actions / total_actions
-    目标: 稳定在 5-15%（太低=没拦住，太高=AI太差）
+    Target: Stable at 5-15% (too low = not catching issues, too high = AI too poor)
 
-  AI自报 vs Evidence 不一致率 (evidence_mismatch_rate):
-    = evidence 与 AI 自报不一致的 task 数 / 总 task 数
-    目标: < 10%
+  AI self-report vs Evidence mismatch rate (evidence_mismatch_rate):
+    = Tasks where evidence differs from AI self-report / total tasks
+    Target: < 10%
 
-  错改目标文件率 (wrong_file_rate):
-    = 改了非 target_files 文件的 task 数 / 总 dev_task 数
-    目标: < 5%（PM 修复后应下降）
+  Wrong file modification rate (wrong_file_rate):
+    = Tasks that modified non-target_files / total dev_tasks
+    Target: < 5% (should decrease after PM fixes)
 
-  手动降级率 (manual_downgrade_rate):
-    = 降级到手动修的次数 / 总迭代轮数
-    目标: 持续下降
+  Manual downgrade rate (manual_downgrade_rate):
+    = Number of downgrades to manual / total iteration rounds
+    Target: Continuously decreasing
 
-  Replay 成功复现率 (replay_success_rate):
-    = replay 结果一致的次数 / replay 总次数
-    目标: > 80%
+  Replay reproduction rate (replay_success_rate):
+    = Consistent replay results / total replays
+    Target: > 80%
 
-  PM 触发准确率 (pm_trigger_accuracy):
-    = PM 正确触发次数 / (应触发总次数)
-    目标: > 90%
+  PM trigger accuracy (pm_trigger_accuracy):
+    = Correct PM triggers / (total that should have triggered)
+    Target: > 90%
 ```
 
-### 6.4 统一任务入口
+### 6.4 Unified Task Entry Point
 
-Telegram 和 Claude Code 使用**同一个 API 创建任务**，只是通知方式不同：
+Telegram and Claude Code use **the same API to create tasks**, only the notification method differs:
 
 ```
-POST /executor/task  ← 统一入口
+POST /executor/task  ← Unified entry point
 Body: {
-    "source": "telegram|claude_code",   // 来源
-    "session_type": "auto|human_observer",  // 观察者模式
-    "message": "修复bug",               // 用户需求
-    "project_id": "amingClaw",          // 项目
-    "chat_id": 7848961760,              // Telegram 时必填
+    "source": "telegram|claude_code",   // Source
+    "session_type": "auto|human_observer",  // Observer mode
+    "message": "Fix bug",               // User requirement
+    "project_id": "amingClaw",          // Project
+    "chat_id": 7848961760,              // Required for Telegram
 }
 Returns: {
     "task_id": "task-xxx",
-    "observer_token": "obs-xxx",        // 用于后续查询
+    "observer_token": "obs-xxx",        // For subsequent queries
     "observer_url": "/observer/watch/task-xxx",
     "status": "created"
 }
 ```
 
-#### 两种入口的完整流程对比
+#### Complete Flow Comparison Between Two Entry Points
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│ 入口 A: Telegram                                               │
+│ Entry A: Telegram                                               │
 │                                                                │
-│ 用户发 Telegram 消息: "修复上下文bug"                           │
+│ User sends Telegram message: "Fix context bug"                  │
 │   ↓                                                            │
-│ Gateway 收到 → 调 POST /executor/task {                        │
+│ Gateway receives → calls POST /executor/task {                  │
 │   source: "telegram", chat_id: 7848961760,                     │
 │   session_type: "auto",                                        │
-│   message: "修复上下文bug", project_id: "amingClaw"             │
+│   message: "Fix context bug", project_id: "amingClaw"           │
 │ }                                                              │
 │   ↓                                                            │
 │ Executor:                                                      │
-│   1. 创建 task (DB + file)                                     │
-│   2. 自动注册 observer session (auto 模式)                     │
-│   3. 返回 {task_id, observer_token} 给 Gateway                 │
+│   1. Create task (DB + file)                                    │
+│   2. Auto-register observer session (auto mode)                 │
+│   3. Return {task_id, observer_token} to Gateway                │
 │   4. TaskOrchestrator.handle_user_message()                    │
 │   5. PM → Coordinator → Dev → Tester → QA → Gatekeeper        │
 │   ↓                                                            │
 │ Gateway:                                                       │
-│   持有 observer_token → 每 30s 轮询 /observer/status           │
-│   状态变化 → push 到 Telegram                                  │
-│   完成 → 推送报告摘要                                          │
+│   Holds observer_token → polls /observer/status every 30s      │
+│   Status change → push to Telegram                              │
+│   Complete → push report summary                                │
 └────────────────────────────────────────────────────────────────┘
 
 ┌────────────────────────────────────────────────────────────────┐
-│ 入口 B: Claude Code session                                    │
+│ Entry B: Claude Code session                                    │
 │                                                                │
-│ 用户在终端: curl POST /executor/task {                         │
+│ User in terminal: curl POST /executor/task {                    │
 │   source: "claude_code",                                       │
 │   session_type: "human_observer",                              │
-│   message: "修复上下文bug", project_id: "amingClaw"             │
+│   message: "Fix context bug", project_id: "amingClaw"           │
 │ }                                                              │
 │   ↓                                                            │
 │ Executor:                                                      │
-│   1. 创建 task (DB + file)                                     │
-│   2. 注册 observer session (human 模式, 可干预)                │
-│   3. 返回 {task_id, observer_token} 给 Claude Code             │
+│   1. Create task (DB + file)                                    │
+│   2. Register observer session (human mode, can intervene)      │
+│   3. Return {task_id, observer_token} to Claude Code            │
 │   4. TaskOrchestrator.handle_user_message()                    │
 │   5. PM → Coordinator → Dev → Tester → QA → Gatekeeper        │
 │   ↓                                                            │
 │ Claude Code session:                                           │
-│   持有 observer_token → 主动查询:                              │
+│   Holds observer_token → active queries:                        │
 │     curl /observer/status?token=obs-xxx                        │
 │     curl /ctx/{session_id}/trace                               │
 │     curl /observer/report/{task_id}                            │
-│   可干预:                                                      │
+│   Can intervene:                                                │
 │     curl POST /observer/pause {task_id}                        │
 │     curl POST /observer/cancel {task_id}                       │
-│   完成 → 查看完整报告 + 补充分析                               │
+│   Complete → view full report + add analysis                    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-#### 通知方式差异
+#### Notification Method Differences
 
-| | Telegram 入口 | Claude Code 入口 |
+| | Telegram Entry | Claude Code Entry |
 |---|---|---|
-| 任务创建 | 同一个 /executor/task | 同一个 /executor/task |
-| 观察者注册 | 自动(Gateway 持有 token) | 自动(返回给 session) |
-| 进度通知 | Gateway 轮询 → push Telegram | session 主动 curl |
-| 完成通知 | Gateway push Telegram | session 读 /observer/report |
-| 干预能力 | 有限(Telegram 按钮) | 完整(pause/cancel/downgrade) |
-| 报告查看 | /report Telegram 命令 | curl /observer/report |
-| 降级修代码 | 不支持 | 支持(显式声明) |
+| Task creation | Same /executor/task | Same /executor/task |
+| Observer registration | Auto (Gateway holds token) | Auto (returned to session) |
+| Progress notification | Gateway polls → push Telegram | Session actively curls |
+| Completion notification | Gateway push Telegram | Session reads /observer/report |
+| Intervention capability | Limited (Telegram buttons) | Full (pause/cancel/downgrade) |
+| Report viewing | /report Telegram command | curl /observer/report |
+| Downgrade to fix code | Not supported | Supported (explicit declaration) |
 
-### 6.5 Executor API — 观察者端点
+### 6.5 Executor API — Observer Endpoints
 
 ```
-# 统一任务创建（替代旧的 /coordinator/chat）
+# Unified task creation (replaces the legacy /coordinator/chat)
 POST /executor/task
 Body: {source, session_type, message, project_id, chat_id?}
 Returns: {task_id, observer_token, observer_url, status}
 
-# 接管已有任务的观察者（从 auto 切换到 human）
+# Take over an existing task's observer (switch from auto to human)
 POST /observer/attach
 Body: {"task_id": "xxx", "observer_token": "obs-xxx"}
 Returns: {"observer_id": "...", "mode": "human", "task_status": "..."}
 
-# 释放观察者（恢复自动模式）
+# Release observer (restore auto mode)
 POST /observer/detach
 Body: {"observer_id": "xxx"}
 
-# 查询当前任务状态
+# Query current task status
 GET /observer/status?token=obs-xxx
 Returns: {"task_id": "...", "phase": "dev", "progress": 50, "duration": 120}
 
-# 查看观察者正在监控的任务
+# View tasks being monitored by the observer
 GET /observer/watching
 Returns: {"tasks": [{"task_id": "...", "phase": "dev", "duration": 120}]}
 
-# 查看/下载执行报告
+# View/download execution report
 GET /observer/report/{task_id}
-Returns: {完整报告 JSON}
+Returns: {Full report JSON}
 
-# 观察者列表
+# Observer list
 GET /observer/list
 Returns: {"observers": [{"id": "...", "type": "auto|human", "task_id": "..."}]}
 
-# 干预操作（仅 human 观察者）
+# Intervention actions (human observers only)
 POST /observer/pause   Body: {"task_id": "xxx"}
 POST /observer/cancel  Body: {"task_id": "xxx"}
 POST /observer/retry   Body: {"task_id": "xxx"}
 
-# 降级到手动模式
+# Downgrade to manual mode
 POST /observer/downgrade
-Body: {"observer_id": "xxx", "reason": "系统无法自修"}
-→ 审计记录 "observer downgraded"
-→ 必须按 workflow 操作
+Body: {"observer_id": "xxx", "reason": "System cannot self-repair"}
+→ Audit records "observer downgraded"
+→ Must operate per workflow
 ```
 
-### 6.6 Telegram 观察者命令
+### 6.6 Telegram Observer Commands
 
 ```
-用户在 Telegram 可用:
-  /observe task-xxx   → 查看任务实时状态（简化版 trace）
-  /report task-xxx    → 查看执行报告
-  /trace task-xxx     → 查看完整链路
-  /reports            → 最近 10 个报告摘要
+Available to users in Telegram:
+  /observe task-xxx   → View task real-time status (simplified trace)
+  /report task-xxx    → View execution report
+  /trace task-xxx     → View full chain
+  /reports            → Last 10 report summaries
 ```
 
-### 6.6 执行报告结构
+### 6.6 Execution Report Structure
 
-每个任务完成后，观察者（自动或人工）必须生成报告写入 dbservice：
+After each task completes, the observer (auto or manual) must generate a report and write it to dbservice:
 
 ```json
 {
@@ -523,7 +525,7 @@ Body: {"observer_id": "xxx", "reason": "系统无法自修"}
     "scope": "{project_id}",
     "content": {
         "task_id": "task-xxx",
-        "task_prompt": "修复上下文系统",
+        "task_prompt": "Fix context system",
         "project_id": "amingClaw",
         "observer_type": "auto|human",
         "observer_id": "...",
@@ -581,20 +583,20 @@ Body: {"observer_id": "xxx", "reason": "系统无法自修"}
                 "phase": "dev",
                 "type": "wrong_file_modified",
                 "severity": "high",
-                "description": "Dev AI 改了 executor.py 而不是 gatekeeper.py",
-                "root_cause": "PM target_files 未传递到 dev prompt",
+                "description": "Dev AI modified executor.py instead of gatekeeper.py",
+                "root_cause": "PM target_files not passed to dev prompt",
                 "resolved": true,
-                "resolution": "手动修复 PM 触发条件"
+                "resolution": "Manually fixed PM trigger conditions"
             }
         ],
 
         "five_whys": [
             {
-                "symptom": "Dev改错文件",
-                "why1": "prompt里没有target_files",
-                "why2": "Coordinator create_dev_task没带target_files",
-                "why3": "PM没触发所以没PRD",
-                "fix": "加宽PM关键词",
+                "symptom": "Dev modified wrong file",
+                "why1": "No target_files in prompt",
+                "why2": "Coordinator create_dev_task didn't include target_files",
+                "why3": "PM didn't trigger so no PRD",
+                "fix": "Broaden PM keywords",
                 "fix_applied": true
             }
         ],
@@ -609,14 +611,14 @@ Body: {"observer_id": "xxx", "reason": "系统无法自修"}
         },
 
         "recommendations": [
-            "PM 关键词需要继续扩大",
-            "Dev AI 对 governance/ 子目录路径认知不够"
+            "PM keywords need to be further expanded",
+            "Dev AI has insufficient awareness of governance/ subdirectory paths"
         ],
 
         "system_improvements": [
             {
                 "type": "validator_rule",
-                "description": "dev_task 没有 target_files 应该被 validator 拒绝",
+                "description": "dev_task without target_files should be rejected by validator",
                 "priority": "P0",
                 "status": "implemented"
             }
@@ -625,214 +627,214 @@ Body: {"observer_id": "xxx", "reason": "系统无法自修"}
 }
 ```
 
-### 6.7 Claude Code 接入观察者的 Prompt
+### 6.7 Claude Code Observer Prompt
 
-当用户使用 Claude Code session 作为人工观察者时，使用以下 prompt：
+When users use a Claude Code session as a manual observer, use the following prompt:
 
 ```
-你是 {project_id} 项目的人工观察者。
+You are the manual observer for the {project_id} project.
 
-## 角色
-- 观察者：监控任务执行 → 分析问题 → 生成报告 → 转译给用户
-- 可以干预：暂停/取消/重试 task
-- 可以降级：系统无法自修时按 workflow 手动修代码
+## Role
+- Observer: Monitor task execution → Analyze issues → Generate reports → Translate for user
+- Can intervene: Pause/cancel/retry task
+- Can downgrade: Manually fix code per workflow when system cannot self-repair
 
-## 接入方式（统一入口）
+## Connection Method (Unified Entry Point)
 
-1. 创建任务 + 自动注册观察者:
+1. Create task + auto-register observer:
    RESULT=$(curl -s -X POST http://localhost:40100/executor/task \
      -H "Content-Type: application/json" \
      -d '{
        "source": "claude_code",
        "session_type": "human_observer",
-       "message": "你的需求描述",
+       "message": "Your requirement description",
        "project_id": "{project_id}"
      }')
-   # 返回: {task_id, observer_token, observer_url}
+   # Returns: {task_id, observer_token, observer_url}
    TASK_ID=$(echo $RESULT | python -c "import sys,json;print(json.load(sys.stdin)['task_id'])")
    OBS_TOKEN=$(echo $RESULT | python -c "import sys,json;print(json.load(sys.stdin)['observer_token'])")
 
-2. 监控任务状态:
-   # 实时状态
+2. Monitor task status:
+   # Real-time status
    curl http://localhost:40100/observer/status?token=$OBS_TOKEN
-   # 完整 trace
+   # Full trace
    curl http://localhost:40100/ctx/$TASK_ID/trace
-   # 当前 phase
+   # Current phase
    curl http://localhost:40100/observer/watching
 
-3. 接管已有任务（从 Telegram 创建的任务）:
+3. Take over existing task (created from Telegram):
    curl -X POST http://localhost:40100/observer/attach \
      -H "Content-Type: application/json" \
      -d '{"task_id":"task-xxx", "observer_token":"obs-xxx"}'
 
-4. 干预（仅 human 模式）:
+4. Intervene (human mode only):
    curl -X POST http://localhost:40100/observer/pause -d '{"task_id":"xxx"}'
    curl -X POST http://localhost:40100/observer/cancel -d '{"task_id":"xxx"}'
    curl -X POST http://localhost:40100/observer/retry -d '{"task_id":"xxx"}'
 
-5. 查看报告:
+5. View report:
    curl http://localhost:40100/observer/report/$TASK_ID
 
-6. Telegram 通知:
+6. Telegram notification:
    curl -X POST http://localhost:40000/gateway/reply \
      -H "X-Gov-Token: {coordinator_token}" \
-     -d '{"chat_id": {chat_id}, "text": "消息"}'
+     -d '{"chat_id": {chat_id}, "text": "message"}'
 
-7. 降级到手动模式（仅在系统无法自修时）:
+7. Downgrade to manual mode (only when system cannot self-repair):
    curl -X POST http://localhost:40100/observer/downgrade \
-     -d '{"observer_id":"xxx", "reason":"说明原因"}'
-   # 从此必须按 workflow 流程操作代码
+     -d '{"observer_id":"xxx", "reason":"explain reason"}'
+   # From this point, must operate code per workflow process
 
-## 观察者 SOP
+## Observer SOP
 
-### 任务下发流程
+### Task Dispatch Flow
 
 ```
-1. 下发任务
+1. Dispatch task
    curl -X POST http://localhost:40100/coordinator/chat \
      -d '{"message":"...", "project_id":"..."}'
 
-2. 确认 PM 是否触发
-   检查 reply 中是否有 "PRD" / "PM" / "target_files"
-   如果没有 → 检查 _needs_pm_analysis 是否匹配关键词
+2. Confirm whether PM triggered
+   Check if reply contains "PRD" / "PM" / "target_files"
+   If not → Check whether _needs_pm_analysis matches keywords
 
-3. 监控 Dev 执行
+3. Monitor Dev execution
    curl http://localhost:40100/status
    curl http://localhost:40100/ctx/list?role=dev  (v7)
    ls shared-volume/codex-tasks/processing/
 
-4. Dev 完成后检查
-   检查分支改动: git diff main..dev/task-xxx
-   检查是否改了正确文件（对照 PM target_files）
-   检查 evidence: curl http://localhost:40100/ctx/{sid}/trace (v7)
+4. Post-Dev completion checks
+   Check branch changes: git diff main..dev/task-xxx
+   Check if correct files were modified (compare against PM target_files)
+   Check evidence: curl http://localhost:40100/ctx/{sid}/trace (v7)
 ```
 
-### 失败根因分析 SOP（5 Whys）
+### Failure Root Cause Analysis SOP (5 Whys)
 
 ```
-自动修失败后，观察者必须执行以下分析链:
+After auto-fix fails, the observer must execute the following analysis chain:
 
-Step 1: 记录失败现象
-  "Dev task 完成但改了 executor.py 而不是 evidence.py"
+Step 1: Record the failure symptom
+  "Dev task completed but modified executor.py instead of evidence.py"
 
-Step 2: Why x1 — 直接原因
-  "Dev AI prompt 里没有明确 target_files"
+Step 2: Why x1 — Direct cause
+  "Dev AI prompt did not specify target_files"
 
-  验证方法:
-  - v7: curl /ctx/{session_id}/input → 检查 target_files 字段
-  - v6: 检查 task 文件的 _coordinator_context
+  Verification method:
+  - v7: curl /ctx/{session_id}/input → Check target_files field
+  - v6: Check task file's _coordinator_context
 
-Step 3: Why x2 — 上游原因
-  "Coordinator 的 create_dev_task 没带 target_files"
+Step 3: Why x2 — Upstream cause
+  "Coordinator's create_dev_task did not include target_files"
 
-  验证方法:
-  - 检查 Coordinator 输出的 actions 里有没有 target_files
-  - 检查 DecisionValidator 是否应该拦截没有 target_files 的 dev_task
+  Verification method:
+  - Check if Coordinator output actions contain target_files
+  - Check if DecisionValidator should reject dev_task without target_files
 
-Step 4: Why x3 — 系统原因
-  "PM 没触发，所以没有 PRD 提供 target_files"
+Step 4: Why x3 — System cause
+  "PM didn't trigger, so no PRD provided target_files"
 
-  验证方法:
-  - 检查 executor 日志: grep "PM check"
-  - 检查 _needs_pm_analysis 的关键词匹配
+  Verification method:
+  - Check executor logs: grep "PM check"
+  - Check _needs_pm_analysis keyword matching
 
-Step 5: 定位修复点
-  分类:
-  a) 系统 bug → 加入自动修复队列
-  b) 配置问题 → 手动调整后重试
-  c) AI 能力边界 → 记录为已知限制，手动修
-  d) 架构缺陷 → 记录为 Gap，设计方案后修
+Step 5: Locate fix point
+  Classification:
+  a) System bug → Add to auto-fix queue
+  b) Configuration issue → Manually adjust then retry
+  c) AI capability boundary → Record as known limitation, fix manually
+  d) Architecture gap → Record as Gap, design solution then fix
 
-  决不能做:
-  ❌ 看到失败就"移入手动组"
-  ❌ 简单重试不分析原因
-  ❌ 只记录表面症状不追根因
+  Must never do:
+  ❌ See failure and just "move to manual group"
+  ❌ Simply retry without analyzing cause
+  ❌ Only record surface symptoms without tracing root cause
 ```
 
-### 质量评估 SOP
+### Quality Assessment SOP
 
 ```
-每轮迭代完成后，观察者必须评估:
+After each iteration round, the observer must evaluate:
 
-1. 流程正确性
-   - PM 触发了吗？PRD 质量如何？
-   - Coordinator 编排合理吗？
-   - Dev 改了正确文件吗？
-   - Tester/QA/Gatekeeper 触发了吗？
-   - verify_loop 全绿吗？
+1. Process correctness
+   - Did PM trigger? What was the PRD quality?
+   - Was Coordinator orchestration reasonable?
+   - Did Dev modify the correct files?
+   - Did Tester/QA/Gatekeeper trigger?
+   - Is verify_loop all green?
 
-2. 记忆质量
-   - 新增记忆是否有价值？
-   - 是否有重复/噪声？
-   - refId 是否语义化（不是 UUID）？
+2. Memory quality
+   - Are new memories valuable?
+   - Are there duplicates/noise?
+   - Are refIds semantic (not UUIDs)?
 
-3. 上下文连续性
-   - 多条消息之间 Coordinator 是否记得之前说了什么？
-   - session_context 是否正确更新？
+3. Context continuity
+   - Does Coordinator remember what was said across multiple messages?
+   - Is session_context correctly updated?
 
-4. Executor 约束
-   - DecisionValidator 拦截了什么？应该拦没拦？
-   - EvidenceCollector 采集到了什么？和 AI 自报一致吗？
-   - tool_policy 有没有被绕过？
+4. Executor constraints
+   - What did DecisionValidator reject? Should it have rejected what it didn't?
+   - What did EvidenceCollector collect? Does it match AI self-report?
+   - Was tool_policy bypassed?
 
-5. 性能
-   - Dev task 执行时间
-   - 僵尸进程数量
-   - 失败重试次数
+5. Performance
+   - Dev task execution time
+   - Number of orphaned processes
+   - Failure retry count
 ```
 
-### 迭代 Loop 退出条件
+### Iteration Loop Exit Conditions
 
 ```
-Loop 退出当且仅当:
-  1. 手动组为空
-  2. P0 全部完成（自动或手动）
-  3. P1 全部完成（自动或手动）
-  4. P2 全部完成或评估后关闭
-  5. 没有新增手动项
+Loop exits if and only if:
+  1. Manual group is empty
+  2. All P0 completed (auto or manual)
+  3. All P1 completed (auto or manual)
+  4. All P2 completed or closed after assessment
+  5. No new manual items added
 
-Loop 中每轮:
-  1. 手动组先修
-  2. 自动组尝试修
-     - 成功 → 观察质量 → 有新问题加入列表
-     - 失败 → 5 Whys 分析 → 能修系统的修系统后重试 → 不能的移手动
-  3. 按严重度重排
-  4. 回到 1
+Each round in the loop:
+  1. Fix manual group first
+  2. Auto group attempts fixes
+     - Success → Observe quality → Add new issues to list if found
+     - Failure → 5 Whys analysis → Fix system if possible then retry → Otherwise move to manual
+  3. Re-sort by severity
+  4. Return to 1
 ```
 
-## 七、评审反馈整合（codex 评估 6 点）
+## 7. Review Feedback Integration (codex evaluation 6 points)
 
-### 7.1 双写一致性 → Session 状态机 + 幂等
+### 7.1 Dual-Write Consistency → Session State Machine + Idempotency
 
-**问题：** Redis + SQLite 双写无事务语义，可能 Redis 有 SQLite 没有。
+**Problem:** Redis + SQLite dual-write has no transaction semantics; Redis may have data that SQLite does not.
 
-**修复：** 定义明确的 session 生命周期状态机：
+**Fix:** Define an explicit session lifecycle state machine:
 
 ```
 created → input_saved → prompt_rendered → running → output_saved → validated → executed → archived
                                                                                     ↘ failed
 ```
 
-#### 状态迁移约束（codex 评审 R2 #1 补充）
+#### State Transition Constraints (codex review R2 #1 supplement)
 
-| 当前状态 | 允许迁移到 | 禁止 | 说明 |
-|---------|-----------|------|------|
-| created | input_saved | running, archived | 必须先存 input |
-| input_saved | prompt_rendered | running | 必须先渲染 |
-| prompt_rendered | running | validated | 必须先跑 |
-| running | output_saved, failed | archived | 只能正常完成或失败 |
-| output_saved | validated | executed | 必须先校验 |
-| validated | executed, failed | archived | 校验通过才执行，失败可拒绝 |
-| executed | archived | running | 执行完归档，不可回退 |
-| archived | — | 任何迁移 | 终态，只读 |
-| failed | created (new attempt) | running | 失败后必须创建新 attempt，不 resume |
+| Current State | Allowed Transitions | Forbidden | Description |
+|---------------|--------------------|-----------|----|
+| created | input_saved | running, archived | Must save input first |
+| input_saved | prompt_rendered | running | Must render first |
+| prompt_rendered | running | validated | Must run first |
+| running | output_saved, failed | archived | Can only complete normally or fail |
+| output_saved | validated | executed | Must validate first |
+| validated | executed, failed | archived | Execute only if validated, failure can reject |
+| executed | archived | running | Archive after execution, cannot revert |
+| archived | — | Any transition | Terminal state, read-only |
+| failed | created (new attempt) | running | After failure must create new attempt, no resume |
 
-**关键规则：**
-- 非法迁移一律拒绝并记录 violation
-- 重复写入同一状态 → 幂等（检查 idempotency_key，已存在则跳过）
-- **replay = 新 session + 新 attempt_no**，不是原 session 改状态
-- **failed 后不允许直接回到 validated**，必须新建 session 从 created 开始
-- **archived 后彻底只读**，任何写入请求返回 403
+**Key Rules:**
+- Illegal transitions are always rejected and recorded as violations
+- Duplicate writes to the same state → Idempotent (check idempotency_key, skip if exists)
+- **replay = new session + new attempt_no**, not changing the original session's state
+- **After failed, cannot directly return to validated**; must create a new session from created
+- **After archived, completely read-only**; any write request returns 403
 
 ```python
 VALID_TRANSITIONS = {
@@ -856,13 +858,13 @@ def transition(self, session_id: str, from_state: str, to_state: str) -> bool:
     return self._cas_update(session_id, from_state, to_state)
 ```
 
-所有写操作必须带：
-- `session_id` — 唯一标识
-- `attempt_no` — 第几次尝试（retry 时递增，从 0 开始）
+All write operations must include:
+- `session_id` — Unique identifier
+- `attempt_no` — Attempt number (incremented on retry, starting from 0)
 - `idempotency_key` — `{session_id}:{attempt_no}:{phase}`
-- `version` — 乐观锁（CAS）
+- `version` — Optimistic lock (CAS)
 
-写入策略：**SQLite 先写（真源），Redis 后写（缓存）。** Redis 写失败不阻塞，SQLite 写失败则整个操作失败。
+Write strategy: **SQLite writes first (source of truth), Redis writes second (cache).** Redis write failure does not block; SQLite write failure causes the entire operation to fail.
 
 ```python
 def save_input(self, session_id, context):
@@ -879,27 +881,27 @@ def save_input(self, session_id, context):
         pass  # Redis failure is non-fatal
 ```
 
-### 7.2 唯一真源 → 结构化 snapshot 是 canonical
+### 7.2 Single Source of Truth → Structured Snapshot is Canonical
 
-**问题：** Redis JSON 和 /tmp prompt file 可能不一致。
+**Problem:** Redis JSON and /tmp prompt file may be inconsistent.
 
-**原则：**
-- **Canonical source = SQLite context_audit 表的 context_json**
-- prompt file 是 render artifact，由 `PromptRenderer` 从 canonical source 生成
-- 审计时同时保存 `renderer_version` 和 `rendered_prompt_hash`
-- trace 展示 `snapshot_hash` vs `rendered_hash`，不一致则报警
+**Principles:**
+- **Canonical source = context_json in the SQLite context_audit table**
+- Prompt file is a render artifact, generated by `PromptRenderer` from the canonical source
+- During audit, save both `renderer_version` and `rendered_prompt_hash`
+- Trace displays `snapshot_hash` vs `rendered_hash`; alerts on mismatch
 
 ```python
 class PromptRenderer:
     VERSION = "v1.0"
 
     def render(self, context: dict) -> str:
-        """从结构化 context 生成 prompt 文本。"""
+        """Generate prompt text from structured context."""
         text = self._format(context)
         return text
 
     def render_to_file(self, session_id: str, context: dict) -> tuple[str, str]:
-        """生成 prompt file 并返回 (file_path, content_hash)."""
+        """Generate prompt file and return (file_path, content_hash)."""
         text = self.render(context)
         path = f"/tmp/ctx-{session_id}.md"
         with open(path, "w") as f:
@@ -909,11 +911,11 @@ class PromptRenderer:
         return path, content_hash
 ```
 
-### 7.3 Replay Bundle → 完整重现环境
+### 7.3 Replay Bundle → Full Environment Reproduction
 
-**问题：** 只保存 input 不够，还需要环境信息。
+**Problem:** Saving only input is not enough; environment information is also needed.
 
-**Replay Bundle 必须包含：**
+**Replay Bundle must contain:**
 
 ```json
 {
@@ -948,29 +950,29 @@ class PromptRenderer:
 }
 ```
 
-**补充说明（codex 评审 R2 #2）：**
-- `external_deps` 记录外部工具调用结果的快照/引用，防止"不是模型变了而是环境变了"
-- `time_boundary` 记录关键依赖输入的时间边界，replay 时可对比"当时的环境 vs 现在的环境"
-- 没有这些，replay 是"再跑一次"；有了这些，replay 是"还原现场"
+**Additional notes (codex review R2 #2):**
+- `external_deps` records snapshots/references of external tool call results, preventing "it's not the model that changed but the environment"
+- `time_boundary` records time boundaries of key dependency inputs; during replay, can compare "environment then vs environment now"
+- Without these, replay is "run again"; with these, replay is "restore the scene"
 
-### 7.4 权限模型 → 四级访问控制
+### 7.4 Permission Model → Four-Level Access Control
 
-**问题：** /ctx/* 端点能看完整 context，是最敏感的一层。
+**Problem:** /ctx/* endpoints can see full context, the most sensitive layer.
 
-| 权限级别 | 能访问 | 角色 |
-|---------|--------|------|
-| `observer_read` | /ctx/list, /ctx/{sid}/trace (摘要) | 观察者 |
-| `executor_internal` | /ctx/{sid}/input, /ctx/{sid}/output (完整) | Executor 内部 |
-| `ai_session_prompt_only` | /ctx/{sid}/prompt (渲染后文本) | AI session |
-| `admin_full` | /ctx/{sid}/replay, /ctx/diff, 完整 JSON | 管理员 |
+| Permission Level | Can Access | Role |
+|-----------------|------------|------|
+| `observer_read` | /ctx/list, /ctx/{sid}/trace (summary) | Observer |
+| `executor_internal` | /ctx/{sid}/input, /ctx/{sid}/output (full) | Executor internal |
+| `ai_session_prompt_only` | /ctx/{sid}/prompt (rendered text) | AI session |
+| `admin_full` | /ctx/{sid}/replay, /ctx/diff, full JSON | Admin |
 
-**AI session 默认只读 /prompt，不能读完整 /input 结构。** 这防止 AI 看到系统内部元数据。
+**AI session defaults to read-only /prompt, cannot read full /input structure.** This prevents AI from seeing internal system metadata.
 
-### 7.5 Context Budget → 前移到 P0.5
+### 7.5 Context Budget → Moved Up to P0.5
 
-**问题：** budget 放 P2 太晚，直接影响 AI 行为正确性。
+**Problem:** Budget at P2 is too late; it directly affects AI behavior correctness.
 
-**立即实施的 budget 规则：**
+**Budget rules for immediate implementation:**
 
 ```python
 ROLE_BUDGETS = {
@@ -982,225 +984,225 @@ ROLE_BUDGETS = {
 }
 ```
 
-字段优先级（裁剪时从低到高删）：
-1. **必选**：prompt, target_files, role_instructions
-2. **重要**：conversation_history (最近 5 条), governance_summary
-3. **辅助**：memories, git_status, runtime_info
-4. **可删**：full file contents (改为摘要), 旧对话历史
+Field priority (pruned from lowest to highest):
+1. **Required**: prompt, target_files, role_instructions
+2. **Important**: conversation_history (last 5 entries), governance_summary
+3. **Supplementary**: memories, git_status, runtime_info
+4. **Removable**: full file contents (convert to summary), old conversation history
 
-### 7.6 SOP → 硬规则升级
+### 7.6 SOP → Hard Rule Upgrade
 
-**问题：** SOP 是人治，需要变成 Validator 硬规则。
+**Problem:** SOP is governance by convention; needs to become Validator hard rules.
 
-**新增 DecisionValidator 规则：**
+**New DecisionValidator rules:**
 
 ```python
-# 观察者 SOP 发现的问题 → 升级为代码强制规则
+# Issues discovered by observer SOP → upgraded to code-enforced rules
 
 HARD_RULES = {
     "dev_task_must_have_target_files": {
         "check": lambda action: bool(action.get("target_files")),
-        "reject_msg": "create_dev_task 必须包含 target_files（由 PM PRD 提供）",
+        "reject_msg": "create_dev_task must include target_files (provided by PM PRD)",
     },
     "pm_required_for_complex_task": {
-        "check": lambda action: True,  # 由 _needs_pm_analysis 在 orchestrator 层控制
-        "reject_msg": "复杂任务必须先经过 PM 分析",
+        "check": lambda action: True,  # Controlled by _needs_pm_analysis at orchestrator layer
+        "reject_msg": "Complex tasks must go through PM analysis first",
     },
     "evidence_must_be_complete": {
-        "check": lambda action: True,  # 由 EvidenceCollector 在 dev_complete 时检查
-        "reject_msg": "证据不完整，不允许 merge/pass",
+        "check": lambda action: True,  # Checked by EvidenceCollector at dev_complete
+        "reject_msg": "Incomplete evidence, merge/pass not allowed",
     },
     "session_must_have_snapshot": {
-        "check": lambda action: True,  # 由 ContextStore 在 session 创建时检查
-        "reject_msg": "Session 没有输入快照，不能执行",
+        "check": lambda action: True,  # Checked by ContextStore at session creation
+        "reject_msg": "Session has no input snapshot, cannot execute",
     },
 }
 ```
 
-## 八、迭代复盘 — 缺陷报告（codex 评审 R3）
+## 8. Iteration Retrospective — Defect Report (codex review R3)
 
-### 8.1 核心发现
+### 8.1 Core Findings
 
-| 类别 | 缺陷 | 严重度 | 根因 |
-|------|------|--------|------|
-| **架构** | Node ID 由 AI 生成 | 🔴 | 把确定性元数据交给概率模型 |
-| **架构** | "创建新文件"不是一等执行操作 | 🔴 | Executor 主要消费 stdout/diff |
-| **架构** | PM 触发靠关键词碰运气 | 🟡 | 没有硬规则，只有 SOP |
-| **流程** | 手动修改没走 workflow (5次) | 🔴 | "紧急情况"心态 |
-| **流程** | 手动修改污染自动实验 | 🟡 | 未 commit 就开新任务 |
-| **分析** | 5 Whys 过早归因（上下文污染） | 🟡 | 先解释后验证 |
-| **分析** | "AI 不能创建新文件"结论过大 | 🟡 | 系统锅≠AI 能力边界 |
-| **运行** | worktree 基线不干净 | 🟡 | 手动改动和自动任务混在一起 |
+| Category | Defect | Severity | Root Cause |
+|----------|--------|----------|------------|
+| **Architecture** | Node ID generated by AI | 🔴 | Giving deterministic metadata to a probabilistic model |
+| **Architecture** | "Create new file" is not a first-class execution operation | 🔴 | Executor primarily consumes stdout/diff |
+| **Architecture** | PM trigger relies on keyword luck | 🟡 | No hard rules, only SOP |
+| **Process** | Manual modifications bypassed workflow (5 times) | 🔴 | "Emergency" mindset |
+| **Process** | Manual modifications polluted auto experiments | 🟡 | Started new tasks without committing |
+| **Analysis** | 5 Whys premature attribution (context pollution) | 🟡 | Explained before verifying |
+| **Analysis** | "AI cannot create new files" conclusion too broad | 🟡 | System fault != AI capability boundary |
+| **Runtime** | Worktree baseline not clean | 🟡 | Manual changes mixed with auto tasks |
 
-### 8.2 Node ID 系统分配方案
+### 8.2 System-Assigned Node ID Scheme
 
-**问题：** AI 反复生成空 ID / 占位符 ID，被 validator 拒绝。
+**Problem:** AI repeatedly generates empty IDs / placeholder IDs, rejected by validator.
 
-**根因：** 治理图的 node ID 是系统内部主键，本质是确定性元数据，不应由概率模型生成。
+**Root Cause:** The governance graph's node ID is a system internal primary key, essentially deterministic metadata that should not be generated by a probabilistic model.
 
-**方案：分离 node_uid 和 display_id**
+**Solution: Separate node_uid and display_id**
 
 ```
-数据模型:
-  node_uid:     n_8f3a2c...   (系统生成，永不变，内部引用用)
-  display_id:   L22.1         (系统分配，给人看，可调整)
-  parent_uid:   n_ab12...     (父节点引用)
-  order_index:  3             (同级排序)
+Data model:
+  node_uid:     n_8f3a2c...   (system-generated, never changes, for internal references)
+  display_id:   L22.1         (system-assigned, human-readable, adjustable)
+  parent_uid:   n_ab12...     (parent node reference)
+  order_index:  3             (sibling ordering)
   title:        "ContextStore"
 
-AI 输出（propose_node）:
+AI output (propose_node):
   {
-    "parent_display_id": "L22",     ← AI 只说"挂哪里"
-    "title": "ContextStore",         ← AI 说"做什么"
+    "parent_display_id": "L22",     ← AI only says "where to attach"
+    "title": "ContextStore",         ← AI says "what to do"
     "description": "...",
     "acceptance_criteria": [...],
     "target_files": [...]
   }
-  不输出 node_id / display_id / node_uid
+  Does not output node_id / display_id / node_uid
 
-系统处理:
-  1. 解析 parent_display_id → 找到 parent_uid
-  2. 查该父节点现有子节点最大序号
-  3. 分配 display_id = L22.3 (auto-increment)
-  4. 生成 node_uid = n_{uuid}
-  5. 落库 + 审计
+System processing:
+  1. Parse parent_display_id → find parent_uid
+  2. Query the parent node's existing children for max sequence number
+  3. Assign display_id = L22.3 (auto-increment)
+  4. Generate node_uid = n_{uuid}
+  5. Persist to DB + audit
 ```
 
-### 8.3 Dev Task 显式文件契约
+### 8.3 Dev Task Explicit File Contract
 
-**问题：** Dev AI 不知道该创建新文件还是修改已有文件。
+**Problem:** Dev AI does not know whether to create new files or modify existing ones.
 
-**方案：** create_dev_task 必须包含显式文件契约：
+**Solution:** create_dev_task must include an explicit file contract:
 
 ```json
 {
   "type": "create_dev_task",
-  "target_files": ["agent/executor.py"],       // 允许修改的已有文件
-  "create_files": ["agent/context_store.py"],   // 必须创建的新文件
-  "forbidden_files": ["agent/governance/*"],    // 禁止修改的文件
-  "expected_artifacts": ["test_file"]           // 预期产出
+  "target_files": ["agent/executor.py"],       // Existing files allowed to modify
+  "create_files": ["agent/context_store.py"],   // New files that must be created
+  "forbidden_files": ["agent/governance/*"],    // Files forbidden to modify
+  "expected_artifacts": ["test_file"]           // Expected output artifacts
 }
 ```
 
-DecisionValidator 检查：
-- `target_files` 全部存在 → 否则拒绝
-- `create_files` 全部不存在 → 否则拒绝（防覆盖）
-- Dev 完成后 EvidenceCollector 检查：
-  - `create_files` 里的文件确实被创建了
-  - 没有改动 `forbidden_files`
-  - `expected_artifacts` 已生成
+DecisionValidator checks:
+- All `target_files` exist → reject otherwise
+- All `create_files` do not exist → reject otherwise (prevent overwriting)
+- After Dev completes, EvidenceCollector checks:
+  - Files in `create_files` were actually created
+  - `forbidden_files` were not modified
+  - `expected_artifacts` were generated
 
-### 8.4 观察者纪律约束
+### 8.4 Observer Discipline Constraints
 
-**问题：** 观察者（我）5 次手动修改没走 workflow。
+**Problem:** The observer (me) made 5 manual modifications without following workflow.
 
-**硬规则（补充到观察者 SOP）：**
-
-```
-手动修改前 checklist（必须全部完成才能动代码）:
-  □ executor 已停止（防并发污染）
-  □ git status clean（无未 commit 改动）
-  □ 节点存在（没有就先建）
-  □ 改完后: coverage-check + verify-update + verify_loop + commit
-  □ 启动 executor 前确认 worktree 干净
-
-自动实验前 checklist:
-  □ main 分支 clean（git status 无改动）
-  □ 基线 commit 固定（记录 commit hash）
-  □ 无残留 dev 分支
-  □ executor 重启（加载最新代码）
-```
-
-### 8.5 分析纪律
-
-**5 Whys 正确顺序：**
+**Hard rules (added to observer SOP):**
 
 ```
-1. 看原始输出 JSON（不是推理）
-2. 看 PM 是否触发（检查日志，不是猜）
-3. 看 validator 拒绝/通过了什么（检查 trace）
-4. 看 Dev AI 实际做了什么（检查 git diff）
-5. 最后才考虑上下文污染/AI 能力边界
+Pre-manual-modification checklist (all must be completed before touching code):
+  □ Executor stopped (prevent concurrent pollution)
+  □ git status clean (no uncommitted changes)
+  □ Node exists (create one first if not)
+  □ After modification: coverage-check + verify-update + verify_loop + commit
+  □ Confirm worktree is clean before starting executor
 
-不要:
-  ❌ 看到相关现象就先解释
-  ❌ 一次失败就下"AI 不能 xxx"的结论
-  ❌ 不区分系统锅/实验污染/AI 边界
+Pre-auto-experiment checklist:
+  □ main branch clean (git status shows no changes)
+  □ Baseline commit fixed (record commit hash)
+  □ No leftover dev branches
+  □ Executor restarted (loads latest code)
 ```
 
-## 九、修订后的实施路线（v7.1）
+### 8.5 Analysis Discipline
 
-基于迭代复盘，重新排优先级。**核心原则：先修执行契约，再加审计能力。**
-
-### P-1：执行契约修正（最高优先级，手动）
-
-必须先手动完成，否则自动修复链路不可靠。
-
-**共同模式：全部是"自举悖论"——修的是 AI 运行所依赖的基础设施，AI 不能通过自己来修自己的运行环境。** 类似操作系统不能在运行时重写自己的内核。
-
-| 步骤 | 内容 | 位置 | 不能自动修的原因 |
-|------|------|------|----------------|
-| 0 | **Node ID 系统分配** | governance server | 自动修需要 propose_node → propose_node 依赖 ID 生成 → **循环依赖** |
-| 1 | **Dev task 文件契约** | governance server (decision validation) | 需要改 validator 的校验逻辑 → Dev AI 被 validator 校验 → **自己改不了审判自己的规则** |
-| 2 | **PM 硬规则** | governance server (task_registry) | 自动修 PM 时 Dev AI 改错文件 → PM 不触发时无法通过 PM 产出正确路径 → **鸡生蛋问题** |
-| 3 | **worktree 强制 clean** | executor-gateway | 需要改执行逻辑 → Dev AI 通过 executor-gateway 被调用 → **自己改不了运行自己的代码** |
-
-### P0：Context Store 基础（已完成 ✅）
-
-| 步骤 | 内容 | 状态 |
-|------|------|------|
-| 4 | ContextStore + Session 状态机 | ✅ L22.1 自动完成 |
-| 5 | AILifecycleManager system-prompt-file | ✅ L22.2 手动完成 |
-| 6 | 统一入口 /executor/task | ✅ L22.3 自动完成 |
-
-### P0.5：Budget + 硬规则（已完成 ✅）
-
-| 步骤 | 内容 | 状态 |
-|------|------|------|
-| 7 | Context budget 角色裁剪 | ✅ L22.4 自动完成 |
-| 8 | DecisionValidator 硬规则 | ✅ L22.5 自动完成 |
-
-### P1：审计 + 权限 + Observer
-
-| 步骤 | 内容 | 文件 | 方式 |
-|------|------|------|------|
-| 9 | context_audit 表 + replay bundle | governance server | 自动 |
-| 10 | 四级权限模型 | executor_api (port 40100) | 自动 |
-| 11 | /ctx/{sid}/trace 完整链路 | executor_api (port 40100) | 自动 |
-| 12 | Observer 系统 (attach/detach/report) | executor_api (port 40100) | 自动 |
-| 13 | KPI 自动采集 | executor_api (port 40100) | 自动 |
-
-### P2：增强
-
-| 步骤 | 内容 | 文件 |
-|------|------|------|
-| 14 | /ctx/{sid}/replay 完整重现 | executor_api (port 40100) |
-| 15 | /ctx/diff 对比 | executor_api (port 40100) |
-| 16 | 图片路径 + 多模态 | governance server |
-| 17 | AI 进度上报 | executor_api (port 40100) |
-
-### 实施顺序
+**5 Whys correct order:**
 
 ```
-1. P-1（手动）→ 修执行契约，让自动修复可靠
-2. P1（自动尝试）→ 审计+Observer
-3. P2（自动尝试）→ 增强
-4. 每轮自动修后评估 KPI
+1. Look at raw output JSON (not reasoning)
+2. Check if PM triggered (check logs, don't guess)
+3. Check what validator rejected/passed (check trace)
+4. Check what Dev AI actually did (check git diff)
+5. Only then consider context pollution/AI capability boundaries
+
+Do not:
+  ❌ See a related symptom and explain first
+  ❌ Draw "AI cannot do xxx" conclusions from a single failure
+  ❌ Fail to distinguish system fault / experiment pollution / AI boundary
 ```
 
-## 十、当前架构说明
+## 9. Revised Implementation Roadmap (v7.1)
 
-> 旧的 Telegram bot 系统（v6 及更早的 20 个 agent/ 模块）已完全移除。不再有 v6 fallback。
+Based on iteration retrospective, re-prioritized. **Core principle: Fix execution contracts first, then add audit capabilities.**
 
-当前架构要点：
-- Context 管理完全通过 governance API (`/api/context/*`)
-- 任务执行通过 executor-gateway (port 8090)
-- 监控通过 executor_api (port 40100)
-- Telegram 消息路由通过 telegram_gateway (port 40010)
-- **SQLite 是唯一真源，Redis 是缓存层**
-- **AI session 只读 /prompt，不读完整 /input**
-- **Node ID 由系统分配，AI 只提供 parent + title**（R3 修正）
-- **Dev task 必须有显式文件契约**（R3 修正）
+### P-1: Execution Contract Corrections (Highest Priority, Manual)
 
-## 变更记录
-- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
+Must be completed manually first; otherwise, the auto-fix pipeline is unreliable.
+
+**Common pattern: All are "bootstrapping paradoxes" -- what's being fixed is the infrastructure AI depends on to run; AI cannot fix its own runtime environment through itself.** Similar to how an OS cannot rewrite its own kernel at runtime.
+
+| Step | Content | Location | Why Cannot Auto-Fix |
+|------|---------|----------|---------------------|
+| 0 | **System-assigned Node ID** | governance server | Auto-fix needs propose_node → propose_node depends on ID generation → **circular dependency** |
+| 1 | **Dev task file contract** | governance server (decision validation) | Need to change validator's verification logic → Dev AI is verified by validator → **cannot change the rules that judge itself** |
+| 2 | **PM hard rules** | governance server (task_registry) | When auto-fixing PM, Dev AI modifies wrong file → PM not triggering means cannot produce correct path through PM → **chicken-and-egg problem** |
+| 3 | **Forced clean worktree** | executor-gateway | Need to change execution logic → Dev AI is invoked by executor-gateway → **cannot change the code that runs itself** |
+
+### P0: Context Store Foundation (Completed ✅)
+
+| Step | Content | Status |
+|------|---------|--------|
+| 4 | ContextStore + Session state machine | ✅ L22.1 auto-completed |
+| 5 | AILifecycleManager system-prompt-file | ✅ L22.2 manually completed |
+| 6 | Unified entry /executor/task | ✅ L22.3 auto-completed |
+
+### P0.5: Budget + Hard Rules (Completed ✅)
+
+| Step | Content | Status |
+|------|---------|--------|
+| 7 | Context budget role-based pruning | ✅ L22.4 auto-completed |
+| 8 | DecisionValidator hard rules | ✅ L22.5 auto-completed |
+
+### P1: Audit + Permissions + Observer
+
+| Step | Content | File | Method |
+|------|---------|------|--------|
+| 9 | context_audit table + replay bundle | governance server | Auto |
+| 10 | Four-level permission model | executor_api (port 40100) | Auto |
+| 11 | /ctx/{sid}/trace full chain | executor_api (port 40100) | Auto |
+| 12 | Observer system (attach/detach/report) | executor_api (port 40100) | Auto |
+| 13 | KPI auto-collection | executor_api (port 40100) | Auto |
+
+### P2: Enhancements
+
+| Step | Content | File |
+|------|---------|------|
+| 14 | /ctx/{sid}/replay full reproduction | executor_api (port 40100) |
+| 15 | /ctx/diff comparison | executor_api (port 40100) |
+| 16 | Image paths + multimodal | governance server |
+| 17 | AI progress reporting | executor_api (port 40100) |
+
+### Implementation Order
+
+```
+1. P-1 (manual) → Fix execution contracts, make auto-fix reliable
+2. P1 (auto attempt) → Audit + Observer
+3. P2 (auto attempt) → Enhancements
+4. Evaluate KPIs after each auto-fix round
+```
+
+## 10. Current Architecture Notes
+
+> The legacy Telegram bot system (v6 and earlier 20 agent/ modules) has been completely removed. There is no longer a v6 fallback.
+
+Current architecture key points:
+- Context management entirely via governance API (`/api/context/*`)
+- Task execution via executor-gateway (port 8090)
+- Monitoring via executor_api (port 40100)
+- Telegram message routing via telegram_gateway (port 40010)
+- **SQLite is the sole source of truth, Redis is the cache layer**
+- **AI session reads only /prompt, not full /input**
+- **Node ID is system-assigned, AI only provides parent + title** (R3 fix)
+- **Dev task must have explicit file contract** (R3 fix)
+
+## Changelog
+- 2026-03-26: Legacy Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules); now using governance API exclusively

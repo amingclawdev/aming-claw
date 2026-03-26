@@ -1,204 +1,204 @@
-# Telegram 对话绑定项目运行时方案
+# Telegram Chat-to-Project Binding Runtime Design
 
-> **2026-03-26 确认：** telegram_gateway (port 40010) 是唯一的 Telegram 入口。旧 coordinator.py 的 Telegram polling 机制已完全移除（连同 bot_commands.py、interactive_menu.py 等 20 个模块）。所有 Telegram 消息路由均通过 Gateway → Governance API 完成。
+> **2026-03-26 Confirmed:** telegram_gateway (port 40010) is the sole Telegram entry point. The old coordinator.py Telegram polling mechanism has been fully removed (along with bot_commands.py, interactive_menu.py, and 20 other modules). All Telegram message routing goes through Gateway → Governance API.
 
-## 问题
+## Problem
 
-当前 Telegram 聊天只有一个 chat_id，但可能绑定到不同项目。切换项目时：
-- 上下文要隔离（amingClaw 的对话不该出现在 toolboxClient 里）
-- 记忆要隔离（查 dbservice 用不同 scope）
-- Scheduled Task 要感知切换（只消费当前绑定项目的消息）
-- 历史消息不丢（切换项目后旧项目的未处理消息怎么办）
+A Telegram chat has only one chat_id, but may be bound to different projects. When switching projects:
+- Context must be isolated (amingClaw conversations should not appear in toolboxClient)
+- Memory must be isolated (dbservice queries use different scopes)
+- Scheduled Tasks must be aware of switches (only consume messages for the currently bound project)
+- Historical messages must not be lost (what happens to unprocessed messages from the old project after switching)
 
-## 架构
+## Architecture
 
 ```
 Telegram chat_id: 7848961760
     │
     ▼
-Gateway 路由表 (Redis):
+Gateway routing table (Redis):
   chat:route:7848961760 → {
-    project_id: "amingClaw",         ← 当前活跃项目
+    project_id: "amingClaw",         ← currently active project
     token_hash: "9cb15f91",
     token: "gov-3506be...",
     bound_at: "2026-03-22T..."
   }
     │
-    ├── 消息进入: chat:inbox:9cb15f91  (amingClaw 的 stream)
+    ├── Messages enter: chat:inbox:9cb15f91  (amingClaw's stream)
     │
-    │   用户 /bind toolboxClient token → 路由表更新
+    │   User /bind toolboxClient token → routing table updated
     │
-    └── 消息进入: chat:inbox:6643e5d7  (toolboxClient 的 stream)
+    └── Messages enter: chat:inbox:6643e5d7  (toolboxClient's stream)
 ```
 
-## 运行时状态模型
+## Runtime State Model
 
 ```
-每个项目独立的运行时状态:
+Independent runtime state per project:
 
 Redis:
-  chat:route:{chat_id}              → 当前活跃绑定
-  chat:inbox:{token_hash}           → 该项目的消息 stream
-  context:snapshot:{project_id}     → 该项目的 session context
-  context:log:{project_id}          → 该项目的 session log
-  lease:{lease_id}                  → 该项目的 agent 租约
+  chat:route:{chat_id}              → currently active binding
+  chat:inbox:{token_hash}           → message stream for this project
+  context:snapshot:{project_id}     → session context for this project
+  context:log:{project_id}          → session log for this project
+  lease:{lease_id}                  → agent lease for this project
 
 SQLite (per project):
-  governance.db                     → 节点状态、sessions、outbox
-  gatekeeper_checks                 → coverage-check 结果
+  governance.db                     → node status, sessions, outbox
+  gatekeeper_checks                 → coverage-check results
 
 dbservice:
-  scope={project_id}                → 该项目的记忆
+  scope={project_id}                → memory for this project
 ```
 
-## 项目切换流程
+## Project Switching Flow
 
 ```
-用户发送: /bind gov-48ed6f69... (toolboxClient token)
+User sends: /bind gov-48ed6f69... (toolboxClient token)
     │
     ▼
 Gateway:
-  1. 验证 token → 确认是 toolboxClient coordinator
-  2. 保存旧绑定的 context:
-     POST /api/context/amingClaw/save (自动)
-  3. 更新路由表:
+  1. Validate token → confirm it is toolboxClient coordinator
+  2. Save old binding's context:
+     POST /api/context/amingClaw/save (automatic)
+  3. Update routing table:
      chat:route:7848961760 → {project_id: "toolboxClient", ...}
-  4. 加载新项目 context:
+  4. Load new project context:
      GET /api/context/toolboxClient/load
-  5. 回复用户:
-     "已切换到 toolboxClient (89 节点, 89 qa_pass)"
+  5. Reply to user:
+     "Switched to toolboxClient (89 nodes, 89 qa_pass)"
     │
     ▼
-Scheduled Task 感知:
+Scheduled Task awareness:
   telegram-handler-amingclaw:
-    → 查路由 → project_id = toolboxClient ≠ amingClaw
-    → 静默退出
+    → Check route → project_id = toolboxClient ≠ amingClaw
+    → Exit silently
 
   telegram-handler-toolboxclient:
-    → 查路由 → project_id = toolboxClient ✓
-    → 消费消息 → 处理
+    → Check route → project_id = toolboxClient ✓
+    → Consume messages → process
 ```
 
-## /menu 交互式切换
+## /menu Interactive Switching
 
 ```
-用户发送: /menu
+User sends: /menu
     │
     ▼
-Gateway 构建菜单:
+Gateway builds menu:
   ┌─────────────────────────────────┐
   │ Aming Claw Gateway              │
   │                                 │
-  │ 当前: amingClaw (9cb15f91...)    │
-  │ 已注册 Coordinator: 2           │
+  │ Current: amingClaw (9cb15f91...)│
+  │ Registered Coordinators: 2      │
   │                                 │
-  │ [>> amingClaw (9cb1)]           │  ← 当前活跃
-  │ [   toolboxClient (6643)]       │  ← 可切换
+  │ [>> amingClaw (9cb1)]           │  ← currently active
+  │ [   toolboxClient (6643)]       │  ← switchable
   │                                 │
-  │ [项目状态] [项目列表]             │
-  │ [服务健康] [解绑]                │
+  │ [Project Status] [Project List] │
+  │ [Service Health] [Unbind]       │
   └─────────────────────────────────┘
     │
     ▼
-用户点击 "toolboxClient (6643)":
+User clicks "toolboxClient (6643)":
     │
     ▼
 Gateway callback_query:
-  1. 自动保存 amingClaw context
-  2. 切换路由 → toolboxClient
-  3. 加载 toolboxClient context
-  4. 刷新菜单:
-     "当前: toolboxClient (6643e5d7...)"
+  1. Auto-save amingClaw context
+  2. Switch route → toolboxClient
+  3. Load toolboxClient context
+  4. Refresh menu:
+     "Current: toolboxClient (6643e5d7...)"
 ```
 
-## 消息路由细节
+## Message Routing Details
 
-### 同一时刻只有一个活跃项目
-
-```
-chat:route:{chat_id} 只存一条记录 → 消息只进一个 stream
-
-优点: 简单，不混淆
-缺点: 切换后旧项目消息不再消费
-```
-
-### 旧项目未处理消息
+### Only One Active Project at a Time
 
 ```
-切换前:
-  amingClaw stream 有 3 条未消费消息
+chat:route:{chat_id} stores only one record → messages enter only one stream
 
-切换后:
-  这 3 条消息留在 stream 里
-  telegram-handler-amingclaw 检测到路由不匹配 → 不消费
-  消息不丢（stream 保留），但不处理
-
-切回 amingClaw 时:
-  telegram-handler-amingclaw 检测到路由匹配 → 恢复消费 → 处理积压消息
+Advantage: Simple, no confusion
+Disadvantage: Old project messages stop being consumed after switching
 ```
 
-## Context 隔离
+### Unprocessed Messages from Old Project
 
 ```
-切换时自动保存/加载:
+Before switching:
+  amingClaw stream has 3 unconsumed messages
+
+After switching:
+  These 3 messages remain in the stream
+  telegram-handler-amingclaw detects route mismatch → does not consume
+  Messages are not lost (stream preserved), but not processed
+
+When switching back to amingClaw:
+  telegram-handler-amingclaw detects route match → resumes consumption → processes backlog
+```
+
+## Context Isolation
+
+```
+Auto-save/load on switch:
 
 Gateway.handle_bind():
   1. old_route = get_route(chat_id)
   2. if old_route:
-       # 保存旧项目 context
+       # Save old project context
        POST /api/context/{old_project}/save
   3. bind_route(chat_id, new_token, new_project)
-  4. # 加载新项目 context
+  4. # Load new project context
      context = GET /api/context/{new_project}/load
-  5. 回复: 包含新项目状态 + context 摘要
+  5. Reply: includes new project status + context summary
 ```
 
-## Scheduled Task 项目感知
+## Scheduled Task Project Awareness
 
-### 每个项目一个 Task
-
-```
-telegram-handler-amingclaw:     绑定 amingClaw
-telegram-handler-toolboxclient: 绑定 toolboxClient
-
-每次触发:
-  1. 查路由表 → 当前 chat 绑的是哪个项目
-  2. 不是我的项目 → 直接退出 (< 1秒)
-  3. 是我的项目 → 消费消息 → 处理
-```
-
-### Task 处理时的上下文
+### One Task Per Project
 
 ```
-Task 启动:
-  1. GET /api/context/{my_project}/load → 获取上次工作状态
-  2. POST /api/context/{my_project}/assemble → 获取项目记忆
-  3. 处理消息时结合上下文理解用户意图
-  4. 回复后保存更新的 context
+telegram-handler-amingclaw:     bound to amingClaw
+telegram-handler-toolboxclient: bound to toolboxClient
+
+On each trigger:
+  1. Check routing table → which project is the current chat bound to
+  2. Not my project → exit immediately (< 1 second)
+  3. Is my project → consume messages → process
 ```
 
-## 跨项目查询
-
-用户可以在当前项目的对话里查其他项目：
+### Context During Task Processing
 
 ```
-用户 (当前绑定 amingClaw): "toolboxClient 有多少节点？"
+Task starts:
+  1. GET /api/context/{my_project}/load → get last working state
+  2. POST /api/context/{my_project}/assemble → get project memory
+  3. Combine context when processing messages to understand user intent
+  4. Save updated context after replying
+```
+
+## Cross-Project Queries
+
+Users can query other projects from the current project's conversation:
+
+```
+User (currently bound to amingClaw): "How many nodes does toolboxClient have?"
     │
     ▼
-Task 识别跨项目查询:
-  → GET /api/wf/toolboxClient/summary (无需 token，summary 是公开的)
-  → 回复: "toolboxClient: 89 节点, 89 qa_pass"
-  → 不切换项目绑定
+Task identifies cross-project query:
+  → GET /api/wf/toolboxClient/summary (no token needed, summary is public)
+  → Reply: "toolboxClient: 89 nodes, 89 qa_pass"
+  → Does not switch project binding
 ```
 
-## Gateway 改造点
+## Gateway Modifications
 
-### bind 时自动保存/加载 context
+### Auto-save/load context on bind
 
 ```python
-# gateway.py handle_bind 改造
+# gateway.py handle_bind modification
 def handle_bind_with_context(chat_id, token, project_id):
-    # 1. 保存旧 context
+    # 1. Save old context
     old_route = get_route(chat_id)
     if old_route and old_route.get("project_id"):
         old_pid = old_route["project_id"]
@@ -209,10 +209,10 @@ def handle_bind_with_context(chat_id, token, project_id):
                 timeout=3)
         except: pass
 
-    # 2. 绑定新项目
+    # 2. Bind new project
     bind_route(chat_id, token, project_id)
 
-    # 3. 加载新 context
+    # 3. Load new context
     context = None
     try:
         resp = requests.get(f"{GOVERNANCE_URL}/api/context/{project_id}/load",
@@ -220,34 +220,34 @@ def handle_bind_with_context(chat_id, token, project_id):
         context = resp.json().get("context")
     except: pass
 
-    # 4. 获取项目状态
+    # 4. Get project status
     summary = gov_api("GET", f"/api/wf/{project_id}/summary")
 
     return context, summary
 ```
 
-### menu 切换时显示项目状态
+### Display project status on menu switch
 
 ```python
-# 每个项目按钮显示:
-#   项目名 (token_hash前4位) — N节点 M%通过
+# Each project button displays:
+#   project_name (first 4 chars of token_hash) — N nodes M% passed
 def build_project_button(route):
     pid = route.get("project_id", "?")
     summary = gov_api("GET", f"/api/wf/{pid}/summary")
     total = summary.get("total_nodes", 0)
     passed = summary.get("by_status", {}).get("qa_pass", 0)
     pct = int(passed / total * 100) if total else 0
-    return f"{pid} — {total}节点 {pct}%通过"
+    return f"{pid} — {total} nodes {pct}% passed"
 ```
 
-## 实现优先级
+## Implementation Priority
 
-| 步骤 | 内容 | 复杂度 |
-|------|------|--------|
-| 1 | Gateway bind 时自动保存/加载 context | 低 |
-| 2 | /menu 显示项目状态 + 切换自动保存 | 低 |
-| 3 | Task 启动时查路由 + 加载 context | 已有 |
-| 4 | 跨项目查询 | 中 |
+| Step | Content | Complexity |
+|------|---------|------------|
+| 1 | Auto-save/load context on Gateway bind | Low |
+| 2 | /menu displays project status + auto-save on switch | Low |
+| 3 | Check route + load context on Task start | Already exists |
+| 4 | Cross-project queries | Medium |
 
-## 变更记录
-- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
+## Changelog
+- 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API

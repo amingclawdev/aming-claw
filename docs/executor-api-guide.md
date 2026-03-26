@@ -1,48 +1,48 @@
-# Executor API 接入指南
+# Executor API Integration Guide
 
-> **2026-03-26 更新：** executor_api.py 不再依赖旧 executor.py 或 workspace_registry.py（已删除）。`/cleanup-orphans`、`/workspaces`、`/workspaces/resolve` 端点现为 stub，返回 degraded 响应。`/coordinator/chat` 端点已废弃。
+> **2026-03-26 update:** executor_api.py no longer depends on old executor.py or workspace_registry.py (deleted). `/cleanup-orphans`, `/workspaces`, `/workspaces/resolve` endpoints are now stubs returning degraded responses. `/coordinator/chat` endpoint is deprecated.
 
-> Executor HTTP API (端口 40100) 运行在宿主机。
-> 用于 Claude Code session 直接监控、调试执行链路。
+> Executor HTTP API (port 40100) runs on the host machine.
+> Used for Claude Code session direct monitoring and debugging the execution chain.
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 检查 Executor 是否运行
+# Check if Executor is running
 curl http://localhost:40100/health
 
-# 查看整体状态
+# View overall status
 curl http://localhost:40100/status
 
-# ⚠ /coordinator/chat 已废弃（旧 coordinator.py 已删除）
+# ⚠ /coordinator/chat deprecated (old coordinator.py deleted)
 # curl -X POST http://localhost:40100/coordinator/chat \
 #   -H "Content-Type: application/json" \
-#   -d '{"message": "当前项目状态", "project_id": "amingClaw"}'
+#   -d '{"message": "current project status", "project_id": "amingClaw"}'
 ```
 
-## 端点列表
+## Endpoint List
 
-### 监控 (GET)
+### Monitoring (GET)
 
-| 端点 | 说明 | 返回 |
-|------|------|------|
-| `/health` | API 健康检查 | `{status, port, ai_manager, orchestrator}` |
-| `/status` | 整体状态 | `{pending_tasks, processing_tasks, active_ai_sessions}` |
-| `/sessions` | 活跃 AI 进程 | `{sessions: [{session_id, role, pid, elapsed_sec}]}` |
-| `/tasks?project_id=X&status=Y` | 任务列表 | `{tasks: [...], count}` |
-| `/task/{task_id}` | 单任务详情 | 任务 JSON + `_stage` + `_file` |
-| `/trace/{trace_id}` | 链路追踪 | `{trace_id, entries: [...]}` |
-| `/workspaces` | ~~工作区注册表~~ **stub，返回 degraded** | `{workspaces: [], count: 0, degraded: true}` |
-| `/workspaces/resolve?project_id=X` | ~~按项目ID解析工作区~~ **stub，返回 degraded** | `{degraded: true}` |
+| Endpoint | Description | Returns |
+|----------|-------------|---------|
+| `/health` | API health check | `{status, port, ai_manager, orchestrator}` |
+| `/status` | Overall status | `{pending_tasks, processing_tasks, active_ai_sessions}` |
+| `/sessions` | Active AI processes | `{sessions: [{session_id, role, pid, elapsed_sec}]}` |
+| `/tasks?project_id=X&status=Y` | Task list | `{tasks: [...], count}` |
+| `/task/{task_id}` | Single task details | Task JSON + `_stage` + `_file` |
+| `/trace/{trace_id}` | Trace tracking | `{trace_id, entries: [...]}` |
+| `/workspaces` | ~~Workspace registry~~ **stub, returns degraded** | `{workspaces: [], count: 0, degraded: true}` |
+| `/workspaces/resolve?project_id=X` | ~~Resolve workspace by project ID~~ **stub, returns degraded** | `{degraded: true}` |
 
-### 介入 (POST)
+### Intervention (POST)
 
-| 端点 | 说明 | Body |
-|------|------|------|
-| `/task/{id}/pause` | 暂停运行中的任务 | 无 |
-| `/task/{id}/cancel` | 取消任务 | 无 |
-| `/task/{id}/retry` | 重试失败的任务 | 无 |
-| `/cleanup-orphans` | ~~清理僵尸进程~~ **stub，返回 degraded** | 无 |
+| Endpoint | Description | Body |
+|----------|-------------|------|
+| `/task/{id}/pause` | Pause running task | None |
+| `/task/{id}/cancel` | Cancel task | None |
+| `/task/{id}/retry` | Retry failed task | None |
+| `/cleanup-orphans` | ~~Clean up zombie processes~~ **stub, returns degraded** | None |
 | `/tasks/create` | Idempotent task file creation (used by Orchestrator) | JSON task object |
 
 ### POST /tasks/create — Idempotency Guarantees
@@ -78,159 +78,159 @@ If a match is found in **any** of these stages, the endpoint returns the existin
 {"status": "exists",  "task_id": "task-abc123", "stage": "processing"}
 ```
 
-### 直接对话 (POST) — **已废弃**
+### Direct Conversation (POST) — **Deprecated**
 
-| 端点 | 说明 | Body |
-|------|------|------|
-| `/coordinator/chat` | ~~直接启动 Coordinator session~~ **已废弃，旧 coordinator.py 已删除** | `{message, project_id, chat_id?}` |
+| Endpoint | Description | Body |
+|----------|-------------|------|
+| `/coordinator/chat` | ~~Directly start Coordinator session~~ **Deprecated, old coordinator.py deleted** | `{message, project_id, chat_id?}` |
 
-### 调试 (GET)
+### Debugging (GET)
 
-| 端点 | 说明 | 返回 |
-|------|------|------|
-| `/validator/last-result` | 最近一次校验结果 | `{approved, rejected, layers[], needs_retry}` |
-| `/context/{project_id}` | 当前上下文组装结果 | `{project_id, context: {...}}` |
-| `/ai-session/{id}/output` | AI 原始输出 | `{stdout, stderr, exit_code, elapsed_sec}` |
+| Endpoint | Description | Returns |
+|----------|-------------|---------|
+| `/validator/last-result` | Latest validation result | `{approved, rejected, layers[], needs_retry}` |
+| `/context/{project_id}` | Current context assembly result | `{project_id, context: {...}}` |
+| `/ai-session/{id}/output` | AI raw output | `{stdout, stderr, exit_code, elapsed_sec}` |
 
-## 工作区路由（已废弃）
+## Workspace Routing (Deprecated)
 
-> **注意 (2026-03-26)：** workspace_registry.py 已删除。以下路由逻辑仅作历史参考。`/workspaces` 和 `/workspaces/resolve` 现返回 degraded 响应。
+> **Note (2026-03-26):** workspace_registry.py has been deleted. The following routing logic is for historical reference only. `/workspaces` and `/workspaces/resolve` now return degraded responses.
 
-1. `target_workspace_id` — 精确 ID 匹配
-2. `target_workspace` — 标签匹配
-3. **`project_id`** — 归一化项目 ID 匹配（推荐）
-4. `@workspace:<label>` 前缀
-5. 默认工作区（fallback）
+1. `target_workspace_id` — Exact ID match
+2. `target_workspace` — Label match
+3. **`project_id`** — Normalized project ID match (recommended)
+4. `@workspace:<label>` prefix
+5. Default workspace (fallback)
 
-### project_id 归一化规则
+### project_id Normalization Rules
 
-所有变体自动统一为 kebab-case：
+All variants are automatically unified to kebab-case:
 
-| 输入 | 归一化结果 |
-|------|-----------|
+| Input | Normalized Result |
+|-------|-------------------|
 | `amingClaw` | `aming-claw` |
 | `aming_claw` | `aming-claw` |
 | `toolBoxClient` | `tool-box-client` |
 
-### 查询工作区
+### Query Workspaces
 
 ```bash
-# 列出所有注册的工作区
+# List all registered workspaces
 curl http://localhost:40100/workspaces
 
-# 查询某项目对应的工作区
+# Query workspace for a specific project
 curl "http://localhost:40100/workspaces/resolve?project_id=amingClaw"
 # → {"workspace": {"id":"ws-xxx", "path":"C:/...", "project_id":"aming-claw"}, "matched_by":"project_id"}
 ```
 
-### 注册工作区（已废弃）
+### Register Workspace (Deprecated)
 
-> workspace_registry.py 已于 2026-03-26 删除，以下代码不再可用。
+> workspace_registry.py was deleted on 2026-03-26, the following code is no longer available.
 
 ```python
-# ⚠ 已废弃
+# ⚠ Deprecated
 # from workspace_registry import add_workspace
 # add_workspace(Path("/path/to/repo"), label="my-project", project_id="my-project")
 ```
 
-### Redis Stream 审计
+### Redis Stream Audit
 
-每次 AI session 的 prompt（输入）和 result（输出）会写入 Redis Stream `ai:prompt:{session_id}`，用于审计和调试：
+Each AI session's prompt (input) and result (output) are written to Redis Stream `ai:prompt:{session_id}`, used for auditing and debugging:
 
 ```bash
-# 查看某 session 的完整 prompt+result
+# View a session's complete prompt+result
 redis-cli -p 40079 XRANGE ai:prompt:ai-dev-xxx - +
 ```
 
-## 使用场景
+## Usage Scenarios
 
-### 1. 检查为什么任务没执行
+### 1. Check Why a Task Hasn't Executed
 
 ```bash
-# 查看队列
+# View queue
 curl http://localhost:40100/status
 # → pending_tasks: 3, processing_tasks: 1
 
-# 看具体任务
+# View specific tasks
 curl http://localhost:40100/tasks?status=queued
 
-# 看正在处理的任务
+# View task being processed
 curl http://localhost:40100/task/task-xxx
 ```
 
-### 2. 任务卡住了
+### 2. Task is Stuck
 
 ```bash
-# 查看活跃 AI session
+# View active AI sessions
 curl http://localhost:40100/sessions
 
-# 取消卡住的任务
+# Cancel stuck task
 curl -X POST http://localhost:40100/task/task-xxx/cancel
 
-# 清理所有僵尸
+# Clean up all zombies
 curl -X POST http://localhost:40100/cleanup-orphans
 ```
 
-### 3. 调试回复不对（旧 Coordinator 已移除，以下仅供参考）
+### 3. Debug Incorrect Reply (Old Coordinator removed, the following is for reference only)
 
 ```bash
-# 看最近的 validator 决策
+# View latest validator decisions
 curl http://localhost:40100/validator/last-result
 
-# 看注入的上下文
+# View injected context
 curl http://localhost:40100/context/amingClaw
 
-# 看 AI 原始输出
+# View AI raw output
 curl http://localhost:40100/ai-session/ai-coordinator-xxx/output
 ```
 
-### 4. 直接和 Coordinator 对话（已废弃，旧 coordinator.py 已删除）
+### 4. Direct Conversation with Coordinator (Deprecated, old coordinator.py deleted)
 
 ```bash
 curl -X POST http://localhost:40100/coordinator/chat \
   -H "Content-Type: application/json" \
   -d '{
-    "message": "帮我分析一下 L15 的状态",
+    "message": "Help me analyze L15 status",
     "project_id": "amingClaw"
   }'
 
-# 返回:
+# Returns:
 # {
-#   "reply": "L15 共 9 个节点，全部 qa_pass...",
+#   "reply": "L15 has 9 nodes, all qa_pass...",
 #   "actions_executed": 0,
 #   "actions_rejected": 0
 # }
 ```
 
-### 5. 查看完整链路追踪
+### 5. View Full Trace
 
 ```bash
-# 列出最近的 trace
+# List recent traces
 ls shared-volume/codex-tasks/traces/
 
-# 查看某个 trace 详情
+# View a specific trace in detail
 curl http://localhost:40100/trace/trace-1774230000-abcdef12
 ```
 
-## 与其他服务的关系
+## Relationship with Other Services
 
 ```
-Claude Code Session (开发者)
+Claude Code Session (Developer)
     │ curl localhost:40100/...
     ▼
-Executor API (:40100)  ← 本文档描述的接口（监控层）
+Executor API (:40100)  ← Interface described in this document (monitoring layer)
     │
-    └── executor-gateway (:8090) → 实际任务执行
+    └── executor-gateway (:8090) → Actual task execution
 
-Telegram 用户
-    │ 消息
+Telegram User
+    │ Messages
     ▼
-Gateway (:40010) → task 文件 → Executor task loop
+Gateway (:40010) → task files → Executor task loop
     │
     ▼
-Governance (:40006)  → 规则引擎
-dbservice (:40002)   → 记忆层
-Redis (:40079)       → 缓存
+Governance (:40006)  → Rule engine
+dbservice (:40002)   → Memory layer
+Redis (:40079)       → Cache
 ```
 
 ## QA Status Types
@@ -301,13 +301,13 @@ loop iteration N:
 end of full scan cycle → _skipped_tasks.clear()
 ```
 
-## 注意事项
+## Notes
 
-- Executor API 只在宿主机上可访问（localhost:40100）
-- 不经过 nginx，不需要 governance token
-- `/coordinator/chat` 已废弃（旧 coordinator.py 已删除）
-- `/task/{id}/cancel` 会终止 AI 进程，谨慎使用
-- `/cleanup-orphans` 现为 stub（旧 executor.py 的 `_EXECUTOR_SPAWNED_PIDS` 机制已移除）
+- Executor API is only accessible on the host machine (localhost:40100)
+- Does not go through nginx, no governance token needed
+- `/coordinator/chat` is deprecated (old coordinator.py deleted)
+- `/task/{id}/cancel` will terminate AI process, use with caution
+- `/cleanup-orphans` is now a stub (old executor.py's `_EXECUTOR_SPAWNED_PIDS` mechanism removed)
 
-## 变更记录
-- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
+## Changelog
+- 2026-03-26: Old Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules), unified to use governance API

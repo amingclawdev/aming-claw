@@ -152,9 +152,9 @@ If at layer 3 (or deeper) you confirm a **self-bootstrap paradox** — the execu
 
 When the system detects conditions that **may** require intervention (not confirmed yet), it sends a notification and pauses — it does not request manual action immediately.
 
-### 5.1 Gate Blocked 事件
+### 5.1 Gate Blocked Event
 
-当 auto_chain 的 gate 检查失败时（`gate.blocked` 事件），链路暂停，`complete_task()` 的响应中包含阻塞信息：
+When auto_chain's gate check fails (`gate.blocked` event), the chain pauses, and the `complete_task()` response includes blocking information:
 
 ```json
 {
@@ -168,16 +168,16 @@ When the system detects conditions that **may** require intervention (not confir
 }
 ```
 
-**Observer 处理 gate blocked 的流程：**
+**Observer flow for handling gate blocked:**
 
-1. 通过 task list API 查看阻塞原因（`GET /api/task/list?project_id=xxx`）
-2. 根据 `reason` 定位问题（如 PRD 缺字段、scope 外文件修改、测试失败等）
-3. 修复问题后，重新提交该阶段的任务（`POST /api/task/create`），auto_chain 会从该阶段重新推进
+1. View blocking reason via task list API (`GET /api/task/list?project_id=xxx`)
+2. Locate the issue based on `reason` (e.g., PRD missing fields, out-of-scope file modifications, test failures, etc.)
+3. After fixing the issue, resubmit the task for that stage (`POST /api/task/create`); auto_chain will resume from that stage
 
-各 gate 可能的阻塞原因：
+Possible blocking reasons for each gate:
 
-| Gate | 典型 reason |
-|------|-----------|
+| Gate | Typical Reason |
+|------|---------------|
 | Post-PM | `PRD missing mandatory fields: ['target_files']` |
 | Checkpoint | `No files changed` / `Unrelated files modified: [...]` / `Dev tests failed` |
 | T2 Pass | `Tests failed: N failures` |
@@ -324,6 +324,6 @@ Manual intervention unlocked only when:
       OR an architectural / credential / large-scope condition applies
 ```
 
-## 变更记录
-- 2026-03-26: auto_chain.py 实现完成，全链路 PM→Dev→Test→QA→Merge→Deploy 自动调度，含 gate 验证
-- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
+## Changelog
+- 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation
+- 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API

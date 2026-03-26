@@ -1,132 +1,132 @@
-# Scheduled Task 消息处理设计
+# Scheduled Task Message Processing Design
 
-## 核心原则
+## Core Principles
 
-- 每个 Scheduled Task 绑定一个项目
-- 多项目 = 多个 Task 实例
-- 通过 Gateway 路由表感知项目切换
-- Context 和记忆按项目隔离
+- Each Scheduled Task is bound to one project
+- Multiple projects = multiple Task instances
+- Project switching is detected via the Gateway routing table
+- Context and memory are isolated per project
 
-## 架构
+## Architecture
 
 ```
-Gateway 路由表 (Redis)
+Gateway Routing Table (Redis)
   chat:route:7848961760 → {token_hash, project_id: "amingClaw"}
       │
-      │ 用户 /bind 切换项目时自动更新
+      │ Auto-updated when user switches project via /bind
       │
       ▼
 Scheduled Task: telegram-handler-amingClaw
   │
-  ├── 1. 查路由表确认 chat 还绑在本项目
-  │     → 是 → 继续处理
-  │     → 否 → 静默退出 (用户切换到了别的项目)
+  ├── 1. Check routing table to confirm chat is still bound to this project
+  │     → Yes → Continue processing
+  │     → No → Exit silently (user switched to a different project)
   │
-  ├── 2. 加载项目 context
+  ├── 2. Load project context
   │     GET /api/context/amingClaw/load
   │
-  ├── 3. 加载项目记忆
+  ├── 3. Load project memory
   │     POST /api/context/amingClaw/assemble
   │
-  ├── 4. 消费消息 + 处理 + 回复
+  ├── 4. Consume messages + process + reply
   │
-  └── 5. 保存 context
+  └── 5. Save context
         POST /api/context/amingClaw/save
 
 Scheduled Task: telegram-handler-toolboxClient
-  └── 同上，绑定 toolboxClient
+  └── Same as above, bound to toolboxClient
 ```
 
-## 单项目 Task 模板
+## Single-Project Task Template
 
 ```
 Task ID: telegram-handler-{project_id}
-Schedule: * * * * * (每分钟)
+Schedule: * * * * * (every minute)
 
-启动流程:
-  1. CHECK: 本项目是否是当前活跃绑定？
-     → GET /gateway/status → 找 chat_id 对应的 project_id
-     → project_id != 本 task 的项目 → 退出
-     → project_id == 本 task 的项目 → 继续
+Startup Flow:
+  1. CHECK: Is this project the currently active binding?
+     → GET /gateway/status → Find the project_id for the chat_id
+     → project_id != this task's project → Exit
+     → project_id == this task's project → Continue
 
-  2. CHECK: 消息队列有内容？
+  2. CHECK: Does the message queue have content?
      → XLEN chat:inbox:{token_hash}
-     → 0 → 退出
+     → 0 → Exit
 
-  3. LOAD: 上下文 + 记忆
-     → GET /api/context/{pid}/load → 上次工作状态
-     → POST /api/context/{pid}/assemble → 项目相关记忆
+  3. LOAD: Context + memory
+     → GET /api/context/{pid}/load → Previous working state
+     → POST /api/context/{pid}/assemble → Project-related memory
 
-  4. PROCESS: 逐条消费消息
-     → XREADGROUP + 处理 + XACK
-     → 回复: POST /gateway/reply
+  4. PROCESS: Consume messages one by one
+     → XREADGROUP + process + XACK
+     → Reply: POST /gateway/reply
 
-  5. SAVE: 更新 context
+  5. SAVE: Update context
      → POST /api/context/{pid}/save
-     → POST /api/context/{pid}/log (追加处理记录)
+     → POST /api/context/{pid}/log (append processing records)
 ```
 
-## 多项目切换场景
+## Multi-Project Switching Scenario
 
 ```
-用户在 Telegram /menu 切换到 toolboxClient:
+User switches to toolboxClient via Telegram /menu:
     │
     ▼
-Gateway 更新路由表:
+Gateway updates routing table:
   chat:route:7848961760 → {project_id: "toolboxClient", token_hash: "xxx"}
     │
     ▼
-下一次 Scheduled Task 触发:
+Next Scheduled Task trigger:
   telegram-handler-amingClaw:
-    → 查路由 → project_id = toolboxClient ≠ amingClaw
-    → 静默退出 (不处理)
+    → Check route → project_id = toolboxClient ≠ amingClaw
+    → Exit silently (skip processing)
 
   telegram-handler-toolboxClient:
-    → 查路由 → project_id = toolboxClient ✓
-    → 消费消息 → 处理 → 回复
+    → Check route → project_id = toolboxClient ✓
+    → Consume messages → process → reply
 ```
 
-## 创建方式
+## Creation Method
 
-人类或 Coordinator 为每个项目创建一个 Task:
+A human or Coordinator creates one Task per project:
 
 ```bash
 # amingClaw
 mcp__scheduled-tasks__create_scheduled_task(
     taskId="telegram-handler-amingClaw",
     cronExpression="* * * * *",
-    prompt="... 绑定 amingClaw ..."
+    prompt="... bound to amingClaw ..."
 )
 
 # toolboxClient
 mcp__scheduled-tasks__create_scheduled_task(
     taskId="telegram-handler-toolboxClient",
     cronExpression="* * * * *",
-    prompt="... 绑定 toolboxClient ..."
+    prompt="... bound to toolboxClient ..."
 )
 ```
 
-## 保留的多项目交互能力
+## Retained Multi-Project Interaction Capabilities
 
-1. **跨项目查询**: 消息里提到另一个项目 → task 可以调另一个项目的 API
+1. **Cross-project queries**: When a message mentions another project, the task can call that project's API
    ```
-   用户: "amingClaw 和 toolboxClient 各有多少节点？"
+   User: "How many nodes do amingClaw and toolboxClient each have?"
    → GET /api/wf/amingClaw/summary
    → GET /api/wf/toolboxClient/summary
-   → 合并回复
+   → Merge replies
    ```
 
-2. **项目切换提示**: 用户 /bind 切换项目后，旧项目 task 检测到路由变化
-   → 保存 context → 通知 "已切换到 xxx"
+2. **Project switch notification**: After user switches project via /bind, the old project's task detects the route change
+   → Save context → Notify "Switched to xxx"
 
-3. **全局记忆**: dbservice 的 scope=global 可存跨项目通用知识
+3. **Global memory**: dbservice with scope=global can store cross-project common knowledge
 
-4. **统一 Gateway**: 不管绑哪个项目，Gateway 路由表统一管理，task 只需查路由
+4. **Unified Gateway**: Regardless of which project is bound, the Gateway routing table manages everything uniformly; tasks only need to check the route
 
-## Task Prompt 模板
+## Task Prompt Template
 
 ```
-你是 {project_id} 项目的 Coordinator 助手。
+You are the Coordinator assistant for the {project_id} project.
 
 TOKEN: {coordinator_token}
 PROJECT: {project_id}
@@ -134,31 +134,31 @@ CHAT_ID: {chat_id}
 STREAM: chat:inbox:{token_hash}
 BASE_URL: http://localhost:40000
 
-步骤:
-1. 检查路由: curl -s http://localhost:40000/gateway/status
-   → 找 chat_id={chat_id} 的绑定
-   → 如果 project_id 不是 {project_id}，直接结束
+Steps:
+1. Check routing: curl -s http://localhost:40000/gateway/status
+   → Find the binding for chat_id={chat_id}
+   → If project_id is not {project_id}, exit immediately
 
-2. 检查队列: docker exec aming_claw-redis-1 redis-cli XLEN {stream}
-   → 0 则结束
+2. Check queue: docker exec aming_claw-redis-1 redis-cli XLEN {stream}
+   → If 0, exit
 
-3. 加载上下文:
+3. Load context:
    curl -s http://localhost:40000/api/context/{project_id}/load \
      -H "X-Gov-Token: {token}"
 
-4. 读取消息:
+4. Read messages:
    docker exec aming_claw-redis-1 redis-cli XRANGE {stream} - + COUNT 5
 
-5. 处理每条消息并回复:
+5. Process each message and reply:
    curl -s -X POST http://localhost:40000/gateway/reply \
      -H "Content-Type: application/json" \
      -H "X-Gov-Token: {token}" \
-     -d '{{"token":"{token}","chat_id":{chat_id},"text":"回复内容"}}'
+     -d '{{"token":"{token}","chat_id":{chat_id},"text":"reply content"}}'
 
-6. ACK 消息:
+6. ACK messages:
    docker exec aming_claw-redis-1 redis-cli XACK {stream} coordinator-group {msg_id}
 
-7. 保存上下文:
+7. Save context:
    curl -s -X POST http://localhost:40000/api/context/{project_id}/save \
      -H "Content-Type: application/json" \
      -H "X-Gov-Token: {token}" \

@@ -1,96 +1,96 @@
-# Aming Claw 架构方案 v6 — Executor 驱动架构
+# Aming Claw Architecture v6 — Executor-Driven Architecture
 
-> **⚠ 2026-03-26 重大变更：旧 Telegram bot 系统已完全移除。**
-> 以下 20 个 agent/ 模块已删除：bot_commands.py, coordinator.py, executor.py, interactive_menu.py, task_accept.py, service_manager.py, backends.py, config.py, task_state.py, auth.py, model_registry.py, git_rollback.py, workspace.py, workspace_registry.py, workspace_queue.py, parallel_dispatcher.py, project_summary.py, task_retry.py, task_orchestrator.py, approval_manager.py。
+> **⚠ 2026-03-26 Major Change: Old Telegram bot system completely removed.**
+> The following 20 agent/ modules have been deleted: bot_commands.py, coordinator.py, executor.py, interactive_menu.py, task_accept.py, service_manager.py, backends.py, config.py, task_state.py, auth.py, model_registry.py, git_rollback.py, workspace.py, workspace_registry.py, workspace_queue.py, parallel_dispatcher.py, project_summary.py, task_retry.py, task_orchestrator.py, approval_manager.py.
 >
-> 当前系统统一使用：
-> - **governance server** (port 40006) — 任务注册、workflow、审计
-> - **telegram_gateway** (port 40010) — Telegram 消息路由
-> - **executor-gateway** (FastAPI port 8090) — 任务执行
-> - **executor_api.py** (port 40100) — 监控 API
+> Current system uses uniformly:
+> - **governance server** (port 40006) — Task registration, workflow, audit
+> - **telegram_gateway** (port 40010) — Telegram message routing
+> - **executor-gateway** (FastAPI port 8090) — Task execution
+> - **executor_api.py** (port 40100) — Monitoring API
 >
-> 本文档中引用旧模块的设计仅作历史参考，实际架构流程为：Gateway → Governance API → Task Registry → executor-gateway。
+> Designs referencing old modules in this document are for historical reference only. Actual architecture flow: Gateway → Governance API → Task Registry → executor-gateway.
 
-> 核心原则：**代码管流程，AI 管决策。** 所有 AI 调用由 Executor 代码控制，AI 不能直接操作系统。
-> AI 进程生命周期由 Executor 管理，Coordinator 指挥 Executor 分派上下文和记忆。
+> Core principle: **Code manages flow, AI manages decisions.** All AI calls controlled by Executor code, AI cannot directly operate the system.
+> AI process lifecycle managed by Executor, Coordinator directs Executor to dispatch context and memory.
 >
-> v6.1 新增 PM 角色：需求分析→PRD→节点设计→Coordinator 编排→Dev 执行。完整的需求到交付链路。
+> v6.1 adds PM role: Requirements analysis → PRD → node design → Coordinator orchestration → Dev execution. Complete requirements-to-delivery pipeline.
 
-## 零、角色全景（v6.1）
+## 0. Role Overview (v6.1)
 
 ```
-用户需求
+User Requirements
     ↓
-PM (需求分析 + PRD + 节点设计)
+PM (Requirements analysis + PRD + node design)
     ↓ PRD + proposed_nodes
-Coordinator (编排 + 决策 + 回复用户)
+Coordinator (Orchestration + decisions + reply to user)
     ↓ create_dev_task / create_test_task
-Dev (编码) → Tester (测试) → QA (验收)
+Dev (Coding) → Tester (Testing) → QA (Acceptance)
     ↓ eval_complete
-Coordinator (评估结果 + 归档)
+Coordinator (Evaluate results + archive)
     ↓
-用户收到回复
+User receives reply
 ```
 
-| 角色 | 输入 | 输出 | 不能做 |
-|------|------|------|--------|
-| **PM** | 用户需求 | PRD + 节点提议 + 工作量评估 | 写代码、执行命令、创建任务、验证节点 |
-| **Coordinator** | PRD + 项目状态 | 任务编排 + 回复用户 | 写代码、需求分析 |
-| **Dev** | 任务 prompt | 代码修改 + 测试 | 和用户对话、创建任务 |
-| **Tester** | 代码变更 | 测试报告 + verify(testing/t2_pass) | 修改代码、创建任务 |
-| **QA** | 测试结果 | 验收决策 + verify(qa_pass) | 修改代码、运行测试 |
+| Role | Input | Output | Cannot Do |
+|------|-------|--------|-----------|
+| **PM** | User requirements | PRD + node proposals + effort estimate | Write code, execute commands, create tasks, verify nodes |
+| **Coordinator** | PRD + project status | Task orchestration + reply to user | Write code, requirements analysis |
+| **Dev** | Task prompt | Code changes + tests | Converse with user, create tasks |
+| **Tester** | Code changes | Test report + verify(testing/t2_pass) | Modify code, create tasks |
+| **QA** | Test results | Acceptance decision + verify(qa_pass) | Modify code, run tests |
 
-## 一、v5.1 → v6 核心变更
+## 1. v5.1 → v6 Core Changes
 
-| 维度 | v5.1 | v6 | 原因 |
-|------|------|----|------|
-| AI 调用 | Gateway/AI 自己调 CLI | **Executor 统一调 CLI** | 代码控制 = 可校验、可拦截、可重试 |
-| AI 输出 | 自由文本 + 直接操作 API | **结构化决策 JSON** | 代码可解析、可验证 |
-| 任务创建 | Coordinator AI 调 API 创建 | **Coordinator 输出决策 → Executor 代码创建** | AI 不直接操作系统 |
-| AI 生命周期 | 无统一管理 | **Executor AI Lifecycle Manager** | 统一启动/监控/kill/回收 |
-| 结果评估 | Gateway 直接发用户 | **Executor 自动创建 Coordinator eval** | 决策闭环 |
-| 记忆归档 | 手动 | **任务完成自动触发** | 不遗漏 |
-| 越权检查 | verify_loop 事后检查 | **Executor 代码实时拦截** | 前置防御 |
+| Dimension | v5.1 | v6 | Reason |
+|-----------|------|----|--------|
+| AI invocation | Gateway/AI calls CLI itself | **Executor unified CLI calls** | Code control = verifiable, interceptable, retryable |
+| AI output | Free text + direct API operations | **Structured decision JSON** | Code parseable, verifiable |
+| Task creation | Coordinator AI calls API to create | **Coordinator outputs decisions → Executor code creates** | AI does not directly operate system |
+| AI lifecycle | No unified management | **Executor AI Lifecycle Manager** | Unified start/monitor/kill/reclaim |
+| Result evaluation | Gateway sends directly to user | **Executor auto-creates Coordinator eval** | Decision closed loop |
+| Memory archival | Manual | **Auto-triggered on task completion** | No omissions |
+| Authorization check | verify_loop post-hoc check | **Executor code real-time interception** | Proactive defense |
 
-## 二、系统全景
+## 2. System Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        人类用户 (Telegram)                       │
+│                        Human User (Telegram)                     │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ 消息
+                               │ Messages
                     ┌──────────▼──────────┐
                     │    Nginx (:40000)    │
                     └──────┬──────────────┘
                            │
               ┌────────────▼──────────────────────┐
               │       Telegram Gateway             │
-              │       (Docker, 消息收发)            │
+              │       (Docker, message send/receive)│
               │                                    │
-              │  职责: 只做消息收发                  │
-              │  收到非命令消息 → 写 task 文件       │
-              │  收到通知 → 发 Telegram              │
+              │  Responsibility: message send/receive only │
+              │  Non-command message → write task file     │
+              │  Receive notification → send Telegram      │
               └────────────┬──────────────────────┘
-                           │ task 文件 (shared-volume)
+                           │ task files (shared-volume)
 ─ ─ ─ ─ ─ ─ Docker ─ ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
                            │
               ┌────────────▼──────────────────────────────────────┐
-              │            Executor (宿主机, 常驻)                  │
+              │            Executor (host machine, resident)          │
               │                                                    │
               │  ┌──────────────────────────────────────────────┐  │
               │  │         AI Lifecycle Manager                  │  │
               │  │                                              │  │
-              │  │  管理所有 AI 进程:                             │  │
+              │  │  Manage all AI processes:                       │  │
               │  │    create_session(role, context, prompt)      │  │
               │  │    monitor_session(pid, timeout)              │  │
               │  │    kill_session(pid)                          │  │
-              │  │    collect_output(pid) → 结构化 JSON          │  │
+              │  │    collect_output(pid) → structured JSON       │  │
               │  └──────────────────────────────────────────────┘  │
               │                                                    │
               │  ┌──────────────────────────────────────────────┐  │
               │  │         Decision Validator                    │  │
               │  │                                              │  │
-              │  │  校验 AI 输出的每个 action:                    │  │
+              │  │  Validate every action in AI output:            │  │
               │  │    check_permission(role, action_type)        │  │
               │  │    check_node_exists(node_id)                 │  │
               │  │    check_coverage(target_files)               │  │
@@ -102,7 +102,7 @@ Coordinator (评估结果 + 归档)
               │  ┌──────────────────────────────────────────────┐  │
               │  │         Task Orchestrator                     │  │
               │  │                                              │  │
-              │  │  任务状态机 + 自动触发链:                       │  │
+              │  │  Task state machine + auto-trigger chain:       │  │
               │  │    user_message → coordinator                 │  │
               │  │    coordinator_decision → validate → execute  │  │
               │  │    dev_complete → coordinator_eval             │  │
@@ -111,31 +111,31 @@ Coordinator (评估结果 + 归档)
               │                                                    │
               │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐  │
               │  │Coord AI│  │Dev AI  │  │Test AI │  │QA AI   │  │
-              │  │(决策)  │  │(编码)  │  │(测试)  │  │(验收)  │  │
+              │  │(Decide)│  │(Code)  │  │(Test)  │  │(Accept)│  │
               │  └────────┘  └────────┘  └────────┘  └────────┘  │
               └───────────────────────────────────────────────────┘
                            │
               ┌────────────▼──────────────────────┐
               │  Governance Service (Docker)        │
-              │  规则引擎 + 状态 + 审计              │
+              │  Rule engine + state + audit          │
               └────────────────────────────────────┘
               ┌────────────────────────────────────┐
-              │  dbservice (Docker) — 记忆层        │
+              │  dbservice (Docker) — Memory layer   │
               └────────────────────────────────────┘
               ┌────────────────────────────────────┐
-              │  Redis (Docker) — 缓存/队列/通知    │
+              │  Redis (Docker) — Cache/queue/notify │
               └────────────────────────────────────┘
 ```
 
-## 三、核心组件设计
+## 3. Core Component Design
 
 ### 3.1 AI Lifecycle Manager
 
-管理所有 AI 进程的启动、监控、回收。**AI 不能自己启动 AI。**
+Manages startup, monitoring, and reclamation of all AI processes. **AI cannot start AI by itself.**
 
 ```python
 class AILifecycleManager:
-    """管理所有 AI 进程。代码控制，AI 不能自启。"""
+    """Manage all AI processes. Code-controlled, AI cannot self-start."""
 
     def __init__(self):
         self.sessions: dict[str, AISession] = {}
@@ -143,31 +143,31 @@ class AILifecycleManager:
     def create_session(
         self,
         role: str,           # coordinator / dev / tester / qa
-        prompt: str,         # AI 的输入
-        context: dict,       # 注入的上下文
+        prompt: str,         # AI input
+        context: dict,       # Injected context
         project_id: str,
         timeout_sec: int = 120,
         output_format: str = "structured",  # structured / freeform
     ) -> AISession:
-        """启动一个 AI CLI 进程。
+        """Start an AI CLI process.
 
-        - 组装 system prompt (角色 + 上下文 + 输出格式要求)
-        - 启动 claude CLI subprocess
-        - 记录 PID 到 sessions 表
-        - 返回 AISession 对象
+        - Assemble system prompt (role + context + output format requirements)
+        - Start claude CLI subprocess
+        - Record PID to sessions table
+        - Return AISession object
         """
 
     def wait_for_output(self, session_id: str) -> AIOutput:
-        """等待 AI 完成，收集 stdout → 解析为结构化输出。"""
+        """Wait for AI completion, collect stdout → parse into structured output."""
 
     def kill_session(self, session_id: str, reason: str) -> None:
-        """强制终止 AI 进程。记录原因到审计。"""
+        """Force terminate AI process. Record reason to audit."""
 
     def cleanup_orphans(self) -> int:
-        """扫描所有 session，kill 超时/无心跳的。"""
+        """Scan all sessions, kill timed-out/no-heartbeat ones."""
 
     def list_active(self) -> list[AISession]:
-        """列出所有活跃 AI 进程。"""
+        """List all active AI processes."""
 ```
 
 ```python
@@ -175,7 +175,7 @@ class AILifecycleManager:
 class AISession:
     session_id: str
     role: str           # coordinator / dev / tester / qa
-    pid: int            # OS 进程 ID
+    pid: int            # OS process ID
     project_id: str
     prompt: str
     context: dict
@@ -185,27 +185,27 @@ class AISession:
     output: AIOutput | None
 ```
 
-### 3.2 AI 结构化输出
+### 3.2 AI Structured Output
 
-**AI 不输出自由操作，只输出结构化决策 JSON。**
+**AI does not output free-form operations, only structured decision JSON.**
 
-#### Coordinator 输出格式
+#### Coordinator Output Format
 
 ```json
 {
-  "reply": "用户可见的回复文本",
+  "reply": "User-visible reply text",
   "actions": [
     {
       "type": "create_dev_task",
-      "prompt": "修复 deploy-governance.sh 端口从 40006 改为 40000",
+      "prompt": "Fix deploy-governance.sh port from 40006 to 40000",
       "target_files": ["deploy-governance.sh"],
       "related_nodes": ["L13.5"],
       "priority": 1
     },
     {
       "type": "create_test_task",
-      "prompt": "测试端口修复后 pre-deploy-check 是否通过",
-      "depends_on": "上一个 dev_task 完成后"
+      "prompt": "Test if pre-deploy-check passes after port fix",
+      "depends_on": "After previous dev_task completes"
     },
     {
       "type": "query_governance",
@@ -213,8 +213,8 @@ class AISession:
     },
     {
       "type": "update_context",
-      "current_focus": "修复部署端口配置",
-      "decisions": ["端口应统一通过 nginx:40000 访问"]
+      "current_focus": "Fix deployment port configuration",
+      "decisions": ["Ports should be unified through nginx:40000"]
     }
   ],
   "needs_human_confirm": false,
@@ -222,11 +222,11 @@ class AISession:
 }
 ```
 
-#### Dev 输出格式
+#### Dev Output Format
 
 ```json
 {
-  "summary": "修复了 deploy-governance.sh 中的端口配置",
+  "summary": "Fixed port configuration in deploy-governance.sh",
   "changed_files": ["deploy-governance.sh"],
   "test_results": {
     "ran": true,
@@ -240,7 +240,7 @@ class AISession:
 }
 ```
 
-#### Tester 输出格式
+#### Tester Output Format
 
 ```json
 {
@@ -263,56 +263,56 @@ class AISession:
 
 ### 3.3 Decision Validator
 
-**代码实时校验 AI 的每个决策，不合法则拒绝并让 AI 重新分析。**
+**Code validates every AI decision in real-time, rejects illegal ones and has AI re-analyze.**
 
 ```python
 class DecisionValidator:
-    """校验 AI 输出的每个 action。代码强制执行，不靠 AI 自律。"""
+    """Validate every action in AI output. Code-enforced, not relying on AI self-discipline."""
 
     def validate(self, role: str, output: AIOutput, project_id: str) -> ValidationResult:
         """
         Returns:
             ValidationResult with:
-                - approved_actions: list[Action]  — 通过校验
-                - rejected_actions: list[{action, reason}]  — 被拒绝
-                - needs_retry: bool  — 是否需要让 AI 重分析
+                - approved_actions: list[Action]  — Passed validation
+                - rejected_actions: list[{action, reason}]  — Rejected
+                - needs_retry: bool  — Whether AI needs to re-analyze
         """
         results = ValidationResult()
 
         for action in output.actions:
-            # 1. 角色权限检查
+            # 1. Role permission check
             if not self._check_role_permission(role, action.type):
-                results.reject(action, f"{role} 无权执行 {action.type}")
+                results.reject(action, f"{role} not authorized for {action.type}")
                 continue
 
-            # 2. 节点存在性检查
+            # 2. Node existence check
             if action.related_nodes:
                 for node in action.related_nodes:
                     if not self._node_exists(node, project_id):
-                        results.reject(action, f"节点 {node} 不存在")
+                        results.reject(action, f"Node {node} does not exist")
                         continue
 
-            # 3. 文件覆盖率检查
+            # 3. File coverage check
             if action.target_files:
                 uncovered = self._coverage_check(action.target_files, project_id)
                 if uncovered:
-                    results.reject(action, f"文件无节点覆盖: {uncovered}")
+                    results.reject(action, f"Files without node coverage: {uncovered}")
                     continue
 
-            # 4. 工具策略检查
+            # 4. Tool policy check
             if action.type in ("run_command", "execute_script"):
                 policy = self._check_tool_policy(action.command)
                 if policy == "deny":
-                    results.reject(action, f"命令被策略禁止: {action.command}")
+                    results.reject(action, f"Command forbidden by policy: {action.command}")
                     continue
                 if policy == "approval":
-                    results.reject(action, f"命令需要人工确认: {action.command}")
+                    results.reject(action, f"Command requires human confirmation: {action.command}")
                     continue
 
-            # 5. Workflow 步骤检查
+            # 5. Workflow step check
             if action.type == "verify_update":
                 if not self._validate_transition(action):
-                    results.reject(action, "状态转换不合法")
+                    results.reject(action, "Invalid state transition")
                     continue
 
             results.approve(action)
@@ -320,7 +320,7 @@ class DecisionValidator:
         return results
 ```
 
-#### 角色权限矩阵
+#### Role Permission Matrix
 
 ```python
 ROLE_PERMISSIONS = {
@@ -335,10 +335,10 @@ ROLE_PERMISSIONS = {
             "archive_memory",
         ],
         "denied": [
-            "modify_code",      # Coordinator 不改代码
-            "run_tests",        # Coordinator 不跑测试
-            "verify_update",    # Coordinator 不直接验证节点
-            "release_gate",     # 需要通过 Executor 代码执行
+            "modify_code",      # Coordinator does not modify code
+            "run_tests",        # Coordinator does not run tests
+            "verify_update",    # Coordinator does not directly verify nodes
+            "release_gate",     # Needs to go through Executor code execution
         ],
     },
     "dev": {
@@ -349,8 +349,8 @@ ROLE_PERMISSIONS = {
             "read_file",
         ],
         "denied": [
-            "create_dev_task",  # Dev 不能派活给别人
-            "reply_user",       # Dev 不和用户对话
+            "create_dev_task",  # Dev cannot assign work to others
+            "reply_user",       # Dev does not converse with users
             "release_gate",
             "delete_node",
         ],
@@ -384,18 +384,18 @@ ROLE_PERMISSIONS = {
 
 ### 3.4 Task Orchestrator
 
-**代码控制任务流转。自动触发链路，不靠 AI 记得下一步该做什么。**
+**Code controls task flow. Auto-trigger chain, does not rely on AI remembering what to do next.**
 
 ```python
 class TaskOrchestrator:
-    """任务编排。代码驱动，AI 不控制流程。"""
+    """Task orchestration. Code-driven, AI does not control flow."""
 
     def handle_user_message(self, chat_id: int, text: str, project_id: str):
-        """用户消息 → 自动创建 coordinator session。"""
-        # 1. 组装 context
+        """User message → auto-create coordinator session."""
+        # 1. Assemble context
         context = self.assemble_context(project_id, chat_id)
 
-        # 2. 启动 Coordinator AI
+        # 2. Start Coordinator AI
         session = self.ai_manager.create_session(
             role="coordinator",
             prompt=text,
@@ -404,15 +404,15 @@ class TaskOrchestrator:
             output_format="structured",
         )
 
-        # 3. 等待输出
+        # 3. Wait for output
         output = self.ai_manager.wait_for_output(session.session_id)
 
-        # 4. 校验决策
+        # 4. Validate decisions
         validation = self.validator.validate("coordinator", output, project_id)
 
-        # 5. 处理结果
+        # 5. Process results
         if validation.rejected_actions:
-            # 有被拒绝的 action → 让 AI 重新分析
+            # Some actions Rejected → have AI re-analyze
             retry_prompt = self._build_retry_prompt(output, validation)
             retry_session = self.ai_manager.create_session(
                 role="coordinator",
@@ -423,29 +423,29 @@ class TaskOrchestrator:
             output = self.ai_manager.wait_for_output(retry_session.session_id)
             validation = self.validator.validate("coordinator", output, project_id)
 
-        # 6. 执行通过的 action
+        # 6. Execute approved actions
         for action in validation.approved_actions:
             self._execute_action(action, project_id)
 
-        # 7. 发回复
+        # 7. Send reply
         self.gateway_reply(chat_id, output.reply)
 
-        # 8. 更新上下文
+        # 8. Update context
         self._update_context(project_id, chat_id, text, output)
 
     def handle_dev_complete(self, task_id: str, dev_output: AIOutput, project_id: str):
-        """Dev 完成 → 自动创建 Coordinator eval。"""
+        """Dev completes → auto-create Coordinator eval."""
         chat_id = self._get_task_chat_id(task_id)
 
-        # 1. 代码校验 dev 输出
+        # 1. Code validates dev output
         dev_validation = self.validator.validate("dev", dev_output, project_id)
 
         if dev_validation.has_critical_issues:
-            # Dev 输出有问题 → 自动重试
+            # Dev output has issues → auto-retry
             self._retry_dev_task(task_id, dev_validation.issues)
             return
 
-        # 2. 组装 eval context
+        # 2. Assemble eval context
         eval_context = self.assemble_context(project_id, chat_id)
         eval_context["dev_result"] = {
             "task_id": task_id,
@@ -455,33 +455,33 @@ class TaskOrchestrator:
             "validation": dev_validation.summary,
         }
 
-        # 3. 启动 Coordinator eval session
+        # 3. Start Coordinator eval session
         eval_session = self.ai_manager.create_session(
             role="coordinator",
-            prompt="Dev 任务完成，请评估结果并决定下一步",
+            prompt="Dev task completed, please evaluate results and decide next steps",
             context=eval_context,
             project_id=project_id,
         )
 
         eval_output = self.ai_manager.wait_for_output(eval_session.session_id)
 
-        # 4. 校验 + 执行
+        # 4. Validate + execute
         eval_validation = self.validator.validate("coordinator", eval_output, project_id)
         for action in eval_validation.approved_actions:
             self._execute_action(action, project_id)
 
-        # 5. 回复用户
+        # 5. Reply to user
         self.gateway_reply(chat_id, eval_output.reply)
 
-        # 6. 自动归档
+        # 6. Auto-archive
         self._auto_archive(project_id, task_id, dev_output, eval_output)
 
     def _auto_archive(self, project_id, task_id, dev_output, eval_output):
-        """任务完成后自动归档记忆和上下文。"""
-        # 归档对话历史到 session_context
+        """Auto-archive memory and context after task completion."""
+        # Archive conversation history to session_context
         self.context_service.archive_if_expired(project_id)
 
-        # 提取有价值决策写入长期记忆
+        # Extract valuable decisions and write to long-term memory
         if eval_output.context_update and eval_output.context_update.get("decisions"):
             for decision in eval_output.context_update["decisions"]:
                 self.memory_service.write({
@@ -491,7 +491,7 @@ class TaskOrchestrator:
                     "source_task": task_id,
                 })
 
-        # 记录 dev 改动摘要
+        # Record dev change summary
         if dev_output.changed_files:
             self.memory_service.write({
                 "type": "workaround" if "fix" in dev_output.summary.lower() else "pattern",
@@ -503,344 +503,344 @@ class TaskOrchestrator:
 
 ### 3.5 Context Assembly
 
-**Executor 代码组装 AI 的上下文，AI 不自己拉数据。**
+**Executor code assembles AI context, AI does not pull data itself.**
 
 ```python
 class ContextAssembler:
-    """为每个 AI session 组装上下文。代码控制，保证一致性。"""
+    """Assemble context for each AI session. Code-controlled, ensures consistency."""
 
     def assemble(self, project_id: str, chat_id: int, role: str) -> dict:
-        """根据角色组装不同粒度的上下文。"""
+        """Assemble different granularity context based on role."""
 
         context = {}
 
-        # 1. 对话历史（Coordinator 需要）
+        # 1. Conversation history (Coordinator needs)
         if role == "coordinator":
             history = self.context_service.load(project_id)
             context["conversation_history"] = history.get("recent_messages", [])[-10:]
             context["current_focus"] = history.get("current_focus", "")
 
-        # 2. 项目状态（所有角色需要）
+        # 2. Project status (all roles need)
         summary = self.gov_api(f"/api/wf/{project_id}/summary")
         context["project_status"] = summary
 
-        # 3. 活跃任务（Coordinator 需要）
+        # 3. Active tasks (Coordinator needs)
         if role == "coordinator":
             runtime = self.gov_api(f"/api/runtime/{project_id}")
             context["active_tasks"] = runtime.get("active_tasks", [])
             context["queued_tasks"] = runtime.get("queued_tasks", [])
 
-        # 4. 相关记忆（所有角色按需）
+        # 4. Related memories (all roles as needed)
         memories = self.dbservice.search(project_id, role=role, limit=5)
         context["memories"] = memories
 
-        # 5. 角色特定上下文
+        # 5. Role-specific context
         if role == "dev":
-            # Dev 需要知道 workspace 路径、git 状态
+            # Dev needs workspace path, git status
             context["workspace"] = str(self.workspace_path)
             context["git_status"] = self._get_git_status()
 
         if role == "tester":
-            # Tester 需要知道测试命令、覆盖范围
+            # Tester needs test command, coverage scope
             context["test_command"] = self.config.get("test_command", "pytest")
             context["affected_nodes"] = self._get_affected_nodes(project_id)
 
         return context
 ```
 
-## 四、完整消息流程
+## 4. Complete Message Flow
 
-### 4.1 用户消息 → Coordinator 对话
+### 4.1 User Message → Coordinator Conversation
 
 ```
-用户: "帮我修复部署端口的 bug"
+User: "Help me fix the deployment port bug"
     │
     ▼
-Gateway: 写 coordinator_chat task 文件 (atomic)
+Gateway: write coordinator_chat task file (atomic)
     │
     ▼
 Executor TaskOrchestrator.handle_user_message():
     │
-    ├── 1. ContextAssembler 组装上下文
-    │     - 对话历史 (最近 10 条)
-    │     - 项目状态 (104 nodes, all qa_pass)
-    │     - 活跃任务 (0 running)
-    │     - 相关记忆 (部署相关 pitfall)
+    ├── 1. ContextAssembler assembles context
+    │     - Conversation history (last 10)
+    │     - Project status (104 nodes, all qa_pass)
+    │     - Active tasks (0 running)
+    │     - Related memories (deployment-related pitfall)
     │
     ├── 2. AILifecycleManager.create_session("coordinator", ...)
-    │     → 启动 claude CLI, PID=12345
-    │     → 等待输出
+    │     → Start claude CLI, PID=12345
+    │     → Wait for output
     │
-    ├── 3. AI 输出结构化决策:
+    ├── 3. AI outputs structured decisions:
     │     {
-    │       "reply": "我来分析部署端口问题...",
+    │       "reply": "Let me analyze the deployment port issue...",
     │       "actions": [
-    │         {"type": "create_dev_task", "prompt": "修复端口", "target_files": ["deploy-governance.sh"]}
+    │         {"type": "create_dev_task", "prompt": "Fix port", "target_files": ["deploy-governance.sh"]}
     │       ]
     │     }
     │
     ├── 4. DecisionValidator.validate("coordinator", output):
-    │     ✅ create_dev_task — coordinator 有权
-    │     ✅ target_files coverage — deploy-governance.sh 有 L13.5 覆盖
+    │     ✅ create_dev_task — coordinator has permission
+    │     ✅ target_files coverage — deploy-governance.sh has L13.5 coverage
     │
-    ├── 5. 执行 approved actions:
-    │     → 创建 dev_task 文件
-    │     → 更新 Task Registry
+    ├── 5. Execute approved actions:
+    │     → Create dev_task file
+    │     → Update Task Registry
     │
-    ├── 6. Gateway 回复用户: "我来分析部署端口问题..."
+    ├── 6. Gateway replies to user: "Let me analyze the deployment port issue..."
     │
-    └── 7. 更新上下文:
-          → 保存用户消息 + coordinator 回复
-          → 更新 current_focus
+    └── 7. Update context:
+          → Save user message + coordinator reply
+          → Update current_focus
 ```
 
-### 4.2 Dev 完成 → Coordinator 评估 → 归档
+### 4.2 Dev Completes → Coordinator Evaluation → Archive
 
 ```
-Executor 执行 dev_task:
+Executor executes dev_task:
     │
     ├── AILifecycleManager.create_session("dev", ...)
-    │     → claude CLI 修改代码
+    │     → claude CLI modifies code
     │
-    ├── AI 输出:
-    │     {"summary": "修改了端口", "changed_files": ["deploy.sh"], "test_results": {...}}
+    ├── AI outputs:
+    │     {"summary": "Modified port", "changed_files": ["deploy.sh"], "test_results": {...}}
     │
     ├── DecisionValidator.validate("dev", output):
-    │     ✅ 修改文件在 allowed 范围
-    │     ✅ 测试通过
+    │     ✅ Modified files within allowed scope
+    │     ✅ Tests passed
     │
     ▼
-TaskOrchestrator.handle_dev_complete():  ← 代码自动触发
+TaskOrchestrator.handle_dev_complete():  ← Code auto-triggered
     │
-    ├── 1. 组装 eval context (含 dev 结果)
+    ├── 1. Assemble eval context (with dev results)
     │
     ├── 2. AILifecycleManager.create_session("coordinator", eval_prompt)
-    │     → Coordinator 评估 dev 结果
+    │     → Coordinator evaluates dev results
     │
-    ├── 3. Coordinator 输出:
+    ├── 3. Coordinator output:
     │     {
-    │       "reply": "端口已修复，测试通过。建议部署。",
+    │       "reply": "Port fixed, tests passed. Recommend deployment.",
     │       "actions": [
-    │         {"type": "update_context", "decisions": ["端口统一用 nginx:40000"]}
+    │         {"type": "update_context", "decisions": ["Unify ports through nginx:40000"]}
     │       ]
     │     }
     │
-    ├── 4. 回复用户
+    ├── 4. Reply to user
     │
-    └── 5. 自动归档:
-          → session_context: 保存对话
-          → dbservice: 写入决策 "端口统一用 nginx:40000"
-          → dbservice: 写入修改摘要
+    └── 5. Auto-archive:
+          → session_context: save conversation
+          → dbservice: write decision "Unify ports through nginx:40000"
+          → dbservice: write change summary
 ```
 
-### 4.3 校验失败 → 自动重试
+### 4.3 Validation Failure → Auto-Retry
 
 ```
-Coordinator 输出:
+Coordinator output:
   {
     "actions": [
-      {"type": "modify_code", "file": "server.py"}  ← 越权！
+      {"type": "modify_code", "file": "server.py"}  ← Unauthorized!
     ]
   }
     │
     ▼
 DecisionValidator:
-  ❌ coordinator 无权 modify_code
+  ❌ coordinator not authorized for modify_code
     │
     ▼
 TaskOrchestrator:
-  构建重试 prompt:
-    "你之前的决策被拒绝:
-     - modify_code: coordinator 无权直接修改代码
-     请重新分析，使用 create_dev_task 让 dev 角色执行"
+  Build retry prompt:
+    "Your previous decisions were rejected:
+     - modify_code: coordinator not authorized to modify code directly
+     Please re-analyze, use create_dev_task to have dev role execute"
     │
     ▼
 AILifecycleManager.create_session("coordinator", retry_prompt)
     │
     ▼
-Coordinator 重新输出:
+Coordinator re-outputs:
   {
     "actions": [
-      {"type": "create_dev_task", "prompt": "修改 server.py ..."}
+      {"type": "create_dev_task", "prompt": "Modify server.py ..."}
     ]
   }
-  → ✅ 通过
+  → ✅ Passed
 ```
 
-## 五、文件结构
+## 5. File Structure
 
-> **注意 (2026-03-26)：** executor.py、backends.py、task_orchestrator.py 等旧模块已删除。以下为历史设计参考，当前实际结构以 governance/ 和 telegram_gateway/ 为主。
+> **Note (2026-03-26):** Old modules like executor.py, backends.py, task_orchestrator.py have been deleted. The following is historical design reference. Current actual structure is primarily governance/ and telegram_gateway/.
 
 ```
-agent/                             # ⚠ 以下标注 [已删除] 的模块已于 2026-03-26 移除
-├── executor.py                    # [已删除] 原 orchestrator 入口
+agent/                             # ⚠ Modules marked [deleted] below were removed on 2026-03-26
+├── executor.py                    # [deleted] Original orchestrator entry point
 ├── ai_lifecycle.py                # NEW: AI Lifecycle Manager
-├── decision_validator.py          # NEW: 决策校验器
-├── task_orchestrator.py           # [已删除] 原任务编排器
-├── context_assembler.py           # NEW: 上下文组装器
-├── ai_output_parser.py            # NEW: AI 输出解析 (JSON extraction)
-├── role_permissions.py            # NEW: 角色权限矩阵
-├── backends.py                    # [已删除] 原 run_claude / run_codex
+├── decision_validator.py          # NEW: Decision validator
+├── task_orchestrator.py           # [deleted] Original task orchestrator
+├── context_assembler.py           # NEW: Context assembler
+├── ai_output_parser.py            # NEW: AI output parser (JSON extraction)
+├── role_permissions.py            # NEW: Role permission matrix
+├── backends.py                    # [deleted] Original run_claude / run_codex
 ├── telegram_gateway/
-│   └── gateway.py                 # 保留: Telegram 消息路由 (:40010)
+│   └── gateway.py                 # Retained: Telegram message routing (:40010)
 └── governance/
-    ├── server.py                  # 保留: 规则引擎 (:40006)
-    ├── task_registry.py           # 保留
-    ├── session_context.py         # 保留
+    ├── server.py                  # Retained: Rule engine (:40006)
+    ├── task_registry.py           # Retained
+    ├── session_context.py         # Retained
     └── ...
 ```
 
-## 六、Coordinator System Prompt 模板
+## 6. Coordinator System Prompt Template
 
 ```
-你是 {project_id} 项目的 Coordinator。
+You are the Coordinator for project {project_id}.
 
-## 你的职责
-1. 理解用户意图
-2. 回答问题
-3. 如需执行代码修改，输出 create_dev_task action
-4. 如需确认，追问用户
+## Your Responsibilities
+1. Understand user intent
+2. Answer questions
+3. If code modification is needed, output create_dev_task action
+4. If confirmation is needed, ask the user
 
-## 当前上下文
+## Current Context
 {context_json}
 
-## 输出格式 (严格 JSON)
-你必须输出以下 JSON 格式，不要输出其他内容:
+## Output Format (strict JSON)
+You must output the following JSON format, no other content:
 
 ```json
 {
-  "reply": "给用户的回复文本",
+  "reply": "Reply text for the user",
   "actions": [
     {
       "type": "create_dev_task | create_test_task | query_governance | update_context | reply_only",
-      "prompt": "任务描述 (如果是 task)",
-      "target_files": ["文件路径"],
-      "related_nodes": ["L节点ID"]
+      "prompt": "Task description (if task)",
+      "target_files": ["File path"],
+      "related_nodes": ["L node ID"]
     }
   ],
   "context_update": {
-    "current_focus": "当前工作焦点",
-    "decisions": ["做出的决策"]
+    "current_focus": "Current work focus",
+    "decisions": ["Decisions made"]
   }
 }
 ```
 
-## 约束
-- 你不能直接修改代码，必须通过 create_dev_task 让 dev 角色执行
-- 你不能直接调用 API，只能输出 query_governance action
-- 你的所有 action 都会被代码校验，越权会被拒绝
-- 如果你不确定，使用 reply_only 追问用户
+## Constraints
+- You cannot directly modify code, must use create_dev_task to have dev role execute
+- You cannot directly call APIs, only output query_governance action
+- All your actions will be validated by code, unauthorized ones will be rejected
+- If you are unsure, use reply_only to ask the user
 ```
 
-## 七、实施路线
+## 7. Implementation Roadmap
 
-### P0 — 核心框架（必须先完成）
+### P0 — Core Framework (Must Complete First)
 
-| 步骤 | 内容 | 依赖 |
+| Step | Content | Dependencies |
 |------|------|------|
-| 1 | ai_lifecycle.py: AILifecycleManager | 无 |
-| 2 | ai_output_parser.py: 从 claude stdout 提取 JSON | 无 |
-| 3 | role_permissions.py: 角色权限矩阵 | 无 |
-| 4 | decision_validator.py: 校验逻辑 | 2, 3 |
-| 5 | context_assembler.py: 上下文组装 | 无 |
+| 1 | ai_lifecycle.py: AILifecycleManager | None |
+| 2 | ai_output_parser.py: Extract JSON from claude stdout | None |
+| 3 | role_permissions.py: Role permission matrix | None |
+| 4 | decision_validator.py: Validation logic | 2, 3 |
+| 5 | context_assembler.py: Context assembly | None |
 | 6 | task_orchestrator.py: handle_user_message | 1, 4, 5 |
 
-### P1 — 闭环链路
+### P1 — Closed-Loop Pipeline
 
-| 步骤 | 内容 | 依赖 |
+| Step | Content | Dependencies |
 |------|------|------|
 | 7 | task_orchestrator: handle_dev_complete | 6 |
-| 8 | Coordinator eval 自动触发 | 7 |
-| 9 | 自动重试 (校验失败 → 重新分析) | 4, 6 |
-| 10 | 对话历史持久化 (跨消息上下文) | 5 |
-| 11 | 自动归档 (记忆 + 上下文) | 7 |
+| 8 | Coordinator eval auto-trigger | 7 |
+| 9 | Auto-retry (validation failure → re-analyze) | 4, 6 |
+| 10 | Conversation history persistence (cross-message context) | 5 |
+| 11 | Auto-archive (memory + context) | 7 |
 
-### P2 — 增强
+### P2 — Enhancements
 
-| 步骤 | 内容 | 依赖 |
+| Step | Content | Dependencies |
 |------|------|------|
-| 12 | 多角色并行 (dev + tester 同时) | 6 |
-| 13 | 任务依赖链 (dev 完成后自动跑 tester) | 7 |
-| 14 | 人工确认流程 (危险操作 → Telegram 确认) | 6 |
-| 15 | 记忆辅助决策 (context 注入 pitfall) | 5 |
-| 16 | 观测性 (trace_id 串联全链路) | 6 |
+| 12 | Multi-role parallel (dev + tester simultaneously) | 6 |
+| 13 | Task dependency chain (auto-run tester after dev completes) | 7 |
+| 14 | Human confirmation flow (dangerous ops → Telegram confirm) | 6 |
+| 15 | Memory-assisted decisions (inject pitfall into context) | 5 |
+| 16 | Observability (trace_id across full chain) | 6 |
 
-## 八、与现有系统的兼容性
+## 8. Compatibility with Existing System
 
-> **2026-03-26 更新：** 旧 Executor run loop、process_task、process_coordinator_chat 等组件已随模块删除而移除。当前任务执行由 executor-gateway (port 8090) 承担。
+> **2026-03-26 update:** Old Executor run loop, process_task, process_coordinator_chat and other components removed with module deletion. Current task execution handled by executor-gateway (port 8090).
 
-| 现有组件 | 状态 (2026-03-26) |
+| Existing Component | Status (2026-03-26) |
 |---------|---------------|
-| Gateway 消息收发 (telegram_gateway) | **保留** — Telegram 消息路由 (:40010) |
-| Gateway 消息分类器 | **已删除** — 随旧系统移除 |
-| Gateway handle_task_dispatch | **已删除** — 随旧系统移除 |
-| Executor run loop (executor.py) | **已删除** — 由 executor-gateway (:8090) 替代 |
-| Executor process_task | **已删除** — 由 executor-gateway 替代 |
-| process_coordinator_chat | **已删除** — 由 executor-gateway 替代 |
-| Governance API | **保留** — 规则引擎 (:40006) |
-| Task Registry | **保留** — 被 Governance 管理 |
-| Session Context | **保留** — 被 ContextAssembler 调用 |
-| dbservice | **保留** — 被自动归档调用 |
-| verify_loop | **保留** — 作为事后检查的补充 |
+| Gateway message send/receive (telegram_gateway) | **Retained** — Telegram message routing (:40010) |
+| Gateway message classifier | **Deleted** — Removed with old system |
+| Gateway handle_task_dispatch | **Deleted** — Removed with old system |
+| Executor run loop (executor.py) | **Deleted** — Replaced by executor-gateway (:8090) |
+| Executor process_task | **Deleted** — Replaced by executor-gateway |
+| process_coordinator_chat | **Deleted** — Replaced by executor-gateway |
+| Governance API | **Retained** — Rule engine (:40006) |
+| Task Registry | **Retained** — Managed by Governance |
+| Session Context | **Retained** — Called by ContextAssembler |
+| dbservice | **Retained** — Called by auto-archive |
+| verify_loop | **Retained** — As supplementary post-hoc check |
 
-## 九、安全边界
-
-```
-硬约束 (代码强制执行，AI 无法绕过):
-
-1. AI 不能启动 AI
-   → AILifecycleManager 是唯一入口
-   → AI 的 action 只是"请求"，代码决定是否执行
-
-2. AI 不能直接操作系统
-   → 所有 API 调用由代码执行
-   → AI 输出 JSON，代码解析后操作
-
-3. 角色权限不可逾越
-   → role_permissions.py 硬编码
-   → DecisionValidator 每个 action 都检查
-
-4. 越权自动重试
-   → 被拒绝的 action 带原因反馈给 AI
-   → AI 必须在权限范围内重新决策
-   → 最多重试 3 次，超过则人工介入
-
-5. 任务流转由代码控制
-   → dev 完成 → 代码自动创建 eval
-   → 不靠 AI 记得调 API
-   → 不靠 AI 记得归档记忆
-```
-
-## 十、验收图集成 — Executor 感知 DAG
-
-### 10.1 为什么 Executor 必须感知验收图
-
-验收图是整个 workflow 的规则核心。v5.1 之前，AI 通过 API 查询验收图，然后"自觉"遵守规则。
-这违反了 v6 的核心原则——**规则由代码强制执行，不靠 AI 自律**。
+## 9. Security Boundary
 
 ```
-v5.1:  AI 查询验收图 → AI "自觉"遵守 → 经常跳步骤
-v6:    Executor 代码主动拉取验收图 → 编码进校验逻辑 → AI 无法绕过
+Hard constraints (code-enforced, AI cannot bypass):
+
+1. AI cannot start AI
+   → AILifecycleManager is the only entry point
+   → AI actions are just "requests", code decides whether to execute
+
+2. AI cannot directly operate the system
+   → All API calls executed by code
+   → AI outputs JSON, code parses then operates
+
+3. Role permissions cannot be exceeded
+   → role_permissions.py hardcoded
+   → DecisionValidator checks every action
+
+4. Unauthorized auto-retry
+   → Rejected actions fed back to AI with reasons
+   → AI must re-decide within permission scope
+   → Max 3 retries, then human intervention
+
+5. Task flow controlled by code
+   → dev completes → code auto-creates eval
+   → Does not rely on AI remembering to call API
+   → Does not rely on AI remembering to archive memory
 ```
 
-### 10.2 Executor 拉取的验收图数据
+## 10. Acceptance Graph Integration — Executor-Aware DAG
 
-Executor 启动时和定期（每 60s）从 Governance 拉取验收图快照缓存：
+### 10.1 Why Executor Must Be Aware of Acceptance Graph
+
+The acceptance graph is the rule core of the entire workflow. Before v5.1, AI queried the acceptance graph via API, then "voluntarily" followed rules.
+This violates v6's core principle — **rules are code-enforced, not relying on AI self-discipline**.
+
+```
+v5.1:  AI queries acceptance graph → AI "voluntarily" follows → often skips steps
+v6:    Executor code proactively fetches acceptance graph → encoded in validation logic → AI cannot bypass
+```
+
+### 10.2 Acceptance Graph Data Fetched by Executor
+
+Executor fetches and caches acceptance graph snapshot from Governance at startup and periodically (every 60s):
 
 ```python
 class GraphAwareValidator:
-    """验收图感知的校验器。Executor 代码强制执行图约束。"""
+    """Acceptance graph-aware validator. Executor code enforces graph constraints."""
 
     def __init__(self):
         self._graph_cache = None
         self._cache_ts = 0
-        self._cache_ttl = 60  # 60s 刷新
+        self._cache_ttl = 60  # 60s refresh
 
     def refresh_graph(self, project_id: str):
-        """从 Governance 拉取验收图快照。"""
+        """Fetch acceptance graph snapshot from Governance."""
         self._graph_cache = gov_api("GET", f"/api/wf/{project_id}/export?format=json")
         self._cache_ts = time.time()
-        # 缓存结构:
+        # Cache structure:
         # {
         #   "nodes": {
         #     "L13.5": {
@@ -858,15 +858,15 @@ class GraphAwareValidator:
         # }
 ```
 
-### 10.3 验收图约束在 Executor 中的强制执行
+### 10.3 Acceptance Graph Constraints Enforced in Executor
 
-#### 约束 1：文件修改必须有节点覆盖
+#### Constraint 1: File Modifications Must Have Node Coverage
 
 ```python
 def check_file_coverage(self, changed_files: list[str], project_id: str) -> list[str]:
-    """检查 AI 要修改的文件是否都有节点覆盖。
+    """Check if all files AI wants to modify have node coverage.
 
-    Returns: 未覆盖的文件列表（空 = 全部覆盖）
+    Returns: List of uncovered files (empty = all covered)
     """
     graph = self._get_graph(project_id)
     covered_files = set()
@@ -881,7 +881,7 @@ def check_file_coverage(self, changed_files: list[str], project_id: str) -> list
     return uncovered
 ```
 
-**触发时机**：Dev AI 输出 changed_files 时，Executor 代码检查。
+**Trigger timing**: When Dev AI outputs changed_files, Executor code checks.
 
 ```python
 # TaskOrchestrator.handle_dev_complete()
@@ -889,18 +889,18 @@ uncovered = self.graph_validator.check_file_coverage(
     dev_output.changed_files, project_id
 )
 if uncovered:
-    # 拒绝 dev 结果，让 Coordinator 决定是否创建节点
-    self._reject_dev_output(task_id, f"文件无节点覆盖: {uncovered}")
+    # Reject dev results, let Coordinator decide whether to create nodes
+    self._reject_dev_output(task_id, f"Files without node coverage: {uncovered}")
     return
 ```
 
-#### 约束 2：节点依赖必须满足
+#### Constraint 2: Node Dependencies Must Be Satisfied
 
 ```python
 def check_node_deps_satisfied(self, node_id: str, project_id: str) -> list[str]:
-    """检查节点的上游依赖是否都已 pass。
+    """Check if all upstream dependencies of a node have passed.
 
-    Returns: 未满足的依赖节点列表
+    Returns: List of unsatisfied dependency nodes
     """
     graph = self._get_graph(project_id)
     node = graph["nodes"].get(node_id)
@@ -917,7 +917,7 @@ def check_node_deps_satisfied(self, node_id: str, project_id: str) -> list[str]:
     return unsatisfied
 ```
 
-**触发时机**：Coordinator AI 输出 verify_update action 时。
+**Trigger timing**: When Coordinator AI outputs verify_update action.
 
 ```python
 # DecisionValidator.validate()
@@ -926,14 +926,14 @@ if action.type == "verify_update":
         action.node_id, project_id
     )
     if unsatisfied:
-        results.reject(action, f"上游依赖未满足: {unsatisfied}")
+        results.reject(action, f"Upstream dependencies not satisfied: {unsatisfied}")
 ```
 
-#### 约束 3：Gate 策略检查
+#### Constraint 3: Gate Policy Check
 
 ```python
 def check_gate_policy(self, node_id: str, target_status: str, project_id: str) -> bool:
-    """检查节点的 gate 策略是否允许推进到目标状态。"""
+    """Check if node gate policy allows advancing to target status."""
     graph = self._get_graph(project_id)
     node = graph["nodes"].get(node_id)
     if not node:
@@ -952,33 +952,33 @@ def check_gate_policy(self, node_id: str, target_status: str, project_id: str) -
     return True
 ```
 
-#### 约束 4：角色验证级别限制
+#### Constraint 4: Role Verification Level Limits
 
 ```python
 def check_role_verify_level(self, role: str, target_status: str) -> bool:
-    """检查角色是否有权推进到目标状态。
+    """Check if role is authorized to advance to target status.
 
     tester: pending → testing → t2_pass
     qa:     t2_pass → qa_pass
-    coordinator: 不能直接 verify
+    coordinator: cannot directly verify
     """
     ROLE_VERIFY_LIMITS = {
         "tester": {"testing", "t2_pass"},
         "qa": {"qa_pass"},
-        "coordinator": set(),  # coordinator 不能直接 verify
-        "dev": set(),          # dev 不能 verify
+        "coordinator": set(),  # coordinator cannot directly verify
+        "dev": set(),          # dev cannot verify
     }
     allowed = ROLE_VERIFY_LIMITS.get(role, set())
     return target_status in allowed
 ```
 
-#### 约束 5：Artifacts 完整性检查
+#### Constraint 5: Artifacts Completeness Check
 
 ```python
 def check_artifacts_complete(self, node_id: str, project_id: str) -> list[str]:
-    """检查节点的 artifacts 约束是否满足。
+    """Check if node artifacts constraints are satisfied.
 
-    Returns: 缺失的 artifact 列表
+    Returns: List of missing artifacts
     """
     graph = self._get_graph(project_id)
     node = graph["nodes"].get(node_id)
@@ -995,16 +995,16 @@ def check_artifacts_complete(self, node_id: str, project_id: str) -> list[str]:
     return missing
 ```
 
-**触发时机**：推进到 qa_pass 时自动检查。
+**Trigger timing**: Auto-check when advancing to qa_pass.
 
-#### 约束 6：新文件必须先建节点
+#### Constraint 6: New Files Must Have Nodes First
 
 ```python
 def check_new_files_have_nodes(self, dev_output, project_id: str) -> list[str]:
-    """检查 dev 新创建的文件是否有对应节点。
+    """Check if files newly created by dev have corresponding nodes.
 
-    已有文件修改 → 检查 coverage
-    新文件创建 → 必须先有节点（或 Coordinator 提议创建）
+    Existing file modifications → check coverage
+    New file creation → must have node first (or Coordinator proposes creation)
     """
     graph = self._get_graph(project_id)
     all_tracked_files = set()
@@ -1019,25 +1019,25 @@ def check_new_files_have_nodes(self, dev_output, project_id: str) -> list[str]:
     return new_untracked
 ```
 
-### 10.4 验收图修改权限 — Executor 控制
+### 10.4 Acceptance Graph Modification Permissions — Executor Controlled
 
-**AI 不能直接修改验收图。所有图变更通过 Executor 代码校验。**
+**AI cannot directly modify acceptance graph. All graph changes validated by Executor code.**
 
 ```python
-# Coordinator AI 输出（请求，不是直接操作）
+# Coordinator AI output (request, not direct operation)
 {
     "actions": [
         {
             "type": "propose_node",
             "node": {
                 "id": "L15.1",
-                "title": "新功能 X",
+                "title": "New feature X",
                 "deps": ["L14.1"],
                 "primary": ["agent/new_module.py"],
                 "verify": "L4",
                 "description": "..."
             },
-            "reason": "dev 需要创建新文件 agent/new_module.py，当前无节点覆盖"
+            "reason": "dev needs to create new file agent/new_module.py, currently no node coverage"
         },
         {
             "type": "propose_node_update",
@@ -1045,7 +1045,7 @@ def check_new_files_have_nodes(self, dev_output, project_id: str) -> list[str]:
             "changes": {
                 "secondary": {"add": ["scripts/new_helper.sh"]}
             },
-            "reason": "新增辅助脚本需要跟踪"
+            "reason": "New helper script needs tracking"
         }
     ]
 }
@@ -1053,86 +1053,86 @@ def check_new_files_have_nodes(self, dev_output, project_id: str) -> list[str]:
 
 ```python
 class GraphModificationValidator:
-    """验收图修改校验。代码强制执行，AI 不能直接改图。"""
+    """Acceptance graph modification validation. Code-enforced, AI cannot directly modify graph."""
 
     def validate_propose_node(self, proposal: dict, project_id: str) -> ValidationResult:
-        """校验新节点提议。"""
+        """Validate new node proposal."""
         node = proposal["node"]
         result = ValidationResult()
 
-        # 1. ID 格式检查
+        # 1. ID format check
         if not re.match(r"^L\d+\.\d+$", node["id"]):
-            result.reject("ID 格式不合法，应为 L{layer}.{index}")
+            result.reject("Invalid ID format, should be L{layer}.{index}")
             return result
 
-        # 2. ID 唯一性
+        # 2. ID uniqueness
         graph = self._get_graph(project_id)
         if node["id"] in graph["nodes"]:
-            result.reject(f"节点 {node['id']} 已存在")
+            result.reject(f"Node {node['id']} already exists")
             return result
 
-        # 3. 依赖存在性
+        # 3. Dependency existence
         for dep in node.get("deps", []):
             if dep not in graph["nodes"]:
-                result.reject(f"依赖 {dep} 不存在")
+                result.reject(f"Dependency {dep} does not exist")
                 return result
 
-        # 4. 无环检测
+        # 4. Cycle detection
         if self._would_create_cycle(graph, node["id"], node.get("deps", [])):
-            result.reject("会造成循环依赖")
+            result.reject("Would create circular dependency")
             return result
 
-        # 5. primary 文件路径格式检查
+        # 5. Primary file path format check
         for f in node.get("primary", []):
             if ".." in f or f.startswith("/"):
-                result.reject(f"文件路径不安全: {f}")
+                result.reject(f"Unsafe file path: {f}")
                 return result
 
         result.approve()
         return result
 
     def validate_propose_update(self, update: dict, project_id: str) -> ValidationResult:
-        """校验节点更新提议。"""
+        """Validate node update proposal."""
         node_id = update["node_id"]
         graph = self._get_graph(project_id)
 
         if node_id not in graph["nodes"]:
-            return ValidationResult(rejected=True, reason=f"节点 {node_id} 不存在")
+            return ValidationResult(rejected=True, reason=f"Node {node_id} does not exist")
 
-        # 只允许修改 secondary 和 description
-        # primary / deps / gates 修改需要人工确认
+        # Only allow modifying secondary and description
+        # primary / deps / gates modification requires human confirmation
         changes = update.get("changes", {})
         sensitive_fields = {"primary", "deps", "gates", "gate_mode", "verify"}
         for field in changes:
             if field in sensitive_fields:
                 return ValidationResult(
                     rejected=True,
-                    reason=f"修改 {field} 需要人工确认",
+                    reason=f"Modifying {field} requires human confirmation",
                     needs_human_confirm=True
                 )
 
         return ValidationResult(approved=True)
 ```
 
-#### 执行流程
+#### Execution Flow
 
 ```
 Coordinator AI: {"type": "propose_node", "node": {...}}
     │
     ▼
 Executor GraphModificationValidator:
-    ├── ID 格式 ✅
-    ├── 唯一性 ✅
-    ├── 依赖存在 ✅
-    ├── 无环 ✅
-    └── 路径安全 ✅
+    ├── ID format ✅
+    ├── Uniqueness ✅
+    ├── Dependencies exist ✅
+    ├── No cycles ✅
+    └── Path safe ✅
     │
-    ▼ 通过
-Executor 代码调 Governance API:
+    ▼ Passed
+Executor code calls Governance API:
     POST /api/wf/{project_id}/import-graph (or node-create)
     │
     ▼
-验收图更新完成 → 审计记录:
+Acceptance graph update complete → audit record:
     {
         "action": "node_created",
         "node_id": "L15.1",
@@ -1142,90 +1142,90 @@ Executor 代码调 Governance API:
     }
 ```
 
-### 10.5 验收图约束总览 — Executor 代码执行矩阵
+### 10.5 Acceptance Graph Constraints Overview — Executor Code Execution Matrix
 
-| 约束 | 触发时机 | 检查内容 | 失败处理 |
+| Constraint | Trigger Timing | Check Content | Failure Handling |
 |------|---------|---------|---------|
-| 文件覆盖率 | Dev AI 输出 changed_files | 每个文件有对应节点 | 拒绝 dev 结果 → Coordinator 决定建节点 |
-| 依赖满足 | verify_update action | 上游节点全部 pass | 拒绝 → 告诉 AI 哪些依赖未满足 |
-| Gate 策略 | verify_update 到 qa_pass | gate 条件全部满足 | 拒绝 → 列出未满足的 gate |
-| 角色验证级别 | verify_update action | 角色权限匹配目标状态 | 拒绝 → 告诉 AI 谁有权 |
-| Artifacts 完整 | 推进到 qa_pass | 文档/测试/证据齐全 | 拒绝 → 列出缺失 artifacts |
-| 新文件建节点 | Dev 创建新文件 | 新文件有对应节点 | 暂停 → 让 Coordinator propose_node |
-| 节点创建校验 | propose_node action | ID/依赖/无环/路径安全 | 拒绝 → 原因反馈给 AI |
-| 节点修改校验 | propose_node_update | 敏感字段需人工确认 | 需确认 → Telegram 通知人类 |
-| Coverage 新代码 | Dev 完成后 | 所有改动文件有覆盖 | 拒绝 → 让 Coordinator 分析 |
+| File coverage | Dev AI outputs changed_files | Each file has corresponding node | Reject dev results → Coordinator decides to create node |
+| Dependencies satisfied | verify_update action | All upstream nodes passed | Reject → tell AI which dependencies unsatisfied |
+| Gate policy | verify_update to qa_pass | All gate conditions satisfied | Reject → list unsatisfied gates |
+| Role verify level | verify_update action | Role permission matches target status | Reject → tell AI who has permission |
+| Artifacts complete | Advancing to qa_pass | Docs/tests/evidence complete | Reject → list missing artifacts |
+| New file needs node | Dev creates new file | New file has corresponding node | Pause → let Coordinator propose_node |
+| Node creation validation | propose_node action | ID/dependencies/no cycles/path safe | Reject → reason fed back to AI |
+| Node modification validation | propose_node_update | Sensitive fields need human confirmation | Needs confirmation → Telegram notifies human |
+| Coverage new code | After Dev completes | All changed files have coverage | Reject → let Coordinator analyze |
 
-### 10.6 Dev 任务全生命周期中的验收图检查
+### 10.6 Acceptance Graph Checks Throughout Dev Task Lifecycle
 
 ```
-Coordinator 创建 dev_task:
+Coordinator creates dev_task:
     │
-    ├── Executor 检查:
-    │   ✓ target_files 都有节点覆盖?
-    │   ✓ 对应节点状态允许修改? (pending/testing, 不能改 qa_pass 的)
-    │   ✓ 节点依赖满足?
+    ├── Executor checks:
+    │   ✓ target_files all have node coverage?
+    │   ✓ Corresponding node status allows modification? (pending/testing, cannot modify qa_pass)
+    │   ✓ Node dependencies satisfied?
     │
-    ▼ 通过 → 启动 Dev AI
+    ▼ Passed → Start Dev AI
     │
-Dev AI 执行:
-    │ ... 修改代码 ...
+Dev AI executes:
+    │ ... modifies code ...
     │
-    ▼ 完成
+    ▼ Completes
     │
-    ├── Executor 检查 dev 输出:
-    │   ✓ changed_files 都有节点覆盖?
-    │   ✓ 没有修改不相关的文件?
-    │   ✓ 新创建的文件有节点?
-    │   ✓ 测试通过?
+    ├── Executor checks dev output:
+    │   ✓ changed_files all have node coverage?
+    │   ✓ No unrelated files modified?
+    │   ✓ Newly created files have nodes?
+    │   ✓ Tests passed?
     │
-    ├── 如有问题:
-    │   → 构建重试 prompt (含拒绝原因)
-    │   → 重新启动 Dev AI (最多 3 次)
+    ├── If issues found:
+    │   → Build retry prompt (with rejection reasons)
+    │   → Restart Dev AI (max 3 times)
     │
-    ▼ 通过 → 启动 Coordinator eval
+    ▼ Passed → Start Coordinator eval
     │
 Coordinator eval:
     │
-    ├── Executor 检查 eval 输出:
-    │   ✓ 不能越权 (Coordinator 不能自己 verify)
-    │   ✓ 如有 verify_update action → 检查角色+依赖+gate
-    │   ✓ 如有 propose_node → 检查 ID/依赖/无环
+    ├── Executor checks eval output:
+    │   ✓ No authorization overstepping (Coordinator cannot verify itself)
+    │   ✓ If verify_update action → check role+dependencies+gate
+    │   ✓ If propose_node → check ID/dependencies/no cycles
     │
-    ▼ 通过 → 执行 actions + 回复用户 + 自动归档
+    ▼ Passed → Execute actions + reply to user + auto-archive
 ```
 
-## 十一、证据采集 — Executor 独立采集，不信 AI 自报
+## 11. Evidence Collection — Executor Independently Collects, Does Not Trust AI Self-Report
 
-### 11.1 核心原则
+### 11.1 Core Principle
 
-AI 输出分两类，Executor 区别对待：
+AI output falls into two categories, Executor treats them differently:
 
-| 类别 | 来源 | 信任度 | 例子 |
+| Category | Source | Trust Level | Examples |
 |------|------|--------|------|
-| **Decision** (决策) | AI 生成 | 需校验后执行 | create_dev_task, reply, update_context |
-| **Evidence** (证据) | **Executor 独立采集** | 可信 | changed_files, test_results, git_diff |
+| **Decision** | AI generated | Needs validation before execution | create_dev_task, reply, update_context |
+| **Evidence** | **Executor independently collected** | Trustworthy | changed_files, test_results, git_diff |
 
 ```python
 class EvidenceCollector:
-    """Executor 独立采集事实证据，不依赖 AI 自报。"""
+    """Executor independently collects factual evidence, not relying on AI self-report."""
 
     def collect_after_dev(self, workspace: Path, before_snapshot: dict) -> DevEvidence:
-        """Dev AI 执行完后，代码独立采集真实结果。"""
+        """After Dev AI execution, code independently collects actual results."""
 
-        # 1. 真实 changed_files — 从 git diff 采集，不信 AI 报的
+        # 1. Actual changed_files — collected from git diff, not trusting AI report
         changed = subprocess.run(
             ["git", "diff", "--name-only", before_snapshot["commit"]],
             capture_output=True, text=True, cwd=workspace
         ).stdout.strip().splitlines()
 
-        # 2. 真实 new_files — 从 git status 采集
+        # 2. Actual new_files — collected from git status
         new_files = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             capture_output=True, text=True, cwd=workspace
         ).stdout.strip().splitlines()
 
-        # 3. 真实 test_results — 从 pytest/junit 报告采集
+        # 3. Actual test_results — collected from pytest/junit report
         test_result = subprocess.run(
             ["python", "-m", "pytest", "--tb=short", "-q"],
             capture_output=True, text=True, cwd=workspace,
@@ -1237,7 +1237,7 @@ class EvidenceCollector:
             "passed": test_result.returncode == 0,
         }
 
-        # 4. 真实 diff 统计
+        # 4. Actual diff statistics
         diff_stat = subprocess.run(
             ["git", "diff", "--stat", before_snapshot["commit"]],
             capture_output=True, text=True, cwd=workspace
@@ -1253,81 +1253,81 @@ class EvidenceCollector:
         )
 ```
 
-### 11.2 AI 自报 vs Executor 采集对比
+### 11.2 AI Self-Report vs Executor Collection Comparison
 
 ```
-Dev AI 完成后:
+After Dev AI completes:
 
-AI 自报:                          Executor 独立采集:
-  changed_files: ["a.py"]          git diff: ["a.py", "b.py"]  ← 多改了 b.py!
-  test_results: {passed: 10}       pytest exit_code: 1          ← 测试其实没通过!
-  summary: "修复完成"               diff_stat: "+50 -3"          ← 真实统计
+AI self-report:                   Executor independent collection:
+  changed_files: ["a.py"]          git diff: ["a.py", "b.py"]  ← Also modified b.py!
+  test_results: {passed: 10}       pytest exit_code: 1          ← Tests actually failed!
+  summary: "Fix complete"           diff_stat: "+50 -3"          ← Actual statistics
 
-→ Executor 以独立采集为准
-→ AI 自报只用于 Coordinator eval 的参考
-→ 不一致时记录到审计
+→ Executor uses independent collection as authoritative
+→ AI self-report only used as reference for Coordinator eval
+→ Inconsistencies recorded to audit
 ```
 
-## 十二、任务状态机 — 显式定义
+## 12. Task State Machine — Explicit Definition
 
-### 12.1 状态枚举
+### 12.1 Status Enum
 
 ```python
 class TaskStatus(str, Enum):
-    # 创建态
+    # Creation state
     CREATED = "created"
     QUEUED = "queued"
 
-    # 执行态
+    # Execution state
     CLAIMED = "claimed"
     RUNNING = "running"
     WAITING_RETRY = "waiting_retry"
     WAITING_HUMAN = "waiting_human"
     BLOCKED_BY_DEP = "blocked_by_dep"
 
-    # 终结态
+    # Terminal state
     SUCCEEDED = "succeeded"
     FAILED_RETRYABLE = "failed_retryable"
     FAILED_TERMINAL = "failed_terminal"
     CANCELLED = "cancelled"
 
-    # 评估态
-    EVAL_PENDING = "eval_pending"        # 等待 Coordinator eval
-    EVAL_APPROVED = "eval_approved"      # Coordinator 确认通过
-    EVAL_REJECTED = "eval_rejected"      # Coordinator 要求重做
+    # Evaluation state
+    EVAL_PENDING = "eval_pending"        # Awaiting Coordinator eval
+    EVAL_APPROVED = "eval_approved"      # Coordinator confirmed pass
+    EVAL_REJECTED = "eval_rejected"      # Coordinator requires redo
 
-    # 通知态
+    # Notification state
     NOTIFY_PENDING = "notify_pending"
     NOTIFIED = "notified"
 
-    # 归档态
+    # Archive state
     ARCHIVED = "archived"
 ```
 
-### 12.2 状态转换规则
+### 12.2 State Transition Rules
 
 ```python
 VALID_TRANSITIONS = {
     "created":           {"queued", "cancelled"},
     "queued":            {"claimed", "cancelled"},
-    "claimed":           {"running", "queued"},           # claim 失败可退回
+    "claimed":           {"running", "queued"},           # claim failure can revert
     "running":           {"succeeded", "failed_retryable", "failed_terminal", "cancelled"},
-    "waiting_retry":     {"queued"},                      # 重新排队
-    "waiting_human":     {"queued", "cancelled"},         # 人工决定
-    "blocked_by_dep":    {"queued"},                      # 依赖满足后恢复
-    "succeeded":         {"eval_pending"},                # 自动触发 eval
+    "waiting_retry":     {"queued"},                      # Re-queue
+    "waiting_human":     {"queued", "cancelled"},         # Human decides
+    "blocked_by_dep":    {"queued"},                      # Resume after dependency satisfied
+    "succeeded":         {"eval_pending"},                # Auto-trigger eval
     "failed_retryable":  {"waiting_retry", "failed_terminal"},
     "failed_terminal":   {"notify_pending", "archived"},
     "eval_pending":      {"eval_approved", "eval_rejected"},
     "eval_approved":     {"notify_pending"},
-    "eval_rejected":     {"queued"},                      # 重新执行
+    "eval_rejected":     {"queued"},                      # Re-execute
     "notify_pending":    {"notified"},
     "notified":          {"archived"},
     "cancelled":         {"archived"},
 }
 ```
 
-### 12.3 Task 扩展字段
+### 12.3 Task Extended Fields
 
 ```python
 @dataclass
@@ -1338,71 +1338,71 @@ class Task:
     project_id: str
     prompt: str
 
-    # 调度
+    # Scheduling
     attempt: int = 0
     max_attempts: int = 3
     priority: int = 0
-    parent_task_id: str = ""  # 父任务（eval 的父是 dev_task）
+    parent_task_id: str = ""  # Parent task (eval's parent is dev_task)
 
     # Lease
     lease_owner: str = ""
     lease_expire_at: str = ""
 
-    # 追踪
+    # Tracking
     trace_id: str = ""
     idempotency_key: str = ""
     schema_version: str = "v1"
 
-    # 证据（Executor 独立采集）
+    # Evidence (Executor independently collected)
     evidence: dict = field(default_factory=dict)
 
-    # AI 决策（需校验）
+    # AI decisions (needs validation)
     ai_decision: dict = field(default_factory=dict)
 
-    # 时间线
+    # Timeline
     created_at: str = ""
     claimed_at: str = ""
     completed_at: str = ""
     archived_at: str = ""
 ```
 
-## 十三、Validator 分层
+## 13. Validator Layers
 
 ```
 ┌───────────────────────────────────────┐
 │ Layer 1: SchemaValidator              │
-│   JSON 格式、schema_version、必填字段  │
+│   JSON format, schema_version, required fields │
 └───────────────┬───────────────────────┘
                 ▼
 ┌───────────────────────────────────────┐
 │ Layer 2: PolicyValidator              │
-│   角色权限、tool policy、危险操作检测   │
+│   Role permissions, tool policy, dangerous op detection │
 └───────────────┬───────────────────────┘
                 ▼
 ┌───────────────────────────────────────┐
 │ Layer 3: GraphValidator               │
-│   节点存在、依赖满足、gate、coverage    │
-│   图版本一致性 (version/etag CAS)      │
+│   Node existence, dependencies met, gate, coverage │
+│   Graph version consistency (version/etag CAS)    │
 └───────────────┬───────────────────────┘
                 ▼
 ┌───────────────────────────────────────┐
 │ Layer 4: ExecutionPreconditionValidator│
-│   workspace 可用、文件存在、lease 有效  │
-│   并发冲突检测、资源限制               │
+│   Workspace available, file exists, lease valid    │
+│   Concurrency conflict detection, resource limits  │
 └───────────────────────────────────────┘
 ```
 
-每层独立返回 `{layer, passed, errors[]}`，审计时可精确定位哪层拦截了。
+Each layer independently returns `{layer, passed, errors[]}`, enabling precise audit of which layer blocked.
 
-## 十四、错误分类重试策略
+## 14. Error Classification and Retry Strategy
 
 ```python
 class ErrorCategory(str, Enum):
-    RETRYABLE_MODEL = "retryable_model"      # JSON 解析失败、AI 输出格式错
-    RETRYABLE_ENV = "retryable_env"          # 网络超时、文件系统临时错误
-    BLOCKED_BY_DEP = "blocked_by_dep"        # 图依赖未满足
-    NON_RETRYABLE_POLICY = "non_retryable"   # 权限拒绝、命令 deny
-    NEEDS_HUMAN = "needs_human"              # 敏感操作需确认
+    RETRYABLE_MODEL = "retryable_model"      # JSON parse failure, AI output format error
+    RETRYABLE_ENV = "retryable_env"          # Network timeout, filesystem temporary error
+    BLOCKED_BY_DEP = "blocked_by_dep"        # Graph dependency not satisfied
+    NON_RETRYABLE_POLICY = "non_retryable"   # Permission denied, command deny
+    NEEDS_HUMAN = "needs_human"              # Sensitive operation needs confirmation
 
 RETRY_STRATEGY = {
     "retryable_model":     {"max_retries": 3, "backoff": "immediate", "action": "rebuild_prompt"},
@@ -1413,20 +1413,20 @@ RETRY_STRATEGY = {
 }
 ```
 
-## 十五、记忆写入治理
+## 15. Memory Write Governance
 
 ```python
 class MemoryWriteGuard:
-    """记忆写入前的治理检查。防止污染长期记忆。"""
+    """Governance check before memory write. Prevent polluting long-term memory."""
 
     def should_write(self, entry: dict, project_id: str) -> tuple[bool, str]:
-        # 1. 去重 — 检查是否已有高度相似记忆
+        # 1. Dedup — check if highly similar memory already exists
         existing = self.dbservice.search(entry["content"][:100], scope=project_id, limit=3)
         for e in existing:
             if self._similarity(e["doc"]["content"], entry["content"]) > 0.85:
                 return False, "duplicate"
 
-        # 2. 来源检查 — 只有 qa_pass 的决策才能写长期记忆
+        # 2. Source check — only qa_pass decisions can write to long-term memory
         if entry.get("type") == "decision":
             source_node = entry.get("related_node")
             if source_node:
@@ -1434,18 +1434,18 @@ class MemoryWriteGuard:
                 if node.get("verify_status") != "qa_pass":
                     return False, "node_not_qa_pass"
 
-        # 3. 可信度 — 低于阈值的不写
+        # 3. Confidence — below threshold is not written
         if entry.get("confidence", 1.0) < 0.6:
             return False, "low_confidence"
 
-        # 4. TTL — workaround 类自动设 30 天过期
+        # 4. TTL — workaround type auto-set 30 day expiry
         if entry.get("type") == "workaround":
             entry.setdefault("ttl_days", 30)
 
         return True, "ok"
 ```
 
-## 十六、Context 预算与确定性
+## 16. Context Budget and Determinism
 
 ```python
 CONTEXT_BUDGET = {
@@ -1475,14 +1475,14 @@ CONTEXT_BUDGET = {
 }
 ```
 
-上下文组装时严格按预算截断，保证确定性：
+Context assembly strictly truncates by budget, ensuring determinism:
 
 ```python
 def assemble(self, project_id, chat_id, role):
     budget = CONTEXT_BUDGET[role]
     context = {}
 
-    # 按优先级填充，超预算则截断
+    # Fill by priority, truncate when over budget
     used = 0
     for layer in ["hard_context", "conversation", "memory", "runtime", "git_context"]:
         layer_budget = budget.get(layer, 0)
@@ -1498,12 +1498,12 @@ def assemble(self, project_id, chat_id, role):
     return context
 ```
 
-## 十七、图版本一致性 (CAS)
+## 17. Graph Version Consistency (CAS)
 
 ```python
 class GraphAwareValidator:
     def _get_graph(self, project_id):
-        """带版本号的图缓存。"""
+        """Graph cache with version number."""
         now = time.time()
         if self._graph_cache and now - self._cache_ts < self._cache_ttl:
             return self._graph_cache
@@ -1515,113 +1515,113 @@ class GraphAwareValidator:
         return result
 
     def validate_with_cas(self, action, project_id):
-        """校验时带图版本，执行时 compare-and-swap。"""
+        """Validate with graph version, compare-and-swap on execution."""
         graph = self._get_graph(project_id)
         validate_version = self._graph_version
 
-        # ... 校验逻辑 ...
+        # ... validation logic ...
 
-        # 执行时检查版本没变
+        # Check version unchanged at execution time
         current_version = gov_api("GET", f"/api/wf/{project_id}/summary").get("version", 0)
         if current_version != validate_version:
-            # 图在校验期间被修改了 → 刷新重试
+            # Graph was modified during validation → refresh and retry
             self._graph_cache = None
             return ValidationResult(rejected=True, reason="graph_version_conflict", retryable=True)
 
         return validation_result
 ```
 
-## 十八、与 v5.1 的关系
+## 18. Relationship with v5.1
 
-v6 不是推倒重来，而是在 v5.1 基础上加一层 **代码控制层**：
+v6 is not a rewrite, but adds a **code control layer** on top of v5.1:
 
 ```
-v5.1:  Gateway → [AI 自由操作] → 结果
-v6:    Gateway → [Executor 代码] → [AI 结构化输出] → [4层校验 + 独立证据采集 + 图CAS] → 结果
+v5.1:  Gateway → [AI free operation] → Results
+v6:    Gateway → [Executor code] → [AI structured output] → [4-layer validation + independent evidence collection + graph CAS] → Results
 
-新增的是中间的代码控制层 + 验收图集成 + 证据采集 + 状态机，不改底层服务。
+What is added is the middle code control layer + acceptance graph integration + evidence collection + state machine, without changing underlying services.
 ```
 
-## 十九、实施路线（终版）
+## 19. Implementation Roadmap (Final)
 
-### P0 — 核心框架 + 地基加固
+### P0 — Core Framework + Foundation Reinforcement
 
-| 步骤 | 内容 | 依赖 | 来源 |
+| Step | Content | Dependencies | Source |
 |------|------|------|------|
-| 1 | ai_lifecycle.py: AILifecycleManager | 无 | 原设计 |
-| 2 | ai_output_parser.py: JSON 提取 + schema_version | 无 | 原设计 + 评审#5 |
-| 3 | role_permissions.py: 角色权限矩阵 | 无 | 原设计 |
-| 4 | graph_validator.py: 验收图约束 + 版本CAS | Gov API | 原设计 + 评审#7 |
-| 5 | evidence_collector.py: Executor 独立采集 | 无 | 评审#2 |
-| 6 | task_state_machine.py: 显式状态枚举+转换规则 | 无 | 评审#4 |
-| 7 | decision_validator.py: 4层分层校验 | 2,3,4 | 原设计 + 评审#6 |
-| 8 | context_assembler.py: 预算化上下文组装 | 无 | 原设计 + 评审#10 |
-| 9 | task_orchestrator.py: handle_user_message | 1,7,8 | 原设计 |
+| 1 | ai_lifecycle.py: AILifecycleManager | None | Original design |
+| 2 | ai_output_parser.py: JSON extraction + schema_version | None | Original design + Review #5 |
+| 3 | role_permissions.py: Role permission matrix | None | Original design |
+| 4 | graph_validator.py: Acceptance graph constraints + version CAS | Gov API | Original design + Review #7 |
+| 5 | evidence_collector.py: Executor independent collection | None | Review #2 |
+| 6 | task_state_machine.py: Explicit status enum + transition rules | None | Review #4 |
+| 7 | decision_validator.py: 4-layer validation | 2,3,4 | Original design + Review #6 |
+| 8 | context_assembler.py: Budget-based Context assembly | None | Original design + Review #10 |
+| 9 | task_orchestrator.py: handle_user_message | 1,7,8 | Original design |
 
-### P1 — 闭环 + 可靠性
+### P1 — Closed-Loop + Reliability
 
-| 步骤 | 内容 | 依赖 | 来源 |
+| Step | Content | Dependencies | Source |
 |------|------|------|------|
-| 10 | handle_dev_complete + 独立证据校验 | 5,9 | 原设计 + 评审#2 |
-| 11 | Coordinator eval 自动触发 | 10 | 原设计 |
-| 12 | 错误分类重试策略 | 7,9 | 评审#8 |
-| 13 | 对话历史持久化 | 8 | 原设计 |
-| 14 | 记忆写入治理 (去重/可信度/TTL) | dbservice | 评审#9 |
-| 15 | 自动归档 (记忆 + 上下文) | 10,14 | 原设计 |
-| 16 | propose_node 校验 | 4 | 原设计 |
-| 17 | task file → DB+Redis 驱动 | 6 | 评审#1 |
+| 10 | handle_dev_complete + independent evidence validation | 5,9 | Original design + Review #2 |
+| 11 | Coordinator eval auto-trigger | 10 | Original design |
+| 12 | Error classification retry strategy | 7,9 | Review #8 |
+| 13 | Conversation history persistence | 8 | Original design |
+| 14 | Memory write governance (dedup/confidence/TTL) | dbservice | Review #9 |
+| 15 | Auto-archive (memory + context) | 10,14 | Original design |
+| 16 | propose_node validation | 4 | Original design |
+| 17 | task file → DB+Redis driven | 6 | Review #1 |
 
-### P2 — 增强
+### P2 — Enhancements
 
-| 步骤 | 内容 | 依赖 | 来源 |
+| Step | Content | Dependencies | Source |
 |------|------|------|------|
-| 18 | 执行沙箱 (隔离workspace/命令白名单) | 9 | 评审#3 |
-| 19 | 多角色并行 | 9 | 原设计 |
-| 20 | 任务依赖链 (dev→tester→qa 自动) | 10 | 原设计 |
-| 21 | 人工审批对象 (approval_id/scope) | 9 | 评审#12 |
-| 22 | Plan 层 (请求→计划→任务) | 9 | 评审#11 |
-| 23 | 观测性 (trace_id + replay) | 9 | 评审#13 |
+| 18 | Execution sandbox (isolated workspace/command allowlist) | 9 | Review #3 |
+| 19 | Multi-role parallel | 9 | Original design |
+| 20 | Task dependency chain (dev→tester→qa auto) | 10 | Original design |
+| 21 | Human approval objects (approval_id/scope) | 9 | Review #12 |
+| 22 | Plan layer (request→plan→task) | 9 | Review #11 |
+| 23 | Observability (trace_id + replay) | 9 | Review #13 |
 
-### 评审建议采纳总结
+### Review Feedback Adoption Summary
 
-| 评审# | 建议 | 采纳 | 落地章节 |
+| Review # | Suggestion | Adopted | Section |
 |-------|------|------|---------|
-| 1 | task file → DB+Redis | ✅ P1 #17 | §12 状态机 |
-| 2 | 证据独立采集 | ✅ P0 #5 | §11 证据采集 |
-| 3 | 执行沙箱 | ✅ P2 #18 | 后置（当前单机足够） |
-| 4 | 显式状态机 | ✅ P0 #6 | §12 状态机 |
-| 5 | schema_version | ✅ P0 #2 | §12.3 Task 字段 |
-| 6 | validator 拆层 | ✅ P0 #7 | §13 分层校验 |
-| 7 | graph CAS | ✅ P0 #4 | §17 图版本一致性 |
-| 8 | 错误分类重试 | ✅ P1 #12 | §14 重试策略 |
-| 9 | 记忆写入治理 | ✅ P1 #14 | §15 记忆治理 |
-| 10 | context budget | ✅ P0 #8 | §16 预算与确定性 |
-| 11 | Plan 层 | ✅ P2 #22 | 后置 |
-| 12 | 审批对象 | ✅ P2 #21 | 后置 |
-| 13 | replay/审计链 | ✅ P2 #23 | 后置 |
+| 1 | task file → DB+Redis | ✅ P1 #17 | Section 12 State machine |
+| 2 | Independent evidence collection | ✅ P0 #5 | Section 11 Evidence collection |
+| 3 | Execution sandbox | ✅ P2 #18 | Deferred (single machine sufficient for now) |
+| 4 | Explicit state machine | ✅ P0 #6 | Section 12 State machine |
+| 5 | schema_version | ✅ P0 #2 | Section 12.3 Task fields |
+| 6 | Validator layer split | ✅ P0 #7 | Section 13 Layered validation |
+| 7 | graph CAS | ✅ P0 #4 | Section 17 Graph version consistency |
+| 8 | Error classification retry | ✅ P1 #12 | Section 14 Retry strategy |
+| 9 | Memory write governance | ✅ P1 #14 | Section 15 Memory governance |
+| 10 | context budget | ✅ P0 #8 | Section 16 Budget and determinism |
+| 11 | Plan layer | ✅ P2 #22 | Deferred |
+| 12 | Approval objects | ✅ P2 #21 | Deferred |
+| 13 | replay/audit chain | ✅ P2 #23 | Deferred |
 
-## 二十、v6.2 实施补充
+## 20. v6.2 Implementation Supplement
 
-### 20.1 Git Worktree 隔离（已实施）
+### 20.1 Git Worktree Isolation (Implemented)
 
-Dev AI 不再使用 `git checkout -b` 在主工作目录创建分支，改为 `git worktree add` 在独立目录工作：
+Dev AI no longer uses `git checkout -b` to create branches in the main working directory, switched to `git worktree add` for working in an isolated directory:
 
 ```
-主工作目录: C:\Users\z5866\Documents\amingclaw\aming_claw\  (main 分支，观察者操作)
-Worktree:   .worktrees/dev-task-xxx/                         (Dev 分支，AI 操作)
+Main working directory: C:\Users\z5866\Documents\amingclaw\aming_claw\  (main branch, observer operations)
+Worktree:   .worktrees/dev-task-xxx/                         (Dev branch, AI operations)
 ```
 
-流程：
-1. `git worktree add -b dev/task-xxx .worktrees/dev-task-xxx` — 创建隔离目录
-2. Dev AI 在 worktree 目录内执行所有操作
-3. 完成后 `git worktree remove .worktrees/dev-task-xxx --force` — 清理
-4. 分支保留供 review 和 merge
+Flow:
+1. `git worktree add -b dev/task-xxx .worktrees/dev-task-xxx` — Create isolated directory
+2. Dev AI executes all operations within worktree directory
+3. After completion `git worktree remove .worktrees/dev-task-xxx --force` — Cleanup
+4. Branch retained for review and merge
 
-好处：观察者和 Executor 可并行操作，不会因分支切换导致文件丢失。
+Benefit: Observer and Executor can operate in parallel without file loss due to branch switching.
 
-### 20.2 Chain Depth 限制（已实施）
+### 20.2 Chain Depth Limit (Implemented)
 
-防止 Dev→eval→Dev→eval 无限循环。TaskOrchestrator 维护 `_chain_depth` 计数器：
+Prevent Dev→eval→Dev→eval infinite loops. TaskOrchestrator maintains a `_chain_depth` counter:
 
 ```
 MAX_CHAIN_DEPTH = 4
@@ -1630,21 +1630,21 @@ handle_user_message()   → depth = 1
 _trigger_coordinator_eval() → depth = 2
 handle_test_complete()  → depth = 3
 handle_qa_complete()    → depth = 4
-再次触发 → 拒绝: "chain depth exceeded, stopping"
+Trigger again → Reject: "chain depth exceeded, stopping"
 ```
 
-每次 `handle_user_message()` 从 Gateway 调用时重置为 0。
+Reset to 0 each time `handle_user_message()` is called from Gateway.
 
-### 20.3 Trace/Replay API（已实施）
+### 20.3 Trace/Replay API (Implemented)
 
-Executor API (:40100) 新增两个只读端点：
+Executor API (:40100) added two read-only endpoints:
 
-| 端点 | 说明 |
+| Endpoint | Description |
 |------|------|
-| `GET /trace/{trace_id}` | 返回完整 trace 链路（从 task 创建到完成的所有事件） |
-| `GET /traces?project_id=amingClaw&limit=20` | 列出最近的 trace，支持按 project_id 过滤 |
+| `GET /trace/{trace_id}` | Returns complete trace chain (all events from task creation to completion) |
+| `GET /traces?project_id=amingClaw&limit=20` | Lists recent traces, supports filtering by project_id |
 
-数据源：`shared-volume/codex-tasks/processing/` 和 `results/` 的 JSON 文件。
+Data source: JSON files in `shared-volume/codex-tasks/processing/` and `results/`.
 
-## 变更记录
-- 2026-03-26: 旧 Telegram bot 系统完全移除（bot_commands, coordinator, executor 等 20 个模块），统一使用 governance API
+## Changelog
+- 2026-03-26: Old Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules), unified to use governance API

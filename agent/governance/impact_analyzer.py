@@ -2,10 +2,66 @@
 
 Given file changes, determines which nodes need re-verification,
 what tests to run, and in what order.
+
+Also provides code→doc relationship inference: when code files change,
+affected documentation files are surfaced so gates can enforce doc updates.
 """
 
 from .enums import VerifyStatus, VerifyLevel
 from .models import FileHitPolicy, PropagationPolicy, VerificationPolicy, ImpactAnalysisRequest
+
+# Code path prefix → related documentation files
+# Used by checkpoint gate to verify doc consistency on code changes
+CODE_DOC_MAP = {
+    "agent/telegram_gateway/": [
+        "docs/telegram-project-binding-design.md",
+        "docs/ai-agent-integration-guide.md",
+        "README.md",
+    ],
+    "agent/governance/server.py": [
+        "docs/ai-agent-integration-guide.md",
+        "docs/p0-3-design.md",
+        "README.md",
+    ],
+    "agent/governance/auto_chain.py": [
+        "docs/p0-3-design.md",
+        "docs/ai-agent-integration-guide.md",
+        "docs/human-intervention-guide.md",
+    ],
+    "agent/governance/task_registry.py": [
+        "docs/ai-agent-integration-guide.md",
+        "README.md",
+    ],
+    "agent/governance/state_service.py": [
+        "docs/workflow-governance-architecture-v2.md",
+        "docs/p0-3-design.md",
+    ],
+    "agent/governance/role_service.py": [
+        "docs/ai-agent-integration-guide.md",
+    ],
+    "agent/governance/gatekeeper.py": [
+        "docs/production-guard.md",
+    ],
+    "agent/executor_api.py": [
+        "docs/executor-api-guide.md",
+    ],
+    "agent/ai_lifecycle.py": [
+        "docs/architecture-v6-executor-driven.md",
+    ],
+    "agent/deploy_chain.py": [
+        "docs/deployment-guide.md",
+    ],
+}
+
+
+def get_related_docs(changed_files: list[str]) -> set[str]:
+    """Given code file changes, return set of docs that may need updating."""
+    docs = set()
+    for cf in changed_files:
+        for pattern, doc_list in CODE_DOC_MAP.items():
+            if pattern in cf or cf == pattern:
+                docs.update(doc_list)
+    return docs
 
 
 class ImpactAnalyzer:
@@ -106,6 +162,9 @@ class ImpactAnalyzer:
             except Exception:
                 pass
 
+        # Step 5: Doc consistency — which docs should be reviewed
+        related_docs = get_related_docs(request.changed_files)
+
         return {
             "direct_hit": sorted(direct_hit),
             "total_affected": len(affected),
@@ -114,6 +173,7 @@ class ImpactAnalyzer:
             "skipped": skipped,
             "test_files": sorted(test_files),
             "max_verify": max_vl,
+            "related_docs": sorted(related_docs),
         }
 
     def _file_match(self, changed_files: list[str], policy: FileHitPolicy) -> set[str]:

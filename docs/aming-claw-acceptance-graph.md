@@ -29,7 +29,7 @@ L0.1  Python 运行环境  [impl:done] [verify:pending] v1.0
       secondary:[runtime/python/]
       test:[]
 
-L0.2  共享存储目录结构  [impl:done] [verify:pending] v1.0
+L0.2  共享存储目录结构  [impl:done] [verify:T2-pass] v1.0
       deps:[]
       gate_mode: auto
       verify: L1
@@ -38,7 +38,7 @@ L0.2  共享存储目录结构  [impl:done] [verify:pending] v1.0
       secondary:[shared-volume/]
       test:[agent/tests/test_task_state.py]
 
-L0.3  JSON/JSONL 持久化工具  [impl:done] [verify:pending] v1.0
+L0.3  JSON/JSONL 持久化工具  [impl:done] [verify:T2-pass] v1.0
       deps:[]
       gate_mode: auto
       verify: L2
@@ -253,7 +253,7 @@ L3.5  自我更新（mgr_reinit）  [impl:done] [verify:pending] v1.0
 ## L4 — 治理服务层（依赖 L0）
 
 ```
-L4.1  SQLite 数据库层  [impl:done] [verify:pending] v1.0
+L4.1  SQLite 数据库层  [impl:done] [verify:T2-pass] v1.0
       deps:[L0.2]
       gate_mode: auto
       verify: L2
@@ -262,7 +262,7 @@ L4.1  SQLite 数据库层  [impl:done] [verify:pending] v1.0
       secondary:[]
       test:[agent/tests/test_governance_db.py]
 
-L4.2  显式枚举与错误体系  [impl:done] [verify:pending] v1.0
+L4.2  显式枚举与错误体系  [impl:done] [verify:T2-pass] v1.0
       deps:[]
       gate_mode: auto
       verify: L1
@@ -271,7 +271,7 @@ L4.2  显式枚举与错误体系  [impl:done] [verify:pending] v1.0
       secondary:[]
       test:[agent/tests/test_governance_enums.py]
 
-L4.3  权限矩阵与状态机  [impl:done] [verify:pending] v1.0
+L4.3  权限矩阵与状态机  [impl:done] [verify:T2-pass] v1.0
       deps:[L4.2]
       gate_mode: auto
       verify: L2
@@ -289,7 +289,7 @@ L4.4  结构化证据校验  [impl:done] [verify:pending] v1.0
       secondary:[]
       test:[agent/tests/test_governance_evidence.py]
 
-L4.5  Gate 策略引擎  [impl:done] [verify:pending] v1.0
+L4.5  Gate 策略引擎  [impl:done] [verify:T2-pass] v1.0
       deps:[L4.2]
       gate_mode: auto
       verify: L2
@@ -364,7 +364,7 @@ L4.12  记忆服务  [impl:done] [verify:pending] v1.0
       secondary:[]
       test:[agent/tests/test_governance_memory.py]
 
-L4.13  事件总线  [impl:done] [verify:pending] v1.0
+L4.13  事件总线  [impl:done] [verify:T2-pass] v1.0
       deps:[]
       gate_mode: auto
       verify: L2

@@ -356,6 +356,13 @@ class AcceptanceGraph:
             raise NodeNotFoundError(node_id)
         return dict(self.G.nodes[node_id])
 
+    def update_node_attrs(self, node_id: str, attrs: dict) -> None:
+        """Update specific attributes of an existing node (e.g. secondary files)."""
+        if node_id not in self.G:
+            raise NodeNotFoundError(node_id)
+        for key, value in attrs.items():
+            self.G.nodes[node_id][key] = value
+
     def list_nodes(self) -> list[str]:
         return list(self.G.nodes)
 

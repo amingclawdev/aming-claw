@@ -1,56 +1,56 @@
-# Aming Claw 架构方案 v5 修订版
+# Aming Claw Architecture v5 Revised
 
-> 基于 v5 初版 + 10 条评审反馈 + Toolbox 项目实战教训修订。
-> 核心原则：先把单角色单任务跑稳，再上多角色。
+> Based on v5 initial draft + 10 review feedback items + lessons learned from Toolbox project.
+> Core principle: Stabilize single-role single-task first, then add multi-role.
 
-## 修订记录
+## Revision History
 
-### 评审反馈采纳
+### Review Feedback Adopted
 
-| # | 建议 | 采纳 | 修订 |
-|---|------|------|------|
-| 1 | Runtime 改为状态投影，Task Registry 为唯一事实源 | ✅ | Runtime 只做读模型 |
-| 2 | task 文件补原子性 + 恢复机制 | ✅ | tmp+rename、claim lease、启动恢复扫盘 |
-| 3 | Pub/Sub 不做唯一通知通道 | ✅ | Pub/Sub 加速，持久化兜底 |
-| 4 | 任务状态枚举定全 | ✅ | 11 个状态 |
-| 5 | 消息分类器改两段式 | ✅ | 规则拦截 + LLM 后续 |
-| 6 | 通知归属任务不归属项目视图 | ✅ | 任务完成发回原 chat |
-| 7 | 角色冲突治理 | ✅ 延后 | P2 做 |
-| 8 | Executor 权限边界 | ✅ | workspace allowlist + tool policy |
-| 9 | 长任务进度 heartbeat | ✅ | phase + percent |
-| 10 | 实施顺序调整 | ✅ | 先可靠性闭环再多角色 |
+| # | Suggestion | Adopted | Revision |
+|---|-----------|---------|----------|
+| 1 | Runtime changed to state projection, Task Registry as single source of truth | ✅ | Runtime is read-only model |
+| 2 | Add atomicity + recovery mechanism for task files | ✅ | tmp+rename, claim lease, startup recovery scan |
+| 3 | Pub/Sub not the sole notification channel | ✅ | Pub/Sub for speed, persistence as fallback |
+| 4 | Define complete task status enum | ✅ | 11 statuses |
+| 5 | Message classifier changed to two-stage | ✅ | Rule interception + LLM follow-up |
+| 6 | Notifications belong to task, not project view | ✅ | Task completion replies to original chat |
+| 7 | Role conflict governance | ✅ Deferred | To be done in P2 |
+| 8 | Executor permission boundary | ✅ | workspace allowlist + tool policy |
+| 9 | Long task progress heartbeat | ✅ | phase + percent |
+| 10 | Implementation order adjustment | ✅ | Reliability loop first, multi-role later |
 
-### Toolbox 实战教训采纳
+### Toolbox Lessons Learned Adopted
 
-| 教训 | 来源 | 对 v5 的影响 |
-|------|------|-------------|
-| Coordinator 只做调度不做业务 | toolbox v1.4.4 | **角色职责硬约束**：coord 不碰代码/分析/验证 |
-| Gatekeeper 记忆隔离 | toolbox wf-gatekeeper | **Gatekeeper 检查时只看验收图+task-log**，不看 coord context |
-| 子进程 PID + orphan 管理 | toolbox 14 个残留 worktree | **Runtime 记录 worker_pid**，启动时恢复扫盘 kill 孤儿 |
-| 非阻塞调度 | toolbox coord 卡死 | **Agent 必须后台启动**，coord 不阻塞等待 |
-| Release gate 硬检查 | toolbox 6 节点未绿就发布 | **代码修复 ≠ verify:pass**，改了代码的节点必须重新验证 |
-| coverage-check 属于 governance 不属于 runtime | 架构分析 | **静态分析不进 runtime**，phase 转换时自动触发 |
+| Lesson | Source | Impact on v5 |
+|--------|--------|-------------|
+| Coordinator only dispatches, no business logic | toolbox v1.4.4 | **Hard role responsibility constraint**: coord does not touch code/analysis/verification |
+| Gatekeeper memory isolation | toolbox wf-gatekeeper | **Gatekeeper checks only see acceptance graph + task-log**, not coord context |
+| Subprocess PID + orphan management | toolbox 14 leftover worktrees | **Runtime records worker_pid**, startup recovery scan kills orphans |
+| Non-blocking dispatch | toolbox coord deadlocked | **Agent must launch in background**, coord does not block waiting |
+| Release gate hard check | toolbox 6 nodes not green but released | **Code fix ≠ verify:pass**, nodes with code changes must be re-verified |
+| coverage-check belongs to governance not runtime | Architecture analysis | **Static analysis stays out of runtime**, auto-triggered on phase transition |
 
-## 一、核心原则
-
-```
-1. 唯一事实源：Task Registry (SQLite)
-2. Runtime 是投影，不是双写
-3. 文件队列保留，但补原子性
-4. Pub/Sub 加速，持久化兜底
-5. 先单角色跑稳，再上多角色
-6. Coordinator 只调度不做业务 (toolbox 教训)
-7. Gatekeeper 记忆隔离，天然免疫偏移 (toolbox 教训)
-8. 代码修复 ≠ verify:pass，必须重新验证 (toolbox 教训)
-9. 消息驱动：session 无状态，token 绑项目不绑 session
-```
-
-## 二、任务状态机（定稿，修订 #2）
-
-### 双字段模型：执行状态 + 通知状态
+## 1. Core Principles
 
 ```
-执行状态和通知状态是两个独立维度，不混在一条状态链里。
+1. Single source of truth: Task Registry (SQLite)
+2. Runtime is a projection, not dual-write
+3. File queue retained, but with added atomicity
+4. Pub/Sub for speed, persistence as fallback
+5. Stabilize single-role first, then add multi-role
+6. Coordinator only dispatches, no business logic (toolbox lesson)
+7. Gatekeeper memory isolation, naturally immune to drift (toolbox lesson)
+8. Code fix ≠ verify:pass, must re-verify (toolbox lesson)
+9. Message-driven: session is stateless, token bound to project not session
+```
+
+## 2. Task State Machine (Finalized, Revision #2)
+
+### Dual-Field Model: Execution Status + Notification Status
+
+```
+Execution status and notification status are two independent dimensions, not mixed in a single status chain.
 
 execution_status:
   queued ──→ claimed ──→ running ──→ succeeded
@@ -61,143 +61,143 @@ execution_status:
     │           │
     └──→ cancelled
 
-  running ──→ waiting_human ──→ running (确认后)
-  running ──→ blocked ──→ running (解除后)
+  running ──→ waiting_human ──→ running (after confirmation)
+  running ──→ blocked ──→ running (after unblocked)
 
-notification_status (独立字段):
+notification_status (independent field):
   none ──→ pending ──→ sent ──→ read
 ```
 
-### 表结构
+### Table Structure
 
 ```sql
 ALTER TABLE tasks ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'queued';
 ALTER TABLE tasks ADD COLUMN notification_status TEXT NOT NULL DEFAULT 'none';
 ALTER TABLE tasks ADD COLUMN notified_at TEXT;
 
--- execution_status 管"任务做到哪了"
--- notification_status 管"用户知道没"
--- 两者独立变更，不互相阻塞
+-- execution_status tracks "where the task is at"
+-- notification_status tracks "whether the user knows"
+-- Both change independently, no mutual blocking
 ```
 
-### 状态枚举
+### Status Enum
 
 ```python
 EXECUTION_STATUSES = {
-    "queued",           # 已创建，等待 claim
-    "claimed",          # Executor 已认领，尚未开始
-    "running",          # 正在执行
-    "waiting_human",    # 等待人工确认（发布/rollback）
-    "blocked",          # 缺少上下文/权限，暂停
-    "succeeded",        # 执行成功
-    "failed",           # 执行失败（可重试）
-    "cancelled",        # 被取消
-    "timed_out",        # 超时
-    "enqueue_failed",   # DB 写成功但文件投递失败
+    "queued",           # Created, waiting for claim
+    "claimed",          # Executor has claimed, not yet started
+    "running",          # Currently executing
+    "waiting_human",    # Waiting for human confirmation (release/rollback)
+    "blocked",          # Missing context/permissions, paused
+    "succeeded",        # Execution succeeded
+    "failed",           # Execution failed (retryable)
+    "cancelled",        # Cancelled
+    "timed_out",        # Timed out
+    "enqueue_failed",   # DB write succeeded but file delivery failed
 }
 
 NOTIFICATION_STATUSES = {
-    "none",             # 不需要通知（查询类）
-    "pending",          # 需要通知但还没发
-    "sent",             # 已发送 Telegram
-    "read",             # 用户已确认查看
+    "none",             # No notification needed (query type)
+    "pending",          # Notification needed but not yet sent
+    "sent",             # Sent via Telegram
+    "read",             # User confirmed viewing
 }
 ```
 
-## 三、Token 模型（简化版）
+## 3. Token Model (Simplified)
 
-### 旧模型 vs 新模型
-
-```
-旧（v4 双令牌）:
-  人类 init → refresh_token(90d)
-  Session 启动 → POST /api/token/refresh → access_token(4h)
-  所有 API 用 access_token
-  每 4h 刷新 → session 结束 deregister
-
-新（v5 消息驱动）:
-  人类 init → project_token（不过期）
-  Gateway 持有 project_token → 代理所有 API 调用
-  CLI session 只需 project_id → Gateway 转发
-  没有 refresh/rotate/expire 开销
-```
-
-### Token 分类
-
-| Token | 持有者 | TTL | 用途 |
-|-------|--------|-----|------|
-| **project_token** | Gateway / 人类 | 不过期 | 项目 API 全权限（coordinator 级别） |
-| **agent_token** | dev/tester/qa 进程 | 24h | 受限 API（只能 verify-update 等角色操作） |
-
-### 安全保障
+### Old Model vs New Model
 
 ```
-不过期不等于不安全：
+Old (v4 dual token):
+  Human init → refresh_token(90d)
+  Session start → POST /api/token/refresh → access_token(4h)
+  All APIs use access_token
+  Refresh every 4h → session end deregister
 
-1. 密码保护：init 时设密码，重置 token 需要密码
-2. 可撤销：POST /api/token/revoke (人工操作)
-3. 网络隔离：token 只在 localhost / Docker 内网使用
-4. Gateway 代理：CLI session 不直接持有 token
-   → Gateway 收到消息 → 用自己存的 token 调 API
-   → CLI session 只需要 project_id
-5. agent_token 仍有 TTL：独立进程的权限有时间限制
+New (v5 message-driven):
+  Human init → project_token (no expiry)
+  Gateway holds project_token → proxies all API calls
+  CLI session only needs project_id → Gateway forwards
+  No refresh/rotate/expire overhead
 ```
 
-### 去掉的组件
+### Token Classification
+
+| Token | Holder | TTL | Purpose |
+|-------|--------|-----|---------|
+| **project_token** | Gateway / Human | No expiry | Full project API permissions (coordinator level) |
+| **agent_token** | dev/tester/qa process | 24h | Restricted API (only role operations like verify-update) |
+
+### Security Guarantees
 
 ```
-删除：
-  - /api/token/refresh  → 不需要，project_token 不过期
-  - /api/token/rotate   → 简化为 /api/token/revoke + 重新 init
-  - access_token (gat-*) → 不需要，直接用 project_token (gov-*)
-  - token_service.py    → 可以保留但标记废弃
+No expiry does not mean insecure:
 
-保留：
-  - /api/token/revoke   → 安全撤销能力
-  - /api/init           → 创建项目 + 获取 project_token
-  - /api/role/assign    → coordinator 分配 agent_token (24h TTL)
+1. Password protection: set password at init, resetting token requires password
+2. Revocable: POST /api/token/revoke (manual operation)
+3. Network isolation: token only used on localhost / Docker internal network
+4. Gateway proxy: CLI session does not directly hold token
+   → Gateway receives message → calls API with its stored token
+   → CLI session only needs project_id
+5. agent_token still has TTL: independent process permissions are time-limited
 ```
 
-### Gateway 作为 Token 代理
+### Removed Components
 
 ```
-用户 Telegram 消息
+Removed:
+  - /api/token/refresh  → Not needed, project_token has no expiry
+  - /api/token/rotate   → Simplified to /api/token/revoke + re-init
+  - access_token (gat-*) → Not needed, use project_token (gov-*) directly
+  - token_service.py    → Can keep but mark as deprecated
+
+Retained:
+  - /api/token/revoke   → Secure revocation capability
+  - /api/init           → Create project + obtain project_token
+  - /api/role/assign    → Coordinator assigns agent_token (24h TTL)
+```
+
+### Gateway as Token Proxy
+
+```
+User Telegram message
     ↓
-Gateway 查路由表 → 找到 project_token
+Gateway looks up routing table → finds project_token
     ↓
-Gateway 用 project_token 调 governance API
+Gateway calls governance API with project_token
     ↓
-不需要 CLI session 自己管 token
+CLI session does not need to manage tokens itself
 
-CLI session 启动时:
-    不需要: token refresh / agent register / lease
-    只需要: 知道 project_id + Gateway URL
-    Gateway 替它做所有认证
+CLI session at startup:
+    Not needed: token refresh / agent register / lease
+    Only needed: know project_id + Gateway URL
+    Gateway handles all authentication for it
 ```
 
-## 四、Task Registry 为唯一事实源
+## 4. Task Registry as Single Source of Truth
 
 ```
-所有状态变更只写 Task Registry (SQLite):
+All state changes only write to Task Registry (SQLite):
 
-  Gateway 创建任务   → INSERT tasks SET status='queued'
-  Executor claim    → UPDATE tasks SET status='claimed', worker_id, lease_expires_at
-  Executor 开始执行  → UPDATE tasks SET status='running'
-  Executor 完成     → UPDATE tasks SET status='succeeded', result_json
-  Executor 失败     → UPDATE tasks SET status='failed', error, attempt+1
-  超时              → UPDATE tasks SET status='timed_out'
-  人工确认等待       → UPDATE tasks SET status='waiting_human'
-  Gateway 已通知     → UPDATE tasks SET status='notified', notified_at
+  Gateway creates task    → INSERT tasks SET status='queued'
+  Executor claim          → UPDATE tasks SET status='claimed', worker_id, lease_expires_at
+  Executor starts running → UPDATE tasks SET status='running'
+  Executor completes      → UPDATE tasks SET status='succeeded', result_json
+  Executor fails          → UPDATE tasks SET status='failed', error, attempt+1
+  Timeout                 → UPDATE tasks SET status='timed_out'
+  Waiting for human       → UPDATE tasks SET status='waiting_human'
+  Gateway notified        → UPDATE tasks SET status='notified', notified_at
 
-Runtime API 只读取 Task Registry 做投影，不维护自己的状态。
+Runtime API only reads Task Registry for projection, does not maintain its own state.
 ```
 
-### Runtime 投影 API
+### Runtime Projection API
 
 ```python
 @route("GET", "/api/runtime/{project_id}")
 def handle_runtime(ctx):
-    """投影视图，不存状态。每次从 Task Registry 实时查询。"""
+    """Projection view, no stored state. Real-time query from Task Registry each time."""
     project_id = ctx.get_project_id()
     with DBContext(project_id) as conn:
         active = task_registry.list_tasks(conn, project_id, status="running")
@@ -214,35 +214,35 @@ def handle_runtime(ctx):
     }
 ```
 
-## 四、文件投递原子化
+## 4. Atomic File Delivery
 
-### 4.1 写入顺序：DB 先于文件（修订 #1）
+### 4.1 Write Order: DB Before File (Revision #1)
 
 ```
-关键原则：任务的"存在性"由 DB 定义，不由文件定义。
+Key principle: Task "existence" is defined by DB, not by file.
 
-顺序：
-  1. DB INSERT tasks (status=queued)    ← 任务诞生
-  2. 写 task 文件 (tmp → fsync → rename) ← 投递给 Executor
-  3. 若写文件失败 → DB UPDATE status='enqueue_failed'
+Order:
+  1. DB INSERT tasks (status=queued)    ← Task is born
+  2. Write task file (tmp → fsync → rename) ← Deliver to Executor
+  3. If file write fails → DB UPDATE status='enqueue_failed'
 
-好处：
-  - Executor 扫到文件时，DB 一定有记录
-  - DB 有记录但没文件 → 恢复时重投递或标记失败
-  - 不存在"文件有但 DB 没有"的不一致
+Benefits:
+  - When Executor scans a file, DB always has a record
+  - DB has record but no file → re-deliver or mark failed during recovery
+  - No inconsistency of "file exists but DB doesn't"
 ```
 
 ```python
 def create_task_file(project_id, prompt, backend="claude", chat_id=0):
     task_id = new_task_id()
 
-    # 1. 先写 DB（任务诞生点）
+    # 1. Write DB first (task birth point)
     with DBContext(project_id) as conn:
         task_registry.create_task(conn, project_id, prompt,
             task_type=backend, created_by="gateway",
             metadata={"chat_id": chat_id})
 
-    # 2. 再写文件（投递给 Executor）
+    # 2. Then write file (deliver to Executor)
     task_data = {
         "task_id": task_id,
         "project_id": project_id,
@@ -255,7 +255,7 @@ def create_task_file(project_id, prompt, backend="claude", chat_id=0):
     }
 
     try:
-        # 原子写入：先写 tmp，fsync，再 rename
+        # Atomic write: write tmp first, fsync, then rename
         tmp_path = pending_dir / f"{task_id}.json.tmp"
         final_path = pending_dir / f"{task_id}.json"
 
@@ -264,9 +264,9 @@ def create_task_file(project_id, prompt, backend="claude", chat_id=0):
         f.flush()
         os.fsync(f.fileno())
 
-    os.rename(tmp_path, final_path)  # 原子操作
+    os.rename(tmp_path, final_path)  # Atomic operation
 
-    # 同时写 Task Registry
+    # Also write to Task Registry
     with DBContext(project_id) as conn:
         task_registry.create_task(conn, project_id, prompt,
             task_type=backend, created_by="gateway",
@@ -275,7 +275,7 @@ def create_task_file(project_id, prompt, backend="claude", chat_id=0):
     return task_id
 ```
 
-### 4.2 Claim with Fencing Token（修订 #3）
+### 4.2 Claim with Fencing Token (Revision #3)
 
 ```python
 def claim_task(task_file):
@@ -283,11 +283,11 @@ def claim_task(task_file):
     task_id = task["task_id"]
     project_id = task["project_id"]
 
-    # 生成 fencing token（防止双执行）
+    # Generate fencing token (prevent double execution)
     fence_token = f"fence-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    lease_expires = utc_iso_after(seconds=300)  # 5 分钟 lease
+    lease_expires = utc_iso_after(seconds=300)  # 5 minute lease
 
-    # 1. 原子 claim：CAS 更新（只有 queued 状态才能 claim）
+    # 1. Atomic claim: CAS update (only queued status can be claimed)
     with DBContext(project_id) as conn:
         result = conn.execute(
             """UPDATE tasks SET execution_status='claimed',
@@ -304,24 +304,24 @@ def claim_task(task_file):
             (worker_id, utc_iso(), lease_expires, worker_id, fence_token, task_id)
         )
         if result.rowcount == 0:
-            return None  # 已被其他 worker claim
+            return None  # Already claimed by another worker
 
-    # 2. 移动文件
+    # 2. Move file
     os.rename(pending_path, processing_path)
     return task, fence_token
 
-# 执行任务时，每次写 DB 都校验 fence_token
+# When executing tasks, validate fence_token on every DB write
 def update_with_fence(conn, task_id, fence_token, **updates):
-    """带 fencing token 的更新，防止旧 worker 覆盖新 worker 的状态"""
+    """Update with fencing token, prevents old worker from overwriting new worker's state"""
     current = conn.execute(
         "SELECT json_extract(metadata_json, '$.fence_token') FROM tasks WHERE task_id=?",
         (task_id,)
     ).fetchone()
     if current and current[0] != fence_token:
         raise RuntimeError(f"Fence token mismatch: task reclaimed by another worker")
-    # 安全更新...
+    # Safe update...
 
-# Lease 续期（heartbeat 时）
+# Lease renewal (during heartbeat)
 def renew_lease(conn, task_id, fence_token):
     new_expires = utc_iso_after(seconds=300)
     conn.execute(
@@ -333,35 +333,35 @@ def renew_lease(conn, task_id, fence_token):
     )
 ```
 
-### 4.3 启动恢复
+### 4.3 Startup Recovery
 
 ```python
 def recover_on_startup():
-    """Executor 启动时恢复卡住的任务"""
+    """Recover stuck tasks on Executor startup"""
 
-    # 1. 扫 processing/ 目录
+    # 1. Scan processing/ directory
     for f in processing_dir.glob("*.json"):
         task = load_json(f)
         task_id = task["task_id"]
 
-        # 检查 Task Registry 状态
+        # Check Task Registry status
         with DBContext(task["project_id"]) as conn:
             db_task = task_registry.get_task(conn, task_id)
 
         if not db_task:
-            # 孤儿文件，移回 pending
+            # Orphan file, move back to pending
             os.rename(f, pending_dir / f.name)
             continue
 
         if db_task["status"] in ("claimed", "running"):
-            # lease 过期了 → 重排队
+            # Lease expired → re-queue
             if db_task.get("lease_expires_at", "") < utc_iso():
                 os.rename(f, pending_dir / f.name)
                 with DBContext(task["project_id"]) as conn:
                     conn.execute("UPDATE tasks SET status='queued' WHERE task_id=?", (task_id,))
                     conn.commit()
 
-    # 2. 扫 Task Registry 中 claimed/running 但 lease 过期的
+    # 2. Scan Task Registry for claimed/running with expired lease
     for project in list_projects():
         with DBContext(project["project_id"]) as conn:
             stale = conn.execute(
@@ -375,96 +375,95 @@ def recover_on_startup():
             conn.commit()
 ```
 
-## 五、通知可靠性
+## 5. Notification Reliability
 
 ```
-Executor 完成任务:
+Executor completes task:
     │
-    ├── 1. UPDATE Task Registry: running → succeeded (持久化)
-    ├── 2. UPDATE Task Registry: status = 'notify_pending' (持久化)
-    ├── 3. Redis PUBLISH task:completed (加速，非必须)
+    ├── 1. UPDATE Task Registry: running → succeeded (persisted)
+    ├── 2. UPDATE Task Registry: status = 'notify_pending' (persisted)
+    ├── 3. Redis PUBLISH task:completed (acceleration, not required)
     │
     ▼
-Gateway 通知用户 (两条路径，互为备份):
+Gateway notifies user (two paths, mutual backup):
     │
-    ├── 路径 A: Pub/Sub 订阅 → 收到 → 回复 Telegram → UPDATE notified
+    ├── Path A: Pub/Sub subscription → received → reply Telegram → UPDATE notified
     │
-    └── 路径 B: 定期扫描 Task Registry 中 notify_pending 的任务
-         → 找到 → 回复 Telegram → UPDATE notified
-         (Gateway 每次 poll Telegram 时顺便查一次，无需额外定时)
+    └── Path B: Periodically scan Task Registry for notify_pending tasks
+         → found → reply Telegram → UPDATE notified
+         (Gateway checks once on each Telegram poll, no extra timer needed)
 
-判断已通知: notified_at IS NOT NULL，不是靠 Pub/Sub 是否收到
+Determining notified: notified_at IS NOT NULL, not based on whether Pub/Sub was received
 ```
 
-## 六、消息分类器（两段式）
+## 6. Message Classifier (Two-Stage)
 
-### 第一层：规则快速拦截
+### First Layer: Rule-Based Fast Interception
 
 ```python
 def classify_fast(text: str) -> str | None:
-    """规则拦截，确定性高的直接返回"""
+    """Rule interception, high-certainty cases return directly"""
     if text.startswith("/"):
         return "command"
 
-    # 危险操作（必须人工确认）
-    danger = ["rollback", "delete", "revoke", "release", "deploy",
-              "回滚", "删除", "发布", "撤销"]
+    # Dangerous operations (require human confirmation)
+    danger = ["rollback", "delete", "revoke", "release", "deploy"]
     if any(kw in text.lower() for kw in danger):
         return "dangerous"
 
-    # 明确查询模板
+    # Explicit query patterns
     query_patterns = [
-        r"(状态|status)\s*(怎么样|是什么|查|看)",
-        r"(多少|几个)\s*(节点|node|任务|task)",
-        r"(列表|list|列出)",
+        r"(status)\s*(how|what|check|view)",
+        r"(how many)\s*(node|task)",
+        r"(list|show)",
     ]
     for p in query_patterns:
         if re.search(p, text, re.I):
             return "query"
 
-    return None  # 不确定，交给第二层
+    return None  # Uncertain, pass to second layer
 ```
 
-### 第二层：LLM 意图解析（后续接入）
+### Second Layer: LLM Intent Parsing (Future Integration)
 
 ```python
 def classify_llm(text: str, context: dict) -> dict:
-    """LLM 解析意图，当前先用简单规则代替"""
-    # 阶段 1: 关键词兜底
-    task_kw = ["帮我", "写", "改", "修", "创建", "实现", "优化",
-               "测试", "fix", "add", "create", "implement"]
+    """LLM parses intent, currently using simple rules as placeholder"""
+    # Phase 1: Keyword fallback
+    task_kw = ["help me", "write", "change", "fix", "create", "implement", "optimize",
+               "test", "add"]
     if any(kw in text for kw in task_kw):
         return {"intent": "execute", "risk": "low", "needs_workspace": True}
 
-    # 阶段 2: 后续替换为 LLM 调用
+    # Phase 2: Replace with LLM call later
     # return llm_classify(text, context)
 
     return {"intent": "chat", "risk": "none", "needs_workspace": False}
 ```
 
-## 七、通知归属任务（不归属项目视图）
+## 7. Notifications Belong to Task (Not Project View)
 
 ```
-任务创建时记录 chat_id:
+Record chat_id when task is created:
   task.chat_id = 7848961760
 
-任务完成时:
-  不管用户当前绑在哪个项目
-  直接发回 task.chat_id
+When task completes:
+  Regardless of which project user is currently bound to
+  Send directly back to task.chat_id
 
-/menu 显示各项目未读:
-  ┌──────────────────────────┐
-  │ [>> amingClaw]     2 未读 │  ← 有完成但未查看的任务
-  │ [   toolboxClient] 0 未读 │
-  └──────────────────────────┘
+/menu shows unread per project:
+  ┌──────────────────────────────┐
+  │ [>> amingClaw]     2 unread  │  ← Has completed but unviewed tasks
+  │ [   toolboxClient] 0 unread  │
+  └──────────────────────────────┘
 ```
 
-## 八、Executor 权限边界
+## 8. Executor Permission Boundary
 
 ### workspace allowlist
 
 ```python
-# 每个项目只能访问自己的 repo 路径
+# Each project can only access its own repo path
 PROJECT_WORKSPACES = {
     "amingClaw": "C:/Users/z5866/Documents/amingclaw/aming_claw",
     "toolboxClient": "C:/Users/z5866/Documents/Toolbox/toolBoxClient",
@@ -474,14 +473,14 @@ def validate_workspace(project_id, task):
     allowed = PROJECT_WORKSPACES.get(project_id)
     if not allowed:
         raise RuntimeError(f"No workspace configured for {project_id}")
-    # backends.py 已有 is_sensitive_path 检查
+    # backends.py already has is_sensitive_path check
 ```
 
-### tool policy（修订 #4：结构化命令策略）
+### tool policy (Revision #4: Structured Command Policy)
 
 ```python
-# 阶段 1：字符串规则（当前）
-# 阶段 2：结构化命令能力模型（后续升级）
+# Phase 1: String rules (current)
+# Phase 2: Structured command capability model (future upgrade)
 
 TOOL_POLICY = {
     "auto_allow": [
@@ -510,7 +509,7 @@ TOOL_POLICY = {
     ],
 }
 
-# 校验逻辑
+# Validation logic
 def check_command_policy(cmd: list[str], project_id: str) -> str:
     """Returns: 'allow' | 'approve' | 'deny'"""
     program = cmd[0] if cmd else ""
@@ -524,13 +523,13 @@ def check_command_policy(cmd: list[str], project_id: str) -> str:
     for rule in TOOL_POLICY["auto_allow"]:
         if program == rule["program"]:
             return "allow"
-    return "approve"  # 默认需要审批
+    return "approve"  # Default requires approval
 ```
 
-## 九、长任务进度 Heartbeat
+## 9. Long Task Progress Heartbeat
 
 ```python
-# Executor 执行期间定期上报进度
+# Executor periodically reports progress during execution
 def report_progress(task_id, project_id, phase, percent, message):
     with DBContext(project_id) as conn:
         conn.execute(
@@ -545,143 +544,143 @@ def report_progress(task_id, project_id, phase, percent, message):
         )
         conn.commit()
 
-# phase 枚举
+# Phase enum
 PHASES = [
-    "planning",        # 分析任务
-    "coding",          # 编写代码
-    "testing",         # 运行测试
-    "reviewing",       # 自检
-    "waiting_human",   # 等人工确认
-    "finalizing",      # 收尾
+    "planning",        # Analyzing task
+    "coding",          # Writing code
+    "testing",         # Running tests
+    "reviewing",       # Self-review
+    "waiting_human",   # Waiting for human confirmation
+    "finalizing",      # Wrapping up
 ]
 
-# 用户查询进度时
+# When user queries progress
 # GET /api/runtime/{pid} → active_tasks[0].progress
-# → "coding (60%) — 已修改 3 个文件，正在跑单测"
+# → "coding (60%) — modified 3 files, running unit tests"
 ```
 
-## 十、角色职责硬约束（Toolbox 教训）
+## 10. Hard Role Responsibility Constraints (Toolbox Lesson)
 
-### 10.1 角色定义
+### 10.1 Role Definitions
 
-| 角色 | 只做 | 不做 |
-|------|------|------|
-| **Coordinator** | 接收指令→派发→监控→汇报 | ❌ 不读代码、不写代码、不分析需求、不跑测试 |
-| **PM** (未来) | 需求分析+方案设计+验收标准 | ❌ 不写代码 |
-| **Dev** | 代码实现+单元测试 | ❌ 不做需求分析、不做 QA |
-| **Tester** | 运行测试+生成测试报告 | ❌ 不改代码 |
-| **QA** | 真实环境 E2E 验收 | ❌ 不改代码 |
-| **Gatekeeper** | 审计+对齐+纠正+裁决 | ❌ 不改文件、不派 agent、不跑测试 |
+| Role | Only Does | Does Not Do |
+|------|-----------|-------------|
+| **Coordinator** | Receive instructions → dispatch → monitor → report | ❌ No reading code, writing code, analyzing requirements, running tests |
+| **PM** (future) | Requirements analysis + design + acceptance criteria | ❌ No writing code |
+| **Dev** | Code implementation + unit testing | ❌ No requirements analysis, no QA |
+| **Tester** | Run tests + generate test reports | ❌ No modifying code |
+| **QA** | Real environment E2E acceptance | ❌ No modifying code |
+| **Gatekeeper** | Audit + alignment + correction + adjudication | ❌ No modifying files, dispatching agents, running tests |
 
-### 10.2 Coordinator 允许的代码修改上限
-
-```
-Coordinator 可以做的"小修"（最多 2 次/任务）:
-  - 修改配置文件（docker-compose, nginx.conf, .env）
-  - 修改文档（docs/, README）
-  - 修改 acceptance graph
-
-超过 2 次代码修改 → 自动触发 Gatekeeper 角色坍塌检查
-```
-
-### 10.3 代码修复 ≠ verify:pass
+### 10.2 Coordinator Code Modification Limit
 
 ```
-节点被标记 qa_pass 后，如果代码被修改:
-  → 节点自动降级为 testing（不是 pending）
-  → 必须重新走 tester → qa 验证
-  → 不可跳过
+"Minor edits" Coordinator is allowed (max 2 per task):
+  - Modify config files (docker-compose, nginx.conf, .env)
+  - Modify documentation (docs/, README)
+  - Modify acceptance graph
 
-实现方式:
-  verify-update 时检查: 该节点的 primary/secondary 文件
-  自上次 qa_pass 以来是否有 git 变更
-  如果有 → 阻断: "Node L1.3 files changed since qa_pass, re-verify required"
+Over 2 code modifications → auto-trigger Gatekeeper role collapse check
 ```
 
-## 十一、Gatekeeper 设计（Toolbox 记忆隔离模型）
-
-### 11.1 Gatekeeper 触发点（修订 #5：错误前移，不堆到 release）
+### 10.3 Code Fix ≠ verify:pass
 
 ```
-原则：把检查尽量前移到出错的那一步，release-gate 只做最终不可绕过检查。
+After a node is marked qa_pass, if code is modified:
+  → Node auto-downgrades to testing (not pending)
+  → Must go through tester → qa verification again
+  → Cannot be skipped
+
+Implementation:
+  On verify-update check: the node's primary/secondary files
+  Whether there are git changes since last qa_pass
+  If yes → block: "Node L1.3 files changed since qa_pass, re-verify required"
 ```
 
-| 触发点 | 时机 | 检查内容 | 阻断级别 |
-|--------|------|---------|---------|
-| G-coverage | **verify-update (t2_pass/qa_pass)** | 节点 primary 文件是否都有图覆盖 | 拒绝推进 |
-| G-artifacts | **verify-update (qa_pass)** | 文档/测试文件是否完整（含自动推断） | 拒绝推进 |
-| G-role | **coord 改代码 ≥2 次时** | 角色坍塌检查 | 告警 |
-| G-file-change | **verify-update 时** | 节点 qa_pass 后 primary 文件被改了？ | 自动降级到 testing |
-| G-release | **release-gate 时** | 最终检查：最近 1h 内有 coverage-check pass + 全绿 | 阻断发布 |
+## 11. Gatekeeper Design (Toolbox Memory Isolation Model)
+
+### 11.1 Gatekeeper Trigger Points (Revision #5: Shift Errors Left, Don't Pile on Release)
 
 ```
-错误前移链路：
+Principle: Shift checks as far left as possible to the step where errors occur. release-gate only does final non-bypassable checks.
+```
 
-  改代码 → verify-update
-            ├── G-coverage: 文件有节点覆盖？ (前移)
-            ├── G-file-change: qa_pass 后文件改了？ (前移)
-            └── G-artifacts: 文档/测试完整？ (前移)
+| Trigger Point | Timing | Check Content | Block Level |
+|---------------|--------|--------------|-------------|
+| G-coverage | **verify-update (t2_pass/qa_pass)** | Are node primary files all covered in graph | Reject advancement |
+| G-artifacts | **verify-update (qa_pass)** | Are docs/test files complete (including auto-inference) | Reject advancement |
+| G-role | **When coord modifies code >= 2 times** | Role collapse check | Warning |
+| G-file-change | **On verify-update** | Were node primary files changed after qa_pass? | Auto-downgrade to testing |
+| G-release | **On release-gate** | Final check: coverage-check pass within last 1h + all green | Block release |
+
+```
+Shift-left error chain:
+
+  Modify code → verify-update
+            ├── G-coverage: Files have node coverage? (shifted left)
+            ├── G-file-change: Files changed after qa_pass? (shifted left)
+            └── G-artifacts: Docs/tests complete? (shifted left)
                       ↓
-            全部通过 → 允许推进
+            All pass → allow advancement
                       ↓
   release-gate
-            └── G-release: 只检查"是否有人跑过 coverage-check 且通过"
-                          不重复检查已经前移的内容
+            └── G-release: Only checks "has someone run coverage-check and passed"
+                          Does not re-check content already shifted left
 ```
 
-### 11.2 Gatekeeper 记忆隔离
+### 11.2 Gatekeeper Memory Isolation
 
 ```
-Gatekeeper 检查时只接收:
-  ✅ acceptance-graph 当前状态（节点+状态）
-  ✅ task-log（角色实例+状态）
-  ✅ 用户原始指令（一句话）
-  ✅ 当前 phase 转换方向
+Gatekeeper checks only receive:
+  ✅ acceptance-graph current state (nodes + statuses)
+  ✅ task-log (role instances + statuses)
+  ✅ Original user instruction (one sentence)
+  ✅ Current phase transition direction
 
-Gatekeeper 不接收:
-  ❌ Coordinator 的 context（recent_messages, decisions）
-  ❌ 调试上下文、错误日志、代码 diff
-  ❌ 多轮迭代的历史
-  ❌ 角色间的对话内容
+Gatekeeper does not receive:
+  ❌ Coordinator's context (recent_messages, decisions)
+  ❌ Debug context, error logs, code diffs
+  ❌ Multi-iteration history
+  ❌ Inter-role conversation content
 
-原因: 长时间执行后 Coordinator 会积累沉没成本，
-     导致"够好了"的妥协心理。
-     Gatekeeper 不知道调了多少轮 bug，
-     只看节点是否全绿，天然免疫偏移。
+Reason: After long execution, Coordinator accumulates sunk costs,
+     leading to "good enough" compromise mentality.
+     Gatekeeper doesn't know how many debug rounds occurred,
+     only checks if nodes are all green, naturally immune to drift.
 ```
 
-### 11.3 Governance vs Runtime 职责分界
+### 11.3 Governance vs Runtime Responsibility Boundary
 
 ```
-Governance (静态规则):
-  ├── 节点状态机（谁能做什么转换）
-  ├── Gate 策略（节点间依赖）
-  ├── Coverage-check（文件→节点映射）
-  ├── Artifacts 检查（文档/测试完整性）
-  ├── Gatekeeper checks（发布前全局校验）
-  └── Release profile（发布范围）
+Governance (static rules):
+  ├── Node state machine (who can make which transitions)
+  ├── Gate policy (inter-node dependencies)
+  ├── Coverage-check (file → node mapping)
+  ├── Artifacts check (doc/test completeness)
+  ├── Gatekeeper checks (pre-release global validation)
+  └── Release profile (release scope)
 
-Runtime (动态状态):
-  ├── 谁在运行（worker_pid, lease）
-  ├── 跑什么任务（task_id, prompt, phase, percent）
-  ├── 进度多少（heartbeat + progress）
-  ├── 哪些结果待通知（notify_pending）
-  └── 孤儿进程检测（pid 存活检查）
+Runtime (dynamic state):
+  ├── Who is running (worker_pid, lease)
+  ├── What task is running (task_id, prompt, phase, percent)
+  ├── Progress (heartbeat + progress)
+  ├── Which results need notification (notify_pending)
+  └── Orphan process detection (pid alive check)
 
-coverage-check 属于 Governance，不进 Runtime。
-phase 转换时 Governance 自动触发 coverage-check。
+coverage-check belongs to Governance, not Runtime.
+Governance auto-triggers coverage-check on phase transitions.
 ```
 
-## 十二、进程生命周期管理（Toolbox 教训）
+## 12. Process Lifecycle Management (Toolbox Lesson)
 
-### 12.1 PID 追踪
+### 12.1 PID Tracking
 
 ```python
-# Executor 启动 CLI 进程时记录 PID
+# Record PID when Executor starts CLI process
 def run_with_pid_tracking(task_id, project_id, cmd):
     proc = subprocess.Popen(cmd, ...)
 
-    # 记录到 Task Registry
+    # Record to Task Registry
     with DBContext(project_id) as conn:
         conn.execute(
             """UPDATE tasks SET metadata_json = json_set(
@@ -694,11 +693,11 @@ def run_with_pid_tracking(task_id, project_id, cmd):
     return proc
 ```
 
-### 12.2 启动时 orphan 扫盘
+### 12.2 Startup Orphan Scan
 
 ```python
 def cleanup_orphan_processes():
-    """Executor 启动时清理孤儿进程"""
+    """Clean up orphan processes on Executor startup"""
     for project in list_projects():
         with DBContext(project["project_id"]) as conn:
             stale = conn.execute(
@@ -709,7 +708,7 @@ def cleanup_orphan_processes():
             for row in stale:
                 pid = row["pid"]
                 if pid and not is_process_alive(pid):
-                    # 进程已死但状态还是 running → 重排队
+                    # Process dead but status still running → re-queue
                     conn.execute(
                         "UPDATE tasks SET status='queued' WHERE task_id=?",
                         (row["task_id"],)
@@ -717,11 +716,11 @@ def cleanup_orphan_processes():
             conn.commit()
 ```
 
-### 12.3 任务结束时进程清理
+### 12.3 Process Cleanup After Task Completion
 
 ```python
 def cleanup_after_task(task_id, project_id):
-    """任务完成后清理所有相关进程"""
+    """Clean up all related processes after task completion"""
     with DBContext(project_id) as conn:
         task = task_registry.get_task(conn, task_id)
         pid = task.get("metadata", {}).get("worker_pid")
@@ -729,49 +728,49 @@ def cleanup_after_task(task_id, project_id):
             kill_process_tree(pid)
 ```
 
-## 十三、实施路线（最终版）
+## 13. Implementation Roadmap (Final)
 
-### P0：单角色单任务跑稳
+### P0: Stabilize Single-Role Single-Task
 
-| 步骤 | 内容 | 交付物 |
-|------|------|--------|
-| 1 | Token 模型简化 (去掉 refresh/access，project_token 不过期) | token_service.py 废弃 |
-| 2 | Task Registry 状态机 (双字段: execution + notification) | task_registry.py |
-| 3 | 文件投递原子化 (DB先→文件后+fencing token) | Gateway + Executor |
-| 4 | Executor 完成写持久状态 (notification_status=pending) | executor.py |
-| 5 | 通知持久化 + 可补发 (Gateway poll 查 notification_status=pending) | gateway.py |
-| 6 | 取消 / 重试 / 超时 | task_registry + executor |
-| 7 | 进度 heartbeat (phase+percent) | executor |
-| 8 | PID 追踪 + orphan 扫盘 (toolbox 教训) | executor |
+| Step | Content | Deliverable |
+|------|---------|-------------|
+| 1 | Token model simplification (remove refresh/access, project_token no expiry) | token_service.py deprecated |
+| 2 | Task Registry state machine (dual field: execution + notification) | task_registry.py |
+| 3 | Atomic file delivery (DB first → file second + fencing token) | Gateway + Executor |
+| 4 | Executor writes persistent state on completion (notification_status=pending) | executor.py |
+| 5 | Persistent notifications + re-delivery (Gateway poll checks notification_status=pending) | gateway.py |
+| 6 | Cancel / retry / timeout | task_registry + executor |
+| 7 | Progress heartbeat (phase+percent) | executor |
+| 8 | PID tracking + orphan scan (toolbox lesson) | executor |
 
-### P1：交互体验
+### P1: User Experience
 
-| 步骤 | 内容 |
-|------|------|
-| 9 | 消息分类器 (两段式: 规则+LLM) |
-| 10 | Runtime 投影 API (只读 Task Registry) |
-| 11 | /menu 运行时状态 + 未读通知 |
-| 12 | 项目切换 context 自动保存/加载 |
-| 13 | 通知归属 chat_id (跨项目通知) |
-| 14 | Gateway 作为 token 代理 (CLI session 不需要自己管 token) |
+| Step | Content |
+|------|---------|
+| 9 | Message classifier (two-stage: rules + LLM) |
+| 10 | Runtime projection API (read-only Task Registry) |
+| 11 | /menu runtime status + unread notifications |
+| 12 | Project switch context auto save/load |
+| 13 | Notification belongs to chat_id (cross-project notification) |
+| 14 | Gateway as token proxy (CLI session does not need to manage tokens) |
 
-### P2：多角色协作
+### P2: Multi-Role Collaboration
 
-| 步骤 | 内容 |
-|------|------|
-| 15 | 角色职责硬约束 (coord 改代码上限) |
-| 16 | 角色上下文隔离 (per-role context key) |
-| 17 | Gatekeeper 记忆隔离 (只看验收图+task-log) |
-| 18 | 代码修复→节点自动降级 (qa_pass 后文件变更) |
-| 19 | 角色冲突治理 (workspace 锁 + 资源范围) |
-| 20 | Executor workspace allowlist + 结构化 tool policy |
-| 21 | 角色交接协议 (dev→tester→qa 自动流转) |
+| Step | Content |
+|------|---------|
+| 15 | Hard role responsibility constraints (coord code modification limit) |
+| 16 | Role context isolation (per-role context key) |
+| 17 | Gatekeeper memory isolation (only sees acceptance graph + task-log) |
+| 18 | Code fix → auto node downgrade (file changes after qa_pass) |
+| 19 | Role conflict governance (workspace lock + resource scope) |
+| 20 | Executor workspace allowlist + structured tool policy |
+| 21 | Role handoff protocol (dev → tester → qa auto-flow) |
 
-### P3：智能化
+### P3: Intelligence
 
-| 步骤 | 内容 |
-|------|------|
-| 22 | LLM 意图分类器 (替换关键词) |
-| 23 | 自动任务分解 (大任务→子任务 DAG) |
-| 24 | Context Assembly 驱动的智能回复 |
-| 25 | PM 角色 (需求分析+方案设计) |
+| Step | Content |
+|------|---------|
+| 22 | LLM intent classifier (replace keywords) |
+| 23 | Auto task decomposition (large task → sub-task DAG) |
+| 24 | Context Assembly driven smart replies |
+| 25 | PM role (requirements analysis + design) |

@@ -481,51 +481,7 @@ def handle_list_sessions(ctx: RequestContext):
     return {"sessions": sessions}
 
 
-# --- Token (dual-token model) ---
-
-@route("POST", "/api/token/refresh")
-def handle_token_refresh(ctx: RequestContext):
-    """DEPRECATED (v5): Exchange refresh_token for access_token. Use project_token directly.
-    Removal timeline: deprecated since v5, scheduled for removal in v8.
-    """
-    # Deprecation headers: deprecated since v5, removal planned for v8
-    _deprecation_headers = {
-        "X-Deprecated-Since": "v5",
-        "X-Removal-Date": "v8",
-    }
-    refresh_token = ctx.body.get("refresh_token", "")
-    if not refresh_token:
-        from .errors import ValidationError
-        raise ValidationError("refresh_token required")
-
-    # Find project from token
-    from . import token_service
-    from .role_service import _hash_token
-    th = _hash_token(refresh_token)
-    rc = get_redis()
-    session_id = rc.get_session_by_token(th) if rc else None
-    project_id = ""
-
-    if session_id:
-        cached = rc.get_cached_session(session_id)
-        if cached:
-            project_id = cached.get("project_id", "")
-
-    if not project_id:
-        for p in project_service.list_projects():
-            try:
-                with DBContext(p["project_id"]) as conn:
-                    result = token_service.issue_access_token(conn, refresh_token)
-                    return 200, result, _deprecation_headers
-            except Exception:
-                continue
-        from .errors import AuthError
-        raise AuthError("Invalid refresh token")
-
-    with DBContext(project_id) as conn:
-        result = token_service.issue_access_token(conn, refresh_token)
-    return 200, result, _deprecation_headers
-
+# --- Token ---
 
 @route("POST", "/api/token/revoke")
 def handle_token_revoke(ctx: RequestContext):
@@ -1010,6 +966,57 @@ def handle_get_node(ctx: RequestContext):
     return {**state, "definition": node_def}
 
 
+@route("POST", "/api/wf/{project_id}/node-update")
+def handle_node_update(ctx: RequestContext):
+    """Update node attributes (e.g. secondary doc bindings). Coordinator only."""
+    project_id = ctx.get_project_id()
+    with DBContext(project_id) as conn:
+        ctx.require_auth(conn)
+    node_id = ctx.body.get("node_id")
+    attrs = ctx.body.get("attrs", {})
+    if not node_id or not attrs:
+        from .errors import GovernanceError
+        raise GovernanceError("missing node_id or attrs", "invalid_request")
+    # Only allow safe attributes to be updated
+    ALLOWED_ATTRS = {"secondary", "test", "description", "propagation"}
+    rejected = set(attrs.keys()) - ALLOWED_ATTRS
+    if rejected:
+        from .errors import GovernanceError
+        raise GovernanceError(f"Cannot update attrs: {rejected}. Allowed: {ALLOWED_ATTRS}", "forbidden_attr")
+    graph = project_service.load_project_graph(project_id)
+    graph.update_node_attrs(node_id, attrs)
+    from .db import _resolve_project_dir
+    graph.save(_resolve_project_dir(project_id) / "graph.json")
+    return {"node_id": node_id, "updated_attrs": list(attrs.keys())}
+
+
+@route("POST", "/api/wf/{project_id}/node-batch-update")
+def handle_node_batch_update(ctx: RequestContext):
+    """Batch update secondary doc bindings for multiple nodes. Coordinator only."""
+    project_id = ctx.get_project_id()
+    with DBContext(project_id) as conn:
+        ctx.require_auth(conn)
+    updates = ctx.body.get("updates", [])
+    if not updates:
+        from .errors import GovernanceError
+        raise GovernanceError("missing updates array", "invalid_request")
+    graph = project_service.load_project_graph(project_id)
+    results = []
+    for upd in updates:
+        node_id = upd.get("node_id")
+        attrs = upd.get("attrs", {})
+        try:
+            ALLOWED_ATTRS = {"secondary", "test", "description", "propagation"}
+            safe_attrs = {k: v for k, v in attrs.items() if k in ALLOWED_ATTRS}
+            graph.update_node_attrs(node_id, safe_attrs)
+            results.append({"node_id": node_id, "status": "updated"})
+        except Exception as e:
+            results.append({"node_id": node_id, "status": "error", "error": str(e)})
+    from .db import _resolve_project_dir
+    graph.save(_resolve_project_dir(project_id) / "graph.json")
+    return {"updated": len([r for r in results if r["status"] == "updated"]), "results": results}
+
+
 @route("GET", "/api/wf/{project_id}/impact")
 def handle_impact(ctx: RequestContext):
     project_id = ctx.get_project_id()
@@ -1306,7 +1313,7 @@ _DOCS = {
         "base_url": "http://localhost:40000",
         "api_prefix": "/api",
         "gateway_prefix": "/gateway",
-        "auth": "All API calls (except /api/init, /api/health, /api/project/list, /api/docs) require X-Gov-Token header.",
+        "auth": "Task operations (create/claim/complete/progress/list) do NOT require token. Workflow (verify-update/baseline), role, and admin APIs require X-Gov-Token header. Public endpoints: /api/init, /api/health, /api/project/list, /api/docs.",
     },
     "quickstart": {
         "title": "Coordinator Session Quickstart",

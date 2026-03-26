@@ -99,9 +99,8 @@ Supported gateway commands:
 ### 2. Submit Tasks via Governance API
 
 ```bash
-# Create a task
+# Create a task (no token required for task operations)
 curl -X POST http://localhost:40006/api/task/aming-claw/create \
-  -H "X-Gov-Token: $GOV_COORDINATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Fix the /config endpoint bug in server.py",
@@ -132,18 +131,16 @@ CREATE ──► QUEUED ──► CLAIMED ──► RUNNING ──► SUCCEEDED
 #### Monitoring APIs
 
 ```bash
-# List tasks
-curl http://localhost:40006/api/task/aming-claw/list \
-  -H "X-Gov-Token: $TOKEN"
+# List tasks (no token required)
+curl http://localhost:40006/api/task/aming-claw/list
 
 # Runtime status (active + queued + pending notifications)
-curl http://localhost:40006/api/runtime/aming-claw \
-  -H "X-Gov-Token: $TOKEN"
+curl http://localhost:40006/api/runtime/aming-claw
 
-# Node status summary
+# Node status summary (token required for workflow APIs)
 curl http://localhost:40006/api/wf/aming-claw/summary \
   -H "X-Gov-Token: $TOKEN"
-# => {"pending": 112, "testing": 5, "waived": 62}
+# => {"pending": 1, "testing": 108, "waived": 70}
 ```
 
 ### 4. Take Over a Task
@@ -352,23 +349,23 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 | GET | `/api/project/list` | List all projects |
 | POST | `/api/projects/register` | Register workspace |
 
-### Task Management
+### Task Management (no token required)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/task/{pid}/create` | Create task |
 | POST | `/api/task/{pid}/claim` | Claim task (returns fence_token) |
 | POST | `/api/task/{pid}/progress` | Report progress |
-| POST | `/api/task/{pid}/complete` | Mark complete |
+| POST | `/api/task/{pid}/complete` | Mark complete (triggers auto-chain) |
 | GET | `/api/task/{pid}/list` | List tasks |
 | POST | `/api/task/{pid}/recover` | Recover failed task |
 
-### Workflow (Nodes)
+### Workflow / Nodes (token required: `X-Gov-Token`)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/wf/{pid}/verify-update` | Update node verification status |
-| POST | `/api/wf/{pid}/baseline` | Batch set node status |
+| POST | `/api/wf/{pid}/baseline` | Batch set node status (coordinator only) |
 | POST | `/api/wf/{pid}/release-gate` | Pre-release gate check |
 | GET | `/api/wf/{pid}/summary` | Node status summary |
 | GET | `/api/wf/{pid}/node/{nid}` | Single node details |
@@ -376,7 +373,7 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 | GET | `/api/wf/{pid}/impact?files=...` | File change impact analysis |
 | POST | `/api/wf/{pid}/rollback` | Rollback to snapshot version |
 
-### Roles & Sessions
+### Roles & Sessions (token required)
 
 | Method | Path | Description |
 |--------|------|-------------|

@@ -113,7 +113,7 @@ def _gate_post_pm(conn, project_id, result, metadata):
 
 
 def _gate_checkpoint(conn, project_id, result, metadata):
-    """Checkpoint gate: files changed? no unrelated files outside target_files?"""
+    """Checkpoint gate: files changed? no unrelated files outside target_files? docs updated?"""
     changed = result.get("changed_files", [])
     if not changed:
         return False, "No files changed"
@@ -126,6 +126,19 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     test_results = result.get("test_results", {})
     if test_results.get("ran") and test_results.get("failed", 0) > 0:
         return False, f"Dev tests failed: {test_results.get('failed')} failures"
+    # Doc consistency check: use CODE_DOC_MAP to verify related docs are updated
+    from .impact_analyzer import get_related_docs
+    code_files = [f for f in changed if not f.startswith("docs/") and not f.endswith(".md")]
+    doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
+    expected_docs = get_related_docs(code_files)
+    if expected_docs:
+        missing_docs = expected_docs - doc_files_changed
+        if missing_docs:
+            # Warn but don't block — set metadata.doc_update_required=true to enforce
+            if metadata.get("doc_update_required", False):
+                return False, f"Doc update required but not changed: {sorted(missing_docs)}"
+            else:
+                log.warning("checkpoint_gate: docs may need update: %s", sorted(missing_docs))
     return True, "ok"
 
 
