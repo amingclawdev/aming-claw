@@ -203,6 +203,121 @@ def handle_project_list(ctx: RequestContext):
     return {"projects": project_service.list_projects()}
 
 
+@route("POST", "/api/projects/register")
+def handle_project_register(ctx: RequestContext):
+    """Register a project workspace with config validation.
+
+    Body: {"workspace_path": "/path/to/project"}
+    Returns: {"project_id", "config_hash", "registered": true}
+    """
+    import sys as _sys
+    _agent_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)))
+    if _agent_dir not in _sys.path:
+        _sys.path.insert(0, _agent_dir)
+
+    workspace_path = ctx.body.get("workspace_path", "").strip()
+    if not workspace_path:
+        return 400, {"error": "workspace_path is required"}
+
+    from pathlib import Path
+    ws = Path(workspace_path)
+    if not ws.exists() or not ws.is_dir():
+        return 400, {"error": f"workspace_path does not exist: {workspace_path}"}
+
+    # Load and validate config
+    try:
+        from project_config import load_project_config, validate_commands
+        config = load_project_config(ws)
+    except ValueError as e:
+        return 400, {"error": f"config validation failed: {e}"}
+    except FileNotFoundError:
+        return 400, {"error": f"no .aming-claw.yaml found in {workspace_path}"}
+
+    # Command safety
+    cmd_violations = validate_commands(config)
+    if cmd_violations:
+        return 400, {"error": "unsafe commands", "violations": cmd_violations}
+
+    # Check uniqueness
+    existing = project_service.get_project(config.project_id)
+    if existing and existing.get("workspace_path") and existing["workspace_path"] != str(ws):
+        return 409, {"error": f"project_id '{config.project_id}' already registered to different workspace"}
+
+    # Register in governance
+    project_id = config.project_id
+    try:
+        with DBContext(project_id) as conn:
+            # Init project if not exists
+            if not existing:
+                project_service.init_project(conn, project_id)
+            # Store config
+            project_service.update_project_meta(conn, project_id, {
+                "workspace_path": str(ws),
+                "language": config.language,
+                "config_hash": str(hash(str(config))),
+            })
+    except Exception as e:
+        return 500, {"error": f"registration failed: {e}"}
+
+    # Register workspace
+    try:
+        from workspace_registry import add_workspace, find_workspace_by_project_id
+        if not find_workspace_by_project_id(project_id):
+            add_workspace(ws, label=ws.name, project_id=project_id)
+    except Exception:
+        pass  # Workspace registration is best-effort (may already exist)
+
+    return 201, {
+        "project_id": project_id,
+        "config_hash": str(hash(str(config))),
+        "registered": True,
+        "language": config.language,
+        "test_command": config.testing.unit_command,
+        "deploy_strategy": config.deploy.strategy,
+    }
+
+
+@route("GET", "/api/projects/{project_id}/config")
+def handle_project_config(ctx: RequestContext):
+    """Return resolved project config."""
+    import sys as _sys
+    _agent_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)))
+    if _agent_dir not in _sys.path:
+        _sys.path.insert(0, _agent_dir)
+
+    project_id = ctx.get_project_id()
+    try:
+        from project_config import resolve_project_config
+        config = resolve_project_config(project_id)
+        return {
+            "project_id": config.project_id,
+            "language": config.language,
+            "testing": {"unit_command": config.testing.unit_command, "e2e_command": config.testing.e2e_command},
+            "build": {"command": config.build.command, "release_checks": config.build.release_checks},
+            "deploy": {"strategy": config.deploy.strategy, "service_rules_count": len(config.deploy.service_rules)},
+            "governance": {"enabled": config.governance.enabled, "test_tool_label": config.governance.test_tool_label},
+        }
+    except Exception as e:
+        return 404, {"error": f"config not found: {e}"}
+
+
+@route("POST", "/api/projects/{project_id}/explain")
+def handle_project_explain(ctx: RequestContext):
+    """Dry-run: explain what would happen for given changed files."""
+    import sys as _sys
+    _agent_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)))
+    if _agent_dir not in _sys.path:
+        _sys.path.insert(0, _agent_dir)
+
+    project_id = ctx.get_project_id()
+    changed_files = ctx.body.get("changed_files", [])
+    try:
+        from project_config import explain_config
+        return explain_config(project_id, changed_files=changed_files)
+    except Exception as e:
+        return 404, {"error": f"explain failed: {e}"}
+
+
 # --- Role (coordinator assigns roles to other agents) ---
 
 @route("POST", "/api/role/assign")
