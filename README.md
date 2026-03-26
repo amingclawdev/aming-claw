@@ -201,6 +201,23 @@ notepad .env          # fill in TELEGRAM_BOT_TOKEN_CODEX and EXECUTOR_API_TOKEN
 
 > **Requirements:** Windows 10/11. No Python installation needed -- `setup.ps1` downloads an embedded Python 3.12 runtime into `runtime/python/`.
 
+### Register a New Project
+
+Any project can use the auto-chain by adding a `.aming-claw.yaml` config:
+
+```bash
+# 1. Create .aming-claw.yaml in your project root (see docs/ai-agent-integration-guide.md)
+# 2. Register via API
+curl -X POST http://localhost:40000/api/projects/register \
+  -H "Content-Type: application/json" \
+  -d '{"workspace_path": "/path/to/your/project"}'
+# 3. Submit tasks
+curl -X POST http://localhost:40100/coordinator/chat \
+  -d '{"message":"Fix the bug","project_id":"your-project-id"}'
+```
+
+See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for full config format.
+
 ---
 
 ### Two-Factor Authentication (2FA)

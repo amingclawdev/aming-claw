@@ -1,6 +1,102 @@
 # AI Agent Integration Guide — Governance Service
 
-本文档面向 **AI Agent 开发者和 Agent 本身**，说明如何接入治理服务、遵循工作流规则、正确使用 API。
+This guide is for **AI agents and developers** integrating with the aming-claw
+auto-chain workflow. It covers project registration, config format, API usage,
+and role-based permissions.
+
+---
+
+## Quick Start: Register a New Project
+
+### 1. Create `.aming-claw.yaml` in your project root
+
+```yaml
+version: 1
+project:
+  id: "my-project"           # kebab-case ONLY (enforced)
+  name: "My Project"
+  language: "javascript"      # javascript | python | go
+
+testing:
+  unit_command: "npm run test:all"
+  e2e_command: "npm run test:e2e"
+
+build:
+  command: "npm run build"
+  release_checks:             # run before merge (exit 0 = pass)
+    - "node scripts/pre-dist.js"
+
+deploy:
+  strategy: "electron"        # docker | electron | systemd | process | none
+  service_rules:              # file pattern → service mapping
+    - patterns: ["server/**"]
+      services: ["backend"]
+    - patterns: ["client/src/**"]
+      services: ["frontend"]
+  smoke_test:
+    - { name: "backend", type: "http", url: "http://localhost:3000/api/health" }
+
+governance:
+  enabled: true
+  test_tool_label: "jest"
+```
+
+### 2. Register via API
+
+```bash
+curl -X POST http://localhost:40000/api/projects/register \
+  -H "Content-Type: application/json" \
+  -H "X-Gov-Token: <coordinator-token>" \
+  -d '{"workspace_path": "/path/to/my-project"}'
+```
+
+Returns: `{project_id, config_hash, registered: true, test_command, deploy_strategy}`
+
+### 3. Submit tasks
+
+```bash
+# Via API
+curl -X POST http://localhost:40100/coordinator/chat \
+  -d '{"message":"Fix the login bug","project_id":"my-project"}'
+
+# Via Telegram
+# Just send the message — coordinator routes by project_id
+```
+
+### 4. Query config
+
+```bash
+# Resolved config
+GET /api/projects/my-project/config
+
+# Dry-run: what services affected by these files?
+POST /api/projects/my-project/explain
+  {"changed_files": ["server/auth.js", "client/src/Login.tsx"]}
+# Returns: affected_services=["backend","frontend"], test_cmd="npm run test:all"
+```
+
+---
+
+## Auto-Chain Flow
+
+Every task follows this pipeline automatically:
+
+```
+Message → Coordinator → PM → Dev → Checkpoint Gate → Tester → QA → Merge → Deploy
+```
+
+| Stage | What happens | Config used |
+|-------|-------------|-------------|
+| Coordinator | Routes message to PM, creates dev_task | project_id routing |
+| PM | Outputs PRD with target_files + `_verification` | — |
+| Dev | Code changes in isolated git worktree | — |
+| Checkpoint Gate | Fast check: files changed? syntax valid? | — |
+| Tester | Runs `testing.unit_command` from config | `.aming-claw.yaml` |
+| QA | Runs governance checks (if `_verification` says so) | `_verification` |
+| Merge | Rebases dev branch onto main | — |
+| Release Checks | Runs `build.release_checks` from config | `.aming-claw.yaml` |
+| Deploy | Detects affected services, restarts them | `deploy.service_rules` |
+| Smoke Test | Checks health endpoints | `deploy.smoke_test` |
 
 ---
 

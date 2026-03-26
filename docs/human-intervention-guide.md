@@ -62,6 +62,8 @@ If your situation does not match one of these four conditions, **do not interven
 | Rollback execution | Irreversible, high risk | Human confirms in Telegram |
 | Node / project deletion | Irreversible | Human operates directly |
 | Scheduled Task permission grant | Platform restriction | Human clicks "Always allow" |
+| **New project registration** | Requires `.aming-claw.yaml` review | Human creates yaml, calls `POST /api/projects/register` |
+| **Docker image rebuild** | Affects running services | Human runs `docker compose build` or deploy chain auto-triggers |
 
 ---
 
