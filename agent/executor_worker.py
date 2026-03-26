@@ -48,7 +48,7 @@ TASK_ROLE_MAP = {
     "dev":   ("dev", 300),
     "test":  ("tester", 180),
     "qa":    ("qa", 120),
-    "merge": ("dev", 180),
+    "merge": ("script", 30),  # handled by _execute_merge, no AI
     "task":  ("dev", 300),
 }
 
@@ -122,6 +122,10 @@ class ExecutorWorker:
                  task_id, task_type, role, timeout)
         self._report_progress(task_id, {"step": "starting", "role": role})
 
+        # Merge is a script operation, not AI
+        if task_type == "merge":
+            return self._execute_merge(task_id, metadata)
+
         # Build context for AI session
         context = {
             "task_id": task_id,
@@ -189,6 +193,58 @@ class ExecutorWorker:
             result["changed_files"] = []
 
         return {"status": "succeeded", "result": result}
+
+    def _execute_merge(self, task_id: str, metadata: dict) -> dict:
+        """Merge is a script operation: git add → git commit. No AI needed."""
+        import subprocess
+
+        changed = metadata.get("changed_files", [])
+        self._report_progress(task_id, {"step": "merging"})
+
+        try:
+            # Stage changed files (or all if none specified)
+            if changed:
+                subprocess.run(["git", "add", "--"] + changed,
+                               cwd=self.workspace, capture_output=True, timeout=30)
+            else:
+                subprocess.run(["git", "add", "-A"],
+                               cwd=self.workspace, capture_output=True, timeout=30)
+
+            # Check if there's anything to commit
+            status = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                                    cwd=self.workspace, capture_output=True, text=True, timeout=10)
+            staged = [f.strip() for f in status.stdout.splitlines() if f.strip()]
+
+            if not staged:
+                return {"status": "succeeded", "result": {
+                    "merge_commit": "none", "branch": "main",
+                    "files_changed": 0, "note": "nothing to commit"
+                }}
+
+            # Commit
+            msg = f"Auto-merge: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
+            proc = subprocess.run(
+                ["git", "commit", "-m", msg],
+                cwd=self.workspace, capture_output=True, text=True, timeout=30)
+
+            if proc.returncode != 0:
+                return {"status": "failed", "error": f"git commit failed: {proc.stderr[:300]}"}
+
+            # Get commit hash
+            rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                 cwd=self.workspace, capture_output=True, text=True, timeout=5)
+            commit_hash = rev.stdout.strip()
+
+            log.info("Merge complete: %s (%d files)", commit_hash, len(staged))
+            return {"status": "succeeded", "result": {
+                "merge_commit": commit_hash,
+                "branch": "main",
+                "files_changed": len(staged),
+                "changed_files": staged,
+            }}
+
+        except Exception as e:
+            return {"status": "failed", "error": str(e)}
 
     def _build_prompt(self, prompt: str, task_type: str, context: dict) -> str:
         """Enhance task prompt with governance context."""
