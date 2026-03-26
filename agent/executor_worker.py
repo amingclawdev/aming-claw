@@ -16,6 +16,8 @@ Flow:
 Usage:
   python -m agent.executor_worker --project aming-claw
   GOVERNANCE_URL=http://localhost:40006 python -m agent.executor_worker
+
+Full chain verified: dev→test→qa→merge→deploy.
 """
 
 import json
