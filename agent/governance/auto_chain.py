@@ -189,6 +189,39 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     changed = result.get("changed_files", [])
     if not changed:
         return False, "No files changed"
+
+    # Verify files actually changed in git diff
+    try:
+        import subprocess
+        import os as _os
+        repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__)))
+        # Check working-tree + staged changes vs HEAD
+        diff_proc = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+            cwd=repo_root,
+        )
+        diff_files = set()
+        if diff_proc.returncode == 0:
+            diff_files = {f.strip() for f in diff_proc.stdout.splitlines() if f.strip()}
+        # If working tree is clean, also check the most recent commit
+        if not diff_files:
+            commit_proc = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+                cwd=repo_root,
+            )
+            if commit_proc.returncode == 0:
+                diff_files = {f.strip() for f in commit_proc.stdout.splitlines() if f.strip()}
+        if diff_files:  # Only enforce when git diff data is available
+            not_in_diff = [f for f in changed if f not in diff_files]
+            if not_in_diff:
+                return False, (
+                    f"Files listed in changed_files but not found in git diff: {not_in_diff}"
+                )
+    except Exception as _git_err:
+        log.warning("checkpoint_gate: git diff verification failed (non-blocking): %s", _git_err)
+
     target = metadata.get("target_files", [])
     if target:
         unrelated = [f for f in changed if f not in target]
@@ -242,6 +275,10 @@ def _gate_qa_pass(conn, project_id, result, metadata):
 def _gate_release(conn, project_id, result, metadata):
     """Verify merge succeeded before deploy."""
     # For auto-chain deploys, we trust the merge task result
+    # After successful merge, promote related_nodes to qa_pass
+    if metadata.get("related_nodes"):
+        _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
+                           {"type": "merge_complete", "producer": "auto-chain"})
     return True, "ok"
 
 
@@ -270,13 +307,14 @@ def _build_dev_prompt(task_id, result, metadata):
 
 
 def _build_test_prompt(task_id, result, metadata):
-    changed = result.get("changed_files", [])
+    changed = result.get("changed_files", metadata.get("changed_files", []))
     prompt = (
         f"Run tests for {task_id}.\n"
         f"changed_files: {json.dumps(changed)}"
     )
     return prompt, {
         **metadata,
+        "target_files": result.get("target_files", metadata.get("target_files", [])),
         "changed_files": changed,
         "related_nodes": result.get("related_nodes", metadata.get("related_nodes", [])),
     }
@@ -284,17 +322,28 @@ def _build_test_prompt(task_id, result, metadata):
 
 def _build_qa_prompt(task_id, result, metadata):
     report = result.get("test_report", {})
+    changed = result.get("changed_files", metadata.get("changed_files", []))
     prompt = (
         f"QA review for {task_id}.\n"
         f"test_report: {json.dumps(report)}\n"
-        f"changed_files: {json.dumps(metadata.get('changed_files', []))}"
+        f"changed_files: {json.dumps(changed)}"
     )
-    return prompt, metadata
+    return prompt, {
+        **metadata,
+        "target_files": result.get("target_files", metadata.get("target_files", [])),
+        "changed_files": changed,
+        "related_nodes": result.get("related_nodes", metadata.get("related_nodes", [])),
+    }
 
 
 def _build_merge_prompt(task_id, result, metadata):
     prompt = f"Merge dev branch for {task_id} to main."
-    return prompt, metadata
+    return prompt, {
+        **metadata,
+        "target_files": result.get("target_files", metadata.get("target_files", [])),
+        "changed_files": result.get("changed_files", metadata.get("changed_files", [])),
+        "related_nodes": result.get("related_nodes", metadata.get("related_nodes", [])),
+    }
 
 
 def _trigger_deploy(conn, project_id, task_id, result, metadata):

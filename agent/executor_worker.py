@@ -158,8 +158,32 @@ class ExecutorWorker:
         if session.status == "failed":
             return {"status": "failed", "error": session.stderr[:500]}
 
-        # Parse output
+        # Detect actually changed files via git diff
+        changed_files = self._get_git_changed_files()
+
+        # Stage changed files if any
+        if changed_files:
+            try:
+                import subprocess
+                subprocess.run(
+                    ["git", "add", "--"] + changed_files,
+                    cwd=self.workspace,
+                    capture_output=True,
+                    timeout=30,
+                )
+                log.info("Staged %d changed file(s): %s", len(changed_files), changed_files)
+            except Exception as e:
+                log.warning("git add failed: %s", e)
+
+        # Parse output and merge with real changed_files
         result = self._parse_output(session, task_type)
+
+        # Always overwrite/set changed_files from git diff (ground truth)
+        if changed_files:
+            result["changed_files"] = changed_files
+        elif "changed_files" not in result:
+            result["changed_files"] = []
+
         return {"status": "succeeded", "result": result}
 
     def _build_prompt(self, prompt: str, task_type: str, context: dict) -> str:
@@ -185,24 +209,81 @@ class ExecutorWorker:
 
         return "\n".join(parts)
 
+    def _get_git_changed_files(self) -> list:
+        """Run git diff --name-only to detect files changed since last commit."""
+        try:
+            import subprocess
+            # Check both staged and unstaged changes
+            result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD"],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+
+            # Also include untracked files that are new (not yet in HEAD)
+            result2 = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=A", "--cached"],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            new_files = [f.strip() for f in result2.stdout.splitlines() if f.strip()]
+
+            # Merge, preserving order, dedup
+            seen = set(files)
+            for f in new_files:
+                if f not in seen:
+                    files.append(f)
+                    seen.add(f)
+
+            return files
+        except Exception as e:
+            log.warning("git diff failed: %s", e)
+            return []
+
     def _parse_output(self, session, task_type: str) -> dict:
-        """Parse AI session output into structured result."""
+        """Parse AI session output into structured result, handling non-JSON gracefully."""
         stdout = session.stdout or ""
 
-        # Try to extract JSON from output
-        try:
-            # Look for JSON block in output
-            import re
-            json_match = re.search(r'\{[^{}]*\}', stdout, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, AttributeError):
-            pass
+        # Try to extract the last (outermost) JSON object from output
+        import re
+        # Find all JSON-like blocks (handles nested braces)
+        parsed = None
+        for candidate in reversed(list(re.finditer(r'\{', stdout))):
+            start = candidate.start()
+            depth = 0
+            end = None
+            for i, ch in enumerate(stdout[start:], start):
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end is not None:
+                try:
+                    obj = json.loads(stdout[start:end])
+                    if isinstance(obj, dict):
+                        parsed = obj
+                        break
+                except json.JSONDecodeError:
+                    continue
 
-        # Fallback: return raw output as summary
+        if parsed is not None:
+            return parsed
+
+        # Fallback: return raw output as summary (non-JSON output is acceptable)
+        summary = stdout.strip()
+        if not summary:
+            summary = "(no output)"
         return {
-            "summary": stdout[:500] if stdout else "(no output)",
-            "exit_code": session.exit_code,
+            "summary": summary[:1000],
+            "exit_code": getattr(session, "exit_code", None),
         }
 
     def run_once(self) -> bool:
