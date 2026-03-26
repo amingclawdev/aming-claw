@@ -24,8 +24,8 @@ function Get-ExecutorPythonProcesses {
         $name = [string]$_.Name
         $cmd = [string]$_.CommandLine
         $name -match '^python(\.exe)?$' -and (
-            $cmd -like "*agent\\executor.py*" -or
-            $cmd -like "*agent/executor.py*"
+            $cmd -like "*agent\\executor_worker.py*" -or
+            $cmd -like "*agent/executor_worker.py*"
         )
     }
 }
