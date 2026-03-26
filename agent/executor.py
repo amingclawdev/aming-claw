@@ -1566,7 +1566,7 @@ def _recover_stale_tasks() -> int:
             if started:
                 try:
                     ts = datetime.datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
-                    age_min = (datetime.datetime.utcnow() - ts).total_seconds() / 60
+                    age_min = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - ts).total_seconds() / 60
                     if age_min < 5:
                         continue  # Still fresh, might be running
                 except Exception:
