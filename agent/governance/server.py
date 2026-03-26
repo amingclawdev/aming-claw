@@ -31,7 +31,49 @@ from .impact_analyzer import ImpactAnalyzer
 from .models import ImpactAnalysisRequest, FileHitPolicy
 
 import os
+import signal
+import subprocess
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40006"))
+
+# --- Server Version (git commit hash at startup) ---
+def _get_git_version():
+    """Read current git commit hash."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+SERVER_VERSION = _get_git_version()
+SERVER_PID = os.getpid()
+
+def _acquire_pid_lock():
+    """Write PID lockfile. Kill old process if still alive."""
+    lock_dir = os.path.join(
+        os.environ.get("SHARED_VOLUME_PATH",
+                        os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
+        "codex-tasks", "state")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, "governance.pid")
+
+    # Check old PID
+    if os.path.exists(lock_path):
+        try:
+            old_pid = int(open(lock_path).read().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, signal.SIGTERM)
+                import logging
+                logging.getLogger(__name__).info("Killed old governance process PID %d", old_pid)
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass  # Old process already dead
+
+    # Write new PID
+    with open(lock_path, "w") as f:
+        f.write(str(os.getpid()))
 
 # --- Route Registry ---
 ROUTES = []
@@ -1292,7 +1334,8 @@ def handle_task_recover(ctx: RequestContext):
 
 @route("GET", "/api/health")
 def handle_health(ctx: RequestContext):
-    return {"status": "ok", "service": "governance", "port": PORT}
+    return {"status": "ok", "service": "governance", "port": PORT,
+            "version": SERVER_VERSION, "pid": SERVER_PID}
 
 
 @route("GET", "/api/metrics")
@@ -1959,6 +2002,10 @@ def create_server(port: int = None) -> HTTPServer:
 
 
 def main():
+    # PID lock — kill old process, prevent zombies
+    _acquire_pid_lock()
+    print(f"Governance v{SERVER_VERSION} (PID {SERVER_PID})")
+
     # Enable Redis Pub/Sub bridge for EventBus
     from .event_bus import get_event_bus
     redis = get_redis()

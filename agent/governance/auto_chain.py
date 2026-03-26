@@ -68,6 +68,17 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
 
     gate_fn_name, next_type, builder_name = CHAIN[task_type]
 
+    # Pre-gate: version check — ensure governance server is running latest code
+    ver_passed, ver_reason = _gate_version_check(project_id, result, metadata)
+    if not ver_passed:
+        log.info("auto_chain: version gate blocked for task %s: %s", task_id, ver_reason)
+        _publish_event("gate.blocked", {
+            "project_id": project_id, "task_id": task_id,
+            "stage": "version_check", "next_stage": task_type,
+            "reason": ver_reason,
+        })
+        return {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
+
     # Auto-update nodes based on stage completion
     if task_type == "dev" and metadata.get("related_nodes"):
         _try_verify_update(conn, project_id, metadata, "testing", "dev",
@@ -126,6 +137,37 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
 # ---------------------------------------------------------------------------
 # Gate functions — each returns (passed: bool, reason: str)
 # ---------------------------------------------------------------------------
+
+def _gate_version_check(project_id, result, metadata):
+    """Pre-gate: verify governance server is running the latest code.
+
+    Compares the server's startup git hash (from /api/health) against
+    the current git HEAD. If the server is stale, blocks the chain.
+    """
+    if metadata.get("skip_version_check"):
+        return True, "skipped"
+    try:
+        from .server import SERVER_VERSION
+        import subprocess
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        ).stdout.strip()
+        if not head or head == "unknown":
+            return True, "git HEAD unavailable, skipping"
+        if SERVER_VERSION == "unknown":
+            return True, "server version unavailable, skipping"
+        if SERVER_VERSION != head:
+            return False, (
+                f"Governance server version ({SERVER_VERSION}) is behind git HEAD ({head}). "
+                f"Restart the server to pick up latest code."
+            )
+        return True, f"version match: {SERVER_VERSION}"
+    except Exception as e:
+        log.warning("version_check failed (non-blocking): %s", e)
+        return True, f"check failed: {e}"
+
 
 def _gate_post_pm(conn, project_id, result, metadata):
     """Validate PM PRD has mandatory fields: target_files, verification, acceptance_criteria."""
@@ -268,6 +310,26 @@ def _trigger_deploy(conn, project_id, task_id, result, metadata):
         from deploy_chain import run_deploy
         chat_id = int(metadata.get("chat_id", 0))
         report = run_deploy(changed_files, chat_id=chat_id, project_id=project_id)
+
+        # Post-deploy: verify governance server version matches git HEAD
+        try:
+            import subprocess as _sp, time as _time
+            _time.sleep(2)  # Wait for restart
+            head = _sp.run(["git", "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5,
+                           cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                           ).stdout.strip()
+            import requests as _req
+            health = _req.get("http://localhost:40006/api/health", timeout=5).json()
+            srv_ver = health.get("version", "unknown")
+            if head and srv_ver != head:
+                report["version_mismatch"] = f"server={srv_ver}, git={head}"
+                log.warning("deploy: version mismatch after restart: %s vs %s", srv_ver, head)
+            else:
+                report["version_verified"] = srv_ver
+        except Exception as ve:
+            report["version_check_error"] = str(ve)
+
         return {"deploy": "completed", "report": report}
     except Exception as e:
         log.error("auto_chain: deploy failed: %s", e)
