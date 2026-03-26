@@ -815,8 +815,8 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
 
         task_id = body.get("task_id", "")
         if not task_id:
-            self._json_response(400, {"error": "task_id is required"})
-            return
+            from utils import new_task_id
+            task_id = new_task_id()
 
         root = tasks_root()
         pending_file = root / "pending" / f"{task_id}.json"
