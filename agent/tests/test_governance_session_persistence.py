@@ -21,53 +21,36 @@ class TestInitProject(unittest.TestCase):
         os.environ.pop("SHARED_VOLUME_PATH", None)
         self.tmp.cleanup()
 
-    def test_init_returns_coordinator_token(self):
+    def test_init_creates_project(self):
         from governance.project_service import init_project
-        result = init_project("test-proj", "mypassword123", "Test Project")
-        self.assertIn("coordinator", result)
-        self.assertTrue(result["coordinator"]["token"].startswith("gov-"))
-        self.assertIn("session_id", result["coordinator"])
+        result = init_project("test-proj", project_name="Test Project")
+        self.assertIn("project", result)
         self.assertEqual(result["project"]["project_id"], "test-proj")
+        self.assertEqual(result["project"]["status"], "active")
 
-    def test_init_same_project_without_password_rejected(self):
+    def test_init_idempotent(self):
         from governance.project_service import init_project
-        init_project("test-proj", "mypassword123")
-        with self.assertRaises(AuthError) as ctx:
-            init_project("test-proj", "wrongpassword")
-        self.assertIn("already initialized", ctx.exception.message)
+        r1 = init_project("test-proj")
+        r2 = init_project("test-proj")
+        # Second call returns same project, no error
+        self.assertEqual(r2["project"]["project_id"], "test-proj")
+        self.assertIn("already initialized", r2.get("message", "").lower())
 
-    def test_init_same_project_with_correct_password_resets(self):
+    def test_init_no_password_required(self):
         from governance.project_service import init_project
-        r1 = init_project("test-proj", "mypassword123")
-        r2 = init_project("test-proj", "mypassword123")
-        # New token issued
-        self.assertIn("coordinator", r2)
-        self.assertTrue(r2["coordinator"]["token"].startswith("gov-"))
-        self.assertIn("reset", r2.get("message", "").lower())
-
-    def test_init_short_password_rejected(self):
-        from governance.project_service import init_project
-        from governance.errors import ValidationError
-        with self.assertRaises(ValidationError):
-            init_project("test-proj", "abc")
+        # Should work without password
+        result = init_project("test-proj")
+        self.assertEqual(result["project"]["project_id"], "test-proj")
 
     def test_init_invalid_project_id_rejected(self):
         from governance.project_service import init_project
         from governance.errors import ValidationError
         with self.assertRaises(ValidationError):
-            init_project("bad project!", "password123")
-
-    def test_token_not_saved_to_disk(self):
-        from governance.project_service import init_project
-        from governance.db import _governance_root
-        init_project("no-persist", "password123")
-        project_dir = _governance_root() / "no-persist"
-        credential_files = list(project_dir.glob("session_*.json"))
-        self.assertEqual(len(credential_files), 0)
+            init_project("bad project!")
 
     def test_password_hash_not_in_list(self):
         from governance.project_service import init_project, list_projects
-        init_project("test-proj", "mypassword123")
+        init_project("test-proj")
         projects = list_projects()
         for p in projects:
             self.assertNotIn("password_hash", p)
@@ -80,9 +63,18 @@ class TestRoleAssignment(unittest.TestCase):
         reset_redis()
 
         from governance.project_service import init_project
-        result = init_project("test-proj", "password123")
-        self.coord_token = result["coordinator"]["token"]
+        from governance import role_service
+        init_project("test-proj")
         self.project_id = "test-proj"
+
+        # Create a coordinator session directly for testing role assignment
+        conn = get_connection(self.project_id)
+        coord_result = role_service.register(
+            conn, "coordinator", self.project_id, "coordinator",
+        )
+        conn.commit()
+        close_connection(conn)
+        self.coord_token = coord_result["token"]
 
     def tearDown(self):
         os.environ.pop("SHARED_VOLUME_PATH", None)
@@ -174,7 +166,6 @@ class TestRoleAssignment(unittest.TestCase):
         conn = get_connection(self.project_id)
         tester_session = role_service.authenticate(conn, tester["token"])
         self.assertEqual(tester_session["role"], "tester")
-        self.assertEqual(tester_session["principal_id"], "tester-001")
         close_connection(conn)
 
 

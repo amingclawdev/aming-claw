@@ -168,9 +168,27 @@ class RequestContext:
         return project_service._normalize_project_id(raw) if raw else raw
 
     def require_auth(self, conn) -> dict:
-        """Authenticate and return session. Caches result."""
+        """Authenticate and return session. Caches result.
+
+        Token-free mode: when no token is provided, returns a default
+        coordinator session so all APIs work without authentication.
+        Tokens still work if provided (for backward compatibility).
+        """
         if self._session is None:
-            self._session = role_service.authenticate(conn, self.token)
+            if not self.token:
+                # Anonymous access — full coordinator permissions
+                project_id = self.get_project_id()
+                self._session = {
+                    "session_id": "anonymous",
+                    "principal_id": "anonymous",
+                    "project_id": project_id,
+                    "role": "coordinator",
+                    "scope": [],
+                    "token": "",
+                    "permissions": ["*"],
+                }
+            else:
+                self._session = role_service.authenticate(conn, self.token)
         return self._session
 
 
@@ -1313,7 +1331,7 @@ _DOCS = {
         "base_url": "http://localhost:40000",
         "api_prefix": "/api",
         "gateway_prefix": "/gateway",
-        "auth": "Task operations (create/claim/complete/progress/list) do NOT require token. Workflow (verify-update/baseline), role, and admin APIs require X-Gov-Token header. Public endpoints: /api/init, /api/health, /api/project/list, /api/docs.",
+        "auth": "No authentication required. All APIs work without tokens. Optional X-Gov-Token header is accepted for backward compatibility but not enforced.",
     },
     "quickstart": {
         "title": "Coordinator Session Quickstart",

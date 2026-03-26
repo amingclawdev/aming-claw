@@ -131,15 +131,14 @@ CREATE ──► QUEUED ──► CLAIMED ──► RUNNING ──► SUCCEEDED
 #### Monitoring APIs
 
 ```bash
-# List tasks (no token required)
+# List tasks
 curl http://localhost:40006/api/task/aming-claw/list
 
 # Runtime status (active + queued + pending notifications)
 curl http://localhost:40006/api/runtime/aming-claw
 
-# Node status summary (token required for workflow APIs)
-curl http://localhost:40006/api/wf/aming-claw/summary \
-  -H "X-Gov-Token: $TOKEN"
+# Node status summary
+curl http://localhost:40006/api/wf/aming-claw/summary
 # => {"pending": 1, "testing": 108, "waived": 70}
 ```
 
@@ -148,7 +147,7 @@ curl http://localhost:40006/api/wf/aming-claw/summary \
 When the auto-chain fails or needs human intervention, the Observer can take over directly:
 
 ```bash
-# Claim a queued task (no token needed for task operations)
+# Claim a queued task
 curl -X POST http://localhost:40006/api/task/aming-claw/claim \
   -H "Content-Type: application/json" \
   -d '{"worker_id": "observer-claude-code"}'
@@ -161,12 +160,12 @@ curl -X POST http://localhost:40006/api/task/aming-claw/claim \
   ]
 }
 
-# Report progress (no token needed)
+# Report progress
 curl -X POST http://localhost:40006/api/task/aming-claw/progress \
   -H "Content-Type: application/json" \
   -d '{"task_id": "task-xxx", "progress": {"step": "coding", "files_changed": 3}}'
 
-# Mark complete (no token needed — auto-chain triggers next stage)
+# Mark complete (auto-chain triggers next stage)
 curl -X POST http://localhost:40006/api/task/aming-claw/complete \
   -H "Content-Type: application/json" \
   -d '{
@@ -183,7 +182,7 @@ After a task completes, the Observer updates workflow node verification status:
 ```bash
 # Update individual or batch node status
 curl -X POST http://localhost:40006/api/wf/aming-claw/verify-update \
-  -H "X-Gov-Token: $TOKEN" \
+  -H "Content-Type: application/json" \
   -d '{
     "nodes": ["L8.5", "L14.7"],
     "status": "testing",
@@ -195,9 +194,9 @@ curl -X POST http://localhost:40006/api/wf/aming-claw/verify-update \
     }
   }'
 
-# Batch baseline (coordinator only)
+# Batch baseline
 curl -X POST http://localhost:40006/api/wf/aming-claw/baseline \
-  -H "X-Gov-Token: $TOKEN" \
+  -H "Content-Type: application/json" \
   -d '{
     "nodes": {"L1.1": "waived", "L1.2": "waived"},
     "reason": "Old modules removed"
@@ -300,25 +299,36 @@ copy .env.example .env
 .\start.ps1          # Start all services
 ```
 
-### 2. Initialize a Project
+### 2. Create a Project (one command, no password)
 
 ```bash
-# Create project and get coordinator token
 curl -X POST http://localhost:40006/api/init \
   -H "Content-Type: application/json" \
-  -d '{
-    "project_id": "my-project",
-    "password": "your-secret",
-    "project_name": "My Project"
-  }'
+  -d '{"project_id": "my-project"}'
 
-# Response includes coordinator token (save it!)
-# => {"coordinator": {"token": "gov-xxxx..."}}
+# => {"project": {"project_id": "my-project", "status": "active"}}
 ```
 
-### 3. Register an External Project
+That's it. No tokens, no passwords. Start submitting tasks immediately:
 
-Any project can join the auto-chain by adding `.aming-claw.yaml`:
+```bash
+curl -X POST http://localhost:40006/api/task/my-project/create \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Fix the login bug", "type": "dev"}'
+```
+
+### 3. Bind Telegram (optional)
+
+```
+# In Telegram, send to @your_bot:
+/bind my-project
+
+# Now any message you send creates a task automatically
+```
+
+### 4. Register an External Project (optional)
+
+Any project can join by adding `.aming-claw.yaml`:
 
 ```bash
 curl -X POST http://localhost:40006/api/projects/register \
@@ -328,15 +338,6 @@ curl -X POST http://localhost:40006/api/projects/register \
 
 See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the full config format.
 
-### 4. Bind Telegram
-
-```
-# In Telegram, send:
-/bind gov-xxxx...
-
-# Once bound, any message creates a task automatically
-```
-
 ---
 
 ## API Reference
@@ -345,11 +346,11 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/init` | Create project + get coordinator token |
+| POST | `/api/init` | Create project (no password needed) |
 | GET | `/api/project/list` | List all projects |
 | POST | `/api/projects/register` | Register workspace |
 
-### Task Management (no token required)
+### Task Management
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -360,7 +361,7 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 | GET | `/api/task/{pid}/list` | List tasks |
 | POST | `/api/task/{pid}/recover` | Recover failed task |
 
-### Workflow / Nodes (token required: `X-Gov-Token`)
+### Workflow / Nodes
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -373,7 +374,7 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 | GET | `/api/wf/{pid}/impact?files=...` | File change impact analysis |
 | POST | `/api/wf/{pid}/rollback` | Rollback to snapshot version |
 
-### Roles & Sessions (token required)
+### Roles & Sessions
 
 | Method | Path | Description |
 |--------|------|-------------|

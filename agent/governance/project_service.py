@@ -95,17 +95,15 @@ def _check_id_conflict(normalized: str, projects: dict) -> str | None:
 # /api/init — one-time project initialization
 # ============================================================
 
-def init_project(project_id: str, password: str, project_name: str = "", workspace_path: str = "") -> dict:
-    """Initialize a project and return the coordinator token.
+def init_project(project_id: str, password: str = "", project_name: str = "", workspace_path: str = "") -> dict:
+    """Initialize a project. No password or token required.
 
     Rules:
       - project_id is normalized to lowercase kebab-case
-      - First call: creates project + coordinator session → returns token
-      - Repeat call without password: 403 (project already initialized)
-      - Repeat call with correct password: resets coordinator token → returns new token
-      - Wrong password: 403
+      - First call: creates project → returns project info
+      - Repeat call: returns existing project info (idempotent)
 
-    Returns: {project, coordinator: {session_id, token}}
+    Returns: {project: {project_id, name, status, created_at}}
     """
     if not project_id:
         raise ValidationError("project_id is required")
@@ -125,22 +123,20 @@ def init_project(project_id: str, password: str, project_name: str = "", workspa
             f"Project ID conflict: {original_id!r} normalizes to {project_id!r} "
             f"which conflicts with existing project {conflict!r}"
         )
-    if not password or len(password) < 6:
-        raise ValidationError("Password must be at least 6 characters")
-
-    password_hash = _hash_password(password)
 
     existing = projects["projects"].get(project_id)
 
     if existing and existing.get("initialized"):
-        # Project already initialized — need password to reset
-        if existing.get("password_hash") != password_hash:
-            raise AuthError(
-                "Project already initialized. Provide correct password to reset coordinator token.",
-                "project_already_initialized",
-            )
-        # Password correct → reset coordinator token
-        return _reset_coordinator_token(project_id, projects, existing)
+        # Already exists — return existing project (idempotent)
+        return {
+            "project": {
+                "project_id": project_id,
+                "name": existing.get("name", project_id),
+                "status": existing.get("status", "active"),
+                "created_at": existing.get("created_at", ""),
+            },
+            "message": "Project already initialized",
+        }
 
     # First-time initialization
     project_dir = _governance_root() / project_id
@@ -150,7 +146,6 @@ def init_project(project_id: str, password: str, project_name: str = "", workspa
         "project_id": project_id,
         "name": project_name or project_id,
         "workspace_path": workspace_path,
-        "password_hash": password_hash,
         "created_at": _utc_iso(),
         "initialized": True,
         "status": "active",
@@ -159,15 +154,9 @@ def init_project(project_id: str, password: str, project_name: str = "", workspa
     projects["projects"][project_id] = entry
     _save_projects(projects)
 
-    # Create coordinator session
+    # Ensure DB exists
     conn = get_connection(project_id)
-    try:
-        coord_result = role_service.register(
-            conn, "coordinator", project_id, "coordinator",
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    conn.close()
 
     result = {
         "project": {
@@ -176,12 +165,7 @@ def init_project(project_id: str, password: str, project_name: str = "", workspa
             "status": "active",
             "created_at": entry["created_at"],
         },
-        "coordinator": {
-            "session_id": coord_result["session_id"],
-            "token": coord_result["token"],
-        },
-        "message": "Project initialized. Give this token to your Coordinator agent. "
-                   "This token will not be shown again unless you reset with password.",
+        "message": "Project initialized. Submit tasks via API or Telegram.",
     }
     if original_id != project_id:
         result["normalized_from"] = original_id
