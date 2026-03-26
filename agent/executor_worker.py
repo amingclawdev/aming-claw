@@ -1,3 +1,4 @@
+# v2: git-diff verified, artifact-filtered.
 # Verified: executor self-fix bootstrap successful.
 """Executor Worker — polls Governance API for tasks and executes them via Claude CLI.
 
@@ -191,7 +192,14 @@ class ExecutorWorker:
         """Enhance task prompt with governance context."""
         parts = [prompt]
 
-        if task_type == "test":
+        if task_type == "pm":
+            parts.append(
+                "\nAnalyze the request and output a PRD as JSON with the following fields: "
+                "{\"target_files\": [\"...\"], \"verification\": {\"method\": \"...\", \"command\": \"...\"}, "
+                "\"acceptance_criteria\": [\"...\"]}"
+            )
+
+        elif task_type == "test":
             changed = context.get("changed_files", [])
             parts.append(f"\nRun tests. Changed files: {json.dumps(changed)}")
             parts.append("Report result as JSON: {\"test_report\": {\"passed\": N, \"failed\": N, \"tool\": \"pytest\"}}")

@@ -102,6 +102,8 @@ class AILifecycleManager:
         # - coordinator/pm/tester/qa: Read-only (must delegate code changes to dev)
         if role == "dev":
             allowed_tools = "Read,Grep,Glob,Write,Edit,Bash"
+        elif role == "tester":
+            allowed_tools = "Read,Grep,Glob,Bash"
         else:
             allowed_tools = "Read,Grep,Glob"
 

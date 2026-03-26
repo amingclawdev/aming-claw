@@ -250,8 +250,11 @@ def _gate_checkpoint(conn, project_id, result, metadata):
 def _gate_t2_pass(conn, project_id, result, metadata):
     """Verify tests passed before advancing to QA."""
     report = result.get("test_report", {})
-    if report.get("failed", 1) > 0:
-        return False, f"Tests failed: {report.get('failed')} failures"
+    failed = report.get("failed", 0)
+    if failed is None:
+        failed = 0
+    if failed > 0:
+        return False, f"Tests failed: {failed} failures"
     # Update related nodes to t2_pass
     _try_verify_update(conn, project_id, metadata, "t2_pass", "tester",
                        {"type": "test_report", "producer": "auto-chain",
