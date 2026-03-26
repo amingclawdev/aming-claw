@@ -9,6 +9,8 @@
 
 ### A Self-Evolving AI Development Tool
 
+> **Want to integrate your project?** Read [`WORKFLOW.md`](WORKFLOW.md) — one file, everything you need.
+
 Aming Claw is a self-evolving AI development tool that manages its own codebase through a Telegram-driven task pipeline. Rather than being a passive assistant, Aming Claw operates as an autonomous development team: a product manager writes requirements, a developer codes the solution, a tester validates the output, and a QA auditor reviews quality -- all powered by AI models, all orchestrated through a single Telegram chat.
 
 The core idea is **iterative self-improvement**. Every task submitted through Telegram flows through a multi-stage AI pipeline, producing code changes that are reviewed by a human gatekeeper. Accepted changes are committed and archived. Rejected changes are rolled back, and the feedback loop starts again. Over time, the system improves itself -- updating its own code, fixing its own bugs, and extending its own capabilities.
