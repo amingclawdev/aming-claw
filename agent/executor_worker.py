@@ -51,6 +51,7 @@ TASK_ROLE_MAP = {
     "merge": ("script", 30),  # handled by _execute_merge, no AI
     "task":  ("dev", 300),
 }
+# Merge is script-based, see _execute_merge()
 
 
 class ExecutorWorker:
