@@ -161,19 +161,30 @@ def rebuild_governance() -> tuple[bool, str]:
         _log_error("rebuild_governance", exc)
         return False, str(exc)
 
-    # Health check
+    # Health check with retry (container needs a few seconds after restart)
+    import time as _time
     try:
         import requests  # local import to avoid hard dep at module level
 
-        resp = requests.get("http://localhost:40000/api/health", timeout=10)
-        if resp.status_code == 200:
-            output_lines.append("[health] governance OK")
-            return True, "\n".join(output_lines)
-        else:
-            output_lines.append(f"[health] governance returned HTTP {resp.status_code}")
-            return False, "\n".join(output_lines)
+        for attempt in range(4):  # 0, 1, 2, 3 — up to ~15s total wait
+            if attempt > 0:
+                _time.sleep(5)
+            try:
+                resp = requests.get("http://localhost:40000/api/health", timeout=10)
+                if resp.status_code == 200:
+                    output_lines.append("[health] governance OK")
+                    return True, "\n".join(output_lines)
+                elif attempt < 3:
+                    continue  # Retry on non-200 (e.g., 502 from nginx)
+                else:
+                    output_lines.append(f"[health] governance returned HTTP {resp.status_code} after {attempt+1} attempts")
+                    return False, "\n".join(output_lines)
+            except Exception:
+                if attempt < 3:
+                    continue
+                raise
     except Exception as exc:  # noqa: BLE001
-        output_lines.append(f"[health] governance unreachable: {exc}")
+        output_lines.append(f"[health] governance unreachable after retries: {exc}")
         return False, "\n".join(output_lines)
 
 
@@ -274,11 +285,13 @@ def smoke_test() -> dict[str, Any]:
         "all_pass": False,
     }
 
+    import time as _time
+    _time.sleep(5)  # Brief pause to let services stabilize after restarts
+
     # --- executor ---
     try:
         import requests
-
-        resp = requests.get("http://localhost:40001/status", timeout=5)
+        resp = requests.get("http://localhost:40100/status", timeout=5)
         results["executor"] = resp.status_code == 200
     except Exception:  # noqa: BLE001
         results["executor"] = False
@@ -286,7 +299,6 @@ def smoke_test() -> dict[str, Any]:
     # --- governance ---
     try:
         import requests
-
         resp = requests.get("http://localhost:40000/api/health", timeout=5)
         results["governance"] = resp.status_code == 200
     except Exception:  # noqa: BLE001
@@ -295,10 +307,9 @@ def smoke_test() -> dict[str, Any]:
     # --- gateway (docker inspect) ---
     try:
         insp = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Running}}", "telegram-gateway"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            ["docker", "inspect", "--format", "{{.State.Running}}",
+             "aming_claw-telegram-gateway-1"],
+            capture_output=True, text=True, timeout=10,
         )
         results["gateway"] = insp.stdout.strip().lower() == "true"
     except Exception:  # noqa: BLE001
