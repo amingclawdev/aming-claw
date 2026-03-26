@@ -53,48 +53,58 @@ The acceptance/rejection loop is the engine of self-evolution. Each rejected tas
 
 ---
 
-### Architecture
+### Architecture (v7 — Executor-Driven Auto-Chain)
 
 ```
-Telegram User
-     | sends message
-     v
-+-----------------+
-|   Coordinator   |  coordinator.py -- Telegram polling, command handling,
-|                 |  acceptance gates, timeout detection, archiving
-+--------+--------+
-         | writes task file to shared-volume/codex-tasks/pending/
-         v
-+-----------------+
-|    Executor     |  executor.py -- picks up pending tasks, invokes AI backend,
-|                 |  streams output, writes results, updates heartbeat
-+--------+--------+
-         | optional screenshot / file ops via HTTP
-         v
-+-----------------+
-| Executor Gateway|  executor-gateway/ (FastAPI) -- REST API for screenshots
-|  (host process) |  and file operations on the host machine, port 8090
-+-----------------+
-
-Service Manager (service_manager.py):
-  - Monitors coordinator + executor processes (auto-restart on crash)
-  - Handles /mgr_reinit (git pull + restart) and /mgr_restart signals
-  - Writes live status to state/manager_status.json
-
-Parallel Dispatcher (parallel_dispatcher.py):
-  - Worker-pool model: each registered workspace gets its own worker thread
-  - Tasks routed to workspace based on explicit targeting or default assignment
-  - Sequential execution within a workspace, parallel across workspaces
-
-Shared storage: shared-volume/codex-tasks/
-  pending/      -- task queue (JSON files)
-  processing/   -- tasks currently running
-  results/      -- completed tasks awaiting acceptance
-  archive/      -- accepted tasks (permanent)
-  state/        -- status.json, events.jsonl per task
-  logs/         -- run logs
-  acceptance/   -- acceptance documents and test cases
+Telegram / API
+     │ message
+     ▼
+Coordinator ──► PM (requirements) ──► Dev (worktree)
+  (dispatcher)      │                      │
+                    _verification       code changes
+                    config                 │
+                                           ▼
+                              Checkpoint Gatekeeper (isolated, ~10s)
+                                           │ pass
+                                           ▼
+                              Tester (1200+ unit tests, ~70s)
+                                           │ pass
+                                           ▼
+                              QA (_verification honored)
+                                           │ pass
+                                           ▼
+                              Merge (rebase onto main)
+                                           │
+                                           ▼
+                              Deploy Chain (auto-detect + restart)
+                                ├─ executor restart (signal file)
+                                ├─ governance Docker rebuild
+                                ├─ gateway Docker restart
+                                └─ smoke test (all services)
 ```
+
+**Key components:**
+
+- **Executor** (`executor.py`): Central orchestrator. Picks up tasks, spawns AI
+  sessions in git worktrees, runs auto-chain (gate → test → QA → merge → deploy).
+- **Coordinator** (`coordinator.py`): Pure dispatcher. Routes Telegram messages
+  to PM, creates dev_tasks. Never writes code.
+- **Parallel Dispatcher** (`parallel_dispatcher.py`): Worker-pool model. Each
+  workspace (toolBoxClient, aming_claw) gets its own thread. Sequential within
+  workspace, parallel across workspaces.
+- **Workspace Registry** (`workspace_registry.py`): Routes tasks by normalized
+  `project_id` (e.g., `amingClaw` → `aming-claw` → aming_claw workspace).
+- **Deploy Chain** (`deploy_chain.py`): Post-merge auto-deploy. Maps changed
+  files to affected services, rebuilds Docker containers, runs smoke tests.
+- **Service Manager** (`service_manager.py`): Watches executor process.
+  Restarts on crash or signal file from deploy chain.
+- **Redis Stream Audit**: Full round-trip AI prompt + result stored in Redis
+  streams (`ai:prompt:{session_id}`) for debugging and replay.
+
+**Shared storage:** `shared-volume/codex-tasks/`
+  `pending/` → `processing/` → `results/` → `archive/` (task lifecycle)
+  `state/` — workspace_registry.json, dispatcher state, manager signals
+  `logs/` — per-task timeline.jsonl, pipeline_audit.jsonl
 
 ---
 
