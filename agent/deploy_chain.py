@@ -433,7 +433,8 @@ def smoke_test() -> dict[str, Any]:
 # 6. run_deploy
 # ---------------------------------------------------------------------------
 
-def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "") -> dict[str, Any]:
+def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
+               skip_services: list[str] = None) -> dict[str, Any]:
     """Full deploy orchestration.
 
     Steps:
@@ -459,6 +460,8 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "")
     try:
         # 1. Detect
         affected = detect_affected_services(changed_files, project_id=project_id)
+        if skip_services:
+            affected = [s for s in affected if s not in skip_services]
         report["affected_services"] = affected
 
         if not affected:

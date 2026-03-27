@@ -43,18 +43,22 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
         changed = result.get("changed_files", metadata.get("changed_files", []))
         if changed:
             try:
-                from .impact_analyzer import analyze_impact
-                import os
-                state_root = os.path.join(
-                    os.environ.get("SHARED_VOLUME_PATH",
-                                   os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
-                    "codex-tasks", "state", "governance", project_id)
-                graph_path = os.path.join(state_root, "graph.json")
-                if os.path.exists(graph_path):
-                    from .graph import AcceptanceGraph
-                    graph = AcceptanceGraph()
-                    graph.load(graph_path)
-                    impact = analyze_impact(graph, changed)
+                from .impact_analyzer import ImpactAnalyzer, ImpactAnalysisRequest, FileHitPolicy
+                from . import project_service
+                graph = project_service.load_project_graph(project_id)
+                if graph:
+                    def _get_status(nid):
+                        from .enums import VerifyStatus
+                        row = conn.execute(
+                            "SELECT verify_status FROM node_state WHERE project_id = ? AND node_id = ?",
+                            (project_id, nid)).fetchone()
+                        return VerifyStatus.from_str(row["verify_status"]) if row else VerifyStatus.PENDING
+                    analyzer = ImpactAnalyzer(graph, _get_status)
+                    request = ImpactAnalysisRequest(
+                        changed_files=changed,
+                        file_policy=FileHitPolicy(match_primary=True, match_secondary=True),
+                    )
+                    impact = analyzer.analyze(request)
                     nodes = [n["node_id"] for n in impact.get("affected_nodes", [])]
                     if nodes:
                         metadata["related_nodes"] = nodes
@@ -367,7 +371,15 @@ def _build_merge_prompt(task_id, result, metadata):
 
 
 def _trigger_deploy(conn, project_id, task_id, result, metadata):
-    """Terminal stage: invoke deploy_chain.run_deploy()."""
+    """Terminal stage: invoke deploy_chain.run_deploy().
+
+    NOTE: When called from within the governance server process,
+    deploy_chain must NOT restart the governance server (it would kill
+    the process running this code). We pass skip_self=True to avoid
+    self-restart. The executor worker will detect the version mismatch
+    and log a warning; the governance server should be restarted
+    separately (e.g. by Docker healthcheck or manual restart).
+    """
     changed_files = metadata.get("changed_files", [])
     if not changed_files:
         return {"deploy": "skipped", "reason": "no changed_files in metadata"}
@@ -378,27 +390,10 @@ def _trigger_deploy(conn, project_id, task_id, result, metadata):
             sys.path.insert(0, agent_dir)
         from deploy_chain import run_deploy
         chat_id = int(metadata.get("chat_id", 0))
-        report = run_deploy(changed_files, chat_id=chat_id, project_id=project_id)
-
-        # Post-deploy: verify governance server version matches git HEAD
-        try:
-            import subprocess as _sp, time as _time
-            _time.sleep(2)  # Wait for restart
-            head = _sp.run(["git", "rev-parse", "--short", "HEAD"],
-                           capture_output=True, text=True, timeout=5,
-                           cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-                           ).stdout.strip()
-            import requests as _req
-            health = _req.get("http://localhost:40006/api/health", timeout=5).json()
-            srv_ver = health.get("version", "unknown")
-            if head and srv_ver != head:
-                report["version_mismatch"] = f"server={srv_ver}, git={head}"
-                log.warning("deploy: version mismatch after restart: %s vs %s", srv_ver, head)
-            else:
-                report["version_verified"] = srv_ver
-        except Exception as ve:
-            report["version_check_error"] = str(ve)
-
+        # skip_self=True prevents governance from restarting itself
+        report = run_deploy(changed_files, chat_id=chat_id, project_id=project_id,
+                            skip_services=["governance"])
+        report["governance_note"] = "skipped self-restart; restart governance manually or via Docker"
         return {"deploy": "completed", "report": report}
     except Exception as e:
         log.error("auto_chain: deploy failed: %s", e)

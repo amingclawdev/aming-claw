@@ -116,7 +116,7 @@ When a gate fails, it returns `{"gate_blocked": True, "stage": "...", "reason": 
 | QA | Runs governance checks (if `_verification` says so) | `_verification` |
 | Merge | Rebases dev branch onto main | — |
 | Release Checks | Runs `build.release_checks` from config | `.aming-claw.yaml` |
-| Deploy | Detects affected services, restarts them (non-Docker environments fall back to `restart_local_governance()`) | `deploy.service_rules` |
+| Deploy | Detects affected services, restarts them. When called from within governance server, `skip_services=["governance"]` prevents self-restart (governance must be restarted separately). | `deploy.service_rules` |
 | Smoke Test | Checks health endpoints | `deploy.smoke_test` |
 
 ---
