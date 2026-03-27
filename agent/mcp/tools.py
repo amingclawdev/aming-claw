@@ -191,12 +191,16 @@ class ToolDispatcher:
                 body["evidence"] = args["evidence"]
             return self._api("POST", f"/api/wf/{pid}/verify-update", body)
 
-        # --- Executor tools (in-process) ---
+        # --- Executor tools ---
         if name == "executor_status":
-            return self._pool.status()
+            if self._pool:
+                return self._pool.status()
+            return {"mode": "external", "message": "Executor runs as independent process. Use: python -m agent.mcp.executor --project aming-claw"}
 
         if name == "executor_scale":
-            return self._pool.scale(args["workers"])
+            if self._pool:
+                return self._pool.scale(args["workers"])
+            return {"error": "Executor is external. Scale via process manager."}
 
         # --- System ---
         if name == "health":

@@ -84,18 +84,21 @@ class AmingClawMCP:
     """MCP Server main class."""
 
     def __init__(self, project_id: str, governance_url: str, workspace: str,
-                 redis_url: str, max_workers: int = 1):
+                 redis_url: str, max_workers: int = 0):
         self.project_id = project_id
         self.gov_url = governance_url.rstrip("/")
 
-        # Worker pool
-        self.worker_pool = WorkerPool(
-            governance_url=governance_url,
-            project_id=project_id,
-            workspace=workspace,
-            max_workers=max_workers,
-            on_event=self._on_worker_event,
-        )
+        # Worker pool — only if explicitly requested (default: 0 = no workers)
+        # Executor should run as independent process to avoid blocking MCP stdio
+        self.worker_pool = None
+        if max_workers > 0:
+            self.worker_pool = WorkerPool(
+                governance_url=governance_url,
+                project_id=project_id,
+                workspace=workspace,
+                max_workers=max_workers,
+                on_event=self._on_worker_event,
+            )
 
         # Event bridge (Redis → MCP notifications)
         self.event_bridge = EventBridge(
@@ -103,7 +106,7 @@ class AmingClawMCP:
             notify_fn=self._on_redis_event,
         )
 
-        # Tool dispatcher
+        # Tool dispatcher (worker_pool may be None — executor tools return status only)
         self.dispatcher = ToolDispatcher(
             api_fn=self._http,
             worker_pool=self.worker_pool,
@@ -115,7 +118,8 @@ class AmingClawMCP:
                  self.project_id, self.gov_url)
 
         # Start subsystems
-        self.worker_pool.start()
+        if self.worker_pool:
+            self.worker_pool.start()
         self.event_bridge.start()
 
         # Read stdin (JSON-RPC messages from Claude Code)
@@ -136,7 +140,8 @@ class AmingClawMCP:
     def _shutdown(self) -> None:
         log.info("Shutting down MCP server...")
         self.event_bridge.stop()
-        self.worker_pool.stop(timeout=30)
+        if self.worker_pool:
+            self.worker_pool.stop(timeout=30)
         log.info("MCP server stopped")
 
     # -----------------------------------------------------------------------

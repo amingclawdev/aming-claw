@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "aming-claw": {
+      "command": "python",
+      "args": ["-m", "agent.mcp.server", "--project", "aming-claw", "--workers", "0", "--governance-url", "http://localhost:40000"],
+      "cwd": "C:\\Users\\z5866\\Documents\\amingclaw\\aming_claw",
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TELEGRAM_BOT_TOKEN": "8654388599:AAHhCYb0E1CBpi_k3j7dbnl3u8hEW3WJDSw",
+        "GOVERNANCE_URL": "http://localhost:40000"
+      }
+    }
+  }
+}
