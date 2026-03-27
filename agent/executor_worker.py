@@ -514,7 +514,7 @@ class ExecutorWorker:
         except Exception as e:
             log.error("Telegram reply failed: %s", e)
 
-    _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", "executor_worker.py"}
+    _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/", "executor_worker.py"}
 
     def _get_git_changed_files(self) -> list:
         """Run git diff --name-only to detect files changed since last commit."""

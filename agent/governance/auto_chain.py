@@ -10,6 +10,7 @@ Each transition runs a gate check before advancing.
 
 import json
 import logging
+import os
 import traceback
 
 log = logging.getLogger(__name__)
@@ -103,7 +104,9 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
         })
 
         # Auto-retry: create a new task at the SAME stage with gate reason injected
-        if depth < MAX_CHAIN_DEPTH - 1 and not metadata.get("_no_retry"):
+        # Max 2 retries per gate to prevent infinite loops
+        gate_retries = metadata.get("_gate_retry_count", 0)
+        if gate_retries < 2 and depth < MAX_CHAIN_DEPTH - 1 and not metadata.get("_no_retry"):
             retry_prompt = (
                 f"Previous attempt ({task_id}) was blocked by gate.\n"
                 f"Gate reason: {reason}\n\n"
@@ -121,6 +124,7 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
                     "parent_task_id": task_id,
                     "chain_depth": depth + 1,
                     "previous_gate_reason": reason,
+                    "_gate_retry_count": gate_retries + 1,
                     "_original_prompt": metadata.get("_original_prompt", ""),
                 },
             )
