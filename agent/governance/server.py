@@ -1384,7 +1384,7 @@ def handle_health(ctx: RequestContext):
 @route("GET", "/api/version-check/{project_id}")
 def handle_version_check(ctx: RequestContext):
     """Check chain version vs git HEAD. Calls MCP /git-status for git data."""
-    pid = ctx.params["project_id"]
+    pid = ctx.get_project_id()
     conn = _get_conn(pid)
 
     # Read chain_version from DB
@@ -1445,7 +1445,7 @@ def handle_version_check(ctx: RequestContext):
 @route("POST", "/api/version-update/{project_id}")
 def handle_version_update(ctx: RequestContext):
     """Update chain_version. 5-step validation: token + fields + lifecycle + version + audit."""
-    pid = ctx.params["project_id"]
+    pid = ctx.get_project_id()
     conn = _get_conn(pid)
     body = ctx.body or {}
 
@@ -1556,7 +1556,7 @@ def handle_context_snapshot(ctx: RequestContext):
     Single API call providing point-in-time consistent snapshot.
     AI can query on-demand APIs for more details.
     """
-    pid = ctx.params["project_id"]
+    pid = ctx.get_project_id()
     conn = _get_conn(pid)
     role = ctx.query.get("role", ["coordinator"])[0]
     task_id = ctx.query.get("task_id", [""])[0]
