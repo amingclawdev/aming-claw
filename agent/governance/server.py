@@ -1385,7 +1385,7 @@ def handle_health(ctx: RequestContext):
 def handle_version_check(ctx: RequestContext):
     """Check chain version vs git HEAD. Calls MCP /git-status for git data."""
     pid = ctx.get_project_id()
-    conn = _get_conn(pid)
+    conn = get_connection(pid)
 
     # Read chain_version from DB
     row = conn.execute("SELECT chain_version, updated_at FROM project_version WHERE project_id=?", (pid,)).fetchone()
@@ -1446,7 +1446,7 @@ def handle_version_check(ctx: RequestContext):
 def handle_version_update(ctx: RequestContext):
     """Update chain_version. 5-step validation: token + fields + lifecycle + version + audit."""
     pid = ctx.get_project_id()
-    conn = _get_conn(pid)
+    conn = get_connection(pid)
     body = ctx.body or {}
 
     # Step 1: Internal token check
@@ -1557,7 +1557,7 @@ def handle_context_snapshot(ctx: RequestContext):
     AI can query on-demand APIs for more details.
     """
     pid = ctx.get_project_id()
-    conn = _get_conn(pid)
+    conn = get_connection(pid)
     role = ctx.query.get("role", ["coordinator"])[0]
     task_id = ctx.query.get("task_id", [""])[0]
     now = _utc_now()
