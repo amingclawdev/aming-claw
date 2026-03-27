@@ -576,19 +576,10 @@ def handle_message(chat_id: int, text: str, msg: dict = None) -> None:
         send_menu(chat_id, text_body, kb)
         return
 
-    # Classify message → route to appropriate handler
-    msg_type = classify_message(text)
-    log.info("Message classified as '%s': %s", msg_type, text[:60])
-
-    if msg_type == "query":
-        handle_query(chat_id, text, route)
-    elif msg_type == "task":
-        handle_task_dispatch(chat_id, text, route)
-    elif msg_type == "dangerous":
-        handle_dangerous(chat_id, text, route)
-    else:
-        # "chat" — simple acknowledgement, create as low-priority task
-        handle_task_dispatch(chat_id, text, route)
+    # All non-command messages go to coordinator for AI-driven decision
+    # Coordinator decides: reply directly, create task, or escalate
+    log.info("Routing to coordinator: %s", text[:60])
+    handle_task_dispatch(chat_id, text, route)
 
 
 # --- Message Classifier (two-stage) ---
