@@ -310,8 +310,26 @@ class ExecutorWorker:
 
             log.info("Merge complete: %s (%d files)", commit_hash, len(staged))
 
-            # Update chain_version via governance API (5-step validated)
+            # Update VERSION file + DB chain_version + git sync
             try:
+                # 1. Update VERSION file
+                ver_path = os.path.join(self.workspace, "VERSION")
+                if os.path.exists(ver_path):
+                    with open(ver_path) as f:
+                        content = f.read()
+                    import re as _re
+                    content = _re.sub(r'CHAIN_VERSION=\S+', f'CHAIN_VERSION={commit_hash}', content)
+                    with open(ver_path, 'w') as f:
+                        f.write(content)
+                    # Amend commit to include VERSION
+                    subprocess.run(["git", "add", "VERSION"], cwd=self.workspace, capture_output=True, timeout=10)
+                    subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.workspace, capture_output=True, timeout=10)
+                    # Re-read hash after amend
+                    rev2 = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                          cwd=self.workspace, capture_output=True, text=True, timeout=5)
+                    commit_hash = rev2.stdout.strip()
+
+                # 2. Update DB chain_version
                 old_ver_row = self._api("GET", f"/api/version-check/{self.project_id}")
                 old_ver = old_ver_row.get("chain_version", "")
                 self._api("POST", f"/api/version-update/{self.project_id}", {
@@ -321,7 +339,13 @@ class ExecutorWorker:
                     "chain_stage": "merge",
                     "old_version": old_ver if old_ver != "(not set)" else "",
                 })
-                log.info("Chain version updated: %s → %s", old_ver, commit_hash)
+
+                # 3. Sync git_head to DB
+                self._api("POST", f"/api/version-sync/{self.project_id}", {
+                    "git_head": commit_hash,
+                    "dirty_files": [],
+                })
+                log.info("Chain version updated: %s → %s (VERSION + DB + sync)", old_ver, commit_hash)
             except Exception as e:
                 log.warning("Version update failed (non-fatal): %s", e)
 
