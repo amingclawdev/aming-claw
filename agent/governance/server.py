@@ -1451,7 +1451,7 @@ def handle_version_update(ctx: RequestContext):
 
     # Step 1: Internal token check
     expected_token = os.environ.get("VERSION_UPDATE_TOKEN", "")
-    provided_token = ctx.headers.get("x-internal-token", "") or body.get("internal_token", "")
+    provided_token = (ctx.handler.headers.get("X-Internal-Token", "") if ctx.handler else "") or body.get("internal_token", "")
     if expected_token and provided_token != expected_token:
         _audit_version_update(conn, pid, body, "rejected", "INVALID_TOKEN")
         return {"error": "INVALID_TOKEN", "message": "Internal token mismatch"}, 403
