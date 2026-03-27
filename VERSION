@@ -1,4 +1,4 @@
 # CHAIN_VERSION — Auto-chain integrity seal
 # DO NOT modify manually. Only updated by auto-chain merge.
 # If AI edits this: commit changes HEAD, gate still fails.
-CHAIN_VERSION=697626b
+CHAIN_VERSION=01ba3b2
