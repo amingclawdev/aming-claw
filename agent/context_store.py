@@ -103,6 +103,18 @@ class ContextStore:
         self._redis_hset(f"ctx:{task_id}:outputs", {"latest": output})
 
     def transition(self, task_id: str, from_state: str, to_state: str) -> None:
+        # Verify the actual current state in the DB matches the declared from_state.
+        row = self._conn.execute(
+            "SELECT status FROM context WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"task_id '{task_id}' not found in context store")
+        actual_state = row["status"]
+        if actual_state != from_state:
+            raise InvalidTransitionError(
+                f"task_id '{task_id}' is in state '{actual_state}', "
+                f"not '{from_state}' as declared"
+            )
         allowed = VALID_TRANSITIONS.get(from_state, [])
         if to_state not in allowed:
             raise InvalidTransitionError(
@@ -193,6 +205,44 @@ class ContextStore:
             self._redis.delete(key)
         except Exception as exc:
             logger.warning("Redis delete failed for key '%s': %s", key, exc)
+
+
+def list_audit_sessions(db_path: Optional[str] = None, limit: int = 50) -> list:
+    """Module-level helper: list recent distinct sessions from context_audit.
+
+    Returns a list of dicts with keys: ``session_id``, ``project_id``,
+    ``status``, ``created_at`` (most recent record per session).
+    Returns an empty list if no records exist or the DB is not yet initialised.
+    """
+    import os as _os
+    if db_path is None:
+        shared_vol = _os.getenv(
+            "SHARED_VOLUME_PATH",
+            _os.path.join(_os.path.dirname(__file__), "..", "shared-volume"),
+        )
+        db_path = _os.path.join(shared_vol, "context_store.db")
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.execute(
+                """
+                SELECT session_id, project_id, status, MAX(created_at) AS created_at
+                FROM context_audit
+                GROUP BY session_id
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+        return rows
+    except Exception as exc:
+        logger.warning("list_audit_sessions failed: %s", exc)
+        return []
 
 
 def query_audit_by_session(session_id: str, db_path: Optional[str] = None) -> list:

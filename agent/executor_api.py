@@ -24,8 +24,10 @@ log = logging.getLogger(__name__)
 
 try:
     from context_store import query_audit_by_session as _query_audit_by_session
+    from context_store import list_audit_sessions as _list_audit_sessions
 except ImportError:  # pragma: no cover — only absent in unit-test stubs
     _query_audit_by_session = None  # type: ignore[assignment]
+    _list_audit_sessions = None  # type: ignore[assignment]
 
 
 class ObserverManager:
@@ -1090,9 +1092,9 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
     def _handle_ctx_list(self):
         """GET /ctx/list — List all context sessions from audit."""
         try:
-            if _query_audit_by_session:
+            if _list_audit_sessions:
                 # Get recent sessions from context_store audit
-                sessions = _query_audit_by_session(limit=50)
+                sessions = _list_audit_sessions(limit=50)
                 self._json_response(200, {"sessions": sessions})
             else:
                 # Fallback: list from observer sessions

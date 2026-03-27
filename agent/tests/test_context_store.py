@@ -175,5 +175,43 @@ class TestQueryAuditBySession(unittest.TestCase):
         self.assertEqual(prompts, ["first", "second", "third"])
 
 
+class TestContextStoreTransition(unittest.TestCase):
+    """transition() validates current DB state before applying the transition."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = ContextStore(db_path=self.tmp.name)
+        # Seed a task in pending state
+        self.store.save_input("t1", {"description": "test task"})
+
+    def tearDown(self):
+        self.store._conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_valid_transition_succeeds(self):
+        self.store.transition("t1", "pending", "processing")
+        row = self.store._conn.execute(
+            "SELECT status FROM context WHERE task_id='t1'"
+        ).fetchone()
+        self.assertEqual(row["status"], "processing")
+
+    def test_wrong_from_state_raises(self):
+        from context_store import InvalidTransitionError
+        # task is 'pending', declare from_state='processing' → should fail
+        with self.assertRaises(InvalidTransitionError):
+            self.store.transition("t1", "processing", "qa_review")
+
+    def test_invalid_to_state_raises(self):
+        from context_store import InvalidTransitionError
+        # pending → qa_review is not in VALID_TRANSITIONS["pending"]
+        with self.assertRaises(InvalidTransitionError):
+            self.store.transition("t1", "pending", "qa_review")
+
+    def test_missing_task_id_raises(self):
+        with self.assertRaises(KeyError):
+            self.store.transition("nonexistent", "pending", "processing")
+
+
 if __name__ == "__main__":
     unittest.main()
