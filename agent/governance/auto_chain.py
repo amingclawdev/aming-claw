@@ -249,6 +249,12 @@ def _gate_checkpoint(conn, project_id, result, metadata):
                 log.warning("checkpoint_gate: docs may need update (skipped): %s", sorted(missing_docs))
             else:
                 return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files or set skip_doc_check=true."
+    # Node status check: related_nodes must be at least "testing" (not "pending")
+    related_nodes = metadata.get("related_nodes", [])
+    if related_nodes:
+        passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "testing")
+        if not passed:
+            return False, f"checkpoint gate blocked — {reason}"
     return True, "ok"
 
 
@@ -260,11 +266,17 @@ def _gate_t2_pass(conn, project_id, result, metadata):
         failed = 0
     if failed > 0:
         return False, f"Tests failed: {failed} failures"
-    # Update related nodes to t2_pass
+    # Update nodes FIRST (test passed → promote to t2_pass)
     _try_verify_update(conn, project_id, metadata, "t2_pass", "tester",
                        {"type": "test_report", "producer": "auto-chain",
                         "tool": report.get("tool", "pytest"),
                         "summary": report})
+    # Then verify nodes reached t2_pass
+    related_nodes = metadata.get("related_nodes", [])
+    if related_nodes:
+        passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "t2_pass")
+        if not passed:
+            return False, f"t2_pass gate blocked — {reason}"
     return True, "ok"
 
 
@@ -285,18 +297,30 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             return False, f"QA blocking issue: {result.get('detail', result.get('reason', ''))}"
         # Auto-pass: QA didn't explicitly reject, treat as pass
         log.info("qa_pass gate: no explicit recommendation, auto-passing (rec=%s)", rec)
-    # Update related nodes to qa_pass
+    # Update nodes FIRST (QA passed → promote to qa_pass)
     _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
                        {"type": "qa_review", "producer": "auto-chain",
                         "summary": result.get("review_summary", "")})
+    # Then verify nodes reached qa_pass
+    related_nodes = metadata.get("related_nodes", [])
+    if related_nodes:
+        passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
+        if not passed:
+            return False, f"qa_pass gate blocked — {reason}"
     return True, "ok"
 
 
 def _gate_release(conn, project_id, result, metadata):
     """Verify merge succeeded before deploy."""
+    # Node status check: all related_nodes must be "qa_pass" before merge is allowed
+    related_nodes = metadata.get("related_nodes", [])
+    if related_nodes:
+        passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
+        if not passed:
+            return False, f"release gate blocked — {reason}"
     # For auto-chain deploys, we trust the merge task result
     # After successful merge, promote related_nodes to qa_pass
-    if metadata.get("related_nodes"):
+    if related_nodes:
         _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
                            {"type": "merge_complete", "producer": "auto-chain"})
     return True, "ok"
@@ -404,6 +428,51 @@ def _trigger_deploy(conn, project_id, task_id, result, metadata):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Status ordering for node_state validation
+_STATUS_ORDER = ["pending", "testing", "t2_pass", "qa_pass"]
+
+
+def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
+    """Verify every node in related_nodes has at least min_status in node_state.
+
+    Returns (passed: bool, reason: str).
+    If a node is not found in the DB it is treated as 'pending' and blocks.
+    """
+    if not related_nodes:
+        return True, "no related_nodes"
+    try:
+        min_rank = _STATUS_ORDER.index(min_status)
+    except ValueError:
+        return False, f"unknown min_status '{min_status}'"
+
+    blocking = []
+    for node_id in related_nodes:
+        row = conn.execute(
+            "SELECT verify_status FROM node_state WHERE project_id = ? AND node_id = ?",
+            (project_id, node_id),
+        ).fetchone()
+        if row is None:
+            # Not found → treat as pending
+            blocking.append((node_id, "pending (not found in DB)"))
+            continue
+        status = (row["verify_status"] or "pending").strip()
+        try:
+            rank = _STATUS_ORDER.index(status)
+        except ValueError:
+            # Unknown status — treat conservatively as pending
+            blocking.append((node_id, f"unknown status '{status}'"))
+            continue
+        if rank < min_rank:
+            blocking.append((node_id, status))
+
+    if blocking:
+        details = ", ".join(f"{nid}={st}" for nid, st in blocking)
+        return False, (
+            f"related_nodes not yet at '{min_status}': [{details}]"
+        )
+    return True, "ok"
+
 
 def _try_verify_update(conn, project_id, metadata, target_status, role, evidence_dict):
     """Best-effort node status update. Non-blocking on failure."""
