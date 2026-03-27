@@ -1,5 +1,4 @@
-# Auto-chain e2e test verified
-# v10: complete chain verified
+# v11: worktree isolation verified
 """Auto-chain dispatcher.
 
 Wires task completion to next-stage task creation with gate validation
