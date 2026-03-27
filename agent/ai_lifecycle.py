@@ -289,17 +289,21 @@ class AILifecycleManager:
             ws = context.get("workspace", "")
             tf = context.get("target_files", [])
             if ws:
-                workspace_info = f"工作目录: {ws}\n"
+                workspace_info = (
+                    f"IMPORTANT: Your working directory is: {ws}\n"
+                    f"All file paths MUST use this directory as root. "
+                    f"Use absolute paths starting with {ws}/ for all Read/Write/Edit operations.\n"
+                )
             if tf:
-                workspace_info += f"目标文件: {', '.join(tf)}\n"
+                workspace_info += f"Target files: {', '.join(tf)}\n"
 
         return (
             f"{role_prompt}\n\n"
-            f"项目: {project_id}\n"
+            f"Project: {project_id}\n"
             f"{workspace_info}\n"
-            f"当前上下文:\n{context_str}\n\n"
-            f"用户消息: {prompt}\n\n"
-            "请按照指定 JSON 格式输出你的决策。"
+            f"Context:\n{context_str}\n\n"
+            f"Task: {prompt}\n\n"
+            "Respond with your decision in the specified JSON format."
         )
 
     @staticmethod

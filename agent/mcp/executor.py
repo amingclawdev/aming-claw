@@ -177,15 +177,6 @@ class WorkerSlot:
         """Execute via Claude CLI, with worktree isolation for dev role."""
         from ai_lifecycle import AILifecycleManager
 
-        context = {
-            "task_id": task_id,
-            "task_type": task_type,
-            "project_id": self.pool.project_id,
-            "target_files": metadata.get("target_files", []),
-            "changed_files": metadata.get("changed_files", []),
-            "related_nodes": metadata.get("related_nodes", []),
-        }
-
         # Dev tasks run in isolated worktree; others run in main workspace
         worktree_path = None
         branch_name = None
@@ -197,6 +188,16 @@ class WorkerSlot:
                 work_dir = worktree_path
                 log.info("[%s] Dev worktree created: %s (branch: %s)",
                          self.slot_id, worktree_path, branch_name)
+
+        context = {
+            "task_id": task_id,
+            "task_type": task_type,
+            "project_id": self.pool.project_id,
+            "target_files": metadata.get("target_files", []),
+            "changed_files": metadata.get("changed_files", []),
+            "related_nodes": metadata.get("related_nodes", []),
+            "workspace": work_dir,
+        }
             else:
                 log.warning("[%s] Worktree creation failed, running in main", self.slot_id)
 
