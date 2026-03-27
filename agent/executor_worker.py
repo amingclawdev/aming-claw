@@ -137,6 +137,7 @@ class ExecutorWorker:
             "changed_files": metadata.get("changed_files", []),
             "related_nodes": metadata.get("related_nodes", []),
             "attempt_num": task.get("attempt_num", 1),
+            "chat_id": metadata.get("chat_id", ""),
         }
 
         # Enhance prompt with governance context
@@ -260,7 +261,7 @@ class ExecutorWorker:
             )
 
         elif task_type == "coordinator":
-            chat_id = context.get("chat_id", metadata.get("chat_id", ""))
+            chat_id = context.get("chat_id", "")
             parts.append(f"\nYou are a Coordinator. Analyze the user message and decide the action.")
             parts.append("User message from Telegram (chat_id=" + str(chat_id) + "):")
             parts.append(f'"{prompt}"')
