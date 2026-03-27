@@ -314,3 +314,9 @@ def send_document(chat_id: int, path: Path, caption: str = "") -> None:
             {"chat_id": str(chat_id), "caption": caption},
             files={"document": f},
         )
+
+
+def get_version():
+    """Return current git commit hash (short form)."""
+    import subprocess
+    return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
