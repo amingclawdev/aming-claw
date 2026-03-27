@@ -1,4 +1,4 @@
-# v6: gate order fix verified
+# v7: full chain with node gates
 """Auto-chain dispatcher.
 
 Wires task completion to next-stage task creation with gate validation
@@ -267,12 +267,13 @@ def _gate_t2_pass(conn, project_id, result, metadata):
     if failed > 0:
         return False, f"Tests failed: {failed} failures"
     # Update nodes FIRST (test passed → promote to t2_pass)
+    # Evidence validator checks summary.passed > 0, so ensure it's there
     passed_count = report.get("passed", 1)  # Default 1 if not reported (tests passed gate)
+    summary = {**report, "passed": passed_count, "failed": failed}
     _try_verify_update(conn, project_id, metadata, "t2_pass", "tester",
                        {"type": "test_report", "producer": "auto-chain",
                         "tool": report.get("tool", "pytest"),
-                        "passed": passed_count, "failed": 0,
-                        "summary": report})
+                        "summary": summary})
     # Then verify nodes reached t2_pass
     related_nodes = metadata.get("related_nodes", [])
     if related_nodes:
