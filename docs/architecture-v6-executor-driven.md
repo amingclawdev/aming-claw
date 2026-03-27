@@ -1646,5 +1646,40 @@ Executor API (:40100) added two read-only endpoints:
 
 Data source: JSON files in `shared-volume/codex-tasks/processing/` and `results/`.
 
+## Version Gate
+
+Prevents manual code changes from bypassing the auto-chain workflow.
+
+### Architecture
+
+```
+Host machine (git source of truth):
+  executor_worker._sync_git_status() [each poll cycle]
+    → git rev-parse HEAD
+    → git diff --name-only
+    │
+    ▼
+  POST /api/version-sync/{pid}
+    → governance DB (git_head, dirty_files, git_synced_at)
+
+Docker (no git):
+  gateway → GET /api/version-check/{pid}
+    → reads DB: git_head vs chain_version
+    → HEAD ≠ CHAIN → block, reply to user
+    → dirty files → block, reply to user
+
+Auto-chain merge (_execute_merge):
+  1. Update VERSION file (CHAIN_VERSION=new_hash)
+  2. git commit --amend (include VERSION)
+  3. POST /api/version-update (DB chain_version = new_hash)
+  4. POST /api/version-sync (git_head = new_hash)
+  → All aligned → next message passes gate
+```
+
+### Anti-tamper
+
+VERSION file warns AI agents not to edit manually. Even if they do, the commit changes HEAD → no longer matches the value written → gate still blocks.
+
 ## Changelog
-- 2026-03-26: Old Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules), unified to use governance API
+- 2026-03-27: Version gate, context snapshot, structured memory, role prompts with API reference
+- 2026-03-26: Old Telegram bot system completely removed, unified to governance API

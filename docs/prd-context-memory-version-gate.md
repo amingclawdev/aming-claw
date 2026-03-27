@@ -176,14 +176,34 @@ def handle_task_dispatch(chat_id, text, route):
     # ... create coordinator task
 ```
 
-#### 3.1.6 Merge Updates Version
+#### 3.1.6 Merge Updates Version (4-step)
 
-**File:** `agent/executor_worker.py` — `_execute_merge()` after success
+**File:** `agent/executor_worker.py` — `_execute_merge()` after git commit
+
+```
+Step 1: Update VERSION file (CHAIN_VERSION=new_hash)
+Step 2: git commit --amend (include VERSION in merge commit)
+Step 3: POST /api/version-update (DB chain_version = new_hash)
+Step 4: POST /api/version-sync (git_head = new_hash, dirty_files = [])
+```
+
+This closes the version gate loop:
+- After merge, VERSION file + DB + git_head all point to same hash
+- Next Telegram message → gateway version-check → ok=true → proceeds
 
 ```python
+# Step 1: VERSION file
+content = re.sub(r'CHAIN_VERSION=\S+', f'CHAIN_VERSION={commit_hash}', content)
+# Step 2: Amend commit
+subprocess.run(["git", "commit", "--amend", "--no-edit"], ...)
+# Step 3: DB chain_version
 self._api("POST", f"/api/version-update/{self.project_id}", {
-    "chain_version": new_hash,
-    "updated_by": "auto-chain",
+    "chain_version": commit_hash, "updated_by": "auto-chain",
+    "task_id": task_id, "chain_stage": "merge",
+})
+# Step 4: Sync git_head
+self._api("POST", f"/api/version-sync/{self.project_id}", {
+    "git_head": commit_hash, "dirty_files": [],
 })
 ```
 
