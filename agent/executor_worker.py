@@ -138,6 +138,8 @@ class ExecutorWorker:
             "related_nodes": metadata.get("related_nodes", []),
             "attempt_num": task.get("attempt_num", 1),
             "chat_id": metadata.get("chat_id", ""),
+            "previous_gate_reason": metadata.get("previous_gate_reason", ""),
+            "rejection_reason": metadata.get("rejection_reason", ""),
         }
 
         # Enhance prompt with governance context
@@ -310,6 +312,12 @@ class ExecutorWorker:
 
             log.info("Merge complete: %s (%d files)", commit_hash, len(staged))
 
+            # Immediately sync git HEAD to governance after commit (don't wait for 60s poll)
+            HEAD = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=self.workspace
+            ).decode().strip()
+            self._api("POST", f"/api/version-sync/{self.project_id}", {"git_head": HEAD, "dirty_files": []})
+
             # Update VERSION file + DB chain_version + git sync
             try:
                 # 1. Update VERSION file
@@ -401,12 +409,20 @@ class ExecutorWorker:
             target = context.get("target_files", [])
             if target:
                 parts.append(f"\nTarget files: {json.dumps(target)}")
+            attempt = context.get("attempt_num", 1)
+            gate_reason = context.get("previous_gate_reason", "") or context.get("rejection_reason", "")
+            if attempt and int(attempt) > 1 and gate_reason:
+                parts.append(f"\nThis is retry attempt #{attempt}. Previous attempt was blocked by gate.")
+                parts.append(f"Gate rejection reason: {gate_reason}")
+                parts.append("Fix ONLY the specific issue described above; do not make unrelated changes.")
             parts.append("\nAfter completing, respond with JSON: {\"changed_files\": [...], \"summary\": \"...\"}")
 
         return "\n".join(parts)
 
     # Files/patterns to ignore in git diff (Claude CLI artifacts, not real changes).
-    # executor_worker.py is intentionally excluded — it IS the executor itself, not a task deliverable.
+    # NOTE: executor_worker.py is NOT excluded here — it can be a legitimate task target.
+    # If it were excluded, any dev task targeting this file would always fail the gate
+    # with "No files changed", making such tasks unretryable.
     #
     # Node mapping (file → acceptance-graph node):
     #   executor_worker.py        → L3.2  ExecutorWorker (this file — executor process)
@@ -508,7 +524,7 @@ class ExecutorWorker:
         except Exception as e:
             log.error("Telegram reply failed: %s", e)
 
-    _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/", "executor_worker.py"}
+    _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/"}
 
     def _get_git_changed_files(self) -> list:
         """Run git diff --name-only to detect files changed since last commit."""
