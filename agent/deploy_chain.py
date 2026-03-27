@@ -301,24 +301,37 @@ def restart_local_governance(port: int = 40006) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def restart_gateway() -> tuple[bool, str]:
-    """docker compose restart telegram-gateway, then verify via logs.
+    """Rebuild + restart telegram-gateway Docker container, then verify via logs.
 
+    Uses build + up (not just restart) to ensure latest code is deployed.
     Returns (success, output_summary).
     """
     compose_file = (
         Path(__file__).resolve().parent.parent / "docker-compose.governance.yml"
     )
+    repo_root = compose_file.parent
     output_lines: list[str] = []
     try:
+        # Build first to pick up code changes
+        build = subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "build", "telegram-gateway"],
+            capture_output=True, text=True, timeout=300, cwd=str(repo_root),
+        )
+        if build.returncode != 0:
+            return False, f"gateway build failed: {build.stderr[:300]}"
+        output_lines.append("gateway build OK")
+
+        # Up -d to restart with new image
         result = subprocess.run(
             [
                 "docker", "compose",
                 "-f", str(compose_file),
-                "restart", "telegram-gateway",
+                "up", "-d", "telegram-gateway",
             ],
             capture_output=True,
             text=True,
             timeout=120,
+            cwd=str(repo_root),
         )
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
