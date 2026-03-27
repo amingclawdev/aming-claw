@@ -1,3 +1,4 @@
+# Auto-chain e2e test verified
 # v10: complete chain verified
 """Auto-chain dispatcher.
 
