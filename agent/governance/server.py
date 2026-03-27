@@ -8,6 +8,7 @@ import json
 import sys
 import uuid
 import traceback
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -50,6 +51,10 @@ def _get_git_version():
 
 SERVER_VERSION = _get_git_version()
 SERVER_PID = os.getpid()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _acquire_pid_lock():
     """Write PID lockfile. Kill old process if still alive."""
@@ -1376,6 +1381,147 @@ def handle_health(ctx: RequestContext):
             "version": SERVER_VERSION, "pid": SERVER_PID}
 
 
+@route("GET", "/api/version-check/{project_id}")
+def handle_version_check(ctx: RequestContext):
+    """Check chain version vs git HEAD. Calls MCP /git-status for git data."""
+    pid = ctx.params["project_id"]
+    conn = _get_conn(pid)
+
+    # Read chain_version from DB
+    row = conn.execute("SELECT chain_version, updated_at FROM project_version WHERE project_id=?", (pid,)).fetchone()
+    chain_ver = row["chain_version"] if row else None
+    chain_updated = row["updated_at"] if row else None
+
+    # Get git status from MCP server (host has git)
+    import urllib.request, urllib.error
+    git_data = {"head": "unknown", "dirty": False, "dirty_files": []}
+    try:
+        resp = urllib.request.urlopen("http://host.docker.internal:40020/git-status", timeout=5)
+        git_data = json.loads(resp.read().decode())
+    except Exception:
+        try:
+            resp = urllib.request.urlopen("http://localhost:40020/git-status", timeout=3)
+            git_data = json.loads(resp.read().decode())
+        except Exception:
+            pass  # fail-open: can't reach MCP
+
+    head = git_data.get("head", "unknown")
+    dirty = git_data.get("dirty", False)
+    dirty_files = git_data.get("dirty_files", [])
+
+    # Compare
+    if not chain_ver:
+        ok = True
+        msg = "No chain_version set (project not initialized)"
+    elif head == "unknown":
+        ok = True
+        msg = "Git status unavailable (MCP unreachable)"
+    elif head != chain_ver or dirty:
+        ok = False
+        parts = []
+        if head != chain_ver:
+            parts.append(f"HEAD ({head}) != CHAIN_VERSION ({chain_ver})")
+        if dirty:
+            parts.append(f"{len(dirty_files)} uncommitted files")
+        msg = "; ".join(parts)
+    else:
+        ok = True
+        msg = ""
+
+    return {
+        "ok": ok,
+        "project_id": pid,
+        "head": head,
+        "chain_version": chain_ver or "(not set)",
+        "chain_updated_at": chain_updated,
+        "dirty": dirty,
+        "dirty_files": dirty_files,
+        "message": msg,
+        "generated_at": _utc_now(),
+        "project_version": chain_ver or "unknown",
+    }
+
+
+@route("POST", "/api/version-update/{project_id}")
+def handle_version_update(ctx: RequestContext):
+    """Update chain_version. 5-step validation: token + fields + lifecycle + version + audit."""
+    pid = ctx.params["project_id"]
+    conn = _get_conn(pid)
+    body = ctx.body or {}
+
+    # Step 1: Internal token check
+    expected_token = os.environ.get("VERSION_UPDATE_TOKEN", "")
+    provided_token = ctx.headers.get("x-internal-token", "") or body.get("internal_token", "")
+    if expected_token and provided_token != expected_token:
+        _audit_version_update(conn, pid, body, "rejected", "INVALID_TOKEN")
+        return {"error": "INVALID_TOKEN", "message": "Internal token mismatch"}, 403
+
+    # Step 2: Field completeness
+    required = ("chain_version", "updated_by")
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        _audit_version_update(conn, pid, body, "rejected", "MISSING_FIELDS")
+        return {"error": "MISSING_FIELDS", "message": f"Missing: {missing}"}, 400
+
+    # Step 3: Lifecycle validation
+    updated_by = body["updated_by"]
+    if updated_by not in ("auto-chain", "init", "register", "merge-service"):
+        _audit_version_update(conn, pid, body, "rejected", "INVALID_UPDATED_BY")
+        return {"error": "INVALID_UPDATED_BY", "message": f"updated_by '{updated_by}' not allowed"}, 403
+
+    task_id = body.get("task_id", "")
+    chain_stage = body.get("chain_stage", "")
+    if updated_by == "auto-chain" and chain_stage and chain_stage != "merge":
+        _audit_version_update(conn, pid, body, "rejected", "INVALID_CHAIN_STAGE")
+        return {"error": "INVALID_CHAIN_STAGE", "message": f"Expected merge, got {chain_stage}"}, 400
+
+    # Step 4: Version consistency (optional — old_version check)
+    old_version = body.get("old_version")
+    if old_version:
+        row = conn.execute("SELECT chain_version FROM project_version WHERE project_id=?", (pid,)).fetchone()
+        current = row["chain_version"] if row else None
+        if current and old_version != current:
+            _audit_version_update(conn, pid, body, "rejected", "OLD_VERSION_MISMATCH")
+            return {"error": "OLD_VERSION_MISMATCH",
+                    "message": f"Expected {old_version}, DB has {current}"}, 409
+
+    # Step 5: Update + audit
+    new_version = body["chain_version"]
+    now = _utc_now()
+    conn.execute("""
+        INSERT INTO project_version (project_id, chain_version, updated_at, updated_by)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET
+            chain_version=excluded.chain_version,
+            updated_at=excluded.updated_at,
+            updated_by=excluded.updated_by
+    """, (pid, new_version, now, updated_by))
+    conn.commit()
+
+    _audit_version_update(conn, pid, body, "success", "")
+    return {"ok": True, "chain_version": new_version, "updated_at": now}
+
+
+def _audit_version_update(conn, pid, body, result, reason):
+    """Write audit record for every version-update attempt."""
+    try:
+        audit_service.record(
+            conn, pid, "version.update_attempt",
+            actor=body.get("updated_by", "unknown"),
+            details={
+                "task_id": body.get("task_id", ""),
+                "old_version": body.get("old_version", ""),
+                "new_version": body.get("chain_version", ""),
+                "chain_stage": body.get("chain_stage", ""),
+                "updated_by": body.get("updated_by", ""),
+                "result": result,
+                "reject_reason": reason,
+            },
+        )
+    except Exception:
+        pass  # audit failure should not block
+
+
 @route("GET", "/api/metrics")
 def handle_metrics(ctx: RequestContext):
     """Return in-memory metrics snapshot."""
@@ -1401,6 +1547,98 @@ def handle_deep_health(ctx: RequestContext):
     checks["alert_count"] = len(alerts)
 
     return checks
+
+
+@route("GET", "/api/context-snapshot/{project_id}")
+def handle_context_snapshot(ctx: RequestContext):
+    """Return minimal base context for AI session startup (~500 tokens).
+
+    Single API call providing point-in-time consistent snapshot.
+    AI can query on-demand APIs for more details.
+    """
+    pid = ctx.params["project_id"]
+    conn = _get_conn(pid)
+    role = ctx.query.get("role", ["coordinator"])[0]
+    task_id = ctx.query.get("task_id", [""])[0]
+    now = _utc_now()
+
+    # Task summary
+    task_summary = {}
+    if task_id:
+        row = conn.execute(
+            "SELECT task_id, type, prompt, status FROM tasks WHERE task_id=?",
+            (task_id,)
+        ).fetchone()
+        if row:
+            task_summary = {
+                "task_id": row["task_id"],
+                "type": row["type"],
+                "prompt": (row["prompt"] or "")[:500],
+                "status": row["status"],
+            }
+
+    # Project state
+    ver_row = conn.execute(
+        "SELECT chain_version, updated_at FROM project_version WHERE project_id=?",
+        (pid,)
+    ).fetchone()
+    project_state = {
+        "chain_version": ver_row["chain_version"] if ver_row else "unknown",
+        "version_updated_at": ver_row["updated_at"] if ver_row else None,
+    }
+
+    # Node summary (one-line)
+    node_counts = {}
+    for row in conn.execute(
+        "SELECT verify_status, COUNT(*) as cnt FROM node_state WHERE project_id=? GROUP BY verify_status",
+        (pid,)
+    ).fetchall():
+        node_counts[row["verify_status"]] = row["cnt"]
+
+    # Recent memories (top 3 by relevance)
+    recent_memories = []
+    try:
+        all_mems = memory_service.query_all(pid, active_only=True)
+        task_prompt = task_summary.get("prompt", "")
+        scored = []
+        for m in all_mems:
+            score = 0
+            s = m.get("structured", {}) or {}
+            if s.get("followup_needed"):
+                score += 10
+            if m.get("kind") == "failure_pattern":
+                score += 5
+            if m.get("kind") == "decision":
+                score += 2
+            if m.get("module", "") and m["module"] in task_prompt:
+                score += 3
+            scored.append((score, m))
+        scored.sort(key=lambda x: -x[0])
+        for _, m in scored[:3]:
+            recent_memories.append({
+                "module": m.get("module", ""),
+                "kind": m.get("kind", ""),
+                "content": (m.get("content", ""))[:200],
+            })
+    except Exception:
+        pass
+
+    return {
+        "snapshot_at": now,
+        "project_id": pid,
+        "role": role,
+        "task": task_summary,
+        "project_state": project_state,
+        "node_summary": node_counts,
+        "recent_memories": recent_memories,
+        "constraints": [
+            "All data in governance.db (SQLite) and dbservice. Do NOT check log files.",
+            "Version gate: code must go through auto-chain (PM→Dev→Test→QA→Merge).",
+            f"Current chain_version: {project_state['chain_version']}",
+        ],
+        "generated_at": now,
+        "project_version": project_state["chain_version"],
+    }
 
 
 # --- Documentation ---

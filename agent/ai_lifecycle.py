@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -279,12 +280,31 @@ class AILifecycleManager:
         return self._sessions.get(session_id)
 
     def _build_system_prompt(self, role: str, prompt: str, context: dict, project_id: str) -> str:
-        """Build the full prompt sent to Claude CLI."""
-        from role_permissions import ROLE_PROMPTS
+        """Build the full prompt sent to Claude CLI.
+
+        Structure:
+          1. Role prompt (static, from ROLE_PROMPTS)
+          2. API reference (shared across all roles)
+          3. Base context snapshot (from /api/context-snapshot)
+          4. Workspace info (dev only)
+          5. Task prompt
+        """
+        from role_permissions import ROLE_PROMPTS, _API_REFERENCE
 
         role_prompt = ROLE_PROMPTS.get(role, ROLE_PROMPTS.get("coordinator", ""))
 
-        context_str = json.dumps(context, ensure_ascii=False, indent=2) if context else "{}"
+        # Fetch base context snapshot (single API call, consistent)
+        snapshot_str = ""
+        try:
+            gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+            task_id = context.get("task_id", "")
+            url = f"{gov_url}/api/context-snapshot/{project_id}?role={role}&task_id={task_id}"
+            req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                snapshot = json.loads(resp.read().decode())
+            snapshot_str = f"\n--- Base Context Snapshot ---\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}\n"
+        except Exception as e:
+            log.warning("Context snapshot fetch failed: %s", e)
 
         # Dev role: inject workspace and target_files so AI knows where to work
         workspace_info = ""
@@ -302,9 +322,10 @@ class AILifecycleManager:
 
         return (
             f"{role_prompt}\n\n"
+            f"{_API_REFERENCE}\n\n"
             f"Project: {project_id}\n"
-            f"{workspace_info}\n"
-            f"Context:\n{context_str}\n\n"
+            f"{workspace_info}"
+            f"{snapshot_str}\n"
             f"Task: {prompt}\n\n"
             "Respond with your decision in the specified JSON format."
         )

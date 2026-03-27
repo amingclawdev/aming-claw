@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -145,6 +145,14 @@ CREATE TABLE IF NOT EXISTS event_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON event_outbox(delivered_at) WHERE delivered_at IS NULL AND dead_letter = 0;
 CREATE INDEX IF NOT EXISTS idx_outbox_dead ON event_outbox(dead_letter) WHERE dead_letter = 1;
+
+-- Per-project chain version (auto-chain integrity seal)
+CREATE TABLE IF NOT EXISTS project_version (
+    project_id    TEXT PRIMARY KEY,
+    chain_version TEXT NOT NULL,     -- git short hash from last auto-merge
+    updated_at    TEXT NOT NULL,     -- ISO 8601
+    updated_by    TEXT NOT NULL      -- "auto-chain" | "init" | "register"
+);
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -381,7 +389,18 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4}
+    def _migrate_v4_to_v5(c):
+        """Add project_version table for chain integrity seal."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS project_version (
+                project_id    TEXT PRIMARY KEY,
+                chain_version TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                updated_by    TEXT NOT NULL
+            )
+        """)
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)

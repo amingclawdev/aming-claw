@@ -195,7 +195,77 @@ class ExecutorWorker:
         elif "changed_files" not in result:
             result["changed_files"] = []
 
+        # Write structured memory on completion
+        self._write_memory(task_type, task_id, result, metadata)
+
         return {"status": "succeeded", "result": result}
+
+    def _write_memory(self, task_type: str, task_id: str, result: dict, metadata: dict):
+        """Write structured memory after task completion (best-effort)."""
+        try:
+            changed = result.get("changed_files", [])
+            summary = result.get("summary", "")
+
+            if task_type == "dev" and (summary or changed):
+                prompt_lower = (metadata.get("original_prompt", summary) or "").lower()
+                if any(w in prompt_lower for w in ("fix", "bug", "error")):
+                    decision_type = "bugfix"
+                elif any(w in prompt_lower for w in ("add", "new", "create", "implement")):
+                    decision_type = "feature"
+                elif any(w in prompt_lower for w in ("refactor", "clean", "rename")):
+                    decision_type = "refactor"
+                else:
+                    decision_type = "config"
+
+                gate_reason = metadata.get("previous_gate_reason", "")
+                self._api("POST", f"/api/mem/{self.project_id}/write", {
+                    "module": changed[0] if changed else "general",
+                    "kind": "decision",
+                    "content": summary or f"Changed {len(changed)} files",
+                    "structured": {
+                        "decision_type": decision_type,
+                        "related_files": changed,
+                        "validation_status": "untested",
+                        "failure_pattern": gate_reason if gate_reason else None,
+                        "followup_needed": bool(gate_reason),
+                        "task_id": task_id,
+                        "chain_stage": "dev",
+                    },
+                })
+
+            elif task_type == "test":
+                report = result.get("test_report", {})
+                passed = report.get("passed", 0) or 0
+                failed = report.get("failed", 0) or 0
+                self._api("POST", f"/api/mem/{self.project_id}/write", {
+                    "module": "testing",
+                    "kind": "test_result" if failed == 0 else "failure_pattern",
+                    "content": f"{passed} passed, {failed} failed",
+                    "structured": {
+                        "related_files": changed,
+                        "validation_status": "tested" if failed == 0 else "failed",
+                        "failure_pattern": report.get("error_summary", "") if failed > 0 else None,
+                        "followup_needed": failed > 0,
+                        "task_id": task_id,
+                        "chain_stage": "test",
+                    },
+                })
+
+            elif task_type == "qa" and result.get("recommendation") == "reject":
+                self._api("POST", f"/api/mem/{self.project_id}/write", {
+                    "module": changed[0] if changed else "general",
+                    "kind": "failure_pattern",
+                    "content": result.get("review_summary", "QA rejected"),
+                    "structured": {
+                        "root_cause": result.get("reject_reason", ""),
+                        "related_files": changed,
+                        "followup_needed": True,
+                        "task_id": task_id,
+                        "chain_stage": "qa",
+                    },
+                })
+        except Exception as e:
+            log.warning("Memory write failed (non-fatal): %s", e)
 
     def _execute_merge(self, task_id: str, metadata: dict) -> dict:
         """Merge is a script operation: git add → git commit. No AI needed."""
@@ -239,6 +309,22 @@ class ExecutorWorker:
             commit_hash = rev.stdout.strip()
 
             log.info("Merge complete: %s (%d files)", commit_hash, len(staged))
+
+            # Update chain_version via governance API (5-step validated)
+            try:
+                old_ver_row = self._api("GET", f"/api/version-check/{self.project_id}")
+                old_ver = old_ver_row.get("chain_version", "")
+                self._api("POST", f"/api/version-update/{self.project_id}", {
+                    "chain_version": commit_hash,
+                    "updated_by": "auto-chain",
+                    "task_id": task_id,
+                    "chain_stage": "merge",
+                    "old_version": old_ver if old_ver != "(not set)" else "",
+                })
+                log.info("Chain version updated: %s → %s", old_ver, commit_hash)
+            except Exception as e:
+                log.warning("Version update failed (non-fatal): %s", e)
+
             return {"status": "succeeded", "result": {
                 "merge_commit": commit_hash,
                 "branch": "main",

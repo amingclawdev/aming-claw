@@ -182,6 +182,46 @@ def check_verify_permission(role: str, target_status: str) -> tuple[bool, str]:
     return False, f"{role} cannot verify to {target_status}"
 
 
+# Shared API knowledge injected into all role prompts
+_API_REFERENCE = """
+--- Available Governance APIs (use curl in Bash) ---
+
+1. Project State
+   GET /api/health                          — Service health, version, PID
+   GET /api/version-check/{pid}             — Version gate status, dirty files
+
+2. Task / Node
+   GET /api/task/{pid}/list                 — All tasks with status
+   GET /api/wf/{pid}/summary               — Node status counts
+   GET /api/wf/{pid}/node/{nid}            — Single node details
+   GET /api/wf/{pid}/export?format=json    — Full graph
+   GET /api/wf/{pid}/impact?files=a.py     — Impact analysis
+
+3. Memory
+   GET /api/mem/{pid}/query                 — All memories
+   GET /api/mem/{pid}/query?module=X        — Module-specific
+   GET /api/mem/{pid}/query?kind=pitfall    — By type
+
+4. Runtime / Audit
+   GET /api/audit/{pid}/log?limit=10        — Recent audit entries (SQLite, NOT log files)
+   GET /api/runtime/{pid}                   — Running tasks, queue depth
+
+5. Context Snapshot
+   GET /api/context-snapshot/{pid}?role=X   — Base context (auto-injected at startup)
+
+IMPORTANT: All data is in governance.db (SQLite) and dbservice.
+Do NOT suggest checking log files or filesystem directories.
+Each response includes generated_at and project_version for staleness detection.
+
+--- Query Guidelines ---
+1. Always read the base context snapshot before querying Layer 2 APIs
+2. Only query APIs relevant to your role
+3. If base context is sufficient, do NOT expand queries
+4. Prefer summaries first, details only when needed
+5. Do NOT continuously query "just in case"
+"""
+
+
 # System prompts per role
 ROLE_PROMPTS = {
     "pm": """You are the project PM (Product Manager).

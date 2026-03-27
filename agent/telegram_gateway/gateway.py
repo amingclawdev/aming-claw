@@ -659,6 +659,24 @@ def handle_task_dispatch(chat_id: int, text: str, route: dict) -> None:
     project_id = route.get("project_id", "")
     token = route.get("token", "")
 
+    # Version gate — check chain_version vs git HEAD (0 token, code logic only)
+    try:
+        check = gov_api("GET", f"/api/version-check/{project_id}")
+        if check and not check.get("ok", True):
+            lines = ["\u26a0\ufe0f Workflow gate blocked:"]
+            commits = check.get("commits_since_chain", 0)
+            if commits:
+                lines.append(f"  {commits} manual commits since last chain merge")
+                lines.append(f"  HEAD={check.get('head','')}  CHAIN={check.get('chain_version','')}")
+            dirty = check.get("dirty_files", [])
+            if dirty:
+                lines.append(f"  {len(dirty)} uncommitted files: {', '.join(dirty[:5])}")
+            lines.append("\nRun auto-chain to sync before submitting tasks.")
+            send_text(chat_id, "\n".join(lines))
+            return
+    except Exception as e:
+        log.warning("Version check failed (proceeding): %s", e)
+
     # Create coordinator task — AI decides whether to reply, create subtask, or escalate
     result = gov_api("POST", f"/api/task/{project_id}/create",
         data={

@@ -54,6 +54,33 @@ INTERNAL_ERROR = -32603
 _stdout_lock = threading.Lock()
 
 
+def _git_status(workspace: str) -> dict:
+    """Get git HEAD and dirty status from workspace."""
+    import subprocess
+    from datetime import datetime, timezone
+    result = {"head": "unknown", "dirty": False, "dirty_files": [],
+              "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=workspace, timeout=10
+        ).decode().strip()
+        result["head"] = head
+    except Exception:
+        pass
+    try:
+        diff = subprocess.check_output(
+            ["git", "diff", "--name-only"],
+            cwd=workspace, timeout=10
+        ).decode().strip()
+        if diff:
+            result["dirty"] = True
+            result["dirty_files"] = [f for f in diff.splitlines() if f.strip()]
+    except Exception:
+        pass
+    return result
+
+
 def _write(msg: dict) -> None:
     line = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
     with _stdout_lock:
@@ -87,6 +114,7 @@ class AmingClawMCP:
                  redis_url: str, max_workers: int = 0):
         self.project_id = project_id
         self.gov_url = governance_url.rstrip("/")
+        self._workspace = workspace
 
         # Worker pool — only if explicitly requested (default: 0 = no workers)
         # Executor should run as independent process to avoid blocking MCP stdio
@@ -121,6 +149,7 @@ class AmingClawMCP:
         if self.worker_pool:
             self.worker_pool.start()
         self.event_bridge.start()
+        self._start_http_api()
 
         # Read stdin (JSON-RPC messages from Claude Code)
         try:
@@ -136,6 +165,35 @@ class AmingClawMCP:
             pass
         finally:
             self._shutdown()
+
+    def _start_http_api(self):
+        """Lightweight HTTP API on :40020 for Docker services to query git status."""
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        workspace = self._workspace
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self_):
+                if self_.path == "/git-status":
+                    result = _git_status(workspace)
+                    body = json.dumps(result).encode()
+                    self_.send_response(200)
+                    self_.send_header("Content-Type", "application/json")
+                    self_.end_headers()
+                    self_.wfile.write(body)
+                else:
+                    self_.send_response(404)
+                    self_.end_headers()
+
+            def log_message(self_, *args):
+                pass  # suppress HTTP access logs
+
+        try:
+            http = HTTPServer(("0.0.0.0", 40020), Handler)
+            t = threading.Thread(target=http.serve_forever, daemon=True)
+            t.start()
+            log.info("HTTP API listening on :40020 (/git-status)")
+        except OSError as e:
+            log.warning("Could not bind :40020: %s (git-status unavailable)", e)
 
     def _shutdown(self) -> None:
         log.info("Shutting down MCP server...")

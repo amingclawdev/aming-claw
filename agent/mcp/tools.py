@@ -130,6 +130,29 @@ TOOLS: list[dict] = [
         "description": "Check governance service health and version.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "version_check",
+        "description": "Check if working tree is clean and HEAD matches CHAIN_VERSION. Returns ok, head, chain_version, dirty_files.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project identifier"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "telegram_send",
+        "description": "Send a message to Telegram via the bot.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "string", "description": "Telegram chat ID"},
+                "text": {"type": "string", "description": "Message text"},
+            },
+            "required": ["chat_id", "text"],
+        },
+    },
 ]
 
 
@@ -206,4 +229,33 @@ class ToolDispatcher:
         if name == "health":
             return self._api("GET", "/api/health")
 
+        if name == "version_check":
+            pid = args["project_id"]
+            return self._api("GET", f"/api/version-check/{pid}")
+
+        # --- Telegram ---
+        if name == "telegram_send":
+            return self._send_telegram(args["chat_id"], args["text"])
+
         raise ValueError(f"Unknown tool: {name!r}")
+
+    def _send_telegram(self, chat_id: str, text: str) -> dict:
+        """Send message directly via Telegram Bot API."""
+        import os
+        import urllib.request
+        import urllib.error
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not token:
+            return {"error": "TELEGRAM_BOT_TOKEN not set"}
+        import json as _json
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        body = _json.dumps({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return _json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            return {"error": str(exc), "body": exc.read().decode()[:200]}
+        except Exception as exc:
+            return {"error": str(exc)}
