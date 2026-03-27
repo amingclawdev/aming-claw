@@ -231,7 +231,40 @@ class ToolDispatcher:
 
         if name == "version_check":
             pid = args["project_id"]
-            return self._api("GET", f"/api/version-check/{pid}")
+            # Get chain_version from governance DB
+            result = self._api("GET", f"/api/version-check/{pid}")
+            # Enrich with git dirty check (MCP runs on host, has git)
+            import subprocess, os
+            workspace = os.environ.get("CODEX_WORKSPACE",
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            try:
+                head = subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=workspace, timeout=5
+                ).decode().strip()
+                result["head"] = head
+                dirty = subprocess.check_output(
+                    ["git", "diff", "--name-only"],
+                    cwd=workspace, timeout=5
+                ).decode().strip()
+                if dirty:
+                    result["dirty"] = True
+                    result["dirty_files"] = [f for f in dirty.splitlines() if f.strip()]
+                    result["ok"] = False
+                    result["message"] = (result.get("message", "") + "; " if result.get("message") else "") + f"{len(result['dirty_files'])} uncommitted files"
+                # Also check HEAD vs chain_version
+                chain_ver = result.get("chain_version", "")
+                if chain_ver and chain_ver != "(not set)" and head != chain_ver:
+                    result["ok"] = False
+                    commits = subprocess.check_output(
+                        ["git", "log", "--oneline", f"{chain_ver}..HEAD"],
+                        cwd=workspace, timeout=5
+                    ).decode().strip().splitlines()
+                    result["commits_since_chain"] = len(commits)
+                    result["message"] = (result.get("message", "") + "; " if result.get("message") else "") + f"{len(commits)} manual commits"
+            except Exception:
+                pass  # fail-open if git unavailable
+            return result
 
         # --- Telegram ---
         if name == "telegram_send":

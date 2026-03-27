@@ -12,6 +12,13 @@ from typing import Any, Dict, Optional
 import requests
 
 
+# ── Hello World ──────────────────────────────────────────────────────────────
+
+def hello_world() -> str:
+    """Return a hello world greeting string."""
+    return "Hello, World!"
+
+
 # ── Project ID normalization ─────────────────────────────────────────────────
 
 def normalize_project_id(raw: str) -> str:

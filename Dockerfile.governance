@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r agent/requirements.txt
 # Copy agent source
 COPY agent/ agent/
 
+# Copy VERSION file for version gate
+COPY VERSION VERSION
+
 # Create shared-volume directory structure
 RUN mkdir -p /app/shared-volume/codex-tasks/state/governance
 

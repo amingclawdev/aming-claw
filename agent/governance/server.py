@@ -1383,7 +1383,12 @@ def handle_health(ctx: RequestContext):
 
 @route("GET", "/api/version-check/{project_id}")
 def handle_version_check(ctx: RequestContext):
-    """Check chain version vs git HEAD. Calls MCP /git-status for git data."""
+    """Check chain version. Reads CHAIN_VERSION from DB, compares with VERSION file.
+
+    VERSION file is COPY'd into Docker at build time and contains the git HEAD
+    at build time. This avoids needing git inside the container or calling MCP.
+    For dirty-file detection, caller (MCP tool / gateway) should check separately.
+    """
     pid = ctx.get_project_id()
     conn = get_connection(pid)
 
@@ -1392,38 +1397,33 @@ def handle_version_check(ctx: RequestContext):
     chain_ver = row["chain_version"] if row else None
     chain_updated = row["updated_at"] if row else None
 
-    # Get git status from MCP server (host has git)
-    import urllib.request, urllib.error
-    git_data = {"head": "unknown", "dirty": False, "dirty_files": []}
-    try:
-        resp = urllib.request.urlopen("http://host.docker.internal:40020/git-status", timeout=5)
-        git_data = json.loads(resp.read().decode())
-    except Exception:
+    # Read build-time version from VERSION file (COPY'd into Docker)
+    build_ver = "unknown"
+    import os
+    for vpath in ["/app/VERSION", os.path.join(os.getcwd(), "VERSION"),
+                  os.path.join(os.path.dirname(__file__), "..", "..", "VERSION")]:
         try:
-            resp = urllib.request.urlopen("http://localhost:40020/git-status", timeout=3)
-            git_data = json.loads(resp.read().decode())
-        except Exception:
-            pass  # fail-open: can't reach MCP
+            with open(vpath) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("CHAIN_VERSION="):
+                        build_ver = line.split("=", 1)[1].strip()
+                        break
+            if build_ver != "unknown":
+                break
+        except FileNotFoundError:
+            continue
 
-    head = git_data.get("head", "unknown")
-    dirty = git_data.get("dirty", False)
-    dirty_files = git_data.get("dirty_files", [])
-
-    # Compare
+    # Compare: chain_ver (DB) vs build_ver (VERSION file)
     if not chain_ver:
         ok = True
         msg = "No chain_version set (project not initialized)"
-    elif head == "unknown":
+    elif build_ver == "unknown":
         ok = True
-        msg = "Git status unavailable (MCP unreachable)"
-    elif head != chain_ver or dirty:
+        msg = "VERSION file not found (first deploy)"
+    elif build_ver != chain_ver:
         ok = False
-        parts = []
-        if head != chain_ver:
-            parts.append(f"HEAD ({head}) != CHAIN_VERSION ({chain_ver})")
-        if dirty:
-            parts.append(f"{len(dirty_files)} uncommitted files")
-        msg = "; ".join(parts)
+        msg = f"BUILD_VERSION ({build_ver}) != CHAIN_VERSION ({chain_ver})"
     else:
         ok = True
         msg = ""
@@ -1431,11 +1431,11 @@ def handle_version_check(ctx: RequestContext):
     return {
         "ok": ok,
         "project_id": pid,
-        "head": head,
+        "head": build_ver,
         "chain_version": chain_ver or "(not set)",
         "chain_updated_at": chain_updated,
-        "dirty": dirty,
-        "dirty_files": dirty_files,
+        "dirty": False,   # dirty check done by MCP tool on host
+        "dirty_files": [],
         "message": msg,
         "generated_at": _utc_now(),
         "project_version": chain_ver or "unknown",
