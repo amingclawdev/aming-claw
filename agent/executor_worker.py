@@ -44,6 +44,7 @@ WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]
 
 # Task type → (role, timeout_sec)
 TASK_ROLE_MAP = {
+    "coordinator": ("coordinator", 120),
     "pm":    ("coordinator", 120),
     "dev":   ("dev", 300),
     "test":  ("tester", 180),
@@ -258,6 +259,18 @@ class ExecutorWorker:
                 "\"acceptance_criteria\": [\"...\"]}"
             )
 
+        elif task_type == "coordinator":
+            chat_id = context.get("chat_id", metadata.get("chat_id", ""))
+            parts.append(f"\nYou are a Coordinator. Analyze the user message and decide the action.")
+            parts.append("User message from Telegram (chat_id=" + str(chat_id) + "):")
+            parts.append(f'"{prompt}"')
+            parts.append("\nRespond with EXACTLY ONE JSON object (no other text):")
+            parts.append('If this is a question → {"action": "reply", "text": "your answer here"}')
+            parts.append('If this needs code changes → {"action": "create_task", "type": "pm", "prompt": "detailed description of what to build/fix"}')
+            parts.append('If this needs testing → {"action": "create_task", "type": "test", "prompt": "what to test"}')
+            parts.append('If this is a status check → {"action": "reply", "text": "status info"}')
+            parts.append('\nIMPORTANT: Output ONLY the JSON object, nothing else.')
+
         elif task_type == "test":
             changed = context.get("changed_files", [])
             parts.append(f"\nRun tests. Changed files: {json.dumps(changed)}")
@@ -289,6 +302,81 @@ class ExecutorWorker:
     #   governance/auto_chain.py  → L2.1  AutoChain      (stage-transition dispatcher)
     #   governance/graph.py       → L1.3  AcceptanceGraph (DAG rule layer)
     #   governance/task_registry.py → L2.2 TaskRegistry  (task CRUD / queue)
+    def _handle_coordinator_result(self, task: dict, result: dict) -> None:
+        """Parse coordinator AI output and execute the decided action."""
+        import re
+
+        metadata = task.get("metadata", {})
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        chat_id = metadata.get("chat_id", "")
+
+        # Extract JSON from AI output (may be wrapped in markdown or text)
+        raw = result.get("summary", "") or result.get("raw_output", "") or json.dumps(result)
+        json_match = re.search(r'\{[^{}]*"action"\s*:\s*"[^"]+?"[^{}]*\}', raw)
+        if not json_match:
+            log.warning("Coordinator output has no action JSON: %s", raw[:200])
+            if chat_id:
+                self._telegram_reply(chat_id, f"Coordinator could not decide. Raw output:\n{raw[:500]}")
+            return
+
+        try:
+            action_data = json.loads(json_match.group())
+        except json.JSONDecodeError:
+            log.error("Invalid coordinator JSON: %s", json_match.group()[:200])
+            return
+
+        action = action_data.get("action", "")
+        log.info("Coordinator action: %s (task %s)", action, task["task_id"])
+
+        if action == "reply":
+            text = action_data.get("text", "No response")
+            if chat_id:
+                self._telegram_reply(chat_id, text)
+            else:
+                log.warning("No chat_id for reply: %s", text[:200])
+
+        elif action == "create_task":
+            sub_type = action_data.get("type", "pm")
+            sub_prompt = action_data.get("prompt", "")
+            if sub_prompt:
+                sub_result = self._api("POST", f"/api/task/{self.project_id}/create", {
+                    "prompt": sub_prompt,
+                    "type": sub_type,
+                    "priority": 1,
+                    "metadata": {
+                        "parent_task_id": task["task_id"],
+                        "chat_id": chat_id,
+                        "source": "coordinator",
+                    },
+                })
+                sub_id = sub_result.get("task_id", "?")
+                log.info("Coordinator created subtask: %s (type=%s)", sub_id, sub_type)
+                if chat_id:
+                    self._telegram_reply(chat_id, f"Task created: {sub_id[-12:]}\nType: {sub_type}\nPrompt: {sub_prompt[:100]}")
+
+        elif action == "scale_workers":
+            count = action_data.get("count", 1)
+            log.info("Coordinator requested scale to %d workers (not implemented)", count)
+
+        else:
+            log.warning("Unknown coordinator action: %s", action)
+
+    def _telegram_reply(self, chat_id, text: str) -> None:
+        """Send reply to Telegram via Bot API."""
+        import urllib.request, urllib.error
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not token:
+            log.warning("TELEGRAM_BOT_TOKEN not set, cannot reply")
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        body = json.dumps({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            log.error("Telegram reply failed: %s", e)
+
     _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", "executor_worker.py"}
 
     def _get_git_changed_files(self) -> list:
@@ -395,6 +483,11 @@ class ExecutorWorker:
             outcome = self._execute_task(task)
             status = outcome.get("status", "failed")
             result = outcome.get("result", {"error": outcome.get("error", "unknown")})
+
+            # Coordinator post-processing: parse action from AI output
+            task_type = task.get("type", "")
+            if task_type == "coordinator" and status == "succeeded":
+                self._handle_coordinator_result(task, result)
 
             completion = self._complete_task(task_id, status, result)
             chain = completion.get("auto_chain", {})

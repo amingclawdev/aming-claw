@@ -668,11 +668,11 @@ def handle_task_dispatch(chat_id: int, text: str, route: dict) -> None:
     project_id = route.get("project_id", "")
     token = route.get("token", "")
 
-    # Create task via Governance API — single source of truth
+    # Create coordinator task — AI decides whether to reply, create subtask, or escalate
     result = gov_api("POST", f"/api/task/{project_id}/create",
         data={
             "prompt": text,
-            "type": "task",
+            "type": "coordinator",
             "priority": 1,
             "metadata": {"chat_id": chat_id, "source": "telegram"},
         },

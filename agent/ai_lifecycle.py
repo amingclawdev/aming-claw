@@ -99,10 +99,13 @@ class AILifecycleManager:
 
         # Tool access by role:
         # - dev: Read + Write + Edit + Bash (worktree isolation protects main)
-        # - coordinator/pm/tester/qa: Read-only (must delegate code changes to dev)
+        # Role-based tool permissions:
+        # - dev: full access (worktree isolation protects main)
+        # - tester/coordinator: read + bash (run tests, query APIs)
+        # - pm/qa: read-only
         if role == "dev":
             allowed_tools = "Read,Grep,Glob,Write,Edit,Bash"
-        elif role == "tester":
+        elif role in ("tester", "coordinator"):
             allowed_tools = "Read,Grep,Glob,Bash"
         else:
             allowed_tools = "Read,Grep,Glob"
