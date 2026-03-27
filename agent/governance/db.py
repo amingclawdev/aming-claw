@@ -257,11 +257,15 @@ def get_connection(project_id: str) -> sqlite3.Connection:
         This means callers never need to manage schema lifecycle manually.
     """.format(version=SCHEMA_VERSION)
     db_path = _project_db_path(project_id)
-    conn = sqlite3.connect(str(db_path), timeout=10)
+
+    # On Docker restart, stale WAL locks may block new connections.
+    # SQLite automatically recovers WAL state on first connect, but only
+    # if the -shm file is accessible. Increase timeout to handle this.
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=10000")
     _ensure_schema(conn)
     return conn
 
