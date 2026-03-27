@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -403,7 +403,19 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
             )
         """)
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5}
+    def _migrate_v5_to_v6(c):
+        """Add git sync columns to project_version (executor writes git status)."""
+        for col, typedef in [
+            ("git_head", "TEXT DEFAULT ''"),
+            ("dirty_files", "TEXT DEFAULT '[]'"),
+            ("git_synced_at", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE project_version ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass  # column already exists
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)
