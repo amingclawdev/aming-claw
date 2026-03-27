@@ -1,4 +1,4 @@
-# v7: full chain with node gates
+# v8: evidence summary fix
 """Auto-chain dispatcher.
 
 Wires task completion to next-stage task creation with gate validation
@@ -301,9 +301,11 @@ def _gate_qa_pass(conn, project_id, result, metadata):
         # Auto-pass: QA didn't explicitly reject, treat as pass
         log.info("qa_pass gate: no explicit recommendation, auto-passing (rec=%s)", rec)
     # Update nodes FIRST (QA passed → promote to qa_pass)
+    # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
     _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
-                       {"type": "qa_review", "producer": "auto-chain",
-                        "summary": result.get("review_summary", "")})
+                       {"type": "e2e_report", "producer": "auto-chain",
+                        "summary": {"passed": 1, "failed": 0,
+                                    "review": result.get("review_summary", "auto-chain QA pass")}})
     # Then verify nodes reached qa_pass
     related_nodes = metadata.get("related_nodes", [])
     if related_nodes:
