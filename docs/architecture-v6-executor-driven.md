@@ -1676,6 +1676,18 @@ Auto-chain merge (_execute_merge):
   → All aligned → next message passes gate
 ```
 
+### Deploy Chain
+
+After merge, `deploy_chain.run_deploy()` detects affected services and rebuilds:
+
+| Service | Trigger files | Action |
+|---------|--------------|--------|
+| governance | `agent/governance/*` | `docker compose build governance` + `up -d` |
+| gateway | `agent/telegram_gateway/*` | `docker compose build telegram-gateway` + `up -d` |
+| executor | `agent/executor_worker.py`, `agent/ai_lifecycle.py` | ServiceManager reload |
+
+Both governance and gateway do `build + up` (not just `restart`), ensuring code changes are deployed.
+
 ### Anti-tamper
 
 VERSION file warns AI agents not to edit manually. Even if they do, the commit changes HEAD → no longer matches the value written → gate still blocks.
