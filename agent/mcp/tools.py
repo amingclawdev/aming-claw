@@ -251,7 +251,7 @@ class ToolDispatcher:
                 os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
             try:
                 head = subprocess.check_output(
-                    ["git", "rev-parse", "--short", "HEAD"],
+                    ["git", "rev-parse", "HEAD"],
                     cwd=workspace, timeout=5
                 ).decode().strip()
                 result["head"] = head
