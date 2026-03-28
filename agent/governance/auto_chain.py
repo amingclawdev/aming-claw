@@ -32,12 +32,34 @@ MAX_CHAIN_DEPTH = 10
 def on_task_completed(conn, project_id, task_id, task_type, status, result, metadata):
     """Called by complete_task(). Dispatches next stage if gate passes.
 
+    Uses a SEPARATE connection to avoid holding caller's transaction lock
+    during potentially slow gate checks and task creation.
+
     Returns dict with chain result, or None if not a chain-eligible task.
     """
     if status != "succeeded":
         return None
     if task_type not in CHAIN:
         return None
+
+    # Use independent connection — don't hold caller's lock during chain ops
+    from .db import get_connection
+    try:
+        conn = get_connection(project_id)
+    except Exception:
+        log.error("auto_chain: failed to get independent connection for %s", project_id)
+        return None
+    try:
+        return _do_chain(conn, project_id, task_id, task_type, result, metadata)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _do_chain(conn, project_id, task_id, task_type, result, metadata):
+    """Internal chain logic with guaranteed conn cleanup by caller."""
 
     # Auto-enrich: derive related_nodes from changed_files via impact API
     if not metadata.get("related_nodes"):
