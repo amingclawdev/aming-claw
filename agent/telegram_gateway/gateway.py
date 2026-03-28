@@ -675,7 +675,12 @@ def handle_task_dispatch(chat_id: int, text: str, route: dict) -> None:
             send_text(chat_id, "\n".join(lines))
             return
     except Exception as e:
-        log.warning("Version check failed (proceeding): %s", e)
+        log.error("Version check failed (blocking): %s", e)
+        send_text(chat_id, f"⚠️ System unavailable: governance API error.\n"
+                  f"Possible cause: DB locked by direct sqlite3 access from host.\n"
+                  f"Observer: stop direct DB reads, use governance API only.\n"
+                  f"Error: {str(e)[:100]}")
+        return
 
     # Create coordinator task — AI decides whether to reply, create subtask, or escalate
     result = gov_api("POST", f"/api/task/{project_id}/create",
