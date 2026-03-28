@@ -748,7 +748,7 @@ class ExecutorWorker:
         permanently stuck in the 'claimed' state.
         """
         try:
-            data = self._api("GET", f"/api/task/{self.project_id}/list")
+            data = self._api("GET", f"/api/task/{self.project_id}/list?status=claimed&limit=200")
             tasks = data.get("tasks", [])
             claimed = [t for t in tasks if t.get("status") == "claimed"]
             if not claimed:

@@ -132,6 +132,50 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         "project_id": project_id, "task_id": task_id,
         "result": result, "type": task_type,
     })
+    # A1: Audit task.completed lifecycle event
+    try:
+        from . import audit_service
+        audit_service.record(
+            conn, project_id, f"{task_type}.completed",
+            actor="auto-chain",
+            ok=True,
+            node_ids=metadata.get("related_nodes", []),
+            task_id=task_id,
+            chain_depth=depth,
+        )
+    except Exception:
+        log.debug("auto_chain: audit task.completed failed (non-critical)", exc_info=True)
+
+    # M1: PM completes → persist PRD scope to memory for future dev/qa recall
+    if task_type == "pm":
+        prd = result.get("prd", result)
+        requirements = prd.get("requirements", result.get("requirements", []))
+        criteria = result.get("acceptance_criteria", prd.get("acceptance_criteria", []))
+        if requirements or criteria:
+            _write_chain_memory(
+                conn, project_id, "prd_scope",
+                json.dumps({"requirements": requirements,
+                            "acceptance_criteria": criteria,
+                            "summary": result.get("summary", "")},
+                           ensure_ascii=False),
+                metadata,
+                extra_structured={"task_id": task_id, "chain_stage": "pm"},
+            )
+
+    # M4: Test completes → write validation_result memory (marks dev decision as tested)
+    if task_type == "test":
+        report = result.get("test_report", {})
+        passed = report.get("passed", 0) if isinstance(report, dict) else 0
+        if passed:
+            _write_chain_memory(
+                conn, project_id, "validation_result",
+                f"Tests passed ({passed} passing) for {', '.join(metadata.get('changed_files', [])[:3])}",
+                metadata,
+                extra_structured={"task_id": task_id, "chain_stage": "test",
+                                   "test_report": report,
+                                   "validation_status": "tested",
+                                   "parent_task_id": metadata.get("parent_task_id", "")},
+            )
 
     # Auto-update nodes based on stage completion
     if task_type == "dev" and metadata.get("related_nodes"):
@@ -150,6 +194,29 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             "stage": task_type, "next_stage": next_type or "deploy",
             "reason": reason,
         })
+        # M3: Gate fail → write pitfall memory so future tasks avoid same mistake
+        _write_chain_memory(
+            conn, project_id, "pitfall",
+            f"Gate blocked at {task_type}: {reason}",
+            metadata,
+            extra_structured={"task_id": task_id, "gate_stage": task_type,
+                               "gate_reason": reason, "chain_stage": task_type},
+        )
+        # G3: Persist gate.blocked to audit_index
+        try:
+            from . import audit_service
+            audit_service.record(
+                conn, project_id, "gate.blocked",
+                actor="auto-chain",
+                ok=False,
+                node_ids=metadata.get("related_nodes", []),
+                task_id=task_id,
+                stage=task_type,
+                next_stage=next_type or "deploy",
+                reason=reason,
+            )
+        except Exception:
+            log.debug("auto_chain: audit gate.blocked failed (non-critical)", exc_info=True)
 
         # Auto-retry: create a new task at the SAME stage with gate reason injected
         # Max 2 retries per gate to prevent infinite loops
@@ -207,6 +274,20 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         builder_fn = _BUILDERS[builder_name]
         deploy_result = builder_fn(conn, project_id, task_id, result, metadata)
         log.info("auto_chain: deploy triggered from task %s: %s", task_id, deploy_result)
+        # A2: chain.completed audit summary
+        try:
+            from . import audit_service
+            audit_service.record(
+                conn, project_id, "chain.completed",
+                actor="auto-chain",
+                ok=True,
+                node_ids=metadata.get("related_nodes", []),
+                task_id=task_id,
+                chain_depth=depth,
+                changed_files=metadata.get("changed_files", []),
+            )
+        except Exception:
+            log.debug("auto_chain: audit chain.completed failed (non-critical)", exc_info=True)
         # Archive chain context (release memory, DB data preserved)
         try:
             from .chain_context import get_store
@@ -422,7 +503,8 @@ def _gate_t2_pass(conn, project_id, result, metadata):
 def _gate_qa_pass(conn, project_id, result, metadata):
     """Verify QA recommendation before merge.
 
-    Accepts: explicit qa_pass, or auto-pass when tests passed and no reject.
+    Requires explicit qa_pass or qa_pass_with_fallback recommendation.
+    Missing or ambiguous recommendation is a hard block (not auto-pass).
     """
     rec = result.get("recommendation", "")
     if rec in ("qa_pass", "qa_pass_with_fallback"):
@@ -430,12 +512,11 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     elif rec in ("reject", "rejected"):
         return False, f"QA rejected: {result.get('reason', 'no reason given')}"
     else:
-        # No explicit recommendation — auto-pass if severity is not blocking
-        severity = result.get("severity", "")
-        if severity == "blocking":
-            return False, f"QA blocking issue: {result.get('detail', result.get('reason', ''))}"
-        # Auto-pass: QA didn't explicitly reject, treat as pass
-        log.info("qa_pass gate: no explicit recommendation, auto-passing (rec=%s)", rec)
+        # No explicit recommendation — BLOCK. Auto-pass is a security risk.
+        return False, (
+            f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
+            f"Got: {rec!r}. QA agent must set result.recommendation."
+        )
     # Update nodes FIRST (QA passed → promote to qa_pass)
     # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
     _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
@@ -448,6 +529,14 @@ def _gate_qa_pass(conn, project_id, result, metadata):
         passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
         if not passed:
             return False, f"qa_pass gate blocked — {reason}"
+    # M2: QA passed → write success pattern memory
+    _write_chain_memory(
+        conn, project_id, "qa_decision",
+        result.get("review_summary", f"QA approved (rec={rec})"),
+        metadata,
+        extra_structured={"recommendation": rec, "chain_stage": "qa",
+                          "changed_files": metadata.get("changed_files", [])},
+    )
     return True, "ok"
 
 
@@ -595,6 +684,37 @@ def _trigger_deploy(conn, project_id, task_id, result, metadata):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _write_chain_memory(conn, project_id, kind, content, metadata, extra_structured=None):
+    """Best-effort memory write for chain events. Never blocks chain progress."""
+    try:
+        from . import memory_service
+        from .models import MemoryEntry
+        # Derive module_id from first target_file or changed_file
+        target = (metadata.get("target_files") or metadata.get("changed_files") or [])
+        module_id = target[0].replace("/", ".").replace("\\", ".") if target else "governance"
+        entry = MemoryEntry(
+            module_id=module_id,
+            kind=kind,
+            content=content,
+            created_by="auto-chain",
+        )
+        result = memory_service.write_memory(conn, project_id, entry)
+        if extra_structured:
+            # Patch structured field if write succeeded
+            mid = result.get("memory_id", "")
+            if mid:
+                try:
+                    import json as _json
+                    conn.execute(
+                        "UPDATE memories SET structured = ? WHERE memory_id = ?",
+                        (_json.dumps(extra_structured), mid),
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        log.debug("_write_chain_memory failed (non-critical)", exc_info=True)
+
 
 # Status ordering for node_state validation
 _STATUS_ORDER = ["pending", "testing", "t2_pass", "qa_pass"]
