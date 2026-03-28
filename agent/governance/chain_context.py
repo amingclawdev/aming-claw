@@ -231,7 +231,7 @@ class ChainContextStore:
                             payload, project_id)
 
     def on_task_failed(self, payload: dict):
-        """Handle task.failed event (retry exhausted)."""
+        """Handle task.failed event (retry exhausted). Auto-archives to release memory."""
         task_id = payload.get("task_id", "")
         project_id = payload.get("project_id", "")
 
@@ -247,6 +247,10 @@ class ChainContextStore:
 
         self._persist_event(root_id, task_id, "task.failed",
                             payload, project_id)
+
+        # Auto-archive failed chains to prevent memory leak
+        if not self._recovering:
+            self.archive_chain(task_id, project_id)
 
     # ── Read API (from memory, O(1)) ──
 

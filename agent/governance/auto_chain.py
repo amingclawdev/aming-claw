@@ -242,6 +242,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         "parent_task_id": task_id,
         "task_id": new_task.get("task_id"),
         "type": next_type,
+        "prompt": prompt,
         "source": "auto-chain",
     })
     return new_task
@@ -470,18 +471,26 @@ def _build_dev_prompt(task_id, result, metadata):
     # target_files: result > prd > original metadata (preserve original task metadata)
     target_files = result.get("target_files", prd.get("target_files", metadata.get("target_files", [])))
 
+    verification = result.get("verification", prd.get("verification", {}))
+    requirements = prd.get("requirements", [])
+    criteria = result.get("acceptance_criteria", prd.get("acceptance_criteria", []))
+
     # Fallback: if PM result lacks expected structure, read from chain context
-    if not target_files:
+    if not target_files or not verification or not criteria:
         try:
             from .chain_context import get_store
             parent_result = get_store().get_parent_result(task_id)
             if parent_result:
-                target_files = parent_result.get("target_files", target_files)
+                if not target_files:
+                    target_files = parent_result.get("target_files", target_files)
+                if not verification:
+                    verification = parent_result.get("verification", verification)
+                if not criteria:
+                    criteria = parent_result.get("acceptance_criteria", criteria)
+                if not requirements:
+                    requirements = parent_result.get("requirements", requirements)
         except Exception:
             pass
-    verification = result.get("verification", prd.get("verification", {}))
-    requirements = prd.get("requirements", [])
-    criteria = result.get("acceptance_criteria", prd.get("acceptance_criteria", []))
     prompt = (
         f"Implement per PRD from {task_id}.\n\n"
         f"target_files: {json.dumps(target_files)}\n"
