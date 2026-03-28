@@ -1728,7 +1728,16 @@ def handle_context_snapshot(ctx: RequestContext):
     except Exception:
         pass
 
-    return {
+    # Task chain context (if task_id provided)
+    task_chain = None
+    if task_id:
+        try:
+            from .chain_context import get_store
+            task_chain = get_store().get_chain(task_id, role=role)
+        except Exception:
+            pass
+
+    result = {
         "snapshot_at": now,
         "project_id": pid,
         "role": role,
@@ -1740,6 +1749,9 @@ def handle_context_snapshot(ctx: RequestContext):
         "generated_at": now,
         "project_version": project_state["chain_version"],
     }
+    if task_chain:
+        result["task_chain"] = task_chain
+    return result
 
 
 # --- Documentation ---
@@ -2391,6 +2403,21 @@ def main():
         print("EventBus: Redis Pub/Sub bridge enabled")
     else:
         print("EventBus: Redis unavailable, in-process only")
+
+    # Register chain context EventBus subscribers + recover active chains
+    try:
+        from .chain_context import register_events, get_store
+        register_events()
+        # Recover active chains for known projects
+        from .db import _governance_root
+        gov_root = _governance_root()
+        if gov_root.exists():
+            for pdir in gov_root.iterdir():
+                if pdir.is_dir() and (pdir / "governance.db").exists():
+                    get_store().recover_from_db(pdir.name)
+        print("ChainContext: registered + recovered")
+    except Exception as e:
+        print(f"ChainContext: failed to start ({e})")
 
     # Start doc generator listener
     try:

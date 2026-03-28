@@ -458,6 +458,40 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 9. Duplicate trigger of same stage for same parent → no-op (idempotency)
 10. Checkpoint Gatekeeper has NO access to project context (isolation enforced)
 
+## Phase 8: Event-Sourced Chain Context
+
+### Problem
+Auto-chain retry loses context when `_original_prompt` metadata is empty. Gate-blocked tasks create retries with garbled prompts. No runtime visibility into chain state.
+
+### Solution: ChainContextStore
+Event-sourced in-memory store backed by append-only `chain_events` table.
+
+**Write path:** EventBus event → in-memory dict update → sync INSERT to DB (<1ms)
+**Read path:** in-memory dict lookup (O(1), no DB)
+**Recovery:** replay events from DB → rebuild in-memory state
+
+### Chain State Machine
+```
+running → blocked → retrying → running (loop)
+       → completed (merge success)
+       → failed (retry exhausted)
+       → archived (memory released, DB preserved)
+```
+
+### Role-Based Projection
+Each role sees only relevant stages and result fields:
+- **dev**: PM + dev stages, target_files/requirements/acceptance_criteria
+- **test**: dev + test stages, changed_files/target_files
+- **qa**: test + qa stages, test_report/changed_files/acceptance_criteria
+- **merge**: qa + merge stages, changed_files/test_report
+- **coordinator**: all stages, summary view
+
+### Integration Points
+- `auto_chain.py`: emits task.completed before gate, task.failed on retry exhaust, archives after merge
+- `server.py`: context-snapshot injects task_chain, startup registers EventBus + recovers
+- `task_registry.py`: auto-stores _original_prompt on create_task
+
 ## Changelog
+- 2026-03-28: Phase 8 Chain Context design and implementation
 - 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation
 - 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API

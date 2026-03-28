@@ -171,6 +171,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_project_ts ON audit_index(project_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_ok ON audit_index(ok);
 CREATE INDEX IF NOT EXISTS idx_idem_expires ON idempotency_keys(expires_at);
 CREATE INDEX IF NOT EXISTS idx_node_history_project ON node_history(project_id, node_id, ts);
+
+-- Chain context events (event-sourced, append-only)
+CREATE TABLE IF NOT EXISTS chain_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_task_id  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    event_type    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    ts            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chain_events_root ON chain_events(root_task_id, ts);
+CREATE INDEX IF NOT EXISTS idx_chain_events_task ON chain_events(task_id, event_type, ts);
 """
 
 

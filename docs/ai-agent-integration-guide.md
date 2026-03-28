@@ -588,6 +588,43 @@ POST /api/wf/my-app/release-gate
 
 **Never mark node status on your own when the governance service is unreachable.**
 
+## Chain Context (Phase 8)
+
+The auto-chain now maintains event-sourced runtime context for each task chain.
+
+### How It Works
+- `ChainContextStore` subscribes to EventBus events (`task.created`, `task.completed`, `gate.blocked`, `task.retry`, `task.failed`)
+- Each event updates in-memory state AND appends to `chain_events` DB table (append-only)
+- On crash recovery, events are replayed from DB to rebuild in-memory state
+
+### Context Snapshot API
+`GET /api/context-snapshot/{project_id}?task_id=XXX&role=dev` now includes a `task_chain` field:
+- Shows all stages in the chain, filtered by role visibility
+- dev sees PM + dev stages; test sees dev + test; coordinator sees all
+- `result_core` fields filtered per role (dev gets target_files/requirements, test gets changed_files, etc.)
+
+### Retry Prompt Recovery
+When a gate blocks and creates a retry task, the retry prompt now recovers the original prompt from chain context instead of relying solely on metadata (which was often empty). Fallback chain: metadata → ChainContextStore → result summary.
+
+### Chain Lifecycle
+- Chain starts when root task is created (root_task_id = first task_id)
+- Retry tasks inherit root_task_id from the original task
+- Chain states: running → blocked → retrying → completed/failed
+- After merge completes, chain is archived (memory released, DB data preserved for audit)
+
+### DB Schema
+```sql
+CREATE TABLE chain_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_task_id  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    event_type    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    ts            TEXT NOT NULL
+);
+```
+
 ## Changelog
+- 2026-03-28: Phase 8 Chain Context — event-sourced chain runtime context, retry prompt recovery, context-snapshot API
 - 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation
 - 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API

@@ -85,6 +85,12 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
         })
         return {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
 
+    # Emit task.completed to chain context store
+    _publish_event("task.completed", {
+        "project_id": project_id, "task_id": task_id,
+        "result": result, "type": task_type,
+    })
+
     # Auto-update nodes based on stage completion
     if task_type == "dev" and metadata.get("related_nodes"):
         _try_verify_update(conn, project_id, metadata, "testing", "dev",
@@ -107,11 +113,21 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
         # Max 2 retries per gate to prevent infinite loops
         gate_retries = metadata.get("_gate_retry_count", 0)
         if gate_retries < 2 and depth < MAX_CHAIN_DEPTH - 1 and not metadata.get("_no_retry"):
+            # Recover original prompt: metadata → chain context → result summary
+            original_prompt = metadata.get("_original_prompt", "")
+            if not original_prompt:
+                try:
+                    from .chain_context import get_store
+                    original_prompt = get_store().get_original_prompt(task_id)
+                except Exception:
+                    pass
+            if not original_prompt:
+                original_prompt = result.get("summary", "")
             retry_prompt = (
                 f"Previous attempt ({task_id}) was blocked by gate.\n"
                 f"Gate reason: {reason}\n\n"
                 f"Fix the issue described above and retry.\n"
-                f"Original task: {metadata.get('_original_prompt', result.get('summary', ''))}"
+                f"Original task: {original_prompt}"
             )
             from . import task_registry
             retry_task = task_registry.create_task(
@@ -125,7 +141,7 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
                     "chain_depth": depth + 1,
                     "previous_gate_reason": reason,
                     "_gate_retry_count": gate_retries + 1,
-                    "_original_prompt": metadata.get("_original_prompt", ""),
+                    "_original_prompt": original_prompt,
                 },
             )
             retry_id = retry_task.get("task_id", "?")
@@ -137,13 +153,24 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
             return {"gate_blocked": True, "stage": task_type, "reason": reason,
                     "retry_task_id": retry_id}
 
+        # Retry exhausted — emit task.failed
+        _publish_event("task.failed", {
+            "project_id": project_id, "task_id": task_id,
+            "reason": "gate_retry_exhausted", "gate_reason": reason,
+        })
         return {"gate_blocked": True, "stage": task_type, "reason": reason}
 
-    # Terminal stage → trigger deploy
+    # Terminal stage → trigger deploy + archive chain
     if next_type is None:
         builder_fn = _BUILDERS[builder_name]
         deploy_result = builder_fn(conn, project_id, task_id, result, metadata)
         log.info("auto_chain: deploy triggered from task %s: %s", task_id, deploy_result)
+        # Archive chain context (release memory, DB data preserved)
+        try:
+            from .chain_context import get_store
+            get_store().archive_chain(task_id, project_id)
+        except Exception:
+            log.debug("auto_chain: chain archive failed (non-critical)")
         return deploy_result
 
     # Create next stage task
@@ -389,6 +416,16 @@ def _build_dev_prompt(task_id, result, metadata):
     prd = result.get("prd", {})
     # target_files: result > prd > original metadata (preserve original task metadata)
     target_files = result.get("target_files", prd.get("target_files", metadata.get("target_files", [])))
+
+    # Fallback: if PM result lacks expected structure, read from chain context
+    if not target_files:
+        try:
+            from .chain_context import get_store
+            parent_result = get_store().get_parent_result(task_id)
+            if parent_result:
+                target_files = parent_result.get("target_files", target_files)
+        except Exception:
+            pass
     verification = result.get("verification", prd.get("verification", {}))
     requirements = prd.get("requirements", [])
     criteria = result.get("acceptance_criteria", prd.get("acceptance_criteria", []))

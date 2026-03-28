@@ -410,6 +410,7 @@ aming_claw/
 │   ├── governance/              # Governance service (29 modules)
 │   │   ├── server.py            # HTTP server + routing (40006)
 │   │   ├── auto_chain.py        # Auto-chain dispatcher (PM→Dev→Test→QA→Merge→Deploy)
+│   │   ├── chain_context.py      # Event-sourced chain context + crash recovery
 │   │   ├── task_registry.py     # Task lifecycle management
 │   │   ├── state_service.py     # Node state transitions
 │   │   ├── role_service.py      # Roles + sessions + tokens

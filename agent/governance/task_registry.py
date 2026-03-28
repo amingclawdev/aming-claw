@@ -60,7 +60,12 @@ def create_task(
     task_id = _new_task_id()
     now = _utc_iso()
 
-    notify = "pending" if (metadata or {}).get("chat_id") else "none"
+    # Auto-store original prompt for retry context recovery
+    metadata = metadata or {}
+    if "_original_prompt" not in metadata:
+        metadata["_original_prompt"] = prompt
+
+    notify = "pending" if metadata.get("chat_id") else "none"
     conn.execute(
         """INSERT INTO tasks
            (task_id, project_id, status, execution_status, notification_status,

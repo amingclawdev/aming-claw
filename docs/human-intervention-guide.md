@@ -324,6 +324,20 @@ Manual intervention unlocked only when:
       OR an architectural / credential / large-scope condition applies
 ```
 
+## Chain Context & Crash Recovery (Phase 8)
+
+### Automatic Recovery
+When governance restarts, `ChainContextStore.recover_from_db()` replays `chain_events` to rebuild all active chain states. No manual intervention needed for normal crashes.
+
+### When Manual Intervention IS Needed
+- **Bootstrap paradox**: the chain context module itself needs fixing (self-referential failure)
+- **Corrupted chain_events**: events replayed in wrong order or with missing payloads
+- **Stale chains**: chains stuck >1h with no updates (future: auto-cleanup timer)
+
+### Observer Chain Inspection
+Use `GET /api/context-snapshot/{pid}?task_id=XXX&role=coordinator` to see full chain state including all stages, gate reasons, and result summaries.
+
 ## Changelog
+- 2026-03-28: Chain Context crash recovery and observer inspection added
 - 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation
 - 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API
