@@ -176,3 +176,149 @@ def get_latest_by_ref(conn: sqlite3.Connection, project_id: str, ref_id: str) ->
     """Get latest active version for a ref_id."""
     backend = get_backend()
     return backend.get_latest(conn, project_id, ref_id)
+
+
+# ------------------------------------------------------------------
+# Phase 8: Cross-project memory sharing
+# ------------------------------------------------------------------
+
+_PROMOTABLE_KINDS = {
+    "failure_pattern", "architecture", "pattern", "rule", "decision", "knowledge",
+}
+
+
+def promote_memory(
+    conn: sqlite3.Connection,
+    project_id: str,
+    memory_id: str,
+    target_scope: str = "global",
+    reason: str = "",
+    actor_id: str = "",
+) -> dict:
+    """Promote a memory to a different scope (creates a copy with same ref_id).
+
+    Used for cross-project knowledge sharing. The original stays project-scoped,
+    the new entry gets the target scope (typically "global").
+    """
+    # 1. Fetch original
+    row = conn.execute(
+        "SELECT * FROM memories WHERE memory_id=? AND project_id=?",
+        (memory_id, project_id),
+    ).fetchone()
+    if not row:
+        from .errors import GovernanceError
+        raise GovernanceError("NOT_FOUND", f"Memory {memory_id} not found", status=404)
+
+    original = dict(row)
+    kind = original.get("kind", "knowledge")
+    if kind not in _PROMOTABLE_KINDS:
+        from .errors import GovernanceError
+        raise GovernanceError(
+            "INVALID_KIND",
+            f"Kind '{kind}' is not promotable. Allowed: {sorted(_PROMOTABLE_KINDS)}",
+            status=400,
+        )
+
+    # 2. Create promoted copy via backend
+    backend = get_backend()
+    promoted = backend.write(conn, project_id, {
+        "ref_id": original.get("ref_id", ""),
+        "entity_id": original.get("entity_id", ""),
+        "kind": kind,
+        "module": original.get("module_id", ""),
+        "content": original.get("content", ""),
+        "summary": original.get("summary", ""),
+        "scope": target_scope,
+        "tags": original.get("tags", ""),
+        "metadata_json": json.dumps({
+            **(json.loads(original["metadata_json"]) if original.get("metadata_json") else {}),
+            "promoted_from": memory_id,
+            "promote_reason": reason,
+        }, ensure_ascii=False),
+    })
+
+    # 3. Record event
+    now = _utc_iso()
+    conn.execute(
+        "INSERT INTO memory_events (ref_id, event_type, actor_id, detail, metadata_json, created_at) "
+        "VALUES (?, 'promoted', ?, ?, ?, ?)",
+        (original.get("ref_id", ""), actor_id, reason,
+         json.dumps({"target_scope": target_scope, "original_memory_id": memory_id}), now),
+    )
+    conn.commit()
+
+    # 4. Audit
+    audit_service.record(
+        conn, project_id, "memory.promoted",
+        actor=actor_id, module_id=original.get("module_id", ""), kind=kind,
+    )
+
+    log.info("memory promoted: %s → scope=%s (new=%s)", memory_id, target_scope, promoted.get("memory_id"))
+    return promoted
+
+
+# ------------------------------------------------------------------
+# Phase 8: Domain Pack registration
+# ------------------------------------------------------------------
+
+_VALID_DURABILITIES = {"permanent", "durable", "session", "transient"}
+_VALID_CONFLICT_POLICIES = {"replace", "append", "append_set", "temporal_replace", "merge_object"}
+
+
+def register_domain_pack(
+    conn: sqlite3.Connection,
+    project_id: str,
+    domain: str,
+    types: dict,
+    actor_id: str = "",
+) -> dict:
+    """Register or update a DomainPack for a project.
+
+    Args:
+        domain: Domain name (e.g., "development")
+        types: Dict of {kind_name: {"durability": str, "conflictPolicy": str}}
+    """
+    now = _utc_iso()
+
+    # Ensure domain_packs table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS domain_packs (
+            project_id TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            type_name TEXT NOT NULL,
+            durability TEXT NOT NULL DEFAULT 'durable',
+            conflict_policy TEXT NOT NULL DEFAULT 'replace',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, domain, type_name)
+        )
+    """)
+
+    registered = 0
+    for type_name, config in types.items():
+        durability = config.get("durability", "durable")
+        conflict_policy = config.get("conflictPolicy", config.get("conflict_policy", "replace"))
+
+        if durability not in _VALID_DURABILITIES:
+            from .errors import GovernanceError
+            raise GovernanceError("INVALID_DURABILITY", f"Invalid durability '{durability}'. Allowed: {sorted(_VALID_DURABILITIES)}", status=400)
+        if conflict_policy not in _VALID_CONFLICT_POLICIES:
+            from .errors import GovernanceError
+            raise GovernanceError("INVALID_CONFLICT_POLICY", f"Invalid conflictPolicy '{conflict_policy}'. Allowed: {sorted(_VALID_CONFLICT_POLICIES)}", status=400)
+
+        conn.execute("""
+            INSERT OR REPLACE INTO domain_packs
+            (project_id, domain, type_name, durability, conflict_policy, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (project_id, domain, type_name, durability, conflict_policy, now, now))
+        registered += 1
+
+    conn.commit()
+
+    audit_service.record(
+        conn, project_id, "memory.pack_registered",
+        actor=actor_id, metadata={"domain": domain, "type_count": registered},
+    )
+
+    log.info("domain pack registered: %s/%s (%d types)", project_id, domain, registered)
+    return {"domain": domain, "types_registered": registered, "registered_at": now}

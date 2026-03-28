@@ -1261,6 +1261,44 @@ def handle_mem_expand(ctx: RequestContext):
     return {"results": results, "count": len(results), "ref_id": ref_id, "depth": depth}
 
 
+@route("POST", "/api/mem/{project_id}/promote")
+def handle_mem_promote(ctx: RequestContext):
+    """Promote a memory to global scope (creates a cross-project copy)."""
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    memory_id = body.get("memory_id", "")
+    target_scope = body.get("target_scope", "global")
+    reason = body.get("reason", "")
+    if not memory_id:
+        return {"error": "MISSING_FIELD", "message": "memory_id required"}, 400
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn) if ctx.token else {}
+        result = memory_service.promote_memory(
+            conn, project_id, memory_id,
+            target_scope=target_scope, reason=reason,
+            actor_id=session.get("principal_id", ""),
+        )
+    return result
+
+
+@route("POST", "/api/mem/{project_id}/register-pack")
+def handle_mem_register_pack(ctx: RequestContext):
+    """Register a domain pack (kind definitions) for a project."""
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    domain = body.get("domain", "development")
+    types = body.get("types", {})
+    if not types:
+        return {"error": "MISSING_FIELD", "message": "types dict required"}, 400
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn) if ctx.token else {}
+        result = memory_service.register_domain_pack(
+            conn, project_id, domain, types,
+            actor_id=session.get("principal_id", ""),
+        )
+    return result
+
+
 # --- Audit ---
 
 @route("GET", "/api/audit/{project_id}/log")
