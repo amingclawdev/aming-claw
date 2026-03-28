@@ -1502,7 +1502,7 @@ def handle_version_check(ctx: RequestContext):
 
     if not git_head:
         parts.append("Executor has not synced git status yet")
-    elif git_head != chain_ver:
+    elif not (git_head.startswith(chain_ver) or chain_ver.startswith(git_head)):
         ok = False
         parts.append(f"HEAD ({git_head}) != CHAIN_VERSION ({chain_ver})")
     if dirty_files:
@@ -1543,6 +1543,7 @@ def handle_version_sync(ctx: RequestContext):
         WHERE project_id = ?
     """, (git_head, json.dumps(dirty_files), now, pid))
     conn.commit()
+    conn.close()
 
     return {"ok": True, "git_head": git_head, "dirty_files": dirty_files, "synced_at": now}
 
@@ -1604,6 +1605,7 @@ def handle_version_update(ctx: RequestContext):
     conn.commit()
 
     _audit_version_update(conn, pid, body, "success", "")
+    conn.close()
     return {"ok": True, "chain_version": new_version, "updated_at": now}
 
 

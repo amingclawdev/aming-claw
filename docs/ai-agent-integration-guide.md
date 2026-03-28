@@ -625,6 +625,7 @@ CREATE TABLE chain_events (
 ```
 
 ## Changelog
+- 2026-03-28: Fix version_check hash prefix comparison + DB connection leak in version-sync/update
 - 2026-03-28: Phase 8 Chain Context — event-sourced chain runtime context, retry prompt recovery, context-snapshot API
 - 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation
 - 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API
