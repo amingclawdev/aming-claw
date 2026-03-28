@@ -173,11 +173,22 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
             log.debug("auto_chain: chain archive failed (non-critical)")
         return deploy_result
 
-    # Create next stage task
+    # Create next stage task (with dedup check)
     builder_fn = _BUILDERS[builder_name]
     prompt, task_meta = builder_fn(task_id, result, metadata)
 
+    # M6: Dedup — check if next stage already exists for this parent
     from . import task_registry
+    existing = conn.execute(
+        "SELECT task_id FROM tasks WHERE type = ? AND status IN ('queued','claimed') "
+        "AND metadata_json LIKE ?",
+        (next_type, f'%"parent_task_id": "{task_id}"%'),
+    ).fetchone()
+    if existing:
+        log.warning("auto_chain: dedup — %s task already exists for parent %s: %s",
+                     next_type, task_id, existing["task_id"])
+        return {"task_id": existing["task_id"], "dedup": True}
+
     new_task = task_registry.create_task(
         conn, project_id,
         prompt=prompt,
@@ -321,11 +332,16 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     if expected_docs:
         missing_docs = expected_docs - doc_files_changed
         if missing_docs:
-            # Block by default — set metadata.skip_doc_check=true to bypass
+            # Block by default — skip_doc_check only allowed with bootstrap_reason
             if metadata.get("skip_doc_check", False):
-                log.warning("checkpoint_gate: docs may need update (skipped): %s", sorted(missing_docs))
+                bootstrap_reason = metadata.get("bootstrap_reason", "")
+                if not bootstrap_reason:
+                    return False, (f"skip_doc_check=true requires bootstrap_reason in metadata. "
+                                   f"Missing docs: {sorted(missing_docs)}")
+                log.warning("checkpoint_gate: docs skipped (bootstrap: %s): %s",
+                            bootstrap_reason, sorted(missing_docs))
             else:
-                return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files or set skip_doc_check=true."
+                return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files."
     # Node status check: related_nodes must be at least "testing" (not "pending")
     related_nodes = metadata.get("related_nodes", [])
     if related_nodes:
@@ -400,6 +416,9 @@ def _gate_release(conn, project_id, result, metadata):
         passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
         if not passed:
             return False, f"release gate blocked — {reason}"
+    else:
+        log.warning("release gate: no related_nodes — node verification skipped for %s",
+                     metadata.get("parent_task_id", "unknown"))
     # For auto-chain deploys, we trust the merge task result
     # After successful merge, promote related_nodes to qa_pass
     if related_nodes:

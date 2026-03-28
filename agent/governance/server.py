@@ -1583,6 +1583,18 @@ def handle_version_update(ctx: RequestContext):
         _audit_version_update(conn, pid, body, "rejected", "INVALID_CHAIN_STAGE")
         return {"error": "INVALID_CHAIN_STAGE", "message": f"Expected merge, got {chain_stage}"}, 400
 
+    # Step 3b: Chain link validation — verify task_id references a succeeded merge task
+    if updated_by in ("auto-chain", "merge-service") and task_id:
+        task_row = conn.execute(
+            "SELECT status, type FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if task_row:
+            if task_row["status"] != "succeeded":
+                _audit_version_update(conn, pid, body, "rejected", "TASK_NOT_SUCCEEDED")
+                return {"error": "TASK_NOT_SUCCEEDED",
+                        "message": f"Task {task_id} status is {task_row['status']}, expected succeeded"}, 400
+        # Note: task_row could be None if task is in a different DB or not found — allow (backward compat)
+
     # Step 4: Version consistency (optional — old_version check)
     old_version = body.get("old_version")
     if old_version:

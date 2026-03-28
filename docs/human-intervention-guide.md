@@ -338,6 +338,7 @@ When governance restarts, `ChainContextStore.recover_from_db()` replays `chain_e
 Use `GET /api/context-snapshot/{pid}?task_id=XXX&role=coordinator` to see full chain state including all stages, gate reasons, and result summaries.
 
 ## Changelog
+- 2026-03-28: M3 skip_doc_check now requires bootstrap_reason; M4 release gate warns on missing nodes
 - 2026-03-28: Chain Context crash recovery and observer inspection added
 - 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation
 - 2026-03-26: Old Telegram bot system fully removed (bot_commands, coordinator, executor, and 20 other modules), unified on governance API

@@ -625,6 +625,7 @@ CREATE TABLE chain_events (
 ```
 
 ## Changelog
+- 2026-03-28: M3-M6 Gate enhancements: skip_doc_check needs bootstrap_reason, release gate node warning, version-update chain link validation, QA dedup
 - 2026-03-28: M1+M2 Task ownership validation + observer override audit in complete_task
 - 2026-03-28: Fix version_check hash prefix comparison + DB connection leak in version-sync/update
 - 2026-03-28: Phase 8 Chain Context — event-sourced chain runtime context, retry prompt recovery, context-snapshot API
