@@ -60,6 +60,64 @@ class MemoryBackend(ABC):
     def get_latest(self, conn: sqlite3.Connection, project_id: str, ref_id: str) -> Optional[dict]:
         """Get the latest active version for a ref_id."""
 
+    def search_and_aggregate(self, conn: sqlite3.Connection, project_id: str, query: str, top_k: int = 5) -> list[dict]:
+        """Search + dedupe by ref_id, returning only latest active per ref_id."""
+        raw = self.search(conn, project_id, query, top_k * 2)
+        seen: dict[str, dict] = {}
+        for r in raw:
+            rid = r.get("ref_id", "")
+            if rid not in seen:
+                seen[rid] = r
+        return list(seen.values())[:top_k]
+
+    def relate(self, conn: sqlite3.Connection, project_id: str,
+               from_ref_id: str, relation: str, to_ref_id: str,
+               metadata: dict = None) -> dict:
+        """Create a relation between two ref_ids."""
+        now = _utc_iso()
+        meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+        conn.execute("""
+            INSERT INTO memory_relations (from_ref_id, relation, to_ref_id, project_id, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (from_ref_id, relation, to_ref_id, project_id, meta_json, now))
+        conn.commit()
+        return {"from_ref_id": from_ref_id, "relation": relation, "to_ref_id": to_ref_id, "created_at": now}
+
+    def expand(self, conn: sqlite3.Connection, project_id: str,
+               ref_id: str, depth: int = 2) -> list[dict]:
+        """Traverse relation graph from a ref_id up to given depth."""
+        visited: set[str] = set()
+        results: list[dict] = []
+        queue = [(ref_id, 0)]
+        while queue:
+            current, d = queue.pop(0)
+            if current in visited or d > depth:
+                continue
+            visited.add(current)
+            # Get the memory for this ref_id
+            latest = self.get_latest(conn, project_id, current)
+            if latest and d > 0:  # Skip the root (caller already has it)
+                results.append({**latest, "_depth": d, "_from_ref_id": ref_id})
+            # Find relations
+            rows = conn.execute(
+                "SELECT to_ref_id, relation FROM memory_relations "
+                "WHERE project_id=? AND from_ref_id=?",
+                (project_id, current),
+            ).fetchall()
+            for row in rows:
+                if row["to_ref_id"] not in visited:
+                    queue.append((row["to_ref_id"], d + 1))
+            # Also check reverse relations
+            rows = conn.execute(
+                "SELECT from_ref_id, relation FROM memory_relations "
+                "WHERE project_id=? AND to_ref_id=?",
+                (project_id, current),
+            ).fetchall()
+            for row in rows:
+                if row["from_ref_id"] not in visited:
+                    queue.append((row["from_ref_id"], d + 1))
+        return results
+
 
 # ------------------------------------------------------------------
 # Local backend: SQLite + FTS5
@@ -72,6 +130,7 @@ class LocalBackend(MemoryBackend):
         now = _utc_iso()
         memory_id = entry.get("memory_id") or _gen_memory_id()
         ref_id = entry.get("ref_id", "")
+        entity_id = entry.get("entity_id", "")
         kind = entry.get("kind", "knowledge")
         module_id = entry.get("module", entry.get("module_id", ""))
         content = entry.get("content", "")
@@ -107,21 +166,36 @@ class LocalBackend(MemoryBackend):
         if not ref_id:
             ref_id = f"{module_id}:{kind}:{memory_id}"
 
-        conn.execute("""
-            INSERT INTO memories (
+        # Build INSERT with entity_id if the column exists (schema v8+)
+        try:
+            conn.execute("""
+                INSERT INTO memories (
+                    memory_id, project_id, ref_id, entity_id, kind, module_id, scope, content, summary,
+                    metadata_json, tags, version, status, superseded_by_memory_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """, (
+                memory_id, project_id, ref_id, entity_id, kind, module_id, scope, content, summary,
+                metadata, tags, version, status, now, now,
+            ))
+        except sqlite3.OperationalError:
+            # Fallback for schema v7 (no entity_id column)
+            conn.execute("""
+                INSERT INTO memories (
+                    memory_id, project_id, ref_id, kind, module_id, scope, content, summary,
+                    metadata_json, tags, version, status, superseded_by_memory_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """, (
                 memory_id, project_id, ref_id, kind, module_id, scope, content, summary,
-                metadata_json, tags, version, status, superseded_by_memory_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-        """, (
-            memory_id, project_id, ref_id, kind, module_id, scope, content, summary,
-            metadata, tags, version, status, now, now,
-        ))
+                metadata, tags, version, status, now, now,
+            ))
         conn.commit()
 
         result = {
             "memory_id": memory_id,
             "ref_id": ref_id,
+            "entity_id": entity_id,
             "kind": kind,
             "module_id": module_id,
             "content": content,

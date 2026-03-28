@@ -221,5 +221,128 @@ class TestLocalBackend(unittest.TestCase):
             conn.close()
 
 
+    # ------------------------------------------------------------------
+    # Phase 3 tests: ref_id lifecycle, entity mapping, relations
+    # ------------------------------------------------------------------
+
+    def test_entity_id_mapping(self):
+        """Entity ID stored with memory and queryable."""
+        from governance.memory_backend import get_backend
+        backend = get_backend()
+        conn = self._get_conn()
+        try:
+            result = backend.write(conn, "test-project", {
+                "ref_id": "task-status-1",
+                "entity_id": "task-123",
+                "kind": "task_status",
+                "module": "executor",
+                "content": "Task 123 completed successfully",
+            })
+            self.assertEqual(result["entity_id"], "task-123")
+        finally:
+            conn.close()
+
+    def test_ref_id_stability_across_updates(self):
+        """Same task's updates reuse ref_id, don't create new ones."""
+        from governance.memory_backend import get_backend
+        backend = get_backend()
+        conn = self._get_conn()
+        try:
+            # Write initial status
+            v1 = backend.write(conn, "test-project", {
+                "ref_id": "task-status-42",
+                "kind": "task_status",
+                "module": "executor",
+                "content": "Task 42: queued",
+            })
+            # Update same task status
+            v2 = backend.write(conn, "test-project", {
+                "ref_id": "task-status-42",
+                "kind": "task_status",
+                "module": "executor",
+                "content": "Task 42: running",
+            })
+            v3 = backend.write(conn, "test-project", {
+                "ref_id": "task-status-42",
+                "kind": "task_status",
+                "module": "executor",
+                "content": "Task 42: completed",
+            })
+            # All versions share the same ref_id
+            self.assertEqual(v1["ref_id"], v2["ref_id"])
+            self.assertEqual(v2["ref_id"], v3["ref_id"])
+            # Versions increment
+            self.assertEqual(v1["version"], 1)
+            self.assertEqual(v2["version"], 2)
+            self.assertEqual(v3["version"], 3)
+            # Only latest is active
+            entries = backend.query(conn, "test-project", ref_id="task-status-42")
+            self.assertEqual(len(entries), 1)
+            self.assertIn("completed", entries[0]["content"])
+        finally:
+            conn.close()
+
+    def test_search_and_aggregate(self):
+        """search_and_aggregate dedupes by ref_id."""
+        from governance.memory_backend import get_backend
+        backend = get_backend()
+        conn = self._get_conn()
+        try:
+            backend.write(conn, "test-project", {
+                "ref_id": "pitfall-db-1",
+                "kind": "pitfall",
+                "module": "database",
+                "content": "SQLite lock timeout under heavy write load",
+            })
+            backend.write(conn, "test-project", {
+                "ref_id": "pitfall-db-2",
+                "kind": "pitfall",
+                "module": "database",
+                "content": "SQLite WAL mode requires checkpoint management",
+            })
+            results = backend.search_and_aggregate(conn, "test-project", "SQLite")
+            ref_ids = [r["ref_id"] for r in results]
+            # No duplicate ref_ids
+            self.assertEqual(len(ref_ids), len(set(ref_ids)))
+        finally:
+            conn.close()
+
+    def test_relate_and_expand(self):
+        """Create relations and traverse the graph."""
+        from governance.memory_backend import get_backend
+        backend = get_backend()
+        conn = self._get_conn()
+        try:
+            backend.write(conn, "test-project", {
+                "ref_id": "decision-auth",
+                "kind": "decision",
+                "module": "auth",
+                "content": "Use JWT tokens",
+            })
+            backend.write(conn, "test-project", {
+                "ref_id": "pitfall-jwt",
+                "kind": "pitfall",
+                "module": "auth",
+                "content": "JWT token expiration not enforced",
+            })
+            backend.write(conn, "test-project", {
+                "ref_id": "fix-jwt-exp",
+                "kind": "decision",
+                "module": "auth",
+                "content": "Add JWT expiration validation middleware",
+            })
+            # Create relations
+            backend.relate(conn, "test-project", "decision-auth", "caused", "pitfall-jwt")
+            backend.relate(conn, "test-project", "pitfall-jwt", "fixed_by", "fix-jwt-exp")
+
+            # Expand from decision-auth, depth 2
+            expanded = backend.expand(conn, "test-project", "decision-auth", depth=2)
+            ref_ids = {r["ref_id"] for r in expanded}
+            self.assertIn("pitfall-jwt", ref_ids)
+            self.assertIn("fix-jwt-exp", ref_ids)
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

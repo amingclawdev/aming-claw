@@ -1222,6 +1222,36 @@ def handle_mem_search(ctx: RequestContext):
     return {"results": results, "count": len(results), "query": q}
 
 
+@route("POST", "/api/mem/{project_id}/relate")
+def handle_mem_relate(ctx: RequestContext):
+    """Create a relation between two ref_ids."""
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    from_ref = body.get("from_ref_id", "")
+    relation = body.get("relation", "")
+    to_ref = body.get("to_ref_id", "")
+    if not from_ref or not relation or not to_ref:
+        return {"error": "MISSING_FIELDS", "message": "from_ref_id, relation, to_ref_id required"}, 400
+    from .memory_backend import get_backend
+    with DBContext(project_id) as conn:
+        result = get_backend().relate(conn, project_id, from_ref, relation, to_ref, body.get("metadata"))
+    return 201, result
+
+
+@route("GET", "/api/mem/{project_id}/expand")
+def handle_mem_expand(ctx: RequestContext):
+    """Traverse relation graph from a ref_id."""
+    project_id = ctx.get_project_id()
+    ref_id = ctx.query.get("ref_id", "")
+    depth = int(ctx.query.get("depth", "2"))
+    if not ref_id:
+        return {"error": "MISSING_REF_ID", "message": "ref_id parameter required"}, 400
+    from .memory_backend import get_backend
+    with DBContext(project_id) as conn:
+        results = get_backend().expand(conn, project_id, ref_id, depth)
+    return {"results": results, "count": len(results), "ref_id": ref_id, "depth": depth}
+
+
 # --- Audit ---
 
 @route("GET", "/api/audit/{project_id}/log")
