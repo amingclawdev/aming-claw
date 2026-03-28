@@ -1017,6 +1017,15 @@ def handle_summary(ctx: RequestContext):
         return state_service.get_summary(conn, project_id)
 
 
+@route("GET", "/api/wf/{project_id}/preflight-check")
+def handle_preflight_check(ctx: RequestContext):
+    project_id = ctx.get_project_id()
+    auto_fix = ctx.query_params.get("auto_fix", ["false"])[0].lower() == "true"
+    from .preflight import run_preflight
+    with DBContext(project_id) as conn:
+        return run_preflight(conn, project_id, auto_fix=auto_fix)
+
+
 @route("GET", "/api/wf/{project_id}/node/{node_id}")
 def handle_get_node(ctx: RequestContext):
     project_id = ctx.get_project_id()

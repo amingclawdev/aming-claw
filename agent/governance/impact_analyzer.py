@@ -83,6 +83,9 @@ CODE_DOC_MAP = {
     "agent/governance/observability.py": [
         "docs/ai-agent-integration-guide.md",
     ],
+    "agent/governance/preflight.py": [
+        "docs/ai-agent-integration-guide.md",
+    ],
 }
 
 

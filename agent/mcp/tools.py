@@ -107,6 +107,18 @@ TOOLS: list[dict] = [
             "required": ["project_id", "nodes", "status"],
         },
     },
+    {
+        "name": "preflight_check",
+        "description": "Run pre-flight self-check: system, version, graph, coverage, queue health.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "auto_fix": {"type": "boolean", "description": "Auto-fix recoverable issues (orphan nodes, stuck tasks)", "default": False},
+            },
+            "required": ["project_id"],
+        },
+    },
     # --- Executor ---
     {
         "name": "executor_status",
@@ -215,6 +227,11 @@ class ToolDispatcher:
             if args.get("evidence"):
                 body["evidence"] = args["evidence"]
             return self._api("POST", f"/api/wf/{pid}/verify-update", body)
+
+        if name == "preflight_check":
+            pid = args["project_id"]
+            af = "true" if args.get("auto_fix") else "false"
+            return self._api("GET", f"/api/wf/{pid}/preflight-check?auto_fix={af}")
 
         # --- Executor tools ---
         if name == "executor_status":

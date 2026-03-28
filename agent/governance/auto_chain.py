@@ -61,6 +61,18 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
 def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     """Internal chain logic with guaranteed conn cleanup by caller."""
 
+    # Non-blocking preflight log (first stage only)
+    if task_type == "pm":
+        try:
+            from .preflight import run_preflight
+            report = run_preflight(conn, project_id, auto_fix=False)
+            if report.get("warnings"):
+                log.warning("preflight warnings for %s: %s", project_id, report["warnings"])
+            if not report.get("ok"):
+                log.error("preflight blockers for %s: %s", project_id, report["blockers"])
+        except Exception:
+            pass  # never block chain on preflight failure
+
     # Auto-enrich: derive related_nodes from changed_files via impact API
     if not metadata.get("related_nodes"):
         changed = result.get("changed_files", metadata.get("changed_files", []))

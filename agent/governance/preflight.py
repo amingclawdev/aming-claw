@@ -1,0 +1,412 @@
+"""Pre-flight self-check for governance auto-chain.
+
+Validates system, version, graph, coverage, and queue health BEFORE
+chain execution. Each check is independent — errors in one don't block others.
+
+Usage:
+    from .preflight import run_preflight
+    report = run_preflight(conn, "aming-claw")
+"""
+
+import json
+import logging
+import os
+import glob as _glob
+from datetime import datetime, timezone, timedelta
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Check result helpers
+# ---------------------------------------------------------------------------
+
+def _pass(details=None):
+    return {"status": "pass", "details": details or {}}
+
+def _warn(details=None):
+    return {"status": "warn", "details": details or {}}
+
+def _fail(details=None):
+    return {"status": "fail", "details": details or {}}
+
+
+# ---------------------------------------------------------------------------
+# 1. System check — DB accessible, required tables exist
+# ---------------------------------------------------------------------------
+
+_REQUIRED_TABLES = [
+    "node_state", "node_history", "tasks", "task_attempts",
+    "project_version", "sessions", "schema_meta",
+]
+
+def check_system(conn) -> dict:
+    """Verify database is accessible and has required tables."""
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        existing = {r["name"] if hasattr(r, "keys") else r[0] for r in rows}
+        missing = [t for t in _REQUIRED_TABLES if t not in existing]
+        if missing:
+            return _fail({"missing_tables": missing})
+        return _pass({"table_count": len(existing)})
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 2. Version check — chain_version == git_head, freshness
+# ---------------------------------------------------------------------------
+
+def check_version(conn, project_id: str) -> dict:
+    """Verify chain_version matches git_head and sync is recent."""
+    try:
+        row = conn.execute(
+            "SELECT chain_version, git_head, git_synced_at, dirty_files "
+            "FROM project_version WHERE project_id=?",
+            (project_id,)
+        ).fetchone()
+        if not row:
+            return _fail({"error": "no project_version row"})
+
+        chain_ver = row["chain_version"] if hasattr(row, "keys") else row[0]
+        git_head = row["git_head"] if hasattr(row, "keys") else row[1]
+        synced_at = row["git_synced_at"] if hasattr(row, "keys") else row[2]
+        dirty = row["dirty_files"] if hasattr(row, "keys") else row[3]
+
+        issues = {}
+        status = "pass"
+
+        # Version mismatch
+        if git_head and chain_ver and git_head != chain_ver:
+            issues["version_mismatch"] = {
+                "chain_version": chain_ver, "git_head": git_head
+            }
+            status = "fail"
+
+        # Dirty files
+        if dirty:
+            dirty_list = json.loads(dirty) if isinstance(dirty, str) else dirty
+            if dirty_list:
+                issues["dirty_files"] = dirty_list
+                if status != "fail":
+                    status = "warn"
+
+        # Stale sync (>5 min)
+        if synced_at:
+            try:
+                synced_dt = datetime.fromisoformat(synced_at.replace("Z", "+00:00"))
+                age = datetime.now(timezone.utc) - synced_dt
+                if age > timedelta(minutes=5):
+                    issues["sync_stale_seconds"] = int(age.total_seconds())
+                    if status != "fail":
+                        status = "warn"
+            except (ValueError, TypeError):
+                pass
+
+        if status == "pass":
+            return _pass({"chain_version": chain_ver})
+        elif status == "warn":
+            return _warn(issues)
+        else:
+            return _fail(issues)
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 3. Graph check — orphan nodes, pending without active tasks
+# ---------------------------------------------------------------------------
+
+def check_graph(conn, project_id: str) -> dict:
+    """Check for orphan or stuck nodes in the acceptance graph."""
+    try:
+        # Pending nodes
+        pending = conn.execute(
+            "SELECT node_id FROM node_state WHERE project_id=? AND verify_status='pending'",
+            (project_id,)
+        ).fetchall()
+        pending_ids = [r["node_id"] if hasattr(r, "keys") else r[0] for r in pending]
+
+        # Active tasks (queued or claimed)
+        active = conn.execute(
+            "SELECT task_id, metadata_json FROM tasks "
+            "WHERE project_id=? AND status IN ('queued', 'claimed')",
+            (project_id,)
+        ).fetchall()
+
+        # Check if pending nodes have active tasks targeting them
+        active_nodes = set()
+        for t in active:
+            meta = t["metadata_json"] if hasattr(t, "keys") else t[-1]
+            if meta:
+                try:
+                    m = json.loads(meta)
+                    for n in m.get("related_nodes", []):
+                        active_nodes.add(n)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        orphan_pending = [n for n in pending_ids if n not in active_nodes]
+
+        if not pending_ids:
+            return _pass({"pending_count": 0})
+        elif orphan_pending:
+            return _warn({
+                "pending_count": len(pending_ids),
+                "orphan_pending": orphan_pending,
+            })
+        else:
+            return _pass({"pending_count": len(pending_ids), "all_have_active_tasks": True})
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 4. Coverage check — CODE_DOC_MAP completeness
+# ---------------------------------------------------------------------------
+
+def check_coverage() -> dict:
+    """Scan governance/*.py and agent/*.py for CODE_DOC_MAP gaps."""
+    try:
+        from .impact_analyzer import CODE_DOC_MAP
+
+        # Find the agent directory
+        agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        gov_dir = os.path.join(agent_dir, "governance")
+
+        # Collect all .py files that should be mapped
+        scan_files = []
+
+        # governance/*.py (exclude __init__, __pycache__, tests)
+        for f in sorted(os.listdir(gov_dir)):
+            if f.endswith(".py") and f != "__init__.py" and not f.startswith("test_"):
+                rel = f"agent/governance/{f}"
+                scan_files.append(rel)
+
+        # agent/*.py (key files only, not all)
+        for f in sorted(os.listdir(agent_dir)):
+            if f.endswith(".py") and f != "__init__.py" and not f.startswith("test_"):
+                rel = f"agent/{f}"
+                scan_files.append(rel)
+
+        # Check which files are covered by CODE_DOC_MAP
+        mapped_patterns = set(CODE_DOC_MAP.keys())
+        unmapped = []
+        for sf in scan_files:
+            covered = False
+            for pattern in mapped_patterns:
+                if pattern in sf or sf == pattern:
+                    covered = True
+                    break
+            if not covered:
+                unmapped.append(sf)
+
+        if not unmapped:
+            return _pass({"mapped_files": len(scan_files)})
+        else:
+            return _warn({
+                "mapped_files": len(scan_files) - len(unmapped),
+                "total_files": len(scan_files),
+                "unmapped_files": unmapped,
+            })
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 5. Queue check — stuck tasks, circular retries
+# ---------------------------------------------------------------------------
+
+_STUCK_THRESHOLD_SECONDS = 1800  # 30 minutes
+
+def check_queue(conn, project_id: str) -> dict:
+    """Check for stuck claimed tasks and circular retry patterns."""
+    try:
+        now = datetime.now(timezone.utc)
+
+        # Claimed tasks older than threshold
+        claimed = conn.execute(
+            "SELECT task_id, type, updated_at, attempt_count, parent_task_id "
+            "FROM tasks WHERE project_id=? AND status='claimed'",
+            (project_id,)
+        ).fetchall()
+
+        stuck = []
+        for t in claimed:
+            updated = t["updated_at"] if hasattr(t, "keys") else t[2]
+            try:
+                updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                age = (now - updated_dt).total_seconds()
+                if age > _STUCK_THRESHOLD_SECONDS:
+                    stuck.append({
+                        "task_id": t["task_id"] if hasattr(t, "keys") else t[0],
+                        "type": t["type"] if hasattr(t, "keys") else t[1],
+                        "stuck_seconds": int(age),
+                    })
+            except (ValueError, TypeError):
+                pass
+
+        # Circular retries: tasks with attempt_count >= max_attempts that spawned children
+        circular = conn.execute(
+            "SELECT task_id, type, attempt_count FROM tasks "
+            "WHERE project_id=? AND status='failed' AND attempt_count >= 3 "
+            "AND task_id IN (SELECT DISTINCT parent_task_id FROM tasks WHERE parent_task_id IS NOT NULL)",
+            (project_id,)
+        ).fetchall()
+        circular_ids = [
+            (t["task_id"] if hasattr(t, "keys") else t[0])
+            for t in circular
+        ]
+
+        issues = {}
+        status = "pass"
+
+        if stuck:
+            issues["stuck_tasks"] = stuck
+            status = "warn"
+        if circular_ids:
+            issues["circular_retry_roots"] = circular_ids
+            if status != "fail":
+                status = "warn"
+
+        if status == "pass":
+            queued_count = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE project_id=? AND status='queued'",
+                (project_id,)
+            ).fetchone()
+            qc = queued_count[0] if queued_count else 0
+            return _pass({"queued": qc, "claimed": len(claimed)})
+        elif status == "warn":
+            return _warn(issues)
+        else:
+            return _fail(issues)
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix actions
+# ---------------------------------------------------------------------------
+
+def _auto_fix_graph(conn, project_id: str, orphan_nodes: list) -> list:
+    """Waive orphan pending nodes."""
+    fixed = []
+    now = datetime.now(timezone.utc).isoformat()
+    for node_id in orphan_nodes:
+        try:
+            conn.execute(
+                "UPDATE node_state SET verify_status='waived', updated_by='preflight-autofix', "
+                "updated_at=?, evidence_json=? WHERE project_id=? AND node_id=? AND verify_status='pending'",
+                (now, json.dumps({"type": "manual_review", "reason": "preflight auto-fix: orphan pending node"}),
+                 project_id, node_id)
+            )
+            conn.execute(
+                "INSERT INTO node_history (project_id, node_id, from_status, to_status, role, "
+                "evidence_json, session_id, ts, version) VALUES (?, ?, 'pending', 'waived', 'preflight', ?, ?, ?, 1)",
+                (project_id, node_id,
+                 json.dumps({"type": "manual_review", "reason": "preflight auto-fix"}),
+                 "preflight", now)
+            )
+            fixed.append(f"waived orphan node {node_id}")
+        except Exception as e:
+            log.warning("preflight auto-fix failed for node %s: %s", node_id, e)
+    if fixed:
+        conn.commit()
+    return fixed
+
+
+def _auto_fix_queue(conn, project_id: str, stuck_tasks: list) -> list:
+    """Mark stuck claimed tasks as failed."""
+    fixed = []
+    now = datetime.now(timezone.utc).isoformat()
+    for task in stuck_tasks:
+        tid = task["task_id"]
+        try:
+            conn.execute(
+                "UPDATE tasks SET status='failed', updated_at=?, error_message=? "
+                "WHERE task_id=? AND status='claimed'",
+                (now, "preflight auto-fix: stuck >30min", tid)
+            )
+            fixed.append(f"failed stuck task {tid}")
+        except Exception as e:
+            log.warning("preflight auto-fix failed for task %s: %s", tid, e)
+    if fixed:
+        conn.commit()
+    return fixed
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
+    """Run all pre-flight checks.
+
+    Args:
+        conn: SQLite connection for the project
+        project_id: Project identifier
+        auto_fix: If True, attempt to fix recoverable issues
+
+    Returns:
+        PreflightReport dict with ok, checks, blockers, warnings, auto_fixed
+    """
+    checks = {}
+    warnings = []
+    blockers = []
+    auto_fixed = []
+
+    # Run all checks independently
+    checks["system"] = check_system(conn)
+    checks["version"] = check_version(conn, project_id)
+    checks["graph"] = check_graph(conn, project_id)
+    checks["coverage"] = check_coverage()
+    checks["queue"] = check_queue(conn, project_id)
+
+    # Collect warnings and blockers
+    for name, result in checks.items():
+        if result["status"] == "warn":
+            details = result.get("details", {})
+            if name == "graph" and details.get("orphan_pending"):
+                warnings.append(f"{len(details['orphan_pending'])} orphan pending node(s)")
+            elif name == "coverage" and details.get("unmapped_files"):
+                warnings.append(f"{len(details['unmapped_files'])} unmapped file(s) in CODE_DOC_MAP")
+            elif name == "queue" and details.get("stuck_tasks"):
+                warnings.append(f"{len(details['stuck_tasks'])} stuck task(s)")
+            elif name == "version":
+                if details.get("sync_stale_seconds"):
+                    warnings.append(f"version sync stale ({details['sync_stale_seconds']}s)")
+                if details.get("dirty_files"):
+                    warnings.append(f"{len(details['dirty_files'])} dirty file(s)")
+            else:
+                warnings.append(f"{name}: {result['status']}")
+        elif result["status"] == "fail":
+            blockers.append(f"{name}: {json.dumps(result.get('details', {}))}")
+
+    # Auto-fix if requested
+    if auto_fix:
+        graph_details = checks["graph"].get("details", {})
+        if graph_details.get("orphan_pending"):
+            fixes = _auto_fix_graph(conn, project_id, graph_details["orphan_pending"])
+            auto_fixed.extend(fixes)
+            if fixes:
+                checks["graph"] = check_graph(conn, project_id)
+
+        queue_details = checks["queue"].get("details", {})
+        if queue_details.get("stuck_tasks"):
+            fixes = _auto_fix_queue(conn, project_id, queue_details["stuck_tasks"])
+            auto_fixed.extend(fixes)
+            if fixes:
+                checks["queue"] = check_queue(conn, project_id)
+
+    ok = all(c["status"] != "fail" for c in checks.values())
+
+    return {
+        "ok": ok,
+        "project_id": project_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+        "blockers": blockers,
+        "warnings": warnings,
+        "auto_fixed": auto_fixed,
+    }
