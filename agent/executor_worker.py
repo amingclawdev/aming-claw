@@ -363,6 +363,27 @@ class ExecutorWorker:
             except Exception as e:
                 log.warning("Version update failed (non-fatal): %s", e)
 
+            # Write merge outcome to memory for future recall
+            try:
+                summary = metadata.get("intent_summary", "")
+                if not summary:
+                    summary = f"Merged {len(staged)} files: {', '.join(staged[:5])}"
+                self._api("POST", f"/api/mem/{self.project_id}/write", {
+                    "module": staged[0] if staged else "general",
+                    "kind": "task_result",
+                    "content": summary,
+                    "structured": {
+                        "merge_commit": commit_hash,
+                        "changed_files": staged,
+                        "files_changed": len(staged),
+                        "task_id": task_id,
+                        "chain_stage": "merge",
+                        "parent_task_id": metadata.get("parent_task_id", ""),
+                    },
+                })
+            except Exception:
+                log.debug("Merge memory write failed (non-fatal)")
+
             return {"status": "succeeded", "result": {
                 "merge_commit": commit_hash,
                 "branch": "main",

@@ -74,36 +74,10 @@ def write_memory(
         module_id=entry.module_id, kind=entry.kind,
     )
 
-    # Forward to dbservice (best-effort, for existing docker integration)
-    _forward_to_dbservice(project_id, entry_dict)
+    # Note: dbservice forwarding is handled by DockerBackend.write() when
+    # MEMORY_BACKEND=docker. No separate forwarding needed here.
 
     return result
-
-
-def _forward_to_dbservice(project_id: str, entry: dict) -> None:
-    """Forward memory write to dbservice for semantic search. Best-effort."""
-    import os
-    dbservice_url = os.environ.get("DBSERVICE_URL", "")
-    if not dbservice_url:
-        return
-    try:
-        import requests
-        ref_id = entry.get("id", f"{entry.get('module_id', '')}:{entry.get('kind', '')}:{entry.get('created_at', '')}")
-        requests.post(
-            f"{dbservice_url}/knowledge/upsert",
-            json={
-                "refId": ref_id,
-                "type": entry.get("kind", "knowledge"),
-                "title": f"{entry.get('module_id', '')}: {entry.get('kind', '')}",
-                "body": entry.get("content", ""),
-                "tags": [entry.get("module_id", ""), entry.get("kind", "")] + entry.get("related_nodes", []),
-                "scope": project_id,
-                "status": "active",
-            },
-            timeout=3,
-        )
-    except Exception:
-        pass  # Best-effort
 
 
 # ------------------------------------------------------------------
