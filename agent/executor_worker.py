@@ -312,7 +312,7 @@ class ExecutorWorker:
                 return {"status": "failed", "error": f"git commit failed: {proc.stderr[:300]}"}
 
             # Get commit hash
-            rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+            rev = subprocess.run(["git", "rev-parse", "HEAD"],
                                  cwd=self.workspace, capture_output=True, text=True, timeout=5)
             commit_hash = rev.stdout.strip()
 
@@ -320,7 +320,7 @@ class ExecutorWorker:
 
             # Immediately sync git HEAD to governance after commit (don't wait for 60s poll)
             HEAD = subprocess.check_output(
-                ["git", "rev-parse", "--short", "HEAD"], cwd=self.workspace
+                ["git", "rev-parse", "HEAD"], cwd=self.workspace
             ).decode().strip()
             self._api("POST", f"/api/version-sync/{self.project_id}", {"git_head": HEAD, "dirty_files": []})
 
@@ -339,7 +339,7 @@ class ExecutorWorker:
                     subprocess.run(["git", "add", "VERSION"], cwd=self.workspace, capture_output=True, timeout=10)
                     subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=self.workspace, capture_output=True, timeout=10)
                     # Re-read hash after amend
-                    rev2 = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                    rev2 = subprocess.run(["git", "rev-parse", "HEAD"],
                                           cwd=self.workspace, capture_output=True, text=True, timeout=5)
                     commit_hash = rev2.stdout.strip()
 
@@ -854,7 +854,7 @@ class ExecutorWorker:
         try:
             import subprocess
             head = subprocess.check_output(
-                ["git", "rev-parse", "--short", "HEAD"],
+                ["git", "rev-parse", "HEAD"],
                 cwd=self.workspace, timeout=5
             ).decode().strip()
 
