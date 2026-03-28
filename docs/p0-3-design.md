@@ -492,6 +492,7 @@ Each role sees only relevant stages and result fields:
 - `task_registry.py`: auto-stores _original_prompt on create_task
 
 ## Changelog
+- 2026-03-28: M1+M2 Task ownership validation + observer override audit
 - 2026-03-28: Fix version_check hash prefix comparison + DB connection leak
 - 2026-03-28: Phase 8 Chain Context design and implementation
 - 2026-03-26: auto_chain.py implementation complete, full pipeline PM→Dev→Test→QA→Merge→Deploy auto-scheduling with gate validation

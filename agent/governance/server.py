@@ -1382,6 +1382,8 @@ def handle_task_complete(ctx: RequestContext):
             result=ctx.body.get("result"),
             error_message=ctx.body.get("error_message", ""),
             project_id=project_id,
+            completed_by=ctx.body.get("worker_id", ""),
+            override_reason=ctx.body.get("override_reason", ""),
         )
 
 

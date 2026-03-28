@@ -164,6 +164,8 @@ def complete_task(
     error_message: str = "",
     fence_token: str = "",
     project_id: str = "",
+    completed_by: str = "",
+    override_reason: str = "",
 ) -> dict:
     """Mark a task as completed (succeeded/failed). Dual-field update."""
     if status not in ("succeeded", "failed", "timed_out"):
@@ -172,13 +174,48 @@ def complete_task(
 
     now = _utc_iso()
     row = conn.execute(
-        "SELECT attempt_count, max_attempts, notification_status, metadata_json FROM tasks WHERE task_id = ?",
+        "SELECT attempt_count, max_attempts, notification_status, metadata_json, assigned_to FROM tasks WHERE task_id = ?",
         (task_id,),
     ).fetchone()
 
     if not row:
         from .errors import GovernanceError
         raise GovernanceError(f"Task not found: {task_id}", 404)
+
+    # M1: Ownership check — only assignee or observer can complete
+    assigned_to = row["assigned_to"] or ""
+    if completed_by and assigned_to and completed_by != assigned_to:
+        is_observer = completed_by.startswith("observer")
+        if not is_observer:
+            from .errors import GovernanceError
+            raise GovernanceError(
+                f"Ownership violation: task assigned to {assigned_to}, "
+                f"completed_by {completed_by}", 403)
+        # M2: Observer override — allow but audit + warn
+        log.warning("task_registry: observer override: %s completing task %s "
+                     "assigned to %s (reason: %s)",
+                     completed_by, task_id, assigned_to,
+                     override_reason or "not provided")
+        try:
+            from . import event_bus, audit_service
+            event_bus.publish("task.observer_override", {
+                "project_id": project_id,
+                "task_id": task_id,
+                "assigned_to": assigned_to,
+                "override_by": completed_by,
+                "override_reason": override_reason,
+            })
+            audit_service.record(
+                conn, project_id, "task.observer_override",
+                actor=completed_by,
+                details={
+                    "task_id": task_id,
+                    "assigned_to": assigned_to,
+                    "override_reason": override_reason,
+                },
+            )
+        except Exception:
+            pass  # audit failure should not block completion
 
     # Fence token check (if provided)
     if fence_token:

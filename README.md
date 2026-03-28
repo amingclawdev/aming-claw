@@ -500,6 +500,7 @@ docker compose -f docker-compose.governance.yml logs -f governance
 
 ## Changelog
 
+- **2026-03-28**: M1+M2 Task ownership validation + observer override audit
 - **2026-03-28**: Fix version_check hash prefix comparison + DB connection leak in version-sync/update
 - **2026-03-28**: Phase 8 Chain Context — event-sourced chain runtime context, crash recovery, retry prompt fallback
 - **2026-03-26**: Auto-chain fully wired (`auto_chain.py`). PM → Dev → Test → QA → Merge → Deploy runs end-to-end with gate validation between stages. Deploy chain triggers service restart automatically. Task create/claim/complete no longer require token.
