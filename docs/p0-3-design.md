@@ -446,6 +446,14 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 | Pre-flight self-check (5 checks + auto-fix) | `agent/governance/preflight.py` |
 | Chain context event store + crash recovery | `agent/governance/chain_context.py` |
 | Memory promote + domain pack registration | `agent/governance/memory_service.py` |
+| conflict_policy enforcement (append/append_set/merge_object/replace) | `agent/governance/memory_service.py` |
+| TTL auto-archive by durability (transient/session/durable/permanent) | `agent/governance/memory_service.py` |
+| DockerBackend index_status tracking + pending retry queue | `agent/governance/memory_backend.py` |
+| Memory injection for all task types (pm/dev/test/qa via _fetch_memories) | `agent/executor_worker.py` |
+| Orphan task lease recovery — periodic _recover_stale_leases() in run_loop | `agent/executor_worker.py` |
+| TTL cleanup trigger every ~6h in run_loop | `agent/executor_worker.py` |
+| Role-specific agent guides (dev/tester-qa/coordinator) | `docs/guide-*.md` |
+| Flush-index + TTL-cleanup API endpoints | `agent/governance/server.py` |
 | Tests | governance server + executor-gateway tests |
 
 ## Acceptance Criteria

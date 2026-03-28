@@ -739,6 +739,7 @@ _retry_on_busy(_do_write)
 ---
 
 ## Changelog
+- 2026-03-28: P1-P3 optimization — memory injection all task types; index_status tracking + flush-index; conflict_policy enforcement; TTL cleanup endpoint; orphan task recovery; role-split guides (guide-dev-agent.md, guide-tester-qa.md, guide-coordinator.md)
 - 2026-03-28: Add independent_connection() + _retry_on_busy(); use in handle_version_update/handle_version_sync
 - 2026-03-28: DB lock fix: auto_chain uses independent connection with guaranteed close
 - 2026-03-28: M3-M6 Gate enhancements: skip_doc_check needs bootstrap_reason, release gate node warning, version-update chain link validation, QA dedup

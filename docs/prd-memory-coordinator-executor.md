@@ -1334,3 +1334,11 @@ chain.archived → memory.write(kind="task_result", ref_id=root_task_id, content
 
 This would allow Coordinator to recall historical chain outcomes via `/api/mem/search`
 when creating new tasks.
+
+## Changelog
+- 2026-03-28: Phase P1-P3 optimization — conflict_policy enforcement, TTL auto-archive, DockerBackend index_status + retry queue, memory injection all task types, orphan lease recovery, role-split guides
+  - `memory_service.py`: `_get_conflict_policy()` lookup from `domain_packs`, applies append/append_set/merge_object/replace; `archive_expired_memories()` TTL cleanup by durability
+  - `memory_backend.py`: `DockerBackend.write()` returns `index_status`; `_pending_reindex` retry queue with `flush_pending_index()` and `pending_index_count()`
+  - `executor_worker.py`: `_fetch_memories()` helper; pm/dev/test/qa prompts all inject relevant memories; `_recover_stale_leases()` every ~5min; `_run_ttl_cleanup()` every ~6h
+  - `server.py`: `POST /api/mem/{pid}/flush-index`, `POST /api/mem/{pid}/ttl-cleanup`
+  - Docs: `guide-dev-agent.md`, `guide-tester-qa.md`, `guide-coordinator.md` (role-split guides)

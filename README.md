@@ -390,11 +390,13 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 |--------|------|-------------|
 | POST | `/api/context/{pid}/save` | Save session context |
 | GET | `/api/context/{pid}/load` | Load session context |
-| POST | `/api/mem/{pid}/write` | Write development memory |
+| POST | `/api/mem/{pid}/write` | Write development memory (returns `index_status`: indexed/pending) |
 | GET | `/api/mem/{pid}/query` | Query memories |
 | GET | `/api/mem/{pid}/search?q=...` | Full-text / semantic search |
 | POST | `/api/mem/{pid}/promote` | Promote memory to global scope |
-| POST | `/api/mem/{pid}/register-pack` | Register domain kind definitions |
+| POST | `/api/mem/{pid}/register-pack` | Register domain kind definitions (durability + conflict_policy per kind) |
+| POST | `/api/mem/{pid}/flush-index` | Retry pending dbservice vector index queue |
+| POST | `/api/mem/{pid}/ttl-cleanup` | Archive memories with expired TTL (per domain pack durability) |
 
 ### Audit
 
