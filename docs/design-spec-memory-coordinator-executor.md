@@ -117,29 +117,46 @@ ref_id     ←→  memory_id (1:N, version chain)
 
 ### 4.1 Schema
 
+Aligned with existing dbservice knowledgeStore + memorySchema + memoryRelations.
+
 ```sql
+-- Primary memory storage
 CREATE TABLE IF NOT EXISTS memories (
     memory_id TEXT PRIMARY KEY,
     ref_id TEXT NOT NULL,
     entity_id TEXT DEFAULT '',
     kind TEXT NOT NULL,
+    sub_kind TEXT DEFAULT '',
     module_id TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT '',          -- project_id or 'global' for cross-project
     content TEXT NOT NULL,
     summary TEXT DEFAULT '',
     metadata_json TEXT DEFAULT '{}',
+    tags TEXT DEFAULT '[]',                  -- JSON array for flexible tagging
     version INTEGER DEFAULT 1,
-    status TEXT DEFAULT 'active',  -- active / superseded / inactive / archived
+    status TEXT DEFAULT 'active',            -- active / superseded / inactive / archived / candidate
     superseded_by_memory_id TEXT DEFAULT NULL,
+    -- Write classification (aligned with dbservice memorySchema)
+    write_class TEXT DEFAULT 'explicit',     -- explicit / inferred / candidate / transient
+    durability TEXT DEFAULT 'durable',       -- permanent / durable / session / transient
+    source_type TEXT DEFAULT 'system_extracted', -- user_explicit / assistant_inferred / system_extracted / imported
+    confidence REAL DEFAULT 1.0,             -- 0.0-1.0, for inferred/candidate memories
+    -- Conflict handling
+    conflict_policy TEXT DEFAULT 'replace',  -- replace / append / append_set / temporal_replace / merge_object
+    -- Lifecycle
+    ttl INTEGER DEFAULT 0,                   -- 0 = no expiry, >0 = seconds until auto-archive
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    index_status TEXT DEFAULT 'pending',  -- pending / indexed / failed
+    -- Index tracking (for async semantic index retry)
+    index_status TEXT DEFAULT 'pending',     -- pending / indexed / failed
     index_error TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_ref ON memories(ref_id, status);
 CREATE INDEX IF NOT EXISTS idx_mem_entity ON memories(entity_id);
-CREATE INDEX IF NOT EXISTS idx_mem_module ON memories(project_id, module_id, status);
-CREATE INDEX IF NOT EXISTS idx_mem_kind ON memories(project_id, kind, status);
+CREATE INDEX IF NOT EXISTS idx_mem_scope ON memories(scope, kind, status);
+CREATE INDEX IF NOT EXISTS idx_mem_module ON memories(scope, module_id, status);
+CREATE INDEX IF NOT EXISTS idx_mem_kind ON memories(scope, kind, status);
 CREATE INDEX IF NOT EXISTS idx_mem_index ON memories(index_status);
 
 -- FTS5 for local keyword search
@@ -147,21 +164,68 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content, module_id, kind, summary,
     content=memories, content_rowid=rowid
 );
+
+-- Memory relations (graph structure between ref_ids)
+-- Aligned with dbservice memoryRelations.js
+CREATE TABLE IF NOT EXISTS memory_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_ref_id TEXT NOT NULL,
+    relation TEXT NOT NULL,         -- e.g. 'DEPENDS_ON', 'SUPERSEDES', 'RELATED_TO', 'CAUSED_BY'
+    to_ref_id TEXT NOT NULL,
+    metadata_json TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rel_from ON memory_relations(from_ref_id);
+CREATE INDEX IF NOT EXISTS idx_rel_to ON memory_relations(to_ref_id);
+CREATE INDEX IF NOT EXISTS idx_rel_type ON memory_relations(relation);
+
+-- Memory events (append-only event log)
+-- Aligned with dbservice memoryRelations.js memory_events
+CREATE TABLE IF NOT EXISTS memory_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_id TEXT DEFAULT '',
+    event_type TEXT NOT NULL,        -- e.g. 'created', 'superseded', 'promoted', 'archived'
+    actor_id TEXT DEFAULT '',        -- who triggered: 'executor', 'coordinator', 'observer'
+    detail TEXT DEFAULT '',
+    metadata_json TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evt_ref ON memory_events(ref_id);
+CREATE INDEX IF NOT EXISTS idx_evt_type ON memory_events(event_type);
 ```
 
 ### 4.2 kind Enumeration (Fixed Set)
 
-| kind | Description | Example |
-|------|-------------|---------|
-| `fact` | Verified factual statement | "governance.db uses WAL mode" |
-| `summary` | Aggregated summary of multiple events | "Session completed 3 auto-merges" |
-| `decision` | Design or implementation decision | "Use SQLite as source of truth" |
-| `failure_pattern` | Known failure mode with root cause | "Direct sqlite3 access causes WAL lock" |
-| `task_result` | Outcome of a completed task | "247 tests passed, 0 failed" |
-| `task_snapshot` | Point-in-time task state capture | "Task-xxx at QA stage, pending review" |
-| `module_note` | Module-specific knowledge | "auto_chain.py has 5 gate functions" |
-| `rule` | System constraint or policy | "Observer must not bypass auto-chain" |
-| `audit_event` | Significant system event | "Version gate blocked 3 tasks" |
+Aligned with dbservice DomainPack 'development' registration:
+
+| kind | Durability | Conflict Policy | Description | dbservice equivalent |
+|------|-----------|-----------------|-------------|---------------------|
+| `fact` | permanent | replace | Verified factual statement | `knowledge` |
+| `summary` | durable | replace | Aggregated summary | — (new) |
+| `decision` | permanent | append | Design/implementation decision | `decision` |
+| `failure_pattern` | permanent | append | Known failure with root cause | `pitfall` |
+| `task_result` | durable | replace | Outcome of completed task | `task_state` |
+| `task_snapshot` | session | replace | Point-in-time task state | `task_state` |
+| `module_note` | durable | replace | Module-specific knowledge | `knowledge` |
+| `rule` | permanent | append_set | System constraint or policy | `constraint` |
+| `audit_event` | permanent | append | Significant system event | — (new) |
+| `architecture` | permanent | replace | Architecture decisions | `architecture` |
+| `pattern` | permanent | replace | Code patterns | `pattern` |
+
+**Durability levels** (from dbservice memorySchema):
+- `permanent` — never auto-expires, explicit archive only
+- `durable` — long-lived, survives session restarts
+- `session` — cleared when session ends
+- `transient` — auto-expires after ttl seconds
+
+**Conflict policies** (from dbservice memorySchema):
+- `replace` — new content overwrites old
+- `append` — new content appended to old
+- `append_set` — dedup merge (comma-separated unique values)
+- `temporal_replace` — newer timestamp wins
+- `merge_object` — JSON deep merge
 
 **Prohibited:** Free-text kind values. All kind values must be from this list.
 
@@ -177,6 +241,105 @@ ref_id: "decision:memory-backend"
   ├── memory_id: mem-001 (v1, status=superseded)
   ├── memory_id: mem-005 (v2, status=superseded)
   └── memory_id: mem-012 (v3, status=active)  ← Coordinator sees this
+```
+
+### 4.4 Scope: Multi-Project Isolation and Sharing
+
+Aligned with dbservice `scope` field.
+
+**Scope values:**
+
+| scope | Meaning | Visibility |
+|-------|---------|-----------|
+| `aming-claw` | Project-specific memory | Only this project's coordinator/agents |
+| `global` | Cross-project shared memory | All projects |
+| `toolbox` | Another project's memory | Only toolbox project |
+
+**Default write scope:** `scope = project_id` (project-private).
+
+**Sharing mechanism — Promote API:**
+
+```
+POST /api/mem/{pid}/promote
+{
+    "memory_id": "mem-012",
+    "target_scope": "global",
+    "reason": "Generic pitfall applicable to all projects"
+}
+```
+
+Promote creates a **copy** with `scope=global`, original stays project-scoped.
+Both share the same `ref_id` but different `memory_id`.
+
+**Query scope resolution:**
+
+```
+Coordinator query for project "aming-claw":
+  1. scope = "aming-claw" (project-specific) — priority
+  2. scope = "global" (cross-project) — supplementary
+
+  Combined, deduped by ref_id, project-scope wins on conflict.
+```
+
+**Reusable kinds (candidates for promote to global):**
+
+| kind | Reusable? | Why |
+|------|-----------|-----|
+| `failure_pattern` | ✅ High | "SQLite WAL lock" applies to any project using SQLite |
+| `architecture` | ✅ High | General patterns (e.g., "semantic recall + SQLite truth") |
+| `pattern` | ✅ High | Code patterns work across projects |
+| `rule` | ⚠️ Sometimes | Some rules are project-specific, some universal |
+| `decision` | ⚠️ Sometimes | Project-specific decisions usually, but design philosophy can be shared |
+| `task_result` | ❌ No | Tied to specific project task |
+| `task_snapshot` | ❌ No | Tied to specific project state |
+| `audit_event` | ❌ No | Tied to specific project timeline |
+
+**DomainPack per project:**
+
+Each project can register its own DomainPack via:
+```
+POST /api/mem/{pid}/register-pack
+{
+    "domain": "development",
+    "types": {
+        "architecture": { "durability": "permanent", "conflictPolicy": "replace" },
+        "pitfall": { "durability": "permanent", "conflictPolicy": "append" },
+        ...
+    }
+}
+```
+
+This maps to dbservice's `registerDomainPack`. Default 'development' pack auto-registered on project init.
+
+### 4.5 Memory Relations (Graph)
+
+Relations between ref_ids enable traversal queries:
+
+```
+Example relations:
+  task-001 --PRODUCED--> decision:use-sqlite
+  decision:use-sqlite --CAUSED_BY--> failure:json-file-corruption
+  failure:wal-lock --RELATED_TO--> failure:db-timeout
+  node:L22.2 --VERIFIED_BY--> task_result:test-247-pass
+```
+
+**Standard relation types:**
+
+| Relation | Meaning | Example |
+|----------|---------|---------|
+| `PRODUCED` | Task created this knowledge | task → decision |
+| `CAUSED_BY` | Root cause link | failure → another failure |
+| `RELATED_TO` | Semantic relation | failure ↔ failure |
+| `VERIFIED_BY` | Evidence link | node → test_result |
+| `DEPENDS_ON` | Prerequisite | task → task |
+| `SUPERSEDES` | Version replacement | decision_v2 → decision_v1 |
+
+**Query via relations:**
+
+```
+GET /api/mem/{pid}/expand?ref_id=task-001&depth=2
+→ Returns task-001 and all ref_ids within 2 hops
+→ Coordinator can see: "task-001 produced decision X which was caused by failure Y"
 ```
 
 ---

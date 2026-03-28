@@ -137,24 +137,50 @@ class CloudBackend(MemoryBackend):
 
 ### 2.5 DB Schema Addition
 
+> Full schema in design-spec §4.1 (includes scope, durability, confidence, conflict_policy, relations, events).
+
 ```sql
--- Structured memory storage (all backends use this)
+-- Core memory table (see design-spec §4.1 for all fields)
 CREATE TABLE IF NOT EXISTS memories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id TEXT NOT NULL,
+    memory_id TEXT PRIMARY KEY,
+    ref_id TEXT NOT NULL,              -- stable semantic anchor (spec §3.2)
+    entity_id TEXT DEFAULT '',
+    kind TEXT NOT NULL,                -- fixed enum (spec §4.2)
     module_id TEXT NOT NULL DEFAULT '',
-    kind TEXT NOT NULL DEFAULT 'decision',
+    scope TEXT NOT NULL DEFAULT '',    -- project_id or 'global' (spec §4.4)
     content TEXT NOT NULL,
-    structured_json TEXT DEFAULT '{}',
-    ref_id TEXT DEFAULT '',
-    is_active INTEGER DEFAULT 1,
+    summary TEXT DEFAULT '',
+    metadata_json TEXT DEFAULT '{}',
+    tags TEXT DEFAULT '[]',
+    version INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'active',
+    durability TEXT DEFAULT 'durable', -- permanent/durable/session/transient
+    confidence REAL DEFAULT 1.0,
+    conflict_policy TEXT DEFAULT 'replace',
+    superseded_by_memory_id TEXT DEFAULT NULL,
+    index_status TEXT DEFAULT 'pending',
     created_at TEXT NOT NULL,
-    superseded_by TEXT DEFAULT NULL
+    updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id, is_active);
-CREATE INDEX IF NOT EXISTS idx_memories_module ON memories(project_id, module_id);
-CREATE INDEX IF NOT EXISTS idx_memories_ref ON memories(project_id, ref_id);
+-- Relations graph (spec §4.5)
+CREATE TABLE IF NOT EXISTS memory_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_ref_id TEXT NOT NULL,
+    relation TEXT NOT NULL,            -- PRODUCED/CAUSED_BY/RELATED_TO/VERIFIED_BY/DEPENDS_ON
+    to_ref_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Event log (spec §4.5)
+CREATE TABLE IF NOT EXISTS memory_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_id TEXT DEFAULT '',
+    event_type TEXT NOT NULL,          -- created/superseded/promoted/archived
+    actor_id TEXT DEFAULT '',
+    detail TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
 
 -- FTS5 full-text search (local backend)
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -181,6 +207,21 @@ GET  /api/mem/{pid}/search?q=...&top_k=3  — Semantic/FTS search
   → Local: FTS5 MATCH
   → Docker: dbservice /search (mem0)
   → Cloud: Cloud API search
+  → Returns ref_id list (spec §6.1), caller fetches full objects from SQLite
+
+# New: Cross-project sharing (spec §4.4)
+POST /api/mem/{pid}/promote            — Promote memory to global scope
+  → Body: {memory_id, target_scope: "global", reason: "..."}
+  → Creates copy with scope=global, logs memory_event
+
+# New: Relation graph (spec §4.5)
+POST /api/mem/{pid}/relate             — Create relation between ref_ids
+  → Body: {from_ref_id, relation, to_ref_id}
+GET  /api/mem/{pid}/expand?ref_id=X&depth=2  — Graph traversal from ref_id
+
+# New: DomainPack registration (aligned with dbservice)
+POST /api/mem/{pid}/register-pack      — Register project-specific kind types
+  → Body: {domain: "development", types: {...}}
 ```
 
 ### 2.7 Files Changed
