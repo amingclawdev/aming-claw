@@ -372,6 +372,7 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 | GET | `/api/wf/{pid}/node/{nid}` | Single node details |
 | GET | `/api/wf/{pid}/export` | Export as JSON/Mermaid |
 | GET | `/api/wf/{pid}/impact?files=...` | File change impact analysis |
+| GET | `/api/wf/{pid}/preflight-check` | Pre-flight health check (system/version/graph/coverage/queue) |
 | POST | `/api/wf/{pid}/rollback` | Rollback to snapshot version |
 | POST | `/api/wf/{pid}/node-delete` | Delete nodes from graph + DB |
 
@@ -391,6 +392,9 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 | GET | `/api/context/{pid}/load` | Load session context |
 | POST | `/api/mem/{pid}/write` | Write development memory |
 | GET | `/api/mem/{pid}/query` | Query memories |
+| GET | `/api/mem/{pid}/search?q=...` | Full-text / semantic search |
+| POST | `/api/mem/{pid}/promote` | Promote memory to global scope |
+| POST | `/api/mem/{pid}/register-pack` | Register domain kind definitions |
 
 ### Audit
 

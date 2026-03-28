@@ -443,6 +443,9 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 | Gatekeeper budget (git only: 1000 tokens, no memory) | governance server (context assembler) |
 | Isolated gatekeeper session (diff-only prompt) | executor-gateway |
 | Deploy auto-trigger (with non-Docker fallback) | `agent/deploy_chain.py` |
+| Pre-flight self-check (5 checks + auto-fix) | `agent/governance/preflight.py` |
+| Chain context event store + crash recovery | `agent/governance/chain_context.py` |
+| Memory promote + domain pack registration | `agent/governance/memory_service.py` |
 | Tests | governance server + executor-gateway tests |
 
 ## Acceptance Criteria

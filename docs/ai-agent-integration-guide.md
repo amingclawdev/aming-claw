@@ -194,7 +194,11 @@ Body: {"project_id": "<pid>", "status": "idle"}
 | View node | GET | `/api/wf/{pid}/node/{nid}` | Single node details |
 | Impact analysis | GET | `/api/wf/{pid}/impact?files=a.js,b.js` | File change impact |
 | Query memory | GET | `/api/mem/{pid}/query?module=X` | Query related development memory |
+| Search memory | GET | `/api/mem/{pid}/search?q=X&top_k=5` | Full-text / semantic search |
 | Write memory | POST | `/api/mem/{pid}/write` | Write pattern/pitfall |
+| Promote memory | POST | `/api/mem/{pid}/promote` | Copy memory to global scope (cross-project) |
+| Register pack | POST | `/api/mem/{pid}/register-pack` | Register domain kind definitions |
+| Pre-flight check | GET | `/api/wf/{pid}/preflight-check` | System/version/graph/coverage/queue health |
 
 ### Coordinator Only
 
@@ -446,8 +450,48 @@ GET /api/mem/my-app/query?node=L5.1
 | `pitfall` | Lessons learned, known issues |
 | `workaround` | Temporary solutions |
 | `decision` | Why A was chosen over B |
+| `task_result` | Merge outcome summary (auto-written on merge) |
 | `invariant` | Constraints that must not be violated |
 | `ownership` | Who is responsible for which module |
+
+### Promote Memory (Cross-Project Sharing)
+
+```json
+POST /api/mem/my-app/promote
+{"memory_id": "mem-012", "target_scope": "global", "reason": "Applicable to all projects"}
+```
+
+Creates a copy with `scope=global` (original stays project-scoped). Promotable kinds: `failure_pattern`, `architecture`, `pattern`, `rule`, `decision`, `knowledge`.
+
+### Register Domain Pack
+
+```json
+POST /api/mem/my-app/register-pack
+{"domain": "development", "types": {"architecture": {"durability": "permanent", "conflictPolicy": "replace"}}}
+```
+
+---
+
+## Pre-flight Self-Check
+
+Run before starting a chain or investigating issues:
+
+```
+GET /api/wf/my-app/preflight-check
+GET /api/wf/my-app/preflight-check?auto_fix=true
+```
+
+Returns 5 independent checks:
+
+| Check | What it validates |
+|-------|-------------------|
+| `system` | DB accessible, required tables exist |
+| `version` | chain_version == git_head, sync freshness |
+| `graph` | No orphan pending nodes without active tasks |
+| `coverage` | All governance/*.py files in CODE_DOC_MAP |
+| `queue` | No stuck claimed tasks (>30min), no circular retries |
+
+With `auto_fix=true`: waives orphan nodes, marks stuck tasks as failed.
 
 ---
 
@@ -624,7 +668,66 @@ CREATE TABLE chain_events (
 );
 ```
 
+## SQLite Independent Connection Pattern
+
+### Problem
+
+The governance server maintains a long-lived shared SQLite connection per request.
+When a high-frequency writer (e.g. the executor git-sync loop) holds a WAL write
+lock, a concurrent `version-update` or `version-sync` call on the shared connection
+can encounter `SQLITE_BUSY` immediately — the default busy-timeout of 10 000 ms
+adds unacceptable latency to the HTTP worker thread.
+
+### Solution — `independent_connection()` + `_retry_on_busy()`
+
+`db.py` exposes a lightweight helper:
+
+```python
+from agent.governance.db import independent_connection
+
+conn = independent_connection(project_id, busy_timeout=5000)
+# … execute writes …
+conn.close()
+```
+
+Key properties:
+- Opens a **brand-new** connection (not from any pool).
+- `busy_timeout=5000` (5 s) — tighter than the shared-connection 10 s default.
+- Does **not** call `_ensure_schema` — database is assumed to be fully migrated.
+- Caller is responsible for `conn.close()`.
+
+For write paths that may race (version-update, version-sync), wrap the DB call
+with `_retry_on_busy()` defined in `server.py`:
+
+```python
+# 3 attempts with 0.5 s → 1 s → 2 s back-off
+_retry_on_busy(_do_write_fn)
+```
+
+`_retry_on_busy` catches `sqlite3.OperationalError: database is locked` and
+retries up to 3 times before re-raising.  The inner write function should be
+idempotent (use `INSERT OR REPLACE` / `ON CONFLICT … DO UPDATE` semantics).
+
+### Usage in server.py
+
+Both `handle_version_update` and `handle_version_sync` follow this pattern:
+
+```python
+def _do_write():
+    conn = independent_connection(pid)
+    try:
+        conn.execute("INSERT OR REPLACE INTO project_version …", (…,))
+        conn.commit()
+    finally:
+        conn.close()
+
+_retry_on_busy(_do_write)
+```
+
+---
+
 ## Changelog
+- 2026-03-28: Add independent_connection() + _retry_on_busy(); use in handle_version_update/handle_version_sync
 - 2026-03-28: DB lock fix: auto_chain uses independent connection with guaranteed close
 - 2026-03-28: M3-M6 Gate enhancements: skip_doc_check needs bootstrap_reason, release gate node warning, version-update chain link validation, QA dedup
 - 2026-03-28: M1+M2 Task ownership validation + observer override audit in complete_task

@@ -332,12 +332,17 @@ When governance restarts, `ChainContextStore.recover_from_db()` replays `chain_e
 ### When Manual Intervention IS Needed
 - **Bootstrap paradox**: the chain context module itself needs fixing (self-referential failure)
 - **Corrupted chain_events**: events replayed in wrong order or with missing payloads
-- **Stale chains**: chains stuck >1h with no updates (future: auto-cleanup timer)
+- **Stale chains**: failed chains are now auto-archived (retry exhausted → archived). Completed chains archived after merge. Only bootstrap paradox or corrupted events need manual cleanup.
 
 ### Observer Chain Inspection
 Use `GET /api/context-snapshot/{pid}?task_id=XXX&role=coordinator` to see full chain state including all stages, gate reasons, and result summaries.
 
+### Pre-flight Check
+Run `GET /api/wf/{pid}/preflight-check` (or MCP tool `preflight_check`) before intervening. Checks system, version, graph, coverage, and queue health. Use `auto_fix=true` to auto-waive orphan nodes and fail stuck tasks.
+
 ## Changelog
+- 2026-03-28: Pre-flight self-check system, memory promote/register-pack APIs, merge memory write
+- 2026-03-28: Chain Context Phase 8 complete: auto-archive failed chains, prompt in task.created events
 - 2026-03-28: DB lock fix: auto_chain uses independent connection, guaranteed close via try/finally
 - 2026-03-28: M3 skip_doc_check now requires bootstrap_reason; M4 release gate warns on missing nodes
 - 2026-03-28: Chain Context crash recovery and observer inspection added

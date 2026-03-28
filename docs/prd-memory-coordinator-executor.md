@@ -695,7 +695,7 @@ Called at executor startup, before entering poll loop.
 | **Phase 5** | Coordinator awareness (intent classifier, prompt injection) | executor_worker, gateway | Phase 4 | DONE |
 | **Phase 6** | Docker mem0 backend (semantic search + FTS5 fallback) | memory_backend | Phase 2 | DONE |
 | **Phase 7** | Spec invariant verification tests | tests/test_verify_spec | Phase 1-6 | DONE |
-| **Phase 8** | Chain Context (event-sourced runtime context) | chain_context, auto_chain, server, task_registry, db | None | TODO |
+| **Phase 8** | Chain Context (event-sourced runtime context) | chain_context, auto_chain, server, task_registry, db | None | DONE |
 | **Phase 9** | Cloud RemoteBackend (nginx upstream switch) | nginx.conf, memory_backend | Phase 6 | Future |
 
 **Dependency rules:**
