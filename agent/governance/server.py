@@ -1283,9 +1283,14 @@ def handle_audit_violations(ctx: RequestContext):
 
 @route("POST", "/api/task/{project_id}/create")
 def handle_task_create(ctx: RequestContext):
-    """Create a task. Auth optional — uses principal_id if token provided, else 'anonymous'."""
+    """Create a task. Auth optional — uses principal_id if token provided, else 'anonymous'.
+
+    Phase 4: Auto-enriches metadata with operation_type, intent_hash, and
+    runs conflict rules for non-system task types.
+    """
     project_id = ctx.get_project_id()
     from . import task_registry
+    from .conflict_rules import extract_operation_type, compute_intent_hash, check_conflicts
     created_by = "anonymous"
     if ctx.token:
         try:
@@ -1294,17 +1299,55 @@ def handle_task_create(ctx: RequestContext):
                 created_by = session.get("principal_id", "anonymous")
         except Exception:
             pass
+
+    prompt = ctx.body.get("prompt", "")
+    task_type = ctx.body.get("type", "task")
+    metadata = ctx.body.get("metadata") or {}
+    if isinstance(metadata, str):
+        import json as _json
+        try:
+            metadata = _json.loads(metadata)
+        except Exception:
+            metadata = {}
+
+    # Auto-enrich metadata
+    if "operation_type" not in metadata:
+        metadata["operation_type"] = extract_operation_type(prompt)
+    if "intent_hash" not in metadata:
+        metadata["intent_hash"] = compute_intent_hash(prompt)
+    if "intent_summary" not in metadata:
+        metadata["intent_summary"] = prompt[:200]
+
+    # Run conflict rules for user-facing task types (not auto-chain internal)
+    rule_decision = None
+    if task_type in ("pm", "dev", "coordinator") and created_by not in ("auto-chain", "auto-chain-retry"):
+        with DBContext(project_id) as conn:
+            rule_decision = check_conflicts(
+                conn, project_id,
+                target_files=metadata.get("target_files", []),
+                operation_type=metadata["operation_type"],
+                intent_hash=metadata["intent_hash"],
+                prompt=prompt,
+                depends_on=metadata.get("depends_on"),
+            )
+        metadata["rule_decision"] = rule_decision["decision"]
+        metadata["rule_reason"] = rule_decision["reason"]
+
     with DBContext(project_id) as conn:
-        return task_registry.create_task(
+        result = task_registry.create_task(
             conn, project_id,
-            prompt=ctx.body.get("prompt", ""),
-            task_type=ctx.body.get("type", "task"),
+            prompt=prompt,
+            task_type=task_type,
             related_nodes=ctx.body.get("related_nodes"),
             created_by=created_by,
             priority=int(ctx.body.get("priority", 0)),
             max_attempts=int(ctx.body.get("max_attempts", 3)),
-            metadata=ctx.body.get("metadata"),
+            metadata=metadata,
         )
+    # Attach rule decision to response
+    if rule_decision:
+        result["rule_decision"] = rule_decision
+    return result
 
 
 @route("POST", "/api/task/{project_id}/claim")
