@@ -175,6 +175,7 @@ class ExecutorWorker:
 
         # Detect actually changed files via git diff
         changed_files = self._get_git_changed_files()
+        log.info("git diff detected %d changed file(s): %s", len(changed_files), changed_files)
 
         # Stage changed files if any
         if changed_files:
@@ -192,12 +193,15 @@ class ExecutorWorker:
 
         # Parse output and merge with real changed_files
         result = self._parse_output(session, task_type)
+        log.info("_parse_output keys: %s", list(result.keys()))
 
         # Always overwrite/set changed_files from git diff (ground truth)
-        if changed_files:
-            result["changed_files"] = changed_files
-        elif "changed_files" not in result:
-            result["changed_files"] = []
+        # IMPORTANT: git diff is authoritative; always set even if _parse_output
+        # returned its own changed_files (it may be stale or from AI hallucination)
+        result["changed_files"] = changed_files if changed_files else result.get("changed_files", [])
+
+        log.info("Final result for %s: changed_files=%s, keys=%s",
+                 task_id, result.get("changed_files"), list(result.keys()))
 
         # Write structured memory on completion
         self._write_memory(task_type, task_id, result, metadata)

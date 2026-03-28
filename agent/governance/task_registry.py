@@ -333,24 +333,39 @@ def list_tasks(
     limit: int = 50,
 ) -> list[dict]:
     """List tasks for a project."""
+    cols = """task_id, status, type, prompt, assigned_to, created_by,
+                      created_at, updated_at, attempt_count, priority,
+                      result_json, metadata_json"""
     if status:
         rows = conn.execute(
-            """SELECT task_id, status, type, prompt, assigned_to, created_by,
-                      created_at, updated_at, attempt_count, priority
+            f"""SELECT {cols}
                FROM tasks WHERE project_id = ? AND status = ?
                ORDER BY updated_at DESC LIMIT ?""",
             (project_id, status, limit),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT task_id, status, type, prompt, assigned_to, created_by,
-                      created_at, updated_at, attempt_count, priority
+            f"""SELECT {cols}
                FROM tasks WHERE project_id = ?
                ORDER BY updated_at DESC LIMIT ?""",
             (project_id, limit),
         ).fetchall()
 
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        # Parse JSON fields for API consumers
+        for field in ("result_json", "metadata_json"):
+            raw = d.get(field)
+            if raw and isinstance(raw, str):
+                try:
+                    d[field.replace("_json", "")] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    d[field.replace("_json", "")] = raw
+            else:
+                d[field.replace("_json", "")] = raw
+        results.append(d)
+    return results
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> dict | None:

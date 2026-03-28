@@ -1759,3 +1759,100 @@ L24.4  Task绑定worktree  [impl:pending] [verify:pending] v7.2
       primary:[agent/task_orchestrator.py,agent/executor.py]
       description: 每个task/session带worktree_root+allowed_prefixes+base_commit
 ```
+
+## Phase 1-7 — 已实现功能节点（Implementation Phases）
+
+以下节点对应 Phase 1-7 已实现但之前无验收图节点的功能模块。
+
+### L3 补充节点
+
+```
+L3.2  Executor Lifecycle: monitor loop, PID lock, crash recovery, circuit breaker  [impl:done] [verify:pending] v4.0
+      deps:[L3.2]
+      gate_mode: auto
+      verify: L2
+      test_coverage: partial
+      primary:[agent/service_manager.py, agent/executor_worker.py]
+      secondary:[]
+      test:[agent/tests/test_service_manager.py]
+      verify_level: 2
+      description: ServiceManager 监控循环（10s 轮询）、PID 锁防重启、崩溃自动恢复、熔断器（5次/300s）
+```
+
+### L4 补充节点
+
+```
+L4.18  Memory Backend: SQLite + FTS5, pluggable interface  [impl:done] [verify:pending] v4.0
+      deps:[L4.1]
+      gate_mode: auto
+      verify: L3
+      test_coverage: partial
+      primary:[agent/governance/memory_backend.py, agent/governance/memory_service.py]
+      secondary:[agent/governance/db.py]
+      test:[agent/tests/test_memory_backend.py]
+      verify_level: 3
+      description: MemoryBackend 抽象接口 + LocalBackend（SQLite+FTS5）+ DockerBackend + CloudBackend 可插拔实现；/api/mem 搜索端点
+
+L4.19  ref_id Lifecycle: entity mapping, version chain, relation graph  [impl:done] [verify:pending] v4.0
+      deps:[L4.18]
+      gate_mode: auto
+      verify: L2
+      test_coverage: partial
+      primary:[agent/governance/memory_backend.py]
+      secondary:[agent/governance/db.py, agent/governance/server.py]
+      test:[agent/tests/test_memory_backend.py]
+      verify_level: 2
+      description: entity_id 映射、version chain 追踪、search_and_aggregate 聚合查询、关系图（memory_relations 表）
+
+L4.20  Docker mem0 Backend: semantic search with FTS5 fallback  [impl:done] [verify:pending] v4.0
+      deps:[L4.18]
+      gate_mode: auto
+      verify: L2
+      test_coverage: partial
+      primary:[agent/governance/memory_backend.py]
+      secondary:[]
+      test:[agent/tests/test_verify_spec.py]
+      verify_level: 2
+      description: DockerBackend 接入 mem0 语义搜索；FTS5 降级策略；向量索引
+```
+
+### L5 补充节点
+
+```
+L5.5  Conflict Rule Engine: duplicate, opposite-op, dependency, failure-pattern  [impl:done] [verify:pending] v4.0
+      deps:[L4.1, L4.18]
+      gate_mode: auto
+      verify: L3
+      test_coverage: partial
+      primary:[agent/governance/conflict_rules.py, agent/governance/server.py]
+      secondary:[]
+      test:[agent/tests/test_conflict_rules.py]
+      verify_level: 3
+      description: 5 规则引擎（duplicate/conflict/queue_full/retry/new）、task metadata enrichment、规则决策接口
+
+L5.6  Coordinator Awareness: intent classifier, memory+queue+rule prompt injection  [impl:done] [verify:pending] v4.0
+      deps:[L5.5, L5.1]
+      gate_mode: auto
+      verify: L2
+      test_coverage: partial
+      primary:[agent/executor_worker.py, agent/telegram_gateway/gateway.py]
+      secondary:[]
+      test:[agent/tests/test_verify_spec.py]
+      verify_level: 2
+      description: Gateway 意图分类器（greeting/query/dangerous/task/chat）、Coordinator prompt 注入记忆+队列+规则决策
+```
+
+### L6 补充节点
+
+```
+L6.5  Spec Invariant Verification: 10 invariant tests  [impl:done] [verify:pending] v4.0
+      deps:[L3.2, L4.18, L4.19, L5.5, L5.6, L4.20]
+      gate_mode: auto
+      verify: L3
+      test_coverage: full
+      primary:[agent/tests/test_verify_spec.py]
+      secondary:[]
+      test:[agent/tests/test_verify_spec.py]
+      verify_level: 3
+      description: 10 个规格不变量测试覆盖 Phase 1-6 全部特性；总测试数 275
+```

@@ -237,6 +237,10 @@ def _gate_post_pm(conn, project_id, result, metadata):
 
 def _gate_checkpoint(conn, project_id, result, metadata):
     """Checkpoint gate: files changed? no unrelated files outside target_files? docs updated?"""
+    log.info("checkpoint_gate: result keys=%s, changed_files=%s, target_files=%s",
+             list(result.keys()) if result else None,
+             result.get("changed_files"),
+             metadata.get("target_files"))
     changed = result.get("changed_files", [])
     if not changed:
         return False, "No files changed"

@@ -22,10 +22,10 @@ EVENT_FORMATTERS = {
         else f"\U0001f504 [{p.get('project_id')}] {p.get('node_id')} \u2192 {p.get('to', p.get('new_status'))}"
     ),
     "gate.satisfied": lambda p: (
-        f"\U0001f680 [{p.get('project_id')}] Gate {p.get('gate_id', 'unknown')} \u5df2\u6ee1\u8db3"
+        f"\U0001f680 [{p.get('project_id')}] Gate {p.get('stage', p.get('gate_id', 'unknown'))}\u2192{p.get('next_stage', '?')} \u5df2\u6ee1\u8db3"
     ),
     "gate.blocked": lambda p: (
-        f"\u26d4 [{p.get('project_id')}] Gate {p.get('gate_id', 'unknown')} \u88ab\u963b\u585e: {p.get('reason', '')}"
+        f"\u26d4 [{p.get('project_id')}] Gate {p.get('stage', p.get('gate_id', 'unknown'))}\u2192{p.get('next_stage', '?')} \u88ab\u963b\u585e: {p.get('reason', '')}"
     ),
     "release.approved": lambda p: (
         f"\U0001f389 [{p.get('project_id')}] \u53d1\u5e03\u95e8\u7981\u901a\u8fc7!"
