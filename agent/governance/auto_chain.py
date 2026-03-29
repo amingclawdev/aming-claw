@@ -791,7 +791,8 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
     """Verify every node in related_nodes has at least min_status in node_state.
 
     Returns (passed: bool, reason: str).
-    If a node is not found in the DB it is treated as 'pending' and blocks.
+    If node_state table is empty for this project (fresh DB bootstrap), skip check.
+    If a node is not found in a populated DB it is treated as 'pending' and blocks.
     """
     if not related_nodes:
         return True, "no related_nodes"
@@ -800,6 +801,14 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
     except ValueError:
         return False, f"unknown min_status '{min_status}'"
 
+    # Fresh DB: if no node_state records exist for this project, skip node check entirely
+    node_count = conn.execute(
+        "SELECT COUNT(*) FROM node_state WHERE project_id = ?", (project_id,)
+    ).fetchone()[0]
+    if node_count == 0:
+        log.info("_check_nodes_min_status: node_state empty for project %s — skipping node check (fresh DB)", project_id)
+        return True, "node_state empty (fresh DB bootstrap)"
+
     blocking = []
     for node_id in related_nodes:
         row = conn.execute(
@@ -807,7 +816,7 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
             (project_id, node_id),
         ).fetchone()
         if row is None:
-            # Not found → treat as pending
+            # Not found in populated DB → treat as pending
             blocking.append((node_id, "pending (not found in DB)"))
             continue
         status = (row["verify_status"] or "pending").strip()
