@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 
@@ -290,61 +291,122 @@ def complete_task(
         "completed_at": now,
     }
 
-    # Auto-chain: dispatch next stage on success
-    # Cancelled: terminal, no auto-chain, no retry
+    # Auto-chain: dispatch next stage asynchronously on success/failure.
+    # Non-chain types (task, coordinator) are ignored by auto_chain.CHAIN
+    # so they pass through without spawning a thread.
+    # Cancelled: terminal, no auto-chain, no retry.
     if exec_status == "cancelled":
         pass  # skip auto-chain
     elif status == "failed" and project_id:
-        try:
-            from . import auto_chain
-            meta = json.loads(row["metadata_json"] or "{}")
-            type_row = conn.execute(
-                "SELECT type FROM tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            conn.commit()
-            failure_chain = auto_chain.on_task_failed(
-                conn,
-                project_id,
-                task_id,
-                task_type=type_row["type"] if type_row else "task",
-                result=result or {},
-                metadata=meta,
-                reason=error_message or (result or {}).get("error", ""),
-            )
-            if failure_chain:
-                response["auto_chain"] = {
-                    "task_failed": True,
-                    "workflow_improvement_task_id": failure_chain["task_id"],
-                    "failure_class": failure_chain["classification"].get("failure_class", ""),
-                }
-        except Exception:
-            import traceback as _tb
-            _tb.print_exc()
+        meta = json.loads(row["metadata_json"] or "{}")
+        type_row = conn.execute(
+            "SELECT type FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        task_type = type_row["type"] if type_row else "task"
+        conn.commit()
+        response["auto_chain"] = {"dispatched": True}
+        _dispatch_auto_chain_failed(
+            project_id, task_id, task_type,
+            result or {}, meta,
+            error_message or (result or {}).get("error", ""),
+        )
     elif exec_status == "succeeded" and project_id:
-        try:
-            from . import auto_chain
-            meta = json.loads(row["metadata_json"] or "{}")
-            type_row = conn.execute(
-                "SELECT type FROM tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            # Commit before auto_chain opens its independent connection.
-            # Without this, the caller's open transaction holds a write lock and
-            # auto_chain's separate conn fails with "database is locked".
-            conn.commit()
-            chain_result = auto_chain.on_task_completed(
-                conn, project_id, task_id,
-                task_type=type_row["type"] if type_row else "task",
-                status=exec_status,
-                result=result or {},
-                metadata=meta,
-            )
-            if chain_result:
-                response["auto_chain"] = chain_result
-        except Exception:
-            import traceback as _tb
-            _tb.print_exc()
+        meta = json.loads(row["metadata_json"] or "{}")
+        type_row = conn.execute(
+            "SELECT type FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        task_type = type_row["type"] if type_row else "task"
+        # Commit before auto_chain opens its independent connection.
+        # Without this, the caller's open transaction holds a write lock and
+        # auto_chain's separate conn fails with "database is locked".
+        conn.commit()
+        response["auto_chain"] = {"dispatched": True}
+        _dispatch_auto_chain_success(
+            project_id, task_id, task_type,
+            exec_status, result or {}, meta,
+        )
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Background auto-chain dispatch helpers
+# ---------------------------------------------------------------------------
+
+def _dispatch_auto_chain_success(
+    project_id: str,
+    task_id: str,
+    task_type: str,
+    exec_status: str,
+    result: dict,
+    metadata: dict,
+) -> None:
+    """Fire auto_chain.on_task_completed in a background thread.
+
+    Errors are logged (not swallowed) so they appear in service logs.
+    """
+    def _run():
+        try:
+            from . import auto_chain
+            from .db import get_connection
+            conn = get_connection(project_id)
+            try:
+                auto_chain.on_task_completed(
+                    conn, project_id, task_id,
+                    task_type=task_type,
+                    status=exec_status,
+                    result=result,
+                    metadata=metadata,
+                )
+            finally:
+                conn.close()
+        except Exception:
+            log.error(
+                "auto_chain.on_task_completed failed for task %s (project=%s, type=%s)",
+                task_id, project_id, task_type,
+                exc_info=True,
+            )
+
+    t = threading.Thread(target=_run, name=f"auto-chain-{task_id}", daemon=True)
+    t.start()
+
+
+def _dispatch_auto_chain_failed(
+    project_id: str,
+    task_id: str,
+    task_type: str,
+    result: dict,
+    metadata: dict,
+    reason: str,
+) -> None:
+    """Fire auto_chain.on_task_failed in a background thread.
+
+    Errors are logged (not swallowed) so they appear in service logs.
+    """
+    def _run():
+        try:
+            from . import auto_chain
+            from .db import get_connection
+            conn = get_connection(project_id)
+            try:
+                auto_chain.on_task_failed(
+                    conn, project_id, task_id,
+                    task_type=task_type,
+                    result=result,
+                    metadata=metadata,
+                    reason=reason,
+                )
+            finally:
+                conn.close()
+        except Exception:
+            log.error(
+                "auto_chain.on_task_failed failed for task %s (project=%s, type=%s)",
+                task_id, project_id, task_type,
+                exc_info=True,
+            )
+
+    t = threading.Thread(target=_run, name=f"auto-chain-fail-{task_id}", daemon=True)
+    t.start()
 
 
 def hold_task(conn: sqlite3.Connection, task_id: str) -> dict:
