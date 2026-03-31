@@ -340,6 +340,21 @@ Use `GET /api/context-snapshot/{pid}?task_id=XXX&role=coordinator` to see full c
 ### Pre-flight Check
 Run `GET /api/wf/{pid}/preflight-check` (or MCP tool `preflight_check`) before intervening. Checks system, version, graph, coverage, and queue health. Use `auto_fix=true` to auto-waive orphan nodes and fail stuck tasks.
 
+## Merge Isolation & Doc Gate Policy
+
+### Merge Isolation (Fail-Closed)
+
+Chained merge tasks propagate `_worktree` and `_branch` metadata through the entire chain (dev → test → qa → gatekeeper → merge). When a merge task has `parent_task_id` but is missing this isolation metadata, **the merge fails closed** rather than falling back to the main workspace. This prevents accidental main-workspace commits from broken chains.
+
+**Observer action when merge fails closed:**
+1. Check task metadata for the missing `_branch`/`_worktree` fields
+2. Trace back to the originating dev task to identify where propagation broke
+3. Re-run the dev chain from the stage where metadata was lost
+
+### docs/dev/** Gate Exemption
+
+`docs/dev/**` files are informal dev notes and are exempt from the formal doc gate. The checkpoint gate (`_gate_checkpoint`) filters them out before enforcing doc updates. Formal docs outside `docs/dev/` remain fully enforced.
+
 ## Changelog
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: Pre-flight self-check system, memory promote/register-pack APIs, merge memory write

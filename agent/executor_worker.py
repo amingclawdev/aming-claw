@@ -393,6 +393,18 @@ class ExecutorWorker:
         worktree = metadata.get("_worktree", "")
         self._report_progress(task_id, {"step": "merging"})
 
+        # Fail closed: chained merge tasks MUST carry isolated metadata
+        if metadata.get("parent_task_id") and not branch:
+            return {
+                "status": "failed",
+                "error": (
+                    "Chained merge task has parent_task_id but no isolated "
+                    "merge metadata (_branch/_worktree). Refusing to touch "
+                    "main-workspace files. Re-run the dev chain to produce "
+                    "proper isolation metadata."
+                ),
+            }
+
         try:
             if branch:
                 if not self._branch_exists(branch):

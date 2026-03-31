@@ -502,6 +502,21 @@ Each role sees only relevant stages and result fields:
 - `server.py`: context-snapshot injects task_chain, startup registers EventBus + recovers
 - `task_registry.py`: auto-stores _original_prompt on create_task
 
+## Merge Isolation & Doc Gate Policy (L25.1)
+
+### Merge Isolation
+
+Chain metadata (`_worktree`, `_branch`, `changed_files`, `target_files`) is preserved across all chained stages: dev → test → qa → gatekeeper → merge. Each prompt builder (`_build_test_prompt`, `_build_qa_prompt`, `_build_gatekeeper_prompt`, `_build_merge_prompt`) propagates these fields.
+
+**Fail-closed rule:** `_execute_merge` in `executor_worker.py` rejects any chained merge (has `parent_task_id`) that arrives without `_branch` metadata. This prevents a broken chain from silently committing to the main workspace.
+
+### docs/dev/** Gate Exemption
+
+`_gate_checkpoint` uses `_is_dev_note(path)` to filter out `docs/dev/**` from the expected-docs set. This means:
+- Dev notes under `docs/dev/` never block the checkpoint gate
+- Formal docs (`docs/*.md` outside `docs/dev/`) remain enforced
+- `doc_impact.files` entries matching `docs/dev/**` are silently excluded
+
 ## Changelog
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: DB lock fix: auto_chain independent connection + guaranteed conn.close()

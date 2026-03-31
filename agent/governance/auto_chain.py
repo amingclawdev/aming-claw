@@ -795,6 +795,12 @@ def _gate_post_pm(conn, project_id, result, metadata):
     return True, "ok"
 
 
+def _is_dev_note(path: str) -> bool:
+    """Return True for docs/dev/** paths — informal dev notes, not formal docs."""
+    normalized = path.replace("\\", "/")
+    return normalized.startswith("docs/dev/")
+
+
 def _gate_checkpoint(conn, project_id, result, metadata):
     """Checkpoint gate for Dev.
 
@@ -835,6 +841,9 @@ def _gate_checkpoint(conn, project_id, result, metadata):
         expected_docs = set(doc_impact.get("files") or [])
     else:
         expected_docs = get_related_docs(code_files)
+    # docs/dev/** are informal dev notes — never enforce them as formal docs
+    if expected_docs:
+        expected_docs = {d for d in expected_docs if not _is_dev_note(d)}
     if expected_docs:
         missing_docs = expected_docs - doc_files_changed
         if missing_docs:
@@ -1135,10 +1144,18 @@ def _build_gatekeeper_prompt(task_id, result, metadata):
         "Respond with strict JSON: "
         "{\"schema_version\":\"v1\",\"review_summary\":\"...\",\"recommendation\":\"merge_pass|reject\",\"pm_alignment\":\"pass|partial|fail\",\"checked_requirements\":[\"R1\"],\"reason\":\"\"}"
     )
-    return prompt, {
+    meta = {
         **metadata,
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes", result.get("related_nodes", []))),
     }
+    # Propagate worktree isolation metadata through gatekeeper → merge
+    if metadata.get("_worktree"):
+        meta["_worktree"] = metadata["_worktree"]
+        meta["_branch"] = metadata.get("_branch", "")
+    elif result.get("_worktree"):
+        meta["_worktree"] = result["_worktree"]
+        meta["_branch"] = result.get("_branch", "")
+    return prompt, meta
 
 
 def _build_merge_prompt(task_id, result, metadata):

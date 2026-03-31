@@ -738,6 +738,24 @@ _retry_on_busy(_do_write)
 
 ---
 
+## Merge Isolation & Doc Gate Policy
+
+### Merge Isolation
+
+All chained merge tasks carry isolated metadata (`_worktree`, `_branch`) from the originating dev chain through every stage: test → qa → gatekeeper → merge. This ensures:
+
+- The merge operates on the correct dev worktree branch, never the main workspace directly.
+- If a chained merge task (one with `parent_task_id`) arrives without `_branch`/`_worktree` metadata, the merge **fails closed** — it refuses to touch main-workspace files. This prevents accidental commits to main from broken chain propagation.
+- Non-chained merges (manual, no `parent_task_id`) may still use the main workspace fallback.
+
+### docs/dev/** Gate Exemption
+
+Files under `docs/dev/**` are informal developer notes (iteration plans, scratch docs, debug logs). They are **not enforced** by the checkpoint doc gate:
+
+- `_gate_checkpoint` filters out any `docs/dev/**` paths from the expected-docs set before checking for missing documentation.
+- Formal docs (e.g., `docs/ai-agent-integration-guide.md`, `docs/human-intervention-guide.md`, `docs/p0-3-design.md`) remain fully enforced.
+- If `doc_impact.files` contains only `docs/dev/**` paths, the doc gate passes without requiring those files in `changed_files`.
+
 ## Changelog
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: P1-P3 optimization — memory injection all task types; index_status tracking + flush-index; conflict_policy enforcement; TTL cleanup endpoint; orphan task recovery; role-split guides (guide-dev-agent.md, guide-tester-qa.md, guide-coordinator.md)
