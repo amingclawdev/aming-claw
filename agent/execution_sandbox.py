@@ -65,12 +65,12 @@ class ExecutionSandbox:
         # Always deny
         for pattern in ALWAYS_DENY:
             if re.search(pattern, cmd_lower):
-                return "deny", f"命令被永久禁止: {pattern}"
+                return "deny", f"Command permanently denied: {pattern}"
 
         # Needs approval
         for pattern in APPROVAL_REQUIRED:
             if pattern in cmd_lower:
-                return "approval", f"命令需要人工确认: {pattern}"
+                return "approval", f"Command requires human approval: {pattern}"
 
         # Whitelist
         for pattern in COMMAND_WHITELIST:
@@ -96,13 +96,13 @@ class ExecutionSandbox:
         try:
             fp.relative_to(ws)
         except ValueError:
-            return False, f"文件不在工作区内: {filepath}"
+            return False, f"File is outside workspace: {filepath}"
 
         # Sensitive paths
         sensitive = {".ssh", ".aws", ".gnupg", ".env", "credentials", "secrets"}
         for part in fp.parts:
             if part.lower() in sensitive:
-                return False, f"敏感路径: {part}"
+                return False, f"Sensitive path: {part}"
 
         return True, "ok"
 
@@ -120,7 +120,7 @@ class ExecutionSandbox:
                 try:
                     fp.relative_to(ws)
                 except ValueError:
-                    violations.append(f"文件在工作区外: {f}")
+                    violations.append(f"File is outside workspace: {f}")
 
             # Check for sensitive file modifications
             ok, reason = self.check_file_access(str(fp), "write")

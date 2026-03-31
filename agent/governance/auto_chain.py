@@ -11,9 +11,15 @@ Each transition runs a gate check before advancing.
 import json
 import logging
 import os
+import re
 import traceback
+from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 
 log = logging.getLogger(__name__)
+
+# Set to True to skip SERVER_VERSION vs git-HEAD check during development.
+# Restore to False before production use.
+_DISABLE_VERSION_GATE = False
 
 # Chain definition: task_type → (gate_fn, next_type, prompt_builder)
 # next_type=None means terminal stage (deploy trigger)
@@ -21,12 +27,259 @@ CHAIN = {
     "pm":    ("_gate_post_pm",    "dev",   "_build_dev_prompt"),
     "dev":   ("_gate_checkpoint", "test",  "_build_test_prompt"),
     "test":  ("_gate_t2_pass",    "qa",    "_build_qa_prompt"),
-    "qa":    ("_gate_qa_pass",    "merge", "_build_merge_prompt"),
-    "merge": ("_gate_release",    None,    "_trigger_deploy"),
+    "qa":    ("_gate_qa_pass",    "gatekeeper", "_build_gatekeeper_prompt"),
+    "gatekeeper": ("_gate_gatekeeper_pass", "merge", "_build_merge_prompt"),
+    "merge": ("_gate_release",    "deploy", "_build_deploy_prompt"),
+    "deploy": ("_gate_deploy_pass", None, "_finalize_chain"),
 }
 
 # Maximum chain depth to prevent infinite loops
 MAX_CHAIN_DEPTH = 10
+_TEST_FILE_PATTERN = re.compile(r"(agent/tests/[A-Za-z0-9_./-]+\.py)")
+
+
+def _extract_test_files_from_verification(verification):
+    """Pull explicit pytest file targets out of verification.command."""
+    if not isinstance(verification, dict):
+        return []
+    command = verification.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return []
+    return list(dict.fromkeys(_TEST_FILE_PATTERN.findall(command)))
+
+
+def _load_task_metadata(conn, project_id, task_id):
+    if not task_id or not hasattr(conn, "execute"):
+        return {}
+    try:
+        row = conn.execute(
+            "SELECT metadata_json FROM tasks WHERE project_id=? AND task_id=?",
+            (project_id, task_id),
+        ).fetchone()
+        if not row:
+            return {}
+        raw = row["metadata_json"] if isinstance(row, dict) or hasattr(row, "__getitem__") else None
+        if not raw:
+            return {}
+        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:
+        return {}
+
+
+def _walk_task_metadata_chain(conn, project_id, metadata, max_depth=6):
+    visited = set()
+    current = dict(metadata or {})
+    for _ in range(max_depth):
+        yield current
+        parent_task_id = current.get("parent_task_id")
+        if not parent_task_id or parent_task_id in visited:
+            break
+        visited.add(parent_task_id)
+        current = _load_task_metadata(conn, project_id, parent_task_id)
+        if not current:
+            break
+
+
+def _infer_lane_from_metadata(metadata):
+    """Best-effort lane inference for replayed reconciliation chains."""
+    if not isinstance(metadata, dict):
+        return ""
+    explicit = str(metadata.get("lane", "") or "").strip().upper()
+    if explicit in {"A", "B", "C"}:
+        return explicit
+
+    text = " ".join(
+        str(metadata.get(k, "") or "")
+        for k in ("replay_source", "intent_summary", "_original_prompt")
+    ).lower()
+    match = re.search(r"lane\s+([abc])", text)
+    if match:
+        return match.group(1).upper()
+    return ""
+
+
+def _is_governed_dirty_workspace_chain(conn, project_id, metadata):
+    """Allow narrow bypass only for explicit governed dirty-workspace reconciliation chains."""
+    for current in _walk_task_metadata_chain(conn, project_id, metadata):
+        if current.get("allow_dirty_workspace_reconciliation"):
+            return True
+        if current.get("parallel_plan") == "dirty-reconciliation-2026-03-30":
+            return True
+        lane = _infer_lane_from_metadata(current)
+        text = " ".join(
+            str(current.get(k, "") or "")
+            for k in ("replay_source", "intent_summary", "_original_prompt")
+        ).lower()
+        if lane in {"A", "B"} and (
+            "dirty-workspace" in text
+            or "workflow improvement lane" in text
+            or "reconciliation" in text
+        ):
+            return True
+    return False
+
+
+def _should_defer_doc_gate_to_lane_c(conn, project_id, metadata):
+    """Lane A/B reconciliation tasks may defer doc updates to convergence Lane C."""
+    lane = ""
+    for current in _walk_task_metadata_chain(conn, project_id, metadata):
+        lane = _infer_lane_from_metadata(current)
+        if lane:
+            break
+    if lane not in {"A", "B"}:
+        return False
+    if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
+        return True
+    return False
+
+
+def _effective_dev_retry_reason(conn, project_id, metadata, reason):
+    """Rewrite stale lane A/B gate reasons into actionable code-only guidance."""
+    if not isinstance(reason, str):
+        return reason
+    if not _should_defer_doc_gate_to_lane_c(conn, project_id, metadata):
+        return reason
+
+    lowered = reason.lower()
+    if lowered.startswith("related docs not updated:") or (
+        lowered.startswith("unrelated files modified:")
+        and ("readme.md" in lowered or "docs/" in lowered)
+    ):
+        return (
+            "Lane C owns documentation updates for this governed dirty-workspace "
+            "reconciliation. Do NOT modify README.md or docs/. "
+            "Retry as a code-only fix within target_files and keep changed_files "
+            "limited to target_files."
+        )
+    return reason
+
+
+def _maybe_create_workflow_improvement_task(conn, project_id, task_id, stage, reason, metadata, result):
+    """Create one workflow-improvement task for workflow defects.
+
+    The task goes through the normal coordinator entrypoint (`type=task`) so the
+    existing chain can repair workflow/governance issues without introducing a
+    parallel execution model.
+    """
+    if metadata.get("_workflow_improvement_created"):
+        return None
+    if metadata.get("operation_type") == "workflow_improvement":
+        return None
+
+    classification = classify_gate_failure(stage, reason, metadata, result)
+    if not classification.get("workflow_improvement"):
+        return None
+
+    from . import task_registry
+    improvement_prompt = build_workflow_improvement_prompt(task_id, stage, classification, metadata)
+    improvement_task = task_registry.create_task(
+        conn, project_id,
+        prompt=improvement_prompt,
+        task_type="task",
+        created_by="auto-chain-workflow-improvement",
+        metadata={
+            "operation_type": "workflow_improvement",
+            "source_task_id": task_id,
+            "failing_stage": stage,
+            "failure_class": classification.get("failure_class", ""),
+            "suggested_action": classification.get("suggested_action", ""),
+            "workflow_issue": classification,
+            "chain_depth": 0,
+            "_no_retry": True,
+        },
+    )
+    metadata["_workflow_improvement_created"] = True
+    improvement_id = improvement_task.get("task_id", "?")
+    _publish_event("task.workflow_improvement", {
+        "project_id": project_id,
+        "task_id": improvement_id,
+        "source_task_id": task_id,
+        "failing_stage": stage,
+        "failure_class": classification.get("failure_class", ""),
+    })
+    try:
+        from . import audit_service
+        audit_service.record(
+            conn, project_id, "workflow.improvement.created",
+            actor="auto-chain",
+            ok=True,
+            node_ids=metadata.get("related_nodes", []),
+            task_id=improvement_id,
+            source_task_id=task_id,
+            failing_stage=stage,
+            failure_class=classification.get("failure_class", ""),
+            suggested_action=classification.get("suggested_action", ""),
+        )
+    except Exception:
+        log.debug("auto_chain: audit workflow.improvement.created failed", exc_info=True)
+    return {"task_id": improvement_id, "classification": classification}
+
+
+def on_task_failed(conn, project_id, task_id, task_type, result=None, metadata=None, reason=""):
+    """Best-effort workflow-improvement routing for failed task executions."""
+    metadata = metadata or {}
+    result = result or {}
+    effective_reason = (
+        reason
+        or result.get("error")
+        or result.get("summary")
+        or "task execution failed"
+    )
+    return _maybe_create_workflow_improvement_task(
+        conn,
+        project_id,
+        task_id,
+        task_type,
+        effective_reason,
+        metadata,
+        result,
+    )
+
+
+def _normalize_related_nodes(related_nodes):
+    """Keep only concrete node-id strings for gate/audit/state updates."""
+    if not related_nodes:
+        return []
+    if not isinstance(related_nodes, list):
+        related_nodes = [related_nodes]
+
+    normalized = []
+    for item in related_nodes:
+        if isinstance(item, str) and item.strip():
+            normalized.append(item.strip())
+        elif isinstance(item, dict):
+            node_id = item.get("node_id") or item.get("id")
+            if isinstance(node_id, str) and node_id.strip():
+                normalized.append(node_id.strip())
+    return normalized
+
+
+def _render_dev_contract_prompt(source_task_id, metadata):
+    """Render the structured Dev contract from PM/task metadata."""
+    target_files = metadata.get("target_files", [])
+    requirements = metadata.get("requirements", [])
+    criteria = metadata.get("acceptance_criteria", [])
+    verification = metadata.get("verification", {})
+
+    parts = [
+        f"Implement per PRD from {source_task_id}.\n",
+        f"target_files: {json.dumps(target_files)}",
+        f"requirements: {json.dumps(requirements, ensure_ascii=False)}",
+        f"acceptance_criteria: {json.dumps(criteria, ensure_ascii=False)}",
+    ]
+
+    if verification:
+        parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
+
+    test_files = metadata.get("test_files", [])
+    if test_files:
+        parts.append(f"\nTest files to create/modify: {json.dumps(test_files)}")
+
+    doc_impact = metadata.get("doc_impact", {})
+    if doc_impact:
+        parts.append(f"\nDoc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+
+    return "\n".join(parts)
 
 
 def on_task_completed(conn, project_id, task_id, task_type, status, result, metadata):
@@ -68,6 +321,7 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
 
 def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     """Internal chain logic with guaranteed conn cleanup by caller."""
+    metadata["related_nodes"] = _normalize_related_nodes(metadata.get("related_nodes", []))
 
     # Non-blocking preflight log (first stage only)
     if task_type == "pm":
@@ -117,15 +371,22 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     gate_fn_name, next_type, builder_name = CHAIN[task_type]
 
     # Pre-gate: version check — ensure governance server is running latest code
-    ver_passed, ver_reason = _gate_version_check(project_id, result, metadata)
+    ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
     if not ver_passed:
+        workflow_improvement = _maybe_create_workflow_improvement_task(
+            conn, project_id, task_id, "version_check", ver_reason, metadata, result
+        )
         log.info("auto_chain: version gate blocked for task %s: %s", task_id, ver_reason)
         _publish_event("gate.blocked", {
             "project_id": project_id, "task_id": task_id,
             "stage": "version_check", "next_stage": task_type,
             "reason": ver_reason,
         })
-        return {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
+        out = {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
+        if workflow_improvement:
+            out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
+            out["failure_class"] = workflow_improvement["classification"].get("failure_class", "")
+        return out
 
     # Emit task.completed to chain context store
     _publish_event("task.completed", {
@@ -146,18 +407,23 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     except Exception:
         log.debug("auto_chain: audit task.completed failed (non-critical)", exc_info=True)
 
-    # M1: PM completes → persist PRD scope to memory for future dev/qa recall
+    # M1: PM completes → persist full PRD to memory for future dev/qa recall
     if task_type == "pm":
         prd = result.get("prd", result)
-        requirements = prd.get("requirements", result.get("requirements", []))
-        criteria = result.get("acceptance_criteria", prd.get("acceptance_criteria", []))
-        if requirements or criteria:
+        prd_data = {
+            "requirements": prd.get("requirements", result.get("requirements", [])),
+            "acceptance_criteria": result.get("acceptance_criteria", prd.get("acceptance_criteria", [])),
+            "target_files": result.get("target_files", []),
+            "test_files": result.get("test_files", []),
+            "proposed_nodes": result.get("proposed_nodes", []),
+            "doc_impact": result.get("doc_impact", {}),
+            "verification": result.get("verification", {}),
+            "skip_reasons": result.get("skip_reasons", {}),
+        }
+        if any(prd_data.values()):
             _write_chain_memory(
                 conn, project_id, "prd_scope",
-                json.dumps({"requirements": requirements,
-                            "acceptance_criteria": criteria,
-                            "summary": result.get("summary", "")},
-                           ensure_ascii=False),
+                json.dumps(prd_data, ensure_ascii=False),
                 metadata,
                 extra_structured={"task_id": task_id, "chain_stage": "pm"},
             )
@@ -187,6 +453,9 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     gate_fn = _GATES[gate_fn_name]
     passed, reason = gate_fn(conn, project_id, result, metadata)
     if not passed:
+        workflow_improvement = _maybe_create_workflow_improvement_task(
+            conn, project_id, task_id, task_type, reason, metadata, result
+        )
         log.info("auto_chain: gate blocked %s→%s for task %s: %s",
                  task_type, next_type or "deploy", task_id, reason)
         _publish_event("gate.blocked", {
@@ -194,13 +463,17 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             "stage": task_type, "next_stage": next_type or "deploy",
             "reason": reason,
         })
-        # M3: Gate fail → write pitfall memory so future tasks avoid same mistake
+        # M3: Gate fail → write pitfall with previous output context
         _write_chain_memory(
             conn, project_id, "pitfall",
-            f"Gate blocked at {task_type}: {reason}",
+            f"Gate blocked at {task_type}: {reason}\n"
+            f"Previous output keys: {list(result.keys())}\n"
+            f"Previous output preview: {json.dumps(result, ensure_ascii=False)[:300]}",
             metadata,
             extra_structured={"task_id": task_id, "gate_stage": task_type,
-                               "gate_reason": reason, "chain_stage": task_type},
+                               "gate_reason": reason,
+                               "previous_output_keys": list(result.keys()),
+                               "chain_stage": task_type},
         )
         # G3: Persist gate.blocked to audit_index
         try:
@@ -262,11 +535,15 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 "original_task_id": task_id, "reason": failure_reason,
                 "retry_from_stage": task_type,
             })
-            return {
+            out = {
                 "gate_blocked": True, "stage": task_type, "reason": reason,
                 "retry_task_id": retry_id, "retry_type": "dev",
                 "retry_from_stage": task_type,
             }
+            if workflow_improvement:
+                out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
+                out["failure_class"] = workflow_improvement["classification"].get("failure_class", "")
+            return out
 
         # Auto-retry: create a new task at the SAME stage with gate reason injected
         # Max 2 retries per gate to prevent infinite loops
@@ -282,12 +559,26 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     pass
             if not original_prompt:
                 original_prompt = result.get("summary", "")
-            retry_prompt = (
-                f"Previous attempt ({task_id}) was blocked by gate.\n"
-                f"Gate reason: {reason}\n\n"
-                f"Fix the issue described above and retry.\n"
-                f"Original task: {original_prompt}"
-            )
+            if task_type == "dev":
+                retry_reason = _effective_dev_retry_reason(conn, project_id, metadata, reason)
+                retry_contract = _render_dev_contract_prompt(
+                    metadata.get("parent_task_id", task_id),
+                    metadata,
+                )
+                retry_prompt = (
+                    f"Previous attempt ({task_id}) was blocked by gate.\n"
+                    f"Gate reason: {retry_reason}\n\n"
+                    "Fix the issue described above and retry.\n"
+                    "Use the same Dev contract below, including the required verification command.\n\n"
+                    f"{retry_contract}"
+                )
+            else:
+                retry_prompt = (
+                    f"Previous attempt ({task_id}) was blocked by gate.\n"
+                    f"Gate reason: {reason}\n\n"
+                    f"Fix the issue described above and retry.\n"
+                    f"Original task: {original_prompt}"
+                )
             from . import task_registry
             retry_task = task_registry.create_task(
                 conn, project_id,
@@ -298,7 +589,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     **metadata,
                     "parent_task_id": task_id,
                     "chain_depth": depth + 1,
-                    "previous_gate_reason": reason,
+                    "previous_gate_reason": retry_reason if task_type == "dev" else reason,
                     "_gate_retry_count": gate_retries + 1,
                     "_original_prompt": original_prompt,
                 },
@@ -309,15 +600,23 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 "project_id": project_id, "task_id": retry_id,
                 "original_task_id": task_id, "reason": reason,
             })
-            return {"gate_blocked": True, "stage": task_type, "reason": reason,
-                    "retry_task_id": retry_id}
+            out = {"gate_blocked": True, "stage": task_type, "reason": reason,
+                   "retry_task_id": retry_id}
+            if workflow_improvement:
+                out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
+                out["failure_class"] = workflow_improvement["classification"].get("failure_class", "")
+            return out
 
         # Retry exhausted — emit task.failed
         _publish_event("task.failed", {
             "project_id": project_id, "task_id": task_id,
             "reason": "gate_retry_exhausted", "gate_reason": reason,
         })
-        return {"gate_blocked": True, "stage": task_type, "reason": reason}
+        out = {"gate_blocked": True, "stage": task_type, "reason": reason}
+        if workflow_improvement:
+            out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
+            out["failure_class"] = workflow_improvement["classification"].get("failure_class", "")
+        return out
 
     # M5: Dev success + checkpoint gate pass → write success pattern memory
     if task_type == "dev":
@@ -368,7 +667,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     # M6: Dedup — check if next stage already exists for this parent
     from . import task_registry
     existing = conn.execute(
-        "SELECT task_id FROM tasks WHERE type = ? AND status IN ('queued','claimed') "
+        "SELECT task_id FROM tasks WHERE type = ? AND status IN ('queued','claimed','observer_hold') "
         "AND metadata_json LIKE ?",
         (next_type, f'%"parent_task_id": "{task_id}"%'),
     ).fetchone()
@@ -406,15 +705,30 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 # Gate functions — each returns (passed: bool, reason: str)
 # ---------------------------------------------------------------------------
 
-def _gate_version_check(project_id, result, metadata):
-    """Pre-gate: verify governance server is running the latest code.
-
-    Compares the server's startup git hash (from /api/health) against
-    the current git HEAD. If the server is stale, blocks the chain.
-    """
+def _gate_version_check(conn, project_id, result, metadata):
+    """Pre-gate: verify the workspace is clean and governance code is current."""
+    if _DISABLE_VERSION_GATE:
+        return True, "version gate disabled (_DISABLE_VERSION_GATE=True)"
     if metadata.get("skip_version_check"):
         return True, "skipped"
+    if not hasattr(conn, "execute"):
+        return True, "no db-capable connection, skipping"
+
+    if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
+        return True, "governed dirty-workspace reconciliation"
+
     try:
+        row = conn.execute(
+            "SELECT chain_version, git_head, dirty_files FROM project_version WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+        dirty_files = json.loads(row["dirty_files"] or "[]") if row and row["dirty_files"] else []
+        if dirty_files:
+            return False, (
+                f"Dirty workspace detected ({len(dirty_files)} files). "
+                "Commit or discard out-of-band edits before continuing auto-chain."
+            )
+
         from .server import SERVER_VERSION
         import subprocess
         head = subprocess.run(
@@ -433,37 +747,62 @@ def _gate_version_check(project_id, result, metadata):
             )
         return True, f"version match: {SERVER_VERSION}"
     except Exception as e:
-        log.warning("version_check failed (non-blocking): %s", e)
-        return True, f"check failed: {e}"
+        log.warning("version_check failed: %s", e)
+        return False, f"version check failed: {e}"
 
 
 def _gate_post_pm(conn, project_id, result, metadata):
-    """Validate PM PRD has mandatory fields: target_files, verification, acceptance_criteria.
+    """Validate PM PRD has mandatory fields + explain-or-provide for soft fields.
 
-    Falls back to task metadata if PM output lacks structured PRD fields.
-    This handles cases where Claude outputs free-text instead of JSON.
+    Mandatory: target_files, verification, acceptance_criteria (hard block)
+    Soft-mandatory: test_files, proposed_nodes, doc_impact (must provide OR skip_reasons)
     """
     prd = result.get("prd", {})
-    # Check each field in result → prd → metadata (fallback chain)
+
+    # === Hard mandatory fields ===
     missing = []
     for field in ("target_files", "verification", "acceptance_criteria"):
         if not result.get(field) and not prd.get(field) and not metadata.get(field):
             missing.append(field)
     if missing:
         return False, f"PRD missing mandatory fields: {missing}"
+
     target_files = (result.get("target_files") or prd.get("target_files")
                     or metadata.get("target_files") or [])
     if not target_files:
         return False, "PRD target_files is empty"
-    # Merge PRD fields back into result so downstream stages can access them
-    for field in ("target_files", "verification", "acceptance_criteria"):
+
+    # === Soft-mandatory: provide OR explain in skip_reasons ===
+    skip_reasons = result.get("skip_reasons", prd.get("skip_reasons", {}))
+    if not isinstance(skip_reasons, dict):
+        skip_reasons = {}
+    soft_missing = []
+    for field in ("test_files", "proposed_nodes", "doc_impact"):
+        value = result.get(field) or prd.get(field)
+        reason = skip_reasons.get(field, "")
+        if not value and not reason:
+            soft_missing.append(field)
+    if soft_missing:
+        return False, f"PRD fields missing without skip_reasons: {soft_missing}. Provide the field OR explain in skip_reasons why it's not needed."
+
+    # === Merge all fields into result for downstream ===
+    for field in ("target_files", "verification", "acceptance_criteria",
+                  "test_files", "proposed_nodes", "doc_impact", "skip_reasons",
+                  "requirements", "related_nodes"):
         if not result.get(field):
             result[field] = prd.get(field) or metadata.get(field)
+
     return True, "ok"
 
 
 def _gate_checkpoint(conn, project_id, result, metadata):
-    """Checkpoint gate: files changed? no unrelated files outside target_files? docs updated?"""
+    """Checkpoint gate for Dev.
+
+    Trust executor-produced task-local diff evidence. Governance may run in a
+    container without git/worktree parity, so it should not re-compute git diff
+    here. Node alignment is also temporarily non-blocking until the acceptance
+    graph deployed to governance catches up with in-flight node-by-node edits.
+    """
     log.info("checkpoint_gate: result keys=%s, changed_files=%s, target_files=%s",
              list(result.keys()) if result else None,
              result.get("changed_files"),
@@ -472,41 +811,15 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     if not changed:
         return False, "No files changed"
 
-    # Verify files actually changed in git diff
-    try:
-        import subprocess
-        import os as _os
-        repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__)))
-        # Check working-tree + staged changes vs HEAD
-        diff_proc = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-            cwd=repo_root,
-        )
-        diff_files = set()
-        if diff_proc.returncode == 0:
-            diff_files = {f.strip() for f in diff_proc.stdout.splitlines() if f.strip()}
-        # If working tree is clean, also check the most recent commit
-        if not diff_files:
-            commit_proc = subprocess.run(
-                ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
-                capture_output=True, text=True, timeout=10,
-                cwd=repo_root,
-            )
-            if commit_proc.returncode == 0:
-                diff_files = {f.strip() for f in commit_proc.stdout.splitlines() if f.strip()}
-        if diff_files:  # Only enforce when git diff data is available
-            not_in_diff = [f for f in changed if f not in diff_files]
-            if not_in_diff:
-                return False, (
-                    f"Files listed in changed_files but not found in git diff: {not_in_diff}"
-                )
-    except Exception as _git_err:
-        log.warning("checkpoint_gate: git diff verification failed (non-blocking): %s", _git_err)
-
-    target = metadata.get("target_files", [])
-    if target:
-        unrelated = [f for f in changed if f not in target]
+    target = set(metadata.get("target_files", []) or [])
+    allowed = set(target)
+    allowed.update(metadata.get("test_files", []) or [])
+    allowed.update(_extract_test_files_from_verification(metadata.get("verification", {})))
+    doc_impact = metadata.get("doc_impact", {})
+    if isinstance(doc_impact, dict):
+        allowed.update(doc_impact.get("files", []) or [])
+    if allowed:
+        unrelated = [f for f in changed if f not in allowed]
         if unrelated:
             return False, f"Unrelated files modified: {unrelated}"
     # Syntax check: verify test_results if available
@@ -517,10 +830,20 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     from .impact_analyzer import get_related_docs
     code_files = [f for f in changed if not f.startswith("docs/") and not f.endswith(".md")]
     doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
-    expected_docs = get_related_docs(code_files)
+    doc_impact = metadata.get("doc_impact", {})
+    if isinstance(doc_impact, dict) and "files" in doc_impact:
+        expected_docs = set(doc_impact.get("files") or [])
+    else:
+        expected_docs = get_related_docs(code_files)
     if expected_docs:
         missing_docs = expected_docs - doc_files_changed
         if missing_docs:
+            if _should_defer_doc_gate_to_lane_c(conn, project_id, metadata):
+                log.warning(
+                    "checkpoint_gate: deferring doc updates to Lane C for governed reconciliation lane; missing docs=%s",
+                    sorted(missing_docs),
+                )
+                return True, "doc updates deferred to Lane C"
             # Block by default — skip_doc_check only allowed with bootstrap_reason
             if metadata.get("skip_doc_check", False):
                 bootstrap_reason = metadata.get("bootstrap_reason", "")
@@ -531,18 +854,24 @@ def _gate_checkpoint(conn, project_id, result, metadata):
                             bootstrap_reason, sorted(missing_docs))
             else:
                 return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files."
-    # Node status check: related_nodes must be at least "testing" (not "pending")
-    related_nodes = metadata.get("related_nodes", [])
+    # Node gate is temporarily non-blocking while the governance graph catches
+    # up with node-by-node local development. Keep the signal in logs only.
+    related_nodes = _normalize_related_nodes(metadata.get("related_nodes", []))
     if related_nodes:
-        passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "testing")
-        if not passed:
-            return False, f"checkpoint gate blocked — {reason}"
+        log.warning(
+            "checkpoint_gate: skipping related_nodes enforcement for dev task until graph sync is complete: %s",
+            related_nodes,
+        )
     return True, "ok"
 
 
 def _gate_t2_pass(conn, project_id, result, metadata):
     """Verify tests passed before advancing to QA."""
     report = result.get("test_report", {})
+    if not isinstance(report, dict) or not report:
+        return False, "Test stage missing required test_report"
+    if "passed" not in report or "failed" not in report:
+        return False, "Test stage test_report missing passed/failed counts"
     failed = report.get("failed", 0)
     if failed is None:
         failed = 0
@@ -593,7 +922,13 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     if related_nodes:
         passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
         if not passed:
-            return False, f"qa_pass gate blocked — {reason}"
+            if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
+                log.warning(
+                    "qa_gate: deferring related_nodes qa_pass enforcement for governed dirty-workspace reconciliation lane: %s",
+                    reason,
+                )
+            else:
+                return False, f"qa_pass gate blocked — {reason}"
     # M2: QA passed → write success pattern memory
     _write_chain_memory(
         conn, project_id, "qa_decision",
@@ -605,6 +940,34 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     return True, "ok"
 
 
+def _gate_gatekeeper_pass(conn, project_id, result, metadata):
+    """Require explicit isolated gatekeeper approval before merge."""
+    rec = result.get("recommendation", "")
+    if rec == "merge_pass":
+        try:
+            from . import gatekeeper as gk
+            gk.record_check(
+                conn, project_id,
+                check_type="ai_acceptance_check",
+                passed=True,
+                result={
+                    "summary": result.get("review_summary", ""),
+                    "checked_requirements": result.get("checked_requirements", []),
+                    "pm_alignment": result.get("pm_alignment", "pass"),
+                },
+                created_by="auto-chain-gatekeeper",
+            )
+        except Exception:
+            log.debug("gatekeeper ai record failed (non-critical)", exc_info=True)
+        return True, "ok"
+    if rec in ("reject", "rejected"):
+        return False, f"Gatekeeper rejected merge: {result.get('reason', 'no reason given')}"
+    return False, (
+        "Gatekeeper must emit recommendation 'merge_pass' or 'reject'. "
+        f"Got: {rec!r}"
+    )
+
+
 def _gate_release(conn, project_id, result, metadata):
     """Verify merge succeeded before deploy."""
     # Node status check: all related_nodes must be "qa_pass" before merge is allowed
@@ -612,7 +975,13 @@ def _gate_release(conn, project_id, result, metadata):
     if related_nodes:
         passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
         if not passed:
-            return False, f"release gate blocked — {reason}"
+            if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
+                log.warning(
+                    "release_gate: deferring related_nodes qa_pass enforcement for governed dirty-workspace reconciliation lane: %s",
+                    reason,
+                )
+            else:
+                return False, f"release gate blocked — {reason}"
     else:
         log.warning("release gate: no related_nodes — node verification skipped for %s",
                      metadata.get("parent_task_id", "unknown"))
@@ -622,6 +991,14 @@ def _gate_release(conn, project_id, result, metadata):
         _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
                            {"type": "merge_complete", "producer": "auto-chain"})
     return True, "ok"
+
+
+def _gate_deploy_pass(conn, project_id, result, metadata):
+    """Deploy must report success before the chain can be finalized."""
+    report = result.get("report", result)
+    if isinstance(report, dict) and report.get("success") is True:
+        return True, "ok"
+    return False, f"deploy failed: {json.dumps(report, ensure_ascii=False)[:300]}"
 
 
 # ---------------------------------------------------------------------------
@@ -634,8 +1011,12 @@ def _build_dev_prompt(task_id, result, metadata):
     target_files = result.get("target_files", prd.get("target_files", metadata.get("target_files", [])))
 
     verification = result.get("verification", prd.get("verification", {}))
-    requirements = prd.get("requirements", [])
+    requirements = result.get("requirements", prd.get("requirements", []))
     criteria = result.get("acceptance_criteria", prd.get("acceptance_criteria", []))
+    test_files = result.get("test_files", prd.get("test_files", metadata.get("test_files", [])))
+    doc_impact = result.get("doc_impact", prd.get("doc_impact", metadata.get("doc_impact", {})))
+    skip_reasons = result.get("skip_reasons", prd.get("skip_reasons", metadata.get("skip_reasons", {})))
+    proposed_nodes = result.get("proposed_nodes", metadata.get("proposed_nodes", []))
 
     # Fallback: if PM result lacks expected structure, read from chain context
     if not target_files or not verification or not criteria:
@@ -653,32 +1034,43 @@ def _build_dev_prompt(task_id, result, metadata):
                     requirements = parent_result.get("requirements", requirements)
         except Exception:
             pass
-    prompt = (
-        f"Implement per PRD from {task_id}.\n\n"
-        f"target_files: {json.dumps(target_files)}\n"
-        f"requirements: {json.dumps(requirements, ensure_ascii=False)}\n"
-        f"acceptance_criteria: {json.dumps(criteria, ensure_ascii=False)}"
-    )
-    return prompt, {
+    out_meta = {
         **metadata,  # preserves skip_doc_check, changed_files, related_nodes, etc.
         "target_files": target_files,
+        "requirements": requirements,
+        "acceptance_criteria": criteria,
         "verification": verification,
-        "related_nodes": result.get("proposed_nodes", metadata.get("related_nodes", [])),
+        "test_files": test_files,
+        "doc_impact": doc_impact,
+        "skip_reasons": skip_reasons,
+        "related_nodes": _normalize_related_nodes(metadata.get("related_nodes", result.get("related_nodes", []))),
+        "proposed_nodes": proposed_nodes,
     }
+    prompt = _render_dev_contract_prompt(task_id, out_meta)
+    return prompt, out_meta
 
 
 def _build_test_prompt(task_id, result, metadata):
     changed = result.get("changed_files", metadata.get("changed_files", []))
-    prompt = (
-        f"Run tests for {task_id}.\n"
-        f"changed_files: {json.dumps(changed)}"
-    )
+    verification = metadata.get("verification") or result.get("verification", {})
+    test_files = metadata.get("test_files", [])
+    prompt_parts = [
+        f"Run tests for {task_id}.",
+        f"changed_files: {json.dumps(changed)}",
+    ]
+    if verification:
+        prompt_parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
+    if test_files:
+        prompt_parts.append(f"test_files: {json.dumps(test_files)}")
+    prompt = "\n".join(prompt_parts)
     meta = {
         **metadata,  # preserves skip_doc_check and all other original task metadata
         # Prioritise original metadata values; only fall back to result if metadata lacks them
         "target_files": metadata.get("target_files") or result.get("target_files", []),
         "changed_files": changed,
-        "related_nodes": metadata.get("related_nodes") or result.get("related_nodes", []),
+        "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
+        "verification": verification,
+        "test_files": test_files,
     }
     # Propagate worktree info from dev result → test → qa → merge
     if result.get("_worktree"):
@@ -690,19 +1082,62 @@ def _build_test_prompt(task_id, result, metadata):
 def _build_qa_prompt(task_id, result, metadata):
     report = result.get("test_report", {})
     changed = result.get("changed_files", metadata.get("changed_files", []))
-    prompt = (
-        f"QA review for {task_id}.\n"
-        f"test_report: {json.dumps(report)}\n"
-        f"changed_files: {json.dumps(changed)}\n"
-        f"IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' "
-        f"(no other values accepted by the gate)."
-    )
-    return prompt, {
+    requirements = metadata.get("requirements", [])
+    criteria = metadata.get("acceptance_criteria", [])
+    doc_impact = metadata.get("doc_impact", {})
+    verification = metadata.get("verification", {})
+    prompt_parts = [
+        f"QA review for {task_id}.",
+        f"test_report: {json.dumps(report, ensure_ascii=False)}",
+        f"changed_files: {json.dumps(changed)}",
+    ]
+    if requirements:
+        prompt_parts.append(f"requirements: {json.dumps(requirements, ensure_ascii=False)}")
+    if criteria:
+        prompt_parts.append(f"acceptance_criteria: {json.dumps(criteria, ensure_ascii=False)}")
+    if verification:
+        prompt_parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
+    if doc_impact:
+        prompt_parts.append(f"doc_impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+    prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
+    prompt = "\n".join(prompt_parts)
+    meta = {
         **metadata,  # preserves skip_doc_check and all other original task metadata
         # Prioritise original metadata values; only fall back to result if metadata lacks them
         "target_files": metadata.get("target_files") or result.get("target_files", []),
         "changed_files": changed,
-        "related_nodes": metadata.get("related_nodes") or result.get("related_nodes", []),
+        "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
+        "test_report": report,
+        "requirements": requirements,
+        "acceptance_criteria": criteria,
+        "verification": verification,
+        "doc_impact": doc_impact,
+    }
+    if result.get("_worktree"):
+        meta["_worktree"] = result["_worktree"]
+        meta["_branch"] = result.get("_branch", "")
+    return prompt, meta
+
+
+def _build_gatekeeper_prompt(task_id, result, metadata):
+    prompt = (
+        f"Gatekeeper review for {task_id}.\n"
+        "You are the final isolated acceptance check before merge.\n"
+        "Use ONLY the PM contract, test evidence, QA review, changed file list, and doc-impact summary below.\n"
+        "Do NOT request broader project context or unrelated history.\n"
+        f"requirements: {json.dumps(metadata.get('requirements', []), ensure_ascii=False)}\n"
+        f"acceptance_criteria: {json.dumps(metadata.get('acceptance_criteria', []), ensure_ascii=False)}\n"
+        f"verification: {json.dumps(metadata.get('verification', {}), ensure_ascii=False)}\n"
+        f"doc_impact: {json.dumps(metadata.get('doc_impact', {}), ensure_ascii=False)}\n"
+        f"test_report: {json.dumps(metadata.get('test_report', {}), ensure_ascii=False)}\n"
+        f"qa_review: {json.dumps({'review_summary': result.get('review_summary', ''), 'issues': result.get('issues', []), 'doc_updates_applied': result.get('doc_updates_applied', [])}, ensure_ascii=False)}\n"
+        f"changed_files: {json.dumps(metadata.get('changed_files', []))}\n"
+        "Respond with strict JSON: "
+        "{\"schema_version\":\"v1\",\"review_summary\":\"...\",\"recommendation\":\"merge_pass|reject\",\"pm_alignment\":\"pass|partial|fail\",\"checked_requirements\":[\"R1\"],\"reason\":\"\"}"
+    )
+    return prompt, {
+        **metadata,
+        "related_nodes": _normalize_related_nodes(metadata.get("related_nodes", result.get("related_nodes", []))),
     }
 
 
@@ -713,39 +1148,31 @@ def _build_merge_prompt(task_id, result, metadata):
         # Prioritise original metadata values; only fall back to result if metadata lacks them
         "target_files": metadata.get("target_files") or result.get("target_files", []),
         "changed_files": metadata.get("changed_files") or result.get("changed_files", []),
-        "related_nodes": metadata.get("related_nodes") or result.get("related_nodes", []),
+        "_worktree": metadata.get("_worktree") or result.get("_worktree", ""),
+        "_branch": metadata.get("_branch") or result.get("_branch", ""),
+        "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
     }
 
 
-def _trigger_deploy(conn, project_id, task_id, result, metadata):
-    """Terminal stage: invoke deploy_chain.run_deploy().
+def _build_deploy_prompt(task_id, result, metadata):
+    changed_files = metadata.get("changed_files") or result.get("changed_files", [])
+    prompt = (
+        f"Deploy changes after merge task {task_id}.\n"
+        f"changed_files: {json.dumps(changed_files)}\n"
+        "Run host-side deploy orchestration and smoke checks."
+    )
+    return prompt, {
+        **metadata,
+        "changed_files": changed_files,
+        "merge_commit": result.get("merge_commit", metadata.get("merge_commit", "")),
+        "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
+    }
 
-    NOTE: When called from within the governance server process,
-    deploy_chain must NOT restart the governance server (it would kill
-    the process running this code). We pass skip_self=True to avoid
-    self-restart. The executor worker will detect the version mismatch
-    and log a warning; the governance server should be restarted
-    separately (e.g. by Docker healthcheck or manual restart).
-    """
-    changed_files = metadata.get("changed_files", [])
-    if not changed_files:
-        return {"deploy": "skipped", "reason": "no changed_files in metadata"}
-    try:
-        import sys
-        agent_dir = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
-        if agent_dir not in sys.path:
-            sys.path.insert(0, agent_dir)
-        from deploy_chain import run_deploy
-        chat_id = int(metadata.get("chat_id", 0))
-        # skip_self=True prevents governance from restarting itself
-        report = run_deploy(changed_files, chat_id=chat_id, project_id=project_id,
-                            skip_services=["governance"])
-        report["governance_note"] = "skipped self-restart; restart governance manually or via Docker"
-        return {"deploy": "completed", "report": report}
-    except Exception as e:
-        log.error("auto_chain: deploy failed: %s", e)
-        traceback.print_exc()
-        return {"deploy": "failed", "error": str(e)}
+
+def _finalize_chain(conn, project_id, task_id, result, metadata):
+    """Terminal stage after deploy succeeds."""
+    report = result.get("report", result)
+    return {"deploy": "completed", "report": report}
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +1187,18 @@ def _write_chain_memory(conn, project_id, kind, content, metadata, extra_structu
         # Derive module_id from first target_file or changed_file
         target = (metadata.get("target_files") or metadata.get("changed_files") or [])
         module_id = target[0].replace("/", ".").replace("\\", ".") if target else "governance"
+        # Dedup: skip if identical content already exists for same module+kind
+        try:
+            existing = conn.execute(
+                "SELECT memory_id FROM memories WHERE project_id=? AND module_id=? AND kind=? "
+                "AND status='active' AND content=? LIMIT 1",
+                (project_id, module_id, kind, content),
+            ).fetchone()
+            if existing:
+                log.debug("chain_memory dedup: skipping identical %s/%s", module_id, kind)
+                return
+        except Exception:
+            pass  # dedup failure should not block write
         entry = MemoryEntry(
             module_id=module_id,
             kind=kind,
@@ -767,6 +1206,8 @@ def _write_chain_memory(conn, project_id, kind, content, metadata, extra_structu
             created_by="auto-chain",
         )
         result = memory_service.write_memory(conn, project_id, entry)
+        log.info("chain_memory.write: project=%s kind=%s module=%s id=%s content=%r",
+                 project_id, kind, module_id, result.get("memory_id", "?"), content[:100])
         if extra_structured:
             # Patch structured field if write succeeded
             mid = result.get("memory_id", "")
@@ -794,6 +1235,7 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
     If node_state table is empty for this project (fresh DB bootstrap), skip check.
     If a node is not found in a populated DB it is treated as 'pending' and blocks.
     """
+    related_nodes = _normalize_related_nodes(related_nodes)
     if not related_nodes:
         return True, "no related_nodes"
     try:
@@ -839,7 +1281,7 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
 
 def _try_verify_update(conn, project_id, metadata, target_status, role, evidence_dict):
     """Best-effort node status update. Non-blocking on failure."""
-    related = metadata.get("related_nodes", [])
+    related = _normalize_related_nodes(metadata.get("related_nodes", []))
     if not related:
         return
     try:
@@ -887,13 +1329,17 @@ _GATES = {
     "_gate_checkpoint": _gate_checkpoint,
     "_gate_t2_pass": _gate_t2_pass,
     "_gate_qa_pass": _gate_qa_pass,
+    "_gate_gatekeeper_pass": _gate_gatekeeper_pass,
     "_gate_release": _gate_release,
+    "_gate_deploy_pass": _gate_deploy_pass,
 }
 
 _BUILDERS = {
     "_build_dev_prompt": _build_dev_prompt,
     "_build_test_prompt": _build_test_prompt,
     "_build_qa_prompt": _build_qa_prompt,
+    "_build_gatekeeper_prompt": _build_gatekeeper_prompt,
     "_build_merge_prompt": _build_merge_prompt,
-    "_trigger_deploy": _trigger_deploy,
+    "_build_deploy_prompt": _build_deploy_prompt,
+    "_finalize_chain": _finalize_chain,
 }

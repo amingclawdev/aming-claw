@@ -96,13 +96,13 @@ def load_pipeline_config(path: Optional[str] = None) -> Dict:
             import json
             data = json.loads(raw_text)
     except Exception as exc:
-        logger.error("加载管线配置文件失败 %s: %s", config_path, exc)
-        raise ValueError("管线配置文件加载失败 ({}): {}".format(config_path, exc))
+        logger.error("Failed to load pipeline config file %s: %s", config_path, exc)
+        raise ValueError("Pipeline config file load failed ({}): {}".format(config_path, exc))
 
     # Extract pipeline section (support both top-level and nested)
     pipeline = data.get("pipeline", data)
     if not isinstance(pipeline, dict):
-        raise ValueError("管线配置格式无效: 'pipeline' 应为字典")
+        raise ValueError("Invalid pipeline config format: 'pipeline' must be a dict")
 
     result = {}
     # Parse default section
@@ -138,7 +138,7 @@ def _apply_env_overrides(config: Dict) -> Dict:
       PIPELINE_ROLE_{ROLE}_PROVIDER - Override provider for specific role (e.g. PIPELINE_ROLE_PM_PROVIDER)
       PIPELINE_ROLE_{ROLE}_MODEL    - Override model for specific role (e.g. PIPELINE_ROLE_PM_MODEL)
     """
-    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa"]
+    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa", "coordinator", "gatekeeper", "utility"]
 
     result = dict(config)
 
@@ -206,43 +206,43 @@ def validate_pipeline_config(config: Dict) -> List[str]:
         provider = default.get("provider", "")
         model = default.get("model", "")
         if provider and provider not in VALID_PROVIDERS:
-            errors.append("默认配置的 provider '{}' 无效，"
-                          "有效值: {}".format(provider, ", ".join(sorted(VALID_PROVIDERS))))
+            errors.append("Default config provider '{}' is invalid, "
+                          "valid values: {}".format(provider, ", ".join(sorted(VALID_PROVIDERS))))
         if provider and not model:
-            errors.append("默认配置指定了 provider '{}' 但未指定 model".format(provider))
+            errors.append("Default config specifies provider '{}' but no model".format(provider))
         if model and not provider:
             # Try to infer
             # Infer provider from model name
             inferred = ("anthropic" if "claude" in model.lower()
                         else "openai" if "gpt" in model.lower() else "")
             if not inferred:
-                errors.append("默认配置的模型 '{}' 无法推断 provider，"
-                              "请显式指定 provider".format(model))
+                errors.append("Default config model '{}' cannot infer provider, "
+                              "please specify provider explicitly".format(model))
 
     # Validate roles
-    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa"]
+    ROLE_PIPELINE_ORDER = ["pm", "dev", "tester", "qa", "coordinator", "gatekeeper", "utility"]
     roles = config.get("roles", {})
     for role_name, role_cfg in roles.items():
         if role_name not in ROLE_PIPELINE_ORDER:
-            errors.append("未知角色 '{}', 有效角色: {}".format(
+            errors.append("Unknown role '{}', valid roles: {}".format(
                 role_name, ", ".join(ROLE_PIPELINE_ORDER)))
             continue
         provider = role_cfg.get("provider", "")
         model = role_cfg.get("model", "")
         if provider and provider not in VALID_PROVIDERS:
-            errors.append("角色 '{}' 的 provider '{}' 无效，"
-                          "有效值: {}".format(role_name, provider,
-                                              ", ".join(sorted(VALID_PROVIDERS))))
+            errors.append("Role '{}' provider '{}' is invalid, "
+                          "valid values: {}".format(role_name, provider,
+                                                    ", ".join(sorted(VALID_PROVIDERS))))
         if provider and not model:
-            errors.append("角色 '{}' 指定了 provider '{}' 但未指定 model".format(
+            errors.append("Role '{}' specifies provider '{}' but no model".format(
                 role_name, provider))
         if model and not provider:
             # Infer provider from model name
             inferred = ("anthropic" if "claude" in model.lower()
                         else "openai" if "gpt" in model.lower() else "")
             if not inferred:
-                errors.append("角色 '{}' 的模型 '{}' 无法推断 provider，"
-                              "请显式指定 provider".format(role_name, model))
+                errors.append("Role '{}' model '{}' cannot infer provider, "
+                              "please specify provider explicitly".format(role_name, model))
 
     return errors
 
@@ -266,11 +266,11 @@ def validate_provider_availability(config: Dict) -> List[str]:
 
     if "anthropic" in all_providers:
         if not os.getenv("ANTHROPIC_API_KEY", "").strip():
-            warnings.append("provider 'anthropic' 已配置但 ANTHROPIC_API_KEY 环境变量未设置")
+            warnings.append("provider 'anthropic' is configured but ANTHROPIC_API_KEY env var is not set")
 
     if "openai" in all_providers:
         if not os.getenv("OPENAI_API_KEY", "").strip():
-            warnings.append("provider 'openai' 已配置但 OPENAI_API_KEY 环境变量未设置")
+            warnings.append("provider 'openai' is configured but OPENAI_API_KEY env var is not set")
 
     return warnings
 
@@ -287,7 +287,7 @@ def get_effective_pipeline_config(config_path: Optional[str] = None) -> Dict:
     # Validate structure
     errors = validate_pipeline_config(config)
     if errors:
-        msg = "管线配置校验失败:\n" + "\n".join("  - " + e for e in errors)
+        msg = "Pipeline config validation failed:\n" + "\n".join("  - " + e for e in errors)
         logger.error(msg)
         raise ValueError(msg)
 
@@ -349,7 +349,7 @@ def log_role_routing(stages: List[Dict], config: Dict) -> List[Dict]:
             "source": source,
         }
         routing.append(entry)
-        logger.info("[PipelineConfig] 角色 '%s' → provider=%s, model=%s (来源: %s)",
+        logger.info("[PipelineConfig] Role '%s' → provider=%s, model=%s (source: %s)",
                     role, provider, model, source)
 
     return routing

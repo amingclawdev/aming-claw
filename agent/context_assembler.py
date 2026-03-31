@@ -281,15 +281,19 @@ class ContextAssembler:
 
     def _fetch_memories(self, project_id: str, query: str,
                         role: str, budget: int) -> list:
-        """Fetch related memories from dbservice."""
+        """Fetch related memories. Primary: dbservice semantic search. Fallback: governance FTS5."""
+        memories = []
+        tokens_used = 0
+
+        # Primary: dbservice semantic search
         try:
             import requests
+            log.info("context.fetch_memories: project=%s query=%r budget=%d source=dbservice",
+                     project_id, query[:80], budget)
             resp = requests.post(f"{self._db_url}/knowledge/search",
                 json={"query": query[:100], "scope": project_id, "limit": 3},
                 timeout=3)
             results = resp.json().get("results", [])
-            memories = []
-            tokens_used = 0
             for r in results:
                 content = r["doc"]["content"][:200]
                 tokens_used += _estimate_tokens(content)
@@ -299,8 +303,40 @@ class ContextAssembler:
                     "type": r["doc"].get("type", ""),
                     "content": content,
                 })
+            if memories:
+                log.info("context.fetch_memories: returned %d memories (%d tokens) via dbservice",
+                         len(memories), tokens_used)
+                return memories
+        except Exception:
+            log.warning("context.fetch_memories: dbservice failed, trying governance FTS5",
+                        exc_info=True)
+
+        # Fallback: governance FTS5 search
+        try:
+            import requests
+            log.info("context.fetch_memories: fallback to governance FTS5")
+            resp = requests.get(
+                f"{self._gov_url}/api/mem/{project_id}/search",
+                params={"q": query[:100], "top_k": 3},
+                headers={"X-Gov-Token": self._token},
+                timeout=3)
+            results = resp.json().get("results", [])
+            tokens_used = 0
+            for r in results:
+                content = (r.get("content") or "")[:200]
+                tokens_used += _estimate_tokens(content)
+                if tokens_used > budget:
+                    break
+                memories.append({
+                    "type": r.get("kind", ""),
+                    "content": content,
+                })
+            log.info("context.fetch_memories: returned %d memories (%d tokens) via governance FTS5",
+                     len(memories), tokens_used)
             return memories
         except Exception:
+            log.warning("context.fetch_memories: governance FTS5 also failed",
+                        exc_info=True)
             return []
 
     def _fetch_runtime(self, project_id: str) -> dict:

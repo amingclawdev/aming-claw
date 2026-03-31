@@ -203,9 +203,9 @@ class TaskOrchestrator:
         coordinator_prompt = text
         if pm_prd:
             coordinator_prompt = (
-                f"PM 已完成需求分析:\n{json.dumps(pm_prd, ensure_ascii=False)[:2000]}\n\n"
-                f"原始用户消息: {text}\n\n"
-                f"请根据 PM 的 PRD 编排执行。"
+                f"PM has completed requirements analysis:\n{json.dumps(pm_prd, ensure_ascii=False)[:2000]}\n\n"
+                f"Original user message: {text}\n\n"
+                f"Please orchestrate execution based on the PM's PRD."
             )
 
         session = self.ai_manager.create_session(
@@ -221,7 +221,7 @@ class TaskOrchestrator:
 
         if raw_output.get("status") != "completed":
             return {
-                "reply": f"Coordinator 执行失败: {raw_output.get('status')} - {raw_output.get('stderr', '')[:200]}",
+                "reply": f"Coordinator execution failed: {raw_output.get('status')} - {raw_output.get('stderr', '')[:200]}",
                 "actions_executed": 0,
                 "actions_rejected": 0,
             }
@@ -271,14 +271,14 @@ class TaskOrchestrator:
         # 8. Get reply
         reply = ai_decision.get("reply", "")
         if not reply:
-            reply = "处理完成"
+            reply = "Done"
 
         # Add rejection info if any
         if validation.rejected_actions:
             rejection_info = []
             for r in validation.rejected_actions:
                 rejection_info.append(f"  [{r['action'].get('type', '?')}] {', '.join(r['reasons'])}")
-            reply += f"\n\n[系统] {len(validation.rejected_actions)} 个操作被拦截:\n" + "\n".join(rejection_info)
+            reply += f"\n\n[System] {len(validation.rejected_actions)} action(s) blocked:\n" + "\n".join(rejection_info)
 
         # 9. Update context
         self._update_context(project_id, chat_id, text, reply, ai_decision)
@@ -450,9 +450,9 @@ class TaskOrchestrator:
         parent_task_id = ai_report.get("parent_task_id", original_task_id)
         workspace = ai_report.get("workspace", "")
         action = {
-            "prompt": (f"重试 dev 任务 (原 {original_task_id})。"
-                       f"Gatekeeper 失败原因: {reason}\n"
-                       f"原始 prompt: {ai_report.get('prompt', '')}"),
+            "prompt": (f"Retry dev task (original {original_task_id}). "
+                       f"Gatekeeper failure reason: {reason}\n"
+                       f"Original prompt: {ai_report.get('prompt', '')}"),
             "target_files": ai_report.get("target_files", []),
             "related_nodes": ai_report.get("related_nodes", []),
             "parent_task_id": parent_task_id,
@@ -465,7 +465,7 @@ class TaskOrchestrator:
                               auto_triggered=True)
         self._audit_log(parent_task_id, "gatekeeper_fail", "dev_retry",
                         f"new_task={task_id}")
-        self._gateway_reply(chat_id, f"Dev 重试已启动 ({task_id[-8:]})", token)
+        self._gateway_reply(chat_id, f"Dev retry started ({task_id[-8:]})", token)
 
     def _trigger_tester(self, parent_task_id: str, project_id: str,
                         token: str, chat_id: int, evidence,
@@ -486,7 +486,7 @@ class TaskOrchestrator:
             self._write_failure_memory(root_id, "tester", "retry budget exceeded")
             self._audit_log(root_id, "gatekeeper_pass", "needs_review",
                             "budget exceeded before tester")
-            self._gateway_reply(chat_id, f"Pipeline 终止: retry budget 已耗尽", token)
+            self._gateway_reply(chat_id, f"Pipeline terminated: retry budget exhausted", token)
             return
 
         log.info("Auto-triggering Tester for %s", parent_task_id)
@@ -494,7 +494,7 @@ class TaskOrchestrator:
         changed = evidence.changed_files if hasattr(evidence, 'changed_files') else []
         action = {
             "type": "create_test_task",
-            "prompt": f"运行测试验证 {parent_task_id} 的代码变更。changed_files: {changed}",
+            "prompt": f"Run tests to verify code changes for {parent_task_id}. changed_files: {changed}",
             "target_files": changed,
             "parent_task_id": root_id,
         }
@@ -504,7 +504,7 @@ class TaskOrchestrator:
                               parent_task_id=root_id, auto_triggered=True)
         self._audit_log(root_id, "gatekeeper_pass", "tester",
                         f"task={task_id}")
-        self._gateway_reply(chat_id, f"Tester 已启动 ({task_id[-8:]})", token)
+        self._gateway_reply(chat_id, f"Tester started ({task_id[-8:]})", token)
 
     def handle_test_complete(self, task_id: str, project_id: str,
                              token: str, chat_id: int, test_report: dict) -> dict:
@@ -557,21 +557,21 @@ class TaskOrchestrator:
             self._write_failure_memory(root_id, "qa", "retry budget exceeded")
             self._audit_log(root_id, "tester_pass", "needs_review",
                             "budget exceeded before qa")
-            self._gateway_reply(chat_id, f"Pipeline 终止: retry budget 已耗尽", token)
+            self._gateway_reply(chat_id, f"Pipeline terminated: retry budget exhausted", token)
             return
 
         log.info("Auto-triggering QA for %s", parent_task_id)
         task_id = f"qa-{int(time.time())}-{uuid.uuid4().hex[:6]}"
         action = {
             "type": "create_qa_task",
-            "prompt": f"QA 审查 {parent_task_id} 的测试结果和代码变更。test_report: {test_report}",
+            "prompt": f"QA review of test results and code changes for {parent_task_id}. test_report: {test_report}",
             "parent_task_id": root_id,
         }
         self._write_task_file(task_id, action, project_id, token, "qa_task", chat_id,
                               workspace=workspace, parent_task_id=root_id,
                               auto_triggered=True)
         self._audit_log(root_id, "tester_pass", "qa", f"task={task_id}")
-        self._gateway_reply(chat_id, f"QA 已启动 ({task_id[-8:]})", token)
+        self._gateway_reply(chat_id, f"QA started ({task_id[-8:]})", token)
 
     def handle_qa_complete(self, task_id: str, project_id: str,
                            token: str, chat_id: int, qa_report: dict) -> dict:
@@ -624,7 +624,7 @@ class TaskOrchestrator:
             self._write_failure_memory(root_id, "merge_gate", "retry budget exceeded")
             self._audit_log(root_id, "qa_pass", "needs_review",
                             "budget exceeded before merge gate")
-            self._gateway_reply(chat_id, f"Pipeline 终止: retry budget 已耗尽", token)
+            self._gateway_reply(chat_id, f"Pipeline terminated: retry budget exhausted", token)
             return {"pass": False, "reason": "budget_exceeded"}
 
         self._audit_log(root_id, "qa_pass", "merge_gate", f"project={project_id}")
@@ -643,7 +643,7 @@ class TaskOrchestrator:
 
             if release_ok and gatekeeper_ok:
                 self._gateway_reply(chat_id,
-                    f"Gatekeeper PASS\n所有检查通过，可以部署。\n是否批准？回复 '部署' 确认", token)
+                    f"Gatekeeper PASS\nAll checks passed, ready to deploy.\nApprove? Reply '部署' to confirm", token)
                 return {"pass": True}
             else:
                 blockers = gate.get("blockers", [])
@@ -735,12 +735,40 @@ class TaskOrchestrator:
                     return _fail(f"node-create returned {r.status_code}: {r.text[:200]}")
 
             elif action_type == "archive_memory":
+                memory_data = action.get("memory", {})
                 dbservice_url = os.getenv("DBSERVICE_URL", "http://localhost:40002")
-                r = requests.post(f"{dbservice_url}/knowledge/upsert",
-                    json=action.get("memory", {}), timeout=5)
-                if r.status_code >= 400:
-                    return _fail(f"memory upsert returned {r.status_code}")
-                return _ok()
+                # Primary: dbservice semantic store
+                try:
+                    r = requests.post(f"{dbservice_url}/knowledge/upsert",
+                        json=memory_data, timeout=5)
+                    if r.status_code < 400:
+                        log.info("archive_memory: written via dbservice")
+                        return _ok()
+                    log.warning("archive_memory: dbservice returned %d, trying governance",
+                                r.status_code)
+                except Exception:
+                    log.warning("archive_memory: dbservice failed, trying governance",
+                                exc_info=True)
+                # Fallback: governance memory_service
+                try:
+                    gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+                    gov_token = os.getenv("GOV_COORDINATOR_TOKEN", "")
+                    project_id = action.get("project_id") or memory_data.get("scope", "default")
+                    r = requests.post(
+                        f"{gov_url}/api/mem/{project_id}/write",
+                        json={
+                            "kind": memory_data.get("type", "knowledge"),
+                            "content": memory_data.get("content", ""),
+                            "meta": memory_data.get("meta", {}),
+                        },
+                        headers={"X-Gov-Token": gov_token},
+                        timeout=5)
+                    if r.status_code < 400:
+                        log.info("archive_memory: written via governance FTS5")
+                        return _ok()
+                    return _fail(f"governance memory write returned {r.status_code}")
+                except Exception as fallback_err:
+                    return _fail(f"both dbservice and governance memory write failed: {fallback_err}")
 
             elif action_type == "reply_only":
                 return _ok()
@@ -1014,38 +1042,21 @@ class TaskOrchestrator:
     # ── PM Analysis ──
 
     def _needs_pm_analysis(self, text: str) -> bool:
-        """Check if user message needs PM analysis before Coordinator.
+        """All non-trivial messages go through PM analysis.
 
-        PM is triggered for any dev-related request to ensure PRD with
-        explicit target_files is generated before Dev task dispatch.
-        Only pure queries (状态/查看/列出) skip PM.
+        Per coordinator-rules.md: coordinator never creates dev/test/qa tasks
+        directly. All code change requests must go through PM.
         """
-        # Skip PM for pure queries
-        query_only = [
-            "状态", "status", "查看", "列出", "list", "show",
-            "查询", "多少", "几个", "有没有", "ping",
+        # Only skip PM for pure status queries
+        lower = text.lower().strip()
+        query_keywords = [
+            "status", "list", "show", "ping", "health", "how many",
         ]
-        lower = text.lower()
-        if any(kw in lower for kw in query_only) and not any(
-            kw in lower for kw in ["修", "改", "加", "写", "实现", "fix", "add"]
+        if any(kw in lower for kw in query_keywords) and not any(
+            kw in lower for kw in ["fix", "add", "change", "implement", "update", "modify"]
         ):
             return False
-
-        # Trigger PM for anything that implies code changes
-        pm_keywords = [
-            # Chinese
-            "新功能", "添加功能", "设计", "方案", "需求",
-            "架构", "重构", "需要", "修改", "增加", "补充",
-            "优化", "实现", "修复", "修", "改", "加",
-            "写", "创建", "删除", "移除",
-            "我要", "我想要", "能不能加", "需要一个",
-            # English
-            "new feature", "redesign", "RFC", "PRD",
-            "implement", "add", "fix", "update", "modify",
-            "enhance", "refactor", "create", "remove", "delete",
-            "Gap", "gap",
-        ]
-        return any(kw in lower for kw in pm_keywords)
+        return True
 
     def _run_pm_analysis(self, text: str, project_id: str, chat_id: int) -> dict:
         """Run PM AI to analyze requirements and generate PRD."""

@@ -331,22 +331,22 @@ User message arrives
         ▼
 Step 0: INTENT CLASSIFICATION (gateway, code logic, 0 tokens)
   ├── greeting/chitchat → direct reply, NO task created
-  │     keywords: 你好, hi, hello, thanks, 谢谢, ok, 好的
+  │     keywords: hi, hello, thanks, ok
   │     → send_text(chat_id, "👋 Hello! Send a task or question.")
   │
   ├── status_query → gateway queries API directly, NO task created
-  │     keywords: 状态, status, 进度, 节点, 多少, 几个, 列表
+  │     keywords: status, progress, nodes, count, list
   │     → query /api/wf/summary or /api/task/list → format → send_text
   │
   ├── command → existing handler (/menu, /bind, /status, /health)
   │     → already handled before this flow
   │
   ├── dangerous → confirmation flow
-  │     keywords: delete, rollback, 删除, 回滚, deploy
+  │     keywords: delete, rollback, deploy
   │     → existing handle_dangerous
   │
   └── task_intent → create coordinator task → AI decides
-        keywords: 帮我, 修, 写, 改, 添加, 创建, fix, add, implement, build
+        keywords: help me, fix, write, change, add, create, implement, build
         or: no keyword match (default to coordinator for safety)
         │
         ▼

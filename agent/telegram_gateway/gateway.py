@@ -21,6 +21,7 @@ import logging
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Dict, Optional
 
 import requests
 
@@ -143,7 +144,7 @@ def gov_api_for_chat(chat_id: int, method: str, path: str, data: dict = None) ->
     return gov_api(method, path, data=data, token=token)
 
 
-def verify_token(token: str) -> dict | None:
+def verify_token(token: str) -> Optional[Dict]:
     """Verify coordinator token with governance service. Returns session info or None."""
     result = gov_api("GET", "/api/role/verify", token=token)
     if result.get("error"):
@@ -190,7 +191,7 @@ def unbind_route(chat_id: int) -> bool:
     return True
 
 
-def get_route(chat_id: int) -> dict | None:
+def get_route(chat_id: int) -> Optional[Dict]:
     """Get the coordinator route for a chat_id."""
     r = get_redis()
     if not r:
@@ -201,7 +202,7 @@ def get_route(chat_id: int) -> dict | None:
     return json.loads(raw)
 
 
-def get_chat_id_for_token(token: str) -> int | None:
+def get_chat_id_for_token(token: str) -> Optional[int]:
     """Get the chat_id bound to a token."""
     r = get_redis()
     if not r:

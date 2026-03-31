@@ -23,12 +23,15 @@ Full chain verified: dev→test→qa→merge→deploy.
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import argparse
 import threading
+import shutil
 from pathlib import Path
+from typing import Dict, Optional
 
 _agent_dir = str(Path(__file__).resolve().parent)
 if _agent_dir not in sys.path:
@@ -43,17 +46,26 @@ POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "10"))
 WORKER_ID = os.getenv("EXECUTOR_WORKER_ID", f"executor-{os.getpid()}")
 WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]))
 
-# Task type → (role, timeout_sec)
+# Task type → role.
+# Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
+# kills processes that produce no stdout for _HANG_TIMEOUT (120 s), and enforces an
+# absolute cap of _MAX_TIMEOUT (1200 s).  External update_progress() calls extend the
+# deadline via AILifecycleManager.extend_deadline().
 TASK_ROLE_MAP = {
-    "coordinator": ("coordinator", 120),
-    "pm":    ("coordinator", 120),
-    "dev":   ("dev", 300),
-    "test":  ("tester", 180),
-    "qa":    ("qa", 120),
-    "merge": ("script", 30),  # handled by _execute_merge, no AI
-    "task":  ("dev", 300),
+    "coordinator": "coordinator",
+    "pm":    "pm",
+    "dev":   "dev",
+    "test":  "tester",
+    "qa":    "qa",
+    "gatekeeper": "gatekeeper",
+    "merge": "script",  # handled by _execute_merge, no AI
+    "deploy": "script",  # handled by _execute_deploy, no AI
+    "task":  "coordinator",
 }
 # Merge is script-based, see _execute_merge()
+
+# Absolute ceiling passed to ai_lifecycle; actual enforcement is via heartbeat watchdog.
+MAX_SESSION_TIMEOUT = 1200
 
 
 class ExecutorWorker:
@@ -68,25 +80,25 @@ class ExecutorWorker:
         self._running = False
         self._current_task = None
         self._lifecycle = None
-        self._pid_path = None  # type: str | None
+        self._pid_path = None  # type: Optional[str]
 
     def _api(self, method: str, path: str, data: dict = None) -> dict:
-        """Call governance API."""
+        """Call governance API. Short timeouts to avoid MCP IO deadlock."""
         import requests
         url = f"{self.base_url}{path}"
         try:
             if method == "GET":
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, timeout=5)
             else:
-                r = requests.post(url, json=data or {}, timeout=30,
+                r = requests.post(url, json=data or {}, timeout=10,
                                   headers={"Content-Type": "application/json"})
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            log.warning("API call failed: %s %s → %s", method, path, e)
+            # DO NOT use log.warning here — it blocks in MCP subprocess (IO pipe deadlock)
             return {"error": str(e)}
 
-    def _claim_task(self) -> dict | None:
+    def _claim_task(self) -> Optional[Dict]:
         """Try to claim next queued task."""
         result = self._api("POST", f"/api/task/{self.project_id}/claim",
                            {"worker_id": self.worker_id})
@@ -120,15 +132,60 @@ class ExecutorWorker:
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
 
-        role, timeout = TASK_ROLE_MAP.get(task_type, ("dev", 300))
+        role = TASK_ROLE_MAP.get(task_type, "dev")
 
-        log.info("Executing %s (type=%s, role=%s, timeout=%ds)",
-                 task_id, task_type, role, timeout)
-        self._report_progress(task_id, {"step": "starting", "role": role})
+        import time as _time
+        _t0 = _time.time()
+        # Write timing to a file for debugging (host process logs may not be visible)
+        _timing_file = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                     f"timing-{task_id}.txt")
+        os.makedirs(os.path.dirname(_timing_file), exist_ok=True)
+        def _timing(msg):
+            # Write to file ONLY — log.info blocks intermittently in MCP subprocess
+            try:
+                with open(_timing_file, "a") as f:
+                    f.write(f"{_time.time() - _t0:.1f}s {msg}\n")
+            except Exception:
+                pass
+        _timing(f"start: type={task_type} role={role}")
 
-        # Merge is a script operation, not AI
+        # Report progress (non-blocking — short timeout to avoid IO pipe deadlock)
+        try:
+            import requests as _req
+            _req.post(f"{self.base_url}/api/task/{self.project_id}/progress",
+                      json={"task_id": task_id, "progress": {"step": "starting", "role": role}},
+                      timeout=3)
+        except Exception:
+            pass
+        _timing("report_progress: done")
+
+        # Merge/deploy are script operations, not AI
         if task_type == "merge":
             return self._execute_merge(task_id, metadata)
+        if task_type == "deploy":
+            return self._execute_deploy(task_id, metadata)
+
+        worktree_path = None
+        branch_name = None
+        execution_workspace = self.workspace
+        if task_type == "dev":
+            _timing("worktree: starting")
+            worktree_path, branch_name = self._create_worktree(task_id)
+            if worktree_path:
+                execution_workspace = worktree_path
+                _timing(f"worktree: created {worktree_path}")
+            else:
+                _timing("worktree: creation failed, fallback to main workspace")
+        elif task_type in ("test", "qa"):
+            inherited_worktree = metadata.get("_worktree", "")
+            inherited_branch = metadata.get("_branch", "")
+            if inherited_worktree and os.path.isdir(inherited_worktree):
+                execution_workspace = inherited_worktree
+                worktree_path = inherited_worktree
+                branch_name = inherited_branch
+                _timing(f"worktree: reusing {inherited_worktree}")
+            else:
+                _timing("worktree: no inherited worktree, fallback to main workspace")
 
         # Build context for AI session
         context = {
@@ -137,45 +194,86 @@ class ExecutorWorker:
             "project_id": self.project_id,
             "target_files": metadata.get("target_files", []),
             "changed_files": metadata.get("changed_files", []),
+            "verification": metadata.get("verification", {}),
+            "test_files": metadata.get("test_files", []),
+            "requirements": metadata.get("requirements", []),
+            "acceptance_criteria": metadata.get("acceptance_criteria", []),
+            "doc_impact": metadata.get("doc_impact", {}),
+            "test_report": metadata.get("test_report", {}),
             "related_nodes": metadata.get("related_nodes", []),
             "attempt_num": task.get("attempt_num", 1),
             "chat_id": metadata.get("chat_id", ""),
             "previous_gate_reason": metadata.get("previous_gate_reason", ""),
             "rejection_reason": metadata.get("rejection_reason", ""),
+            "_round2_memories": metadata.get("_round2_memories", []),
+            "_coordinator_memories": metadata.get("_coordinator_memories", []),
+            "_coordinator_context": metadata.get("_coordinator_context", {}),
+            "workspace": execution_workspace,
         }
 
         # Enhance prompt with governance context
         enhanced_prompt = self._build_prompt(prompt, task_type, context)
+        _timing(f"build_prompt done: prompt_len={len(enhanced_prompt)}")
 
         # Create AI session
         if self._lifecycle is None:
             from ai_lifecycle import AILifecycleManager
             self._lifecycle = AILifecycleManager()
 
+        _t1 = _time.time()
         session = self._lifecycle.create_session(
             role=role,
             prompt=enhanced_prompt,
             context=context,
             project_id=self.project_id,
-            timeout_sec=timeout,
-            workspace=self.workspace,
+            timeout_sec=MAX_SESSION_TIMEOUT,
+            workspace=execution_workspace,
         )
+
+        _timing(f"create_session done: pid={session.pid}")
 
         if session.status == "failed":
             return {"status": "failed", "error": session.stderr}
 
-        # Wait for completion with progress reporting
-        self._report_progress(task_id, {"step": "running", "session_id": session.session_id})
+        # Wait for completion with progress reporting (short timeout to avoid IO pipe deadlock)
+        try:
+            _req.post(f"{self.base_url}/api/task/{self.project_id}/progress",
+                      json={"task_id": task_id, "progress": {"step": "running", "session_id": session.session_id}},
+                      timeout=3)
+        except Exception:
+            pass
+        if hasattr(self._lifecycle, "extend_deadline"):
+            self._lifecycle.extend_deadline(session.session_id)
+
+        _t2 = _time.time()
         output = self._lifecycle.wait_for_output(session.session_id)
+        _timing(f"wait_for_output done: status={output.get('status')} elapsed={output.get('elapsed_sec')}s")
 
         if session.status == "timeout":
-            return {"status": "failed", "error": f"Timeout after {timeout}s"}
+            _timing(f"TIMEOUT after {_time.time() - _t0:.1f}s total")
+            return {"status": "failed", "error": "Session timed out (hung or exceeded max runtime)"}
         if session.status == "failed":
             return {"status": "failed", "error": session.stderr[:500]}
+        terminal_cli_error = self._detect_terminal_cli_error(session, task_type)
+        if terminal_cli_error:
+            _timing(f"terminal_cli_error: {terminal_cli_error}")
+            return {
+                "status": "failed",
+                "error": terminal_cli_error,
+                "result": {
+                    "error": terminal_cli_error,
+                    "summary": terminal_cli_error,
+                },
+            }
 
-        # Detect actually changed files via git diff
-        changed_files = self._get_git_changed_files()
-        log.info("git diff detected %d changed file(s): %s", len(changed_files), changed_files)
+        # Detect actually changed files via git diff (skip for non-code roles)
+        if task_type in ("coordinator", "task", "pm", "qa"):
+            changed_files = []
+            _timing(f"git_diff: skipped ({task_type})")
+        else:
+            _timing("git_diff: starting")
+            changed_files = self._get_git_changed_files(cwd=execution_workspace)
+            _timing(f"git_diff: done, {len(changed_files)} files")
 
         # Stage changed files if any
         if changed_files:
@@ -183,7 +281,7 @@ class ExecutorWorker:
                 import subprocess
                 subprocess.run(
                     ["git", "add", "--"] + changed_files,
-                    cwd=self.workspace,
+                    cwd=execution_workspace,
                     capture_output=True,
                     timeout=30,
                 )
@@ -192,19 +290,24 @@ class ExecutorWorker:
                 log.warning("git add failed: %s", e)
 
         # Parse output and merge with real changed_files
+        _timing("parse_output: starting")
         result = self._parse_output(session, task_type)
-        log.info("_parse_output keys: %s", list(result.keys()))
+        _timing(f"parse_output: done, keys={list(result.keys())}")
 
         # Always overwrite/set changed_files from git diff (ground truth)
         # IMPORTANT: git diff is authoritative; always set even if _parse_output
         # returned its own changed_files (it may be stale or from AI hallucination)
         result["changed_files"] = changed_files if changed_files else result.get("changed_files", [])
+        if worktree_path and branch_name:
+            result["_worktree"] = worktree_path
+            result["_branch"] = branch_name
 
-        log.info("Final result for %s: changed_files=%s, keys=%s",
-                 task_id, result.get("changed_files"), list(result.keys()))
+        _timing(f"final_result: changed_files={result.get('changed_files')} keys={list(result.keys())}")
 
         # Write structured memory on completion
+        _timing("write_memory: starting")
         self._write_memory(task_type, task_id, result, metadata)
+        _timing("write_memory: done, returning")
 
         return {"status": "succeeded", "result": result}
 
@@ -227,7 +330,7 @@ class ExecutorWorker:
 
                 gate_reason = metadata.get("previous_gate_reason", "")
                 self._api("POST", f"/api/mem/{self.project_id}/write", {
-                    "module": changed[0] if changed else "general",
+                    "module_id": changed[0] if changed else "general",
                     "kind": "decision",
                     "content": summary or f"Changed {len(changed)} files",
                     "structured": {
@@ -243,10 +346,12 @@ class ExecutorWorker:
 
             elif task_type == "test":
                 report = result.get("test_report", {})
+                if not isinstance(report, dict) or not report:
+                    return
                 passed = report.get("passed", 0) or 0
                 failed = report.get("failed", 0) or 0
                 self._api("POST", f"/api/mem/{self.project_id}/write", {
-                    "module": "testing",
+                    "module_id": "testing",
                     "kind": "test_result" if failed == 0 else "failure_pattern",
                     "content": f"{passed} passed, {failed} failed",
                     "structured": {
@@ -261,7 +366,7 @@ class ExecutorWorker:
 
             elif task_type == "qa" and result.get("recommendation") == "reject":
                 self._api("POST", f"/api/mem/{self.project_id}/write", {
-                    "module": changed[0] if changed else "general",
+                    "module_id": changed[0] if changed else "general",
                     "kind": "failure_pattern",
                     "content": result.get("review_summary", "QA rejected"),
                     "structured": {
@@ -276,13 +381,83 @@ class ExecutorWorker:
             log.warning("Memory write failed (non-fatal): %s", e)
 
     def _execute_merge(self, task_id: str, metadata: dict) -> dict:
-        """Merge is a script operation: git add → git commit. No AI needed."""
+        """Merge is a script operation.
+
+        For chained dev work, we verify the merge in a clean integration
+        worktree so a dirty main workspace does not block the pipeline.
+        """
         import subprocess
 
         changed = metadata.get("changed_files", [])
+        branch = metadata.get("_branch", "")
+        worktree = metadata.get("_worktree", "")
         self._report_progress(task_id, {"step": "merging"})
 
         try:
+            if branch:
+                if not self._branch_exists(branch):
+                    return {"status": "failed", "error": f"Merge branch missing for chained merge: {branch}"}
+
+                worktree_available = bool(worktree and os.path.isdir(worktree))
+                branch_already_merged = False
+                if worktree_available:
+                    subprocess.run(["git", "add", "-A"],
+                                   cwd=worktree, capture_output=True, timeout=30)
+                    status = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                                            cwd=worktree, capture_output=True, text=True, timeout=10)
+                    staged = [f.strip() for f in status.stdout.splitlines() if f.strip()]
+                    if staged:
+                        msg = f"dev: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
+                        commit_proc = subprocess.run(["git", "commit", "-m", msg],
+                                                     cwd=worktree, capture_output=True, text=True, timeout=30)
+                        if commit_proc.returncode != 0:
+                            return {"status": "failed", "error": f"git commit failed in dev worktree: {commit_proc.stderr[:300]}"}
+                else:
+                    branch_already_merged = self._branch_already_merged(branch)
+                    if not branch_already_merged:
+                        log.info("merge replay without dev worktree: task=%s branch=%s", task_id, branch)
+
+                if branch_already_merged:
+                    rev = subprocess.run(["git", "rev-parse", "HEAD"],
+                                         cwd=self.workspace, capture_output=True, text=True, timeout=5)
+                    return {"status": "succeeded", "result": {
+                        "merge_commit": rev.stdout.strip(),
+                        "branch": "main",
+                        "merge_mode": "already_merged_replay",
+                        "files_changed": len(changed),
+                        "changed_files": changed,
+                    }}
+
+                integration_worktree = ""
+                integration_branch = ""
+                try:
+                    integration_worktree, integration_branch, create_error = self._create_integration_worktree(task_id)
+                    if not integration_worktree:
+                        return {"status": "failed", "error": f"Integration worktree setup failed: {create_error[:300]}"}
+
+                    proc = subprocess.run(
+                        ["git", "merge", branch, "--no-ff", "-m", f"Auto-merge: {task_id}"],
+                        cwd=integration_worktree, capture_output=True, text=True, timeout=30)
+                    if proc.returncode != 0:
+                        subprocess.run(["git", "merge", "--abort"],
+                                       cwd=integration_worktree, capture_output=True, timeout=10)
+                        return {"status": "failed", "error": f"Merge conflict: {proc.stderr[:300]}"}
+
+                    rev = subprocess.run(["git", "rev-parse", "HEAD"],
+                                         cwd=integration_worktree, capture_output=True, text=True, timeout=5)
+                    if worktree_available:
+                        self._remove_worktree(worktree, branch, delete_branch=False)
+                    return {"status": "succeeded", "result": {
+                        "merge_commit": rev.stdout.strip(),
+                        "branch": "main",
+                        "merge_mode": "isolated_integration",
+                        "files_changed": len(changed),
+                        "changed_files": changed,
+                    }}
+                finally:
+                    if integration_worktree or integration_branch:
+                        self._remove_worktree(integration_worktree, integration_branch)
+
             # Stage changed files (or all if none specified)
             if changed:
                 subprocess.run(["git", "add", "--"] + changed,
@@ -394,81 +569,301 @@ class ExecutorWorker:
         except Exception as e:
             return {"status": "failed", "error": str(e)}
 
-    def _fetch_memories(self, query: str, top_k: int = 3) -> list:
-        """Search memory backend for relevant past work (best-effort, returns list)."""
+    def _branch_exists(self, branch_name: str) -> bool:
         try:
+            proc = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+                cwd=self.workspace,
+                capture_output=True,
+                timeout=10,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def _branch_already_merged(self, branch_name: str) -> bool:
+        try:
+            proc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", branch_name, "HEAD"],
+                cwd=self.workspace,
+                capture_output=True,
+                timeout=10,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def _execute_deploy(self, task_id: str, metadata: dict) -> dict:
+        """Run deploy orchestration on the host executor, not in governance."""
+        changed = metadata.get("changed_files", [])
+        self._report_progress(task_id, {"step": "deploying"})
+        try:
+            from deploy_chain import run_deploy
+
+            chat_id = int(metadata.get("chat_id", 0) or 0)
+            report = run_deploy(changed, chat_id=chat_id, project_id=self.project_id)
+            result = {
+                "deploy": "completed" if report.get("success") else "failed",
+                "report": report,
+                "changed_files": changed,
+            }
+            if report.get("success"):
+                return {"status": "succeeded", "result": result}
+            summary = report.get("error") or json.dumps(report, ensure_ascii=False)[:300]
+            return {"status": "failed", "error": summary, "result": result}
+        except Exception as e:
+            return {"status": "failed", "error": str(e), "result": {"deploy": "failed", "changed_files": changed}}
+
+    def _fetch_memories(self, query: str, top_k: int = 3) -> list:
+        """Search memory backend for relevant past work (best-effort, 3s timeout)."""
+        try:
+            import requests as _req
             from urllib.parse import quote
-            result = self._api("GET", f"/api/mem/{self.project_id}/search?q={quote(query[:120])}&top_k={top_k}")
-            return result.get("results", [])
+            resp = _req.get(f"{self.base_url}/api/mem/{self.project_id}/search?q={quote(query[:120])}&top_k={top_k}",
+                            timeout=3)
+            return resp.json().get("results", [])
         except Exception:
             return []
+
+    def _fetch_conversation_history(self, limit: int = 10) -> list[dict]:
+        """Fetch recent conversation history from session_context log.
+
+        Uses short timeout (3s) to avoid blocking coordinator flow.
+        """
+        try:
+            import requests as _req
+            resp = _req.get(f"{self.base_url}/api/context/{self.project_id}/log?limit={limit}", timeout=3)
+            data = resp.json()
+            entries = data.get("entries", [])
+            result = []
+            for e in entries:
+                if e.get("type") != "coordinator_turn":
+                    continue
+                # The entry is a flat dict; wrap relevant fields under "content"
+                content = {
+                    "user_message": e.get("user_message", ""),
+                    "decision": e.get("decision", ""),
+                    "reply_preview": e.get("reply_preview", ""),
+                }
+                result.append({"content": content, "created_at": e.get("ts", "")})
+            return result
+        except Exception as e:
+            log.debug("_fetch_conversation_history failed: %s", e)
+            return []
+
+    def _write_conversation_history(self, task: dict, parsed_output: dict):
+        """Write coordinator decision to session_context for future reference."""
+        try:
+            actions = parsed_output.get("actions", [])
+            decision = actions[0].get("type", "unknown") if actions else "unknown"
+            entry = {
+                "user_message": task.get("prompt", "")[:500],
+                "decision": decision,
+                "reply_preview": parsed_output.get("reply", "")[:200],
+            }
+            # Add PM task ID if created
+            if decision == "create_pm_task":
+                entry["pm_prompt_preview"] = actions[0].get("prompt", "")[:200]
+            # Add queries if query_memory was used
+            if decision == "query_memory":
+                entry["queries"] = actions[0].get("queries", [])
+
+            import requests as _req
+            _req.post(f"{self.base_url}/api/context/{self.project_id}/log",
+                      json={"type": "coordinator_turn", **entry},
+                      timeout=3)
+        except Exception as e:
+            log.debug("_write_conversation_history failed (non-fatal): %s", e)
 
     def _build_prompt(self, prompt: str, task_type: str, context: dict) -> str:
         """Enhance task prompt with governance context."""
         parts = [prompt]
 
         if task_type == "pm":
-            memories = self._fetch_memories(prompt)
-            if memories:
-                parts.append("\nRelevant memories from past work:")
-                for m in memories:
-                    parts.append(f"  - [{m.get('kind','')}] {m.get('summary', m.get('content',''))[:150]}")
-            parts.append(
-                "\nAnalyze the request and output a PRD as JSON with the following fields: "
-                "{\"target_files\": [\"...\"], \"verification\": {\"method\": \"...\", \"command\": \"...\"}, "
-                "\"acceptance_criteria\": [\"...\"]}"
-            )
+            import time as _bt
+            _bt0 = _bt.time()
+            def _bp_log(msg):
+                try:
+                    bp_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                           f"build-prompt-{context.get('task_id','?')}.txt")
+                    with open(bp_path, "a") as f:
+                        f.write(f"{_bt.time()-_bt0:.1f}s {msg}\n")
+                except Exception:
+                    pass
 
-        elif task_type == "coordinator":
-            chat_id = context.get("chat_id", "")
+            # 1. Coordinator-forwarded context
+            coordinator_memories = context.get("_coordinator_memories", [])
+            coordinator_context = context.get("_coordinator_context", {})
+            if coordinator_memories:
+                parts.append("\n## Context from Coordinator (pre-searched memories)")
+                seen = set()
+                for m in coordinator_memories:
+                    c = m.get('summary', m.get('content', ''))[:150]
+                    if c not in seen:
+                        seen.add(c)
+                        parts.append(f"  - [{m.get('kind','')}] {c}")
+            if coordinator_context:
+                parts.append(f"\n## Coordinator Decision Context")
+                parts.append(f"  {json.dumps(coordinator_context, ensure_ascii=False)}")
+            _bp_log(f"coordinator context: {len(coordinator_memories)} memories")
+
+            # 2. PM's own memory search
+            memories = self._fetch_memories(prompt[:120])
+            if memories:
+                parts.append("\n## Additional Memories (PM search)")
+                seen = set()
+                for m in memories:
+                    c = m.get('summary', m.get('content', ''))[:150]
+                    if c not in seen:
+                        seen.add(c)
+                        parts.append(f"  - [{m.get('kind','')}] {c}")
+            _bp_log(f"pm memory search: {len(memories)} results")
+
+            # 3. Runtime context + queue
+            try:
+                import requests as _req
+                ctx_data = _req.get(f"{self.base_url}/api/context/{self.project_id}/load", timeout=3).json()
+                if ctx_data.get("exists"):
+                    parts.append(f"\n## Runtime Context")
+                    parts.append(f"  {json.dumps(ctx_data.get('context', {}), ensure_ascii=False)}")
+            except Exception:
+                pass
+            try:
+                task_list = _req.get(f"{self.base_url}/api/task/{self.project_id}/list", timeout=3).json()
+                active = [t for t in task_list.get("tasks", [])
+                          if t.get("status") in ("queued", "claimed", "observer_hold")]
+                if active:
+                    parts.append(f"\n## Active Task Queue ({len(active)} tasks)")
+                    for t in active[:5]:
+                        parts.append(f"  - {t.get('task_id','')}: [{t.get('type','')}] {t.get('prompt','')[:60]}")
+            except Exception:
+                pass
+            _bp_log("context + queue done")
+
+            # 4. Project structure
+            parts.append("\n## Project Structure")
+            parts.append("  agent/ — executor_worker, ai_lifecycle, pipeline_config")
+            parts.append("  agent/governance/ — auto_chain, db, server, memory_service, memory_backend")
+            parts.append("  agent/telegram_gateway/ — gateway, message_worker")
+            parts.append("  agent/tests/ — pytest test files")
+            parts.append("  docs/ — specs, rules, dev iteration logs")
+
+            # 5. PRD output format instruction (scheme C — single source of truth)
+            parts.append(
+                "\nOutput a PRD as strict JSON with these fields:\n"
+                "{\n"
+                '  "target_files": ["agent/xxx.py"],        // MANDATORY — files Dev will modify\n'
+                '  "test_files": ["agent/tests/test_xxx.py"], // soft-mandatory (or skip_reasons)\n'
+                '  "requirements": ["R1: ...", "R2: ..."],   // MANDATORY\n'
+                '  "acceptance_criteria": ["AC1: ...", ...],  // MANDATORY — concrete, grep-verifiable\n'
+                '  "verification": {"method": "automated test", "command": "pytest agent/tests/"}, // MANDATORY\n'
+                '  "proposed_nodes": [                        // soft-mandatory (or skip_reasons)\n'
+                '    {\n'
+                '      "parent_layer": 7,\n'
+                '      "title": "Node title",\n'
+                '      "deps": ["L3.2"],\n'
+                '      "verify_requires": ["L4.32"],\n'
+                '      "primary": ["agent/xxx.py"],\n'
+                '      "test": ["agent/tests/test_xxx.py"],\n'
+                '      "test_strategy": "what to test and how",\n'
+                '      "description": "what this node covers"\n'
+                '    }\n'
+                '  ],\n'
+                '  "doc_impact": {"files": [...], "changes": [...]}, // soft-mandatory (or skip_reasons)\n'
+                '  "skip_reasons": {"field_name": "reason"},  // REQUIRED for omitted soft fields\n'
+                '  "related_nodes": ["L7.4"],                 // existing nodes affected\n'
+                '  "prd": {                                   // optional metadata\n'
+                '    "feature": "Feature name",\n'
+                '    "background": "Why this change",\n'
+                '    "scope": "Impact scope",\n'
+                '    "risk": "Risk assessment"\n'
+                '  }\n'
+                "}\n"
+                "\nRules:\n"
+                "- target_files, requirements, acceptance_criteria, verification are MANDATORY (gate blocks if missing)\n"
+                "- test_files, proposed_nodes, doc_impact: provide OR explain in skip_reasons\n"
+                "- Use Read/Grep to verify file paths exist before listing them\n"
+                "- Read at most 3-5 key files, then output the JSON\n"
+                "- Do NOT output actions, reply, or schema_version fields\n"
+                "Output ONLY the PRD JSON object."
+            )
+            _bp_log("format instruction appended")
+
+        elif task_type in ("coordinator", "task"):
+            # Two-round coordinator: round 1 has no memories, round 2 has memory results
+            import time as _bt
+            _bt0 = _bt.time()
+            def _bp_log(msg):
+                try:
+                    log_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                            f"build-prompt-{context.get('task_id','?')}.txt")
+                    with open(log_path, "a") as f:
+                        f.write(f"{_bt.time()-_bt0:.1f}s {msg}\n")
+                except Exception:
+                    pass
+            parts.append(f"\nproject_id: {self.project_id}")
+
+            # Inject conversation history (last 10)
+            _bp_log("fetching history")
+            history = self._fetch_conversation_history()
+            _bp_log(f"history done: {len(history)} entries")
+            if history:
+                parts.append("\n## Recent Conversation (last 10 turns)")
+                for h in reversed(history):  # oldest first
+                    c = h.get("content", {})
+                    parts.append(f"  - [{h.get('created_at','')}] user: {c.get('user_message','')[:80]}")
+                    parts.append(f"    decision: {c.get('decision','?')}")
+
+            # Round 2: inject memory results if available
+            round2_memories = context.get("_round2_memories", [])
+            if round2_memories:
+                parts.append("\n## Memory Search Results (from your query_memory request)")
+                seen_content = set()
+                for m in round2_memories:
+                    content = m.get('summary', m.get('content', ''))[:150]
+                    if content not in seen_content:
+                        seen_content.add(content)
+                        parts.append(f"  - [{m.get('kind','')}] {content}")
+                parts.append("\nNow make your final decision based on these results.")
+                parts.append("You MUST output reply_only or create_pm_task. Do NOT output query_memory again.")
+
+            # Pre-fetch active queue
+            _bp_log("fetching queue")
+            try:
+                import requests as _req
+                task_list = _req.get(f"{self.base_url}/api/task/{self.project_id}/list", timeout=3).json()
+                active = [t for t in task_list.get("tasks", [])
+                          if t.get("status") in ("queued", "claimed", "observer_hold")]
+                if active:
+                    parts.append(f"\n## Active Task Queue ({len(active)} tasks)")
+                    for t in active[:5]:
+                        parts.append(f"  - {t.get('task_id','')}: [{t.get('type','')}] {(t.get('prompt',''))[:60]}")
+            except Exception:
+                pass
+
+            _bp_log("queue done")
+            # Pre-fetch runtime context
+            _bp_log("fetching context")
+            try:
+                ctx_data = _req.get(f"{self.base_url}/api/context/{self.project_id}/load", timeout=3).json()
+                if ctx_data.get("exists"):
+                    parts.append(f"\n## Runtime Context")
+                    parts.append(f"  {json.dumps(ctx_data.get('context', {}), ensure_ascii=False)}")
+            except Exception:
+                pass
+
+            _bp_log("context done")
+            # Inject rule engine decision if non-trivial
             rule_decision = context.get("rule_decision", "new")
             rule_reason = context.get("rule_reason", "")
-
-            parts.append(f"\nYou are a Coordinator. Analyze the user message and decide the action.")
-            parts.append("User message from Telegram (chat_id=" + str(chat_id) + "):")
-            parts.append(f'"{prompt}"')
-
-            # Phase 5: Inject memory search results
-            memories = self._fetch_memories(prompt)
-            if memories:
-                parts.append("\nRelevant memories from past work:")
-                for m in memories:
-                    parts.append(f"  - [{m.get('kind','')}] {m.get('summary', m.get('content',''))[:150]}")
-
-            # Phase 5: Inject active queue state
-            try:
-                task_list = self._api("GET", f"/api/task/{self.project_id}/list")
-                active = [t for t in task_list.get("tasks", []) if t.get("status") in ("queued", "claimed")]
-                if active:
-                    parts.append(f"\nActive task queue ({len(active)} tasks):")
-                    for t in active[:5]:
-                        parts.append(f"  - {t.get('task_id','')}: [{t.get('type','')}] {(t.get('prompt',''))[:80]}")
-            except Exception:
-                pass  # Non-fatal
-
-            # Phase 5: Inject rule engine decision
             if rule_decision and rule_decision != "new":
-                parts.append(f"\nRule engine decision: {rule_decision}")
-                if rule_reason:
-                    parts.append(f"Reason: {rule_reason}")
-                if rule_decision == "duplicate":
-                    parts.append("Ask the user before re-executing this task.")
-                elif rule_decision == "conflict":
-                    parts.append("Warn the user about the conflict and offer options.")
-                elif rule_decision == "queue":
-                    parts.append("Create the task with lower priority (queued behind active work).")
-                elif rule_decision == "retry":
-                    parts.append("Include past failure context when creating the task.")
-
-            parts.append("\nRespond with EXACTLY ONE JSON object (no other text):")
-            parts.append('If this is a question → {"action": "reply", "text": "your answer here"}')
-            parts.append('If this needs code changes → {"action": "create_task", "type": "pm", "prompt": "detailed description"}')
-            parts.append('If this is a duplicate → {"action": "reply", "text": "This was done recently in task-xxx. Want me to redo it?"}')
-            parts.append('If there is a conflict → {"action": "reply", "text": "Conflict detected: ... Options: ..."}')
-            parts.append('\nIMPORTANT: Output ONLY the JSON object, nothing else.')
+                parts.append(f"\n## Rule Engine Decision: {rule_decision}")
+                parts.append(f"  Reason: {rule_reason}")
 
         elif task_type == "test":
             changed = context.get("changed_files", [])
+            verification = context.get("verification", {})
+            test_files = context.get("test_files", [])
             # Inject past failure patterns for these files
             if changed:
                 memories = self._fetch_memories(", ".join(changed[:3]))
@@ -478,10 +873,22 @@ class ExecutorWorker:
                     for m in failures:
                         parts.append(f"  - {m.get('summary', m.get('content',''))[:150]}")
             parts.append(f"\nRun tests. Changed files: {json.dumps(changed)}")
-            parts.append("Report result as JSON: {\"test_report\": {\"passed\": N, \"failed\": N, \"tool\": \"pytest\"}}")
+            if verification:
+                parts.append(f"Verification plan: {json.dumps(verification, ensure_ascii=False)}")
+                if verification.get("command"):
+                    parts.append(f"Required verification command: {verification['command']}")
+                    parts.append("You MUST attempt the required verification command before finishing unless it is unavailable in the current workspace.")
+            if test_files:
+                parts.append(f"Priority test files: {json.dumps(test_files)}")
+            parts.append("Report result as strict JSON: {\"schema_version\":\"v1\",\"summary\":\"...\",\"test_report\":{\"passed\":N,\"failed\":N,\"tool\":\"pytest\",\"command\":\"exact command attempted\"}}")
 
         elif task_type == "qa":
             changed = context.get("changed_files", [])
+            requirements = context.get("requirements", [])
+            criteria = context.get("acceptance_criteria", [])
+            verification = context.get("verification", {})
+            doc_impact = context.get("doc_impact", {})
+            test_report = context.get("test_report", {})
             if changed:
                 memories = self._fetch_memories(", ".join(changed[:3]))
                 decisions = [m for m in memories if m.get("kind") in ("decision", "task_result")]
@@ -489,19 +896,42 @@ class ExecutorWorker:
                     parts.append("\nPast decisions for these files:")
                     for m in decisions:
                         parts.append(f"  - [{m.get('kind','')}] {m.get('summary', m.get('content',''))[:150]}")
+            if test_report:
+                parts.append(f"\nTest report: {json.dumps(test_report, ensure_ascii=False)}")
+            if requirements:
+                parts.append(f"Requirements: {json.dumps(requirements, ensure_ascii=False)}")
+            if criteria:
+                parts.append(f"Acceptance criteria: {json.dumps(criteria, ensure_ascii=False)}")
+            if verification:
+                parts.append(f"Verification contract: {json.dumps(verification, ensure_ascii=False)}")
+            if doc_impact:
+                parts.append(f"Doc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
             parts.append("\nYou are a QA reviewer. Review the test results and changed files above.")
             parts.append("If tests passed and changes look reasonable, respond ONLY with this exact JSON:")
             parts.append('{"recommendation": "qa_pass", "review_summary": "Tests pass, changes approved"}')
             parts.append("If there are critical issues, respond with:")
             parts.append('{"recommendation": "reject", "reason": "description of issue"}')
 
+        elif task_type == "gatekeeper":
+            parts.append("\nYou are the isolated pre-merge gatekeeper.")
+            parts.append("Assess whether the implementation satisfies the PM contract and whether merge should proceed.")
+            parts.append("You must not ask for broader project context or propose code changes.")
+            parts.append('Respond ONLY with JSON: {"schema_version":"v1","review_summary":"...","recommendation":"merge_pass|reject","pm_alignment":"pass|partial|fail","checked_requirements":["R1"],"reason":""}')
+
         elif task_type == "merge":
             parts.append("\nCommit all staged changes to git and respond with JSON: {\"merge_commit\": \"<hash>\", \"branch\": \"main\", \"files_changed\": N}")
 
-        elif task_type in ("dev", "task"):
+        elif task_type == "dev":
             target = context.get("target_files", [])
             if target:
                 parts.append(f"\nTarget files: {json.dumps(target)}")
+            verification = context.get("verification", {})
+            if verification:
+                parts.append(f"Verification plan: {json.dumps(verification, ensure_ascii=False)}")
+                if verification.get("command"):
+                    parts.append(f"Required verification command: {verification['command']}")
+                    parts.append("You MUST attempt the required verification command before finishing unless the command itself is unavailable in the current workspace.")
+                    parts.append("If verification is only partially completed, explain exactly why in summary/retry_context and report the attempted command in test_results.command.")
             # Inject memories relevant to target files and prompt
             mem_query = prompt if len(prompt) <= 120 else (", ".join(target[:3]) if target else prompt[:120])
             memories = self._fetch_memories(mem_query)
@@ -515,7 +945,8 @@ class ExecutorWorker:
                 parts.append(f"\nThis is retry attempt #{attempt}. Previous attempt was blocked by gate.")
                 parts.append(f"Gate rejection reason: {gate_reason}")
                 parts.append("Fix ONLY the specific issue described above; do not make unrelated changes.")
-            parts.append("\nAfter completing, respond with JSON: {\"changed_files\": [...], \"summary\": \"...\"}")
+            parts.append("\nAfter completing, respond with strict JSON including verification evidence:")
+            parts.append("{\"schema_version\":\"v1\",\"summary\":\"...\",\"changed_files\":[...],\"new_files\":[],\"test_results\":{\"ran\":true,\"passed\":N,\"failed\":N,\"command\":\"exact command attempted\"},\"related_nodes\":[...],\"needs_review\":false}")
 
         return "\n".join(parts)
 
@@ -530,31 +961,62 @@ class ExecutorWorker:
     #   governance/graph.py       → L1.3  AcceptanceGraph (DAG rule layer)
     #   governance/task_registry.py → L2.2 TaskRegistry  (task CRUD / queue)
     def _handle_coordinator_result(self, task: dict, result: dict) -> None:
-        """Parse coordinator AI output and execute the decided action."""
-        import re
+        """Parse coordinator AI output and execute the decided action.
 
+        Supports two JSON formats:
+        - New (v1): {"schema_version":"v1", "reply":"...", "actions":[...], "context_update":{...}}
+        - Legacy:   {"action":"reply|create_task", ...}
+
+        Gate validation: only reply_only and create_pm_task actions are allowed.
+        """
         metadata = task.get("metadata", {})
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
         chat_id = metadata.get("chat_id", "")
 
-        # Extract JSON from AI output — try multiple strategies
+        # Extract JSON from AI output
         raw = result.get("summary", "") or result.get("raw_output", "") or json.dumps(result)
 
-        action_data = None
-        # Strategy 1: full output is valid JSON
+        # Debug: dump raw output to file for observability
         try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict) and "action" in parsed:
-                action_data = parsed
+            dump_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                     f"coordinator-{task['task_id']}.raw.txt")
+            os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+            with open(dump_path, "w", encoding="utf-8") as f:
+                f.write(f"result_keys: {list(result.keys())}\n\n")
+                f.write(f"raw ({len(raw)} chars):\n{raw}\n")
+        except Exception:
+            pass
+
+        parsed = self._extract_json(raw)
+
+        if not parsed:
+            if chat_id:
+                self._telegram_reply(chat_id, raw[:2000])
+            return
+
+        # Detect format: new (schema_version) vs legacy (action)
+        if "schema_version" in parsed or "actions" in parsed:
+            self._handle_coordinator_v1(task, parsed, chat_id)
+        elif "action" in parsed:
+            self._handle_coordinator_legacy(task, parsed, chat_id)
+        else:
+            log.warning("coordinator.gate: JSON has no actions or action field: %s",
+                        list(parsed.keys()))
+
+    def _extract_json(self, raw: str) -> Optional[Dict]:
+        """Extract first valid JSON object from raw output."""
+        # Strategy 1: entire output is JSON
+        try:
+            parsed = json.loads(raw.strip())
+            if isinstance(parsed, dict):
+                return parsed
         except (json.JSONDecodeError, TypeError):
             pass
 
         # Strategy 2: find JSON block with balanced braces
-        if not action_data:
-            start = raw.find('{"action"')
-            if start == -1:
-                start = raw.find("{'action")
+        for marker in ['{"schema_version"', '{"action"', '{"actions"']:
+            start = raw.find(marker)
             if start >= 0:
                 depth = 0
                 for i in range(start, len(raw)):
@@ -562,52 +1024,198 @@ class ExecutorWorker:
                     elif raw[i] == '}': depth -= 1
                     if depth == 0:
                         try:
-                            action_data = json.loads(raw[start:i+1])
+                            return json.loads(raw[start:i+1])
                         except json.JSONDecodeError:
                             pass
                         break
+        return None
 
-        if not action_data:
-            log.warning("Coordinator output has no action JSON: %s", raw[:200])
-            if chat_id:
-                self._telegram_reply(chat_id, raw[:2000])  # Send raw output as fallback
-            return
+    def _validate_coordinator_output(self, parsed: dict, round: int = 1) -> tuple[bool, str]:
+        """Validate coordinator JSON output against gate rules G1-G7.
+        Returns (valid, error_message).
+        round=1 allows query_memory; round=2 only allows final decisions."""
+        if not isinstance(parsed, dict):
+            return False, "Output is not a JSON object"
+        if parsed.get("schema_version") != "v1":
+            return False, "Missing or invalid schema_version (expected 'v1')"
 
-        action = action_data.get("action", "")
-        log.info("Coordinator action: %s (task %s)", action, task["task_id"])
+        # reply is required for final decisions, optional for query_memory
+        has_query_memory = any(a.get("type") == "query_memory" for a in (parsed.get("actions") or []))
+        if not has_query_memory and not parsed.get("reply"):
+            return False, "Missing or empty 'reply' field"
+
+        actions = parsed.get("actions")
+        if not actions or not isinstance(actions, list):
+            return False, "Missing or empty 'actions' array"
+        for a in actions:
+            atype = a.get("type", "")
+            if round == 1:
+                allowed_types = ("reply_only", "create_pm_task", "query_memory")
+            else:
+                allowed_types = ("reply_only", "create_pm_task")
+            if atype not in allowed_types:
+                return False, f"Invalid action type '{atype}' (allowed: {', '.join(allowed_types)})"
+            if atype == "query_memory":
+                queries = a.get("queries", [])
+                if not queries or not isinstance(queries, list) or len(queries) > 3:
+                    return False, "query_memory: queries must be non-empty list, max 3 items"
+                if not all(isinstance(q, str) and len(q) >= 2 for q in queries):
+                    return False, "query_memory: each query must be string >= 2 chars"
+            if atype == "create_pm_task":
+                prompt = a.get("prompt", "")
+                if not prompt or len(prompt) < 50:
+                    return False, f"create_pm_task prompt too short ({len(prompt)} chars, min 50)"
+        return True, ""
+
+    def _handle_coordinator_v1(self, task: dict, parsed: dict, chat_id: str) -> None:
+        """Handle new-format coordinator output with gate validation."""
+        import time as _t
+        _hv_t0 = _t.time()
+        def _hv_log(msg):
+            # Write to file FIRST (log.info may block in MCP subprocess)
+            try:
+                _log_path = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                          f"coordinator-flow-{task.get('task_id','?')}.txt")
+                with open(_log_path, "a") as f:
+                    f.write(f"  handle_v1 {_t.time()-_hv_t0:.1f}s {msg}\n")
+            except Exception:
+                pass
+
+        reply = parsed.get("reply", "")
+        actions = parsed.get("actions", [])
+        context_update = parsed.get("context_update", {})
+        task_id = task["task_id"]
+
+        _hv_log(f"start: actions={[a.get('type') for a in actions]} reply={reply[:60]}")
+
+        # Gate: validate each action
+        for action in actions:
+            action_type = action.get("type", "")
+
+            if action_type == "reply_only":
+                _hv_log(f"action: reply_only")
+                if chat_id and reply:
+                    self._telegram_reply(chat_id, reply)
+
+            elif action_type == "create_pm_task":
+                # Gate check: must have prompt
+                prompt = action.get("prompt", "")
+                if not prompt:
+                    log.warning("coordinator.gate: create_pm_task missing prompt, rejected")
+                    continue
+                target_files = action.get("target_files", [])
+                related_nodes = action.get("related_nodes", [])
+                parent_meta = task.get("metadata") or {}
+                if isinstance(parent_meta, str):
+                    try:
+                        parent_meta = json.loads(parent_meta)
+                    except Exception:
+                        parent_meta = {}
+
+                forwarded_meta = {
+                    "parent_task_id": task_id,
+                    "chat_id": chat_id,
+                    "source": "coordinator",
+                    "target_files": target_files,
+                    "related_nodes": related_nodes,
+                    "_coordinator_memories": getattr(self, '_last_query_memories', []),
+                    "_coordinator_context": context_update,
+                }
+                for key in (
+                    "parallel_plan",
+                    "lane",
+                    "lane_name",
+                    "split_plan_doc",
+                    "convergence_required",
+                    "convergence_lane",
+                    "depends_on_lanes",
+                    "allow_dirty_workspace_reconciliation",
+                ):
+                    if key in parent_meta:
+                        forwarded_meta[key] = parent_meta[key]
+
+                _hv_log(f"action: create_pm_task target_files={target_files}")
+
+                sub_result = self._api("POST", f"/api/task/{self.project_id}/create", {
+                    "prompt": prompt,
+                    "type": "pm",
+                    "priority": 1,
+                    "metadata": forwarded_meta,
+                })
+                sub_id = sub_result.get("task_id", "?")
+                _hv_log(f"pm_created: {sub_id}")
+                if chat_id:
+                    self._telegram_reply(
+                        chat_id,
+                        f"PM task created: {sub_id[-12:]}\n{reply[:200] if reply else prompt[:200]}")
+
+            else:
+                # Gate: reject disallowed actions
+                log.warning("coordinator.gate: action '%s' not allowed, rejected (task=%s)",
+                            action_type, task_id)
+
+        _hv_log("actions done")
+        # Save context update if provided
+        if context_update:
+            try:
+                self._api("POST", f"/api/context/{self.project_id}/save",
+                           {"context": context_update})
+                _hv_log(f"context saved: {list(context_update.keys())}")
+            except Exception as e:
+                _hv_log(f"context save failed: {e}")
+        _hv_log("returning")
+
+    def _handle_coordinator_legacy(self, task: dict, parsed: dict, chat_id: str) -> None:
+        """Handle legacy-format coordinator output: {"action": "reply|create_task", ...}"""
+        action = parsed.get("action", "")
+        task_id = task["task_id"]
+        log.info("coordinator.legacy_action: %s (task=%s)", action, task_id)
+
+        # Write coordinator decision to governance audit log
+        try:
+            self._api("POST", f"/api/audit/{self.project_id}/record", {
+                "event": "coordinator.decision",
+                "actor": "coordinator",
+                "details": {
+                    "task_id": task_id,
+                    "decision": [action],
+                    "reply_preview": parsed.get("text", parsed.get("prompt", ""))[:200],
+                    "context_update_keys": [],
+                },
+            })
+        except Exception:
+            pass  # audit failure should not block coordinator
 
         if action == "reply":
-            text = action_data.get("text", "No response")
+            text = parsed.get("text", "No response")
             if chat_id:
                 self._telegram_reply(chat_id, text)
-            else:
-                log.warning("No chat_id for reply: %s", text[:200])
 
         elif action == "create_task":
-            sub_type = action_data.get("type", "pm")
-            sub_prompt = action_data.get("prompt", "")
+            sub_type = parsed.get("type", "pm")
+            # Gate: only PM allowed
+            if sub_type != "pm":
+                log.warning("coordinator.gate: legacy create_task type='%s' rejected, must be 'pm'",
+                            sub_type)
+                sub_type = "pm"  # Force to PM
+            sub_prompt = parsed.get("prompt", "")
             if sub_prompt:
                 sub_result = self._api("POST", f"/api/task/{self.project_id}/create", {
                     "prompt": sub_prompt,
                     "type": sub_type,
                     "priority": 1,
                     "metadata": {
-                        "parent_task_id": task["task_id"],
+                        "parent_task_id": task_id,
                         "chat_id": chat_id,
                         "source": "coordinator",
                     },
                 })
                 sub_id = sub_result.get("task_id", "?")
-                log.info("Coordinator created subtask: %s (type=%s)", sub_id, sub_type)
+                log.info("coordinator.pm_created: %s (parent=%s, legacy)", sub_id, task_id)
                 if chat_id:
-                    self._telegram_reply(chat_id, f"Task created: {sub_id[-12:]}\nType: {sub_type}\nPrompt: {sub_prompt[:100]}")
-
-        elif action == "scale_workers":
-            count = action_data.get("count", 1)
-            log.info("Coordinator requested scale to %d workers (not implemented)", count)
-
+                    self._telegram_reply(chat_id, f"Task created: {sub_id[-12:]}")
         else:
-            log.warning("Unknown coordinator action: %s", action)
+            log.warning("coordinator.gate: unknown legacy action '%s'", action)
 
     def _telegram_reply(self, chat_id, text: str) -> None:
         """Send reply to Telegram via Bot API."""
@@ -626,14 +1234,74 @@ class ExecutorWorker:
 
     _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/"}
 
-    def _get_git_changed_files(self) -> list:
+    def _create_worktree(self, task_id: str):
+        """Create isolated git worktree for a dev task."""
+        branch_name = f"dev/{task_id}"
+        worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}")
+        try:
+            os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+            proc = subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, worktree_dir, "HEAD"],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                return None, None
+            return worktree_dir, branch_name
+        except Exception:
+            return None, None
+
+    def _remove_worktree(self, worktree_path: str, branch_name: str, delete_branch: bool = True) -> None:
+        """Remove worktree and optionally delete its branch."""
+        try:
+            if worktree_path and os.path.isdir(worktree_path):
+                subprocess.run(
+                    ["git", "worktree", "remove", worktree_path, "--force"],
+                    cwd=self.workspace,
+                    capture_output=True,
+                    timeout=30,
+                )
+            elif worktree_path and os.path.exists(worktree_path):
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            if delete_branch and branch_name:
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    cwd=self.workspace,
+                    capture_output=True,
+                    timeout=10,
+                )
+        except Exception:
+            pass
+
+    def _create_integration_worktree(self, task_id: str):
+        """Create a clean integration worktree used only for merge verification."""
+        branch_name = f"merge/{task_id}"
+        worktree_dir = os.path.join(self.workspace, ".worktrees", f"merge-{task_id}")
+        try:
+            os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+            proc = subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, worktree_dir, "HEAD"],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                return None, None, (proc.stderr or proc.stdout or "").strip()
+            return worktree_dir, branch_name, ""
+        except Exception as e:
+            return None, None, str(e)
+
+    def _get_git_changed_files(self, cwd: str = None) -> list:
         """Run git diff --name-only to detect files changed since last commit."""
         try:
-            import subprocess
+            repo_cwd = cwd or self.workspace
             # Check both staged and unstaged changes
             result = subprocess.run(
                 ["git", "diff", "--name-only", "HEAD"],
-                cwd=self.workspace,
+                cwd=repo_cwd,
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -643,7 +1311,7 @@ class ExecutorWorker:
             # Also include untracked files that are new (not yet in HEAD)
             result2 = subprocess.run(
                 ["git", "diff", "--name-only", "--diff-filter=A", "--cached"],
-                cwd=self.workspace,
+                cwd=repo_cwd,
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -669,6 +1337,18 @@ class ExecutorWorker:
     def _parse_output(self, session, task_type: str) -> dict:
         """Parse AI session output into structured result, handling non-JSON gracefully."""
         stdout = session.stdout or ""
+        stripped = stdout.strip()
+
+        # Fast path: many CLI runs return a single top-level JSON object directly.
+        # Parse the whole payload first so nested objects inside a valid result
+        # do not get mistaken for the final answer.
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
 
         # Try to extract JSON from markdown code blocks first (```json ... ```)
         import re
@@ -715,6 +1395,25 @@ class ExecutorWorker:
             "summary": summary[:1000],
             "exit_code": getattr(session, "exit_code", None),
         }
+
+    def _detect_terminal_cli_error(self, session, task_type: str) -> Optional[str]:
+        """Detect terminal CLI failures that should never be treated as success."""
+        if task_type in ("coordinator", "task", "merge", "deploy"):
+            return None
+
+        stdout = (getattr(session, "stdout", "") or "").strip()
+        stderr = (getattr(session, "stderr", "") or "").strip()
+        combined = "\n".join(p for p in (stdout, stderr) if p).strip()
+        lowered = combined.lower()
+
+        if "reached max turns" in lowered:
+            first_line = combined.splitlines()[0].strip() if combined else ""
+            return first_line or "Error: Reached max turns"
+
+        if stdout.startswith("Error:") and not stdout.lstrip().startswith("{"):
+            return stdout.splitlines()[0].strip()
+
+        return None
 
     # ------------------------------------------------------------------
     # Startup helpers: crash recovery + PID lock
@@ -802,7 +1501,7 @@ class ExecutorWorker:
                     )
                     # We log a warning but do NOT abort — in Docker/container restarts the
                     # old PID may still appear transiently in /proc.
-                except (OSError, ProcessLookupError):
+                except (OSError, ProcessLookupError, SystemError):
                     log.info(
                         "_acquire_pid_lock: stale PID file (PID %d no longer running), overwriting",
                         old_pid,
@@ -837,36 +1536,167 @@ class ExecutorWorker:
 
         task_id = task["task_id"]
         self._current_task = task_id
-        log.info("Claimed task: %s", task_id)
+        # Note: log.info removed — blocks intermittently in MCP subprocess
 
         try:
             outcome = self._execute_task(task)
             status = outcome.get("status", "failed")
             result = outcome.get("result", {"error": outcome.get("error", "unknown")})
 
-            # Coordinator post-processing: parse action from AI output
+            # Coordinator two-round flow with gate validation
             task_type = task.get("type", "")
-            if task_type == "coordinator" and status == "succeeded":
-                self._handle_coordinator_result(task, result)
-                # Replace result with minimal payload so the gateway event listener
-                # does NOT send a duplicate "Task completed" Telegram notification.
-                # _reply_sent=True signals that the reply was already sent above.
-                result = {"action": "handled", "_reply_sent": True}
+            if task_type in ("coordinator", "task") and status == "succeeded":
+                self._last_query_memories = []
+                import time as _t
+                _ct0 = _t.time()
+                _coord_log = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                          f"coordinator-flow-{task_id}.txt")
+                os.makedirs(os.path.dirname(_coord_log), exist_ok=True)
+                def _clog(msg):
+                    elapsed = _t.time() - _ct0
+                    line = f"{elapsed:.1f}s {msg}"
+                    try:
+                        with open(_coord_log, "a") as f:
+                            f.write(line + "\n")
+                    except Exception:
+                        pass
 
+                _clog(f"round1 output: status={status} result_keys={list(result.keys())}")
+                raw = result.get("summary", "") or result.get("raw_output", "") or json.dumps(result)
+                _clog(f"raw extraction: len={len(raw)} first100={raw[:100]}")
+                parsed = self._extract_json(raw) if hasattr(self, '_extract_json') else None
+                _clog(f"extract_json: parsed={'yes keys=' + str(list(parsed.keys())) if parsed else 'None'}")
+
+                current_round = 1
+                max_gate_retries = 2
+
+                # Round 1 gate validation with retry
+                for attempt in range(max_gate_retries + 1):
+                    if parsed:
+                        valid, gate_error = self._validate_coordinator_output(parsed, round=current_round)
+                        _clog(f"gate round={current_round} attempt={attempt+1}: valid={valid} error={gate_error[:80] if gate_error else ''}")
+                        if valid:
+                            break
+                    else:
+                        gate_error = "No valid JSON found in output"
+                        _clog(f"gate round={current_round} attempt={attempt+1}: no JSON")
+
+                    if attempt < max_gate_retries:
+                        _clog(f"retry: starting attempt {attempt+2}")
+                        retry_prompt = (
+                            f"{task.get('prompt', '')}\n\n"
+                            f"--- RETRY (attempt {attempt + 2}/{max_gate_retries + 1}) ---\n"
+                            f"Your previous output was invalid: {gate_error}\n"
+                            f"Output ONLY a valid JSON object with schema_version, reply, actions.\n"
+                        )
+                        task_copy = dict(task)
+                        task_copy["prompt"] = retry_prompt
+                        outcome = self._execute_task(task_copy)
+                        _clog(f"retry: _execute_task done, status={outcome.get('status')}")
+                        status = outcome.get("status", "failed")
+                        result = outcome.get("result", {})
+                        raw = result.get("summary", "") or result.get("raw_output", "") or json.dumps(result)
+                        parsed = self._extract_json(raw) if hasattr(self, '_extract_json') else None
+                        _clog(f"retry: parsed={'yes' if parsed else 'None'}")
+                    else:
+                        _clog("gate: ALL RETRIES EXHAUSTED")
+                        status = "failed"
+                        result = {"error": "coordinator_gate_failed", "last_gate_error": gate_error, "raw_output": raw[:500]}
+
+                # Check if round 1 output is query_memory -> need round 2
+                if status == "succeeded" and parsed:
+                    actions = parsed.get("actions", [])
+                    action_types = [a.get("type") for a in actions]
+                    _clog(f"round1 decision: actions={action_types}")
+                    query_action = next((a for a in actions if a.get("type") == "query_memory"), None)
+
+                    if query_action:
+                        queries = query_action.get("queries", [])[:3]
+                        _clog(f"query_memory: queries={queries}")
+                        memory_results = []
+                        seen_ids = set()
+                        for q in queries:
+                            extra = self._fetch_memories(q)
+                            for m in extra:
+                                mid = m.get("memory_id", "")
+                                if mid and mid not in seen_ids:
+                                    seen_ids.add(mid)
+                                    memory_results.append(m)
+                        _clog(f"query_memory: found {len(memory_results)} unique memories")
+                        self._last_query_memories = memory_results
+
+                        self._write_conversation_history(task, parsed)
+                        _clog("round1 history written")
+
+                        # Round 2
+                        _clog("round2: starting _execute_task")
+                        task_copy = dict(task)
+                        task_copy["metadata"] = dict(task.get("metadata") or {})
+                        if isinstance(task_copy["metadata"], str):
+                            task_copy["metadata"] = json.loads(task_copy["metadata"])
+                        task_copy["metadata"]["_round2_memories"] = memory_results
+                        current_round = 2
+                        outcome = self._execute_task(task_copy)
+                        _clog(f"round2: _execute_task done, status={outcome.get('status')}")
+                        status = outcome.get("status", "failed")
+                        result = outcome.get("result", {})
+                        raw = result.get("summary", "") or result.get("raw_output", "") or json.dumps(result)
+                        parsed = self._extract_json(raw) if hasattr(self, '_extract_json') else None
+                        _clog(f"round2: parsed={'yes keys=' + str(list(parsed.keys())) if parsed else 'None'}")
+
+                        if parsed:
+                            valid, gate_error = self._validate_coordinator_output(parsed, round=2)
+                            _clog(f"round2 gate: valid={valid} error={gate_error[:80] if gate_error else ''}")
+                            if not valid:
+                                status = "failed"
+                                result = {"error": "coordinator_gate_round2_failed", "gate_error": gate_error}
+
+                if status == "succeeded" and parsed:
+                    _clog("final: calling _handle_coordinator_result")
+                    self._handle_coordinator_result(task, result)
+                    self._write_conversation_history(task, parsed)
+                    result = {"action": "handled", "_reply_sent": True}
+                    _clog("final: DONE")
+                else:
+                    _clog(f"final: FAILED status={status}")
+
+            # Complete task + auto-chain — write results to file (log.info may block in MCP)
+            import time as _ct
+            _ct0 = _ct.time()
             completion = self._complete_task(task_id, status, result)
             chain = completion.get("auto_chain", {})
 
+            # Write completion result to timing file
+            chain_msg = ""
             if chain.get("gate_blocked"):
-                log.warning("Gate blocked after %s: %s", task_id, chain["reason"])
+                chain_msg = f"gate_blocked: {chain['reason']}"
             elif chain.get("task_id"):
-                log.info("Auto-chain: %s → %s (%s)", task_id, chain["task_id"], chain.get("type"))
+                chain_msg = f"chain: {task_id} -> {chain['task_id']} ({chain.get('type')})"
             elif chain.get("deploy"):
-                log.info("Deploy triggered from %s: %s", task_id, chain["deploy"])
+                chain_msg = f"deploy: {chain['deploy']}"
+            try:
+                complete_file = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                             f"complete-{task_id}.txt")
+                with open(complete_file, "w") as f:
+                    f.write(f"status: {status}\n")
+                    f.write(f"complete_time: {_ct.time()-_ct0:.1f}s\n")
+                    f.write(f"chain: {chain_msg}\n")
+                    f.write(f"result_keys: {list(result.keys()) if isinstance(result, dict) else '?'}\n")
+            except Exception:
+                pass
 
             return True
 
         except Exception as e:
-            log.error("Task %s execution failed: %s", task_id, e, exc_info=True)
+            try:
+                err_file = os.path.join(self.workspace or ".", "shared-volume", "codex-tasks", "logs",
+                                        f"error-{task_id}.txt")
+                with open(err_file, "w") as f:
+                    f.write(f"error: {e}\n")
+                    import traceback
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
             self._complete_task(task_id, "failed", {"error": str(e)})
             return True
         finally:

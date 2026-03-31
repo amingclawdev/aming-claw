@@ -12,14 +12,14 @@ Public API (unchanged for backward compatibility):
 
 New API:
   - search_memories(conn, project_id, query, top_k) -> list
-  - get_latest_by_ref(conn, project_id, ref_id) -> dict | None
+  - get_latest_by_ref(conn, project_id, ref_id) -> Optional[dict]
 """
 
 import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, Optional
 
 from .models import MemoryEntry
 from . import audit_service
@@ -62,6 +62,23 @@ def write_memory(
     module_id = entry_dict.get("module_id", "")
     content = entry_dict.get("content", "")
 
+    # Normalize Chinese content to English for consistent FTS matching
+    import re as _re
+    if content and _re.search(r'[\u4e00-\u9fff]', content):
+        try:
+            from .llm_utils import translate_to_english
+            original_content = content
+            content = translate_to_english(content)
+            # Preserve original in structured metadata
+            if "structured" not in entry_dict:
+                entry_dict["structured"] = {}
+            if isinstance(entry_dict.get("structured"), dict):
+                entry_dict["structured"]["original_content"] = original_content
+            log.info("memory.write: translated Chinese content to English (%d -> %d chars)",
+                     len(original_content), len(content))
+        except Exception as e:
+            log.warning("memory.write: translation failed, keeping original: %s", e)
+
     # Look up conflict policy from domain pack
     conflict_policy = _get_conflict_policy(conn, project_id, kind)
 
@@ -90,6 +107,9 @@ def write_memory(
             "supersedes": entry_dict.get("supersedes"),
         },
     }
+    extra_structured = entry_dict.get("structured", {})
+    if isinstance(extra_structured, dict) and extra_structured:
+        backend_entry["structured"].update(extra_structured)
 
     # --- append / append_set: do NOT supersede existing entries, always create new ---
     if conflict_policy in ("append", "append_set"):
@@ -118,6 +138,10 @@ def write_memory(
 
     result = backend.write(conn, project_id, backend_entry)
     result["conflict_policy"] = conflict_policy
+
+    log.info("memory.write: project=%s kind=%s module=%s ref=%s policy=%s content=%r",
+             project_id, kind, module_id, result.get("memory_id", "?"),
+             conflict_policy, content[:120])
 
     # Audit
     audit_service.record(
@@ -195,10 +219,16 @@ def query_all(project_id: str, active_only: bool = True) -> list[dict]:
 def search_memories(conn: sqlite3.Connection, project_id: str, query: str, top_k: int = 5) -> list[dict]:
     """Full-text search across memories."""
     backend = get_backend()
-    return backend.search(conn, project_id, query, top_k)
+    results = backend.search(conn, project_id, query, top_k)
+    ref_ids = [r.get("ref_id", "?") for r in results[:3]]
+    log.info("memory.search: project=%s query=%r top_k=%d results=%d refs=%s",
+             project_id, query[:80], top_k, len(results), ref_ids)
+    return results
 
 
-def get_latest_by_ref(conn: sqlite3.Connection, project_id: str, ref_id: str) -> dict | None:
+def get_latest_by_ref(
+    conn: sqlite3.Connection, project_id: str, ref_id: str
+) -> Optional[dict]:
     """Get latest active version for a ref_id."""
     backend = get_backend()
     return backend.get_latest(conn, project_id, ref_id)

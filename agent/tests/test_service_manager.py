@@ -369,5 +369,61 @@ class TestGetManager(unittest.TestCase):
         sm._default_manager = None   # cleanup
 
 
+class TestHostDefaults(unittest.TestCase):
+    def test_default_governance_url_prefers_nginx_entrypoint(self):
+        import service_manager as sm
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(sm._default_governance_url(), "http://localhost:40000")
+
+    def test_default_executor_cmd_includes_host_routing(self):
+        import service_manager as sm
+        cmd = sm._default_executor_cmd(
+            "aming-claw",
+            "http://localhost:40000",
+            "C:/workspace/aming_claw",
+        )
+        self.assertEqual(
+            cmd,
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "executor_worker.py"),
+                "--project",
+                "aming-claw",
+                "--url",
+                "http://localhost:40000",
+                "--workspace",
+                "C:/workspace/aming_claw",
+            ],
+        )
+
+    def test_constructor_uses_runtime_defaults(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GOVERNANCE_URL": "http://localhost:40000",
+                "PROJECT_ID": "runtime-project",
+                "CODEX_WORKSPACE": "C:/runtime/workspace",
+            },
+            clear=True,
+        ):
+            mgr = ServiceManager()
+        self.assertEqual(mgr.project_id, "runtime-project")
+        self.assertEqual(mgr.governance_url, "http://localhost:40000")
+        self.assertEqual(mgr.workspace, "C:/runtime/workspace")
+        self.assertEqual(
+            mgr._executor_cmd,
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "executor_worker.py"),
+                "--project",
+                "runtime-project",
+                "--url",
+                "http://localhost:40000",
+                "--workspace",
+                "C:/runtime/workspace",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

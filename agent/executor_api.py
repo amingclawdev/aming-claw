@@ -720,25 +720,25 @@ class ExecutorAPIHandler(BaseHTTPRequestHandler):
                 }
                 # Determine next step
                 if result.get("actions_executed", 0) > 0:
-                    structured["next_step"] = "任务已创建，等待 Executor 执行"
+                    structured["next_step"] = "Task created, waiting for Executor to process"
                 elif result.get("actions_rejected", 0) > 0:
-                    structured["next_step"] = "部分操作被拦截，请检查权限"
+                    structured["next_step"] = "Some actions were blocked, please check permissions"
                 else:
-                    structured["next_step"] = "已回复，无需额外操作"
+                    structured["next_step"] = "Replied, no further action needed"
 
                 self._json_response(200, structured)
             except Exception as e:
                 self._json_response(500, {
-                    "reply": f"处理失败: {str(e)[:200]}",
+                    "reply": f"Processing failed: {str(e)[:200]}",
                     "status": "error",
                     "error": str(e)[:500],
-                    "next_step": "请重试或检查日志",
+                    "next_step": "Please retry or check the logs",
                 })
         else:
             self._json_response(503, {
-                "reply": "Orchestrator 未初始化",
+                "reply": "Orchestrator not initialized",
                 "status": "error",
-                "next_step": "重启 Executor",
+                "next_step": "Restart Executor",
             })
 
     # ── L18.5 Debug Handlers ──

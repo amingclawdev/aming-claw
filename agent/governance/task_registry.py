@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 EXECUTION_STATUSES = {
     "queued", "claimed", "running", "waiting_human", "blocked",
     "succeeded", "failed", "cancelled", "timed_out", "enqueue_failed",
-    "design_mismatch",
+    "design_mismatch", "observer_hold",
 }
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "timed_out", "design_mismatch"}
 
@@ -43,6 +43,17 @@ def _utc_iso_after(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _is_observer_mode(conn: sqlite3.Connection, project_id: str) -> bool:
+    """Return True if observer_mode is enabled for this project."""
+    try:
+        row = conn.execute(
+            "SELECT observer_mode FROM project_version WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        return bool(row and row["observer_mode"])
+    except Exception:
+        return False
+
+
 def create_task(
     conn: sqlite3.Connection,
     project_id: str,
@@ -56,7 +67,7 @@ def create_task(
     parent_task_id: str = None,
     retry_round: int = 0,
 ) -> dict:
-    """Create a new task."""
+    """Create a new task. If observer_mode is on, task starts as observer_hold."""
     task_id = _new_task_id()
     now = _utc_iso()
 
@@ -65,6 +76,9 @@ def create_task(
     if "_original_prompt" not in metadata:
         metadata["_original_prompt"] = prompt
 
+    # Observer mode: new tasks start held, not queued
+    initial_status = "observer_hold" if _is_observer_mode(conn, project_id) else "queued"
+
     notify = "pending" if metadata.get("chat_id") else "none"
     conn.execute(
         """INSERT INTO tasks
@@ -72,9 +86,9 @@ def create_task(
             type, prompt, related_nodes,
             created_by, created_at, updated_at, priority, max_attempts, metadata_json,
             parent_task_id, retry_round)
-           VALUES (?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            task_id, project_id, notify,
+            task_id, project_id, initial_status, initial_status, notify,
             task_type, prompt,
             json.dumps(related_nodes or []),
             created_by, now, now, priority, max_attempts,
@@ -83,13 +97,15 @@ def create_task(
         ),
     )
 
-    log.info("Task created: %s (project: %s, type: %s, retry_round: %d)", task_id, project_id, task_type, retry_round)
+    log.info("Task created: %s (project: %s, type: %s, status: %s, retry_round: %d)",
+             task_id, project_id, task_type, initial_status, retry_round)
     return {
         "task_id": task_id,
         "project_id": project_id,
-        "status": "created",
+        "status": initial_status,
         "type": task_type,
         "created_at": now,
+        "observer_hold": initial_status == "observer_hold",
     }
 
 
@@ -145,6 +161,8 @@ def claim_task(
         (task_id, attempt_num, now),
     )
 
+    log.info("task.claimed: %s type=%s by=%s attempt=%d fence=%s",
+             task_id, row["type"], worker_id or assigned_to, attempt_num, fence_token)
     return {
         "task_id": task_id,
         "type": row["type"],
@@ -227,7 +245,10 @@ def complete_task(
     # Determine execution status
     exec_status = status
     if status == "failed" and row["attempt_count"] < row["max_attempts"]:
-        exec_status = "queued"  # Auto-retry
+        if _is_observer_mode(conn, project_id):
+            exec_status = "observer_hold"  # Auto-retry but hold for observer
+        else:
+            exec_status = "queued"  # Auto-retry
 
     # Determine notification status
     notify_status = row["notification_status"]
@@ -258,6 +279,10 @@ def complete_task(
          error_message, task_id),
     )
 
+    result_summary = str(result)[:200] if result else "{}"
+    log.info("task.complete: %s status=%s exec_status=%s by=%s result=%s",
+             task_id, status, exec_status, completed_by or assigned_to, result_summary)
+
     response = {
         "task_id": task_id,
         "status": exec_status,
@@ -266,7 +291,36 @@ def complete_task(
     }
 
     # Auto-chain: dispatch next stage on success
-    if exec_status == "succeeded" and project_id:
+    # Cancelled: terminal, no auto-chain, no retry
+    if exec_status == "cancelled":
+        pass  # skip auto-chain
+    elif status == "failed" and project_id:
+        try:
+            from . import auto_chain
+            meta = json.loads(row["metadata_json"] or "{}")
+            type_row = conn.execute(
+                "SELECT type FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            conn.commit()
+            failure_chain = auto_chain.on_task_failed(
+                conn,
+                project_id,
+                task_id,
+                task_type=type_row["type"] if type_row else "task",
+                result=result or {},
+                metadata=meta,
+                reason=error_message or (result or {}).get("error", ""),
+            )
+            if failure_chain:
+                response["auto_chain"] = {
+                    "task_failed": True,
+                    "workflow_improvement_task_id": failure_chain["task_id"],
+                    "failure_class": failure_chain["classification"].get("failure_class", ""),
+                }
+        except Exception:
+            import traceback as _tb
+            _tb.print_exc()
+    elif exec_status == "succeeded" and project_id:
         try:
             from . import auto_chain
             meta = json.loads(row["metadata_json"] or "{}")
@@ -293,15 +347,70 @@ def complete_task(
     return response
 
 
-def cancel_task(conn: sqlite3.Connection, task_id: str) -> dict:
-    """Cancel a task."""
+def hold_task(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Put a queued task into observer_hold — pauses auto-chain and executor pickup."""
     now = _utc_iso()
     conn.execute(
-        """UPDATE tasks SET status = 'cancelled', execution_status = 'cancelled',
-           updated_at = ?
-           WHERE task_id = ? AND execution_status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')""",
+        """UPDATE tasks SET status = 'observer_hold', execution_status = 'observer_hold',
+           updated_at = ? WHERE task_id = ? AND execution_status = 'queued'""",
         (now, task_id),
     )
+    if conn.total_changes == 0:
+        row = conn.execute("SELECT execution_status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        current = row["execution_status"] if row else "not found"
+        raise ValueError(f"Task {task_id} cannot be held (current status: {current})")
+    log.info("Task held by observer: %s", task_id)
+    return {"task_id": task_id, "status": "observer_hold"}
+
+
+def release_task(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Release an observer_hold task back to queued — resumes auto-chain and executor."""
+    now = _utc_iso()
+    conn.execute(
+        """UPDATE tasks SET status = 'queued', execution_status = 'queued',
+           updated_at = ? WHERE task_id = ? AND execution_status = 'observer_hold'""",
+        (now, task_id),
+    )
+    if conn.total_changes == 0:
+        row = conn.execute("SELECT execution_status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        current = row["execution_status"] if row else "not found"
+        raise ValueError(f"Task {task_id} cannot be released (current status: {current})")
+    log.info("Task released by observer: %s", task_id)
+    return {"task_id": task_id, "status": "queued"}
+
+
+def set_observer_mode(conn: sqlite3.Connection, project_id: str, enabled: bool) -> dict:
+    """Enable or disable observer_mode for a project."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        """UPDATE project_version SET observer_mode = ?, updated_at = ?
+           WHERE project_id = ?""",
+        (1 if enabled else 0, now, project_id),
+    )
+    log.info("Observer mode %s for project %s", "enabled" if enabled else "disabled", project_id)
+    return {"project_id": project_id, "observer_mode": enabled}
+
+
+def get_observer_mode(conn: sqlite3.Connection, project_id: str) -> bool:
+    """Return current observer_mode flag for a project."""
+    return _is_observer_mode(conn, project_id)
+
+
+def cancel_task(conn: sqlite3.Connection, task_id: str, reason: str = "") -> dict:
+    """Cancel a task. Terminal state — no auto-chain, no retry."""
+    now = _utc_iso()
+    row = conn.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    if not row:
+        from .errors import GovernanceError
+        raise GovernanceError(f"Task not found: {task_id}", 404)
+    conn.execute(
+        """UPDATE tasks SET status = 'cancelled', execution_status = 'cancelled',
+           completed_at = ?, updated_at = ?, error_message = ?
+           WHERE task_id = ?""",
+        (now, now, reason or "Cancelled by observer", task_id),
+    )
+    log.info("task.cancelled: %s reason=%s", task_id, reason or "observer")
     return {"task_id": task_id, "status": "cancelled"}
 
 

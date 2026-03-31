@@ -5,6 +5,7 @@
 
 .DESCRIPTION
     启动全部服务：
+      - governance-host   (治理服务，端口 40000)
       - executor-gateway  (截图/执行网关，端口 8090)
       - codex coordinator (Telegram Bot 消息处理)
       - codex executor    (任务调度与执行)
@@ -135,9 +136,10 @@ function Get-ServiceProcesses([string]$scriptName) {
 $coordRunning = @(Get-ServiceProcesses "coordinator.py").Count -gt 0
 $execRunning  = @(Get-ServiceProcesses "executor.py").Count -gt 0
 $mgrRunning   = @(Get-ServiceProcesses "manager.py").Count -gt 0
+$govRunning   = @(Get-NetTCPConnection -LocalPort 40000 -State Listen -ErrorAction SilentlyContinue).Count -gt 0
 $gwRunning    = @(Get-NetTCPConnection -LocalPort 8090 -State Listen -ErrorAction SilentlyContinue).Count -gt 0
 
-$allRunning = $coordRunning -and $execRunning -and $mgrRunning -and $gwRunning
+$allRunning = $govRunning -and $coordRunning -and $execRunning -and $mgrRunning -and $gwRunning
 
 if ($allRunning) {
     Write-OK "所有服务已在运行"
@@ -145,6 +147,7 @@ if ($allRunning) {
     Write-Host "  coordinator: 运行中" -ForegroundColor Green
     Write-Host "  executor   : 运行中" -ForegroundColor Green
     Write-Host "  manager    : 运行中" -ForegroundColor Green
+    Write-Host "  governance : 运行中 (http://localhost:40000)" -ForegroundColor Green
     Write-Host "  gateway    : 运行中 (http://localhost:8090)" -ForegroundColor Green
     Write-Host ""
     Write-Host "  提示: 使用 .\start.ps1 -Restart 可强制重启所有服务" -ForegroundColor White
@@ -173,7 +176,11 @@ $envBlock = @"
 "@
 
 function Start-ServiceWindow([string]$title, [string]$script, [string]$extra = "") {
-    $cmd = "$envBlock`n$extra`n& '$script'"
+    $invoke = "& '$script'"
+    if ($extra) {
+        $invoke = "$invoke $extra"
+    }
+    $cmd = "$envBlock`n$invoke"
     Start-Process powershell -ArgumentList @(
         "-NoExit",
         "-NoProfile",
@@ -186,6 +193,12 @@ function Start-ServiceWindow([string]$title, [string]$script, [string]$extra = "
 # executor-gateway
 if (-not $gwRunning) {
     Start-ServiceWindow "executor-gateway" "$PSScriptRoot\scripts\start-gateway.ps1"
+    Start-Sleep -Seconds 2
+}
+
+# governance-host
+if (-not $govRunning) {
+    Start-ServiceWindow "governance-host" "$PSScriptRoot\scripts\start-governance.ps1" "-Takeover"
     Start-Sleep -Seconds 2
 }
 
@@ -211,6 +224,7 @@ Write-Host "============================================================" -Foreg
 Write-Host "  aming-claw 已启动！" -ForegroundColor Green
 Write-Host ""
 Write-Host "  服务状态:" -ForegroundColor White
+Write-Host "    governance-host : http://localhost:40000" -ForegroundColor White
 Write-Host "    executor-gateway : http://localhost:8090" -ForegroundColor White
 Write-Host "    manager          : 管理服务（/mgr_restart /mgr_reinit）" -ForegroundColor White
 Write-Host "    coordinator      : 监听 Telegram 消息" -ForegroundColor White

@@ -1,5 +1,7 @@
 param(
-    [switch]$Takeover
+    [switch]$Takeover,
+    [string]$Project = "aming-claw",
+    [int]$HealthWaitSeconds = 20
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,9 +25,34 @@ function Get-ManagerPythonProcesses {
     return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $name = [string]$_.Name
         $cmd  = [string]$_.CommandLine
-        $name -match '^python(\.exe)?$' -and (
+        $name -match '^python.*(\.exe)?$' -and (
             $cmd -like "*agent\service_manager.py*" -or
-            $cmd -like "*agent/service_manager.py*"
+            $cmd -like "*agent/service_manager.py*" -or
+            $cmd -like "*-m agent.service_manager*"
+        )
+    }
+}
+
+function Get-ExecutorWorkerProcesses {
+    return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $name = [string]$_.Name
+        $cmd  = [string]$_.CommandLine
+        $name -match '^python.*(\.exe)?$' -and (
+            $cmd -like "*agent.executor_worker*" -or
+            $cmd -like "*agent\\executor_worker.py*" -or
+            $cmd -like "*agent/executor_worker.py*"
+        )
+    }
+}
+
+function Get-McpServerProcesses {
+    return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $name = [string]$_.Name
+        $cmd  = [string]$_.CommandLine
+        $name -match '^python.*(\.exe)?$' -and (
+            $cmd -like "*agent.mcp.server*" -or
+            $cmd -like "*agent\\mcp\\server.py*" -or
+            $cmd -like "*agent/mcp/server.py*"
         )
     }
 }
@@ -40,6 +67,23 @@ function Stop-ManagerByLockPort {
         Stop-Process -Id $pidVal -Force -ErrorAction SilentlyContinue
         taskkill /F /T /PID $pidVal | Out-Null
     }
+}
+
+function Wait-ManagedWorker {
+    param([int]$WaitSeconds)
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $manager = @(Get-ManagerPythonProcesses | Select-Object -First 1)
+        $worker = @(Get-ExecutorWorkerProcesses | Select-Object -First 1)
+        if ($manager.Count -gt 0 -and $worker.Count -gt 0) {
+            return @{
+                manager_pid = $manager[0].ProcessId
+                worker_pid = $worker[0].ProcessId
+            }
+        }
+        Start-Sleep -Milliseconds 750
+    }
+    throw "Managed executor worker did not appear within $WaitSeconds seconds."
 }
 
 if (-not (Test-Path ".\.env")) {
@@ -94,14 +138,55 @@ if ($existing.Count -gt 0 -and $Takeover) {
     }
 }
 
+if ($Takeover) {
+    $workerPids = @(Get-ExecutorWorkerProcesses | Select-Object -ExpandProperty ProcessId -Unique)
+    foreach ($id in $workerPids) {
+        Write-Host "Takeover: stopping existing executor worker PID=$id ..."
+        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+        taskkill /F /T /PID $id | Out-Null
+    }
+
+    $mcpPids = @(Get-McpServerProcesses | Select-Object -ExpandProperty ProcessId -Unique)
+    foreach ($id in $mcpPids) {
+        Write-Host "Takeover: stopping existing MCP server PID=$id ..."
+        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+        taskkill /F /T /PID $id | Out-Null
+    }
+}
+
 if (-not $env:SHARED_VOLUME_PATH) {
     $env:SHARED_VOLUME_PATH = Join-Path (Get-Location).Path "shared-volume"
 }
 New-Item -ItemType Directory -Force -Path $env:SHARED_VOLUME_PATH | Out-Null
 
-Write-Host "Starting aming-claw manager..."
+if (-not $env:GOVERNANCE_URL) {
+    $env:GOVERNANCE_URL = "http://localhost:40000"
+}
+
+if (-not $env:CODEX_WORKSPACE) {
+    $env:CODEX_WORKSPACE = (Get-Location).Path
+}
+
+Write-Host "Starting aming-claw host manager..."
+Write-Host "  project:   $Project"
+Write-Host "  governance:$($env:GOVERNANCE_URL)"
+Write-Host "  workspace: $($env:CODEX_WORKSPACE)"
 try {
-    & $PYTHON .\agent\service_manager.py
+    $proc = Start-Process -FilePath $PYTHON `
+        -ArgumentList @(
+            ".\agent\service_manager.py",
+            "--project", $Project,
+            "--governance-url", $env:GOVERNANCE_URL,
+            "--workspace", $env:CODEX_WORKSPACE
+        ) `
+        -WorkingDirectory (Get-Location).Path `
+        -WindowStyle Hidden `
+        -PassThru
+    $health = Wait-ManagedWorker -WaitSeconds $HealthWaitSeconds
+    Write-Host "Manager healthy."
+    Write-Host "  manager:   $($health.manager_pid)"
+    Write-Host "  worker:    $($health.worker_pid)"
+    Write-Host "  launcher:  $($proc.Id)"
 }
 finally {
     if ($mutex -ne $null) {

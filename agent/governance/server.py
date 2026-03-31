@@ -18,8 +18,11 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from .errors import GovernanceError
+import logging
 import sqlite3
 import time
+
+log = logging.getLogger(__name__)
 from .db import get_connection, DBContext, independent_connection
 from . import role_service
 from . import state_service
@@ -796,19 +799,75 @@ def handle_context_archive(ctx: RequestContext):
 
 @route("POST", "/api/wf/{project_id}/import-graph")
 def handle_import_graph(ctx: RequestContext):
-    """Import acceptance graph from a markdown file. Coordinator only."""
+    """Import acceptance graph from a markdown file.
+
+    Coordinator can always import. Observer can import only as a governance
+    recovery action and must provide a non-empty reason.
+    """
     project_id = ctx.get_project_id()
     md_path = ctx.body.get("md_path", ctx.body.get("graph_source", ""))
+    reason = str(ctx.body.get("reason", "")).strip()
     if not md_path:
         from .errors import ValidationError
         raise ValidationError("md_path is required")
     with DBContext(project_id) as conn:
         session = ctx.require_auth(conn)
-        if session.get("role") != "coordinator":
+        role = session.get("role", "")
+        if role not in ("coordinator", "observer"):
             from .errors import PermissionDeniedError
-            raise PermissionDeniedError(session.get("role", ""), "import-graph",
-                                        {"detail": "Only coordinator can import graphs"})
+            raise PermissionDeniedError(role, "import-graph",
+                                        {"detail": "Only coordinator or observer can import graphs"})
+        if role == "observer" and not reason:
+            from .errors import ValidationError
+            raise ValidationError("reason is required for observer import-graph")
     result = project_service.import_graph(project_id, md_path)
+    with DBContext(project_id) as conn:
+        audit_service.record(
+            conn, project_id,
+            "observer_graph_import" if role == "observer" else "graph_import",
+            actor=session.get("principal_id", ""),
+            role=role,
+            reason=reason,
+            graph_source=md_path,
+            graph_nodes=result.get("node_count", 0),
+            node_states_initialized=result.get("node_states_initialized", 0),
+        )
+    return result
+
+
+@route("POST", "/api/wf/{project_id}/observer-sync-node-state")
+def handle_observer_sync_node_state(ctx: RequestContext):
+    """Rebuild runtime node_state rows from the persisted graph definition.
+
+    This is a governance recovery path only. It does not mark nodes as verified.
+    """
+    project_id = ctx.get_project_id()
+    reason = str(ctx.body.get("reason", "")).strip()
+    if not reason:
+        from .errors import ValidationError
+        raise ValidationError("reason is required")
+
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        role = session.get("role", "")
+        if role not in ("coordinator", "observer"):
+            from .errors import PermissionDeniedError
+            raise PermissionDeniedError(role, "observer-sync-node-state",
+                                        {"detail": "Only coordinator or observer can sync node_state"})
+
+    result = project_service.sync_node_state_from_graph(project_id)
+    with DBContext(project_id) as conn:
+        audit_service.record(
+            conn, project_id,
+            "observer_node_state_sync" if role == "observer" else "node_state_sync",
+            actor=session.get("principal_id", ""),
+            role=role,
+            reason=reason,
+            graph_nodes=result.get("graph_nodes", 0),
+            node_states_initialized=result.get("node_states_initialized", 0),
+            node_state_total=result.get("node_state_total", 0),
+            repair_mode=result.get("repair_mode", ""),
+        )
     return result
 
 
@@ -1067,7 +1126,7 @@ def handle_summary(ctx: RequestContext):
 @route("GET", "/api/wf/{project_id}/preflight-check")
 def handle_preflight_check(ctx: RequestContext):
     project_id = ctx.get_project_id()
-    auto_fix = ctx.query_params.get("auto_fix", ["false"])[0].lower() == "true"
+    auto_fix = ctx.query.get("auto_fix", "false").lower() == "true"
     from .preflight import run_preflight
     with DBContext(project_id) as conn:
         return run_preflight(conn, project_id, auto_fix=auto_fix)
@@ -1092,7 +1151,11 @@ def handle_node_update(ctx: RequestContext):
     """Update node attributes (e.g. secondary doc bindings). Coordinator only."""
     project_id = ctx.get_project_id()
     with DBContext(project_id) as conn:
-        ctx.require_auth(conn)
+        session = ctx.require_auth(conn)
+        if session.get("role") != "coordinator":
+            from .errors import PermissionDeniedError
+            raise PermissionDeniedError(session.get("role", ""), "node-update",
+                                        {"detail": "Only coordinator can update node attributes"})
     node_id = ctx.body.get("node_id")
     attrs = ctx.body.get("attrs", {})
     if not node_id or not attrs:
@@ -1116,7 +1179,11 @@ def handle_node_batch_update(ctx: RequestContext):
     """Batch update secondary doc bindings for multiple nodes. Coordinator only."""
     project_id = ctx.get_project_id()
     with DBContext(project_id) as conn:
-        ctx.require_auth(conn)
+        session = ctx.require_auth(conn)
+        if session.get("role") != "coordinator":
+            from .errors import PermissionDeniedError
+            raise PermissionDeniedError(session.get("role", ""), "node-batch-update",
+                                        {"detail": "Only coordinator can batch update node attributes"})
     updates = ctx.body.get("updates", [])
     if not updates:
         from .errors import GovernanceError
@@ -1405,6 +1472,8 @@ def handle_task_create(ctx: RequestContext):
     runs conflict rules for non-system task types.
     """
     project_id = ctx.get_project_id()
+    log.info("API task.create: project=%s type=%s prompt=%r",
+             project_id, ctx.body.get("type", "task"), (ctx.body.get("prompt", ""))[:80])
     from . import task_registry
     from .conflict_rules import extract_operation_type, compute_intent_hash, check_conflicts
     created_by = "anonymous"
@@ -1448,6 +1517,8 @@ def handle_task_create(ctx: RequestContext):
             )
         metadata["rule_decision"] = rule_decision["decision"]
         metadata["rule_reason"] = rule_decision["reason"]
+        log.info("API conflict_rules: project=%s decision=%s reason=%s",
+                 project_id, rule_decision["decision"], rule_decision["reason"])
 
     with DBContext(project_id) as conn:
         result = task_registry.create_task(
@@ -1470,6 +1541,7 @@ def handle_task_create(ctx: RequestContext):
 def handle_task_claim(ctx: RequestContext):
     """Claim a task. Auth optional — uses principal_id if token provided, else body worker_id."""
     project_id = ctx.get_project_id()
+    log.info("API task.claim: project=%s worker=%s", project_id, ctx.body.get("worker_id", "anonymous"))
     from . import task_registry
     worker_id = ctx.body.get("worker_id", "anonymous")
     if ctx.token:
@@ -1490,6 +1562,9 @@ def handle_task_claim(ctx: RequestContext):
 def handle_task_complete(ctx: RequestContext):
     """Complete a task. No auth required."""
     project_id = ctx.get_project_id()
+    log.info("API task.complete: project=%s task=%s status=%s result_keys=%s",
+             project_id, ctx.body.get("task_id", "?"), ctx.body.get("status", "?"),
+             list((ctx.body.get("result") or {}).keys()))
     from . import task_registry
     with DBContext(project_id) as conn:
         return task_registry.complete_task(
@@ -1501,6 +1576,62 @@ def handle_task_complete(ctx: RequestContext):
             completed_by=ctx.body.get("worker_id", ""),
             override_reason=ctx.body.get("override_reason", ""),
         )
+
+
+@route("POST", "/api/task/{project_id}/hold")
+def handle_task_hold(ctx: RequestContext):
+    """Put a queued task into observer_hold — stops executor and auto-chain from touching it."""
+    project_id = ctx.get_project_id()
+    from . import task_registry
+    task_id = ctx.body.get("task_id", "")
+    if not task_id:
+        return {"error": "missing task_id"}, 400
+    with DBContext(project_id) as conn:
+        return task_registry.hold_task(conn, task_id)
+
+
+@route("POST", "/api/task/{project_id}/cancel")
+def handle_task_cancel(ctx: RequestContext):
+    """Cancel a task. No auto-chain, no retry. Terminal state."""
+    project_id = ctx.get_project_id()
+    log.info("API task.cancel: project=%s task=%s", project_id, ctx.body.get("task_id", "?"))
+    from . import task_registry
+    with DBContext(project_id) as conn:
+        return task_registry.cancel_task(conn, ctx.body.get("task_id", ""), ctx.body.get("reason", ""))
+
+
+@route("POST", "/api/task/{project_id}/release")
+def handle_task_release(ctx: RequestContext):
+    """Release an observer_hold task back to queued flow."""
+    project_id = ctx.get_project_id()
+    from . import task_registry
+    task_id = ctx.body.get("task_id", "")
+    if not task_id:
+        return {"error": "missing task_id"}, 400
+    with DBContext(project_id) as conn:
+        return task_registry.release_task(conn, task_id)
+
+
+@route("GET", "/api/project/{project_id}/observer-mode")
+def handle_observer_mode_get(ctx: RequestContext):
+    """Get current observer_mode flag for a project."""
+    project_id = ctx.get_project_id()
+    from . import task_registry
+    with DBContext(project_id) as conn:
+        enabled = task_registry.get_observer_mode(conn, project_id)
+    return {"project_id": project_id, "observer_mode": enabled}
+
+
+@route("POST", "/api/project/{project_id}/observer-mode")
+def handle_observer_mode_set(ctx: RequestContext):
+    """Enable or disable observer_mode. When on, all new tasks start as observer_hold."""
+    project_id = ctx.get_project_id()
+    from . import task_registry
+    enabled = ctx.body.get("enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.lower() in ("true", "1", "on")
+    with DBContext(project_id) as conn:
+        return task_registry.set_observer_mode(conn, project_id, bool(enabled))
 
 
 @route("GET", "/api/task/{project_id}/list")
@@ -1839,8 +1970,10 @@ def handle_context_snapshot(ctx: RequestContext):
     """
     pid = ctx.get_project_id()
     conn = get_connection(pid)
-    role = ctx.query.get("role", ["coordinator"])[0]
-    task_id = ctx.query.get("task_id", [""])[0]
+    role_raw = ctx.query.get("role", "coordinator")
+    task_id_raw = ctx.query.get("task_id", "")
+    role = role_raw[0] if isinstance(role_raw, list) else role_raw
+    task_id = task_id_raw[0] if isinstance(task_id_raw, list) else task_id_raw
     now = _utc_now()
 
     # Task summary — recent 3 tasks
@@ -1876,11 +2009,24 @@ def handle_context_snapshot(ctx: RequestContext):
     ).fetchall():
         node_counts[row["verify_status"]] = row["cnt"]
 
+    # Session context snapshot from DB/Redis
+    session_snapshot = None
+    try:
+        from . import session_context
+        session_snapshot = session_context.load_snapshot(pid)
+    except Exception:
+        pass
+
     # Recent memories (top 3 by relevance)
     recent_memories = []
     try:
         all_mems = memory_service.query_all(pid, active_only=True)
-        task_prompt = task_summary.get("prompt", "")
+        task_prompt = ""
+        if session_snapshot:
+            task_prompt = (
+                session_snapshot.get("current_focus", "")
+                or session_snapshot.get("last_decision", "")
+            )
         scored = []
         for m in all_mems:
             score = 0
@@ -1925,6 +2071,13 @@ def handle_context_snapshot(ctx: RequestContext):
         "generated_at": now,
         "project_version": project_state["chain_version"],
     }
+    if session_snapshot:
+        result["session_context"] = {
+            "current_focus": session_snapshot.get("current_focus", ""),
+            "last_decision": session_snapshot.get("last_decision", ""),
+            "version": session_snapshot.get("version", 0),
+            "updated_at": session_snapshot.get("updated_at", ""),
+        }
     if task_chain:
         result["task_chain"] = task_chain
     return result
@@ -2155,13 +2308,13 @@ _DOCS = {
     },
     "telegram_integration": {
         "title": "Telegram Gateway Integration (v5.1)",
-        "description": "Gateway 只做消息收发。非命令消息启动 Coordinator CLI session 处理。Coordinator 负责对话+决策+任务编排。",
+        "description": "Gateway handles only message sending/receiving. Non-command messages start a Coordinator CLI session. Coordinator handles conversation, decisions, and task orchestration.",
         "architecture": "Telegram <-> Gateway (Docker) -> Claude CLI session (Coordinator) -> Governance API",
-        "v5_1_change": "Gateway 不再分类 query/task/chat，不再直接创建 task。所有决策权归 Coordinator。",
+        "v5_1_change": "Gateway no longer classifies query/task/chat and no longer creates tasks directly. All decision-making belongs to Coordinator.",
         "role_boundary": {
-            "gateway": "消息收发 + /command 处理。不做决策、不创建 task。",
-            "coordinator": "对话 + 决策 + 任务编排。不自己写代码。",
-            "dev_executor": "代码执行。不和用户对话。",
+            "gateway": "Message sending/receiving + /command handling. No decision-making, no task creation.",
+            "coordinator": "Conversation + decision-making + task orchestration. Does not write code itself.",
+            "dev_executor": "Code execution. Does not interact with users.",
         },
         "gateway_api": {
             "POST /gateway/bind": "Bind coordinator token to chat_id. Body: {token, chat_id, project_id}",
@@ -2186,7 +2339,7 @@ _DOCS = {
         },
     },
     "coverage_check": {
-        "title": "Feature Coverage Check (流程保障)",
+        "title": "Feature Coverage Check (workflow assurance)",
         "description": "Detect untracked code changes before release. Reverse impact analysis: checks if all changed files have corresponding acceptance graph nodes.",
         "problem_solved": "Prevents features from being shipped without workflow tracking. Catches cases where developers implement code without first creating acceptance nodes.",
         "api": {
@@ -2221,16 +2374,16 @@ _DOCS = {
         },
     },
     "gatekeeper": {
-        "title": "Gatekeeper (发布前置校验)",
+        "title": "Gatekeeper (pre-release validation)",
         "description": "Gatekeeper is a program (not an AI role) embedded in the governance service. It enforces pre-release checks at two levels: verify-update time and release-gate time.",
         "check_points": {
-            "verify-update (前置拦截)": {
+            "verify-update (pre-check intercept)": {
                 "when": "Any node transitions to t2_pass or qa_pass",
                 "what": "Checks that the node's declared primary files are all covered by graph nodes",
                 "blocks": "If primary files are uncovered → rejects verify-update with error message",
                 "module": "state_service._check_node_coverage → coverage_check.check_feature_coverage",
             },
-            "release-gate (发布拦截)": {
+            "release-gate (release intercept)": {
                 "when": "POST /api/wf/{pid}/release-gate is called",
                 "what": "Checks that a coverage-check was run recently (within 1 hour) and passed",
                 "blocks": "If never run → 'Run coverage-check first'. If stale → 'Re-run'. If failed → 'Uncovered files'.",
@@ -2267,7 +2420,7 @@ _DOCS = {
             "future_checks": ["security_scan", "dependency_audit", "performance_regression"],
         },
         "artifacts_auto_infer": {
-            "title": "L9.6 Artifacts 自动推断",
+            "title": "L9.6 Artifacts Auto-Inference",
             "description": "Nodes without explicit artifacts: declaration are auto-analyzed. If primary files contain @route → api_docs required. If test files declared → test_file required.",
             "rules": [
                 "primary .py file has @route() → auto-require api_docs (section inferred from title)",
@@ -2277,7 +2430,7 @@ _DOCS = {
             "module": "artifacts.infer_required_artifacts",
         },
         "deploy_coverage_check": {
-            "title": "L9.7 Deploy 前置 Coverage-Check",
+            "title": "L9.7 Deploy Pre-flight Coverage-Check",
             "description": "deploy-governance.sh automatically runs coverage-check before building. Uncovered files block deployment.",
             "usage": "GOV_COORDINATOR_TOKEN=gov-xxx ./deploy-governance.sh",
             "bypass": "SKIP_COVERAGE_CHECK=1 ./deploy-governance.sh (not recommended)",
@@ -2299,62 +2452,62 @@ _DOCS = {
             "memory_check_rule": "If >5 code files changed but <5 memories → FAIL. If >10 changed but <10 memories → WARN. Forces developers to document decisions and pitfalls.",
         },
         "scheduled_task_management": {
-            "title": "L9.9 Scheduled Task 管理",
-            "description": "Task prompt 模板存在 scripts/task-templates/ 目录，受 git 跟踪和 coverage-check 保护。",
+            "title": "L9.9 Scheduled Task Management",
+            "description": "Task prompt templates reside in scripts/task-templates/, tracked by git and protected by coverage-check.",
             "template_location": "scripts/task-templates/telegram-handler.md",
             "variables": "{PROJECT_ID}, {TOKEN}, {CHAT_ID}, {STREAM}, {GROUP}, {BASE}",
-            "key_fix": "消息必须用 XREADGROUP 消费 + XACK 确认，不能用 XRANGE（不跟踪消费进度）",
+            "key_fix": "Messages must be consumed with XREADGROUP + XACK confirmation; XRANGE cannot be used (does not track consumption progress).",
         },
         "human_intervention": {
-            "title": "人工介入流程",
+            "title": "Human Intervention Flow",
             "guide": "docs/human-intervention-guide.md",
             "boundaries": {
-                "fully_automated": ["代码测试", "verify-update", "coverage-check", "记忆写入", "消息回复(非敏感)"],
-                "needs_human_confirm": ["新节点创建", "baseline 批量变更", "跨项目操作"],
-                "must_be_human": ["Token 管理", "发布确认", "rollback", "删除", "Scheduled Task 授权"],
-                "human_verification": ["Telegram 交互行为", "UI 变更", "安全功能"],
+                "fully_automated": ["Code testing", "verify-update", "coverage-check", "Memory writes", "Message replies (non-sensitive)"],
+                "needs_human_confirm": ["New node creation", "Baseline batch changes", "Cross-project operations"],
+                "must_be_human": ["Token management", "Release confirmation", "rollback", "delete", "Scheduled task authorization"],
+                "human_verification": ["Telegram interaction behavior", "UI changes", "Security features"],
             },
-            "trigger_keywords": ["紧急", "urgent", "人工", "manual", "rollback", "delete", "release", "deploy"],
-            "verification_flow": "AI 通知人类 → 人类测试 → 回复'验收通过/失败' → AI 提交 verify-update",
+            "trigger_keywords": ["urgent", "urgent", "manual", "manual", "rollback", "delete", "release", "deploy"],
+            "verification_flow": "AI notifies human → human tests → replies 'acceptance pass/fail' → AI submits verify-update",
         },
     },
     "token_model": {
-        "title": "Token Model (v5 简化版)",
-        "description": "消息驱动模式下简化 token：project_token 不过期，Gateway 代理认证。去掉了 refresh/access 双令牌。",
+        "title": "Token Model (v5 simplified)",
+        "description": "Token simplified for message-driven mode: project_token never expires, Gateway proxies auth. Removed refresh/access dual-token design.",
         "tokens": {
             "project_token (gov-xxx)": {
-                "holder": "Gateway / 人类",
-                "ttl": "不过期",
-                "scope": "项目 API 全权限 (coordinator 级别)",
+                "holder": "Gateway / Human",
+                "ttl": "non-expiring",
+                "scope": "Full project API access (coordinator level)",
                 "obtain": "POST /api/init {project_id, password}",
             },
             "agent_token (gov-xxx)": {
-                "holder": "dev/tester/qa 进程",
+                "holder": "dev/tester/qa processes",
                 "ttl": "24h",
-                "scope": "受限 API (verify-update, heartbeat 等角色操作)",
-                "obtain": "POST /api/role/assign (coordinator 分配)",
+                "scope": "Restricted API (verify-update, heartbeat, and other role operations)",
+                "obtain": "POST /api/role/assign (coordinator assigns)",
             },
         },
         "api": {
-            "POST /api/init": "创建项目 + 获取 project_token",
-            "POST /api/token/revoke": "人工撤销 project_token (需密码)",
-            "POST /api/role/assign": "coordinator 分配 agent_token",
+            "POST /api/init": "Create project and obtain project_token",
+            "POST /api/token/revoke": "Manually revoke project_token (requires password)",
+            "POST /api/role/assign": "coordinator assigns agent_token",
         },
         "deprecated": [
-            "POST /api/token/refresh — 不再需要，project_token 不过期 [deprecated: v5, removal: v8]",
-            "POST /api/token/rotate — 简化为 revoke + 重新 init [deprecated: v5, removal: v8]",
-            "access_token (gat-*) — 不再使用",
+            "POST /api/token/refresh — No longer needed; project_token never expires [deprecated: v5, removal: v8]",
+            "POST /api/token/rotate — Simplified to revoke + re-init [deprecated: v5, removal: v8]",
+            "access_token (gat-*) — no longer in use",
         ],
         "security": [
-            "init 密码保护（重置 token 需要密码）",
-            "revoke 能力保留（人工可撤销）",
-            "网络隔离（token 只在 localhost / Docker 内网）",
-            "Gateway 代理认证（CLI session 不直接持有 token）",
-            "agent_token 仍有 24h TTL（独立进程权限有时间限制）",
+            "init password protection (reset token requires password)",
+            "revoke capability retained (manually revocable)",
+            "Network isolation (token only within localhost / Docker internal network)",
+            "Gateway proxies auth (CLI session does not hold token directly)",
+            "agent_token still has 24h TTL (independent process permissions are time-limited)",
         ],
     },
     "agent_lifecycle": {
-        "title": "Agent Lifecycle (租约管理)",
+        "title": "Agent Lifecycle (lease management)",
         "description": "Register/heartbeat/deregister agents with lease-based lifecycle. Orphan detection for stale agents.",
         "api": {
             "POST /api/agent/register": {
@@ -2386,7 +2539,7 @@ _DOCS = {
         "lease_mechanism": "Agent registers → gets lease (5min TTL in Redis). Heartbeat every 2min renews. No heartbeat for 5min → lease expires → agent marked orphan. Gateway checks lease before routing messages.",
     },
     "session_context": {
-        "title": "Session Context (跨会话状态)",
+        "title": "Session Context (cross-session state)",
         "description": "Persist coordinator working state across sessions. Snapshot + append log with optimistic locking.",
         "api": {
             "POST /api/context/{project_id}/save": {
@@ -2421,7 +2574,7 @@ _DOCS = {
         "storage": "Redis (24h TTL) + SQLite (durable fallback). Auto-archived by OutboxWorker after 24h inactivity.",
     },
     "task_registry": {
-        "title": "Task Registry (任务管理)",
+        "title": "Task Registry (task management)",
         "description": "SQLite-backed task lifecycle with dual-field status: execution_status (queued/claimed/running/succeeded/failed/cancelled/timed_out) + notification_status (none/pending/notified).",
         "api": {
             "POST /api/task/{project_id}/create": {
@@ -2451,8 +2604,8 @@ _DOCS = {
         },
     },
     "executor": {
-        "title": "Executor (宿主机任务执行器)",
-        "description": "常驻进程监听 pending/ 目录，claim 并执行 Claude/Codex CLI 任务。集成 Task Registry + Redis 通知。",
+        "title": "Executor (host machine task executor)",
+        "description": "Persistent process monitors the pending/ directory, claims and executes Claude/Codex CLI tasks. Integrates Task Registry + Redis notifications.",
         "flow": {
             "1_pick": "scan pending/*.json (skip .tmp.json) → oldest first",
             "2_claim": "move to processing/ + Task Registry claim (DB insert queued→claimed→running)",
@@ -2468,67 +2621,67 @@ _DOCS = {
         },
     },
     "tool_policy": {
-        "title": "Tool Policy (命令安全策略)",
-        "description": "Executor 执行命令前检查安全策略。三级分类。",
+        "title": "Tool Policy (command security policy)",
+        "description": "Executor checks security policy before executing commands. Three-tier classification.",
         "levels": {
-            "auto_allow": "git diff, pytest, npm test 等只读/测试命令 → 自动执行",
-            "needs_approval": "git push, docker compose down, npm publish → 需要人工确认",
-            "always_deny": "rm -rf /, shutdown, reboot → 永远拒绝",
+            "auto_allow": "git diff, pytest, npm test, and other read-only/test commands → auto-execute",
+            "needs_approval": "git push, docker compose down, npm publish → requires human confirmation",
+            "always_deny": "rm -rf /, shutdown, reboot → always denied",
         },
-        "note": "当前为字符串匹配，后续升级为结构化命令能力模型。",
+        "note": "Currently string-matching; will be upgraded to a structured command capability model.",
     },
     "deployment": {
-        "title": "Deployment (部署流程)",
-        "description": "开发→生产环境切换的自动化检测和部署流程。",
+        "title": "Deployment (deployment workflow)",
+        "description": "Automated detection and deployment workflow for switching from development to production.",
         "scripts": {
-            "scripts/startup.sh": "一键启动所有服务（Docker + domain pack + executor）",
-            "scripts/pre-deploy-check.sh": "部署前检测（节点状态/coverage/docs/memory/gatekeeper/staging/config/gateway）",
-            "deploy-governance.sh": "零停机部署（自动调 pre-deploy-check → build → staging verify → swap）",
+            "scripts/startup.sh": "One-click start of all services (Docker + domain pack + executor)",
+            "scripts/pre-deploy-check.sh": "Pre-deploy checks (node status/coverage/docs/memory/gatekeeper/staging/config/gateway)",
+            "deploy-governance.sh": "Zero-downtime deployment (auto-calls pre-deploy-check → build → staging verify → swap)",
         },
         "checks": {
-            "node_status": "所有节点 qa_pass",
-            "coverage": "所有变更文件有对应节点",
-            "docs": "API 文档 >= 10 sections",
-            "memory": "dbservice 记忆 >= 5 entries",
+            "node_status": "All nodes qa_pass",
+            "coverage": "All changed files have corresponding nodes",
+            "docs": "API docs >= 10 sections",
+            "memory": "dbservice memories >= 5 entries",
             "gatekeeper": "release-gate PASS",
-            "config_consistency": "dev/prod 环境变量一致",
-            "staging": "staging 容器 health + smoke test",
-            "gateway_channel": "Telegram 消息通道可达",
+            "config_consistency": "dev/prod environment variables consistent",
+            "staging": "staging container health + smoke test",
+            "gateway_channel": "Telegram message channel reachable",
         },
         "usage": "GOV_COORDINATOR_TOKEN=gov-xxx ./deploy-governance.sh",
     },
     "executor_api": {
-        "title": "Executor API (Session 介入接口)",
-        "description": "宿主机 Executor 内嵌 HTTP API (:40100)。Claude Code session 通过 curl 直接监控、介入、调试。",
+        "title": "Executor API (session intervention interface)",
+        "description": "Host machine Executor embeds an HTTP API (:40100). Claude Code sessions can directly monitor, intervene, and debug via curl.",
         "port": 40100,
         "endpoints": {
             "monitoring": {
-                "GET /health": "API 健康检查",
-                "GET /status": "整体状态 (pending/processing/active sessions)",
-                "GET /sessions": "活跃 AI 进程列表",
-                "GET /tasks": "任务列表 (支持 project_id, status 过滤)",
-                "GET /task/{id}": "单任务详情 (含 evidence, validator 日志)",
-                "GET /trace/{id}": "链路追踪详情",
+                "GET /health": "API health check",
+                "GET /status": "Overall status (pending/processing/active sessions)",
+                "GET /sessions": "Active AI process list",
+                "GET /tasks": "Task list (supports project_id, status filtering)",
+                "GET /task/{id}": "Single task details (including evidence, validator logs)",
+                "GET /trace/{id}": "Trace details",
             },
             "intervention": {
-                "POST /task/{id}/pause": "暂停运行中的任务",
-                "POST /task/{id}/cancel": "取消任务 (终止 AI 进程)",
-                "POST /task/{id}/retry": "重试失败的任务 (移回 pending)",
-                "POST /cleanup-orphans": "清理僵尸进程和卡住的任务",
+                "POST /task/{id}/pause": "Pause a running task",
+                "POST /task/{id}/cancel": "Cancel a task (terminate AI process)",
+                "POST /task/{id}/retry": "Retry a failed task (move back to pending)",
+                "POST /cleanup-orphans": "Clean up zombie processes and stuck tasks",
             },
             "direct_chat": {
-                "POST /coordinator/chat": "直接启动 Coordinator session (绕过 Telegram)",
+                "POST /coordinator/chat": "Directly launch a Coordinator session (bypasses Telegram)",
                 "body": {"message": "...", "project_id": "amingClaw", "chat_id": 0},
-                "note": "同步等待 AI 完成后返回，最多 120s",
+                "note": "Synchronously waits for AI to complete before returning, maximum 120s",
             },
             "debugging": {
-                "GET /validator/last-result": "最近一次校验结果 (层级/通过/拒绝详情)",
-                "GET /context/{project_id}": "当前上下文组装结果",
-                "GET /ai-session/{id}/output": "AI 原始输出 (stdout/stderr/exit_code)",
+                "GET /validator/last-result": "Most recent validation result (tier/pass/reject details)",
+                "GET /context/{project_id}": "Current assembled context result",
+                "GET /ai-session/{id}/output": "Raw AI output (stdout/stderr/exit_code)",
             },
         },
-        "access": "仅宿主机 localhost:40100 可访问，不经过 nginx，不需要 token",
-        "guide": "详见 docs/executor-api-guide.md",
+        "access": "Only accessible from host machine localhost:40100, does not go through nginx, no token required",
+        "guide": "See docs/executor-api-guide.md for details",
     },
 }
 
@@ -2567,6 +2720,13 @@ def create_server(port: int = None) -> HTTPServer:
 
 
 def main():
+    # Configure logging to INFO level for observability
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+    )
+
     # PID lock — kill old process, prevent zombies
     _acquire_pid_lock()
     print(f"Governance v{SERVER_VERSION} (PID {SERVER_PID})")

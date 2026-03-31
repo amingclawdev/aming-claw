@@ -1,129 +1,129 @@
-# Aming Claw 架构方案 v4
+# Aming Claw Architecture Plan v4
 
-> v3 → v4 核心变更：补地基。消息可靠投递、事件不丢失、上下文不覆盖、token 可撤销、Agent 生命周期前置。
+> v3 → v4 core changes: reinforce the foundation. Reliable message delivery, no event loss, no context overwrite, revocable tokens, Agent lifecycle moved earlier.
 
-## 一、系统全景
+## I. System Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        人类用户 (Telegram)                       │
+│                        Human User (Telegram)                    │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                     ┌──────────▼──────────┐
-                    │    Nginx (:40000)    │  反向代理 / 限流(预留)
+                    │    Nginx (:40000)    │  Reverse Proxy / Rate Limiting (reserved)
                     └──┬────────┬────┬────┘
                        │        │    │
           ┌────────────▼──┐ ┌──▼────▼───────────┐
           │  Governance   │ │  Telegram Gateway  │
           │  (:40006)     │ │  (:40010)          │
-          │  规则+事件源   │ │  消息+路由          │
+          │  Rules+Events │ │  Messages+Routing  │
           └──────┬────────┘ └──────┬─────────────┘
                  │                 │
           ┌──────▼─────────────────▼───────┐
           │          Redis (:6379)          │
-          │  Streams / Pub-Sub / 缓存 / 锁  │
+          │  Streams / Pub-Sub / Cache / Locks│
           └──────┬─────────────────────────┘
                  │
           ┌──────▼──────────┐
           │   dbservice     │
           │   (:40002)      │
-          │   记忆层         │
+          │   Memory Layer  │
           └─────────────────┘
 
-─ ─ ─ ─ ─ ─ Docker 内网 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+─ ─ ─ ─ ─ ─ Docker Internal Network ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 
           ┌─────────────────────────────────┐
-          │         宿主机                   │
+          │         Host Machine            │
           │                                 │
           │  Coordinator Session (Claude)   │
-          │    ├── ChatProxy (Stream 消费)   │
+          │    ├── ChatProxy (Stream consumer)│
           │    ├── GovernanceClient (HTTP)   │
           │    └── Claude Code CLI          │
           │                                 │
-          │  Message Worker (常驻/定时)      │
-          │    └── 消息消费 + 上下文恢复      │
+          │  Message Worker (Resident/Scheduled)│
+          │    └── Message consumption + context recovery│
           └─────────────────────────────────┘
 ```
 
-## 二、v3 → v4 变更清单
+## II. v3 → v4 Change List
 
-| 模块 | v3 | v4 | 原因 |
+| Module | v3 | v4 | Reason |
 |------|----|----|------|
-| 消息队列 | Redis LIST (LPUSH/RPOP) | **Redis Streams + Consumer Group + ACK** | RPOP 崩溃丢消息 |
-| 治理事件 | Pub/Sub only | **Outbox + Pub/Sub 双轨** | Pub/Sub 丢事件 |
-| Session Context | 单 refId replace | **Snapshot + Append Log + Version** | 多 writer 覆盖 |
-| Token 模型 | 10 年 coordinator token | **Refresh + Access 双令牌** | 泄露不可撤销 |
-| Agent Lifecycle | 第五轮扩展 | **第二轮基础设施** | 已是当前痛点 |
-| dbservice 依赖 | 同步调用 | **异步补写 + 降级策略** | 记忆增强≠记忆依赖 |
-| Scheduled Task | 每分钟 RPOP | **阻塞消费 + 租约 + Cron 兜底** | 分钟延迟太高 |
-| 可观测性 | 无 | **trace_id 串联 + 结构化日志** | 排查无从下手 |
+| Message Queue | Redis LIST (LPUSH/RPOP) | **Redis Streams + Consumer Group + ACK** | RPOP crashes lose messages |
+| Governance Events | Pub/Sub only | **Outbox + Pub/Sub dual-track** | Pub/Sub loses events |
+| Session Context | Single refId replace | **Snapshot + Append Log + Version** | Multiple writers overwrite |
+| Token Model | 10-year coordinator token | **Refresh + Access dual-token** | Leaked tokens cannot be revoked |
+| Agent Lifecycle | Round 5 expansion | **Round 2 infrastructure** | Already a current pain point |
+| dbservice Dependency | Synchronous calls | **Async write-back + degradation strategy** | Memory enhancement != memory dependency |
+| Scheduled Task | Per-minute RPOP | **Blocking consume + lease + Cron fallback** | Minute-level delay too high |
+| Observability | None | **trace_id chaining + structured logging** | No way to troubleshoot |
 
-## 三、五层架构（v4 修订）
+## III. Five-Layer Architecture (v4 Revision)
 
-### 第 1 层：规则层 (Governance Service)
+### Layer 1: Rules Layer (Governance Service)
 
-**职责**：强制执行 workflow 规则 + 事件源。
+**Responsibility**: Enforce workflow rules + event sourcing.
 
-| 模块 | 功能 | v4 变更 |
+| Module | Function | v4 Change |
 |------|------|---------|
-| DAG 图 (NetworkX) | 节点、依赖、gate 策略 | 不变 |
-| 状态机 (SQLite) | verify status 流转、权限校验 | 不变 |
-| 角色服务 | token 认证 | **双令牌模型** |
-| Agent Lifecycle | register/heartbeat/deregister/orphans | **新增 (从第五轮提前)** |
-| Event Outbox | 事件持久化 + 异步投递 | **新增** |
-| 审计 | 谁在什么时候做了什么 | 不变 |
-| 文档 API | /api/docs/* | 不变 |
+| DAG Graph (NetworkX) | Nodes, dependencies, gate policies | Unchanged |
+| State Machine (SQLite) | verify status transitions, permission validation | Unchanged |
+| Role Service | Token authentication | **Dual-token model** |
+| Agent Lifecycle | register/heartbeat/deregister/orphans | **New (moved up from Round 5)** |
+| Event Outbox | Event persistence + async delivery | **New** |
+| Audit | Who did what when | Unchanged |
+| Docs API | /api/docs/* | Unchanged |
 
-**关键变更 1：双令牌模型**
+**Key Change 1: Dual-Token Model**
 
 ```
-人类调 /api/init
-    → 返回 refresh_token (长期, 90 天, 只用于换 access_token)
-    → 人类保存 refresh_token
+Human calls /api/init
+    → Returns refresh_token (long-term, 90 days, only used to exchange for access_token)
+    → Human saves refresh_token
 
-Coordinator 启动时:
+Coordinator starts:
     POST /api/token/refresh {refresh_token}
-    → 返回 access_token (短期, 4 小时)
-    → 后续所有 API 调用用 access_token
+    → Returns access_token (short-term, 4 hours)
+    → All subsequent API calls use access_token
 
-access_token 过期:
-    → 自动用 refresh_token 续期
-    → 无需人工介入
+access_token expires:
+    → Automatically renews using refresh_token
+    → No manual intervention required
 
-安全操作:
-    POST /api/token/revoke {refresh_token, password}  ← 人类撤销
-    POST /api/token/rotate {refresh_token, password}  ← 换新 refresh_token
+Security operations:
+    POST /api/token/revoke {refresh_token, password}  ← Human revokes
+    POST /api/token/rotate {refresh_token, password}  ← Rotate to new refresh_token
 ```
 
-| Token | TTL | 持有者 | 能力 |
+| Token | TTL | Holder | Capability |
 |-------|-----|--------|------|
-| refresh_token | 90 天 | 人类 | 换 access_token、revoke |
-| access_token | 4 小时 | Coordinator | 调所有 API |
-| agent_token | 24 小时 | Agent (tester/qa/dev) | 调受限 API |
+| refresh_token | 90 days | Human | Exchange for access_token, revoke |
+| access_token | 4 hours | Coordinator | Call all APIs |
+| agent_token | 24 hours | Agent (tester/qa/dev) | Call restricted APIs |
 
-**关键变更 2：Event Outbox**
+**Key Change 2: Event Outbox**
 
 ```
-状态变更发生
+State change occurs
     │
     ▼
-1. 写 SQLite 状态表 (事务内)
-2. 写 SQLite outbox 表 (同一事务)  ← 保证原子性
+1. Write SQLite state table (within transaction)
+2. Write SQLite outbox table (same transaction)  ← Guarantees atomicity
     │
     ▼
-3. 后台 worker 读 outbox
+3. Background worker reads outbox
     │
-    ├──▶ Redis Pub/Sub (实时通知，best-effort)
-    ├──▶ Redis Stream (持久化，可重试)
-    └──▶ dbservice (记忆写入，异步)
+    ├──▶ Redis Pub/Sub (real-time notification, best-effort)
+    ├──▶ Redis Stream (persistent, retryable)
+    └──▶ dbservice (memory write, async)
     │
     ▼
-4. 投递成功 → 标记 outbox 行 delivered
-   投递失败 → 重试 (指数退避, 最多 5 次)
-   5 次失败 → 进入死信, 告警
+4. Delivery success → mark outbox row as delivered
+   Delivery failure → retry (exponential backoff, max 5 times)
+   5 failures → enter dead letter, alert
 ```
 
-Outbox 表结构：
+Outbox table schema:
 ```sql
 CREATE TABLE event_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,16 +131,16 @@ CREATE TABLE event_outbox (
     payload TEXT NOT NULL,             -- JSON
     project_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    delivered_at TEXT,                 -- NULL = 待投递
+    delivered_at TEXT,                 -- NULL = pending delivery
     retry_count INTEGER DEFAULT 0,
     next_retry_at TEXT,
-    dead_letter INTEGER DEFAULT 0,    -- 1 = 死信
-    trace_id TEXT                      -- 串联追踪
+    dead_letter INTEGER DEFAULT 0,    -- 1 = dead letter
+    trace_id TEXT                      -- trace chaining
 );
 CREATE INDEX idx_outbox_pending ON event_outbox(delivered_at) WHERE delivered_at IS NULL;
 ```
 
-**关键变更 3：Agent Lifecycle API**
+**Key Change 3: Agent Lifecycle API**
 
 ```
 POST /api/agent/register
@@ -159,34 +159,34 @@ GET  /api/agent/orphans
   Returns: {orphans: [{agent_id, last_heartbeat, lease_expired_at}]}
 
 POST /api/agent/cleanup
-  Coordinator 调用: 清理孤儿 agent, 释放资源, 失效路由
+  Coordinator calls: clean up orphan agents, release resources, invalidate routes
 ```
 
-租约机制：
+Lease mechanism:
 ```
-Agent 注册 → 拿到 lease_id (TTL 5 分钟)
-Agent 每 2 分钟 heartbeat → 续租
-超过 5 分钟无 heartbeat → lease 过期 → 标记 orphan
-Coordinator 定期 /agent/orphans → 发现孤儿 → 清理
-Gateway 检查路由时: lease 过期的 coordinator → 提示用户 "离线"
+Agent registers → gets lease_id (TTL 5 minutes)
+Agent heartbeats every 2 minutes → renews lease
+No heartbeat for 5+ minutes → lease expires → marked as orphan
+Coordinator periodically calls /agent/orphans → discovers orphans → cleans up
+Gateway checks routes: coordinator with expired lease → prompt user "offline"
 ```
 
-### 第 2 层：记忆层 (dbservice)
+### Layer 2: Memory Layer (dbservice)
 
-**职责**：知识存储与检索，辅助决策。**非关键路径依赖。**
+**Responsibility**: Knowledge storage and retrieval, assists decision-making. **Not a critical path dependency.**
 
-不变的部分：
+Unchanged parts:
 - Knowledge Store (SQLite + FTS4)
-- Memory Schema + 冲突策略
+- Memory Schema + conflict strategy
 - Memory Relations
-- Embedder (本地向量)
+- Embedder (local vectors)
 - Context Assembly
 
-**关键变更：降级策略**
+**Key Change: Degradation Strategy**
 
 ```python
 class MemoryClient:
-    """Governance 调 dbservice 的客户端"""
+    """Client for Governance to call dbservice"""
 
     def write(self, entry):
         try:
@@ -194,7 +194,7 @@ class MemoryClient:
                                  json=entry, timeout=3)
             return resp.json()
         except Exception:
-            # 降级：写本地 pending 文件，后续补写
+            # Degradation: write to local pending file, write back later
             self._write_to_local_pending(entry)
             log.warning("dbservice unavailable, queued locally")
             return {"ok": True, "degraded": True}
@@ -204,7 +204,7 @@ class MemoryClient:
             return requests.get(f"{DBSERVICE_URL}/knowledge/find",
                                params=kwargs, timeout=3).json()
         except Exception:
-            # 降级：返回空，不阻塞主流程
+            # Degradation: return empty, do not block main flow
             log.warning("dbservice unavailable, returning empty")
             return {"documents": [], "degraded": True}
 
@@ -213,21 +213,21 @@ class MemoryClient:
             return requests.post(f"{DBSERVICE_URL}/assemble-context",
                                 json={...}, timeout=5).json()
         except Exception:
-            # 降级：最小上下文（只有 project_id + token）
+            # Degradation: minimal context (only project_id + token)
             return {"context": [], "degraded": True}
 ```
 
-**原则**：governance 独立可运行，dbservice 挂了只影响"记忆增强"，不影响规则执行。
+**Principle**: governance runs independently; if dbservice goes down, it only affects "memory enhancement", not rule execution.
 
-**开发 workflow domain pack**：
+**Development workflow domain pack**:
 ```javascript
 registerPack("dev-workflow", {
   types: {
     "node_status":      { conflict: "temporal_replace" },
     "verify_decision":  { conflict: "append" },
     "pitfall":          { conflict: "append_set" },
-    "session_snapshot": { conflict: "replace" },       // v4: 改名
-    "session_log":      { conflict: "append" },        // v4: 新增
+    "session_snapshot": { conflict: "replace" },       // v4: renamed
+    "session_log":      { conflict: "append" },        // v4: new
     "architecture":     { conflict: "replace" },
     "workaround":       { conflict: "append" },
     "release_note":     { conflict: "append" },
@@ -235,53 +235,53 @@ registerPack("dev-workflow", {
 })
 ```
 
-### 第 3 层：消息层 (Telegram Gateway)
+### Layer 3: Message Layer (Telegram Gateway)
 
-**职责**：消息收发、路由、交互菜单。
+**Responsibility**: Message sending/receiving, routing, interactive menus.
 
-不变的部分：
-- Telegram 长轮询
-- InlineKeyboard 交互菜单
+Unchanged parts:
+- Telegram long polling
+- InlineKeyboard interactive menus
 - HTTP API (/gateway/bind, /gateway/reply)
 
-**关键变更 1：Redis Streams 替代 LIST**
+**Key Change 1: Redis Streams Replaces LIST**
 
 ```
-# Gateway 写入消息
-XADD chat:inbox:{token_hash} * chat_id 7848961760 text "你好" ts "2026-..."
+# Gateway writes message
+XADD chat:inbox:{token_hash} * chat_id 7848961760 text "hello" ts "2026-..."
 
-# Consumer Group 创建 (首次)
+# Consumer Group creation (first time)
 XGROUP CREATE chat:inbox:{token_hash} coordinator-group 0 MKSTREAM
 
-# Coordinator 消费 (阻塞等待)
+# Coordinator consumes (blocking wait)
 XREADGROUP GROUP coordinator-group worker-1 COUNT 10 BLOCK 30000
   STREAMS chat:inbox:{token_hash} >
 
-# 处理成功后 ACK
+# ACK after successful processing
 XACK chat:inbox:{token_hash} coordinator-group {message_id}
 
-# 崩溃恢复: 读取未 ACK 的消息
+# Crash recovery: read un-ACKed messages
 XREADGROUP GROUP coordinator-group worker-1 COUNT 10
   STREAMS chat:inbox:{token_hash} 0
 ```
 
-对比：
+Comparison:
 
 | | v3 (LIST) | v4 (Streams) |
 |---|---|---|
-| 消费崩溃 | 消息丢失 | 未 ACK 的自动重投 |
-| 多消费者 | 抢消息 | Consumer Group 分配 |
-| 历史回溯 | 不可能 | XRANGE 按时间查 |
-| 监控 | LLEN | XINFO GROUPS / XPENDING |
+| Consumer crash | Message lost | Un-ACKed messages auto-redelivered |
+| Multiple consumers | Race for messages | Consumer Group distributes |
+| Historical replay | Not possible | XRANGE query by time |
+| Monitoring | LLEN | XINFO GROUPS / XPENDING |
 
-**关键变更 2：路由表增加 lease 感知**
+**Key Change 2: Routing Table Adds Lease Awareness**
 
 ```python
 def get_route(chat_id):
     route = redis.get(f"chat:route:{chat_id}")
     if not route:
         return None
-    # 检查 coordinator 是否还活着
+    # Check if coordinator is still alive
     lease = redis.get(f"lease:{route['token_hash']}")
     if not lease:
         route["status"] = "offline"
@@ -290,76 +290,76 @@ def get_route(chat_id):
     return route
 ```
 
-用户发消息时：
-- coordinator online → 正常转发
-- coordinator offline → 提示 "Coordinator 离线，消息已排队，请在电脑上启动 session"
+When user sends a message:
+- coordinator online → forward normally
+- coordinator offline → prompt "Coordinator offline, message queued, please start a session on your computer"
 
-### 第 4 层：缓存/通信层 (Redis)
+### Layer 4: Cache/Communication Layer (Redis)
 
-| 用途 | Key 模式 | 类型 | v4 变更 |
+| Purpose | Key Pattern | Type | v4 Change |
 |------|---------|------|---------|
-| Session 缓存 | session:{id} | STRING | 不变 |
-| Token 映射 | token:{hash} | STRING | **增加 refresh/access 区分** |
-| 分布式锁 | lock:{name} | STRING (NX) | 不变 |
-| 幂等键 | idem:{key} | STRING | 不变 |
-| **消息队列** | chat:inbox:{hash} | **STREAM** | **LIST → STREAM** |
-| 路由表 | chat:route:{cid} | STRING | 不变 |
-| 反向路由 | chat:reverse:{hash} | STRING | 不变 |
-| 事件通知 | gov:events:{pid} | Pub/Sub | **降级为 best-effort** |
-| **事件流** | gov:stream:{pid} | **STREAM** | **新增：持久化事件** |
-| **Agent 租约** | lease:{token_hash} | **STRING (EX)** | **新增** |
-| **Worker 锁** | worker:{hash}:owner | **STRING (NX EX)** | **新增：单消费者** |
+| Session Cache | session:{id} | STRING | Unchanged |
+| Token Mapping | token:{hash} | STRING | **Added refresh/access distinction** |
+| Distributed Lock | lock:{name} | STRING (NX) | Unchanged |
+| Idempotency Key | idem:{key} | STRING | Unchanged |
+| **Message Queue** | chat:inbox:{hash} | **STREAM** | **LIST → STREAM** |
+| Routing Table | chat:route:{cid} | STRING | Unchanged |
+| Reverse Route | chat:reverse:{hash} | STRING | Unchanged |
+| Event Notifications | gov:events:{pid} | Pub/Sub | **Downgraded to best-effort** |
+| **Event Stream** | gov:stream:{pid} | **STREAM** | **New: persistent events** |
+| **Agent Lease** | lease:{token_hash} | **STRING (EX)** | **New** |
+| **Worker Lock** | worker:{hash}:owner | **STRING (NX EX)** | **New: single consumer** |
 
-### 第 5 层：执行层 (宿主机)
+### Layer 5: Execution Layer (Host Machine)
 
-**关键变更：Message Worker 替代纯 Scheduled Task**
+**Key Change: Message Worker Replaces Pure Scheduled Task**
 
 ```
-┌─ Message Worker (常驻进程) ─────────────────────┐
-│                                                  │
-│  主循环:                                          │
-│    XREADGROUP BLOCK 30000 → 有消息 → 处理 → ACK  │
-│    30 秒无消息 → 续租约 → 继续 BLOCK              │
-│    lease 过期 → 检查是否有交互式 session 接管      │
-│                                                  │
-│  降级:                                            │
-│    Worker 崩溃 → Cron 兜底 (每 5 分钟检查 XPENDING)│
-│                                                  │
-└──────────────────────────────────────────────────┘
+┌─ Message Worker (Resident Process) ─────────────────────┐
+│                                                          │
+│  Main loop:                                              │
+│    XREADGROUP BLOCK 30000 → has messages → process → ACK│
+│    30 seconds no message → renew lease → continue BLOCK  │
+│    lease expired → check if interactive session takeover │
+│                                                          │
+│  Degradation:                                            │
+│    Worker crashes → Cron fallback (checks XPENDING every 5 min)│
+│                                                          │
+└──────────────────────────────────────────────────────────┘
 ```
 
-两种消费模式并存：
+Two consumption modes coexist:
 
-| 模式 | 触发 | 延迟 | 用途 |
+| Mode | Trigger | Latency | Purpose |
 |------|------|------|------|
-| **交互式 Session** | 人类启动 Claude Code | 实时 | ChatProxy 直接 XREADGROUP |
-| **Message Worker** | 常驻/Scheduled Task | <1秒 (BLOCK) | 无人时自动处理 |
-| **Cron 兜底** | 每 5 分钟 | 5 分钟 | Worker 也挂了时的最后防线 |
+| **Interactive Session** | Human starts Claude Code | Real-time | ChatProxy directly uses XREADGROUP |
+| **Message Worker** | Resident/Scheduled Task | <1 second (BLOCK) | Auto-process when unattended |
+| **Cron Fallback** | Every 5 minutes | 5 minutes | Last resort when Worker also fails |
 
-互斥保证（单消费者）：
+Mutual exclusion guarantee (single consumer):
 ```python
-# Worker 启动时获取锁
+# Worker acquires lock on startup
 acquired = redis.set(f"worker:{token_hash}:owner", worker_id, nx=True, ex=60)
 if not acquired:
-    # 其他 worker 或交互式 session 在消费
+    # Another worker or interactive session is consuming
     log.info("Another consumer active, standing by")
     return
 
-# 每 30 秒续锁
+# Renew lock every 30 seconds
 redis.expire(f"worker:{token_hash}:owner", 60)
 
-# 退出时释放
+# Release on exit
 redis.delete(f"worker:{token_hash}:owner")
 ```
 
-## 四、Session Context（v4 修订）
+## IV. Session Context (v4 Revision)
 
-### 4.1 从 replace 改为 Snapshot + Log
+### 4.1 Changed from replace to Snapshot + Log
 
 ```
-session_snapshot (replace, 最新快照)
+session_snapshot (replace, latest snapshot)
     │
-    │  每次保存覆盖
+    │  Overwritten on each save
     │
     ├── coordinator_token
     ├── chat_id
@@ -367,22 +367,22 @@ session_snapshot (replace, 最新快照)
     ├── current_focus
     ├── active_nodes
     ├── pending_tasks
-    ├── version: 42          ← 乐观锁
+    ├── version: 42          ← optimistic lock
     ├── updated_at
-    └── recent_messages (最近 20 条, 从 log 压缩)
+    └── recent_messages (last 20, compressed from log)
 
-session_log (append, 追加事件)
+session_log (append, event log)
     │
-    │  每条消息/动作追加
+    │  Append on each message/action
     │
     ├── {type:"msg_in", text:"...", ts:"..."}
     ├── {type:"msg_out", text:"...", ts:"..."}
     ├── {type:"action", action:"verify_update", node:"L1.3", ts:"..."}
-    ├── {type:"decision", content:"先修 A2 再修 A4", ts:"..."}
+    ├── {type:"decision", content:"Fix A2 before A4", ts:"..."}
     └── ...
 ```
 
-### 4.2 保存时乐观锁
+### 4.2 Optimistic Lock on Save
 
 ```python
 def save_context(project_id, context, expected_version):
@@ -396,86 +396,86 @@ def save_context(project_id, context, expected_version):
     upsert_snapshot(project_id, context)
 ```
 
-### 4.3 过期归档
+### 4.3 Expiry Archiving
 
 ```
-Context 24h 不活跃
+Context inactive for 24h
     │
     ▼
-归档 Scheduled Task:
-    1. 读 session_log
-    2. 提取有价值条目:
-       - type:"decision" → 写入长期 verify_decision
-       - type:"action" + 失败 → 写入 pitfall
-       - type:"msg_in" 涉及架构 → 写入 architecture
-    3. 压缩 log 为 session_summary → 写入长期记忆
-    4. 清除过期 snapshot + log
+Archive Scheduled Task:
+    1. Read session_log
+    2. Extract valuable entries:
+       - type:"decision" → write to long-term verify_decision
+       - type:"action" + failed → write to pitfall
+       - type:"msg_in" involving architecture → write to architecture
+    3. Compress log to session_summary → write to long-term memory
+    4. Clear expired snapshot + log
 ```
 
-## 五、Coordinator Session 生命周期（v4 修订）
+## V. Coordinator Session Lifecycle (v4 Revision)
 
-### 5.1 交互式 Session
+### 5.1 Interactive Session
 
 ```
-人类启动 Claude Code
+Human starts Claude Code
     │
     ▼
 [INIT]
-    │  POST /api/token/refresh {refresh_token}  ← 换 access_token
-    │  GET /api/docs/quickstart                 ← 接入指南
-    │  GET context snapshot                     ← 恢复上次状态
-    │  POST /api/agent/register                 ← 注册 + 拿 lease
-    │  ChatProxy.bind(chat_id)                  ← 绑定 Telegram
-    │  获取 worker 锁 (NX)                      ← 接管消息消费
-    │  XREADGROUP 0 → 消费未 ACK 消息            ← 恢复崩溃残留
+    │  POST /api/token/refresh {refresh_token}  ← Exchange for access_token
+    │  GET /api/docs/quickstart                 ← Onboarding guide
+    │  GET context snapshot                     ← Restore last state
+    │  POST /api/agent/register                 ← Register + get lease
+    │  ChatProxy.bind(chat_id)                  ← Bind Telegram
+    │  Acquire worker lock (NX)                 ← Take over message consumption
+    │  XREADGROUP 0 → consume un-ACKed messages ← Recover crash residuals
     │
     ▼
 [ACTIVE]
     │  ┌─────────────────────────────────────────┐
-    │  │  输入:                                   │
-    │  │    终端 / ChatProxy(Stream) / Gov事件    │
+    │  │  Input:                                 │
+    │  │    Terminal / ChatProxy(Stream) / Gov events│
     │  │                                         │
-    │  │  处理:                                   │
-    │  │    governance API / dbservice / CLI      │
+    │  │  Processing:                            │
+    │  │    governance API / dbservice / CLI     │
     │  │                                         │
-    │  │  输出:                                   │
-    │  │    /gateway/reply / 代码变更 / 状态更新   │
+    │  │  Output:                                │
+    │  │    /gateway/reply / code changes / status updates│
     │  │                                         │
-    │  │  持续:                                   │
-    │  │    heartbeat 续租 (每 2 分钟)             │
-    │  │    worker 锁续期 (每 30 秒)              │
-    │  │    session_log 追加 (每次动作)            │
-    │  │    snapshot 保存 (每 5 分钟或重要动作后)  │
+    │  │  Continuously:                          │
+    │  │    heartbeat renewal (every 2 minutes)  │
+    │  │    worker lock renewal (every 30 seconds)│
+    │  │    session_log append (every action)    │
+    │  │    snapshot save (every 5 min or after important actions)│
     │  └─────────────────────────────────────────┘
     │
     ▼
-[SUSPEND] (人类暂时离开)
-    │  save snapshot (带 version)
-    │  释放 worker 锁 → Message Worker 可接管
-    │  heartbeat 继续 → lease 不过期
-    │  ChatProxy 继续监听 → 消息入 Stream 排队
+[SUSPEND] (Human temporarily away)
+    │  save snapshot (with version)
+    │  release worker lock → Message Worker can take over
+    │  heartbeat continues → lease does not expire
+    │  ChatProxy continues listening → messages queue in Stream
     │
     ▼
 [RESUME]
-    │  获取 worker 锁
+    │  acquire worker lock
     │  load snapshot
-    │  XREADGROUP 0 → 消费积压
-    │  继续工作
+    │  XREADGROUP 0 → consume backlog
+    │  continue working
     │
     ▼
 [EXIT]
     │  save snapshot (final)
-    │  POST /api/agent/deregister → 释放 lease
-    │  释放 worker 锁
+    │  POST /api/agent/deregister → release lease
+    │  release worker lock
     │  ChatProxy.stop()
-    │  → Gateway 下次检查 lease → offline
-    │  → 用户消息 → "Coordinator 离线，消息已排队"
+    │  → Gateway next lease check → offline
+    │  → User message → "Coordinator offline, message queued"
 ```
 
-### 5.2 Message Worker (常驻)
+### 5.2 Message Worker (Resident)
 
 ```
-启动 (systemd / Scheduled Task / 手动)
+Start (systemd / Scheduled Task / manual)
     │
     ▼
 [INIT]
@@ -483,88 +483,88 @@ Context 24h 不活跃
     │  POST /api/agent/register → lease
     │
     ▼
-[STANDBY] 等待 worker 锁
-    │  尝试 SET worker:{hash}:owner NX EX 60
-    │  ├── 获取到 → 进入 CONSUME
-    │  └── 未获取 → 交互式 session 在消费
-    │       sleep 30s → 重试
+[STANDBY] Waiting for worker lock
+    │  Attempt SET worker:{hash}:owner NX EX 60
+    │  ├── Acquired → enter CONSUME
+    │  └── Not acquired → interactive session is consuming
+    │       sleep 30s → retry
     │
     ▼
-[CONSUME] 阻塞消费循环
+[CONSUME] Blocking consumption loop
     │  while True:
     │    XREADGROUP BLOCK 30000 COUNT 5
-    │    ├── 有消息:
+    │    ├── Has messages:
     │    │   load context snapshot
-    │    │   POST dbservice /assemble-context (可降级)
-    │    │   逐条处理 → ACK
+    │    │   POST dbservice /assemble-context (can degrade)
+    │    │   process each → ACK
     │    │   save context snapshot
     │    │   POST /gateway/reply
     │    │
-    │    ├── 无消息 (30s 超时):
-    │    │   续 lease heartbeat
-    │    │   续 worker 锁
+    │    ├── No messages (30s timeout):
+    │    │   renew lease heartbeat
+    │    │   renew worker lock
     │    │   continue
     │    │
-    │    └── worker 锁被抢 (交互式 session 启动):
-    │        释放 → 回到 STANDBY
+    │    └── Worker lock taken (interactive session starts):
+    │        release → return to STANDBY
     │
     ▼
 [EXIT]
-    │  释放 worker 锁 + lease
-    │  → Cron 兜底 5 分钟后接管
+    │  release worker lock + lease
+    │  → Cron fallback takes over after 5 minutes
 ```
 
-### 5.3 Cron 兜底
+### 5.3 Cron Fallback
 
 ```python
-# 每 5 分钟执行
-# 检查是否有未消费的消息且无活跃 worker
+# Execute every 5 minutes
+# Check if there are unconsumed messages and no active worker
 
 def cron_fallback():
     for token_hash in get_all_coordinator_hashes():
-        # 检查是否有活跃 worker
+        # Check if there is an active worker
         owner = redis.get(f"worker:{token_hash}:owner")
         if owner:
-            continue  # 有人在消费
+            continue  # Someone is consuming
 
-        # 检查 XPENDING
+        # Check XPENDING
         pending = redis.xpending(f"chat:inbox:{token_hash}", "coordinator-group")
         if pending["count"] > 0:
             log.warning("Orphaned messages found for %s, processing", token_hash)
-            # 认领并处理
+            # Claim and process
             claim_and_process(token_hash)
 
-        # 检查新消息 (未被任何 group 读取)
+        # Check new messages (not read by any group)
         info = redis.xinfo_stream(f"chat:inbox:{token_hash}")
         if info["length"] > 0:
             process_new_messages(token_hash)
 ```
 
-## 六、可观测性
+## VI. Observability
 
-### 6.1 Trace ID 串联
+### 6.1 Trace ID Chaining
 
 ```
-用户 Telegram 消息
-    │ trace_id = "tr-{uuid}"  ← Gateway 生成
+User Telegram message
+    │ trace_id = "tr-{uuid}"  ← Generated by Gateway
     ▼
-Gateway 日志: [tr-xxx] msg from 7848961760: "查 L1.3"
+Gateway log: [tr-xxx] msg from 7848961760: "query L1.3"
     │
     ▼
 Redis Stream: message_id + trace_id
     │
     ▼
-Worker 日志: [tr-xxx] processing message
+Worker log: [tr-xxx] processing message
     │
     ├─▶ Governance: [tr-xxx] GET /api/wf/amingClaw/node/L1.3
     ├─▶ dbservice:  [tr-xxx] /knowledge/find?tags=L1.3
     └─▶ Gateway:    [tr-xxx] POST /gateway/reply
          │
          ▼
-Telegram 回复 [tr-xxx] 完成
+Telegram reply [tr-xxx] complete
 ```
 
-### 6.2 结构化日志格式
+### 6.2 Structured Log Format
 
 ```json
 {
@@ -581,19 +581,19 @@ Telegram 回复 [tr-xxx] 完成
 }
 ```
 
-### 6.3 关键指标
+### 6.3 Key Metrics
 
-| 指标 | 来源 | 告警阈值 |
+| Metric | Source | Alert Threshold |
 |------|------|---------|
-| inbox 积压消息数 | XLEN chat:inbox:* | > 50 |
-| 未 ACK 消息数 | XPENDING | > 10 持续 5 分钟 |
-| outbox 未投递数 | SELECT COUNT WHERE delivered_at IS NULL | > 20 |
-| 死信数 | SELECT COUNT WHERE dead_letter = 1 | > 0 |
-| Agent 孤儿数 | /api/agent/orphans | > 0 持续 10 分钟 |
-| dbservice 降级次数 | 日志计数 | > 5/分钟 |
-| 消息端到端延迟 | trace_id 首尾时间差 | > 60 秒 |
+| inbox backlog message count | XLEN chat:inbox:* | > 50 |
+| Un-ACKed message count | XPENDING | > 10 for 5 minutes |
+| outbox undelivered count | SELECT COUNT WHERE delivered_at IS NULL | > 20 |
+| Dead letter count | SELECT COUNT WHERE dead_letter = 1 | > 0 |
+| Agent orphan count | /api/agent/orphans | > 0 for 10 minutes |
+| dbservice degradation count | Log count | > 5/minute |
+| Message end-to-end latency | trace_id start/end time diff | > 60 seconds |
 
-## 七、Docker Compose（v4 完整）
+## VII. Docker Compose (v4 Complete)
 
 ```yaml
 services:
@@ -614,7 +614,7 @@ services:
     environment:
       - GOVERNANCE_PORT=40006
       - REDIS_URL=redis://redis:6379/0
-      - DBSERVICE_URL=http://dbservice:40002  # 新增
+      - DBSERVICE_URL=http://dbservice:40002  # new
       - SHARED_VOLUME_PATH=/app/shared-volume
     depends_on:
       redis: { condition: service_healthy }
@@ -638,10 +638,10 @@ services:
       redis: { condition: service_healthy }
     restart: unless-stopped
 
-  dbservice:                          # 新增
+  dbservice:                          # new
     build: { context: ./dbservice }
     expose: ["40002"]
-    ports: ["40002:40002"]            # 宿主机也需要访问
+    ports: ["40002:40002"]            # host also needs access
     volumes:
       - memory-data:/app/db
     environment:
@@ -670,11 +670,11 @@ services:
 volumes:
   governance-data: { driver: local }
   redis-data: { driver: local }
-  memory-data: { driver: local }       # 新增
+  memory-data: { driver: local }       # new
   task-data: { driver: local }
 ```
 
-## 八、Nginx 路由（v4 完整）
+## VIII. Nginx Routing (v4 Complete)
 
 ```nginx
 upstream governance       { server governance:40006; }
@@ -688,9 +688,9 @@ server {
 
     location /api/     { proxy_pass http://governance/api/; ... }
     location /gateway/ { proxy_pass http://telegram-gateway/gateway/; ... }
-    location /memory/  { proxy_pass http://dbservice/; ... }       # 新增
+    location /memory/  { proxy_pass http://dbservice/; ... }       # new
 
-    # dev (按需)
+    # dev (on demand)
     location /dev/api/ {
         set $dev governance-dev:40007;
         proxy_pass http://$dev/api/; ...
@@ -698,60 +698,60 @@ server {
 }
 ```
 
-## 九、实施路线（v4 重排）
+## IX. Implementation Roadmap (v4 Reordered)
 
-### P0：地基（立即）
+### P0: Foundation (Immediate)
 
-1. **Redis Streams 消息队列**
-   - Gateway: XADD 替代 LPUSH
-   - ChatProxy: XREADGROUP 替代 RPOP
+1. **Redis Streams Message Queue**
+   - Gateway: XADD replaces LPUSH
+   - ChatProxy: XREADGROUP replaces RPOP
    - Consumer Group + ACK
 
 2. **Event Outbox**
-   - outbox 表 + 后台 worker
-   - Pub/Sub 降级为 best-effort 通知
+   - outbox table + background worker
+   - Pub/Sub downgraded to best-effort notification
 
-3. **双令牌模型**
+3. **Dual-Token Model**
    - /api/token/refresh, /api/token/revoke
    - access_token 4h + refresh_token 90d
 
 4. **Agent Lifecycle**
    - register/heartbeat/deregister/orphans
-   - lease 租约 + 过期检测
+   - Lease mechanism + expiry detection
 
-### P1：一致性（紧接）
+### P1: Consistency (Next)
 
 5. **Session Context snapshot + log + version**
-   - 乐观锁防覆盖
-   - append log 防丢失
+   - Optimistic lock prevents overwrite
+   - Append log prevents data loss
 
-6. **dbservice Docker 化**
-   - 加入 compose
-   - 注册 dev-workflow domain pack
-   - 降级策略
+6. **dbservice Dockerize**
+   - Add to compose
+   - Register dev-workflow domain pack
+   - Degradation strategy
 
 7. **Message Worker**
-   - 阻塞消费 + 租约 + Cron 兜底
-   - 单消费者互斥
+   - Blocking consume + lease + Cron fallback
+   - Single consumer mutual exclusion
 
-8. **可观测性**
-   - trace_id 串联
-   - 结构化日志
-   - 关键指标监控
+8. **Observability**
+   - trace_id chaining
+   - Structured logging
+   - Key metrics monitoring
 
-### P2：能力增强
+### P2: Capability Enhancement
 
-9. **Context Assembly 集成**
-10. **过期上下文自动归档**
-11. **Governance memory → dbservice 代理**
-12. **Task registry (文件 → 表)**
+9. **Context Assembly integration**
+10. **Expired context auto-archiving**
+11. **Governance memory → dbservice proxy**
+12. **Task registry (file → table)**
 
-### P3：Workflow 功能
+### P3: Workflow Features
 
-13. **import-graph 同步状态**
-14. **Agent 友好错误信息**
-15. **状态跳级 API**
+13. **import-graph sync status**
+14. **Agent friendly error messages**
+15. **Status skip API**
 16. **Release Profile**
-17. **Gate 策略化**
-18. **影响分析策略化**
-19. **向量检索按需启用**
+17. **Gate policy**
+18. **Impact analysis policy**
+19. **Vector retrieval on demand**

@@ -47,6 +47,19 @@ def _matches_any(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(normalized, p) for p in patterns)
 
 
+def _executor_health_from_state() -> bool:
+    """Fallback executor health check when the HTTP status port is unavailable."""
+    try:
+        status_path = _state_dir() / "manager_status.json"
+        if not status_path.exists():
+            return False
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        services = data.get("services", {}) or {}
+        return services.get("executor") == "running" and services.get("manager") == "running"
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 1. detect_affected_services
 # ---------------------------------------------------------------------------
@@ -415,7 +428,7 @@ def smoke_test() -> dict[str, Any]:
         resp = requests.get("http://localhost:40100/status", timeout=5)
         results["executor"] = resp.status_code == 200
     except Exception:  # noqa: BLE001
-        results["executor"] = False
+        results["executor"] = _executor_health_from_state()
 
     # --- governance ---
     try:

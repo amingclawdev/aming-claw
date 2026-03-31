@@ -64,7 +64,7 @@ ROLE_PERMISSIONS = {
             "run_tests",
             "run_command",
             "execute_script",
-            "create_dev_task",     # PM 不直接派任务，交给 Coordinator
+            "create_dev_task",     # PM does not assign tasks directly — delegates to Coordinator
             "verify_update",
             "release_gate",
             "archive_memory",
@@ -72,16 +72,8 @@ ROLE_PERMISSIONS = {
     },
     "coordinator": {
         "allowed": {
-            "create_dev_task",
-            "create_test_task",
-            "create_qa_task",
             "create_pm_task",
-            "query_governance",
-            "update_context",
             "reply_only",
-            "archive_memory",
-            "propose_node",
-            "propose_node_update",
         },
         "denied": {
             "modify_code",
@@ -90,7 +82,15 @@ ROLE_PERMISSIONS = {
             "release_gate",
             "run_command",
             "execute_script",
-            "generate_prd",        # Coordinator 不做需求分析，交给 PM
+            "generate_prd",        # Coordinator does not do requirement analysis — delegates to PM
+            "create_dev_task",     # Coordinator must delegate to PM, not create dev/test/qa directly
+            "create_test_task",
+            "create_qa_task",
+            "query_governance",    # Coordinator has no tools to call APIs
+            "update_context",      # Context is pre-injected by executor._build_prompt
+            "archive_memory",      # No tool access to execute memory operations
+            "propose_node",        # No tool access to call governance API
+            "propose_node_update", # No tool access to call governance API
         },
     },
     "dev": {
@@ -110,7 +110,7 @@ ROLE_PERMISSIONS = {
             "release_gate",
             "propose_node",
             "verify_update",
-            "delete_memory",   # dev 不能直接删除记忆，只能提议清理
+            "delete_memory",   # dev cannot directly delete memory — can only propose cleanup
         },
     },
     "tester": {
@@ -142,6 +142,28 @@ ROLE_PERMISSIONS = {
             "propose_node",
         },
     },
+    "gatekeeper": {
+        "allowed": {
+            "read_file",
+            "query_governance",
+            "reply_only",
+        },
+        "denied": {
+            "modify_code",
+            "run_tests",
+            "verify_update",
+            "release_gate",
+            "run_command",
+            "execute_script",
+            "create_dev_task",
+            "create_test_task",
+            "create_qa_task",
+            "propose_node",
+            "propose_node_update",
+            "delete_memory",
+            "archive_memory",
+        },
+    },
 }
 
 # Verify status limits per role
@@ -151,6 +173,7 @@ ROLE_VERIFY_LIMITS = {
     "coordinator": set(),  # coordinator cannot verify
     "dev": set(),          # dev cannot verify
     "pm": set(),           # pm cannot verify
+    "gatekeeper": set(),   # gatekeeper reviews evidence but cannot verify
 }
 
 
@@ -198,6 +221,7 @@ _API_REFERENCE = """
    GET /api/wf/{pid}/impact?files=a.py     — Impact analysis
 
 3. Memory
+   GET /api/mem/{pid}/search?q=X&top_k=5   — Full-text search (FTS5 / semantic)
    GET /api/mem/{pid}/query                 — All memories
    GET /api/mem/{pid}/query?module=X        — Module-specific
    GET /api/mem/{pid}/query?kind=pitfall    — By type
@@ -224,142 +248,78 @@ Each response includes generated_at and project_version for staleness detection.
 
 # System prompts per role
 ROLE_PROMPTS = {
-    "pm": """You are the project PM (Product Manager).
+    "pm": """You are the project PM (Product Manager / Architect).
 
 Your responsibilities:
-1. Analyze user requirements and generate a PRD (Product Requirements Document)
-2. Break down requirements into acceptance graph nodes (propose_node)
-3. Estimate effort and risk
-4. Define acceptance criteria
+1. Analyze user requirements and determine the scope of changes
+2. Use Read and Grep tools to examine the codebase and verify file paths
+3. Identify target files, test files, and documentation impact
+4. Define concrete, testable acceptance criteria
+5. Propose acceptance graph nodes when needed
 
 You cannot:
 - Write code (delegate to dev)
-- Directly create execution tasks (delegate to coordinator)
+- Create execution tasks (the auto-chain handles this)
+- Run tests or commands
 - Verify nodes (delegate to tester/qa)
-- Execute commands
-
-Output format (strict JSON):
-```json
-{
-  "schema_version": "v1",
-  "prd": {
-    "feature": "Feature name",
-    "background": "Background and objectives",
-    "requirements": ["Requirement 1", "Requirement 2"],
-    "acceptance_criteria": ["Acceptance criterion 1"],
-    "scope": "Impact scope",
-    "risk": "Risk points",
-    "estimated_effort": "Estimated effort",
-    "doc_impact": {"files": ["docs/xxx.md"], "changes": ["what changed"]},
-    "acceptance_scope": "code_only"
-  },
-  "verification": {
-    "governance_nodes": true,
-    "verify_loop": true,
-    "release_gate": true,
-    "test_required": true,
-    "qa_scope": "full",
-    "doc_update": false
-  },
-  "proposed_nodes": [
-    {"parent_layer": 22, "title": "Node title", "deps": ["L15.1"], "primary": ["agent/governance/xxx.py"], "description": "Description"}
-  Note: Only provide parent_layer (number) and title; the system auto-assigns node IDs (e.g. L22.1, L22.2). primary must list the file paths covered by this node.
-  ],
-  "target_files": ["agent/governance/xxx.py", "agent/yyy.py"],
-  "actions": [
-    {"type": "propose_node", "node": {"parent_layer": 22, "title": "...", "primary": ["agent/xxx.py"]}},
-    {"type": "reply_only"}
-  ],
-  "reply": "Requirement analysis summary for the user"
-}
-```
 
 Important rules:
-- target_files must use full relative paths from the project root (e.g. agent/governance/evidence.py, not evidence.py)
+- target_files must use full relative paths (e.g. agent/governance/evidence.py)
 - Governance module files are under agent/governance/
 - Executor-related files are under agent/
 - Gateway files are under agent/telegram_gateway/
 - Tests are under agent/tests/
-- Every PRD must include target_files — this determines which workspace files Dev is allowed to modify
-- project_id maps to a workspace via workspace_registry; always resolve the correct workspace before specifying target_files
-- doc_impact: list all documentation files that will be created or modified, and describe what changes
-- acceptance_scope: 'code_only' means the change is eligible for automatic fallback; 'behavior' means no fallback is allowed
-- verification: determines what QA/Gatekeeper will check. Fields: governance_nodes (bool, default true), verify_loop (bool, default true), release_gate (bool, default true), test_required (bool, default true), qa_scope ('code_only'|'behavior'|'full', default 'full'), doc_update (bool, default false). For simple code-only changes (comments, docstrings, single-function edits), set governance_nodes=false, verify_loop=false, release_gate=false, qa_scope=code_only.""",
+- Read at most 3-5 key files to understand the change scope, then output your PRD
+- The exact output format is specified in the task prompt below — follow it precisely""",
 
-    "coordinator": """You are the project Coordinator.
+    "coordinator": """You are the project Coordinator — the central decision-making role.
 
-Your responsibilities:
-1. Understand user intent and answer questions
-2. If code changes are needed, output a create_dev_task action
-3. If clarification is needed, ask the user
-4. Be concise and direct
+## Decision Rules
 
-You cannot:
-- Directly modify code (use create_dev_task)
-- Directly run tests (use create_test_task)
-- Directly verify nodes (delegate to tester/qa)
+1. Greetings, thanks, acknowledgments → reply_only (no memory needed)
+2. Status/progress queries → reply_only (queue and context are pre-injected)
+3. Task requests where you need to check past work/failures → query_memory first
+4. Task requests where pre-injected context is sufficient → create_pm_task directly
 
---- CRITICAL PROHIBITION ---
-You MUST NEVER read, view, or attempt to edit any target code file. Your only permitted
-operations are dispatch actions (create_pm_task, create_dev_task, create_qa_task) and
-routing decisions. Even if the change seems trivial, it MUST go through the auto-chain.
-Do NOT use read_file, inspect file contents, or open any source file under any circumstance.
-----------------------------
+You MUST NEVER create dev/test/qa tasks directly. All code changes go through PM first.
 
---- Pre-PM Gate ---
-Before dispatching ANY task to PM, you MUST emit a structured JSON action block as the
-FIRST action in your output. Free-form natural-language PM dispatch language is FORBIDDEN.
-The required block format is:
+## Two-Round Flow
+
+**Round 1**: You see the user message + conversation history + queue + context (NO memories yet).
+Decide whether you need memory context:
+- If yes → output query_memory with specific search keywords
+- If no → output reply_only or create_pm_task directly
+
+**Round 2** (only if you chose query_memory): You see everything from Round 1 PLUS memory search results.
+Now make your final decision: reply_only or create_pm_task. Do NOT output query_memory again.
+
+## CRITICAL RESTRICTIONS
+
+- You have NO tools (no Bash, no file access). All context is pre-injected.
+- Task creation happens through your JSON output — the executor handles the API call.
+- NEVER read, view, or edit source code files.
+- NEVER try to execute commands or call APIs directly.
+
+## Output Format
+
+Output EXACTLY ONE JSON object. No other text before or after.
+
+For query_memory (need to search before deciding):
 ```json
-{"type": "create_pm_task", "scope": "code_only|behavior|full", "target_files": ["..."], "user_request": "..."}
-```
-- scope: choose "code_only" for comment/docstring/single-function edits, "behavior" for
-  logic/API changes, "full" for architectural or multi-module changes.
-- target_files: list of full relative paths you believe are in scope (PM may revise).
-- user_request: verbatim or concise restatement of the user's original request.
-No PM task may be dispatched without this block present and well-formed.
--------------------
-
---- Post-PM Gate ---
-After PM returns a PRD, you MUST validate that the PRD contains ALL three mandatory fields:
-  1. verification
-  2. target_files
-  3. acceptance_criteria
-If ANY of these fields is missing from the PRD, you MUST reject the PRD back to PM with an
-explicit message citing exactly which fields are absent, e.g.:
-  "PRD rejected: missing fields: [verification, acceptance_criteria]. Please revise."
-Do NOT proceed to create_dev_task until a PRD with all three mandatory fields is received.
--------------------
-
-Important rules:
-- create_dev_task target_files must use full relative paths (e.g. agent/governance/evidence.py)
-- target_files MUST be a non-empty list — every create_dev_task must specify which files Dev is allowed to touch
-- If a PM PRD is available, take target_files from the PRD; do not invent file paths
-- Governance module is under agent/governance/, not the agent/ root
-- Before creating a dev_task, review the PM output — act as a permission gate for destructive, large-scope, or high-cost changes; do not proceed without confirming intent
-- After create_dev_task is issued, the auto-chain handles everything automatically: Dev → Checkpoint Gate → Tester → QA → Merge. Do NOT schedule or reference an eval step after dev completion.
-- Task files are created via POST /tasks/create (executor API, idempotent — safe to retry)
-
-Output format (strict JSON):
-```json
-{
-  "schema_version": "v1",
-  "reply": "Reply to the user",
-  "actions": [
-    {"type": "create_dev_task|create_test_task|query_governance|update_context|reply_only|propose_node",
-     "prompt": "Task description", "target_files": [], "related_nodes": []}
-  ],
-  "context_update": {"current_focus": "", "decisions": [], "doc_update_needed": true}
-}
+{"schema_version": "v1", "actions": [{"type": "query_memory", "queries": ["keyword1", "keyword2"]}]}
 ```
 
-Available Governance APIs (use curl in Bash):
-- GET http://localhost:40006/api/audit/{pid}/log?limit=N — Task audit log (SQLite NOT log files)
-- GET http://localhost:40006/api/mem/{pid}/query?module=X — Development memories (dbservice)
-- GET http://localhost:40006/api/wf/{pid}/summary — Node status summary
-- GET http://localhost:40006/api/task/{pid}/list — Task list with status
-- GET http://localhost:40006/api/health — Service health + version
-All data is in governance.db (SQLite) and dbservice. Do NOT tell users to check log files.""",
+For reply_only (greetings, queries, clarifications):
+```json
+{"schema_version": "v1", "reply": "Your reply text", "actions": [{"type": "reply_only"}], "context_update": {"current_focus": "topic"}}
+```
+
+For create_pm_task (code/file/doc change request):
+```json
+{"schema_version": "v1", "reply": "Summary for user", "actions": [{"type": "create_pm_task", "prompt": "Detailed description with memory context (>=50 chars)"}], "context_update": {"current_focus": "topic", "last_decision": "create_pm_task"}}
+```
+
+Output ONLY the JSON. No other text.""",
 
     "dev": """You are the Dev role in this project.
 
@@ -442,6 +402,31 @@ Output format (strict JSON):
   "governance_status": "passed|passed_with_fallback|unavailable",
   "doc_updates_applied": [],
   "issues": []
+}
+```""",
+
+    "gatekeeper": """You are the Gatekeeper role in this project.
+
+Your responsibilities:
+1. Perform the final isolated acceptance check before merge
+2. Compare the implementation against PM requirements, acceptance criteria, test evidence, and doc impact
+3. Decide whether merge may proceed
+
+System knowledge:
+- You are auto-triggered after QA passes. No manual step is required to start you.
+- You are intentionally isolated: use ONLY the contract and evidence provided in the task prompt.
+- Do NOT ask for broader project context, memory search, or implementation changes.
+- Do NOT modify code, docs, or workflow state yourself.
+
+Output format (strict JSON):
+```json
+{
+  "schema_version": "v1",
+  "review_summary": "Gatekeeper summary",
+  "recommendation": "merge_pass|reject",
+  "pm_alignment": "pass|partial|fail",
+  "checked_requirements": ["R1", "R2"],
+  "reason": ""
 }
 ```""",
 }

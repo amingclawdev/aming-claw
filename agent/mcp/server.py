@@ -111,10 +111,11 @@ class AmingClawMCP:
     """MCP Server main class."""
 
     def __init__(self, project_id: str, governance_url: str, workspace: str,
-                 redis_url: str, max_workers: int = 0):
+                 redis_url: str, max_workers: int = 0, autostart_executor: bool = False):
         self.project_id = project_id
         self.gov_url = governance_url.rstrip("/")
         self._workspace = workspace
+        self._autostart_executor = autostart_executor
 
         # Worker pool — only if explicitly requested (default: 0 = no workers)
         # Executor should run as independent process to avoid blocking MCP stdio
@@ -134,17 +135,22 @@ class AmingClawMCP:
             notify_fn=self._on_redis_event,
         )
 
-        # Service manager — manages executor_worker subprocess lifecycle
-        from service_manager import ServiceManager
-        self.service_mgr = ServiceManager(
-            project_id=project_id,
-            governance_url=governance_url,
-            executor_cmd=[
-                sys.executable, "-m", "agent.executor_worker",
-                "--project", project_id,
-                "--url", governance_url,
-            ],
-        )
+        # Service manager is only constructed when this MCP session explicitly
+        # owns executor lifecycle. Ad-hoc MCP sessions should stay read/control
+        # only and must not have any path that can accidentally spawn a worker.
+        self.service_mgr = None
+        if self._autostart_executor:
+            from service_manager import ServiceManager
+            self.service_mgr = ServiceManager(
+                project_id=project_id,
+                governance_url=governance_url,
+                executor_cmd=[
+                    sys.executable, str(Path(__file__).resolve().parents[1] / "executor_worker.py"),
+                    "--project", project_id,
+                    "--url", governance_url,
+                    "--workspace", workspace,
+                ],
+            )
 
         # Tool dispatcher (worker_pool may be None — executor tools return status only)
         self.dispatcher = ToolDispatcher(
@@ -164,9 +170,13 @@ class AmingClawMCP:
         self.event_bridge.start()
         # Note: :40020 HTTP removed — executor syncs git status via governance API
 
-        # Auto-start executor subprocess
-        self.service_mgr.start()
-        log.info("Executor subprocess started via ServiceManager")
+        # Optional host-side executor ownership. Default off so ad-hoc MCP
+        # sessions do not accidentally spawn duplicate queue consumers.
+        if self._autostart_executor:
+            self.service_mgr.start()
+            log.info("Executor subprocess started via ServiceManager")
+        else:
+            log.info("Executor autostart disabled for this MCP session")
 
         # Read stdin (JSON-RPC messages from Claude Code)
         try:
@@ -214,7 +224,8 @@ class AmingClawMCP:
 
     def _shutdown(self) -> None:
         log.info("Shutting down MCP server...")
-        self.service_mgr.stop()
+        if self.service_mgr:
+            self.service_mgr.stop()
         self.event_bridge.stop()
         if self.worker_pool:
             self.worker_pool.stop(timeout=30)
@@ -327,10 +338,16 @@ class AmingClawMCP:
 def main():
     parser = argparse.ArgumentParser(description="Aming Claw MCP Server")
     parser.add_argument("--project", default="aming-claw", help="Project ID")
-    parser.add_argument("--governance-url", default=os.getenv("GOVERNANCE_URL", "http://localhost:40006"))
+    parser.add_argument("--governance-url", default=os.getenv("GOVERNANCE_URL", "http://localhost:40000"))
     parser.add_argument("--workspace", default=os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[2])))
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:40079/0"))
     parser.add_argument("--workers", type=int, default=int(os.getenv("MCP_WORKERS", "1")))
+    parser.add_argument(
+        "--autostart-executor",
+        action="store_true",
+        default=os.getenv("MCP_AUTOSTART_EXECUTOR", "0") == "1",
+        help="Start executor_worker via ServiceManager for this MCP server process",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -345,6 +362,7 @@ def main():
         workspace=args.workspace,
         redis_url=args.redis_url,
         max_workers=args.workers,
+        autostart_executor=args.autostart_executor,
     )
     server.run()
 

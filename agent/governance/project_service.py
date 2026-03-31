@@ -334,6 +334,38 @@ def import_graph(project_id: str, md_path: str) -> dict:
     return result
 
 
+def sync_node_state_from_graph(project_id: str) -> dict:
+    """Rebuild or sync runtime node_state rows from the persisted graph definition.
+
+    This is intended for governance recovery paths. It never infers new business
+    acceptance; it only re-materializes node_state rows from graph.json and
+    import-declared statuses already encoded in the graph.
+    """
+    if not project_exists(project_id):
+        raise ValidationError(f"Project {project_id!r} not registered")
+
+    graph = load_project_graph(project_id)
+
+    conn = get_connection(project_id)
+    try:
+        initialized = state_service.init_node_states(conn, project_id, graph)
+        total = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM node_state WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["cnt"]
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "project_id": project_id,
+        "graph_nodes": graph.node_count(),
+        "node_states_initialized": initialized,
+        "node_state_total": total,
+        "repair_mode": "sync_from_graph",
+    }
+
+
 def load_project_graph(project_id: str) -> AcceptanceGraph:
     from .db import _resolve_project_dir
     project_dir = _resolve_project_dir(project_id)

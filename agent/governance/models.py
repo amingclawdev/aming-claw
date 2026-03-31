@@ -153,6 +153,7 @@ class MemoryEntry:
     applies_when: str = ""        # Applicability condition
     supersedes: Optional[str] = None  # ID of memory this replaces
     related_nodes: list = field(default_factory=list)
+    structured: dict = field(default_factory=dict)
     created_by: str = ""
     created_at: str = ""
     is_active: bool = True
@@ -170,12 +171,13 @@ class MemoryEntry:
     def from_dict(cls, d: dict) -> "MemoryEntry":
         return cls(
             id=d.get("id", ""),
-            module_id=d.get("module_id", ""),
+            module_id=d.get("module_id", d.get("module", "")),
             kind=d.get("kind", d.get("category", "pattern")),
             content=d.get("content", ""),
-            applies_when=d.get("applies_when", ""),
+            applies_when=d.get("applies_when", d.get("summary", "")),
             supersedes=d.get("supersedes"),
             related_nodes=d.get("related_nodes", []),
+            structured=d.get("structured", {}),
             created_by=d.get("created_by", ""),
             created_at=d.get("created_at", ""),
             is_active=d.get("is_active", True),

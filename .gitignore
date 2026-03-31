@@ -141,7 +141,11 @@ vite.config.ts.timestamp-*
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 
 # OpenClaw local outputs
 .openclaw/
 shared-volume/
+.worktrees/
+governance.db
+agent/governance/governance.db

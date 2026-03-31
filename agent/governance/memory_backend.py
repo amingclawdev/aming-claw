@@ -397,11 +397,11 @@ class DockerBackend(LocalBackend):
             try:
                 import urllib.request
                 import urllib.parse
-                url = f"{self.dbservice_url}/search"
+                url = f"{self.dbservice_url}/knowledge/search"
                 data = json.dumps({
                     "query": query,
-                    "top_k": top_k,
-                    "project_id": project_id,
+                    "limit": top_k,
+                    "scope": project_id,
                 }).encode()
                 req = urllib.request.Request(url, data=data,
                     headers={"Content-Type": "application/json"}, method="POST")
@@ -410,22 +410,25 @@ class DockerBackend(LocalBackend):
                 self._dbservice_available = True
                 results = body.get("results", [])
                 if results:
-                    return [
-                        {
-                            "memory_id": r.get("memory_id", r.get("id", "")),
-                            "ref_id": r.get("ref_id", r.get("metadata", {}).get("ref_id", "")),
-                            "kind": r.get("kind", r.get("metadata", {}).get("kind", "")),
-                            "module_id": r.get("module_id", r.get("metadata", {}).get("module_id", "")),
-                            "content": r.get("content", r.get("memory", "")),
-                            "summary": r.get("summary", ""),
-                            "metadata": r.get("metadata", {}),
-                            "version": r.get("version", 1),
-                            "score": r.get("score", 0.0),
+                    log.info("DockerBackend: dbservice returned %d semantic results", len(results))
+                    mapped = []
+                    for r in results:
+                        # dbservice wraps fields in "doc" key
+                        doc = r.get("doc", r)
+                        mapped.append({
+                            "memory_id": doc.get("refId", doc.get("memory_id", "")),
+                            "ref_id": doc.get("refId", ""),
+                            "kind": doc.get("type", doc.get("kind", "")),
+                            "module_id": doc.get("module_id", ""),
+                            "content": doc.get("content", ""),
+                            "summary": doc.get("summary", ""),
+                            "metadata": {},
+                            "version": doc.get("version", 1),
+                            "score": r.get("score", doc.get("confidence", 0.0)),
                             "search_mode": "semantic",
-                            "created_at": r.get("created_at", ""),
-                        }
-                        for r in results
-                    ]
+                            "created_at": doc.get("created_at", ""),
+                        })
+                    return mapped
             except Exception as e:
                 log.warning("DockerBackend: dbservice search failed, falling back to FTS5: %s", e)
                 self._dbservice_available = False
@@ -442,7 +445,7 @@ class DockerBackend(LocalBackend):
                 "refId": entry.get("ref_id", entry.get("memory_id", "")),
                 "type": entry.get("kind", "knowledge"),
                 "title": f"{entry.get('module_id', '')}: {entry.get('kind', '')}",
-                "body": entry.get("content", ""),
+                "content": entry.get("content", ""),
                 "tags": [entry.get("module_id", ""), entry.get("kind", "")],
                 "scope": project_id,
                 "status": "active",

@@ -467,11 +467,11 @@ Not every user message needs a Coordinator AI session. Before creating any coord
 
 | Intent | Detection | Action | Token Cost |
 |--------|-----------|--------|-----------|
-| **greeting** | Keywords: 你好, hi, hello, thanks, 谢谢, ok | Direct reply, no task | 0 |
-| **status_query** | Keywords: 状态, status, 进度, 节点, 多少 | Gateway queries API, replies | 0 |
+| **greeting** | Keywords: hi, hello, thanks, ok | Direct reply, no task | 0 |
+| **status_query** | Keywords: status, progress, nodes, count | Gateway queries API, replies | 0 |
 | **command** | Starts with `/` | Existing handler | 0 |
-| **dangerous** | Keywords: delete, rollback, 删除, deploy | Confirmation flow | 0 |
-| **task_intent** | Keywords: 帮我, 修, 写, 改, fix, add, build | Create coordinator task | ~500-2000 |
+| **dangerous** | Keywords: delete, rollback, deploy | Confirmation flow | 0 |
+| **task_intent** | Keywords: help me, fix, write, change, add, build | Create coordinator task | ~500-2000 |
 | **ambiguous** | No keyword match | Create coordinator task (safe default) | ~500-2000 |
 
 **Principle:** Only create a coordinator task when AI judgment is genuinely needed. Greetings, status checks, and commands should never spawn a Claude CLI session.
@@ -527,11 +527,11 @@ from user message before creating subtasks. Missing mandatory fields = gate reje
 
 ```python
 OP_KEYWORDS = {
-    "add":      ["添加", "新增", "创建", "实现", "add", "create", "implement", "new"],
-    "modify":   ["修改", "更新", "优化", "改", "update", "modify", "optimize", "improve"],
-    "delete":   ["删除", "移除", "去掉", "delete", "remove", "drop"],
-    "refactor": ["重构", "重写", "迁移", "refactor", "rewrite", "migrate"],
-    "test":     ["测试", "验证", "检查", "test", "verify", "check"],
+    "add":      ["add", "create", "implement", "new"],
+    "modify":   ["update", "modify", "optimize", "improve"],
+    "delete":   ["delete", "remove", "drop"],
+    "refactor": ["refactor", "rewrite", "migrate"],
+    "test":     ["test", "verify", "check"],
 }
 ```
 
@@ -800,9 +800,9 @@ def test_duplicate_detection():
     assert decision == "duplicate"
 
 def test_status_query_no_coordinator():
-    """Status query ('当前状态') must NOT create coordinator task."""
+    """Status query ('current status') must NOT create coordinator task."""
     initial_count = count_tasks(type="coordinator")
-    gateway.handle_message(chat_id=123, text="当前状态怎么样")
+    gateway.handle_message(chat_id=123, text="What is the current status")
     after_count = count_tasks(type="coordinator")
     assert after_count == initial_count  # No new coordinator task
 

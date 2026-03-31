@@ -71,6 +71,56 @@ TOOLS: list[dict] = [
             "required": ["project_id", "task_id", "status"],
         },
     },
+    # --- Observer Control ---
+    {
+        "name": "observer_mode",
+        "description": "Enable or disable observer mode. When enabled, all new tasks start as observer_hold and cannot be auto-claimed by executor or auto-chain.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "enabled": {"type": "boolean", "description": "True to enable, False to disable"},
+            },
+            "required": ["project_id", "enabled"],
+        },
+    },
+    {
+        "name": "task_hold",
+        "description": "Put a queued task into observer_hold state — pauses executor pickup and auto-chain progression. Use before claiming a task for manual review.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+            },
+            "required": ["project_id", "task_id"],
+        },
+    },
+    {
+        "name": "task_release",
+        "description": "Release a task from observer_hold back to queued — resumes normal executor and auto-chain flow.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+            },
+            "required": ["project_id", "task_id"],
+        },
+    },
+    {
+        "name": "task_cancel",
+        "description": "Cancel a task (no auto-chain, no retry). Terminal state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "reason": {"type": "string", "description": "Optional cancellation reason"},
+            },
+            "required": ["project_id", "task_id"],
+        },
+    },
     # --- Workflow / Nodes ---
     {
         "name": "wf_summary",
@@ -213,6 +263,23 @@ class ToolDispatcher:
             if args.get("result"):
                 body["result"] = args["result"]
             return self._api("POST", f"/api/task/{pid}/complete", body)
+
+        # --- Observer tools ---
+        if name == "observer_mode":
+            pid = args["project_id"]
+            return self._api("POST", f"/api/project/{pid}/observer-mode", {"enabled": args["enabled"]})
+
+        if name == "task_hold":
+            pid = args["project_id"]
+            return self._api("POST", f"/api/task/{pid}/hold", {"task_id": args["task_id"]})
+
+        if name == "task_release":
+            pid = args["project_id"]
+            return self._api("POST", f"/api/task/{pid}/release", {"task_id": args["task_id"]})
+
+        if name == "task_cancel":
+            pid = args["project_id"]
+            return self._api("POST", f"/api/task/{pid}/cancel", {"task_id": args["task_id"], "reason": args.get("reason", "")})
 
         # --- Workflow tools ---
         if name == "wf_summary":

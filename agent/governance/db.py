@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -229,6 +229,31 @@ def _project_db_path(project_id: str) -> Path:
     return project_dir / "governance.db"
 
 
+def _configure_connection(conn: sqlite3.Connection, busy_timeout: int) -> None:
+    """Apply portable SQLite connection settings.
+
+    Some shared-volume mounts reject WAL creation even when the DB file exists.
+    In that case, fall back to DELETE journal mode so the governance service
+    stays available instead of failing every request.
+    """
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError:
+            pass
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
+    except sqlite3.OperationalError:
+        pass
+
+
 def get_connection(project_id: str) -> sqlite3.Connection:
     """Get a SQLite connection for a project, creating/migrating schema if needed.
 
@@ -274,10 +299,7 @@ def get_connection(project_id: str) -> sqlite3.Connection:
     # SQLite automatically recovers WAL state on first connect, but only
     # if the -shm file is accessible. Increase timeout to handle this.
     conn = sqlite3.connect(str(db_path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=10000")
+    _configure_connection(conn, busy_timeout=10000)
     _ensure_schema(conn)
     return conn
 
@@ -526,7 +548,33 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
             pass  # Column already exists
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(project_id, entity_id)")
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8}
+    def _migrate_v8_to_v9(c):
+        """Add observer_mode flag to project_version for observer takeover support."""
+        try:
+            c.execute("ALTER TABLE project_version ADD COLUMN observer_mode INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    def _migrate_v9_to_v10(c):
+        """Add session_context table for coordinator session-level logging."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS session_context (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                task_id TEXT,
+                entry_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                created_by TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_context_project
+            ON session_context(project_id, created_at)
+        """)
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)
@@ -559,10 +607,7 @@ def independent_connection(project_id: str, busy_timeout: int = 5000) -> sqlite3
     """
     db_path = _project_db_path(project_id)
     conn = sqlite3.connect(str(db_path), timeout=busy_timeout / 1000.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
+    _configure_connection(conn, busy_timeout=busy_timeout)
     return conn
 
 

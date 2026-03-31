@@ -56,13 +56,13 @@ def validate_dev_task_node(node: dict) -> None:
 
 
 def validate_session(session: dict) -> None:
-    """Hard rule #2 — session 对象必须包含 snapshot 字段。
+    """Hard rule #2 — session object must contain a snapshot field.
 
     Args:
-        session: session 描述 dict。
+        session: session descriptor dict.
 
     Raises:
-        ValidationError: 当 session 缺少 snapshot 字段时。
+        ValidationError: when session is missing the snapshot field.
 
     Example::
 
@@ -73,26 +73,26 @@ def validate_session(session: dict) -> None:
     """
     if "snapshot" not in session or session["snapshot"] is None:
         raise ValidationError(
-            "Hard rule #2 violated: session 对象缺少必要的 snapshot 字段。"
-            " snapshot 记录了执行前的环境状态快照，是回滚与审计的关键依据，"
-            "必须在 session 初始化时写入。"
+            "Hard rule #2 violated: session object is missing the required snapshot field."
+            " snapshot records the environment state snapshot before execution and is the"
+            " key basis for rollback and auditing; it must be written during session initialization."
             f" (session keys={list(session.keys())!r})"
         )
 
 
 def validate_evidence(evidence: dict) -> None:
-    """Hard rule #3 — evidence 对象必须包含 result / timestamp / node_id 三个非空字段。
+    """Hard rule #3 — evidence object must contain three non-empty fields: result / timestamp / node_id.
 
     Args:
-        evidence: 执行证据 dict。
+        evidence: execution evidence dict.
 
     Raises:
-        ValidationError: 当三个必填字段中任意一个缺失或为空时。
+        ValidationError: when any of the three required fields is missing or empty.
 
     Example::
 
         ev_ok = {"result": "pass", "timestamp": "2026-03-23T10:00:00", "node_id": "L1.3"}
-        ev_bad = {"result": "pass", "timestamp": "2026-03-23T10:00:00"}  # 缺 node_id
+        ev_bad = {"result": "pass", "timestamp": "2026-03-23T10:00:00"}  # missing node_id
         validate_evidence(ev_ok)   # OK — no exception
         validate_evidence(ev_bad)  # raises ValidationError
     """
@@ -103,9 +103,9 @@ def validate_evidence(evidence: dict) -> None:
     ]
     if missing_or_empty:
         raise ValidationError(
-            f"Hard rule #3 violated: evidence 对象缺少或为空的必要字段: {missing_or_empty}。"
-            " evidence 必须同时包含 result（执行结果）、timestamp（执行时间戳）、"
-            "node_id（关联节点 ID）三个字段且均不得为空，以保证可追溯性。"
+            f"Hard rule #3 violated: evidence object has missing or empty required fields: {missing_or_empty}."
+            " evidence must contain all three fields — result (execution result), timestamp (execution timestamp),"
+            " node_id (associated node ID) — and none may be empty, to ensure traceability."
             f" (evidence keys present={list(evidence.keys())!r})"
         )
 
@@ -238,7 +238,7 @@ class DecisionValidator:
             return LayerResult(
                 layer="policy",
                 passed=False,
-                errors=["dev 角色不允许直接删除记忆，请使用 propose_memory_cleanup 并等待 QA 审核"],
+                errors=["dev role is not allowed to directly delete memory; use propose_memory_cleanup and wait for QA review"],
             )
 
         from role_permissions import check_permission, check_verify_permission
@@ -330,27 +330,27 @@ class DecisionValidator:
 
 def build_retry_prompt(ai_output: dict, validation: ValidationResult) -> str:
     """Build a retry prompt explaining why actions were rejected."""
-    lines = ["你之前的部分决策被系统拒绝:"]
+    lines = ["Some of your previous decisions were rejected by the system:"]
     for rejected in validation.rejected_actions:
         action = rejected["action"]
         reasons = rejected["reasons"]
         lines.append(f"  - {action.get('type', '?')}: {'; '.join(reasons)}")
     lines.append("")
-    lines.append("请重新分析，在权限范围内重新输出决策。")
-    lines.append("被拒绝的 action 不要重复输出，换一种合法的方式实现目标。")
+    lines.append("Please re-analyze and output your decisions within the allowed permissions.")
+    lines.append("Do not repeat rejected actions; find an alternative valid approach to achieve the goal.")
     return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────
-# 示例用法 / Usage examples
-# (供编写单元测试时参考)
+# Usage examples
+# (for reference when writing unit tests)
 # ──────────────────────────────────────────────
 #
-# 快速运行: python agent/decision_validator.py
+# Quick run: python agent/decision_validator.py
 #
-# 测试文件建议路径: agent/tests/test_decision_validator_hard_rules.py
+# Suggested test file path: agent/tests/test_decision_validator_hard_rules.py
 #
-# 示例测试片段:
+# Example test snippets:
 #
 #   from decision_validator import ValidationError, validate_dev_task_node, \
 #       validate_session, validate_evidence
@@ -362,7 +362,7 @@ def build_retry_prompt(ai_output: dict, validation: ValidationResult) -> str:
 #           validate_dev_task_node({"type": "dev_task", "target_files": []})
 #
 #   def test_dev_task_non_dev_task_skipped():
-#       validate_dev_task_node({"type": "qa_task"})  # 不应抛出异常
+#       validate_dev_task_node({"type": "qa_task"})  # should not raise an exception
 #
 #   # ── Hard rule #2 ──
 #   def test_session_requires_snapshot():
@@ -394,11 +394,11 @@ if __name__ == "__main__":
     import traceback
 
     print("=" * 60)
-    print("decision_validator — Hard Rules 自检示例")
+    print("decision_validator — Hard Rules self-check examples")
     print("=" * 60)
 
     cases = [
-        # (描述, callable)
+        # (description, callable)
         (
             "[#1 PASS] dev_task with target_files",
             lambda: validate_dev_task_node({"type": "dev_task", "target_files": ["agent/foo.py"]}),
@@ -456,4 +456,4 @@ if __name__ == "__main__":
             traceback.print_exc()
 
     print("=" * 60)
-    print("自检完成。BLOCKED 行表示校验正确拦截了非法输入。")
+    print("Self-check complete. BLOCKED lines indicate the validator correctly intercepted invalid input.")

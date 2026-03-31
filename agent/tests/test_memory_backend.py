@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 # Ensure agent/ is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -342,6 +343,16 @@ class TestLocalBackend(unittest.TestCase):
             self.assertIn("fix-jwt-exp", ref_ids)
         finally:
             conn.close()
+
+
+class TestMemoryServicePythonCompatibility(unittest.TestCase):
+    """Guard against PEP 604 unions in memory service runtime signatures."""
+
+    def test_memory_service_avoids_pep604_optional_annotations(self):
+        content = Path(os.path.join(os.path.dirname(__file__), "..", "governance", "memory_service.py")).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("-> dict | None", content)
 
 
 if __name__ == "__main__":

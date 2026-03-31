@@ -99,6 +99,7 @@ class Role(Enum):
     TESTER      = "tester"
     QA          = "qa"
     GATEKEEPER  = "gatekeeper"
+    OBSERVER    = "observer"
     COORDINATOR = "coordinator"
 
     @classmethod

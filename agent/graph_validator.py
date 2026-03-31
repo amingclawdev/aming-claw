@@ -177,9 +177,9 @@ class GraphValidator:
         if not node_id and parent_layer:
             return True, "ok (ID will be auto-allocated by node-create)"
 
-        # ID format: L数字.数字 or kebab-case (e.g., context-store-1)
+        # ID format: L<num>.<num> or kebab-case (e.g., context-store-1)
         if not node_id or not re.match(r"^(L\d+\.\d+|[a-zA-Z][\w-]+)$", node_id):
-            return False, f"ID format invalid: '{node_id}' (must be L数字.数字 or kebab-case)"
+            return False, f"ID format invalid: '{node_id}' (must be L<num>.<num> or kebab-case)"
 
         # Uniqueness
         if self.check_node_exists(node_id, project_id):
@@ -189,6 +189,11 @@ class GraphValidator:
         for dep in node.get("deps", []):
             if not self.check_node_exists(dep, project_id):
                 return False, f"dep {dep} does not exist"
+
+        # verify_requires exist (optional list of node IDs)
+        for req in node.get("verify_requires", []):
+            if not self.check_node_exists(req, project_id):
+                return False, f"verify_requires {req} does not exist"
 
         # Path safety
         for f in node.get("primary", []):

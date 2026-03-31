@@ -1,39 +1,49 @@
 # Pipeline Multi-Provider Configuration Example
-# 管线多服务商配置示例
 #
-# 将此文件复制为 pipeline_config.yaml 并放置在以下位置之一：
+# Copy this file to pipeline_config.yaml and place it in one of these locations:
 #   shared-volume/codex-tasks/state/pipeline_config.yaml
 #
-# Provider 支持的值（含别名）:
-#   anthropic (别名: opus, claude)
-#   openai    (别名: codex, gpt)
+# Supported provider values (including aliases):
+#   anthropic (aliases: opus, claude)
+#   openai    (aliases: codex, gpt)
 #
-# 环境变量覆盖（优先级高于配置文件）:
-#   PIPELINE_DEFAULT_PROVIDER  - 覆盖默认 provider
-#   PIPELINE_DEFAULT_MODEL     - 覆盖默认 model
-#   PIPELINE_ROLE_PM_PROVIDER  - 覆盖 PM 角色的 provider
-#   PIPELINE_ROLE_PM_MODEL     - 覆盖 PM 角色的 model
+# Environment variable overrides (take precedence over config file):
+#   PIPELINE_DEFAULT_PROVIDER  - override default provider
+#   PIPELINE_DEFAULT_MODEL     - override default model
+#   PIPELINE_ROLE_PM_PROVIDER  - override PM role provider
+#   PIPELINE_ROLE_PM_MODEL     - override PM role model
 #   PIPELINE_ROLE_DEV_PROVIDER / PIPELINE_ROLE_DEV_MODEL
 #   PIPELINE_ROLE_TEST_PROVIDER / PIPELINE_ROLE_TEST_MODEL
 #   PIPELINE_ROLE_QA_PROVIDER  / PIPELINE_ROLE_QA_MODEL
+#   PIPELINE_ROLE_COORDINATOR_PROVIDER / PIPELINE_ROLE_COORDINATOR_MODEL
+#   PIPELINE_ROLE_UTILITY_PROVIDER / PIPELINE_ROLE_UTILITY_MODEL
 
 pipeline:
-  # 默认配置 - 未单独配置的角色将使用此配置
+  # Default config - roles without individual config will use this
   default:
-    provider: openai
-    model: gpt-4.1
+    provider: anthropic
+    model: claude-sonnet-4-6
 
-  # 角色级配置 - 覆盖默认配置
+  # Role-level config - overrides default config
   roles:
+    coordinator:
+      provider: anthropic
+      model: claude-sonnet-4-6     # fast routing / decision-only role
     pm:
       provider: anthropic
-      model: claude-opus-4-6
+      model: claude-opus-4-6       # PM reads code and outputs PRD
     dev:
       provider: anthropic
-      model: claude-opus-4-6
-    test:
-      provider: openai
-      model: gpt-4.1
+      model: claude-opus-4-6       # Claude path with stronger implementation reasoning
+    tester:
+      provider: anthropic
+      model: claude-sonnet-4-6
     qa:
-      provider: openai
-      model: gpt-4.1
+      provider: anthropic
+      model: claude-opus-4-6
+    gatekeeper:
+      provider: anthropic
+      model: claude-sonnet-4-6
+    utility:
+      provider: anthropic
+      model: claude-sonnet-4-6

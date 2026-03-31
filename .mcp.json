@@ -7,7 +7,8 @@
       "env": {
         "PYTHONDONTWRITEBYTECODE": "1",
         "TELEGRAM_BOT_TOKEN": "8654388599:AAHhCYb0E1CBpi_k3j7dbnl3u8hEW3WJDSw",
-        "GOVERNANCE_URL": "http://localhost:40000"
+        "GOVERNANCE_URL": "http://localhost:40000",
+        "MEMORY_BACKEND": "docker"
       }
     }
   }

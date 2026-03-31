@@ -86,7 +86,7 @@ def task_touches_sensitive_path(text: str) -> bool:
 def parse_wait_file_task(text: str) -> Optional[Dict]:
     """
     Match a deterministic test task pattern:
-    在工作目录创建文件 <name>，写入当前时间；等待<sec>秒后再追加一行 <line>
+    Create file <name> in the working directory, write current time; wait <sec> seconds then append line <line>
     """
     s = (text or "").strip()
     m = re.search(
@@ -164,9 +164,9 @@ def _image_attachment_hint(task: Dict) -> str:
         if p and Path(p).exists():
             paths.append(str(Path(p).resolve()))
     if not paths:
-        return "\n\n[附件: 图片 {} 张, 请参考任务目录 attachments/ 下的文件]".format(len(images))
+        return "\n\n[Attachments: {} image(s), see task directory attachments/]".format(len(images))
     path_list = "\n".join("{}. {}".format(i + 1, p) for i, p in enumerate(paths))
-    return "\n\n[图片附件]\n请使用 Read 工具查看以下图片文件：\n{}\n".format(path_list)
+    return "\n\n[Image Attachments]\nUse the Read tool to view the following image files:\n{}\n".format(path_list)
 
 
 def encode_image_base64(path: str) -> str:
@@ -1138,7 +1138,7 @@ def process_pipeline(task: Dict, processing: Path) -> Dict:
             from pipeline_config import apply_config_to_stages, log_role_routing
             stages = apply_config_to_stages(stages, pipeline_cfg)
             pipeline_routing = log_role_routing(stages, pipeline_cfg)
-            logger.info("[Pipeline] 角色路由表: %s",
+            logger.info("[Pipeline] Role routing table: %s",
                         "; ".join("{role}→{provider}/{model}({source})".format(**r)
                                   for r in pipeline_routing))
         else:

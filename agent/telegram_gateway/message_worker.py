@@ -171,7 +171,7 @@ class MessageWorker:
         log.info("Processing: [%s] %s", chat_id, text[:80])
 
         # Default: echo back with status
-        reply_text = f"[Worker] 收到: {text[:200]}"
+        reply_text = f"[Worker] Received: {text[:200]}"
 
         # Try governance query if it looks like a status request
         if any(kw in text for kw in ["状态", "status", "节点", "node"]):
@@ -194,7 +194,7 @@ class MessageWorker:
     def _query_status(self, text: str) -> str:
         """Query governance for project status."""
         if not self.governance_url:
-            return f"[Worker] 收到: {text[:200]}"
+            return f"[Worker] Received: {text[:200]}"
         import requests
         try:
             resp = requests.get(
@@ -205,12 +205,12 @@ class MessageWorker:
             data = resp.json()
             total = data.get("total_nodes", 0)
             by_status = data.get("by_status", {})
-            lines = [f"amingClaw ({total} 节点):"]
+            lines = [f"amingClaw ({total} nodes):"]
             for s, c in by_status.items():
                 lines.append(f"  {s}: {c}")
             return "\n".join(lines)
         except Exception:
-            return f"[Worker] 收到: {text[:200]}"
+            return f"[Worker] Received: {text[:200]}"
 
     def _renew_lease(self) -> None:
         """Renew agent lease via governance API."""

@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -185,7 +186,7 @@ class TestSpecInvariants(unittest.TestCase):
     # Invariant 7: Status query → no coordinator task
     # ------------------------------------------------------------------
     def test_status_query_no_coordinator(self):
-        """Status query ('当前状态') must NOT create coordinator task."""
+        """Status query (e.g. Chinese: '当前状态怎么样') must NOT create coordinator task."""
         # This is enforced at gateway level via classify_message
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "telegram_gateway"))
         from gateway import classify_message
@@ -266,6 +267,17 @@ class TestSpecInvariants(unittest.TestCase):
             self.assertIn("completed", latest["content"])
         finally:
             conn.close()
+
+
+class TestGatewayPythonCompatibility(unittest.TestCase):
+    """Guard against PEP 604 unions in gateway runtime signatures."""
+
+    def test_gateway_avoids_pep604_optional_annotations(self):
+        content = Path(os.path.join(os.path.dirname(__file__), "..", "telegram_gateway", "gateway.py")).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("-> dict | None", content)
+        self.assertNotIn("-> int | None", content)
 
 
 if __name__ == "__main__":

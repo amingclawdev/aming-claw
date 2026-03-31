@@ -24,9 +24,24 @@ import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+
+# Heartbeat constants — used by the streaming watchdog in create_session._run()
+_HANG_TIMEOUT = 120    # seconds of stdout silence → treat as hung (non-coordinator roles)
+_COORDINATOR_HANG_TIMEOUT = 300  # coordinator has no tools; waits longer for single-turn output
+_MAX_TIMEOUT = 1200    # absolute session cap regardless of activity
+_CLAUDE_ROLE_TURN_CAPS = {
+    "coordinator": "1",
+    "pm": "10",
+    "dev": "40",
+    "tester": "20",
+    "qa": "20",
+    "gatekeeper": "20",
+}
 
 
 @dataclass
@@ -44,6 +59,7 @@ class AISession:
     stdout: str = ""
     stderr: str = ""
     exit_code: Optional[int] = None
+    last_heartbeat: float = field(default_factory=time.time)  # updated on each stdout line
 
 
 class AILifecycleManager:
@@ -52,6 +68,113 @@ class AILifecycleManager:
     def __init__(self):
         self._sessions: dict[str, AISession] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _resolve_provider_model(role: str) -> tuple[str, str]:
+        """Resolve provider/model for a role, defaulting to anthropic."""
+        try:
+            from pipeline_config import get_effective_pipeline_config, resolve_role_config
+            config = get_effective_pipeline_config()
+            resolved = resolve_role_config(role, config)
+            provider = (resolved.get("provider") or "anthropic").strip().lower()
+            model = (resolved.get("model") or "").strip()
+            return provider or "anthropic", model
+        except Exception:
+            return "anthropic", ""
+
+    @staticmethod
+    def _allowed_tools_for_role(role: str) -> str:
+        if role == "dev":
+            return "Read,Grep,Glob,Write,Edit,Bash"
+        if role == "tester":
+            return "Read,Grep,Glob,Bash"
+        if role == "gatekeeper":
+            return "Read,Grep,Glob"
+        if role == "pm":
+            return "Read,Grep,Glob"
+        if role == "coordinator":
+            return ""
+        return "Read,Grep,Glob"
+
+    @staticmethod
+    def _claude_turn_cap(role: str, context: Optional[dict] = None, prompt: str = "") -> str:
+        base = _CLAUDE_ROLE_TURN_CAPS.get(role, "")
+        if role != "dev":
+            return base
+
+        context = context or {}
+        metadata = context.get("metadata", {}) if isinstance(context.get("metadata", {}), dict) else {}
+        target_files = context.get("target_files", []) or []
+        requirements = context.get("requirements", []) or []
+        operation_type = (
+            metadata.get("operation_type")
+            or context.get("operation_type")
+            or ""
+        )
+        replay_source = str(context.get("replay_source", "") or metadata.get("replay_source", "")).lower()
+
+        is_heavy_workflow_task = (
+            operation_type == "workflow_improvement"
+            or "lane" in replay_source
+            or len(target_files) >= 8
+            or len(requirements) >= 6
+            or len(prompt) >= 5000
+        )
+        return "60" if is_heavy_workflow_task else base
+
+    @staticmethod
+    def _build_claude_command(role: str, model: str, prompt_file: str, cwd: str = "", context: Optional[dict] = None, prompt: str = "") -> list[str]:
+        claude_bin = os.getenv("CLAUDE_BIN", "claude")
+        allowed_tools = AILifecycleManager._allowed_tools_for_role(role)
+        cmd = [
+            claude_bin,
+            "-p",
+            "--system-prompt-file", prompt_file,
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        if cwd:
+            cmd.extend(["--add-dir", cwd])
+        if allowed_tools:
+            cmd.extend(["--allowedTools", allowed_tools])
+        max_turns = AILifecycleManager._claude_turn_cap(role, context=context, prompt=prompt)
+        if max_turns:
+            cmd.extend(["--max-turns", max_turns])
+        return cmd
+
+    @staticmethod
+    def _build_codex_command(model: str, cwd: str) -> list[str]:
+        codex_bin = os.getenv("CODEX_BIN", "").strip()
+        if not codex_bin:
+            codex_bin = "codex.cmd" if os.name == "nt" else "codex"
+        dangerous = os.getenv("CODEX_DANGEROUS", "1").strip().lower() not in {"0", "false", "no"}
+        cmd = [
+            codex_bin,
+            "exec",
+            "--skip-git-repo-check",
+            "-C",
+            cwd,
+            "-o",
+        ]
+        if dangerous:
+            cmd.insert(2, "--dangerously-bypass-approvals-and-sandbox")
+        else:
+            cmd[2:2] = ["--sandbox", "workspace-write"]
+        if model:
+            cmd[2:2] = ["--model", model]
+        return cmd
+
+    @staticmethod
+    def _compose_codex_prompt(system_prompt: str, prompt: str) -> str:
+        return (
+            "Follow this system instruction exactly.\n\n"
+            "=== SYSTEM PROMPT START ===\n"
+            f"{system_prompt}\n"
+            "=== SYSTEM PROMPT END ===\n\n"
+            "=== TASK PROMPT START ===\n"
+            f"{prompt}\n"
+            "=== TASK PROMPT END ===\n"
+        )
 
     def create_session(
         self,
@@ -77,120 +200,144 @@ class AILifecycleManager:
         """
         session_id = f"ai-{role}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
+        # File-based logging — log.info() blocks in MCP subprocess (IO pipe deadlock)
+        _al_t0 = time.time()
+        def _al_log(msg):
+            try:
+                al_path = os.path.join(workspace or os.getcwd(), "shared-volume", "codex-tasks", "logs",
+                                       f"ai-lifecycle-{session_id}.txt")
+                os.makedirs(os.path.dirname(al_path), exist_ok=True)
+                with open(al_path, "a") as f:
+                    f.write(f"{time.time()-_al_t0:.1f}s {msg}\n")
+            except Exception:
+                pass
+
         # Build system prompt from context
         system_prompt = self._build_system_prompt(role, prompt, context, project_id)
+        _al_log(f"build_system_prompt: {len(system_prompt)} chars role={role}")
 
         # Audit: write prompt to Redis Stream for full round-trip tracking
         self._audit_prompt(session_id, role, project_id, workspace or "", prompt, system_prompt)
+        _al_log("audit_prompt done")
 
-        # Determine CLI binary and args
-        claude_bin = os.getenv("CLAUDE_BIN", "claude")
+        _provider, _model = self._resolve_provider_model(role)
+        _al_log(f"pipeline_config: role={role} provider={_provider} model={_model}")
+
         cwd = workspace or os.getenv("CODEX_WORKSPACE", os.getcwd())
+        log_dir = os.path.join(workspace or os.getcwd(), "shared-volume", "codex-tasks", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        output_last = os.path.join(log_dir, f"last-message-{session_id.replace('ai-','')}.txt")
 
-        # v7.2: Write system prompt to file, use --system-prompt-file + -p
-        # AI only gets read-only tools. All writes go through Executor /file/* API.
-        # This prevents AI from writing to main workspace or arbitrary paths.
+        # Write system prompt to file
         prompt_file = os.path.join(tempfile.gettempdir(), f"ctx-{session_id}.md")
         try:
             with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(system_prompt)
-            log.info("Prompt file written: %s (%d bytes)", prompt_file, len(system_prompt))
+            _al_log(f"prompt_file: {prompt_file} ({len(system_prompt)} bytes)")
         except Exception as e:
-            log.error("Failed to write prompt file: %s", e)
+            _al_log(f"ERROR prompt_file write failed: {e}")
 
-        # Tool access by role:
-        # - dev: Read + Write + Edit + Bash (worktree isolation protects main)
-        # Role-based tool permissions:
-        # - dev: full access (worktree isolation protects main)
-        # - tester/coordinator: read + bash (run tests, query APIs)
-        # - pm/qa: read-only
-        if role == "dev":
-            allowed_tools = "Read,Grep,Glob,Write,Edit,Bash"
-        elif role in ("tester", "coordinator"):
-            allowed_tools = "Read,Grep,Glob,Bash"
+        provider = _provider if _provider in ("anthropic", "openai") else "anthropic"
+        if provider == "openai":
+            cmd = self._build_codex_command(_model, cwd)
+            cmd.append(output_last)
+            composed_prompt = self._compose_codex_prompt(system_prompt, prompt)
+            stdin_prompt = composed_prompt
         else:
-            allowed_tools = "Read,Grep,Glob"
-
-        cmd = [
-            claude_bin,
-            "-p",                              # Print mode (structured output via stdout)
-            "--allowedTools", allowed_tools,    # Read-only tools only
-            "--system-prompt-file", prompt_file, # Context via file (no stdin truncation)
-        ]
+            cmd = self._build_claude_command(role, _model, prompt_file, cwd, context=context, prompt=prompt)
+            stdin_prompt = prompt
 
         # Strip env vars that cause nested Claude issues
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
-        env.pop("ANTHROPIC_API_KEY", None)
+        env = dict(os.environ)
+        if provider == "anthropic":
+            env = {k: v for k, v in env.items()
+                   if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+            env.pop("ANTHROPIC_API_KEY", None)
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,         # Prompt via stdin pipe
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=cwd,
-                env=env,
-            )
-            # Write prompt to stdin and close to signal EOF
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-        except FileNotFoundError:
-            session = AISession(
-                session_id=session_id, role=role, pid=0,
-                project_id=project_id, prompt=prompt, context=context,
-                started_at=time.time(), timeout_sec=timeout_sec,
-                status="failed", stderr=f"CLI not found: {claude_bin}",
-            )
-            with self._lock:
-                self._sessions[session_id] = session
-            return session
-
+        # Create session object first (wait_for_output polls session.status)
         session = AISession(
             session_id=session_id,
             role=role,
-            pid=proc.pid,
+            pid=0,  # set after subprocess starts
             project_id=project_id,
             prompt=prompt,
             context=context,
             started_at=time.time(),
             timeout_sec=timeout_sec,
         )
-
         with self._lock:
             self._sessions[session_id] = session
 
-        log.info("AI session created: %s (role=%s, pid=%d, timeout=%ds)",
-                 session_id, role, proc.pid, timeout_sec)
-
-        # Register PID for safe orphan cleanup (executor only kills its own spawns)
-        try:
-            from executor import _EXECUTOR_SPAWNED_PIDS
-            _EXECUTOR_SPAWNED_PIDS.add(proc.pid)
-        except ImportError:
-            pass  # Not running inside executor context
-
-        # Wait for output in background thread (no stdin — prompt is via file + arg)
+        # Run CLI in background thread using subprocess.run (not Popen).
+        # Popen + poll() has Windows pipe deadlock issues with Claude CLI.
         def _run():
             try:
-                stdout, stderr = proc.communicate(
-                    timeout=timeout_sec
+                # Save input for replay/debug
+                try:
+                    _input_path = os.path.join(workspace or os.getcwd(), "shared-volume", "codex-tasks", "logs",
+                                               f"input-{session_id.replace('ai-','')}.txt")
+                    os.makedirs(os.path.dirname(_input_path), exist_ok=True)
+                    with open(_input_path, "w", encoding="utf-8") as _f:
+                        _f.write(f"=== SYSTEM PROMPT ({len(system_prompt)} chars) ===\n")
+                        _f.write(system_prompt)
+                        _f.write(f"\n\n=== STDIN PROMPT ({len(stdin_prompt)} chars) ===\n")
+                        _f.write(stdin_prompt)
+                        _f.write(f"\n\n=== CLI CMD ===\n")
+                        _f.write(" ".join(cmd))
+                except Exception:
+                    pass
+
+                _al_log(f"subprocess.run starting: {' '.join(cmd[:6])}...")
+                result = subprocess.run(
+                    cmd,
+                    input=stdin_prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=_MAX_TIMEOUT,
+                    cwd=cwd,
+                    env=env,
                 )
-                session.stdout = stdout or ""
-                session.stderr = stderr or ""
-                session.exit_code = proc.returncode
-                session.status = "completed" if proc.returncode == 0 else "failed"
+                session.stdout = result.stdout
+                session.stderr = result.stderr
+                session.exit_code = result.returncode
+                session.status = "completed" if result.returncode == 0 else "failed"
+                if provider == "openai" and os.path.exists(output_last):
+                    try:
+                        session.stdout = Path(output_last).read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+                _al_log(f"subprocess.run done: rc={result.returncode} stdout={len(result.stdout)} stderr={len(result.stderr)}")
+                # Save output for debug
+                try:
+                    _output_path = os.path.join(workspace or os.getcwd(), "shared-volume", "codex-tasks", "logs",
+                                                f"output-{session_id.replace('ai-','')}.txt")
+                    with open(_output_path, "w", encoding="utf-8") as _f:
+                        _f.write(f"=== STATUS: {session.status} rc={result.returncode} elapsed={time.time()-session.started_at:.1f}s ===\n\n")
+                        _f.write(f"=== STDOUT ({len(result.stdout)} chars) ===\n")
+                        _f.write(result.stdout)
+                        if result.stderr:
+                            _f.write(f"\n\n=== STDERR ({len(result.stderr)} chars) ===\n")
+                            _f.write(result.stderr)
+                except Exception:
+                    pass
             except subprocess.TimeoutExpired:
-                proc.kill()
-                session.stdout, session.stderr = proc.communicate()
                 session.status = "timeout"
                 session.exit_code = -1
-                log.warning("AI session timeout: %s", session_id)
+                session.stdout = ""
+                session.stderr = "Timeout exceeded"
+                _al_log(f"subprocess.run TIMEOUT after {_MAX_TIMEOUT}s")
+            except FileNotFoundError:
+                session.status = "failed"
+                session.exit_code = -1
+                session.stdout = ""
+                session.stderr = f"CLI not found: {cmd[0]}"
+                _al_log(f"subprocess.run ERROR: CLI not found: {cmd[0]}")
             except Exception as e:
                 session.status = "failed"
+                session.exit_code = -1
+                session.stdout = ""
                 session.stderr = str(e)
-                log.exception("AI session error: %s", session_id)
+                _al_log(f"subprocess.run ERROR: {e}")
             finally:
                 # Cleanup prompt file
                 try:
@@ -199,6 +346,7 @@ class AILifecycleManager:
                 except Exception:
                     pass
 
+        _al_log(f"session_created: {session_id} timeout={timeout_sec}s")
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
 
@@ -215,10 +363,11 @@ class AILifecycleManager:
         if not session:
             return {"status": "failed", "error": f"session {session_id} not found"}
 
-        # Wait until session is no longer running
+        # Wait until session is no longer running.
+        # The watchdog inside _run() is the primary enforcer; this is a safety fallback.
         while session.status == "running":
             elapsed = time.time() - session.started_at
-            if elapsed > session.timeout_sec + 5:
+            if elapsed > _MAX_TIMEOUT + 30:
                 self.kill_session(session_id, "timeout exceeded in wait")
                 break
             time.sleep(poll_interval)
@@ -244,23 +393,39 @@ class AILifecycleManager:
         try:
             os.kill(session.pid, signal.SIGTERM)
             session.status = "killed"
-            log.info("AI session killed: %s (reason=%s)", session_id, reason)
+            pass  # log.info removed — blocks in MCP subprocess
             return True
         except (ProcessLookupError, OSError):
             return False
 
     def cleanup_expired(self) -> int:
-        """Kill all sessions that exceeded their timeout."""
+        """Kill all sessions that are hung (no heartbeat) or exceeded max total runtime."""
         killed = 0
         now = time.time()
         with self._lock:
             for sid, session in list(self._sessions.items()):
                 if session.status != "running":
                     continue
-                if now - session.started_at > session.timeout_sec:
-                    self.kill_session(sid, "timeout_cleanup")
+                if now - session.started_at > _MAX_TIMEOUT:
+                    self.kill_session(sid, "max_timeout_cleanup")
+                    killed += 1
+                elif now - session.last_heartbeat > _HANG_TIMEOUT:
+                    self.kill_session(sid, "hang_timeout_cleanup")
                     killed += 1
         return killed
+
+    def extend_deadline(self, session_id: str) -> None:
+        """Reset the heartbeat clock for a running session.
+
+        Call this from executor update_progress() hooks so that tasks actively
+        reporting progress are not mistaken for hung processes.  Effective
+        extension is +120 s from now (up to _MAX_TIMEOUT absolute cap).
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session and session.status == "running":
+                session.last_heartbeat = time.time()
+                log.debug("Heartbeat extended for session %s", session_id)
 
     def list_active(self) -> list[dict]:
         """List all active sessions."""
@@ -294,17 +459,23 @@ class AILifecycleManager:
         role_prompt = ROLE_PROMPTS.get(role, ROLE_PROMPTS.get("coordinator", ""))
 
         # Fetch base context snapshot (single API call, consistent)
+        # Coordinator: context is pre-injected by executor._build_prompt, skip snapshot fetch
         snapshot_str = ""
-        try:
-            gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
-            task_id = context.get("task_id", "")
-            url = f"{gov_url}/api/context-snapshot/{project_id}?role={role}&task_id={task_id}"
-            req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                snapshot = json.loads(resp.read().decode())
-            snapshot_str = f"\n--- Base Context Snapshot ---\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}\n"
-        except Exception as e:
-            log.warning("Context snapshot fetch failed: %s", e)
+        if role != "coordinator":
+            try:
+                gov_url = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+                task_id = context.get("task_id", "")
+                url = f"{gov_url}/api/context-snapshot/{project_id}?role={role}&task_id={task_id}"
+                req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    snapshot = json.loads(resp.read().decode())
+                if snapshot:
+                    snapshot_str = (
+                        "\n--- Base Context Snapshot ---\n"
+                        f"{json.dumps(snapshot, ensure_ascii=False, indent=2)}\n"
+                    )
+            except Exception:
+                pass  # context snapshot fetch failed — non-critical
 
         # Dev role: inject workspace and target_files so AI knows where to work
         workspace_info = ""
@@ -320,19 +491,12 @@ class AILifecycleManager:
             if tf:
                 workspace_info += f"Target files: {', '.join(tf)}\n"
 
-        context_str = ""
-        try:
-            import urllib.request
-            snapshot_url = f"http://localhost:40000/api/context-snapshot/{project_id}"
-            resp = urllib.request.urlopen(snapshot_url, timeout=5)
-            snapshot = json.loads(resp.read().decode())
-            context_str = json.dumps(snapshot, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        # Skip API reference for coordinator (no tools, can't call APIs)
+        api_section = f"{_API_REFERENCE}\n\n" if role != "coordinator" else ""
 
         return (
             f"{role_prompt}\n\n"
-            f"{_API_REFERENCE}\n\n"
+            f"{api_section}"
             f"Project: {project_id}\n"
             f"{workspace_info}"
             f"{snapshot_str}\n"

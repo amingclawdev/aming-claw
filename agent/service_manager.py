@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import signal
 import threading
 import time
 from pathlib import Path
@@ -43,13 +44,59 @@ log = logging.getLogger(__name__)
 # Configuration defaults (all overridable via environment variables)
 # ---------------------------------------------------------------------------
 
-GOVERNANCE_URL: str = os.getenv("GOVERNANCE_URL", "http://localhost:40006")
-PROJECT_ID: str = os.getenv("EXECUTOR_PROJECT_ID", "aming-claw")
-
 _RELOAD_TIMEOUT: int = int(os.getenv("SERVICE_RELOAD_TIMEOUT", "120"))
 _POLL_INTERVAL: float = float(os.getenv("SERVICE_POLL_INTERVAL", "2"))
 
 _agent_dir = str(Path(__file__).resolve().parent)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _load_env_file(env_path: Optional[Path] = None) -> None:
+    """Load a simple KEY=VALUE .env file into the process environment."""
+    target = env_path or (_repo_root() / ".env")
+    if not target.exists():
+        return
+    try:
+        for raw in target.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+    except Exception as exc:
+        log.debug("ServiceManager: failed to load %s: %s", target, exc)
+
+
+def _default_governance_url() -> str:
+    return os.getenv("GOVERNANCE_URL", "http://localhost:40000")
+
+
+def _default_project_id() -> str:
+    return os.getenv("EXECUTOR_PROJECT_ID", os.getenv("PROJECT_ID", "aming-claw"))
+
+
+def _default_workspace() -> str:
+    return os.getenv("CODEX_WORKSPACE", str(_repo_root()))
+
+
+def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "executor_worker.py"),
+        "--project",
+        project_id,
+        "--url",
+        governance_url,
+        "--workspace",
+        workspace,
+    ]
+
+
+def _shared_log_dir() -> Path:
+    return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
 
 
 # ---------------------------------------------------------------------------
@@ -72,21 +119,24 @@ class ServiceManager:
 
     def __init__(
         self,
-        project_id: str = PROJECT_ID,
-        governance_url: str = GOVERNANCE_URL,
+        project_id: Optional[str] = None,
+        governance_url: Optional[str] = None,
         executor_cmd: Optional[list] = None,
         reload_timeout: int = _RELOAD_TIMEOUT,
         poll_interval: float = _POLL_INTERVAL,
+        workspace: Optional[str] = None,
     ) -> None:
-        self.project_id = project_id
-        self.governance_url = governance_url.rstrip("/")
+        self.project_id = project_id or _default_project_id()
+        self.governance_url = (governance_url or _default_governance_url()).rstrip("/")
         self.reload_timeout = reload_timeout
         self.poll_interval = poll_interval
+        self.workspace = workspace or _default_workspace()
 
-        self._executor_cmd: list = executor_cmd or [
-            sys.executable, "-m", "agent.executor_worker",
-            "--project", self.project_id,
-        ]
+        self._executor_cmd: list = executor_cmd or _default_executor_cmd(
+            self.project_id,
+            self.governance_url,
+            self.workspace,
+        )
 
         self._process: Optional[subprocess.Popen] = None
         self._start_time: Optional[float] = None
@@ -119,11 +169,7 @@ class ServiceManager:
                 return False
 
             log.info("ServiceManager.start: launching executor %s", self._executor_cmd)
-            self._process = subprocess.Popen(
-                self._executor_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
+            self._process = self._spawn_executor_process()
             self._start_time = time.monotonic()
             log.info("ServiceManager.start: executor started (PID %d)", self._process.pid)
 
@@ -225,11 +271,7 @@ class ServiceManager:
         # --- Phase 2: stop then start ---
         with self._lock:
             self._stop_locked()
-            self._process = subprocess.Popen(
-                self._executor_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
+            self._process = self._spawn_executor_process()
             self._start_time = time.monotonic()
             new_pid = self._process.pid
             log.info("ServiceManager.reload: executor restarted (PID %d)", new_pid)
@@ -400,11 +442,7 @@ class ServiceManager:
                     self._CIRCUIT_BREAKER_MAX - 1,
                 )
                 try:
-                    self._process = subprocess.Popen(
-                        self._executor_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    )
+                    self._process = self._spawn_executor_process()
                     self._start_time = time.monotonic()
                     log.info(
                         "ServiceManager._monitor_loop: executor restarted (PID %d)",
@@ -434,6 +472,24 @@ class ServiceManager:
                     )
         if removed:
             log.info("ServiceManager._clear_pycache: removed %d __pycache__ dir(s)", removed)
+
+    def _spawn_executor_process(self) -> subprocess.Popen:
+        """Spawn the executor and redirect output to a persistent host log file."""
+        log_dir = _shared_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = log_dir / f"service-manager-executor-{self.project_id}.log"
+        stderr_path = log_dir / f"service-manager-executor-{self.project_id}.err.log"
+        stdout_handle = open(stdout_path, "ab")
+        stderr_handle = open(stderr_path, "ab")
+        try:
+            return subprocess.Popen(
+                self._executor_cmd,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+            )
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -475,8 +531,9 @@ _default_lock = threading.Lock()
 
 
 def get_manager(
-    project_id: str = PROJECT_ID,
-    governance_url: str = GOVERNANCE_URL,
+    project_id: Optional[str] = None,
+    governance_url: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> ServiceManager:
     """Return the module-level singleton :class:`ServiceManager`.
 
@@ -489,5 +546,85 @@ def get_manager(
             _default_manager = ServiceManager(
                 project_id=project_id,
                 governance_url=governance_url,
+                workspace=workspace,
             )
     return _default_manager
+
+
+def _install_signal_handlers(stop_fn: Callable[[], None]) -> None:
+    """Stop gracefully when the host process receives termination signals."""
+    def _handler(signum, frame):  # pragma: no cover - exercised by manual host runs
+        log.info("ServiceManager host process received signal %s, stopping", signum)
+        stop_fn()
+
+    for signame in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, signame, None)
+        if sig is not None:
+            signal.signal(sig, _handler)
+
+
+def main() -> None:
+    import argparse
+
+    _load_env_file()
+
+    parser = argparse.ArgumentParser(
+        description="Host-side ServiceManager that supervises agent.executor_worker",
+    )
+    parser.add_argument("--project", default=_default_project_id(), help="Project ID")
+    parser.add_argument(
+        "--governance-url",
+        default=_default_governance_url(),
+        help="Governance base URL (use nginx entrypoint, e.g. http://localhost:40000)",
+    )
+    parser.add_argument(
+        "--workspace",
+        default=_default_workspace(),
+        help="Host workspace passed to executor_worker",
+    )
+    parser.add_argument(
+        "--status-only",
+        action="store_true",
+        help="Print current manager status and exit without starting a process",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    manager = ServiceManager(
+        project_id=args.project,
+        governance_url=args.governance_url,
+        workspace=args.workspace,
+    )
+
+    if args.status_only:
+        print(manager.status())
+        return
+
+    os.environ.setdefault("GOVERNANCE_URL", args.governance_url)
+    os.environ.setdefault("CODEX_WORKSPACE", args.workspace)
+    _install_signal_handlers(manager.stop)
+
+    manager.start()
+    log.info(
+        "ServiceManager host loop started (project=%s, governance=%s, workspace=%s)",
+        args.project,
+        args.governance_url,
+        args.workspace,
+    )
+
+    try:
+        while True:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        log.info("ServiceManager host loop interrupted, stopping")
+    finally:
+        manager.stop()
+
+
+if __name__ == "__main__":
+    main()
