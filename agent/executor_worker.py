@@ -457,10 +457,37 @@ class ExecutorWorker:
 
                     rev = subprocess.run(["git", "rev-parse", "HEAD"],
                                          cwd=integration_worktree, capture_output=True, text=True, timeout=5)
+                    merge_commit = rev.stdout.strip()
+
+                    # Advance real workspace main to the merge commit via ff-only
+                    ff_proc = subprocess.run(
+                        ["git", "merge", "--ff-only", merge_commit],
+                        cwd=self.workspace, capture_output=True, text=True, timeout=30)
+                    if ff_proc.returncode != 0:
+                        return {"status": "failed", "error": f"ff-only advance of main failed: {ff_proc.stderr[:300]}"}
+
+                    # Sync version to governance DB
+                    try:
+                        self._api("POST", f"/api/version-sync/{self.project_id}", {
+                            "git_head": merge_commit,
+                            "dirty_files": [],
+                        })
+                        old_ver_row = self._api("GET", f"/api/version-check/{self.project_id}")
+                        old_ver = old_ver_row.get("chain_version", "")
+                        self._api("POST", f"/api/version-update/{self.project_id}", {
+                            "chain_version": merge_commit,
+                            "updated_by": "auto-chain",
+                            "task_id": task_id,
+                            "chain_stage": "merge",
+                            "old_version": old_ver if old_ver != "(not set)" else "",
+                        })
+                    except Exception as e:
+                        log.warning("Version sync in isolated merge failed (non-fatal): %s", e)
+
                     if worktree_available:
                         self._remove_worktree(worktree, branch, delete_branch=False)
                     return {"status": "succeeded", "result": {
-                        "merge_commit": rev.stdout.strip(),
+                        "merge_commit": merge_commit,
                         "branch": "main",
                         "merge_mode": "isolated_integration",
                         "files_changed": len(changed),
