@@ -88,5 +88,88 @@ class TestCheckAllGates(unittest.TestCase):
             check_gates_or_raise("L1.1", gates, get_status)
 
 
+class TestReconciliationBypassPolicy(unittest.TestCase):
+    """Tests for RECONCILIATION_BYPASS_POLICY and _check_reconciliation_bypass."""
+
+    def test_policy_object_exists_with_required_keys(self):
+        from governance.auto_chain import RECONCILIATION_BYPASS_POLICY
+        self.assertIn("required_metadata_fields", RECONCILIATION_BYPASS_POLICY)
+        self.assertIn("allowed_lanes", RECONCILIATION_BYPASS_POLICY)
+        self.assertIn("audit_action", RECONCILIATION_BYPASS_POLICY)
+        self.assertIn("reconciliation_lane", RECONCILIATION_BYPASS_POLICY["required_metadata_fields"])
+        self.assertIn("observer_authorized", RECONCILIATION_BYPASS_POLICY["required_metadata_fields"])
+
+    def test_check_bypass_rejects_missing_lane(self):
+        from unittest.mock import Mock
+        from governance.auto_chain import _check_reconciliation_bypass
+        conn = Mock()
+        bypass, obs_id = _check_reconciliation_bypass(conn, "test", {"observer_authorized": True})
+        self.assertFalse(bypass)
+
+    def test_check_bypass_rejects_invalid_lane(self):
+        from unittest.mock import Mock
+        from governance.auto_chain import _check_reconciliation_bypass
+        conn = Mock()
+        bypass, obs_id = _check_reconciliation_bypass(conn, "test", {
+            "reconciliation_lane": "Z",
+            "observer_authorized": True,
+        })
+        self.assertFalse(bypass)
+
+    def test_check_bypass_rejects_missing_observer_authorized(self):
+        from unittest.mock import Mock
+        from governance.auto_chain import _check_reconciliation_bypass
+        conn = Mock()
+        bypass, obs_id = _check_reconciliation_bypass(conn, "test", {
+            "reconciliation_lane": "A",
+        })
+        self.assertFalse(bypass)
+
+    def test_check_bypass_passes_with_full_policy(self):
+        from unittest.mock import Mock
+        from governance.auto_chain import _check_reconciliation_bypass
+        conn = Mock()
+        conn.execute.return_value.fetchone.return_value = None
+        bypass, obs_id = _check_reconciliation_bypass(conn, "test", {
+            "reconciliation_lane": "A",
+            "observer_authorized": True,
+            "observer_task_id": "task-obs-123",
+        })
+        self.assertTrue(bypass)
+        self.assertEqual(obs_id, "task-obs-123")
+
+    def test_finalize_chain_calls_version_sync(self):
+        """Verify _finalize_chain performs version-sync and version-update."""
+        from unittest.mock import Mock, patch
+        from types import SimpleNamespace
+        from governance.auto_chain import _finalize_chain
+
+        conn = Mock()
+        with patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
+            result = _finalize_chain(conn, "test-proj", "task-merge-1", {"report": {"success": True}}, {})
+
+        self.assertEqual(result["deploy"], "completed")
+        # Verify DB writes happened (version-sync + version-update)
+        self.assertTrue(conn.execute.called)
+
+    def test_finalize_chain_restart_required_on_stale_server(self):
+        """Verify restart_required is set when SERVER_VERSION is stale."""
+        import types as _types
+        from unittest.mock import Mock, patch
+        from types import SimpleNamespace
+        from governance.auto_chain import _finalize_chain
+
+        conn = Mock()
+        # Create a mock server module to avoid importing the real one (Py3.10+ syntax)
+        mock_server = _types.ModuleType("governance.server")
+        mock_server.SERVER_VERSION = "oldvers1"
+        with patch("subprocess.run", return_value=SimpleNamespace(stdout="newhead1\n", returncode=0)), \
+             patch.dict("sys.modules", {"governance.server": mock_server}):
+            result = _finalize_chain(conn, "test-proj", "task-merge-1", {"report": {"success": True}}, {})
+
+        self.assertTrue(result.get("restart_required"))
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -119,7 +119,27 @@ Trace at least **3 causal layers** before concluding manual intervention is requ
 
 If at layer 3 (or deeper) you confirm a **self-bootstrap paradox** — the executor cannot run the fix because the fix must be applied to the executor itself, or the worktree is irrecoverably dirty — proceed to the 10-Step SOP.
 
-### 4.4 10-Step Manual Fix SOP
+### 4.4 Governed Reconciliation Lane (Preferred Alternative)
+
+Before resorting to the manual 10-step SOP below, prefer the **governed reconciliation lane**. When version gate blocks due to HEAD ≠ chain_version, the observer can create a reconciliation task with explicit metadata:
+
+```json
+{
+  "reconciliation_lane": "A",
+  "observer_authorized": true,
+  "observer_task_id": "<observer-session-task-id>"
+}
+```
+
+This reconciliation lane replaces manual bootstrap SOP steps 1-7 with an automated, auditable chain that:
+- Bypasses the version gate under explicit observer authorization
+- Collects evidence and passes through normal QA/gatekeeper gates
+- Merges, deploys, and advances `chain_version` automatically
+- Records every bypass in the audit log for traceability
+
+Only fall through to the manual 10-step SOP if the reconciliation lane itself encounters a bootstrap paradox (e.g., the reconciliation code is the broken component).
+
+### 4.5 10-Step Manual Fix SOP
 
 | Step | Action | Command / Detail |
 |------|--------|-----------------|
@@ -134,7 +154,7 @@ If at layer 3 (or deeper) you confirm a **self-bootstrap paradox** — the execu
 | 9 | **Write memory** | Update `MEMORY.md` or the relevant domain pack with the root cause and the fix applied |
 | 10 | **Start executor** | `.\scripts\start-executor.ps1` (Windows) or `bash scripts/startup.sh` (Linux/macOS) — **from a terminal, not inside a Claude session** |
 
-### 4.5 Prohibited Actions
+### 4.6 Prohibited Actions
 
 | ❌ Do NOT | Reason |
 |-----------|--------|

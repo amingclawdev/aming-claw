@@ -756,6 +756,65 @@ Files under `docs/dev/**` are informal developer notes (iteration plans, scratch
 - Formal docs (e.g., `docs/ai-agent-integration-guide.md`, `docs/human-intervention-guide.md`, `docs/p0-3-design.md`) remain fully enforced.
 - If `doc_impact.files` contains only `docs/dev/**` paths, the doc gate passes without requiring those files in `changed_files`.
 
+## Reconciliation Lane Bypass
+
+When the governance server's `chain_version` diverges from git HEAD (e.g., after a manual commit or bootstrap paradox), normal tasks are blocked by the version gate. The **reconciliation lane bypass** provides a governed, auditable path to resolve this without disabling the version gate globally.
+
+### Policy: `RECONCILIATION_BYPASS_POLICY`
+
+Defined in `agent/governance/auto_chain.py`:
+
+```python
+RECONCILIATION_BYPASS_POLICY = {
+    "required_metadata_fields": ["reconciliation_lane", "observer_authorized"],
+    "allowed_lanes": {"A", "B"},
+    "audit_action": "reconciliation_bypass",
+}
+```
+
+### Required Metadata Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reconciliation_lane` | `str` | Must be `"A"` or `"B"` — the lane this reconciliation task belongs to |
+| `observer_authorized` | `bool` | Must be `true` — confirms an observer explicitly authorized this bypass |
+| `observer_task_id` | `str` | The task ID of the observer task that authorized the reconciliation (used for audit trail) |
+
+### How It Works
+
+1. Observer creates a task with the reconciliation metadata fields set
+2. `_gate_version_check` evaluates the metadata against `RECONCILIATION_BYPASS_POLICY`
+3. If all fields are valid, the version gate is bypassed with reason `reconciliation-bypass (observer=<task_id>, lane=<lane>)`
+4. The bypass event is written to `audit_log` with `action='reconciliation_bypass'`
+
+### Audit Trail
+
+Every reconciliation bypass is recorded in the `audit_log` table:
+
+```json
+{
+  "action": "reconciliation_bypass",
+  "actor": "auto-chain",
+  "task_id": "<task-id>",
+  "details_json": {
+    "observer_task_id": "<observer-task-id>",
+    "lane": "A",
+    "task_id": "<task-id>"
+  }
+}
+```
+
+### Merge-Stage VERSION Lifecycle
+
+After a successful merge, the deploy/finalize stage:
+1. Calls **version-sync** — updates `git_head` and `dirty_files` in `project_version`
+2. Calls **version-update** — sets `chain_version` to new HEAD with `updated_by='auto-chain:<merge_task_id>'`
+3. Verifies `SERVER_VERSION == new HEAD` — if stale, emits `restart_required=true` in the result
+
+This resolves the VERSION file bootstrap paradox: the commit changes HEAD, so the sync→update→verify sequence ensures the DB always catches up after merge.
+
+---
+
 ## Changelog
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: P1-P3 optimization — memory injection all task types; index_status tracking + flush-index; conflict_policy enforcement; TTL cleanup endpoint; orphan task recovery; role-split guides (guide-dev-agent.md, guide-tester-qa.md, guide-coordinator.md)

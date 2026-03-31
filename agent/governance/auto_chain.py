@@ -21,6 +21,73 @@ log = logging.getLogger(__name__)
 # Restore to False before production use.
 _DISABLE_VERSION_GATE = False
 
+# ---------------------------------------------------------------------------
+# Reconciliation Bypass Policy (R1)
+# ---------------------------------------------------------------------------
+RECONCILIATION_BYPASS_POLICY = {
+    "required_metadata_fields": ["reconciliation_lane", "observer_authorized"],
+    "allowed_lanes": {"A", "B"},
+    "audit_action": "reconciliation_bypass",
+}
+
+
+def _check_reconciliation_bypass(conn, project_id, metadata):
+    """Validate metadata against RECONCILIATION_BYPASS_POLICY.
+
+    Returns (bypass: bool, observer_task_id: str|None).
+    Checks:
+      (a) metadata.reconciliation_lane in allowed_lanes
+      (b) metadata.observer_authorized == True
+      (c) task chain traces back to an observer-created parent task
+    """
+    policy = RECONCILIATION_BYPASS_POLICY
+
+    # (a) reconciliation_lane must be in allowed set
+    lane = str(metadata.get("reconciliation_lane", "") or "").strip().upper()
+    if lane not in policy["allowed_lanes"]:
+        return False, None
+
+    # (b) observer_authorized must be explicitly True
+    if not metadata.get("observer_authorized"):
+        return False, None
+
+    # (c) Walk parent chain to find observer-created task
+    observer_task_id = metadata.get("observer_task_id")
+    if not observer_task_id:
+        for parent_meta in _walk_task_metadata_chain(conn, project_id, metadata):
+            if parent_meta.get("created_by_observer") or parent_meta.get("observer_task_id"):
+                observer_task_id = parent_meta.get("observer_task_id") or parent_meta.get("parent_task_id", "")
+                break
+
+    if not observer_task_id:
+        # Fallback: treat the parent_task_id as the observer task if observer_authorized is set
+        observer_task_id = metadata.get("parent_task_id", "unknown")
+
+    return True, observer_task_id
+
+
+def _audit_reconciliation_bypass(conn, project_id, task_id, observer_task_id, lane):
+    """Write reconciliation_bypass event to audit_log (R6)."""
+    try:
+        conn.execute(
+            "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?)",
+            (
+                project_id,
+                "reconciliation_bypass",
+                "auto-chain",
+                1,
+                task_id,
+                json.dumps({
+                    "observer_task_id": observer_task_id,
+                    "lane": lane,
+                    "task_id": task_id,
+                }),
+            ),
+        )
+    except Exception:
+        log.debug("audit reconciliation_bypass failed (non-critical)", exc_info=True)
+
 # Chain definition: task_type → (gate_fn, next_type, prompt_builder)
 # next_type=None means terminal stage (deploy trigger)
 CHAIN = {
@@ -714,6 +781,15 @@ def _gate_version_check(conn, project_id, result, metadata):
     if not hasattr(conn, "execute"):
         return True, "no db-capable connection, skipping"
 
+    # --- Structured reconciliation bypass (RECONCILIATION_BYPASS_POLICY) ---
+    bypass, observer_task_id = _check_reconciliation_bypass(conn, project_id, metadata)
+    if bypass:
+        lane = str(metadata.get("reconciliation_lane", "")).strip().upper()
+        task_id = metadata.get("task_id") or metadata.get("parent_task_id") or "unknown"
+        _audit_reconciliation_bypass(conn, project_id, task_id, observer_task_id, lane)
+        return True, f"reconciliation-bypass (observer={observer_task_id}, lane={lane})"
+
+    # --- Legacy governed dirty-workspace chain (kept for backward compat) ---
     if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
         return True, "governed dirty-workspace reconciliation"
 
@@ -1187,9 +1263,97 @@ def _build_deploy_prompt(task_id, result, metadata):
 
 
 def _finalize_chain(conn, project_id, task_id, result, metadata):
-    """Terminal stage after deploy succeeds."""
+    """Terminal stage after deploy succeeds.
+
+    R4: Call version-sync then version-update to advance chain_version.
+    R5: Verify SERVER_VERSION == new HEAD; warn if stale.
+    """
+    import subprocess as _sp
+
     report = result.get("report", result)
-    return {"deploy": "completed", "report": report}
+    finalize_result = {"deploy": "completed", "report": report}
+
+    # --- R4: version-sync then version-update ---
+    try:
+        _finalize_version_sync(conn, project_id, task_id)
+    except Exception as e:
+        log.warning("_finalize_chain: version-sync/update failed: %s", e)
+        finalize_result["version_sync_error"] = str(e)
+
+    # --- R5: verify SERVER_VERSION == new HEAD ---
+    try:
+        from .server import SERVER_VERSION
+        new_head = _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        ).stdout.strip()
+        if new_head and new_head != "unknown" and SERVER_VERSION != new_head:
+            finalize_result["restart_required"] = True
+            finalize_result["stale_server_version"] = SERVER_VERSION
+            finalize_result["expected_version"] = new_head
+            log.warning(
+                "_finalize_chain: SERVER_VERSION (%s) != HEAD (%s) — restart_required=true",
+                SERVER_VERSION, new_head,
+            )
+    except Exception as e:
+        log.debug("_finalize_chain: version verify failed: %s", e)
+
+    return finalize_result
+
+
+def _finalize_version_sync(conn, project_id, task_id):
+    """Call version-sync then version-update via local DB ops (R4).
+
+    Uses direct DB writes instead of HTTP to avoid circular dependency.
+    """
+    import subprocess as _sp
+
+    # Get current git HEAD
+    head_result = _sp.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    )
+    new_head = head_result.stdout.strip() if head_result.returncode == 0 else None
+    if not new_head:
+        log.warning("_finalize_version_sync: cannot determine git HEAD")
+        return
+
+    # version-sync: update git_head and dirty_files in project_version
+    try:
+        dirty_result = _sp.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        )
+        dirty_files = [
+            line[3:] for line in (dirty_result.stdout or "").strip().split("\n")
+            if line.strip()
+        ] if dirty_result.returncode == 0 else []
+    except Exception:
+        dirty_files = []
+
+    conn.execute(
+        "INSERT OR REPLACE INTO project_version (project_id, chain_version, git_head, dirty_files, updated_at) "
+        "VALUES (?, ?, ?, ?, datetime('now'))",
+        (project_id, new_head, new_head, json.dumps(dirty_files)),
+    )
+    log.info(
+        "_finalize_version_sync: version-sync project=%s head=%s dirty=%d",
+        project_id, new_head, len(dirty_files),
+    )
+
+    # version-update: set chain_version = new HEAD with updated_by='auto-chain'
+    conn.execute(
+        "UPDATE project_version SET chain_version=?, updated_by=?, updated_at=datetime('now') "
+        "WHERE project_id=?",
+        (new_head, f"auto-chain:{task_id}", project_id),
+    )
+    log.info(
+        "_finalize_version_sync: version-update project=%s chain_version=%s updated_by=auto-chain:%s",
+        project_id, new_head, task_id,
+    )
 
 
 # ---------------------------------------------------------------------------

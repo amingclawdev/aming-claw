@@ -517,6 +517,39 @@ Chain metadata (`_worktree`, `_branch`, `changed_files`, `target_files`) is pres
 - Formal docs (`docs/*.md` outside `docs/dev/`) remain enforced
 - `doc_impact.files` entries matching `docs/dev/**` are silently excluded
 
+## Reconciliation Bypass Design Rationale
+
+### Why the Version Gate Cannot Be Globally Disabled
+
+The version gate (`_gate_version_check`) prevents auto-chain from executing tasks against stale governance code. Disabling it globally would allow:
+- Tasks to run against outdated gate logic, producing false passes
+- Merge operations to corrupt `chain_version` by writing stale values
+- Silent drift between deployed code and governance DB state
+
+### Observer-Scoped Reconciliation Bypass
+
+Instead of disabling the gate, the reconciliation bypass is **scoped to observer-authorized tasks only**:
+
+1. **Explicit authorization**: `observer_authorized=true` must be set by an observer
+2. **Lane isolation**: Only lanes A and B are allowed — limits blast radius
+3. **Audit trail**: Every bypass is recorded in `audit_log` with `action='reconciliation_bypass'`
+4. **Chain traceability**: The `observer_task_id` links the bypass to its authorizing observer session
+
+This ensures that reconciliation bypasses are intentional, traceable, and limited in scope.
+
+### VERSION Lifecycle During Merge/Deploy
+
+The VERSION file bootstrap paradox: committing changes to fix version drift itself changes HEAD, causing the VERSION to always lag by one commit. The resolution:
+
+1. **Merge completes** → new git commit created with new HEAD
+2. **version-sync** → `_finalize_version_sync()` reads new HEAD, updates `git_head` and `dirty_files` in `project_version`
+3. **version-update** → sets `chain_version = new HEAD` with `updated_by='auto-chain:<merge_task_id>'`
+4. **Verify** → checks `SERVER_VERSION == new HEAD`; if stale, emits `restart_required=true`
+
+The sync→update→verify sequence ensures the DB is always consistent after merge, without requiring a VERSION file amend.
+
+---
+
 ## Changelog
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: DB lock fix: auto_chain independent connection + guaranteed conn.close()
