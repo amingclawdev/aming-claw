@@ -36,7 +36,7 @@ _COORDINATOR_HANG_TIMEOUT = 300  # coordinator has no tools; waits longer for si
 _MAX_TIMEOUT = 1200    # absolute session cap regardless of activity
 _CLAUDE_ROLE_TURN_CAPS = {
     "coordinator": "1",
-    "pm": "60",
+    "pm": "5",
     "dev": "40",
     "tester": "20",
     "qa": "20",

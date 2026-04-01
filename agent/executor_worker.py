@@ -817,7 +817,24 @@ class ExecutorWorker:
                 pass
             _bp_log("context + queue done")
 
-            # 4. Project structure
+            # 4. Target file preview (help PM verify paths and understand scope)
+            target_files = context.get("target_files", [])
+            if target_files:
+                parts.append(f"\n## Target Files Preview")
+                for tf in target_files[:3]:
+                    tf_path = os.path.join(self.workspace or ".", tf)
+                    try:
+                        with open(tf_path, "r", encoding="utf-8", errors="replace") as f:
+                            lines = f.readlines()
+                        parts.append(f"\n### {tf} ({len(lines)} lines)")
+                        # Show first 30 lines as preview
+                        preview = "".join(lines[:30])
+                        parts.append(f"```\n{preview}```")
+                    except Exception:
+                        parts.append(f"\n### {tf} (file not found or unreadable)")
+                _bp_log(f"target files preview: {len(target_files)} files")
+
+            # 6. Project structure
             parts.append("\n## Project Structure")
             parts.append("  agent/ — executor_worker, ai_lifecycle, pipeline_config")
             parts.append("  agent/governance/ — auto_chain, db, server, memory_service, memory_backend")
@@ -825,7 +842,7 @@ class ExecutorWorker:
             parts.append("  agent/tests/ — pytest test files")
             parts.append("  docs/ — specs, rules, dev iteration logs")
 
-            # 5. PRD output format instruction (scheme C — single source of truth)
+            # 7. PRD output format instruction (scheme C — single source of truth)
             parts.append(
                 "\nOutput a PRD as strict JSON with these fields:\n"
                 "{\n"

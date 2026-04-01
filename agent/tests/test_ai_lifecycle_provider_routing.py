@@ -89,10 +89,10 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
 
         self.assertEqual(dev_cmd[dev_cmd.index("--max-turns") + 1], "60")
 
-    def test_pm_role_turn_cap_is_60(self):
+    def test_pm_role_turn_cap_is_5(self):
         from ai_lifecycle import AILifecycleManager, _CLAUDE_ROLE_TURN_CAPS
 
-        self.assertEqual(_CLAUDE_ROLE_TURN_CAPS["pm"], "60")
+        self.assertEqual(_CLAUDE_ROLE_TURN_CAPS["pm"], "5")
 
         pm_cmd = AILifecycleManager._build_claude_command(
             role="pm",
@@ -102,7 +102,7 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
             context={},
             prompt="analyze requirements",
         )
-        self.assertEqual(pm_cmd[pm_cmd.index("--max-turns") + 1], "60")
+        self.assertEqual(pm_cmd[pm_cmd.index("--max-turns") + 1], "5")
 
     def test_codex_command_for_openai(self):
         from ai_lifecycle import AILifecycleManager
