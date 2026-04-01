@@ -81,6 +81,7 @@ class ExecutorWorker:
         self._current_task = None
         self._lifecycle = None
         self._pid_path = None  # type: Optional[str]
+        self._consecutive_empty_polls = 0  # tracks consecutive polls with no task
 
     def _api(self, method: str, path: str, data: dict = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
@@ -1568,14 +1569,29 @@ class ExecutorWorker:
         self._pid_path = None
 
     def run_once(self) -> bool:
-        """Try to claim and execute one task. Returns True if a task was processed."""
-        task = self._claim_task()
-        if not task:
+        """Try to claim and execute one task. Returns True if a task was processed.
+
+        Contract: this method NEVER raises. All exceptions are caught, the task
+        is marked failed via _complete_task, and True is returned so the poll
+        loop continues without interruption.
+        """
+        try:
+            task = self._claim_task()
+        except Exception:
+            # Transient claim error — treat as empty poll
+            self._consecutive_empty_polls += 1
             return False
 
+        if not task:
+            self._consecutive_empty_polls += 1
+            if self._consecutive_empty_polls == 10:
+                log.warning("10 consecutive empty polls — no tasks available")
+            return False
+
+        # Successful claim — reset counter
+        self._consecutive_empty_polls = 0
         task_id = task["task_id"]
         self._current_task = task_id
-        # Note: log.info removed — blocks intermittently in MCP subprocess
 
         try:
             outcome = self._execute_task(task)
