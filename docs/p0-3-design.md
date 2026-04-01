@@ -452,6 +452,7 @@ Coordinator checks PRD against rules → any match → ask user permission befor
 | Memory injection for all task types (pm/dev/test/qa via _fetch_memories) | `agent/executor_worker.py` |
 | Orphan task lease recovery — periodic _recover_stale_leases() in run_loop | `agent/executor_worker.py` |
 | TTL cleanup trigger every ~6h in run_loop | `agent/executor_worker.py` |
+| Claim-loop stability: run_once() never raises, consecutive empty poll tracking | `agent/executor_worker.py` |
 | Role-specific agent guides (dev/tester-qa/coordinator) | `docs/guide-*.md` |
 | Flush-index + TTL-cleanup API endpoints | `agent/governance/server.py` |
 | Tests | governance server + executor-gateway tests |
