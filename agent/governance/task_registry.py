@@ -6,6 +6,7 @@ Dual-field state model:
 
 Supports: retry, priority, assignment, fencing token, progress heartbeat.
 """
+from __future__ import annotations
 
 import json
 import logging
