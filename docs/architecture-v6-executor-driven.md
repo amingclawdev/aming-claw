@@ -40,6 +40,19 @@ User receives reply
 | **Tester** | Code changes | Test report + verify(testing/t2_pass) | Modify code, create tasks |
 | **QA** | Test results | Acceptance decision + verify(qa_pass) | Modify code, run tests |
 
+### Role Turn Caps
+
+Each role has a `--max-turns` cap enforced by `_CLAUDE_ROLE_TURN_CAPS` in `ai_lifecycle.py`:
+
+| Role | Max Turns | Notes |
+|------|-----------|-------|
+| Coordinator | 1 | Single-turn, no tools |
+| PM | 60 | Needs many turns for requirements analysis, PRD generation, and node design |
+| Dev | 40 | (raised to 60 for heavy workflows) |
+| Tester | 20 | |
+| QA | 20 | |
+| Gatekeeper | 20 | |
+
 ## 1. v5.1 → v6 Core Changes
 
 | Dimension | v5.1 | v6 | Reason |
