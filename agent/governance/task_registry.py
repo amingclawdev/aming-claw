@@ -257,7 +257,12 @@ def complete_task(
         # Has chat_id → needs notification
         meta = json.loads(row["metadata_json"] or "{}")
         if meta.get("chat_id"):
-            notify_status = "pending"
+            # If executor already sent the reply directly (coordinator flow),
+            # mark as "sent" to prevent gateway from sending a duplicate.
+            if (result or {}).get("_reply_sent"):
+                notify_status = "sent"
+            else:
+                notify_status = "pending"
 
     conn.execute(
         """UPDATE tasks SET status = ?, execution_status = ?,
