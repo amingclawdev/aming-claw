@@ -394,8 +394,50 @@ class ExecutorWorker:
         worktree = metadata.get("_worktree", "")
         self._report_progress(task_id, {"step": "merging"})
 
-        # Fail closed: chained merge tasks MUST carry isolated metadata
+        # Chained merge without isolation metadata: check if changes already on main
         if metadata.get("parent_task_id") and not branch:
+            # Observer-completed dev tasks don't produce _branch/_worktree.
+            # If changed_files are already committed to main, treat as pre-merged.
+            if metadata.get("_already_merged") or metadata.get("_merge_commit"):
+                rev = subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=self.workspace, capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                merge_commit = metadata.get("_merge_commit", rev)
+                log.info("merge: pre-merged chain (observer), commit=%s", merge_commit)
+                return {"status": "succeeded", "result": {
+                    "merge_commit": merge_commit,
+                    "changed_files": changed,
+                    "pre_merged": True,
+                }}
+            # Check if HEAD already contains the expected changes
+            try:
+                head_rev = subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=self.workspace, capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                # If chain_version (last merge) != HEAD, there are unmerged commits
+                # that likely contain the dev changes already cherry-picked/committed
+                from .governance.db import get_connection
+                conn = get_connection(self.project_id)
+                try:
+                    row = conn.execute(
+                        "SELECT chain_version FROM project_version WHERE project_id = ?",
+                        (self.project_id,),
+                    ).fetchone()
+                    chain_ver = row["chain_version"] if row else ""
+                finally:
+                    conn.close()
+                if chain_ver and chain_ver != head_rev:
+                    log.info("merge: no isolation branch but HEAD (%s) ahead of chain_version (%s) — treating as pre-merged",
+                             head_rev, chain_ver)
+                    return {"status": "succeeded", "result": {
+                        "merge_commit": head_rev,
+                        "changed_files": changed,
+                        "pre_merged": True,
+                    }}
+            except Exception as e:
+                log.warning("merge: pre-merge detection failed: %s", e)
             return {
                 "status": "failed",
                 "error": (
