@@ -157,10 +157,10 @@ class TestVersionGateRound4(unittest.TestCase):
         self.assertIn("reconciliation-bypass", reason)
         self.assertIn("task-observer-001", reason)
 
-    # --- AC6: normal task blocked despite reconciliation code existing ---
-    def test_normal_task_blocked_despite_reconciliation_code(self):
-        """AC6: _gate_version_check blocks when SERVER_VERSION != HEAD and
-        metadata has no reconciliation fields."""
+    # --- AC6 (D3 update): server version mismatch is now warning-only ---
+    def test_server_version_mismatch_is_warning_only(self):
+        """D3: _gate_version_check warns but does NOT block when SERVER_VERSION != HEAD.
+        Only dirty-workspace failures should block."""
         from governance import auto_chain
 
         conn = mock.Mock()
@@ -176,8 +176,8 @@ class TestVersionGateRound4(unittest.TestCase):
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="def5678\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata)
 
-        self.assertFalse(passed)
-        self.assertIn("behind git HEAD", reason)
+        self.assertTrue(passed)
+        self.assertIn("warning only", reason)
 
     # --- Test RECONCILIATION_BYPASS_POLICY structure (AC1) ---
     def test_reconciliation_bypass_policy_structure(self):
