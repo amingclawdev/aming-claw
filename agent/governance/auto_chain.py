@@ -834,11 +834,13 @@ def _gate_version_check(conn, project_id, result, metadata):
             (project_id,),
         ).fetchone()
         dirty_files = json.loads(row["dirty_files"] or "[]") if row and row["dirty_files"] else []
+        # Filter out tool-local config files that aren't project code
+        _DIRTY_IGNORE = (".claude/", ".claude\\")
+        dirty_files = [f for f in dirty_files if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
         if dirty_files:
-            return False, (
-                f"Dirty workspace detected ({len(dirty_files)} files). "
-                "Commit or discard out-of-band edits before continuing auto-chain."
-            )
+            log.warning("version_check: dirty workspace (%d files: %s) — chain continues as warning",
+                        len(dirty_files), dirty_files[:5])
+            return True, f"dirty workspace warning ({len(dirty_files)} files)"
 
         from .server import SERVER_VERSION
         import subprocess

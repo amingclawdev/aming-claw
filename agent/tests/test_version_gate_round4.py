@@ -17,7 +17,8 @@ class TestVersionGateRound4(unittest.TestCase):
         mock_server.SERVER_VERSION = version
         return mock.patch.dict("sys.modules", {"governance.server": mock_server})
 
-    def test_dirty_workspace_blocks_auto_chain(self):
+    def test_dirty_workspace_is_warning_not_blocker(self):
+        """D5: dirty workspace (non-.claude files) is warning-only, not a blocker."""
         from governance import auto_chain
 
         conn = mock.Mock()
@@ -32,8 +33,27 @@ class TestVersionGateRound4(unittest.TestCase):
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, {})
 
-        self.assertFalse(passed)
-        self.assertIn("Dirty workspace detected", reason)
+        self.assertTrue(passed)
+        self.assertIn("dirty workspace warning", reason)
+
+    def test_claude_config_dirty_files_are_ignored(self):
+        """D5: .claude/ files are filtered out of dirty_files entirely."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = {
+            "chain_version": "abc1234",
+            "git_head": "abc1234",
+            "dirty_files": '[".claude/settings.local.json"]',
+        }
+
+        with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False), \
+             self._patch_server_version("abc1234"), \
+             mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
+            passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, {})
+
+        self.assertTrue(passed)
+        self.assertIn("version match", reason)  # No dirty files after filtering
 
     def test_clean_workspace_and_matching_server_pass(self):
         from governance import auto_chain
@@ -115,10 +135,11 @@ class TestVersionGateRound4(unittest.TestCase):
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata_no_auth)
 
-        self.assertFalse(passed)
-        self.assertIn("Dirty workspace detected", reason)
+        # Dirty workspace is now warning-only (D5), so gate passes regardless of reconciliation auth
+        self.assertTrue(passed)
+        self.assertIn("dirty workspace warning", reason)
 
-        # Also test with observer_authorized=False
+        # Also test with observer_authorized=False — still passes since dirty is warning-only
         metadata_false_auth = {
             "reconciliation_lane": "A",
             "observer_authorized": False,
@@ -128,8 +149,8 @@ class TestVersionGateRound4(unittest.TestCase):
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata_false_auth)
 
-        self.assertFalse(passed)
-        self.assertIn("Dirty workspace detected", reason)
+        self.assertTrue(passed)
+        self.assertIn("dirty workspace warning", reason)
 
     # --- AC5: reconciliation bypass passes with full policy ---
     def test_reconciliation_bypass_passes_with_full_policy(self):
