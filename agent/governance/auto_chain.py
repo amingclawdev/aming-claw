@@ -1032,6 +1032,18 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
             f"Got: {rec!r}. QA agent must set result.recommendation."
         )
+    # E2E1: Verify criteria_results when acceptance_criteria exist
+    criteria = metadata.get("acceptance_criteria", [])
+    criteria_results = result.get("criteria_results", [])
+    if criteria:
+        if not criteria_results:
+            log.warning("qa_gate: acceptance_criteria present (%d items) but QA result missing criteria_results — "
+                        "allowing pass but criteria not individually verified", len(criteria))
+        else:
+            failed_criteria = [cr for cr in criteria_results if not cr.get("passed")]
+            if failed_criteria:
+                names = [cr.get("criterion", "?")[:60] for cr in failed_criteria]
+                return False, f"QA approved overall but {len(failed_criteria)} criteria failed: {names}"
     # Update nodes FIRST (QA passed → promote to qa_pass)
     # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
     _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
@@ -1220,6 +1232,13 @@ def _build_qa_prompt(task_id, result, metadata):
         prompt_parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
     if doc_impact:
         prompt_parts.append(f"doc_impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+    if criteria:
+        prompt_parts.append(
+            "\nYou MUST evaluate each acceptance_criteria item individually.\n"
+            "Include in your result:\n"
+            "  criteria_results: [{criterion: \"<text>\", passed: true/false, evidence: \"<why>\"}]\n"
+            "Only set recommendation='qa_pass' if ALL criteria pass."
+        )
     prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
     prompt = "\n".join(prompt_parts)
     meta = {

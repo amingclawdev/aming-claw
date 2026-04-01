@@ -936,6 +936,10 @@ class ExecutorWorker:
             if rule_decision and rule_decision != "new":
                 parts.append(f"\n## Rule Engine Decision: {rule_decision}")
                 parts.append(f"  Reason: {rule_reason}")
+                # MB4: Inject specific failure/pitfall content for retry decisions
+                failure_content = metadata.get("failure_content") or metadata.get("details", {}).get("failure_content", "")
+                if failure_content and rule_decision == "retry":
+                    parts.append(f"  Historical context: {failure_content[:500]}")
 
         elif task_type == "test":
             changed = context.get("changed_files", [])

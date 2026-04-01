@@ -160,24 +160,27 @@ def check_conflicts(
         except Exception as e:
             log.warning("Rule 4 (dependency) check failed: %s", e)
 
-    # Rule 5: Past failure_pattern with same module → suggest retry with context
+    # Rule 5: Past failure/pitfall/decision with same module → suggest retry with context
     try:
         if target_files:
             module = target_files[0].split("/")[0] if "/" in target_files[0] else target_files[0]
             failure_rows = conn.execute("""
-                SELECT content, metadata_json FROM memories
-                WHERE project_id = ? AND kind = 'failure_pattern' AND status = 'active'
-                  AND module_id = ?
-                ORDER BY created_at DESC LIMIT 1
+                SELECT content, kind, metadata_json FROM memories
+                WHERE project_id = ? AND kind IN ('failure_pattern', 'pitfall', 'decision')
+                  AND status = 'active' AND module_id = ?
+                ORDER BY created_at DESC LIMIT 3
             """, (project_id, module)).fetchall()
             if failure_rows:
+                combined = "; ".join(
+                    f"[{r['kind']}] {r['content'][:100]}" for r in failure_rows
+                )
                 return {
                     "decision": "retry",
-                    "reason": f"Past failure pattern found for module '{module}'",
-                    "details": {"failure_content": failure_rows[0]["content"][:200]},
+                    "reason": f"Past {failure_rows[0]['kind']} found for module '{module}'",
+                    "details": {"failure_content": combined[:500]},
                 }
     except Exception as e:
-        log.warning("Rule 5 (failure pattern) check failed: %s", e)
+        log.warning("Rule 5 (failure/pitfall/decision) check failed: %s", e)
 
     # Rule 6: No conflicts → new task
     return {
