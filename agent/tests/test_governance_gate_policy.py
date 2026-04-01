@@ -170,6 +170,83 @@ class TestReconciliationBypassPolicy(unittest.TestCase):
         self.assertTrue(result.get("restart_required"))
 
 
+class TestGateCheckpointTestFileInference(unittest.TestCase):
+    """Tests for _gate_checkpoint test-file co-modification allowance (R1-R4)."""
+
+    def _call_gate(self, changed_files, target_files, extra_meta=None):
+        from unittest.mock import Mock
+        from governance.auto_chain import _gate_checkpoint
+        conn = Mock()
+        # Mock conn.execute for _should_defer_doc_gate_to_lane_c
+        conn.execute.return_value.fetchone.return_value = None
+        result = {
+            "changed_files": changed_files,
+            "test_results": {"ran": True, "passed": 1, "failed": 0},
+        }
+        metadata = {
+            "target_files": target_files,
+            "doc_impact": {"files": [], "changes": []},
+            "skip_doc_check": True,
+            "bootstrap_reason": "test",
+        }
+        if extra_meta:
+            metadata.update(extra_meta)
+        return _gate_checkpoint(conn, "test-proj", result, metadata)
+
+    def test_ac2_comodified_test_file_allowed(self):
+        """AC2: test file matching target stem is allowed."""
+        ok, reason = self._call_gate(
+            changed_files=["agent/ai_lifecycle.py", "agent/tests/test_ai_lifecycle_provider_routing.py"],
+            target_files=["agent/ai_lifecycle.py"],
+        )
+        self.assertTrue(ok, f"Expected pass but got: {reason}")
+
+    def test_ac3_unrelated_test_file_blocked(self):
+        """AC3: test file NOT matching target stem is blocked."""
+        ok, reason = self._call_gate(
+            changed_files=["agent/ai_lifecycle.py", "agent/tests/test_something_else.py"],
+            target_files=["agent/ai_lifecycle.py"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("Unrelated files modified", reason)
+        self.assertIn("test_something_else.py", reason)
+
+    def test_ac4_explicit_test_files_still_work(self):
+        """AC4: explicit test_files in metadata still allowed."""
+        ok, reason = self._call_gate(
+            changed_files=["agent/ai_lifecycle.py", "agent/tests/test_something_else.py"],
+            target_files=["agent/ai_lifecycle.py"],
+            extra_meta={"test_files": ["agent/tests/test_something_else.py"]},
+        )
+        self.assertTrue(ok, f"Expected pass but got: {reason}")
+
+    def test_exact_stem_match_test_file(self):
+        """test_ai_lifecycle.py (exact stem) is also allowed."""
+        ok, reason = self._call_gate(
+            changed_files=["agent/ai_lifecycle.py", "agent/tests/test_ai_lifecycle.py"],
+            target_files=["agent/ai_lifecycle.py"],
+        )
+        self.assertTrue(ok, f"Expected pass but got: {reason}")
+
+    def test_non_tests_dir_not_allowed(self):
+        """R4: test-named file NOT under tests/ directory is blocked."""
+        ok, reason = self._call_gate(
+            changed_files=["agent/ai_lifecycle.py", "agent/test_ai_lifecycle.py"],
+            target_files=["agent/ai_lifecycle.py"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("Unrelated files modified", reason)
+
+    def test_doc_impact_files_still_allowed(self):
+        """AC4: doc_impact.files entries still work."""
+        ok, reason = self._call_gate(
+            changed_files=["agent/ai_lifecycle.py", "docs/lifecycle.md"],
+            target_files=["agent/ai_lifecycle.py"],
+            extra_meta={"doc_impact": {"files": ["docs/lifecycle.md"], "changes": []}},
+        )
+        self.assertTrue(ok, f"Expected pass but got: {reason}")
+
+
 if __name__ == "__main__":
     unittest.main()
 

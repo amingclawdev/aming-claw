@@ -936,8 +936,30 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     doc_impact = metadata.get("doc_impact", {})
     if isinstance(doc_impact, dict):
         allowed.update(doc_impact.get("files", []) or [])
+    # R1/R2: Derive allowed test files from target_files stems.
+    # For each target file with stem S, allow changed files matching
+    # tests/test_{S}*.py (under any parent directory or agent/tests/).
+    _allowed_test_prefixes = []
+    for tf in target:
+        import os.path as _osp
+        stem = _osp.splitext(_osp.basename(tf))[0]  # e.g. "ai_lifecycle"
+        _allowed_test_prefixes.append(f"test_{stem}")
     if allowed:
-        unrelated = [f for f in changed if f not in allowed]
+        unrelated = []
+        for f in changed:
+            if f in allowed:
+                continue
+            # Check if file is a co-modified test file under a tests/ directory
+            if _allowed_test_prefixes:
+                import posixpath
+                parts = f.replace("\\", "/")
+                parent = posixpath.dirname(parts)
+                basename = posixpath.basename(parts)
+                if (parent.endswith("/tests") or parent.endswith("\\tests") or parent == "tests") \
+                        and basename.endswith(".py"):
+                    if any(basename.startswith(prefix) for prefix in _allowed_test_prefixes):
+                        continue
+            unrelated.append(f)
         if unrelated:
             return False, f"Unrelated files modified: {unrelated}"
     # Syntax check: verify test_results if available
