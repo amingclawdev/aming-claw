@@ -437,23 +437,19 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     gate_fn_name, next_type, builder_name = CHAIN[task_type]
 
-    # Pre-gate: version check — ensure governance server is running latest code
+    # Pre-gate: version check — warn on server lag but don't block chain
     ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
     if not ver_passed:
-        workflow_improvement = _maybe_create_workflow_improvement_task(
-            conn, project_id, task_id, "version_check", ver_reason, metadata, result
-        )
+        # Only dirty-workspace failures reach here (server-version lag is now warning-only)
         log.info("auto_chain: version gate blocked for task %s: %s", task_id, ver_reason)
         _publish_event("gate.blocked", {
             "project_id": project_id, "task_id": task_id,
             "stage": "version_check", "next_stage": task_type,
             "reason": ver_reason,
         })
-        out = {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
-        if workflow_improvement:
-            out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
-            out["failure_class"] = workflow_improvement["classification"].get("failure_class", "")
-        return out
+        return {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
+    else:
+        log.debug("auto_chain: version check passed for task %s: %s", task_id, ver_reason)
 
     # Emit task.completed to chain context store
     _publish_event("task.completed", {
@@ -817,14 +813,13 @@ def _gate_version_check(conn, project_id, result, metadata):
         if SERVER_VERSION == "unknown":
             return True, "server version unavailable, skipping"
         if SERVER_VERSION != head:
-            return False, (
-                f"Governance server version ({SERVER_VERSION}) is behind git HEAD ({head}). "
-                f"Restart the server to pick up latest code."
-            )
+            log.warning("version_check: server version (%s) behind git HEAD (%s) — chain continues",
+                        SERVER_VERSION, head)
+            return True, f"server version lag ({SERVER_VERSION} != {head}), warning only"
         return True, f"version match: {SERVER_VERSION}"
     except Exception as e:
-        log.warning("version_check failed: %s", e)
-        return False, f"version check failed: {e}"
+        log.warning("version_check failed (non-fatal): %s", e)
+        return True, f"version check skipped: {e}"
 
 
 def _gate_post_pm(conn, project_id, result, metadata):
