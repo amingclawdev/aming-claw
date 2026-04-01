@@ -577,6 +577,26 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 f"Original task: {original_prompt}"
             )
             from . import task_registry
+            # Dedup: skip if an active dev-retry already exists for this parent
+            try:
+                _existing_stage_retry = conn.execute(
+                    "SELECT task_id FROM tasks WHERE project_id = ? AND type = 'dev' "
+                    "AND status IN ('queued','claimed','observer_hold') "
+                    "AND json_extract(metadata_json, '$.parent_task_id') = ?",
+                    (project_id, task_id),
+                ).fetchone()
+            except Exception:
+                _existing_stage_retry = None
+            if _existing_stage_retry:
+                _dup_id = _existing_stage_retry["task_id"]
+                log.warning("auto_chain: dedup stage-retry — active dev retry %s already exists for %s",
+                            _dup_id, task_id)
+                out = {"gate_blocked": True, "stage": task_type, "reason": reason,
+                       "retry_task_id": _dup_id, "retry_type": "dev",
+                       "retry_from_stage": task_type, "dedup": True}
+                if workflow_improvement:
+                    out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
+                return out
             dev_retry = task_registry.create_task(
                 conn, project_id,
                 prompt=stage_retry_prompt,
@@ -643,6 +663,25 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     f"Original task: {original_prompt}"
                 )
             from . import task_registry
+            # Dedup: skip if an active same-stage retry already exists for this parent
+            try:
+                _existing_same_retry = conn.execute(
+                    "SELECT task_id FROM tasks WHERE project_id = ? AND type = ? "
+                    "AND status IN ('queued','claimed','observer_hold') "
+                    "AND json_extract(metadata_json, '$.parent_task_id') = ?",
+                    (project_id, task_type, task_id),
+                ).fetchone()
+            except Exception:
+                _existing_same_retry = None
+            if _existing_same_retry:
+                _dup_id = _existing_same_retry["task_id"]
+                log.warning("auto_chain: dedup same-stage-retry — active %s retry %s already exists for %s",
+                            task_type, _dup_id, task_id)
+                out = {"gate_blocked": True, "stage": task_type, "reason": reason,
+                       "retry_task_id": _dup_id, "dedup": True}
+                if workflow_improvement:
+                    out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
+                return out
             retry_task = task_registry.create_task(
                 conn, project_id,
                 prompt=retry_prompt,
