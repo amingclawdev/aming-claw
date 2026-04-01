@@ -15,7 +15,7 @@ Flow:
 
 Usage:
   python -m agent.executor_worker --project aming-claw
-  GOVERNANCE_URL=http://localhost:40006 python -m agent.executor_worker
+  GOVERNANCE_URL=http://localhost:40000 python -m agent.executor_worker
 
 Full chain verified: dev→test→qa→merge→deploy.
 """
@@ -41,7 +41,7 @@ log = logging.getLogger("executor_worker")
 
 # --- Configuration ---
 
-GOVERNANCE_URL = os.getenv("GOVERNANCE_URL", "http://localhost:40006")
+GOVERNANCE_URL = os.getenv("GOVERNANCE_URL", "http://localhost:40000")
 POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "10"))
 WORKER_ID = os.getenv("EXECUTOR_WORKER_ID", f"executor-{os.getpid()}")
 WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]))

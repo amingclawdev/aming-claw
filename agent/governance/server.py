@@ -39,7 +39,7 @@ from .models import ImpactAnalysisRequest, FileHitPolicy
 import os
 import signal
 import subprocess
-PORT = int(os.environ.get("GOVERNANCE_PORT", "40006"))
+PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 
 # --- Server Version (git commit hash at startup) ---
 def _get_git_version():
