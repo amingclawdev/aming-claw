@@ -416,18 +416,13 @@ class ExecutorWorker:
                     ["git", "rev-parse", "--short", "HEAD"],
                     cwd=self.workspace, capture_output=True, text=True, timeout=5,
                 ).stdout.strip()
-                # If chain_version (last merge) != HEAD, there are unmerged commits
-                # that likely contain the dev changes already cherry-picked/committed
-                from .governance.db import get_connection
-                conn = get_connection(self.project_id)
-                try:
-                    row = conn.execute(
-                        "SELECT chain_version FROM project_version WHERE project_id = ?",
-                        (self.project_id,),
-                    ).fetchone()
-                    chain_ver = row["chain_version"] if row else ""
-                finally:
-                    conn.close()
+                # Query chain_version via HTTP API (executor runs standalone, no relative imports)
+                import urllib.request
+                vc_resp = urllib.request.urlopen(
+                    f"{self.base_url}/api/version-check/{self.project_id}", timeout=10,
+                )
+                vc_data = json.loads(vc_resp.read())
+                chain_ver = vc_data.get("chain_version", "")
                 if chain_ver and chain_ver != head_rev:
                     log.info("merge: no isolation branch but HEAD (%s) ahead of chain_version (%s) — treating as pre-merged",
                              head_rev, chain_ver)
