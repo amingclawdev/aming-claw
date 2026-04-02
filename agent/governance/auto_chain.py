@@ -1566,7 +1566,7 @@ def _write_chain_memory(conn, project_id, kind, content, metadata, extra_structu
 
 
 # Status ordering for node_state validation
-_STATUS_ORDER = ["pending", "testing", "t2_pass", "qa_pass"]
+_STATUS_ORDER = ["pending", "testing", "t2_pass", "qa_pass", "waived"]
 
 
 def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
