@@ -58,5 +58,95 @@ class TestDeploySmokeFallbackRound3(unittest.TestCase):
                 self.assertTrue(_executor_health_from_state())
 
 
+class TestDeploySemanticsReconciliation(unittest.TestCase):
+    """Tests for deploy result semantics reconciliation (R1-R7)."""
+
+    # AC6: governance-only deploy skips gateway smoke, all_pass=True
+    def test_governance_only_deploy_skips_gateway_smoke(self):
+        from deploy_chain import smoke_test
+
+        # Mock all HTTP/subprocess calls so only governance is checked
+        with mock.patch("deploy_chain.subprocess") as mock_sp, \
+             mock.patch("requests.get") as mock_get:
+            # governance health returns 200
+            mock_get.return_value = mock.Mock(status_code=200)
+            mock.patch("time.sleep").start()
+
+            result = smoke_test(affected_services=["governance"])
+
+        self.assertEqual(result["gateway"], "skipped")
+        self.assertEqual(result["executor"], "skipped")
+        self.assertTrue(result["all_pass"])
+
+    # AC7: report.success matches smoke_test.all_pass
+    def test_report_success_consistent_with_smoke(self):
+        from deploy_chain import run_deploy
+
+        # Case 1: smoke all_pass=False → report.success=False
+        fake_smoke_fail = {"executor": True, "governance": False, "gateway": "skipped", "all_pass": False}
+        with mock.patch("deploy_chain.detect_affected_services", return_value=["governance"]), \
+             mock.patch("deploy_chain.rebuild_governance", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.smoke_test", return_value=fake_smoke_fail), \
+             mock.patch("deploy_chain._save_report"):
+            report = run_deploy(["agent/governance/server.py"])
+        self.assertFalse(report["success"])
+
+        # Case 2: smoke all_pass=True + step success → report.success=True
+        fake_smoke_pass = {"executor": "skipped", "governance": True, "gateway": "skipped", "all_pass": True}
+        with mock.patch("deploy_chain.detect_affected_services", return_value=["governance"]), \
+             mock.patch("deploy_chain.rebuild_governance", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.smoke_test", return_value=fake_smoke_pass), \
+             mock.patch("deploy_chain._save_report"):
+            report = run_deploy(["agent/governance/server.py"])
+        self.assertTrue(report["success"])
+
+        # Case 3: step fails but smoke passes → report.success=False (R1/R6)
+        fake_smoke_pass2 = {"executor": "skipped", "governance": True, "gateway": "skipped", "all_pass": True}
+        with mock.patch("deploy_chain.detect_affected_services", return_value=["governance"]), \
+             mock.patch("deploy_chain.rebuild_governance", return_value=(False, "fail")), \
+             mock.patch("deploy_chain.restart_local_governance", return_value=(False, "also fail")), \
+             mock.patch("deploy_chain.smoke_test", return_value=fake_smoke_pass2), \
+             mock.patch("deploy_chain._save_report"):
+            report = run_deploy(["agent/governance/server.py"])
+        self.assertFalse(report["success"])
+
+    # AC8: gateway deploy triggers full smoke (gateway is checked, not skipped)
+    def test_gateway_deploy_triggers_full_smoke(self):
+        from deploy_chain import smoke_test
+
+        with mock.patch("deploy_chain.subprocess") as mock_sp, \
+             mock.patch("requests.get") as mock_get:
+            mock_get.return_value = mock.Mock(status_code=200)
+            mock_sp.run.return_value = mock.Mock(stdout="true\n", returncode=0)
+            mock.patch("time.sleep").start()
+
+            result = smoke_test(affected_services=["executor", "governance", "gateway"])
+
+        # gateway should be checked (bool), not skipped
+        self.assertIsInstance(result["gateway"], bool)
+        self.assertNotEqual(result["gateway"], "skipped")
+
+    # AC9: restart_local_governance uses port 40000 by default
+    def test_host_governance_port_40000(self):
+        import inspect
+        from deploy_chain import restart_local_governance
+
+        sig = inspect.signature(restart_local_governance)
+        default_port = sig.parameters["port"].default
+        self.assertEqual(default_port, 40000)
+
+    # AC5: rebuild_governance detects host-runtime and skips Docker
+    def test_rebuild_governance_host_runtime_skips_docker(self):
+        from deploy_chain import rebuild_governance
+
+        with mock.patch("deploy_chain._is_host_runtime_mode", return_value=True), \
+             mock.patch("deploy_chain.restart_local_governance", return_value=(True, "local ok")) as mock_local:
+            ok, summary = rebuild_governance()
+
+        mock_local.assert_called_once_with(port=40000)
+        self.assertTrue(ok)
+        self.assertEqual(summary, "local ok")
+
+
 if __name__ == "__main__":
     unittest.main()
