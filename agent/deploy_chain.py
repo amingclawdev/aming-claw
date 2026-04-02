@@ -153,12 +153,30 @@ def restart_executor() -> bool:
 # 3. rebuild_governance
 # ---------------------------------------------------------------------------
 
+def _is_host_runtime_mode() -> bool:
+    """Detect whether governance runs on the host (not Docker).
+
+    Returns True if GOVERNANCE_RUNTIME=host env var is set,
+    or docker-compose.governance.yml does not exist.
+    """
+    if os.environ.get("GOVERNANCE_RUNTIME", "").lower() == "host":
+        return True
+    repo_root = Path(__file__).resolve().parent.parent
+    compose_file = repo_root / "docker-compose.governance.yml"
+    return not compose_file.exists()
+
+
 def rebuild_governance() -> tuple[bool, str]:
     """Rebuild + restart governance Docker container, then health-check.
 
     Uses docker compose build + up directly (Windows-compatible).
+    In host-runtime mode (no Docker), falls directly to restart_local_governance.
     Returns (success, output_summary).
     """
+    # R4: detect host-runtime mode and skip Docker
+    if _is_host_runtime_mode():
+        return restart_local_governance(port=40000)
+
     repo_root = Path(__file__).resolve().parent.parent
     compose_file = repo_root / "docker-compose.governance.yml"
     output_lines: list[str] = []
@@ -228,7 +246,7 @@ def rebuild_governance() -> tuple[bool, str]:
 # 3b. restart_local_governance (fallback for non-Docker environments)
 # ---------------------------------------------------------------------------
 
-def restart_local_governance(port: int = 40006) -> tuple[bool, str]:
+def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
     """Kill and restart governance as a local Python process.
 
     Fallback when Docker is not available or Docker rebuild fails.
@@ -400,58 +418,71 @@ def restart_gateway() -> tuple[bool, str]:
 # 5. smoke_test
 # ---------------------------------------------------------------------------
 
-def smoke_test() -> dict[str, Any]:
+def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     """Quick health check for executor, governance, and gateway.
+
+    Parameters
+    ----------
+    affected_services : list[str] | None
+        If provided, only services in this list are actively checked.
+        Services not in the list are marked ``'skipped'`` and excluded
+        from the ``all_pass`` computation.
 
     Returns::
 
         {
-            'executor':   bool,
-            'governance': bool,
-            'gateway':    bool,
+            'executor':   bool | 'skipped',
+            'governance': bool | 'skipped',
+            'gateway':    bool | 'skipped',
             'all_pass':   bool,
         }
     """
-    results: dict[str, Any] = {
-        "executor": False,
-        "governance": False,
-        "gateway": False,
-        "all_pass": False,
-    }
+    all_services = ["executor", "governance", "gateway"]
+    results: dict[str, Any] = {svc: False for svc in all_services}
+    results["all_pass"] = False
 
     import time as _time
     _time.sleep(5)  # Brief pause to let services stabilize after restarts
 
+    # Mark services not in affected_services as 'skipped'
+    if affected_services is not None:
+        for svc in all_services:
+            if svc not in affected_services:
+                results[svc] = "skipped"
+
     # --- executor ---
-    try:
-        import requests
-        resp = requests.get("http://localhost:40100/status", timeout=5)
-        results["executor"] = resp.status_code == 200
-    except Exception:  # noqa: BLE001
-        results["executor"] = _executor_health_from_state()
+    if results["executor"] != "skipped":
+        try:
+            import requests
+            resp = requests.get("http://localhost:40100/status", timeout=5)
+            results["executor"] = resp.status_code == 200
+        except Exception:  # noqa: BLE001
+            results["executor"] = _executor_health_from_state()
 
     # --- governance ---
-    try:
-        import requests
-        resp = requests.get("http://localhost:40000/api/health", timeout=5)
-        results["governance"] = resp.status_code == 200
-    except Exception:  # noqa: BLE001
-        results["governance"] = False
+    if results["governance"] != "skipped":
+        try:
+            import requests
+            resp = requests.get("http://localhost:40000/api/health", timeout=5)
+            results["governance"] = resp.status_code == 200
+        except Exception:  # noqa: BLE001
+            results["governance"] = False
 
     # --- gateway (docker inspect) ---
-    try:
-        insp = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Running}}",
-             "aming_claw-telegram-gateway-1"],
-            capture_output=True, text=True, timeout=10,
-        )
-        results["gateway"] = insp.stdout.strip().lower() == "true"
-    except Exception:  # noqa: BLE001
-        results["gateway"] = False
+    if results["gateway"] != "skipped":
+        try:
+            insp = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}",
+                 "aming_claw-telegram-gateway-1"],
+                capture_output=True, text=True, timeout=10,
+            )
+            results["gateway"] = insp.stdout.strip().lower() == "true"
+        except Exception:  # noqa: BLE001
+            results["gateway"] = False
 
-    results["all_pass"] = all(
-        results[k] for k in ("executor", "governance", "gateway")
-    )
+    # all_pass only considers non-skipped services
+    checked = [results[k] for k in all_services if results[k] != "skipped"]
+    results["all_pass"] = all(checked) if checked else True
     return results
 
 
@@ -521,15 +552,15 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
 
         report["steps"] = steps
 
-        # 3. Smoke test
-        smoke = smoke_test()
+        # 3. Smoke test — only check affected services (R5)
+        smoke = smoke_test(affected_services=affected)
         report["smoke_test"] = smoke
 
-        # Overall success: all requested services pass smoke test
-        svc_pass = all(
-            smoke.get(svc, False) for svc in affected if svc in smoke
+        # R6: Overall success = all step-level successes AND smoke_test.all_pass
+        all_steps_ok = all(
+            step.get("success", False) for step in steps.values()
         )
-        report["success"] = svc_pass
+        report["success"] = all_steps_ok and smoke.get("all_pass", False)
 
     except Exception as exc:  # noqa: BLE001
         report["error"] = str(exc)
