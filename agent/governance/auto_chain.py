@@ -913,6 +913,40 @@ def _is_dev_note(path: str) -> bool:
     return normalized.startswith("docs/dev/")
 
 
+_GOVERNANCE_INTERNAL_PREFIXES = (
+    "agent/governance/",
+    "agent/role_permissions.py",
+)
+
+
+def _is_governance_internal_repair(metadata: dict, changed_files: list) -> bool:
+    """Return True when all target_files and changed_files are governance-internal.
+
+    Governance-internal paths are:
+      - agent/governance/*
+      - agent/role_permissions.py
+      - agent/tests/test_* (co-located test files)
+
+    When True, the doc consistency gate is skipped to avoid the oscillation loop
+    where governance repairs are demanded docs they cannot add without triggering
+    the unrelated-files gate.
+    """
+    target_files = metadata.get("target_files", []) or []
+    all_files = list(target_files) + list(changed_files or [])
+    if not all_files:
+        return False
+    for f in all_files:
+        normalized = f.replace("\\", "/")
+        # Allow governance paths
+        if any(normalized.startswith(prefix) for prefix in _GOVERNANCE_INTERNAL_PREFIXES):
+            continue
+        # Allow co-located test files
+        if "/tests/test_" in normalized or normalized.startswith("agent/tests/test_"):
+            continue
+        return False
+    return True
+
+
 def _gate_checkpoint(conn, project_id, result, metadata):
     """Checkpoint gate for Dev.
 
@@ -967,6 +1001,18 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     if test_results.get("ran") and test_results.get("failed", 0) > 0:
         return False, f"Dev tests failed: {test_results.get('failed')} failures"
     # Doc consistency check: use CODE_DOC_MAP to verify related docs are updated
+    # Skip for governance-internal repairs to avoid oscillation loop (R2)
+    if _is_governance_internal_repair(metadata, changed):
+        log.info("checkpoint_gate: skipping doc consistency check for governance-internal repair")
+        # Node gate is temporarily non-blocking while the governance graph catches
+        # up with node-by-node local development. Keep the signal in logs only.
+        related_nodes = _normalize_related_nodes(metadata.get("related_nodes", []))
+        if related_nodes:
+            log.warning(
+                "checkpoint_gate: skipping related_nodes enforcement for dev task until graph sync is complete: %s",
+                related_nodes,
+            )
+        return True, "ok"
     from .impact_analyzer import get_related_docs
     code_files = [f for f in changed if not f.startswith("docs/") and not f.endswith(".md")]
     doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
