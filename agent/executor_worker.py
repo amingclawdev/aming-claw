@@ -679,6 +679,17 @@ class ExecutorWorker:
 
             chat_id = int(metadata.get("chat_id", 0) or 0)
             report = run_deploy(changed, chat_id=chat_id, project_id=self.project_id)
+
+            # Defense-in-depth coherence validation (R2): verify report.success
+            # agrees with smoke_test.all_pass before returning succeeded status.
+            smoke = report.get("smoke_test", {})
+            if "all_pass" in smoke:
+                expected_success = report.get("success", False) and smoke["all_pass"]
+                if report.get("success") and not smoke["all_pass"]:
+                    # coherence violation — force failure
+                    report["success"] = False
+                    report["coherence_override"] = "executor_worker"
+
             result = {
                 "deploy": "completed" if report.get("success") else "failed",
                 "report": report,

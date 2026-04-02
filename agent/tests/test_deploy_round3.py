@@ -148,5 +148,125 @@ class TestDeploySemanticsReconciliation(unittest.TestCase):
         self.assertEqual(summary, "local ok")
 
 
+class TestDeployCoherenceInvariant(unittest.TestCase):
+    """Tests for deploy result coherence invariant (AC3-AC6, R1-R7)."""
+
+    # AC3: test_coherence_violation_impossible — the exact mismatch scenario
+    # (success=true, all_pass=false, gateway=false) must be impossible.
+    def test_coherence_violation_impossible(self):
+        """Construct the exact failure scenario and assert coherence invariant
+        prevents success=True when all_pass=False and gateway=False."""
+        from deploy_chain import run_deploy
+
+        # Simulate: all steps succeed but smoke_test fails (gateway=False, all_pass=False)
+        fake_smoke = {
+            "executor": True,
+            "governance": True,
+            "gateway": False,
+            "all_pass": False,
+        }
+        with mock.patch("deploy_chain.detect_affected_services",
+                         return_value=["executor", "governance", "gateway"]), \
+             mock.patch("deploy_chain.restart_executor", return_value=True), \
+             mock.patch("deploy_chain.rebuild_governance", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.restart_gateway", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
+             mock.patch("deploy_chain._save_report"):
+            report = run_deploy(["agent/telegram_gateway/bot.py"])
+
+        # The coherence invariant must force success=False
+        self.assertFalse(report["success"],
+                         "Coherence violation: success=True while all_pass=False is forbidden")
+        # Verify the exact scenario is what we constructed
+        self.assertFalse(report["smoke_test"]["all_pass"])
+        self.assertFalse(report["smoke_test"]["gateway"])
+
+    # AC4: test_success_false_when_nonskipped_smoke_fails
+    def test_success_false_when_nonskipped_smoke_fails(self):
+        """Assert success=False when any non-skipped service smoke returns False,
+        even if all deploy steps succeed."""
+        from deploy_chain import run_deploy
+
+        # governance smoke fails, gateway skipped, executor skipped
+        fake_smoke = {
+            "executor": "skipped",
+            "governance": False,
+            "gateway": "skipped",
+            "all_pass": False,
+        }
+        with mock.patch("deploy_chain.detect_affected_services",
+                         return_value=["governance"]), \
+             mock.patch("deploy_chain.rebuild_governance", return_value=(True, "ok")), \
+             mock.patch("deploy_chain.smoke_test", return_value=fake_smoke), \
+             mock.patch("deploy_chain._save_report"):
+            report = run_deploy(["agent/governance/server.py"])
+
+        self.assertFalse(report["success"],
+                         "success must be False when any non-skipped smoke test fails")
+
+    # AC5: test_gateway_skipped_for_governance_only_deploy
+    def test_gateway_skipped_for_governance_only_deploy(self):
+        """Assert gateway='skipped' when changed_files only touch agent/governance/** paths."""
+        from deploy_chain import smoke_test
+
+        with mock.patch("deploy_chain.subprocess") as mock_sp, \
+             mock.patch("requests.get") as mock_get:
+            mock_get.return_value = mock.Mock(status_code=200)
+            mock.patch("time.sleep").start()
+
+            result = smoke_test(affected_services=["governance"])
+
+        self.assertEqual(result["gateway"], "skipped",
+                         "gateway must be 'skipped' for governance-only deploys")
+
+    # AC6: test_gateway_checked_for_gateway_deploy
+    def test_gateway_checked_for_gateway_deploy(self):
+        """Assert gateway is a bool (not 'skipped') when changed_files include
+        agent/telegram_gateway/** paths."""
+        from deploy_chain import smoke_test
+
+        with mock.patch("deploy_chain.subprocess") as mock_sp, \
+             mock.patch("requests.get") as mock_get:
+            mock_get.return_value = mock.Mock(status_code=200)
+            mock_sp.run.return_value = mock.Mock(stdout="true\n", returncode=0)
+            mock.patch("time.sleep").start()
+
+            result = smoke_test(affected_services=["executor", "governance", "gateway"])
+
+        self.assertIsInstance(result["gateway"], bool,
+                             "gateway must be a bool (actively checked) for gateway deploys")
+        self.assertNotEqual(result["gateway"], "skipped")
+
+    # AC2-supplement: executor_worker coherence check also catches mismatch
+    def test_executor_worker_coherence_check(self):
+        """Verify _execute_deploy in executor_worker forces failure when
+        report.success=True but smoke_test.all_pass=False."""
+        from executor_worker import ExecutorWorker
+
+        worker = ExecutorWorker("aming-claw",
+                                governance_url="http://localhost:40000",
+                                workspace=os.getcwd())
+        metadata = {"changed_files": ["agent/telegram_gateway/bot.py"]}
+
+        # Simulate run_deploy returning an incoherent result
+        incoherent_report = {
+            "success": True,
+            "affected_services": ["gateway"],
+            "smoke_test": {
+                "executor": "skipped",
+                "governance": "skipped",
+                "gateway": False,
+                "all_pass": False,
+            },
+        }
+        with mock.patch.object(worker, "_report_progress"), \
+             mock.patch("deploy_chain.run_deploy", return_value=incoherent_report):
+            out = worker._execute_deploy("task-deploy-2", metadata)
+
+        # executor_worker coherence check must force failure
+        self.assertEqual(out["status"], "failed",
+                         "executor_worker must reject incoherent report (success=True, all_pass=False)")
+
+
 if __name__ == "__main__":
     unittest.main()
