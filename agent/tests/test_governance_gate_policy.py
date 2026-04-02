@@ -247,6 +247,56 @@ class TestGateCheckpointTestFileInference(unittest.TestCase):
         self.assertTrue(ok, f"Expected pass but got: {reason}")
 
 
+class TestCheckNodesWaivedStatus(unittest.TestCase):
+    """Tests that 'waived' in _STATUS_ORDER allows nodes to pass gate checks."""
+
+    def _make_conn(self, node_id, verify_status):
+        """Create a mock connection that returns the given verify_status for node_id."""
+        from unittest.mock import Mock, MagicMock
+        conn = Mock()
+
+        def execute_side_effect(sql, params=None):
+            result = Mock()
+            if "COUNT" in sql:
+                result.fetchone.return_value = (1,)  # non-empty DB
+            elif "verify_status" in sql:
+                if params and params[1] == node_id:
+                    result.fetchone.return_value = {"verify_status": verify_status}
+                else:
+                    result.fetchone.return_value = None
+            else:
+                result.fetchone.return_value = None
+            return result
+
+        conn.execute = Mock(side_effect=execute_side_effect)
+        return conn
+
+    def test_waived_in_status_order(self):
+        """AC1/AC2: _STATUS_ORDER contains 'waived' ranked >= qa_pass."""
+        from governance.auto_chain import _STATUS_ORDER
+        self.assertIn("waived", _STATUS_ORDER)
+        self.assertGreaterEqual(
+            _STATUS_ORDER.index("waived"),
+            _STATUS_ORDER.index("qa_pass"),
+        )
+
+    def test_check_nodes_waived_passes_t2_gate(self):
+        """AC3: waived node passes t2_pass gate check."""
+        from governance.auto_chain import _check_nodes_min_status
+        conn = self._make_conn("L1.1", "waived")
+        passed, reason = _check_nodes_min_status(conn, "test-proj", ["L1.1"], "t2_pass")
+        self.assertTrue(passed, f"Expected pass but got: {reason}")
+        self.assertEqual(reason, "ok")
+
+    def test_check_nodes_waived_passes_qa_gate(self):
+        """AC4: waived node passes qa_pass gate check."""
+        from governance.auto_chain import _check_nodes_min_status
+        conn = self._make_conn("L1.1", "waived")
+        passed, reason = _check_nodes_min_status(conn, "test-proj", ["L1.1"], "qa_pass")
+        self.assertTrue(passed, f"Expected pass but got: {reason}")
+        self.assertEqual(reason, "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
 
