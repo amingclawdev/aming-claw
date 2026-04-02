@@ -680,15 +680,29 @@ class ExecutorWorker:
             chat_id = int(metadata.get("chat_id", 0) or 0)
             report = run_deploy(changed, chat_id=chat_id, project_id=self.project_id)
 
-            # Defense-in-depth coherence validation (R2): verify report.success
-            # agrees with smoke_test.all_pass before returning succeeded status.
+            # R4: Pre-return coherence assertion — report.success must agree
+            # with smoke_test.all_pass. If incoherent, force status='failed'.
             smoke = report.get("smoke_test", {})
-            if "all_pass" in smoke:
-                expected_success = report.get("success", False) and smoke["all_pass"]
-                if report.get("success") and not smoke["all_pass"]:
-                    # coherence violation — force failure
-                    report["success"] = False
-                    report["coherence_override"] = "executor_worker"
+            if smoke and smoke.get("all_pass") is False and report.get("success"):
+                log.warning(
+                    "deploy coherence violation: report.success=True but "
+                    "smoke_test.all_pass=False — forcing status=failed [task=%s]",
+                    task_id,
+                )
+                report["success"] = False
+                report["coherence_violation"] = True
+            # Also check individual service=False with success=True
+            if report.get("success") and smoke:
+                for svc in ("executor", "governance", "gateway"):
+                    if smoke.get(svc) is False:
+                        log.warning(
+                            "deploy coherence violation: report.success=True but "
+                            "smoke_test.%s=False — forcing status=failed [task=%s]",
+                            svc, task_id,
+                        )
+                        report["success"] = False
+                        report["coherence_violation"] = True
+                        break
 
             result = {
                 "deploy": "completed" if report.get("success") else "failed",
