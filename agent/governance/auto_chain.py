@@ -1195,11 +1195,38 @@ def _gate_release(conn, project_id, result, metadata):
 
 
 def _gate_deploy_pass(conn, project_id, result, metadata):
-    """Deploy must report success before the chain can be finalized."""
+    """Deploy must report success AND smoke_test semantic coherence.
+
+    R3: Validates that smoke_test.all_pass agrees with report.success and
+    that no individual service has a False result. This catches cases where
+    the production path diverges from the tested path.
+    """
     report = result.get("report", result)
-    if isinstance(report, dict) and report.get("success") is True:
-        return True, "ok"
-    return False, f"deploy failed: {json.dumps(report, ensure_ascii=False)[:300]}"
+    if not isinstance(report, dict):
+        return False, f"deploy failed: report is not a dict"
+
+    # Check report.success first
+    if report.get("success") is not True:
+        return False, f"deploy failed: {json.dumps(report, ensure_ascii=False)[:300]}"
+
+    # R3: Validate smoke_test semantic coherence
+    smoke_test = report.get("smoke_test", {})
+    if smoke_test:
+        # Reject if all_pass is explicitly False
+        if smoke_test.get("all_pass") is False:
+            return False, (
+                f"deploy gate rejected: smoke_test.all_pass=False contradicts "
+                f"report.success=True — {json.dumps(smoke_test, ensure_ascii=False)[:200]}"
+            )
+        # Reject if any service has an explicit False value
+        for svc in ("executor", "governance", "gateway"):
+            if smoke_test.get(svc) is False:
+                return False, (
+                    f"deploy gate rejected: smoke_test.{svc}=False contradicts "
+                    f"report.success=True — {json.dumps(smoke_test, ensure_ascii=False)[:200]}"
+                )
+
+    return True, "ok"
 
 
 # ---------------------------------------------------------------------------

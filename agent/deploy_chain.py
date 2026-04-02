@@ -425,15 +425,15 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     ----------
     affected_services : list[str] | None
         If provided, only services in this list are actively checked.
-        Services not in the list are marked ``'skipped'`` and excluded
+        Services not in the list are marked ``'not_applicable'`` and excluded
         from the ``all_pass`` computation.
 
     Returns::
 
         {
-            'executor':   bool | 'skipped',
-            'governance': bool | 'skipped',
-            'gateway':    bool | 'skipped',
+            'executor':   bool | 'not_applicable',
+            'governance': bool | 'not_applicable',
+            'gateway':    bool | 'not_applicable',
             'all_pass':   bool,
         }
     """
@@ -444,14 +444,14 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
     import time as _time
     _time.sleep(5)  # Brief pause to let services stabilize after restarts
 
-    # Mark services not in affected_services as 'skipped'
+    # Mark services not in affected_services as 'not_applicable' (R1/R6)
     if affected_services is not None:
         for svc in all_services:
             if svc not in affected_services:
-                results[svc] = "skipped"
+                results[svc] = "not_applicable"
 
     # --- executor ---
-    if results["executor"] != "skipped":
+    if results["executor"] != "not_applicable":
         try:
             import requests
             resp = requests.get("http://localhost:40100/status", timeout=5)
@@ -460,7 +460,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
             results["executor"] = _executor_health_from_state()
 
     # --- governance ---
-    if results["governance"] != "skipped":
+    if results["governance"] != "not_applicable":
         try:
             import requests
             resp = requests.get("http://localhost:40000/api/health", timeout=5)
@@ -469,7 +469,7 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
             results["governance"] = False
 
     # --- gateway (docker inspect) ---
-    if results["gateway"] != "skipped":
+    if results["gateway"] != "not_applicable":
         try:
             insp = subprocess.run(
                 ["docker", "inspect", "--format", "{{.State.Running}}",
@@ -480,8 +480,8 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             results["gateway"] = False
 
-    # all_pass only considers non-skipped services
-    checked = [results[k] for k in all_services if results[k] != "skipped"]
+    # all_pass only considers affected services (not 'not_applicable')
+    checked = [results[k] for k in all_services if results[k] != "not_applicable"]
     results["all_pass"] = all(checked) if checked else True
     return results
 
@@ -556,18 +556,12 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         smoke = smoke_test(affected_services=affected)
         report["smoke_test"] = smoke
 
-        # R6: Overall success = all step-level successes AND smoke_test.all_pass
+        # R2: Single derivation — success = all steps OK AND smoke_test.all_pass
+        # No post-hoc override; structural correctness by construction.
         all_steps_ok = all(
             step.get("success", False) for step in steps.values()
         )
         report["success"] = all_steps_ok and smoke.get("all_pass", False)
-
-        # Post-condition coherence invariant (R1): force success=False if
-        # smoke_test.all_pass is False, regardless of how success was computed.
-        # This is a defense-in-depth assertion at the result-construction layer.
-        if smoke.get("all_pass") is False and report["success"]:
-            report["success"] = False  # coherence invariant: success must agree with all_pass
-            report["coherence_override"] = True
 
     except Exception as exc:  # noqa: BLE001
         report["error"] = str(exc)
