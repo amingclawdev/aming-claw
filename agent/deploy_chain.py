@@ -562,6 +562,13 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         )
         report["success"] = all_steps_ok and smoke.get("all_pass", False)
 
+        # Post-condition coherence invariant (R1): force success=False if
+        # smoke_test.all_pass is False, regardless of how success was computed.
+        # This is a defense-in-depth assertion at the result-construction layer.
+        if smoke.get("all_pass") is False and report["success"]:
+            report["success"] = False  # coherence invariant: success must agree with all_pass
+            report["coherence_override"] = True
+
     except Exception as exc:  # noqa: BLE001
         report["error"] = str(exc)
         report["success"] = False
