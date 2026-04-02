@@ -651,6 +651,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 retry_prompt = (
                     f"Previous attempt ({task_id}) was blocked by gate.\n"
                     f"Gate reason: {retry_reason}\n\n"
+                    "IMPORTANT: Do not assume previous blockers still exist. "
+                    "Re-verify all alleged blockers against current source before reporting them as remaining issues.\n\n"
                     "Fix the issue described above and retry.\n"
                     "Use the same Dev contract below, including the required verification command.\n\n"
                     f"{retry_contract}"
@@ -682,19 +684,27 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 if workflow_improvement:
                     out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
                 return out
+            # --- Sanitise retry metadata (R1/R2): strip stale inherited fields ---
+            _retry_meta = {
+                **metadata,
+                "parent_task_id": task_id,
+                "chain_depth": depth + 1,
+                "previous_gate_reason": retry_reason if task_type == "dev" else reason,
+                "_gate_retry_count": gate_retries + 1,
+                "_original_prompt": original_prompt,
+            }
+            # R2: Strip inherited worktree/branch so new task creates fresh worktree
+            _retry_meta.pop("_worktree", None)
+            _retry_meta.pop("_branch", None)
+            # R1: Remove inherited failure_reason from grandparent — only current gate reason kept
+            _retry_meta.pop("failure_reason", None)
+
             retry_task = task_registry.create_task(
                 conn, project_id,
                 prompt=retry_prompt,
                 task_type=task_type,
                 created_by="auto-chain-retry",
-                metadata={
-                    **metadata,
-                    "parent_task_id": task_id,
-                    "chain_depth": depth + 1,
-                    "previous_gate_reason": retry_reason if task_type == "dev" else reason,
-                    "_gate_retry_count": gate_retries + 1,
-                    "_original_prompt": original_prompt,
-                },
+                metadata=_retry_meta,
             )
             retry_id = retry_task.get("task_id", "?")
             log.info("auto_chain: retry created %s for blocked %s", retry_id, task_id)

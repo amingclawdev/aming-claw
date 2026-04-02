@@ -1363,6 +1363,14 @@ class ExecutorWorker:
         worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}")
         try:
             os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+            # R3: Fetch latest origin/main so worktree baseline includes recent merges
+            subprocess.run(
+                ["git", "fetch", "origin", "main"],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
             proc = subprocess.run(
                 ["git", "worktree", "add", "-b", branch_name, worktree_dir, "HEAD"],
                 cwd=self.workspace,

@@ -173,6 +173,83 @@ class TestStagingRetryDedup:
         assert len(rows) == 1, f"Expected 1 dev retry, got {len(rows)}"
 
 
+class TestStaleMetadataStripping:
+    """Verify gate-retry metadata does NOT contain stale inherited blocker fields."""
+
+    def test_retry_metadata_strips_stale_worktree_and_branch(self, monkeypatch):
+        """AC5: gate-retry must NOT inherit _worktree, _branch, or failure_reason from parent."""
+        conn = _make_db()
+        _patch_chain(monkeypatch)
+
+        import agent.governance.auto_chain as ac
+
+        # Parent metadata simulates stale inherited fields from a grandparent task
+        stale_metadata = {
+            "chain_depth": 0,
+            "parent_task_id": "task-pm-050",
+            "_worktree": "/old/stale/worktree/path",
+            "_branch": "dev/stale-branch",
+            "failure_reason": "redis_client.py has syntax error (stale inherited blocker)",
+            "previous_gate_reason": "old grandparent gate reason",
+        }
+
+        result = ac._do_chain(
+            conn, "test-proj", "task-dev-050", "dev",
+            result={"summary": "fix attempt"},
+            metadata=dict(stale_metadata),
+        )
+
+        assert result.get("gate_blocked") is True
+        retry_id = result.get("retry_task_id")
+        assert retry_id and retry_id != "?"
+
+        # Read the retry task's metadata from DB
+        row = conn.execute(
+            "SELECT metadata_json FROM tasks WHERE task_id = ?",
+            (retry_id,),
+        ).fetchone()
+        assert row is not None
+        retry_meta = json.loads(row["metadata_json"])
+
+        # Stale _worktree and _branch must be stripped (not inherited)
+        assert retry_meta.get("_worktree") is None, \
+            f"stale _worktree leaked into retry metadata: {retry_meta.get('_worktree')}"
+        assert retry_meta.get("_branch") is None, \
+            f"stale _branch leaked into retry metadata: {retry_meta.get('_branch')}"
+        # Inherited failure_reason from grandparent must be removed
+        assert "failure_reason" not in retry_meta, \
+            f"inherited failure_reason leaked into retry: {retry_meta.get('failure_reason')}"
+        # previous_gate_reason must be set to CURRENT gate reason, not stale one
+        assert retry_meta.get("previous_gate_reason") != stale_metadata["previous_gate_reason"], \
+            "previous_gate_reason should be overwritten with current gate reason, not inherited"
+
+    def test_retry_prompt_includes_re_verify_instruction(self, monkeypatch):
+        """AC4: retry prompt must instruct AI to re-verify blockers against current source."""
+        conn = _make_db()
+        _patch_chain(monkeypatch)
+
+        import agent.governance.auto_chain as ac
+
+        result = ac._do_chain(
+            conn, "test-proj", "task-dev-060", "dev",
+            result={"summary": "fix attempt"},
+            metadata={"chain_depth": 0, "parent_task_id": "task-pm-060"},
+        )
+
+        retry_id = result.get("retry_task_id")
+        assert retry_id
+
+        row = conn.execute(
+            "SELECT prompt FROM tasks WHERE task_id = ?",
+            (retry_id,),
+        ).fetchone()
+        assert row is not None
+        prompt_text = row["prompt"]
+        # Must contain re-verification instruction (do not assume previous blockers)
+        assert "do not assume" in prompt_text.lower() or "re-verify" in prompt_text.lower(), \
+            f"Retry prompt missing re-verify instruction: {prompt_text[:200]}"
+
+
 class TestSameStageRetryDedup:
     """same-stage retry path: gate blocked → same type retry dedup."""
 
