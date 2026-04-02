@@ -194,7 +194,7 @@ def complete_task(
 
     now = _utc_iso()
     row = conn.execute(
-        "SELECT attempt_count, max_attempts, notification_status, metadata_json, assigned_to FROM tasks WHERE task_id = ?",
+        "SELECT attempt_count, max_attempts, notification_status, metadata_json, assigned_to, type FROM tasks WHERE task_id = ?",
         (task_id,),
     ).fetchone()
 
@@ -264,6 +264,23 @@ def complete_task(
                 notify_status = "sent"
             else:
                 notify_status = "pending"
+
+    # --- Test report gate: reject test-type succeeded without valid test_report ---
+    task_type_val = row["type"] if row["type"] else ""
+    if task_type_val == "test" and status == "succeeded":
+        result_obj = result or {}
+        test_report = result_obj.get("test_report")
+        if (
+            not isinstance(test_report, dict)
+            or "passed" not in test_report
+            or "failed" not in test_report
+        ):
+            from .errors import ValidationError
+            raise ValidationError(
+                "Test task succeeded without valid test_report. "
+                "Result must contain test_report dict with 'passed' and 'failed' integer keys.",
+                details={"task_id": task_id, "result_keys": list(result_obj.keys())},
+            )
 
     conn.execute(
         """UPDATE tasks SET status = ?, execution_status = ?,
