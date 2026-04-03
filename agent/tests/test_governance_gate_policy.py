@@ -297,6 +297,82 @@ class TestCheckNodesWaivedStatus(unittest.TestCase):
         self.assertEqual(reason, "ok")
 
 
+class TestCheckNodesMissingVsInsufficientStatus(unittest.TestCase):
+    """Tests for _check_nodes_min_status: missing nodes skip, insufficient nodes block."""
+
+    def _make_conn(self, nodes_in_db):
+        """Create a mock connection with specified nodes.
+
+        Args:
+            nodes_in_db: dict of node_id -> verify_status. Only these nodes exist in DB.
+                         At least one entry means the DB is non-empty (COUNT > 0).
+        """
+        from unittest.mock import Mock
+
+        def execute_side_effect(sql, params=None):
+            result = Mock()
+            if "COUNT" in sql:
+                result.fetchone.return_value = (len(nodes_in_db),)
+            elif "verify_status" in sql:
+                node_id = params[1] if params and len(params) > 1 else None
+                if node_id in nodes_in_db:
+                    result.fetchone.return_value = {"verify_status": nodes_in_db[node_id]}
+                else:
+                    result.fetchone.return_value = None
+            else:
+                result.fetchone.return_value = None
+            return result
+
+        conn = Mock()
+        conn.execute = Mock(side_effect=execute_side_effect)
+        return conn
+
+    def test_ac5_missing_node_skipped_gate_passes(self):
+        """AC5: node_state populated but specific related_node missing — gate passes with skip."""
+        from governance.auto_chain import _check_nodes_min_status
+        # DB has L1.1 at t2_pass, but L1.3 is NOT in DB
+        conn = self._make_conn({"L1.1": "t2_pass"})
+        passed, reason = _check_nodes_min_status(conn, "test-proj", ["L1.3"], "t2_pass")
+        self.assertTrue(passed, f"Expected pass (skip missing node) but got: {reason}")
+
+    def test_ac6_existing_node_below_min_status_blocks(self):
+        """AC6: node exists in DB with status 'testing' and min_status is 't2_pass' — gate blocks."""
+        from governance.auto_chain import _check_nodes_min_status
+        conn = self._make_conn({"L1.1": "testing"})
+        passed, reason = _check_nodes_min_status(conn, "test-proj", ["L1.1"], "t2_pass")
+        self.assertFalse(passed, f"Expected block but got pass: {reason}")
+        self.assertIn("L1.1", reason)
+
+    def test_ac7_warning_logged_for_missing_node(self):
+        """AC7: log.warning called with 'not found in DB' and 'skipping' for missing node."""
+        from unittest.mock import patch
+        from governance.auto_chain import _check_nodes_min_status
+        conn = self._make_conn({"L1.1": "t2_pass"})
+        with patch("governance.auto_chain.log") as mock_log:
+            _check_nodes_min_status(conn, "test-proj", ["L1.3"], "t2_pass")
+            mock_log.warning.assert_called_once()
+            warning_msg = mock_log.warning.call_args[0][0] % mock_log.warning.call_args[0][1:]
+            self.assertIn("not found in DB", warning_msg)
+            self.assertIn("skipping", warning_msg.lower())
+
+    def test_ac1_ac3_all_missing_nodes_pass(self):
+        """AC1/AC3: all related_nodes missing from DB — gate passes."""
+        from governance.auto_chain import _check_nodes_min_status
+        conn = self._make_conn({"L1.1": "t2_pass"})  # non-empty DB
+        passed, reason = _check_nodes_min_status(conn, "test-proj", ["L1.3", "L1.4"], "t2_pass")
+        self.assertTrue(passed, f"Expected pass but got: {reason}")
+
+    def test_ac2_ac4_existing_below_min_blocks_even_with_missing(self):
+        """AC2/AC4: one existing node below min_status blocks even if another is missing."""
+        from governance.auto_chain import _check_nodes_min_status
+        conn = self._make_conn({"L1.1": "testing"})  # below t2_pass
+        passed, reason = _check_nodes_min_status(conn, "test-proj", ["L1.1", "L1.3"], "t2_pass")
+        self.assertFalse(passed, f"Expected block but got pass: {reason}")
+        self.assertIn("L1.1", reason)
+        # L1.3 should NOT appear in the blocking reason
+        self.assertNotIn("L1.3", reason)
+
+
 if __name__ == "__main__":
     unittest.main()
 
