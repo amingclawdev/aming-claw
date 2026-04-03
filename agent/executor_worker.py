@@ -255,18 +255,6 @@ class ExecutorWorker:
             return {"status": "failed", "error": "Session timed out (hung or exceeded max runtime)"}
         if session.status == "failed":
             return {"status": "failed", "error": session.stderr[:500]}
-        terminal_cli_error = self._detect_terminal_cli_error(session, task_type)
-        if terminal_cli_error:
-            _timing(f"terminal_cli_error: {terminal_cli_error}")
-            return {
-                "status": "failed",
-                "error": terminal_cli_error,
-                "result": {
-                    "error": terminal_cli_error,
-                    "summary": terminal_cli_error,
-                },
-            }
-
         # Detect actually changed files via git diff (skip for non-code roles)
         if task_type in ("coordinator", "task", "pm", "qa"):
             changed_files = []
@@ -290,10 +278,31 @@ class ExecutorWorker:
             except Exception as e:
                 log.warning("git add failed: %s", e)
 
-        # Parse output and merge with real changed_files
+        # Parse output FIRST — structured extraction takes priority over error detection.
+        # PM/QA often emit a natural-language preamble before fenced JSON; parsing must
+        # run before _detect_terminal_cli_error so the preamble is not misclassified.
         _timing("parse_output: starting")
         result = self._parse_output(session, task_type)
         _timing(f"parse_output: done, keys={list(result.keys())}")
+
+        # Fallback: only check for terminal CLI error if _parse_output did NOT find
+        # valid structured JSON (i.e. it fell through to the raw-summary fallback).
+        _is_raw_fallback = (
+            set(result.keys()) <= {"summary", "exit_code"}
+            and "exit_code" in result
+        )
+        if _is_raw_fallback:
+            terminal_cli_error = self._detect_terminal_cli_error(session, task_type)
+            if terminal_cli_error:
+                _timing(f"terminal_cli_error: {terminal_cli_error}")
+                return {
+                    "status": "failed",
+                    "error": terminal_cli_error,
+                    "result": {
+                        "error": terminal_cli_error,
+                        "summary": terminal_cli_error,
+                    },
+                }
 
         # Always overwrite/set changed_files from git diff (ground truth)
         # IMPORTANT: git diff is authoritative; always set even if _parse_output
@@ -1492,9 +1501,11 @@ class ExecutorWorker:
             except json.JSONDecodeError:
                 continue
 
-        # Fallback: find last JSON object from raw output
+        # Fallback: find first (outermost) JSON object from raw output.
+        # Forward iteration ensures we match the top-level object rather than
+        # an inner nested object when preamble/trailing text is present.
         parsed = None
-        for candidate in reversed(list(re.finditer(r'\{', stdout))):
+        for candidate in re.finditer(r'\{', stdout):
             start = candidate.start()
             depth = 0
             end = None
