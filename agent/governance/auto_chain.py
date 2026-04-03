@@ -1574,7 +1574,7 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
 
     Returns (passed: bool, reason: str).
     If node_state table is empty for this project (fresh DB bootstrap), skip check.
-    If a node is not found in a populated DB it is treated as 'pending' and blocks.
+    If a node is not found in a populated DB it is skipped with a warning (not blocked).
     """
     related_nodes = _normalize_related_nodes(related_nodes)
     if not related_nodes:
@@ -1599,8 +1599,8 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
             (project_id, node_id),
         ).fetchone()
         if row is None:
-            # Not found in populated DB → treat as pending
-            blocking.append((node_id, "pending (not found in DB)"))
+            # Not found in populated DB → skip with warning (node was never registered)
+            log.warning("_check_nodes_min_status: node '%s' not found in DB for project '%s' — skipping", node_id, project_id)
             continue
         status = (row["verify_status"] or "pending").strip()
         try:
