@@ -13,12 +13,17 @@ The directory structure encodes **governance domain**, not just content type:
 | Path | Governance Domain | Gate Association | Description |
 |------|-------------------|------------------|-------------|
 | `docs/` | **Governed** | Yes — linked to acceptance graph nodes, subject to gate validation | Canonical documents representing current system truth |
-| `docs/dev/` | **Non-governed** | No — explicitly excluded from gate association | Development process artifacts: iterations, proposals, debug logs |
+| `docs/dev/` | **Tracked but non-governed** | No — explicitly excluded from formal gate association | Development process artifacts: iterations, proposals, debug logs |
 | `docs/dev/archive/` | **Non-governed, historical** | No — intentionally excluded to prevent gate pollution | Superseded documents preserved for design decision history |
 
 **Hard rule**: Any document that is currently valid, affects system behavior, or is used as a reference by agents/humans **must** be in `docs/`. Placing it in `dev/` to avoid gate overhead is a governance violation.
 
 `docs/dev/archive/` is NOT a dumping ground. It stores superseded-but-historically-valuable documents, each with metadata explaining why it was archived and what replaced it.
+
+`docs/dev/` is not scratch space. The intended policy is:
+- files under `docs/dev/**` may be committed and may appear in task outputs
+- they are excluded from formal documentation governance by default
+- merge and release logic must treat them as valid tracked development artifacts, not as accidental leftovers
 
 ---
 
@@ -29,7 +34,7 @@ Every document has exactly one lifecycle state:
 | State | Definition | In README? | Gate Associated? | Banner Required? | May Update? |
 |-------|-----------|------------|------------------|-----------------|-------------|
 | **Draft** | Work in progress, not yet reviewed | No | No (lives in `dev/`) | `> Status: DRAFT` | Yes, freely |
-| **Working Note** | Persistent dev artifact (iteration log, debug record) — not expected to become Active | No | No (lives in `dev/`) | None | Yes, freely |
+| **Working Note** | Persistent dev artifact (iteration log, debug record) — not expected to become Active | No | No formal gate association (lives in `dev/`) | None | Yes, freely |
 | **Active** | Reviewed, current, maintained. Supports or elaborates on a Canonical doc's topic | Yes | Yes (if in `docs/`) | None | Yes, via chain |
 | **Canonical** | Single source of truth for its **topic** — no other doc may contradict it on that topic | Yes (primary link) | Yes | None | Yes, via chain |
 | **Deprecated** | Still referenceable but being replaced | Yes (with warning) | Yes (until removed) | `> DEPRECATED: see [replacement]` | Only to add deprecation notice |
@@ -175,6 +180,25 @@ When classifying a file, apply these rules in order:
 | Content contradicts current system behavior and cannot be patched locally | **Rewrite** (new doc from current code + architecture reality) |
 | Content has no current behavioral value but records design decisions | **Archive** with metadata header |
 | Content has no current or historical value | **Delete** (rare — prefer archive) |
+
+### Gate Interpretation Rules
+
+When the workflow evaluates documentation impact:
+
+1. `docs/**` outside `docs/dev/**`
+- governed by formal doc policy
+- may be required by `doc_impact`
+- may participate in release-facing documentation gates
+
+2. `docs/dev/**`
+- tracked and allowed as task output
+- excluded from formal doc completeness requirements unless explicitly requested
+- must not be flagged as unrelated solely because they are development artifacts
+- must not block merge merely because they are not canonical docs
+
+3. internal workflow/governance repair tasks
+- prompt, gate, routing, role-permission, and graph-filter fixes must declare whether formal docs are required
+- if no formal doc update is required, `docs/dev/**` notes may still be written without creating contradiction between gates
 
 ### Keep at docs/ (current, update content)
 

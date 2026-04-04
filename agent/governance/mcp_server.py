@@ -15,7 +15,7 @@ Usage:
 
 Environment variables:
     REDIS_URL          Redis connection URL (default: redis://localhost:6379/0)
-    GOVERNANCE_URL     Governance HTTP base URL (default: http://localhost:40006)
+    GOVERNANCE_URL     Governance HTTP base URL (default: http://localhost:40000)
     GOV_TOKEN          Bearer token for governance API calls
 """
 
@@ -120,7 +120,7 @@ TOOLS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 def _gov_url() -> str:
-    return os.environ.get("GOVERNANCE_URL", "http://localhost:40006").rstrip("/")
+    return os.environ.get("GOVERNANCE_URL", "http://localhost:40000").rstrip("/")
 
 
 def _gov_token() -> str:

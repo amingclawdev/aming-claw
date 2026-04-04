@@ -4,16 +4,18 @@
 
 ## 1. Service Architecture
 
+> **2026-04-02 Update:** Docker-hosted `governance`, `governance-dev`, and `nginx` are retired for development/runtime use. Host governance on `http://localhost:40000` is the only supported control-plane endpoint.
+
 ```
-Docker Containers (docker-compose.governance.yml)
-├── nginx          :40000  Reverse proxy
-├── governance     :40006  Rule engine
+Host Machine
+├── governance     :40000  Rule engine / API
+├── service-manager        Executor supervisor
+└── executor-worker        Task execution
+
+Optional Docker dependencies
 ├── telegram-gw    :40010  Message gateway
 ├── dbservice      :40002  Memory service
 └── redis          :40079  Cache/queue
-
-Host Machine
-└── executor-gateway :8090  Task execution (FastAPI)
 ```
 
 ## 2. Complete Deployment Process
@@ -23,47 +25,46 @@ Host Machine
 ```bash
 cd C:\Users\z5866\Documents\amingclaw\aming_claw
 
-# 1. Start all Docker services
-docker compose -f docker-compose.governance.yml up -d
+# 1. Start optional Docker dependencies
+docker compose -f docker-compose.governance.yml up -d dbservice redis telegram-gateway
 
-# 2. Wait for all services to become healthy
+# 2. Wait for optional dependencies to become healthy
 docker compose -f docker-compose.governance.yml ps
 
-# 3. Register dbservice domain pack (not persisted, required after every restart)
+# 3. Start host governance
+.\scripts\start-governance.ps1
+
+# 4. Register dbservice domain pack (not persisted, required after every restart)
 curl -s -X POST http://localhost:40002/knowledge/register-pack \
   -H "Content-Type: application/json" \
   -d '{"domain":"development","types":{"architecture":{"durability":"permanent","conflictPolicy":"replace","description":"Architecture decisions"},"pitfall":{"durability":"permanent","conflictPolicy":"append","description":"Known pitfalls"},"pattern":{"durability":"permanent","conflictPolicy":"replace","description":"Code patterns"},"workaround":{"durability":"durable","conflictPolicy":"replace","description":"Workarounds"},"session_summary":{"durability":"durable","conflictPolicy":"replace","description":"Session summaries"},"verify_decision":{"durability":"permanent","conflictPolicy":"append","description":"Verify decisions"}}}'
 
-# 4. Initialize project (first time)
+# 5. Initialize project (first time)
 python init_project.py
 # Enter project name and password → Obtain coordinator token
 
-# 5. Import acceptance graph
+# 6. Import acceptance graph
 curl -X POST http://localhost:40000/api/wf/{project_id}/import-graph \
   -H "X-Gov-Token: {token}" \
   -d '{"md_path":"/workspace/docs/aming-claw-acceptance-graph.md"}'
 
-# 6. Start executor-gateway (host machine)
-cd agent && python -m executor_gateway &
-# executor-gateway listens on :8090, executor_api.py listens on :40100
+# 7. Start host executor manager
+.\scripts\start-manager.ps1
 
-# 7. Telegram binding
+# 8. Telegram binding
 # Send to bot in Telegram: /bind {coordinator_token}
 ```
 
 ### 2.2 Code Update Deployment (Routine)
 
 ```bash
-# Method A: Quick deploy (5-10s downtime, Agent auto-retries)
-docker compose -f docker-compose.governance.yml up -d --build
-docker compose -f docker-compose.governance.yml restart nginx
-
-# Method B: Zero-downtime deploy (via script)
-GOV_COORDINATOR_TOKEN=gov-xxx ./deploy-governance.sh
-
-# Method C: Update a single service only
-docker compose -f docker-compose.governance.yml up -d --build governance
+# Restart optional dependencies only when needed
 docker compose -f docker-compose.governance.yml up -d --build telegram-gateway
+docker compose -f docker-compose.governance.yml up -d --build dbservice redis
+
+# Host governance / worker refresh
+.\scripts\start-governance.ps1 -Takeover
+.\scripts\start-manager.ps1 -Takeover
 ```
 
 ### 2.3 Development Environment to Production Switch
@@ -156,39 +157,37 @@ redis-cli -p 40079 XRANGE ai:prompt:ai-dev-xxx - +
 Steps to restore after a computer restart:
 
 ```bash
-# 1. Start Docker services
+# 1. Start optional Docker dependencies
 cd C:\Users\z5866\Documents\amingclaw\aming_claw
-docker compose -f docker-compose.governance.yml up -d
+docker compose -f docker-compose.governance.yml up -d dbservice redis telegram-gateway
 
 # 2. Wait for healthy status
 docker compose -f docker-compose.governance.yml ps
-# Confirm all services are healthy
+# Confirm dbservice / redis / telegram-gateway are healthy
 
-# 3. Restart nginx (resolve upstream resolution issues)
-docker compose -f docker-compose.governance.yml restart nginx
+# 3. Start or take over host governance
+.\scripts\start-governance.ps1 -Takeover
 
 # 4. Register dbservice domain pack
 curl -s -X POST http://localhost:40002/knowledge/register-pack \
   -H "Content-Type: application/json" \
   -d '{"domain":"development","types":{"architecture":{"durability":"permanent","conflictPolicy":"replace","description":"Architecture decisions"},"pitfall":{"durability":"permanent","conflictPolicy":"append","description":"Known pitfalls"},"pattern":{"durability":"permanent","conflictPolicy":"replace","description":"Code patterns"},"workaround":{"durability":"durable","conflictPolicy":"replace","description":"Workarounds"},"session_summary":{"durability":"durable","conflictPolicy":"replace","description":"Session summaries"},"verify_decision":{"durability":"permanent","conflictPolicy":"append","description":"Verify decisions"}}}'
 
-# 5. Start executor-gateway (host machine)
-cd agent && python -m executor_gateway &
+# 5. Start host executor manager
+.\scripts\start-manager.ps1 -Takeover
 
 # 6. Verify services
 curl -s http://localhost:40000/api/health     # governance
 curl -s http://localhost:40002/health          # dbservice
-curl -s http://localhost:40000/nginx-health    # nginx
-curl -s http://localhost:40100/health          # executor
 ```
 
 ## 4. Data Persistence
 
 | Data | Location | After Restart |
 |------|----------|---------------|
-| Project/node state | Docker volume: governance-data (SQLite) | ✅ Retained |
-| DAG graph | Docker volume: governance-data (graph.json) | ✅ Retained |
-| Audit logs | Docker volume: governance-data (JSONL) | ✅ Retained |
+| Project/node state | Host shared-volume (SQLite) | ✅ Retained |
+| DAG graph | Host shared-volume (graph.json) | ✅ Retained |
+| Audit logs | Host shared-volume (JSONL) | ✅ Retained |
 | Memory data | Docker volume: memory-data (SQLite) | ✅ Retained |
 | Redis cache | Docker volume: redis-data (AOF) | ✅ Retained |
 | Coordinator token | Does not expire | ✅ Valid |
@@ -199,10 +198,8 @@ curl -s http://localhost:40100/health          # executor
 ## 5. Rollback
 
 ```bash
-# Roll back to the previous version
-docker tag aming_claw-governance:rollback aming_claw-governance:latest
-docker compose -f docker-compose.governance.yml up -d governance
-docker compose -f docker-compose.governance.yml restart nginx
+# Restart host governance on the last known-good code
+.\scripts\start-governance.ps1 -Takeover
 
 # View rollback audit
 curl -s http://localhost:40000/api/audit/amingClaw/log?limit=10
@@ -213,7 +210,6 @@ curl -s http://localhost:40000/api/audit/amingClaw/log?limit=10
 ```bash
 # Service health
 curl http://localhost:40000/api/health
-curl http://localhost:40000/nginx-health
 curl http://localhost:40002/health
 
 # Node status

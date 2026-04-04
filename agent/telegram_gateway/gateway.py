@@ -34,7 +34,7 @@ log = logging.getLogger("gateway")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "")
-GOVERNANCE_URL = os.environ.get("GOVERNANCE_URL", "http://governance:40006")
+GOVERNANCE_URL = os.environ.get("GOVERNANCE_URL", "http://localhost:40000")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "40010"))
 

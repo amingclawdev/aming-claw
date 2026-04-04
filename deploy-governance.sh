@@ -1,4 +1,9 @@
 #!/bin/bash
+echo "deploy-governance.sh is retired."
+echo "Governance now runs on the host at http://localhost:40000."
+echo "Use ./scripts/start-governance.ps1 -Takeover and ./scripts/start-manager.ps1 -Takeover instead."
+exit 1
+
 # Zero-downtime deployment for governance service
 #
 # Strategy:

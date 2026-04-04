@@ -1,5 +1,9 @@
 # Workflow Autonomy Roadmap
 
+> Baseline: `4cc1688` (2026-04-04, post-reconciliation)
+> Revision: v2 (status updated after baseline reconciliation)
+> Previous: `docs/dev/workflow-autonomy-roadmap-2026-03-31-archived.md`
+
 ## Goal
 
 Evolve the current workflow from:
@@ -9,353 +13,198 @@ to:
 - `Workflow self-diagnoses and self-improves by default`
 - `Observer mainly monitors, approves high-risk actions, and handles rare exceptions`
 
-This roadmap prioritizes automatic repair and automatic optimization first, then gradually reduces Observer intervention.
-
 ## Target End State
 
-The desired operating model is:
-- workflow runs full chain automatically:
-  - `coordinator -> pm -> dev -> test -> qa -> gatekeeper -> merge -> deploy`
+- workflow runs full chain automatically: `coordinator -> pm -> dev -> test -> qa -> gatekeeper -> merge -> deploy`
 - failures are automatically classified
 - workflow defects trigger automatic repair tasks
 - repaired workflow changes are validated through replay and regression coverage
 - Observer sees summaries, alerts, and approval requests instead of manually tracing logs
 
-## Guiding Principles
+## Current Progress (2026-04-04)
 
-1. automation before intervention
-   - prefer automatic retry, automatic diagnosis, automatic repair, and automatic replay
+| Phase | Status | Key Evidence |
+|-------|--------|--------------|
+| Phase 1: Stabilize Contracts | DONE | Role contracts in artifacts.py, memory in models.py, evidence in evidence.py |
+| Phase 2: Failure Classification | DONE | failure_classifier.py with 5 classes + structured issue summaries |
+| Phase 3: Automatic Workflow Repair | PARTIAL | Auto-creation works; replay validation set missing |
+| Phase 4: Graph-Driven Acceptance | NOT STARTED | -- |
+| Phase 5: Observer-Mostly-Monitoring | NOT STARTED | -- |
 
-2. contracts before autonomy
-   - role behavior, memory behavior, graph mapping, and evidence format must be stable before autonomy is expanded
+---
 
-3. evidence before approval
-   - QA, Gatekeeper, merge, and deploy should rely on structured evidence, not only free-form model judgment
+## Phase 1: Stabilize Contracts -- DONE
 
-4. Observer as governor, not executor
-   - Observer should gradually move from fixing workflow details to supervising policy, risk, and exceptions
+All contract areas are implemented:
 
-## Current Baseline
+### Role Contracts
+- PM: goal, acceptance_criteria, fail_conditions (artifacts.py ROLE_ARTIFACT_SCHEMAS)
+- Dev: implementation_summary, changed_files, commit_hash
+- Tester: tests_executed, result_summary, recommendation
+- QA: scenarios_checked, verdict, recommendation, criteria_results
+- Gatekeeper: PM alignment, requirement coverage, acceptance trace
 
-The current system already has:
-- a working multi-stage chain
-- isolated Dev worktrees
-- QA and Gatekeeper stages
-- isolated merge verification
-- host-side deploy with smoke test
-- version gate re-enabled
-- partial audit and memory persistence
+### Memory Contract
+- MemoryEntry dataclass (models.py): module_id, kind, content, structured, supersedes, related_nodes
+- MemoryKind enum: 8 types (decision, pitfall, workaround, invariant, ownership, pattern, api, stub)
+- Write guards: dedup similarity > 0.85, confidence threshold 0.6, source validation, TTL enforcement
 
-The main remaining gaps are:
-- role-based memory rules are not fully fixed
-- graph-to-test/doc/scenario mapping is incomplete
-- requirement-to-evidence trace is incomplete
-- workflow failure classification is still weak
-- workflow self-improvement is still mostly driven by Observer
+### Graph Contract
+- Hard rule #1: target_files/create_files requirement (decision_validator.py)
+- Graph state validation in auto_chain gates
+- Node status tracking: pending -> testing -> t2_pass -> qa_pass (+ waived, failed)
 
-## Phase 1: Stabilize Contracts
+### Evidence Schema
+- EVIDENCE_RULES dict (evidence.py): transition-specific requirements
+- PENDING->T2_PASS requires test_report
+- T2_PASS->QA_PASS requires e2e_report
+- any->FAILED requires error_log
+- False-pass anti-pattern detectors
 
-### Objective
+---
 
-Make the workflow predictable enough that repeated runs behave consistently.
+## Phase 2: Failure Classification -- DONE
 
-### Work Items
+Implementation: `agent/governance/failure_classifier.py`
 
-1. finalize role contracts
-- create or complete rules for:
-  - `dev`
-  - `test`
-  - `qa`
-  - `gatekeeper`
-- define for each role:
-  - inputs
-  - outputs
-  - allowed tools
-  - writable scope
-  - verification duties
-  - retry behavior
+### Failure Classes
+1. **task_defect** -- the task itself produced bad output
+2. **environment_defect** -- infra/tooling failure
+3. **graph_defect** -- graph/governance mismatch
+4. **contract_defect** -- role contract or stage contract violation
+5. **provider_tool_defect** -- AI provider or tool failure
 
-2. finalize memory contract
-- define role-based memory read/write rules
-- fix stable schema for:
-  - `module_id`
-  - `kind`
-  - `content`
-  - `structured`
-  - `task_id`
-  - `chain_stage`
-  - `related_files`
-  - `validation_status`
-  - `supersedes`
-- document which role may write which memory kinds
-- enforce the same policy in code
+### Structured Output
+- failure_class, workflow_improvement flag, observer_attention flag
+- suggested_action, issue_summary
+- Confidence levels: high/medium/low based on anti-pattern count
 
-3. finalize graph contract
-- stabilize:
-  - `file -> node`
-  - `node -> tests`
-  - `node -> docs`
-  - `node -> acceptance scenarios`
-- remove temporary node drift and ad-hoc fallback logic where possible
+### Observer Summaries
+- Classification result available in task metadata
+- Automatic improvement task creation when workflow_improvement=true
 
-4. finalize evidence schema
-- standardize structured evidence for:
-  - `test_report`
-  - `qa_review`
-  - `gatekeeper_decision`
-  - `merge_result`
-  - `deploy_report`
-  - `requirement_coverage`
-  - `acceptance_trace`
+---
 
-### Exit Criteria
+## Phase 3: Automatic Workflow Repair -- PARTIAL
 
-- the same task replay produces consistent stage behavior
-- memory writes are schema-valid and role-valid
-- graph lookups no longer require frequent manual bypasses
+### What's Done
+- Workflow improvement task auto-creation (_maybe_create_workflow_improvement_task in auto_chain.py)
+- Repair prompt generation from classification (build_workflow_improvement_prompt in failure_classifier.py)
+- Event publication + audit recording for improvement tasks
+- Lane deferral logic for doc-gate contradictions
+- Governance internal repair detection
 
-## Phase 2: Add Failure Classification
+### What's Missing
 
-### Objective
+**3.1 Replay Validation Set**
+- No formal replay cases maintained for validating repair quality
+- Repair success is measured only by next-stage execution outcome
+- No regression harness for: coordinator routing, PM contract, dev worktree, test contract, QA contract, gatekeeper alignment, merge isolation, deploy smoke, version gate
 
-Teach the workflow to understand why a run failed.
+**3.2 Contract-Drift Detection (D10)**
+- No mechanism to detect when repair tasks change policy/config outside PM scope
+- This is the most important remaining gap from Layer 0
 
-### Work Items
+**3.3 Predict-Verify-Diff-Iterate Pattern**
+- Not yet standardized: repairs do not explicitly produce predicted output vs. actual output comparison
 
-1. introduce failure classifier
-- classify failures as:
-  - task defect
-  - prompt or contract defect
-  - graph defect
-  - gate defect
-  - environment defect
-  - provider or tool defect
+### Remaining Work
 
-2. introduce workflow issue extraction
-- produce structured issue summaries with:
-  - failing stage
-  - root cause class
-  - affected contracts
-  - affected nodes
-  - affected tools or provider
-  - suggested repair direction
+| Item | Effort | Priority |
+|------|--------|----------|
+| Replay validation set (9 stage cases) | ~5 days | P1 |
+| Contract-drift detection (D10) | ~3 days | P1 |
+| Predict-verify-diff-iterate pattern | ~3 days | P2 |
 
-3. improve observer summaries
-- Observer should receive:
-  - chain summary
-  - evidence summary
-  - automatic retries attempted
-  - root cause guess
-  - whether manual action is still needed
+---
 
-### Exit Criteria
+## Cross-Cutting: Documentation Governance -- DONE
 
-- Observer no longer needs to manually inspect raw logs for common failures
-- common chain failures are automatically labeled into stable categories
+All items from the original roadmap are addressed:
 
-## Phase 3: Add Automatic Workflow Repair
+1. `docs/dev/**` is treated as tracked-but-non-governed -- DONE
+2. Formal docs split from dev artifacts in gate semantics -- DONE (lane deferral logic)
+3. Internal governance repair policy explicit -- DONE (_is_governance_internal_repair)
+4. CODE_DOC_MAP exists but has 22 stale mappings to deleted docs -- LOW PRIORITY cleanup
+
+---
+
+## Phase 4: Graph-Driven Acceptance -- NOT STARTED
 
 ### Objective
-
-Allow the workflow to repair its own governance defects, not only business tasks.
-
-### Work Items
-
-1. create workflow-improvement task type
-- when failure classifier says the problem is in workflow itself:
-  - create a structured workflow improvement task
-  - run through the normal chain
-
-2. standardize `predict -> verify -> diff -> iterate`
-- every workflow repair must produce:
-  - predicted expected output
-  - actual observed output
-  - mismatch analysis
-  - repair hypothesis
-  - verification result
-
-3. add replay-based validation set
-- maintain stable replay cases for:
-  - coordinator routing
-  - PM contract output
-  - Dev context and worktree
-  - Test contract and test report
-  - QA contract
-  - Gatekeeper PM alignment
-  - merge isolation
-  - deploy smoke
-  - version gate
-
-### Exit Criteria
-
-- workflow defects are routinely repaired through workflow-generated tasks
-- Observer no longer authors most repair tasks by hand
-
-## Phase 4: Upgrade QA and Gatekeeper to Graph-Driven Acceptance
-
-### Objective
-
 Move from contract-only acceptance toward evidence-backed graph acceptance.
 
 ### Work Items
+1. Requirement coverage trace (changed files -> related tests -> node coverage -> evidence)
+2. Acceptance trace (criterion -> satisfied? -> by which evidence -> confidence)
+3. QA upgrade: validate PM alignment + test evidence + doc impact + scenario coverage
+4. Gatekeeper upgrade: require PM alignment + requirement coverage + acceptance trace + node readiness
+5. Release gate tightening: node + doc + coverage + version + deploy success
 
-1. add requirement coverage trace
-- for each requirement, capture:
-  - changed files
-  - related tests
-  - node coverage
-  - evidence source
+### Prerequisites
+- Phase 3 replay set (for regression safety)
+- D6 trace_id in tasks (for end-to-end evidence chain)
 
-2. add acceptance trace
-- for each acceptance criterion, capture:
-  - whether it is satisfied
-  - by which evidence
-  - with what confidence
+---
 
-3. upgrade QA
-- QA should validate:
-  - PM contract alignment
-  - test evidence completeness
-  - document impact completeness
-  - scenario coverage where required
-
-4. upgrade Gatekeeper
-- Gatekeeper should require:
-  - complete PM alignment
-  - requirement coverage
-  - acceptance trace
-  - node state readiness
-  - release preconditions
-
-5. tighten release gates
-- enforce:
-  - node gate
-  - doc gate
-  - coverage gate
-  - version gate
-  - deploy success gate
-
-### Exit Criteria
-
-- `merge_pass` is backed by structured evidence, not only model judgment
-- each relevant node can explain why it is ready
-
-## Phase 5: Reach Observer-Mostly-Monitoring Mode
+## Phase 5: Observer-Mostly-Monitoring -- NOT STARTED
 
 ### Objective
-
 Reduce Observer from active repair participant to governance supervisor.
 
 ### Default Observer Role
-
-Observer should mostly:
-- watch dashboards and summaries
-- approve high-risk actions
-- resolve rare ambiguous failures
-- change policy when needed
-
-Observer should no longer routinely:
-- debug prompt routing
-- identify broken metadata by hand
-- create repair tasks for common workflow defects
-- manually replay standard chain cases
+- Watch dashboards and summaries
+- Approve high-risk actions
+- Resolve rare ambiguous failures
+- Change policy when needed
 
 ### Allowed Observer Intervention Categories
+1. Policy changes (graph, memory, gate, approval)
+2. High-risk overrides (release, cancel/rollback, force gate bypass)
+3. Unresolved rare failures (not covered by classifier, infra failures, governance ambiguity)
 
-1. policy changes
-- graph policy
-- memory policy
-- gate policy
-- approval policy
+### Prerequisites
+- Phase 3 fully complete (replay + drift detection)
+- Phase 4 at least partially complete (graph-driven QA)
+- Stable for 2+ weeks without observer-driven repairs
 
-2. high-risk overrides
-- release override
-- destructive cancel or rollback
-- force bypass of a critical gate
+---
 
-3. unresolved rare failures
-- issues not covered by failure classifier
-- infra failures not auto-recoverable
-- conflicting evidence or governance ambiguity
+## Implementation Priority
 
-### Exit Criteria
+### Immediate (P0) -- remaining Layer 0 + Phase 3 gaps
 
-- Observer only handles exceptional or policy-level situations
-- most workflow repairs are automatic
-- chain summaries are readable without log archaeology
+| Item | Effort | Dependency |
+|------|--------|------------|
+| D10 Contract-drift detection | ~3 days | None |
+| D6 trace_id in tasks table + trace API | ~2 days | None |
+| Phase 3 replay validation set | ~5 days | None |
 
-## Implementation Order
+### Near-term (P1) -- close Layer 0 + start Phase 4
 
-Recommended execution order:
+| Item | Effort | Dependency |
+|------|--------|------------|
+| D1 worker stall self-restart | ~1 day | None |
+| D4 gate_events table + API | ~2 days | None |
+| D9 unified doc policy document | ~1 day | None |
+| Phase 3 predict-verify-diff pattern | ~3 days | Replay set |
+| Phase 4 requirement coverage trace | ~3 days | D6 trace_id |
 
-1. role-based memory contract
-2. graph-driven minimal verification mapping
-3. evidence and trace schema
-4. failure classifier
-5. workflow-improvement task automation
-6. graph-driven QA and Gatekeeper acceptance
-7. Observer-mostly-monitoring mode
+### Later (P2) -- Layer 2 expansion
 
-## Priority Breakdown
+| Item | Effort | Dependency |
+|------|--------|------------|
+| 5.1 PM task decomposition | ~2 weeks | Phase 3 complete |
+| 5.3 External project bootstrap | ~1.5 weeks | Layer 1 |
+| 5.5 Graph-driven routing | ~4-6 weeks | Phase 4 |
+| Role templates YAML migration | ~1 week | Any time |
+| CODE_DOC_MAP cleanup | ~1 day | Any time |
 
-### P0
+---
 
-- role-based memory contract
-- graph mapping stabilization
-- evidence schema stabilization
-- failure classification skeleton
+## Revision History
 
-### P1
-
-- workflow improvement auto-task
-- replay set and regression harness
-- QA and Gatekeeper coverage trace
-
-### P2
-
-- Observer-only dashboard mode
-- policy tuning and approval minimization
-- deeper graph-driven release governance
-
-## Required Deliverables
-
-The roadmap should eventually produce:
-
-1. documents
-- `dev-rules.md`
-- memory rules
-- graph mapping spec
-- acceptance trace spec
-- observer operating model
-
-2. runtime policies
-- role-based memory policy
-- role-based tool policy
-- graph lookup policy
-- gate policy
-
-3. tests
-- replay tests for each stage
-- full-chain E2E
-- gate behavior tests
-- version-gate enforcement tests
-- workflow self-repair regression tests
-
-4. audit outputs
-- chain summary
-- release summary
-- requirement coverage report
-- acceptance trace report
-- observer escalation summary
-
-## Practical Short-Term Goal
-
-The most realistic near-term milestone is:
-
-- workflow repairs common defects automatically
-- Observer mostly reviews summaries and only steps in when:
-  - policy is unclear
-  - a high-risk gate is hit
-  - the automatic repair budget is exhausted
-
-This is the correct transition stage before full Observer-mostly-monitoring mode.
+| Date | Version | Changes |
+|------|---------|---------|
+| 2026-03-31 | v1 | Initial workflow autonomy roadmap (5 phases) |
+| 2026-04-04 | v2 | Post-baseline reconciliation update. Phase 1-2 marked DONE. Phase 3 gaps measured. Priority table added. Archived v1. |

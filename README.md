@@ -29,7 +29,7 @@ You (Observer)
                                │                  │
                     ┌──────────▼──────┐   ┌───────▼────────┐
                     │ Telegram Gateway │   │ Governance API │
-                    │   :40010         │   │   :40006       │
+                    │   :40010         │   │   :40000       │
                     └──────────┬──────┘   └───────┬────────┘
                                │                  │
                     ┌──────────▼──────────────────▼────────┐
@@ -50,7 +50,7 @@ You (Observer)
 
 | Service | Port | Responsibility |
 |---------|------|----------------|
-| **Governance Server** | 40006 | Task registry, workflow state machine, node management, audit log |
+| **Governance Server** | 40000 | Task registry, workflow state machine, node management, audit log |
 | **Telegram Gateway** | 40010 | Telegram message routing, project binding, event notifications |
 | **Executor Gateway** | 8090 | Actual AI task execution (code changes, tests, screenshots) |
 | **Executor API** | 40100 | Task monitoring, session management, manual intervention |
@@ -100,7 +100,7 @@ Supported gateway commands:
 
 ```bash
 # Create a task (no token required for task operations)
-curl -X POST http://localhost:40006/api/task/aming-claw/create \
+curl -X POST http://localhost:40000/api/task/aming-claw/create \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Fix the /config endpoint bug in server.py",
@@ -132,13 +132,13 @@ CREATE ──► QUEUED ──► CLAIMED ──► RUNNING ──► SUCCEEDED
 
 ```bash
 # List tasks
-curl http://localhost:40006/api/task/aming-claw/list
+curl http://localhost:40000/api/task/aming-claw/list
 
 # Runtime status (active + queued + pending notifications)
-curl http://localhost:40006/api/runtime/aming-claw
+curl http://localhost:40000/api/runtime/aming-claw
 
 # Node status summary
-curl http://localhost:40006/api/wf/aming-claw/summary
+curl http://localhost:40000/api/wf/aming-claw/summary
 # => {"pending": 1, "testing": 108, "waived": 70}
 ```
 
@@ -148,7 +148,7 @@ When the auto-chain fails or needs human intervention, the Observer can take ove
 
 ```bash
 # Claim a queued task
-curl -X POST http://localhost:40006/api/task/aming-claw/claim \
+curl -X POST http://localhost:40000/api/task/aming-claw/claim \
   -H "Content-Type: application/json" \
   -d '{"worker_id": "observer-claude-code"}'
 
@@ -161,12 +161,12 @@ curl -X POST http://localhost:40006/api/task/aming-claw/claim \
 }
 
 # Report progress
-curl -X POST http://localhost:40006/api/task/aming-claw/progress \
+curl -X POST http://localhost:40000/api/task/aming-claw/progress \
   -H "Content-Type: application/json" \
   -d '{"task_id": "task-xxx", "progress": {"step": "coding", "files_changed": 3}}'
 
 # Mark complete (auto-chain triggers next stage)
-curl -X POST http://localhost:40006/api/task/aming-claw/complete \
+curl -X POST http://localhost:40000/api/task/aming-claw/complete \
   -H "Content-Type: application/json" \
   -d '{
     "task_id": "task-xxx",
@@ -181,7 +181,7 @@ After a task completes, the Observer updates workflow node verification status:
 
 ```bash
 # Update individual or batch node status
-curl -X POST http://localhost:40006/api/wf/aming-claw/verify-update \
+curl -X POST http://localhost:40000/api/wf/aming-claw/verify-update \
   -H "Content-Type: application/json" \
   -d '{
     "nodes": ["L8.5", "L14.7"],
@@ -195,7 +195,7 @@ curl -X POST http://localhost:40006/api/wf/aming-claw/verify-update \
   }'
 
 # Batch baseline
-curl -X POST http://localhost:40006/api/wf/aming-claw/baseline \
+curl -X POST http://localhost:40000/api/wf/aming-claw/baseline \
   -H "Content-Type: application/json" \
   -d '{
     "nodes": {"L1.1": "waived", "L1.2": "waived"},
@@ -291,7 +291,9 @@ Forbidden: PENDING → QA_PASS (cannot skip T2 testing)
 
 ```bash
 # Docker (recommended)
-docker compose -f docker-compose.governance.yml up -d
+docker compose -f docker-compose.governance.yml up -d dbservice redis telegram-gateway
+.\scripts\start-governance.ps1
+.\scripts\start-manager.ps1
 
 # Or Windows local
 .\setup.ps1          # One-time: download Python + install deps
@@ -302,7 +304,7 @@ copy .env.example .env
 ### 2. Create a Project (one command, no password)
 
 ```bash
-curl -X POST http://localhost:40006/api/init \
+curl -X POST http://localhost:40000/api/init \
   -H "Content-Type: application/json" \
   -d '{"project_id": "my-project"}'
 
@@ -312,7 +314,7 @@ curl -X POST http://localhost:40006/api/init \
 That's it. No tokens, no passwords. Start submitting tasks immediately:
 
 ```bash
-curl -X POST http://localhost:40006/api/task/my-project/create \
+curl -X POST http://localhost:40000/api/task/my-project/create \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Fix the login bug", "type": "dev"}'
 ```
@@ -331,7 +333,7 @@ curl -X POST http://localhost:40006/api/task/my-project/create \
 Any project can join by adding `.aming-claw.yaml`:
 
 ```bash
-curl -X POST http://localhost:40006/api/projects/register \
+curl -X POST http://localhost:40000/api/projects/register \
   -H "Content-Type: application/json" \
   -d '{"workspace_path": "/path/to/your/project"}'
 ```
@@ -414,7 +416,7 @@ See [AI Agent Integration Guide](docs/ai-agent-integration-guide.md) for the ful
 aming_claw/
 ├── agent/
 │   ├── governance/              # Governance service (29 modules)
-│   │   ├── server.py            # HTTP server + routing (40006)
+│   │   ├── server.py            # HTTP server + routing (40000)
 │   │   ├── auto_chain.py        # Auto-chain dispatcher (PM→Dev→Test→QA→Merge→Deploy)
 │   │   ├── chain_context.py      # Event-sourced chain context + crash recovery
 │   │   ├── task_registry.py     # Task lifecycle management
@@ -466,7 +468,7 @@ aming_claw/
 |----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | | Telegram bot token |
 | `EXECUTOR_API_TOKEN` | | Executor-gateway auth secret |
-| `GOVERNANCE_PORT` | `40006` | Governance service port |
+| `GOVERNANCE_PORT` | `40000` | Governance service port |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
 | `SHARED_VOLUME_PATH` | `./shared-volume` | Task data root directory |
 | `WORKSPACE_PATH` | cwd | Workspace path |
@@ -475,11 +477,9 @@ aming_claw/
 ### Docker Deployment
 
 ```bash
-# Start all services (governance + gateway + redis)
-docker compose -f docker-compose.governance.yml up -d
-
-# View logs
-docker compose -f docker-compose.governance.yml logs -f governance
+# Start optional Docker dependencies, then host governance
+docker compose -f docker-compose.governance.yml up -d dbservice redis telegram-gateway
+.\scripts\start-governance.ps1
 ```
 
 ---
@@ -499,7 +499,7 @@ docker compose -f docker-compose.governance.yml logs -f governance
 - Coordinator can use `baseline` to bypass permission checks
 
 **Governance service not responding**
-- `curl http://localhost:40006/api/health`
+- `curl http://localhost:40000/api/health`
 - Check that the SQLite database file is writable
 
 ---

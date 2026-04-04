@@ -1,79 +1,6 @@
 services:
-  # --- Reverse Proxy ---
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "40000:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      governance:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/nginx-health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
-  # --- Governance Service (Production) ---
-  governance:
-    build:
-      context: .
-      dockerfile: Dockerfile.governance
-    expose:
-      - "40006"
-    volumes:
-      - ./shared-volume/codex-tasks/state/governance:/app/shared-volume/codex-tasks/state/governance
-      - .:/workspace:ro
-      - C:/Users/z5866/Documents/Yings_work:/projects/yings-work:ro
-    environment:
-      - GOVERNANCE_PORT=40006
-      - REDIS_URL=redis://redis:6379/0
-      - DBSERVICE_URL=http://dbservice:40002
-      - MEMORY_BACKEND=docker
-      - SHARED_VOLUME_PATH=/app/shared-volume
-    depends_on:
-      redis:
-        condition: service_healthy
-      dbservice:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:40006/api/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  # --- Governance Service (Development) ---
-  governance-dev:
-    build:
-      context: .
-      dockerfile: Dockerfile.governance
-    expose:
-      - "40007"
-    ports:
-      - "40007:40007"
-    volumes:
-      - ./shared-volume/codex-tasks/state/governance-dev:/app/shared-volume/codex-tasks/state/governance
-      - .:/workspace:ro
-    environment:
-      - GOVERNANCE_PORT=40007
-      - REDIS_URL=redis://redis:6379/1
-      - DBSERVICE_URL=http://dbservice:40002
-      - MEMORY_BACKEND=docker
-      - SHARED_VOLUME_PATH=/app/shared-volume
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:40007/api/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    profiles:
-      - dev
+  # Governance is host-side only. This compose file now provides supporting
+  # dependencies that the host governance process may still use.
 
   # --- Telegram Gateway ---
   telegram-gateway:
@@ -87,14 +14,14 @@ services:
     env_file:
       - .env
     environment:
-      - GOVERNANCE_URL=http://governance:40006
+      - GOVERNANCE_URL=http://host.docker.internal:40000
       - REDIS_URL=redis://redis:6379/0
       - SHARED_VOLUME_PATH=/app/shared-volume
       - TELEGRAM_ADMIN_CHAT_ID=${TELEGRAM_ADMIN_CHAT_ID:-7848961760}
       - GATEWAY_PORT=40010
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      governance:
-        condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
