@@ -54,7 +54,10 @@ def _make_db() -> sqlite3.Connection:
             assigned_to TEXT,
             fence_token TEXT,
             lease_expires_at TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            trace_id TEXT,
+            chain_id TEXT,
+            error_message TEXT
         );
         CREATE TABLE project_version (
             project_id TEXT PRIMARY KEY,

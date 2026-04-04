@@ -68,6 +68,8 @@ def create_task(
     metadata: dict = None,
     parent_task_id: str = None,
     retry_round: int = 0,
+    trace_id: str = None,
+    chain_id: str = None,
 ) -> dict:
     """Create a new task. If observer_mode is on, task starts as observer_hold."""
     task_id = _new_task_id()
@@ -87,20 +89,20 @@ def create_task(
            (task_id, project_id, status, execution_status, notification_status,
             type, prompt, related_nodes,
             created_by, created_at, updated_at, priority, max_attempts, metadata_json,
-            parent_task_id, retry_round)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            parent_task_id, retry_round, trace_id, chain_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task_id, project_id, initial_status, initial_status, notify,
             task_type, prompt,
             json.dumps(related_nodes or []),
             created_by, now, now, priority, max_attempts,
             json.dumps(metadata or {}),
-            parent_task_id, retry_round,
+            parent_task_id, retry_round, trace_id, chain_id,
         ),
     )
 
-    log.info("Task created: %s (project: %s, type: %s, status: %s, retry_round: %d)",
-             task_id, project_id, task_type, initial_status, retry_round)
+    log.info("Task created: %s (project: %s, type: %s, status: %s, retry_round: %d, trace_id: %s)",
+             task_id, project_id, task_type, initial_status, retry_round, trace_id)
     return {
         "task_id": task_id,
         "project_id": project_id,
@@ -108,6 +110,8 @@ def create_task(
         "type": task_type,
         "created_at": now,
         "observer_hold": initial_status == "observer_hold",
+        "trace_id": trace_id,
+        "chain_id": chain_id,
     }
 
 

@@ -37,7 +37,9 @@ def _make_db():
             fence_token TEXT,
             lease_expires_at TEXT,
             completed_at TEXT,
-            notified_at TEXT
+            notified_at TEXT,
+            trace_id TEXT,
+            chain_id TEXT
         );
         CREATE TABLE task_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

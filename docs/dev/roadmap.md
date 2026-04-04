@@ -156,19 +156,17 @@ Layer 2: EXPAND              --> add capabilities on a stable foundation
 - [x] Idempotency key mechanism (idempotency.py:15-66)
 - [x] _reply_sent flag (executor_worker.py)
 
-### 3.6 Observability Baseline (D6) -- PARTIALLY FIXED
+### 3.6 Observability Baseline (D6) -- FIXED
 
 **What's done:**
 - [x] trace_id generation (observability.py:20-22)
 - [x] Structured logging with trace_id support
 - [x] trace_id in event_outbox table
+- [x] trace_id/chain_id columns in tasks table (schema v10→v11 migration)
+- [x] API: GET /api/task/{project_id}/trace/{trace_id}
+- [x] Gate transitions logged with trace_id in structured fields (auto_chain.py)
 
-**Remaining gap:**
-- [ ] trace_id/chain_id columns in tasks table
-- [ ] API: GET /api/task/{project_id}/trace/{trace_id}
-- [ ] Gate transitions logged with trace_id in structured fields
-
-**Severity:** Medium. End-to-end chain tracing requires manual log correlation today.
+**Severity:** Resolved. End-to-end chain tracing now works via trace_id propagation.
 
 ### 3.7 Test Result Contract Integrity (D8) -- FIXED
 
@@ -289,7 +287,7 @@ LAYER 0 (Stop Bleeding) -- MOSTLY DONE
   D3 PM role mapping fix ............... FIXED
   D4 Gate reason persistence ........... PARTIALLY FIXED
   D5 Duplicate reply fix ............... FIXED
-  D6 Observability baseline ............ PARTIALLY FIXED
+  D6 Observability baseline ............ FIXED
   D8 Test result contract .............. FIXED
   D9 Doc-gate contradiction ............ PARTIALLY FIXED
   D10 Contract-drift detection ......... NOT FIXED  <-- main remaining gap

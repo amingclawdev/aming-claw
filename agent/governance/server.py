@@ -1647,6 +1647,27 @@ def handle_task_list(ctx: RequestContext):
     return {"tasks": tasks, "count": len(tasks)}
 
 
+@route("GET", "/api/task/{project_id}/trace/{trace_id}")
+def handle_task_trace(ctx: RequestContext):
+    """List all tasks sharing a trace_id, ordered by creation time."""
+    project_id = ctx.get_project_id()
+    trace_id = ctx.path_params.get("trace_id", "")
+    if not trace_id:
+        raise GovernanceError("trace_id is required", 400)
+    with DBContext(project_id) as conn:
+        rows = conn.execute(
+            """SELECT task_id, status, type, prompt, assigned_to, created_by,
+                      created_at, updated_at, trace_id, chain_id,
+                      result_json, metadata_json
+               FROM tasks
+               WHERE project_id = ? AND trace_id = ?
+               ORDER BY created_at ASC""",
+            (project_id, trace_id),
+        ).fetchall()
+    tasks = [dict(r) for r in rows]
+    return {"tasks": tasks, "count": len(tasks), "trace_id": trace_id}
+
+
 @route("GET", "/api/runtime/{project_id}")
 def handle_runtime(ctx: RequestContext):
     """Runtime projection — read-only view from Task Registry. No state of its own."""

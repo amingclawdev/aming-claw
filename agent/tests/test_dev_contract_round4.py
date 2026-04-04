@@ -55,7 +55,7 @@ class TestBuildDevPromptRound4(unittest.TestCase):
             last_prompt = ""
 
             @staticmethod
-            def create_task(conn, project_id, prompt, task_type, created_by, metadata):
+            def create_task(conn, project_id, prompt, task_type, created_by, metadata, **kwargs):
                 DummyTaskRegistry.last_prompt = prompt
                 return {"task_id": "task-retry-1", "prompt": prompt, "metadata": metadata}
 
@@ -94,7 +94,7 @@ class TestBuildDevPromptRound4(unittest.TestCase):
             last_metadata = {}
 
             @staticmethod
-            def create_task(conn, project_id, prompt, task_type, created_by, metadata):
+            def create_task(conn, project_id, prompt, task_type, created_by, metadata, **kwargs):
                 DummyTaskRegistry.last_prompt = prompt
                 DummyTaskRegistry.last_metadata = metadata
                 return {"task_id": "task-retry-2", "prompt": prompt, "metadata": metadata}

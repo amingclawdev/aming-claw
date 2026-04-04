@@ -44,7 +44,8 @@ def _create_test_db():
         error_message TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
         max_attempts INTEGER NOT NULL DEFAULT 3,
         priority INTEGER NOT NULL DEFAULT 0, metadata_json TEXT,
-        retry_round INTEGER NOT NULL DEFAULT 0, parent_task_id TEXT)""")
+        retry_round INTEGER NOT NULL DEFAULT 0, parent_task_id TEXT,
+        trace_id TEXT, chain_id TEXT)""")
     conn.execute("""CREATE TABLE task_attempts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id TEXT NOT NULL, attempt INTEGER NOT NULL,

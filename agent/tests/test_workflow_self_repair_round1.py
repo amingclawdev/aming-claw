@@ -50,7 +50,7 @@ class TestWorkflowImprovementTaskRound1(unittest.TestCase):
 
         created = []
 
-        def fake_create_task(conn, project_id, prompt, task_type, created_by, metadata):
+        def fake_create_task(conn, project_id, prompt, task_type, created_by, metadata, **kwargs):
             created.append({
                 "task_type": task_type,
                 "created_by": created_by,
@@ -110,7 +110,7 @@ class TestWorkflowImprovementTaskRound1(unittest.TestCase):
 
         created = []
 
-        def fake_create_task(conn, project_id, prompt, task_type, created_by, metadata):
+        def fake_create_task(conn, project_id, prompt, task_type, created_by, metadata, **kwargs):
             created.append({
                 "task_type": task_type,
                 "created_by": created_by,

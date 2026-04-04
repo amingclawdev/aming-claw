@@ -14,6 +14,7 @@ import os
 import re
 import traceback
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
+from .observability import new_trace_id, structured_log
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +114,22 @@ def _extract_test_files_from_verification(verification):
     if not isinstance(command, str) or not command.strip():
         return []
     return list(dict.fromkeys(_TEST_FILE_PATTERN.findall(command)))
+
+
+def _load_task_trace(conn, task_id):
+    """Load trace_id and chain_id from a task row."""
+    if not task_id or not hasattr(conn, "execute"):
+        return None, None
+    try:
+        row = conn.execute(
+            "SELECT trace_id, chain_id FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None, None
+        return row["trace_id"], row["chain_id"]
+    except Exception:
+        return None, None
 
 
 def _load_task_metadata(conn, project_id, task_id):
@@ -390,6 +407,24 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     """Internal chain logic with guaranteed conn cleanup by caller."""
     metadata["related_nodes"] = _normalize_related_nodes(metadata.get("related_nodes", []))
 
+    # --- Trace propagation: load trace_id/chain_id from current task ---
+    _trace_id, _chain_id = _load_task_trace(conn, task_id)
+    if not _trace_id and task_type == "pm":
+        # Root PM task without trace_id — generate one and backfill
+        _trace_id = new_trace_id()
+        _chain_id = task_id
+        try:
+            conn.execute(
+                "UPDATE tasks SET trace_id=?, chain_id=? WHERE task_id=?",
+                (_trace_id, _chain_id, task_id),
+            )
+        except Exception:
+            log.warning("auto_chain: failed to backfill trace_id on PM task %s", task_id)
+    elif not _trace_id:
+        # Non-PM task without trace (legacy) — generate trace but keep chain_id as parent_task_id
+        _trace_id = new_trace_id()
+        _chain_id = _chain_id or metadata.get("parent_task_id") or task_id
+
     # Non-blocking preflight log (first stage only)
     if task_type == "pm":
         try:
@@ -466,9 +501,14 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             node_ids=metadata.get("related_nodes", []),
             task_id=task_id,
             chain_depth=depth,
+            trace_id=_trace_id,
         )
     except Exception:
         log.debug("auto_chain: audit task.completed failed (non-critical)", exc_info=True)
+    # R6: structured_log with trace_id for gate transitions
+    structured_log("info", f"{task_type}.completed",
+                   project_id=project_id, task_id=task_id,
+                   trace_id=_trace_id, chain_id=_chain_id)
 
     # M1: PM completes → persist full PRD to memory for future dev/qa recall
     if task_type == "pm":
@@ -550,9 +590,14 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 stage=task_type,
                 next_stage=next_type or "deploy",
                 reason=reason,
+                trace_id=_trace_id,
             )
         except Exception:
             log.debug("auto_chain: audit gate.blocked failed (non-critical)", exc_info=True)
+        structured_log("warning", "gate.blocked",
+                       project_id=project_id, task_id=task_id,
+                       stage=task_type, next_stage=next_type or "deploy",
+                       trace_id=_trace_id, chain_id=_chain_id, reason=reason)
 
         # Special cases: test failure or QA rejection → retry as dev (not same stage)
         # Dev fixes the root cause; re-running test/qa without a code fix is wasteful
@@ -610,6 +655,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     "retry_from_stage": task_type,
                     "_original_prompt": original_prompt,
                 },
+                trace_id=_trace_id,
+                chain_id=_chain_id,
             )
             retry_id = dev_retry.get("task_id", "?")
             log.info("auto_chain: %s failure → dev retry task %s", task_type, retry_id)
@@ -705,6 +752,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 task_type=task_type,
                 created_by="auto-chain-retry",
                 metadata=_retry_meta,
+                trace_id=_trace_id,
+                chain_id=_chain_id,
             )
             retry_id = retry_task.get("task_id", "?")
             log.info("auto_chain: retry created %s for blocked %s", retry_id, task_id)
@@ -761,9 +810,13 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 task_id=task_id,
                 chain_depth=depth,
                 changed_files=metadata.get("changed_files", []),
+                trace_id=_trace_id,
             )
         except Exception:
             log.debug("auto_chain: audit chain.completed failed (non-critical)", exc_info=True)
+        structured_log("info", "chain.completed",
+                       project_id=project_id, task_id=task_id,
+                       trace_id=_trace_id, chain_id=_chain_id)
         # Archive chain context (release memory, DB data preserved)
         try:
             from .chain_context import get_store
@@ -798,6 +851,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             "parent_task_id": task_id,
             "chain_depth": depth + 1,
         },
+        trace_id=_trace_id,
+        chain_id=_chain_id,
     )
 
     log.info("auto_chain: %s→%s | %s → %s",
