@@ -6,6 +6,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from governance.db import SCHEMA_VERSION
+
 
 class TestDB(unittest.TestCase):
     def setUp(self):
@@ -40,7 +42,7 @@ class TestDB(unittest.TestCase):
         from governance.db import get_connection, close_connection
         conn = get_connection("test-project")
         row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
-        self.assertEqual(row["value"], "10")
+        self.assertEqual(row["value"], str(SCHEMA_VERSION))
         close_connection(conn)
 
     def test_wal_mode(self):
