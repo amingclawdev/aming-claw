@@ -1065,6 +1065,32 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     test_results = result.get("test_results", {})
     if test_results.get("ran") and test_results.get("failed", 0) > 0:
         return False, f"Dev tests failed: {test_results.get('failed')} failures"
+    # --- Contract-drift detection (D10) --- warn-only ---
+    try:
+        from .drift_detector import detect_drift, findings_to_json
+        _drift_baseline = metadata.get("_drift_baseline")
+        if _drift_baseline and isinstance(_drift_baseline, dict):
+            authorized = set(metadata.get("_drift_authorized_keys") or [])
+            drift_findings = detect_drift(_drift_baseline, authorized_keys=authorized)
+            if drift_findings:
+                drift_report = findings_to_json(drift_findings)
+                metadata["_drift_report"] = drift_report
+                unauthorized = [f for f in drift_findings if not f.authorized]
+                if unauthorized:
+                    log.warning(
+                        "checkpoint_gate: UNAUTHORIZED contract drift detected: %s",
+                        drift_report,
+                    )
+                else:
+                    log.info("checkpoint_gate: authorized contract drift: %s", drift_report)
+        else:
+            # No baseline captured — run fresh capture and attach for next stage
+            from .drift_detector import capture_baseline
+            baseline = capture_baseline()
+            metadata["_drift_baseline"] = baseline
+            metadata["_drift_report"] = "[]"
+    except Exception:
+        log.debug("checkpoint_gate: drift detection failed (non-critical)", exc_info=True)
     # Doc consistency check: use CODE_DOC_MAP to verify related docs are updated
     # Skip for governance-internal repairs to avoid oscillation loop (R2)
     if _is_governance_internal_repair(metadata, changed):
