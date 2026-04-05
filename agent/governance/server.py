@@ -313,6 +313,36 @@ def handle_init(ctx: RequestContext):
 # --- Project ---
 
 
+@route("POST", "/api/project/bootstrap")
+def handle_project_bootstrap(ctx: RequestContext):
+    """Bootstrap a project from workspace (R1).
+
+    Body: {
+        "workspace_path": "/path/to/project" (required),
+        "project_name": "my-project" (optional),
+        "config_override": {} (optional),
+        "scan_depth": 3 (optional),
+        "exclude_patterns": [] (optional),
+    }
+    Returns: {project_id, graph_stats, config, preflight, warning?}
+    """
+    workspace_path = ctx.body.get("workspace_path", "").strip()
+    if not workspace_path:
+        return 400, {"error": "workspace_path is required"}
+
+    try:
+        result = project_service.bootstrap_project(
+            workspace_path=workspace_path,
+            project_name=ctx.body.get("project_name", ""),
+            config_override=ctx.body.get("config_override"),
+            scan_depth=ctx.body.get("scan_depth", 3),
+            exclude_patterns=ctx.body.get("exclude_patterns"),
+        )
+        return 200, result
+    except Exception as e:
+        return 400, {"error": str(e)}
+
+
 @route("GET", "/api/project/list")
 def handle_project_list(ctx: RequestContext):
     return {"projects": project_service.list_projects()}

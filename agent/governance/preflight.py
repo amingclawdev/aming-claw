@@ -286,6 +286,54 @@ def check_queue(conn, project_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 6. Bootstrap check — graph has nodes, node_state populated, version exists
+# ---------------------------------------------------------------------------
+
+def check_bootstrap(conn, project_id: str) -> dict:
+    """Verify bootstrap generated valid state (R9).
+
+    Checks:
+      1. Graph has at least one node (node_state rows exist)
+      2. node_state table is populated for this project
+      3. project_version record exists
+
+    Returns: {"status": "pass"|"fail", "details": {...}}
+    """
+    try:
+        details = {}
+        failures = []
+
+        # Check node_state has rows
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM node_state WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        node_count = row["cnt"] if hasattr(row, "keys") else row[0]
+        details["node_count"] = node_count
+        if node_count == 0:
+            failures.append("no nodes in node_state")
+
+        # Check project_version exists
+        ver_row = conn.execute(
+            "SELECT chain_version, updated_at FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        if ver_row:
+            details["chain_version"] = ver_row["chain_version"] if hasattr(ver_row, "keys") else ver_row[0]
+            details["version_exists"] = True
+        else:
+            details["version_exists"] = False
+            failures.append("no project_version record")
+
+        if failures:
+            details["failures"] = failures
+            return _fail(details)
+        return _pass(details)
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
 # Auto-fix actions
 # ---------------------------------------------------------------------------
 

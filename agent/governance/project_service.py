@@ -366,6 +366,152 @@ def sync_node_state_from_graph(project_id: str) -> dict:
     }
 
 
+def bootstrap_project(
+    workspace_path: str,
+    project_name: str = "",
+    config_override: dict = None,
+    scan_depth: int = 3,
+    exclude_patterns: list = None,
+) -> dict:
+    """Bootstrap a project from workspace — atomic orchestrator (R4).
+
+    Steps: config discovery -> init_project -> scan_codebase -> generate_graph
+           -> node_state init -> version seed -> preflight check.
+
+    Rollback on failure: removes project entry if it was freshly created.
+
+    Returns: {project_id, graph_stats, config, preflight, warning?}
+    """
+    import sys as _sys
+    _agent_root = str(Path(__file__).resolve().parents[1])
+    if _agent_root not in _sys.path:
+        _sys.path.insert(0, _agent_root)
+
+    from project_config import load_project_config, generate_default_config
+    from .graph_generator import generate_graph, save_graph_atomic
+    from .preflight import check_bootstrap
+
+    ws = Path(workspace_path).resolve()
+    if not ws.is_dir():
+        raise ValidationError(f"workspace_path does not exist or is not a directory: {workspace_path}")
+
+    # Step 1: Config discovery
+    try:
+        config = load_project_config(ws)
+    except (FileNotFoundError, ValueError):
+        config = generate_default_config(str(ws), project_name)
+
+    if config_override:
+        # Apply overrides
+        if "project_id" in config_override:
+            config.project_id = config_override["project_id"]
+        if "language" in config_override:
+            config.language = config_override["language"]
+        if "testing" in config_override and "unit_command" in config_override["testing"]:
+            config.testing.unit_command = config_override["testing"]["unit_command"]
+
+    pid = config.project_id or project_name or ws.name.lower().replace("_", "-")
+    pid = _normalize_project_id(pid)
+
+    # Step 2: init_project (idempotent — AC6)
+    is_new = not project_exists(pid)
+    try:
+        init_result = init_project(
+            project_id=pid,
+            project_name=project_name or pid,
+            workspace_path=str(ws),
+        )
+    except Exception as e:
+        raise ValidationError(f"Project initialization failed: {e}")
+
+    try:
+        # Step 3: scan_codebase + generate_graph
+        gen_result = generate_graph(
+            str(ws),
+            scan_depth=scan_depth,
+            exclude_patterns=exclude_patterns,
+        )
+        graph = gen_result["graph"]
+
+        # Step 4: Save graph atomically (R7)
+        graph_path = _governance_root() / pid / "graph.json"
+        save_graph_atomic(graph, str(graph_path))
+
+        # Step 5: Save code_doc_map.json (R6)
+        code_doc_map = gen_result.get("code_doc_map", {})
+        if code_doc_map:
+            cdm_path = _governance_root() / pid / "code_doc_map.json"
+            import tempfile as _tf
+            fd, tmp = _tf.mkstemp(dir=str(cdm_path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(code_doc_map, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, str(cdm_path))
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+        # Step 6: node_state init
+        conn = get_connection(pid)
+        try:
+            count = state_service.init_node_states(conn, pid, graph)
+            conn.commit()
+
+            # Step 7: version seed
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT OR REPLACE INTO project_version "
+                "(project_id, chain_version, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?)",
+                (pid, "bootstrap", now, "bootstrap"),
+            )
+            conn.commit()
+
+            # Step 8: preflight check
+            preflight_result = check_bootstrap(conn, pid)
+
+            # Update project metadata
+            projects = _load_projects()
+            if pid in projects["projects"]:
+                projects["projects"][pid]["node_count"] = gen_result["node_count"]
+                _save_projects(projects)
+        finally:
+            conn.close()
+
+    except Exception as e:
+        # Rollback: remove project if newly created
+        if is_new:
+            projects = _load_projects()
+            projects["projects"].pop(pid, None)
+            _save_projects(projects)
+        raise ValidationError(f"Bootstrap failed: {e}")
+
+    # Build response
+    config_dict = {
+        "project_id": config.project_id or pid,
+        "language": config.language,
+        "testing": {"unit_command": config.testing.unit_command},
+        "deploy": {"strategy": config.deploy.strategy},
+    }
+
+    result = {
+        "project_id": pid,
+        "graph_stats": {
+            "node_count": gen_result["node_count"],
+            "edge_count": gen_result["edge_count"],
+            "layers": gen_result["layers"],
+        },
+        "config": config_dict,
+        "preflight": preflight_result,
+    }
+    if gen_result.get("warning"):
+        result["warning"] = gen_result["warning"]
+
+    return result
+
+
 def load_project_graph(project_id: str) -> AcceptanceGraph:
     from .db import _resolve_project_dir
     project_dir = _resolve_project_dir(project_id)

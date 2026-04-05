@@ -99,17 +99,52 @@ def get_related_docs(changed_files: list[str]) -> set[str]:
     return docs
 
 
+def _load_project_code_doc_map(project_id: str = None) -> dict:
+    """Load project-specific code_doc_map.json if available, else return CODE_DOC_MAP.
+
+    When code_doc_map.json exists in the project's governance data dir,
+    it is used instead of the hardcoded CODE_DOC_MAP (R6, AC5).
+    """
+    if project_id:
+        try:
+            import os as _os
+            from pathlib import Path as _Path
+            # Try to find governance data dir
+            try:
+                from .db import _governance_root
+                cdm_path = _governance_root() / project_id / "code_doc_map.json"
+            except Exception:
+                cdm_path = None
+
+            if cdm_path and cdm_path.exists():
+                import json as _json
+                with open(str(cdm_path), "r", encoding="utf-8") as f:
+                    return _json.load(f)
+        except Exception:
+            pass
+    return CODE_DOC_MAP
+
+
 class ImpactAnalyzer:
     """Analyzes the impact of file changes on the acceptance graph."""
 
-    def __init__(self, graph, get_node_status_fn):
+    def __init__(self, graph, get_node_status_fn, project_id: str = None):
         """
         Args:
             graph: AcceptanceGraph instance.
             get_node_status_fn: callable(node_id) -> VerifyStatus
+            project_id: Optional project ID for loading project-specific code_doc_map.
         """
         self.graph = graph
         self.get_status = get_node_status_fn
+        self.project_id = project_id
+        self._code_doc_map = None
+
+    @property
+    def code_doc_map(self):
+        if self._code_doc_map is None:
+            self._code_doc_map = _load_project_code_doc_map(self.project_id)
+        return self._code_doc_map
 
     def analyze(self, request: ImpactAnalysisRequest) -> dict:
         file_policy = request.file_policy or FileHitPolicy()
@@ -198,7 +233,13 @@ class ImpactAnalyzer:
                 pass
 
         # Step 5: Doc consistency — which docs should be reviewed
-        related_docs = get_related_docs(request.changed_files)
+        # Use project-specific code_doc_map if available
+        doc_map = self.code_doc_map
+        related_docs = set()
+        for cf in request.changed_files:
+            for pattern, doc_list in doc_map.items():
+                if pattern in cf or cf == pattern:
+                    related_docs.update(doc_list)
 
         # Build affected_nodes list with node details
         affected_nodes = []

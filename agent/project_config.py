@@ -488,6 +488,62 @@ def get_project_config(project_id: str) -> ProjectConfig:
 # ---------------------------------------------------------------------------
 
 
+def generate_default_config(workspace_path: str, project_name: str = "") -> ProjectConfig:
+    """Auto-detect language and generate sensible default config (R5).
+
+    Detects test runner based on project marker files:
+      - pyproject.toml → pytest
+      - package.json → npm test
+      - Cargo.toml → cargo test
+      - go.mod → go test
+
+    Does NOT write any files to workspace_path (AC7).
+    """
+    ws = Path(workspace_path)
+    project_id = project_name or ws.name.lower().replace("_", "-").replace(" ", "-")
+
+    # Detect language
+    if (ws / "pyproject.toml").exists() or (ws / "setup.py").exists():
+        language = "python"
+        unit_command = "python -m pytest"
+    elif (ws / "Cargo.toml").exists():
+        language = "rust"
+        unit_command = "cargo test"
+    elif (ws / "go.mod").exists():
+        language = "go"
+        unit_command = "go test ./..."
+    elif (ws / "tsconfig.json").exists():
+        language = "typescript"
+        unit_command = "npm test"
+    elif (ws / "package.json").exists():
+        language = "javascript"
+        unit_command = "npm test"
+    else:
+        language = "unknown"
+        unit_command = ""
+
+    # Detect deploy strategy
+    if (ws / "Dockerfile").exists() or (ws / "docker-compose.yml").exists():
+        strategy = "docker"
+    elif (ws / "electron-builder.yml").exists() or (ws / "electron-builder.json").exists():
+        strategy = "electron"
+    else:
+        strategy = "none"
+
+    return ProjectConfig(
+        project_id=project_id,
+        language=language,
+        testing=TestingConfig(
+            unit_command=unit_command,
+            e2e_command="",
+            allowed_commands=[],
+        ),
+        build=BuildConfig(command="", release_checks=[]),
+        deploy=DeployConfig(strategy=strategy),
+        governance=GovernanceConfig(enabled=True, test_tool_label=language),
+    )
+
+
 def get_test_command(project_id: str) -> str:
     """Return the unit test command for *project_id*."""
     return get_project_config(project_id).testing.unit_command
