@@ -64,6 +64,9 @@ TASK_ROLE_MAP = {
 }
 # Merge is script-based, see _execute_merge()
 
+# Stall detection: after N consecutive empty polls with queued tasks, force-restart poll loop.
+EXECUTOR_STALL_THRESHOLD = int(os.getenv("EXECUTOR_STALL_THRESHOLD", "20"))
+
 # Absolute ceiling passed to ai_lifecycle; actual enforcement is via heartbeat watchdog.
 MAX_SESSION_TIMEOUT = 1200
 
@@ -82,6 +85,8 @@ class ExecutorWorker:
         self._lifecycle = None
         self._pid_path = None  # type: Optional[str]
         self._consecutive_empty_polls = 0  # tracks consecutive polls with no task
+        self._start_time = time.monotonic()
+        self.last_claimed_at = time.monotonic()  # R5: tracked by ServiceManager watchdog
 
     def _api(self, method: str, path: str, data: dict = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
@@ -98,6 +103,14 @@ class ExecutorWorker:
         except Exception as e:
             # DO NOT use log.warning here — it blocks in MCP subprocess (IO pipe deadlock)
             return {"error": str(e)}
+
+    def _check_queued_tasks(self) -> int:
+        """R6: Check how many queued tasks exist via GET /api/task/{project}/list."""
+        result = self._api("GET", f"/api/task/{self.project_id}/list")
+        if "error" in result:
+            return 0
+        tasks = result.get("tasks", [])
+        return sum(1 for t in tasks if t.get("status") in ("queued", "pending"))
 
     def _claim_task(self) -> Optional[Dict]:
         """Try to claim next queued task."""
@@ -1688,10 +1701,29 @@ class ExecutorWorker:
             self._consecutive_empty_polls += 1
             if self._consecutive_empty_polls == 10:
                 log.warning("10 consecutive empty polls — no tasks available")
+
+            # R1/R2/R6: Stall detection — if _consecutive_empty_polls >= STALL_THRESHOLD
+            # and queued tasks exist, force-restart the poll loop (soft reset).
+            if self._consecutive_empty_polls >= EXECUTOR_STALL_THRESHOLD:
+                queued_count = self._check_queued_tasks()
+                if queued_count > 0:
+                    uptime = time.monotonic() - self._start_time
+                    # R3: log at ERROR level with diagnostic info
+                    log.error("STALL detected: %d consecutive empty polls with %d queued tasks (worker=%s, uptime=%.0fs) — forcing poll loop restart", self._consecutive_empty_polls, queued_count, self.worker_id, uptime)
+                    # R4: soft self-restart — reset state, continue loop
+                    self._consecutive_empty_polls = 0
+                    self._current_task = None
+                    if self._lifecycle is not None:
+                        try:
+                            from ai_lifecycle import AILifecycleManager
+                            self._lifecycle = AILifecycleManager()
+                        except Exception:
+                            self._lifecycle = None
             return False
 
         # Successful claim — reset counter
         self._consecutive_empty_polls = 0
+        self.last_claimed_at = time.monotonic()  # R5: update for ServiceManager watchdog
         task_id = task["task_id"]
         self._current_task = task_id
 
