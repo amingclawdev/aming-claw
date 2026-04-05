@@ -1,7 +1,7 @@
 # Aming-Claw Roadmap
 
-> Baseline: `879f1a9` (2026-04-04, all Layer 0 complete)
-> Revision: v4 (Layer 0 COMPLETE, all defects resolved, 658 tests pass)
+> Baseline: `de8133f` (2026-04-05, Layer 2 in progress)
+> Revision: v5 (Layer 0+1 COMPLETE, Layer 2: 5.1+5.3 done, 715 tests)
 > Previous: `docs/dev/roadmap-2026-03-31-archived.md`
 
 ---
@@ -231,39 +231,51 @@ Implementation: audit_service.py dual-write JSONL + SQLite index with cross-modu
 
 ## 5. Layer 2: Expand
 
-**Status: NOT STARTED**
+**Status: IN PROGRESS (2/5 done)**
 
-All Layer 2 items remain as designed in v2. The Layer 1 --> Layer 2 gate is conditionally passed. Work can begin when prioritized.
-
-### 5.1 PM Task Decomposition (~2 weeks)
+### 5.1 PM Task Decomposition -- DONE (de8133f)
 
 PM can output subtasks with explicit dependencies. Max subtask limit: 5 (configurable per project).
 
-Prerequisite: Role templates (4.1) + prompt validator (4.3) -- both done.
+Implementation:
+- Schema v13: subtask_groups table + tasks columns (subtask_group_id, subtask_local_id, subtask_depends_on)
+- _gate_post_pm validates subtask count, mandatory fields, DAG acyclicity
+- Fan-out: creates subtask_group + dev tasks for roots, blocked tasks for dependents
+- Fan-in: merge completion unblocks downstream; all-complete triggers deploy
+- Failure cascade: terminal failure cancels blocked siblings
+- API: GET /api/task/{pid}/subtask-group/{gid}
+- 15 tests (test_subtask_decomposition.py)
 
 ### 5.2 Parallel Dispatch (~2 weeks)
 
 Independent subtasks execute concurrently. Fan-in waits for all subtasks.
 
-Prerequisite: PM decomposition (5.1) + unified audit (4.5) -- audit done, decomposition not started.
+Prerequisite: PM decomposition (5.1) -- DONE. Unified audit (4.5) -- DONE.
 
-### 5.3 External Project Bootstrap (~1.5 weeks)
+### 5.3 External Project Bootstrap -- DONE (c90fbb8)
 
 Single API call to onboard external project. Auto-generate minimal graph from codebase structure.
 
-Prerequisite: Role templates (4.1) + audit trail (4.5) -- both done.
+Implementation:
+- New module graph_generator.py: codebase scanning, language detection, layered graph generation (L0-L4)
+- Python import-based dependency edges via ast.parse; directory-structure fallback for other languages
+- POST /api/project/bootstrap endpoint with config discovery, graph generation, version seed
+- generate_default_config() auto-detects test runner and deploy strategy
+- Per-project code_doc_map.json in impact_analyzer.py
+- check_bootstrap() preflight verification
+- 42 tests (test_graph_generator.py + test_bootstrap.py)
 
 ### 5.4 Pip Packaging + Interface Abstraction (~1.5 weeks)
 
 NotificationGateway abstract class, Redis optional dependency, AmingConfig dataclass, pyproject.toml.
 
-Prerequisite: Bootstrap (5.3) + stable API surface.
+Prerequisite: Bootstrap (5.3) -- DONE. Stable API surface.
 
 ### 5.5 Graph-Path-Driven Routing (~4-6 weeks)
 
 Replace hardcoded CHAIN map with dynamic graph-driven routing.
 
-Prerequisite: All of Layer 1 + PM decomposition (5.1).
+Prerequisite: All of Layer 1 -- DONE. PM decomposition (5.1) -- DONE.
 
 ---
 
@@ -292,9 +304,9 @@ LAYER 1 (Consolidate) -- DONE
       |
       | [Gate: CONDITIONALLY PASSED]
       v
-LAYER 2 (Expand) -- NOT STARTED
-  5.1 PM decomposition -----> 5.2 Parallel dispatch
-  5.3 Bootstrap -----> 5.4 Pip packaging
+LAYER 2 (Expand) -- IN PROGRESS (2/5)
+  5.1 PM decomposition ............ DONE (de8133f) -----> 5.2 Parallel dispatch
+  5.3 Bootstrap ................... DONE (c90fbb8) -----> 5.4 Pip packaging
   5.5a Node gate enforce --> 5.5b Dynamic routing --> 5.5c Skip --> 5.5d Per-node
 ```
 
@@ -348,3 +360,4 @@ Prevention: Directly relevant tests must not be excluded or regressed without ex
 | 2026-04-01 | v2.1 | Added Governance Defect Classes section. |
 | 2026-04-04 | v3 | Baseline reconciliation complete (4cc1688). Updated all defect statuses. Layer 0: 7/10 fixed. Layer 1: 5/5 done. Archived v2 to docs/dev/roadmap-2026-03-31-archived.md. |
 | 2026-04-04 | v4 | Layer 0 COMPLETE (879f1a9). All 10 defects fixed. +71 new tests (658 total). Phase 3 replay validation done. |
+| 2026-04-05 | v5 | Layer 2: 5.1 PM decomposition (de8133f) + 5.3 project bootstrap (c90fbb8). +57 new tests (715 total). |
