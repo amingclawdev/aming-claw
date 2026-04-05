@@ -1,5 +1,0 @@
-# Moved Document
-
-> **This document has been moved.** See [docs/governance/acceptance-graph.md](governance/acceptance-graph.md) for the current version.
-
-This file was moved to `docs/governance/acceptance-graph.md` on 2026-04-05 as part of the documentation restructuring (Phase 1).

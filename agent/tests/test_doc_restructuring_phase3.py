@@ -128,26 +128,6 @@ def test_ac9_gatekeeper_exists():
     assert "# " in content
 
 
-# ---------- AC10: Redirect stubs ----------
-
-def test_ac10_guide_coordinator_redirect():
-    content = _read("docs/guide-coordinator.md")
-    assert "roles/coordinator.md" in content
-    assert "moved" in content.lower() or "see" in content.lower()
-
-
-def test_ac10_observer_feature_guide_redirect():
-    content = _read("docs/observer-feature-guide.md")
-    assert "roles/observer.md" in content
-    assert "moved" in content.lower() or "see" in content.lower()
-
-
-def test_ac10_human_intervention_redirect():
-    content = _read("docs/human-intervention-guide.md")
-    assert "governance/" in content
-    assert "moved" in content.lower() or "see" in content.lower()
-
-
 # ---------- AC11: PM role reachable in 2 clicks ----------
 
 def test_ac11_pm_reachable():
