@@ -1,4 +1,4 @@
-# v11: worktree isolation verified
+# v12: smoke-test verified post MF-2026-04-05-002
 """Auto-chain dispatcher.
 
 Wires task completion to next-stage task creation with gate validation
