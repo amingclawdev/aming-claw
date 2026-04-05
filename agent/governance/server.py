@@ -901,6 +901,43 @@ def handle_observer_sync_node_state(ctx: RequestContext):
     return result
 
 
+@route("POST", "/api/wf/{project_id}/reconcile")
+def handle_reconcile(ctx: RequestContext):
+    """Unified reconcile: scan/diff/merge/sync/verify with two-phase commit.
+
+    Body: {workspace_path, scan_depth?, dry_run?, auto_fix_stale?, require_high_confidence_only?,
+           max_auto_fix_count?, mark_orphans_waived?, update_version?, operator_id?}
+    """
+    from .reconcile import reconcile_project, MergeOptions
+
+    project_id = ctx.get_project_id()
+    body = ctx.body
+
+    workspace_path = body.get("workspace_path", "")
+    if not workspace_path:
+        from .errors import ValidationError
+        raise ValidationError("workspace_path is required")
+
+    merge_options = MergeOptions(
+        auto_fix_stale=body.get("auto_fix_stale", True),
+        require_high_confidence_only=body.get("require_high_confidence_only", True),
+        mark_orphans_waived=body.get("mark_orphans_waived", False),
+        max_auto_fix_count=body.get("max_auto_fix_count", 50),
+        dry_run=body.get("dry_run", False),
+    )
+
+    result = reconcile_project(
+        project_id=project_id,
+        workspace_path=workspace_path,
+        scan_depth=body.get("scan_depth", 3),
+        merge_options=merge_options,
+        update_version=body.get("update_version", False),
+        dry_run=body.get("dry_run", False),
+        operator_id=body.get("operator_id", "observer"),
+    )
+    return result
+
+
 @route("POST", "/api/wf/{project_id}/node-create")
 def handle_node_create(ctx: RequestContext):
     """Create a single node. System allocates display_id.
