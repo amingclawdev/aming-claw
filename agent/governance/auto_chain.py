@@ -745,13 +745,42 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
     _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
     if not ver_passed:
-        log.info("auto_chain: version gate blocked for task %s: %s", task_id, ver_reason)
+        # R2: Log at WARNING level with task_id, project_id, gate_reason, dirty_files
+        _dirty_files = []
+        try:
+            _vrow = conn.execute(
+                "SELECT dirty_files FROM project_version WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            if _vrow and _vrow["dirty_files"]:
+                _dirty_files = json.loads(_vrow["dirty_files"] or "[]")
+        except Exception:
+            pass
+        log.warning(
+            "auto_chain: version gate blocked for task %s (project=%s): %s dirty_files=%s",
+            task_id, project_id, ver_reason, _dirty_files,
+        )
+        # R3: INSERT audit_log row with action='auto_chain_gate_blocked'
+        try:
+            from datetime import datetime, timezone
+            conn.execute(
+                "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+                "VALUES (?, 'auto_chain_gate_blocked', 'auto-chain', 0, ?, ?, ?)",
+                (
+                    project_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    task_id,
+                    json.dumps({"gate_reason": ver_reason, "task_id": task_id, "project_id": project_id}),
+                ),
+            )
+        except Exception:
+            log.debug("auto_chain: failed to insert audit_log for gate block (non-critical)", exc_info=True)
         _publish_event("gate.blocked", {
             "project_id": project_id, "task_id": task_id,
             "stage": "version_check", "next_stage": task_type,
             "reason": ver_reason,
         })
-        return {"gate_blocked": True, "stage": "version_check", "reason": ver_reason}
+        return {"gate_blocked": True, "dispatched": False, "stage": "version_check", "reason": ver_reason}
     else:
         log.debug("auto_chain: version check passed for task %s: %s", task_id, ver_reason)
 

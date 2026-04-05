@@ -345,12 +345,13 @@ def complete_task(
         ).fetchone()
         task_type = type_row["type"] if type_row else "task"
         conn.commit()
-        response["auto_chain"] = {"dispatched": True}
-        _dispatch_auto_chain_failed(
+        # AC1: Run dispatch and reflect actual result in response
+        chain_result = _dispatch_auto_chain_failed(
             project_id, task_id, task_type,
             result or {}, meta,
             error_message or (result or {}).get("error", ""),
         )
+        response["auto_chain"] = _build_auto_chain_response(chain_result)
     elif exec_status == "succeeded" and project_id:
         meta = json.loads(row["metadata_json"] or "{}")
         type_row = conn.execute(
@@ -361,18 +362,39 @@ def complete_task(
         # Without this, the caller's open transaction holds a write lock and
         # auto_chain's separate conn fails with "database is locked".
         conn.commit()
-        response["auto_chain"] = {"dispatched": True}
-        _dispatch_auto_chain_success(
+        # AC1: Run dispatch and reflect actual result in response
+        chain_result = _dispatch_auto_chain_success(
             project_id, task_id, task_type,
             exec_status, result or {}, meta,
         )
+        response["auto_chain"] = _build_auto_chain_response(chain_result)
 
     return response
 
 
 # ---------------------------------------------------------------------------
-# Background auto-chain dispatch helpers
+# Auto-chain dispatch helpers
 # ---------------------------------------------------------------------------
+
+def _build_auto_chain_response(chain_result: dict | None) -> dict:
+    """Build the auto_chain response dict from chain dispatch result.
+
+    AC1/AC2: Response reflects actual dispatch outcome, not assumed success.
+    """
+    if chain_result is None:
+        # Not a chain-eligible task or non-succeeded status
+        return {"dispatched": False}
+    if chain_result.get("gate_blocked"):
+        return {
+            "dispatched": False,
+            "gate_blocked": True,
+            "gate_reason": chain_result.get("reason", "unknown"),
+        }
+    if chain_result.get("chain_stopped"):
+        return {"dispatched": False, "chain_stopped": True, "reason": chain_result.get("reason", "")}
+    # Successful dispatch
+    return {"dispatched": True}
+
 
 def _dispatch_auto_chain_success(
     project_id: str,
@@ -381,35 +403,33 @@ def _dispatch_auto_chain_success(
     exec_status: str,
     result: dict,
     metadata: dict,
-) -> None:
-    """Fire auto_chain.on_task_completed in a background thread.
+) -> dict | None:
+    """Fire auto_chain.on_task_completed synchronously.
 
+    AC1: Returns the chain result so the caller can reflect it in the response.
     Errors are logged (not swallowed) so they appear in service logs.
     """
-    def _run():
+    try:
+        from . import auto_chain
+        from .db import get_connection
+        conn = get_connection(project_id)
         try:
-            from . import auto_chain
-            from .db import get_connection
-            conn = get_connection(project_id)
-            try:
-                auto_chain.on_task_completed(
-                    conn, project_id, task_id,
-                    task_type=task_type,
-                    status=exec_status,
-                    result=result,
-                    metadata=metadata,
-                )
-            finally:
-                conn.close()
-        except Exception:
-            log.error(
-                "auto_chain.on_task_completed failed for task %s (project=%s, type=%s)",
-                task_id, project_id, task_type,
-                exc_info=True,
+            return auto_chain.on_task_completed(
+                conn, project_id, task_id,
+                task_type=task_type,
+                status=exec_status,
+                result=result,
+                metadata=metadata,
             )
-
-    t = threading.Thread(target=_run, name=f"auto-chain-{task_id}", daemon=True)
-    t.start()
+        finally:
+            conn.close()
+    except Exception:
+        log.error(
+            "auto_chain.on_task_completed failed for task %s (project=%s, type=%s)",
+            task_id, project_id, task_type,
+            exc_info=True,
+        )
+        return None
 
 
 def _dispatch_auto_chain_failed(
@@ -419,35 +439,33 @@ def _dispatch_auto_chain_failed(
     result: dict,
     metadata: dict,
     reason: str,
-) -> None:
-    """Fire auto_chain.on_task_failed in a background thread.
+) -> dict | None:
+    """Fire auto_chain.on_task_failed synchronously.
 
+    AC1: Returns the chain result so the caller can reflect it in the response.
     Errors are logged (not swallowed) so they appear in service logs.
     """
-    def _run():
+    try:
+        from . import auto_chain
+        from .db import get_connection
+        conn = get_connection(project_id)
         try:
-            from . import auto_chain
-            from .db import get_connection
-            conn = get_connection(project_id)
-            try:
-                auto_chain.on_task_failed(
-                    conn, project_id, task_id,
-                    task_type=task_type,
-                    result=result,
-                    metadata=metadata,
-                    reason=reason,
-                )
-            finally:
-                conn.close()
-        except Exception:
-            log.error(
-                "auto_chain.on_task_failed failed for task %s (project=%s, type=%s)",
-                task_id, project_id, task_type,
-                exc_info=True,
+            return auto_chain.on_task_failed(
+                conn, project_id, task_id,
+                task_type=task_type,
+                result=result,
+                metadata=metadata,
+                reason=reason,
             )
-
-    t = threading.Thread(target=_run, name=f"auto-chain-fail-{task_id}", daemon=True)
-    t.start()
+        finally:
+            conn.close()
+    except Exception:
+        log.error(
+            "auto_chain.on_task_failed failed for task %s (project=%s, type=%s)",
+            task_id, project_id, task_type,
+            exc_info=True,
+        )
+        return None
 
 
 def hold_task(conn: sqlite3.Connection, task_id: str) -> dict:
