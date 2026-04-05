@@ -57,7 +57,7 @@ SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
 # kills processes that produce no stdout for _HANG_TIMEOUT (120 s), and enforces an
 # absolute cap of _MAX_TIMEOUT (1200 s).  External update_progress() calls extend the
 # deadline via AILifecycleManager.extend_deadline().
-TASK_ROLE_MAP = {
+_DEFAULT_TASK_ROLE_MAP = {
     "coordinator": "coordinator",
     "pm":    "pm",
     "dev":   "dev",
@@ -68,6 +68,25 @@ TASK_ROLE_MAP = {
     "deploy": "script",  # handled by _execute_deploy, no AI
     "task":  "coordinator",
 }
+
+
+def _build_task_role_map():
+    """Build TASK_ROLE_MAP from YAML configs with fallback to defaults."""
+    try:
+        from agent.governance.role_config import get_all_role_configs
+        configs = get_all_role_configs()
+        if configs:
+            result = dict(_DEFAULT_TASK_ROLE_MAP)
+            for role_name, config in configs.items():
+                if config.task_type_alias:
+                    result[config.task_type_alias] = role_name
+            return result
+    except Exception:
+        pass
+    return dict(_DEFAULT_TASK_ROLE_MAP)
+
+
+TASK_ROLE_MAP = _build_task_role_map()
 # Merge is script-based, see _execute_merge()
 
 # Stall detection: after N consecutive empty polls with queued tasks, force-restart poll loop.

@@ -1,0 +1,38 @@
+version: "1.0"
+role: observer
+max_turns: 5
+tools: []
+
+permissions:
+  can: []
+  cannot:
+    - modify_code
+    - run_tests
+    - run_command
+    - execute_script
+    - create_dev_task
+    - create_test_task
+    - create_qa_task
+    - create_pm_task
+    - verify_update
+    - release_gate
+    - generate_prd
+    - design_nodes
+    - analyze_requirements
+    - estimate_effort
+    - propose_node
+    - propose_node_update
+    - query_governance
+    - update_context
+    - archive_memory
+    - delete_memory
+    - propose_memory_cleanup
+    - git_diff
+    - read_file
+    - reply_only
+
+verify_limits: []
+
+prompt_template: |-
+  You are the Observer role. You have read-only access for monitoring purposes.
+  You cannot perform any active operations or modify any state.

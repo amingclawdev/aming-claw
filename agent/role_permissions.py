@@ -2,7 +2,14 @@
 
 Code-enforced. AI cannot modify or bypass.
 Used by DecisionValidator to check every AI action.
+
+Supports YAML-based configuration via role_config.py with fallback
+to hardcoded Python defaults if YAML files not found.
 """
+
+import logging
+
+log = logging.getLogger(__name__)
 
 # Action types that AI can output
 ACTION_TYPES = {
@@ -46,8 +53,9 @@ ACTION_TYPES = {
     "release_gate",
 }
 
-# Permission matrix: role → allowed action types
-ROLE_PERMISSIONS = {
+# --- Hardcoded defaults (used as fallback when YAML not available) ---
+
+_DEFAULT_ROLE_PERMISSIONS = {
     "pm": {
         "allowed": {
             "generate_prd",
@@ -166,8 +174,7 @@ ROLE_PERMISSIONS = {
     },
 }
 
-# Verify status limits per role
-ROLE_VERIFY_LIMITS = {
+_DEFAULT_ROLE_VERIFY_LIMITS = {
     "tester": {"testing", "t2_pass"},
     "qa": {"qa_pass"},
     "coordinator": set(),  # coordinator cannot verify
@@ -175,34 +182,6 @@ ROLE_VERIFY_LIMITS = {
     "pm": set(),           # pm cannot verify
     "gatekeeper": set(),   # gatekeeper reviews evidence but cannot verify
 }
-
-
-def check_permission(role: str, action_type: str) -> tuple[bool, str]:
-    """Check if role is allowed to perform action_type.
-
-    Returns:
-        (allowed: bool, reason: str)
-    """
-    perms = ROLE_PERMISSIONS.get(role)
-    if not perms:
-        return False, f"unknown role: {role}"
-
-    if action_type in perms.get("allowed", set()):
-        return True, "ok"
-
-    if action_type in perms.get("denied", set()):
-        return False, f"{role} cannot perform {action_type}"
-
-    # Unknown action type — deny by default
-    return False, f"unknown action type: {action_type}"
-
-
-def check_verify_permission(role: str, target_status: str) -> tuple[bool, str]:
-    """Check if role can push to target verify status."""
-    allowed = ROLE_VERIFY_LIMITS.get(role, set())
-    if target_status in allowed:
-        return True, "ok"
-    return False, f"{role} cannot verify to {target_status}"
 
 
 # Shared API knowledge injected into all role prompts
@@ -246,8 +225,7 @@ Each response includes generated_at and project_version for staleness detection.
 """
 
 
-# System prompts per role
-ROLE_PROMPTS = {
+_DEFAULT_ROLE_PROMPTS = {
     "pm": """You are the project PM (Product Manager / Architect).
 
 Your responsibilities:
@@ -430,3 +408,93 @@ Output format (strict JSON):
 }
 ```""",
 }
+
+
+def _load_from_yaml():
+    """Try to load role configs from YAML, merge into defaults."""
+    try:
+        from agent.governance.role_config import get_all_role_configs, reset_cache
+        reset_cache()
+        configs = get_all_role_configs()
+        if not configs:
+            return None
+        return configs
+    except Exception as e:
+        log.debug("Could not load YAML role configs, using Python defaults: %s", e)
+        return None
+
+
+def _build_permissions_from_yaml(configs):
+    """Build ROLE_PERMISSIONS dict from loaded YAML configs."""
+    result = {}
+    for role_name, config in configs.items():
+        if role_name == "observer":
+            continue  # observer not in original ROLE_PERMISSIONS
+        result[role_name] = {
+            "allowed": set(config.permissions.allowed),
+            "denied": set(config.permissions.denied),
+        }
+    return result
+
+
+def _build_prompts_from_yaml(configs):
+    """Build ROLE_PROMPTS dict from loaded YAML configs."""
+    result = {}
+    for role_name, config in configs.items():
+        if config.prompt_template and role_name != "observer":
+            result[role_name] = config.prompt_template
+    return result
+
+
+def _build_verify_limits_from_yaml(configs):
+    """Build ROLE_VERIFY_LIMITS dict from loaded YAML configs."""
+    result = {}
+    for role_name, config in configs.items():
+        if role_name == "observer":
+            continue
+        result[role_name] = set(config.verify_limits)
+    return result
+
+
+def _initialize():
+    """Initialize module-level dicts from YAML or fallback to defaults."""
+    yaml_configs = _load_from_yaml()
+    if yaml_configs:
+        perms = _build_permissions_from_yaml(yaml_configs)
+        prompts = _build_prompts_from_yaml(yaml_configs)
+        verify = _build_verify_limits_from_yaml(yaml_configs)
+        return perms, prompts, verify
+    return dict(_DEFAULT_ROLE_PERMISSIONS), dict(_DEFAULT_ROLE_PROMPTS), dict(_DEFAULT_ROLE_VERIFY_LIMITS)
+
+
+# Initialize from YAML or defaults
+ROLE_PERMISSIONS, ROLE_PROMPTS, ROLE_VERIFY_LIMITS = _initialize()
+
+
+# Verify status limits per role
+def check_permission(role: str, action_type: str) -> tuple[bool, str]:
+    """Check if role is allowed to perform action_type.
+
+    Returns:
+        (allowed: bool, reason: str)
+    """
+    perms = ROLE_PERMISSIONS.get(role)
+    if not perms:
+        return False, f"unknown role: {role}"
+
+    if action_type in perms.get("allowed", set()):
+        return True, "ok"
+
+    if action_type in perms.get("denied", set()):
+        return False, f"{role} cannot perform {action_type}"
+
+    # Unknown action type — deny by default
+    return False, f"unknown action type: {action_type}"
+
+
+def check_verify_permission(role: str, target_status: str) -> tuple[bool, str]:
+    """Check if role can push to target verify status."""
+    allowed = ROLE_VERIFY_LIMITS.get(role, set())
+    if target_status in allowed:
+        return True, "ok"
+    return False, f"{role} cannot verify to {target_status}"

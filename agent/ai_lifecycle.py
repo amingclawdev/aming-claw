@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 _HANG_TIMEOUT = 120    # seconds of stdout silence → treat as hung (non-coordinator roles)
 _COORDINATOR_HANG_TIMEOUT = 300  # coordinator has no tools; waits longer for single-turn output
 _MAX_TIMEOUT = 1200    # absolute session cap regardless of activity
-_CLAUDE_ROLE_TURN_CAPS = {
+_DEFAULT_CLAUDE_ROLE_TURN_CAPS = {
     "coordinator": "1",
     "pm": "60",
     "dev": "40",
@@ -42,6 +42,24 @@ _CLAUDE_ROLE_TURN_CAPS = {
     "qa": "20",
     "gatekeeper": "20",
 }
+
+
+def _build_turn_caps():
+    """Build turn caps from YAML configs with fallback to defaults."""
+    try:
+        from agent.governance.role_config import get_all_role_configs
+        configs = get_all_role_configs()
+        if configs:
+            result = {}
+            for role_name, config in configs.items():
+                result[role_name] = str(config.max_turns)
+            return result
+    except Exception:
+        pass
+    return dict(_DEFAULT_CLAUDE_ROLE_TURN_CAPS)
+
+
+_CLAUDE_ROLE_TURN_CAPS = _build_turn_caps()
 
 
 @dataclass
