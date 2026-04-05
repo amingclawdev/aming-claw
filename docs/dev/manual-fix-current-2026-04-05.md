@@ -193,7 +193,7 @@ Bypass reason: dirty workspace blocking all auto_chain dispatch (B1)
 
 ```yaml
 manual_fix_id:          MF-2026-04-05-001
-timestamp:              (after commit)
+timestamp:              2026-04-05T18:25:00Z
 operator:               observer
 trigger_scenario:       dirty_workspace_blocking_chain
 
@@ -206,6 +206,7 @@ changed_files:
   - docs/dev/reconcile-flow-design.md (new, ~1112 lines)
   - docs/dev/bug-and-fix-backlog.md (new)
   - docs/dev/manual-fix-sop.md (new)
+  - docs/dev/manual-fix-current-2026-04-05.md (new, this file)
 
 classification:
   scope:                C (15 nodes reported)
@@ -218,21 +219,28 @@ false_positive_nodes:   14
 false_positive_evidence: E1+E2+E3+E5 (4/5 criteria, min 3 required)
 
 pre_commit_checks:
-  - test_reconcile.py: (pending)
-  - full suite: (pending)
+  - test_reconcile.py: PASS (27/27)
+  - full suite: PASS (869 passed, 0 failed, 3 skipped, 242s)
   - preflight baseline: 1 blocker (pre-existing version), 2 warnings
 
 post_commit_checks:
-  - governance restart: (pending)
-  - version_check: (pending)
-  - preflight delta: (pending)
-  - verification task for L4.15: (pending)
+  - governance restart: OK (PID 68800, version=44b6a0e)
+  - version_check: dirty=false, dirty_files=[], commits_since_chain=0
+  - preflight delta: 0 new blockers (same 1 pre-existing + 2 warnings)
+  - verification task for L4.15: task-1775413565-692614 SUCCEEDED
+    "POST /api/wf/aming-claw/reconcile responded ok:true. All 45 HTTP routing tests passed."
 
-workflow_restore_result: (pending)
-commit_hash:            (pending)
+workflow_restore_result: RESTORED
+  - PM smoke test: task-1775413582-a06bb0 SUCCEEDED (executor auto-claimed + ran)
+  - auto_chain dispatch: task-1775413649-c3679e (dev) created with correct parent_task_id
+  - state transitions observed: queued -> claimed -> succeeded -> auto_chain dispatched
+  - conclusion: dirty workspace gate no longer blocking, chain flows automatically
+
+commit_hash:            44b6a0e
 
 followup_needed:
   - wf_impact granularity: server.py triggers 15 nodes for any change
   - 56 orphan pending nodes need reconcile or waive
   - 49 unmapped files in coverage check
+  - 13 observer_hold tasks from previous sessions need triage
 ```
