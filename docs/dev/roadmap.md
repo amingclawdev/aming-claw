@@ -1,7 +1,7 @@
 # Aming-Claw Roadmap
 
 > Baseline: `de8133f` (2026-04-05, Layer 2 in progress)
-> Revision: v5 (Layer 0+1 COMPLETE, Layer 2: 5.1+5.3 done, 715 tests)
+> Revision: v6 (ALL LAYERS COMPLETE — 809 tests)
 > Previous: `docs/dev/roadmap-2026-03-31-archived.md`
 
 ---
@@ -231,7 +231,7 @@ Implementation: audit_service.py dual-write JSONL + SQLite index with cross-modu
 
 ## 5. Layer 2: Expand
 
-**Status: IN PROGRESS (2/5 done)**
+**Status: COMPLETE (5/5 done)**
 
 ### 5.1 PM Task Decomposition -- DONE (de8133f)
 
@@ -246,11 +246,20 @@ Implementation:
 - API: GET /api/task/{pid}/subtask-group/{gid}
 - 15 tests (test_subtask_decomposition.py)
 
-### 5.2 Parallel Dispatch (~2 weeks)
+### 5.2 Parallel Dispatch -- DONE (fdba749)
 
 Independent subtasks execute concurrently. Fan-in waits for all subtasks.
 
-Prerequisite: PM decomposition (5.1) -- DONE. Unified audit (4.5) -- DONE.
+Implementation:
+- WorkerPool class: manages up to MAX_CONCURRENT_WORKERS threads (env var, default 2, max 5)
+- Sibling subtask detection: same subtask_group_id, no unmet deps → parallel dispatch
+- Each worker thread gets own worktree (.worktrees/worker-{N}/dev-task-{id})
+- Atomic fan-in via governance API (completed_count = completed_count + 1)
+- Graceful shutdown: join threads with SHUTDOWN_TIMEOUT, force-release on timeout
+- Backward compatible: single-task chains use sequential run_once
+- ServiceManager worker pool lifecycle monitoring
+- MCP executor_status reports pool status (active_workers, per-worker info)
+- 25 tests (test_parallel_dispatch.py)
 
 ### 5.3 External Project Bootstrap -- DONE (c90fbb8)
 
@@ -265,17 +274,37 @@ Implementation:
 - check_bootstrap() preflight verification
 - 42 tests (test_graph_generator.py + test_bootstrap.py)
 
-### 5.4 Pip Packaging + Interface Abstraction (~1.5 weeks)
+### 5.4 Pip Packaging + Interface Abstraction -- DONE (cc289f4)
 
 NotificationGateway abstract class, Redis optional dependency, AmingConfig dataclass, pyproject.toml.
 
-Prerequisite: Bootstrap (5.3) -- DONE. Stable API surface.
+Implementation:
+- pyproject.toml: renamed to aming-claw, click dep, redis/docker/full optional groups
+- NotificationGateway ABC + ConsoleGateway + factory (agent/notification_gateway.py)
+- TelegramGateway adapter with virtual ABC registration (duck-typed for Docker isolation)
+- AmingConfig dataclass: env > yaml > defaults priority (agent/config.py)
+- Click-based CLI: init/bootstrap/status/run-executor (agent/cli.py)
+- Public API exports: AmingConfig, bootstrap_project, create_task (agent/__init__.py)
+- aming_claw.py shim for `from aming_claw import ...` after pip install
+- redis_client.py: Python 3.9 compat (Optional[] types, __future__ annotations)
+- 24 tests (test_notification_gateway.py, test_aming_config.py, test_package_install.py, test_cli.py)
 
-### 5.5 Graph-Path-Driven Routing (~4-6 weeks)
+### 5.5 Graph-Path-Driven Routing -- DONE (3b110a9)
 
 Replace hardcoded CHAIN map with dynamic graph-driven routing.
 
-Prerequisite: All of Layer 1 -- DONE. PM decomposition (5.1) -- DONE.
+Implementation:
+- dispatch_next_stage(): graph-driven routing with CHAIN dict fallback
+- Node gate_mode=skip bypasses QA/gatekeeper; verify_level=0 skips test
+- verify_requires ordering: blocks dispatch until prerequisite nodes verified
+- Backward compatible: falls back to linear CHAIN when no graph or all default policies
+- Every routing decision audited with trace_id in audit_log
+- get_node_routing_policy() + get_routing_policies_for_nodes() on AcceptanceGraph
+- get_node_specific_gates() in gate_policy.py for per-node gate retrieval
+- GateMode.SKIP + MANUAL enum variants, NodeDef.verify_requires field
+- Impact analyzer returns gate_mode/verify_level in affected_nodes
+- Integration in _do_chain: graph routing override with CHAIN fallback
+- 45 tests (test_graph_routing.py, test_auto_chain_routing.py)
 
 ---
 
@@ -304,10 +333,10 @@ LAYER 1 (Consolidate) -- DONE
       |
       | [Gate: CONDITIONALLY PASSED]
       v
-LAYER 2 (Expand) -- IN PROGRESS (2/5)
-  5.1 PM decomposition ............ DONE (de8133f) -----> 5.2 Parallel dispatch
-  5.3 Bootstrap ................... DONE (c90fbb8) -----> 5.4 Pip packaging
-  5.5a Node gate enforce --> 5.5b Dynamic routing --> 5.5c Skip --> 5.5d Per-node
+LAYER 2 (Expand) -- COMPLETE (5/5)
+  5.1 PM decomposition ............ DONE (de8133f) -----> 5.2 Parallel dispatch .... DONE (fdba749)
+  5.3 Bootstrap ................... DONE (c90fbb8) -----> 5.4 Pip packaging ....... DONE (cc289f4)
+  5.5 Graph-path routing .......... DONE (3b110a9)
 ```
 
 ---
@@ -361,3 +390,4 @@ Prevention: Directly relevant tests must not be excluded or regressed without ex
 | 2026-04-04 | v3 | Baseline reconciliation complete (4cc1688). Updated all defect statuses. Layer 0: 7/10 fixed. Layer 1: 5/5 done. Archived v2 to docs/dev/roadmap-2026-03-31-archived.md. |
 | 2026-04-04 | v4 | Layer 0 COMPLETE (879f1a9). All 10 defects fixed. +71 new tests (658 total). Phase 3 replay validation done. |
 | 2026-04-05 | v5 | Layer 2: 5.1 PM decomposition (de8133f) + 5.3 project bootstrap (c90fbb8). +57 new tests (715 total). |
+| 2026-04-05 | v6 | ALL LAYERS COMPLETE. Layer 2: 5.2 parallel dispatch (fdba749) + 5.4 pip packaging (cc289f4) + 5.5 graph routing (3b110a9). +94 new tests (809 total). |
