@@ -318,6 +318,20 @@ def complete_task(
         "completed_at": now,
     }
 
+    # --- Subtask fan-in check (R6): when a merge task in a subtask group succeeds ---
+    if exec_status == "succeeded" and task_type_val == "merge":
+        try:
+            _check_subtask_fanin(conn, project_id, task_id)
+        except Exception:
+            log.error("subtask fan-in check failed for %s", task_id, exc_info=True)
+
+    # --- Subtask failure cascade (R9): terminal failure in a subtask chain ---
+    if exec_status in TERMINAL_STATUSES and exec_status != "succeeded":
+        try:
+            _check_subtask_failure_cascade(conn, project_id, task_id, row)
+        except Exception:
+            log.error("subtask failure cascade check failed for %s", task_id, exc_info=True)
+
     # Auto-chain: dispatch next stage asynchronously on success/failure.
     # Non-chain types (task, coordinator) are ignored by auto_chain.CHAIN
     # so they pass through without spawning a thread.
@@ -625,6 +639,82 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> dict | None:
     ).fetchall()
     task["attempts"] = [dict(a) for a in attempts]
     return task
+
+
+def _check_subtask_fanin(conn, project_id, task_id):
+    """Check if a completed merge task belongs to a subtask group and trigger fan-in."""
+    # Walk up from merge → find the dev task with subtask_group_id
+    meta_row = conn.execute(
+        "SELECT metadata_json FROM tasks WHERE task_id=?", (task_id,)
+    ).fetchone()
+    if not meta_row:
+        return
+    meta = json.loads(meta_row["metadata_json"] or "{}")
+    parent_id = meta.get("parent_task_id")
+
+    # Walk the chain up to find the dev task with subtask_group_id
+    visited = set()
+    current_id = parent_id
+    for _ in range(10):
+        if not current_id or current_id in visited:
+            break
+        visited.add(current_id)
+        row = conn.execute(
+            "SELECT subtask_group_id, subtask_local_id, metadata_json FROM tasks WHERE task_id=?",
+            (current_id,)
+        ).fetchone()
+        if not row:
+            break
+        if row["subtask_group_id"]:
+            from . import auto_chain
+            auto_chain.on_subtask_merge_completed(conn, project_id, current_id)
+            return
+        parent_meta = json.loads(row["metadata_json"] or "{}")
+        current_id = parent_meta.get("parent_task_id")
+
+
+def _check_subtask_failure_cascade(conn, project_id, task_id, task_row):
+    """Check if a terminally-failed task belongs to a subtask group and trigger cascade."""
+    # Check if this task itself has subtask_group_id
+    try:
+        row = conn.execute(
+            "SELECT subtask_group_id FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row and row["subtask_group_id"]:
+            # Check if max retries exhausted
+            attempt_count = task_row["attempt_count"] if task_row else 0
+            max_attempts = task_row["max_attempts"] if task_row else 3
+            if attempt_count >= max_attempts:
+                from . import auto_chain
+                auto_chain.on_subtask_terminal_failure(conn, project_id, task_id)
+                return
+    except Exception:
+        pass
+
+    # Walk parent chain
+    meta = json.loads(task_row["metadata_json"] or "{}") if task_row else {}
+    parent_id = meta.get("parent_task_id")
+    visited = set()
+    current_id = parent_id
+    for _ in range(10):
+        if not current_id or current_id in visited:
+            break
+        visited.add(current_id)
+        row = conn.execute(
+            "SELECT subtask_group_id, metadata_json, attempt_count, max_attempts FROM tasks WHERE task_id=?",
+            (current_id,)
+        ).fetchone()
+        if not row:
+            break
+        if row["subtask_group_id"]:
+            attempt_count = task_row["attempt_count"] if task_row else 0
+            max_attempts = task_row["max_attempts"] if task_row else 3
+            if attempt_count >= max_attempts:
+                from . import auto_chain
+                auto_chain.on_subtask_terminal_failure(conn, project_id, current_id)
+            return
+        parent_meta = json.loads(row["metadata_json"] or "{}")
+        current_id = parent_meta.get("parent_task_id")
 
 
 def escalate_task(conn: sqlite3.Connection, task_id: str) -> str | None:

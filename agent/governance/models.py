@@ -264,6 +264,78 @@ class VerificationPolicy:
         )
 
 
+# --- Subtask (PM decomposition) ---
+
+@dataclass
+class Subtask:
+    """A single subtask within a PM decomposition."""
+    id: str = ""
+    title: str = ""
+    target_files: list = field(default_factory=list)
+    verification: dict = field(default_factory=dict)
+    acceptance_criteria: list = field(default_factory=list)
+    test_files: list = field(default_factory=list)
+    depends_on: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Subtask":
+        if not d:
+            return cls()
+        return cls(
+            id=d.get("id", ""),
+            title=d.get("title", ""),
+            target_files=d.get("target_files", []),
+            verification=d.get("verification", {}),
+            acceptance_criteria=d.get("acceptance_criteria", []),
+            test_files=d.get("test_files", []),
+            depends_on=d.get("depends_on", []),
+        )
+
+
+@dataclass
+class SubtaskGroup:
+    """A group of subtasks from PM decomposition."""
+    group_id: str = ""
+    project_id: str = ""
+    pm_task_id: str = ""
+    total_count: int = 0
+    completed_count: int = 0
+    status: str = "active"
+    created_at: str = ""
+    completed_at: str = ""
+    trace_id: str = ""
+    chain_id: str = ""
+
+    def __post_init__(self):
+        if not self.group_id:
+            self.group_id = _gen_id("sg")
+        if not self.created_at:
+            self.created_at = _utc_iso()
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SubtaskGroup":
+        if not d:
+            return cls()
+        return cls(
+            group_id=d.get("group_id", ""),
+            project_id=d.get("project_id", ""),
+            pm_task_id=d.get("pm_task_id", ""),
+            total_count=d.get("total_count", 0),
+            completed_count=d.get("completed_count", 0),
+            status=d.get("status", "active"),
+            created_at=d.get("created_at", ""),
+            completed_at=d.get("completed_at", ""),
+            trace_id=d.get("trace_id", ""),
+            chain_id=d.get("chain_id", ""),
+        )
+
+
 @dataclass
 class ImpactAnalysisRequest:
     changed_files: list = field(default_factory=list)

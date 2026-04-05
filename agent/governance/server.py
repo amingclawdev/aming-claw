@@ -1677,6 +1677,40 @@ def handle_task_list(ctx: RequestContext):
     return {"tasks": tasks, "count": len(tasks)}
 
 
+@route("GET", "/api/task/{project_id}/subtask-group/{group_id}")
+def handle_subtask_group(ctx: RequestContext):
+    """Return subtask group status and member tasks (R8)."""
+    project_id = ctx.get_project_id()
+    group_id = ctx.path_params.get("group_id", "")
+    if not group_id:
+        raise GovernanceError("group_id is required", 400)
+    with DBContext(project_id) as conn:
+        group_row = conn.execute(
+            "SELECT * FROM subtask_groups WHERE group_id = ? AND project_id = ?",
+            (group_id, project_id),
+        ).fetchone()
+        if not group_row:
+            raise GovernanceError(f"Subtask group not found: {group_id}", 404)
+        tasks = conn.execute(
+            """SELECT task_id, status, execution_status, type, subtask_local_id,
+                      subtask_depends_on, created_at, updated_at, completed_at
+               FROM tasks WHERE subtask_group_id = ?
+               ORDER BY created_at ASC""",
+            (group_id,),
+        ).fetchall()
+    return {
+        "group_id": group_row["group_id"],
+        "project_id": group_row["project_id"],
+        "pm_task_id": group_row["pm_task_id"],
+        "status": group_row["status"],
+        "total_count": group_row["total_count"],
+        "completed_count": group_row["completed_count"],
+        "created_at": group_row["created_at"],
+        "completed_at": group_row["completed_at"],
+        "tasks": [dict(t) for t in tasks],
+    }
+
+
 @route("GET", "/api/task/{project_id}/trace/{trace_id}")
 def handle_task_trace(ctx: RequestContext):
     """List all tasks sharing a trace_id, ordered by creation time."""

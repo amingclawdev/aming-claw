@@ -847,6 +847,13 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             log.debug("auto_chain: chain archive failed (non-critical)")
         return deploy_result
 
+    # --- R5/R7: Subtask fan-out for PM→Dev ---
+    if task_type == "pm" and result.get("subtasks"):
+        return _do_subtask_fanout(
+            conn, project_id, task_id, result, metadata,
+            _trace_id, _chain_id, depth,
+        )
+
     # Create next stage task (with dedup check)
     builder_fn = _BUILDERS[builder_name]
     prompt, task_meta = builder_fn(task_id, result, metadata)
@@ -888,6 +895,222 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         "source": "auto-chain",
     })
     return new_task
+
+
+# ---------------------------------------------------------------------------
+# Subtask fan-out / fan-in (R5, R6, R9)
+# ---------------------------------------------------------------------------
+
+def _do_subtask_fanout(conn, project_id, pm_task_id, result, metadata, trace_id, chain_id, depth):
+    """Create subtask_group + dev tasks for PM subtask decomposition (R5)."""
+    from . import task_registry
+    from .models import SubtaskGroup
+    from datetime import datetime, timezone
+
+    subtasks = result["subtasks"]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    group = SubtaskGroup(
+        project_id=project_id,
+        pm_task_id=pm_task_id,
+        total_count=len(subtasks),
+        trace_id=trace_id or "",
+        chain_id=chain_id or "",
+    )
+
+    conn.execute(
+        """INSERT INTO subtask_groups
+           (group_id, project_id, pm_task_id, total_count, completed_count,
+            status, created_at, trace_id, chain_id)
+           VALUES (?, ?, ?, ?, 0, 'active', ?, ?, ?)""",
+        (group.group_id, project_id, pm_task_id, len(subtasks),
+         now, trace_id or "", chain_id or ""),
+    )
+
+    created_tasks = []
+    for st in subtasks:
+        deps = st.get("depends_on") or []
+        is_blocked = len(deps) > 0
+
+        st_meta = {
+            **metadata,
+            "parent_task_id": pm_task_id,
+            "chain_depth": depth + 1,
+            "target_files": st.get("target_files", []),
+            "acceptance_criteria": st.get("acceptance_criteria", []),
+            "verification": st.get("verification", {}),
+            "test_files": st.get("test_files", []),
+            "subtask_title": st.get("title", ""),
+        }
+
+        prompt = _render_dev_contract_prompt(pm_task_id, st_meta)
+
+        new_task = task_registry.create_task(
+            conn, project_id,
+            prompt=prompt,
+            task_type="dev",
+            created_by="auto-chain-subtask",
+            metadata=st_meta,
+            trace_id=trace_id,
+            chain_id=chain_id,
+        )
+        task_id = new_task["task_id"]
+
+        # Set subtask fields and blocked status
+        if is_blocked:
+            conn.execute(
+                """UPDATE tasks SET
+                   subtask_group_id=?, subtask_local_id=?, subtask_depends_on=?,
+                   execution_status='blocked', status='blocked'
+                   WHERE task_id=?""",
+                (group.group_id, st["id"], json.dumps(deps), task_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE tasks SET
+                   subtask_group_id=?, subtask_local_id=?, subtask_depends_on=?
+                   WHERE task_id=?""",
+                (group.group_id, st["id"], json.dumps(deps), task_id),
+            )
+
+        created_tasks.append({
+            "task_id": task_id,
+            "subtask_id": st["id"],
+            "blocked": is_blocked,
+        })
+
+    log.info("auto_chain: subtask fan-out from PM %s → group %s (%d subtasks)",
+             pm_task_id, group.group_id, len(subtasks))
+
+    return {
+        "subtask_group_id": group.group_id,
+        "tasks_created": created_tasks,
+        "total_count": len(subtasks),
+    }
+
+
+def on_subtask_merge_completed(conn, project_id, task_id):
+    """Fan-in: called when a subtask's merge chain completes (R6).
+
+    Decrements deps on downstream subtasks, unblocks ready ones.
+    When all subtasks complete, creates a deploy task.
+    """
+    from . import task_registry
+
+    # Find the subtask's group and local ID
+    row = conn.execute(
+        "SELECT subtask_group_id, subtask_local_id FROM tasks WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["subtask_group_id"]:
+        return None
+
+    group_id = row["subtask_group_id"]
+    completed_local_id = row["subtask_local_id"]
+
+    # Get group info
+    group_row = conn.execute(
+        "SELECT * FROM subtask_groups WHERE group_id=?", (group_id,)
+    ).fetchone()
+    if not group_row:
+        return None
+
+    # Increment completed_count
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        "UPDATE subtask_groups SET completed_count = completed_count + 1 WHERE group_id=?",
+        (group_id,),
+    )
+
+    # Unblock downstream subtasks that depended on this one
+    blocked_tasks = conn.execute(
+        """SELECT task_id, subtask_depends_on FROM tasks
+           WHERE subtask_group_id=? AND execution_status='blocked'""",
+        (group_id,),
+    ).fetchall()
+
+    for bt in blocked_tasks:
+        deps = json.loads(bt["subtask_depends_on"] or "[]")
+        if completed_local_id in deps:
+            deps.remove(completed_local_id)
+            if not deps:
+                # All deps satisfied — unblock
+                conn.execute(
+                    """UPDATE tasks SET execution_status='queued', status='queued',
+                       subtask_depends_on=? WHERE task_id=?""",
+                    (json.dumps(deps), bt["task_id"]),
+                )
+                log.info("auto_chain: unblocked subtask %s (group %s)",
+                         bt["task_id"], group_id)
+            else:
+                conn.execute(
+                    "UPDATE tasks SET subtask_depends_on=? WHERE task_id=?",
+                    (json.dumps(deps), bt["task_id"]),
+                )
+
+    # Check if all subtasks complete → create deploy task
+    updated_group = conn.execute(
+        "SELECT completed_count, total_count, pm_task_id, project_id, trace_id, chain_id FROM subtask_groups WHERE group_id=?",
+        (group_id,),
+    ).fetchone()
+
+    if updated_group and updated_group["completed_count"] >= updated_group["total_count"]:
+        conn.execute(
+            "UPDATE subtask_groups SET status='completed', completed_at=? WHERE group_id=?",
+            (now, group_id),
+        )
+        # Create deploy task (R6)
+        deploy_task = task_registry.create_task(
+            conn, project_id,
+            prompt=f"Deploy all subtasks from group {group_id} (PM: {updated_group['pm_task_id']})",
+            task_type="deploy",
+            created_by="auto-chain-fanin",
+            metadata={
+                "subtask_group_id": group_id,
+                "parent_task_id": updated_group["pm_task_id"],
+            },
+            parent_task_id=updated_group["pm_task_id"],
+            trace_id=updated_group["trace_id"],
+            chain_id=updated_group["chain_id"],
+        )
+        log.info("auto_chain: fan-in complete for group %s → deploy %s",
+                 group_id, deploy_task.get("task_id"))
+        return {"deploy_task_id": deploy_task.get("task_id"), "group_id": group_id}
+
+    return {"group_id": group_id, "unblocked": True}
+
+
+def on_subtask_terminal_failure(conn, project_id, task_id):
+    """Failure cascade: mark group failed, cancel blocked siblings (R9)."""
+    row = conn.execute(
+        "SELECT subtask_group_id FROM tasks WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["subtask_group_id"]:
+        return None
+
+    group_id = row["subtask_group_id"]
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Mark group as failed
+    conn.execute(
+        "UPDATE subtask_groups SET status='failed', completed_at=? WHERE group_id=?",
+        (now, group_id),
+    )
+
+    # Cancel all blocked sibling tasks
+    cancelled = conn.execute(
+        """UPDATE tasks SET status='cancelled', execution_status='cancelled',
+           completed_at=?, error_message='subtask group failed: sibling failure cascade'
+           WHERE subtask_group_id=? AND execution_status='blocked'""",
+        (now, group_id),
+    ).rowcount
+
+    log.info("auto_chain: failure cascade for group %s — cancelled %d blocked tasks",
+             group_id, cancelled)
+    return {"group_id": group_id, "cancelled_count": cancelled}
 
 
 # ---------------------------------------------------------------------------
@@ -984,6 +1207,50 @@ def _gate_post_pm(conn, project_id, result, metadata):
     if soft_missing:
         return False, f"PRD fields missing without skip_reasons: {soft_missing}. Provide the field OR explain in skip_reasons why it's not needed."
 
+    # === Subtask validation (R4) ===
+    subtasks = result.get("subtasks") or prd.get("subtasks")
+    if subtasks:
+        if not isinstance(subtasks, list):
+            return False, "subtasks must be an array"
+
+        # Get max_subtasks limit (R2)
+        max_subtasks = 5  # default
+        try:
+            pv_row = conn.execute(
+                "SELECT max_subtasks FROM project_version WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            if pv_row and pv_row["max_subtasks"]:
+                max_subtasks = pv_row["max_subtasks"]
+        except Exception:
+            pass  # use default
+
+        if len(subtasks) > max_subtasks:
+            return False, f"subtask count {len(subtasks)} exceeds max_subtasks ({max_subtasks})"
+
+        # Validate mandatory fields per subtask
+        seen_ids = set()
+        for st in subtasks:
+            if not isinstance(st, dict):
+                return False, "each subtask must be a dict"
+            for mf in ("id", "title", "target_files", "acceptance_criteria"):
+                if not st.get(mf):
+                    return False, f"subtask missing mandatory field: {mf}"
+            st_id = st["id"]
+            if st_id in seen_ids:
+                return False, f"duplicate subtask id: {st_id}"
+            seen_ids.add(st_id)
+
+        # Validate depends_on references
+        for st in subtasks:
+            for dep in (st.get("depends_on") or []):
+                if dep not in seen_ids:
+                    return False, f"subtask {st['id']} depends_on unknown id: {dep}"
+
+        # DAG acyclicity check
+        if not _check_subtask_dag_acyclic(subtasks):
+            return False, "cyclic dependency in subtask depends_on"
+
     # === Merge all fields into result for downstream ===
     for field in ("target_files", "verification", "acceptance_criteria",
                   "test_files", "proposed_nodes", "doc_impact", "skip_reasons",
@@ -991,7 +1258,52 @@ def _gate_post_pm(conn, project_id, result, metadata):
         if not result.get(field):
             result[field] = prd.get(field) or metadata.get(field)
 
+    # Propagate subtasks to result for _do_chain
+    if subtasks and not result.get("subtasks"):
+        result["subtasks"] = subtasks
+
     return True, "ok"
+
+
+def _check_subtask_dag_acyclic(subtasks):
+    """Return True if the subtask dependency graph is a DAG (no cycles)."""
+    # Build adjacency list
+    adj = {}
+    for st in subtasks:
+        adj[st["id"]] = list(st.get("depends_on") or [])
+
+    # Kahn's algorithm
+    in_degree = {sid: 0 for sid in adj}
+    for sid, deps in adj.items():
+        for dep in deps:
+            if dep in in_degree:
+                in_degree[sid] += 0  # placeholder; we count from deps side
+    # Recount properly
+    in_degree = {sid: 0 for sid in adj}
+    for sid, deps in adj.items():
+        for dep in deps:
+            pass  # deps are what sid depends on, so dep -> sid
+    # Actually: if A depends_on B, then edge B->A. in_degree[A] += 1
+    in_degree = {sid: 0 for sid in adj}
+    for sid, deps in adj.items():
+        for dep in deps:
+            if sid in in_degree:
+                in_degree[sid] += 1
+
+    from collections import deque
+    queue = deque(sid for sid, deg in in_degree.items() if deg == 0)
+    visited = 0
+    while queue:
+        node = queue.popleft()
+        visited += 1
+        # Find nodes that depend on this node
+        for sid, deps in adj.items():
+            if node in deps:
+                in_degree[sid] -= 1
+                if in_degree[sid] == 0:
+                    queue.append(sid)
+
+    return visited == len(adj)
 
 
 def _gate_checkpoint(conn, project_id, result, metadata):

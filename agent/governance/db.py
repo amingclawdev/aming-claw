@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -615,7 +615,44 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_gate_events_project_task ON gate_events(project_id, task_id)")
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12}
+    def _migrate_v12_to_v13(c):
+        """Add subtask_groups table, subtask columns to tasks, max_subtasks to project_version."""
+        # subtask_groups table
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS subtask_groups (
+                group_id       TEXT PRIMARY KEY,
+                project_id     TEXT NOT NULL,
+                pm_task_id     TEXT NOT NULL,
+                total_count    INTEGER NOT NULL,
+                completed_count INTEGER NOT NULL DEFAULT 0,
+                status         TEXT NOT NULL DEFAULT 'active',
+                created_at     TEXT NOT NULL,
+                completed_at   TEXT,
+                trace_id       TEXT,
+                chain_id       TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_subtask_groups_project ON subtask_groups(project_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_subtask_groups_pm ON subtask_groups(pm_task_id)")
+
+        # Add subtask columns to tasks table
+        for col, typedef in [
+            ("subtask_group_id", "TEXT"),
+            ("subtask_local_id", "TEXT"),
+            ("subtask_depends_on", "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # Add max_subtasks to project_version
+        try:
+            c.execute("ALTER TABLE project_version ADD COLUMN max_subtasks INTEGER NOT NULL DEFAULT 5")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)
