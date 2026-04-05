@@ -136,11 +136,11 @@ Bypass reason: dogfooding — using SOP to update itself
 ## Phase 4: POST-COMMIT VERIFY
 
 ```
-[ ] 4.1 Restart governance service
-[ ] 4.2 version_check -> ok=true, dirty=false
-[ ] 4.3 preflight_check -> compare against Phase 0 baseline (no new blockers)
-[ ] 4.4 wf_impact recheck -> 1 node (unchanged)
-[ ] 4.5 R8 check: any additional files to commit? If yes, loop back to 4.1
+[x] 4.1 Restart governance service -> PID 13100, version=2289bea
+[x] 4.2 version_check -> ok=true, dirty=false (after version-sync + version-update)
+[x] 4.3 preflight_check -> 0 blockers (improved from 1), 2 warnings (unchanged)
+[x] 4.4 wf_impact -> L9.12 (unchanged, 1 node)
+[x] 4.5 R8 check: git status clean (only .claude/worktrees/ untracked) -> no loop needed
 ```
 
 ---
@@ -148,27 +148,27 @@ Bypass reason: dogfooding — using SOP to update itself
 ## Phase 5: WORKFLOW RESTORE PROOF
 
 ```
-[ ] 5.1 Create minimal test task
-[ ] 5.2 Observe: queued -> claimed -> succeeded
-[ ] 5.3 Observe: auto_chain dispatches next stage
-[ ] 5.4 Record: RESTORED or STILL_BROKEN
-[ ] 5.5 Write structured audit record
+[x] 5.1 Created PM smoke test: task-1775421604-8fd222 (queued 20:40:04)
+[x] 5.2 State transitions: queued -> claimed (executor-31808, 20:40:23) -> succeeded (20:40:42)
+[x] 5.3 auto_chain dispatched dev task: task-1775421653-508e2e (created 20:40:53, succeeded 20:41:54)
+[x] 5.4 Result: RESTORED — full PM→Dev chain operated automatically
+[x] 5.5 Structured audit record below
 ```
 
 ---
 
-## Structured Audit Record (to be filled after completion)
+## Structured Audit Record
 
 ```yaml
 manual_fix_id:          MF-2026-04-05-002
-timestamp:              (pending)
+timestamp:              2026-04-05T20:39:00Z
 operator:               observer
 trigger_scenario:       dogfooding_sop_update
 
-bypass_used:            none
+bypass_used:            none (this commit resolves staged SOP file)
 
 changed_files:
-  - docs/governance/manual-fix-sop.md (modified, v2->v3)
+  - docs/governance/manual-fix-sop.md (modified, v2->v3, +5 rules R6-R10, +5 pitfalls, +section 13)
   - docs/dev/manual-fix-current-2026-04-05-002.md (new, this file)
 
 classification:
@@ -181,11 +181,24 @@ actual_impact:          1 node (L9.12)
 false_positive_nodes:   0
 
 pre_commit_checks:
-  - tests: N/A (doc-only change)
-  - preflight baseline: 1 blocker (pre-existing), 2 warnings
+  - tests: N/A (doc-only change, L9.12 has no test_files)
+  - preflight baseline: 1 blocker (pre-existing version mismatch), 2 warnings (58 orphan, 49 unmapped)
 
-post_commit_checks:     (pending)
-workflow_restore_result: (pending)
-commit_hash:            (pending)
-followup_needed:        (pending)
+post_commit_checks:
+  - governance restart: OK (PID 13100, version=2289bea)
+  - version_check: ok=true, dirty=false, chain_version=2289bea
+  - preflight delta: 0 blockers (improved), 2 warnings (unchanged)
+  - R8 check: no additional commits needed
+
+workflow_restore_result: RESTORED
+  - PM smoke test: task-1775421604-8fd222 SUCCEEDED (38s, executor auto-claimed)
+  - auto_chain dispatch: task-1775421653-508e2e (dev) created at 20:40:53, SUCCEEDED
+  - state transitions: queued -> claimed -> succeeded -> auto_chain dispatched dev
+  - conclusion: workflow chain fully operational after SOP v3 commit
+
+commit_hash:            2289bea
+followup_needed:
+  - 58 orphan pending nodes still need reconcile or waive
+  - 49 unmapped files in coverage check
+  - B1/B6 (auto_chain silent dispatch failure) still open — worked around but not root-fixed
 ```
