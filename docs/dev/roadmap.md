@@ -1,7 +1,7 @@
 # Aming-Claw Roadmap
 
-> Baseline: `4cc1688` (2026-04-04, post-reconciliation)
-> Revision: v3 (baseline reconciliation complete, Layer 0/1 status updated)
+> Baseline: `879f1a9` (2026-04-04, all Layer 0 complete)
+> Revision: v4 (Layer 0 COMPLETE, all defects resolved, 658 tests pass)
 > Previous: `docs/dev/roadmap-2026-03-31-archived.md`
 
 ---
@@ -111,21 +111,17 @@ Layer 2: EXPAND              --> add capabilities on a stable foundation
 
 ## 3. Layer 0: Stop Bleeding
 
-**Status: MOSTLY COMPLETE (7/10 fixed, 3 remaining)**
+**Status: COMPLETE (10/10 fixed)**
 
-### 3.1 Worker Claim Stability (D1) -- PARTIALLY FIXED
+### 3.1 Worker Claim Stability (D1) -- FIXED
 
-**What's done:**
 - [x] Worker logs every poll cycle result
 - [x] Worker detects N consecutive empty polls (counter at executor_worker.py:84)
 - [x] Heartbeat mechanism (ai_lifecycle.py:417-428, _HANG_TIMEOUT=120s)
 - [x] run_once wrapped in try/except
-
-**Remaining gap:**
-- [ ] Worker self-restarts on stall detection (logs warning but doesn't force restart)
-- [ ] Service manager stall detection (monitor checks process alive, not poll health)
-
-**Severity:** Low. Worker stalls are rare post-D5 fix (.claude/ dirty filter). Current logging is sufficient for observer detection.
+- [x] Worker self-restarts after 20 consecutive empty polls with known queued tasks
+- [x] Configurable via EXECUTOR_STALL_THRESHOLD env var
+- [x] 9 new tests (test_executor_stall.py)
 
 ### 3.2 Auto-Chain Timeout (D2) -- FIXED
 
@@ -138,18 +134,14 @@ Layer 2: EXPAND              --> add capabilities on a stable foundation
 - [x] TASK_ROLE_MAP["pm"] = "pm" (executor_worker.py:54-60)
 - [x] PM output matches PRD schema
 
-### 3.4 Gate Block Reason Persistence (D4) -- PARTIALLY FIXED
+### 3.4 Gate Block Reason Persistence (D4) -- FIXED
 
-**What's done:**
 - [x] Gate block reason stored in task metadata (executor_worker.py:1014-1044)
 - [x] Gate block reason available in auto_chain event metadata
-
-**Remaining gap:**
-- [ ] Dedicated gate_events table for audit trail
-- [ ] API: GET /api/task/{project_id}/{task_id}/history
-- [ ] Observer can inspect block reasons without reading logs
-
-**Severity:** Low. Metadata storage is queryable; dedicated table is nice-to-have.
+- [x] Dedicated gate_events table (schema v12, db.py)
+- [x] Every gate check records pass/block event with reason and trace_id
+- [x] API: GET /api/task/{project_id}/{task_id}/gates returns gate history
+- [x] 11 new tests (test_gate_events.py)
 
 ### 3.5 Duplicate Reply Prevention (D5) -- FIXED
 
@@ -174,40 +166,37 @@ Layer 2: EXPAND              --> add capabilities on a stable foundation
 - [x] Missing test_report on success treated as contract defect
 - [x] test -> qa progression requires structured report presence
 
-### 3.8 Internal Doc-Gate Contradiction (D9) -- PARTIALLY FIXED
+### 3.8 Internal Doc-Gate Contradiction (D9) -- FIXED
 
-**What's done:**
-- [x] Lane deferral logic (_should_defer_doc_gate_to_lane_c, auto_chain.py:189-214)
-- [x] Governance internal repair detection (_is_governance_internal_repair, auto_chain.py:940-943)
-- [x] docs/dev/** treated as tracked-but-non-governed
+- [x] Lane deferral logic (doc_policy.py)
+- [x] Governance internal repair detection (doc_policy.py:is_governance_internal_repair)
+- [x] docs/dev/** treated as tracked-but-non-governed (doc_policy.py:is_dev_artifact)
+- [x] agent/tests/** classified as always-related (doc_policy.py:is_test_fixture)
+- [x] Unified doc_policy.py consolidating all doc governance rules
+- [x] auto_chain.py refactored to use doc_policy instead of inline logic
+- [x] 26 new tests (test_doc_policy.py)
 
-**Remaining gap:**
-- [ ] Unified doc policy document (currently scattered across code)
-- [ ] Replay coverage for doc-governance edge cases
+### 3.9 Contract-Drift Detection (D10) -- FIXED
 
-**Severity:** Low. Current code handles the common cases; edge cases are rare.
+- [x] drift_detector.py: capture_baseline() snapshots policy constants
+- [x] detect_drift() compares current vs baseline, flags unauthorized changes
+- [x] Integrated as warn-only check in _gate_checkpoint (auto_chain.py)
+- [x] Drift report stored in task metadata as _drift_report for QA/Gatekeeper
+- [x] Minimum tracked constants: CHAIN, _CLAUDE_ROLE_TURN_CAPS, _HANG_TIMEOUT, etc.
+- [x] 8 new tests (test_drift_detector.py)
 
-### 3.9 Contract-Drift Detection (D10) -- NOT FIXED
+### Layer 0 Completion Summary
 
-**What's needed:**
-- [ ] Detect policy/config/contract changes outside PM scope
-- [ ] Treat excluded directly-related tests as a defect signal
-- [ ] Record semantic drift as a workflow defect
-- [ ] Add replay coverage for "changed the right file but changed the wrong thing"
+All defects resolved on 2026-04-04. 658 tests pass (up from 587).
 
-**Severity:** Medium. This is the only unaddressed Layer 0 defect. It causes silent regressions when workflow repair tasks change config values without PM authorization.
-
-### Layer 0 Remaining Work Summary
-
-| Item | Effort | Priority |
-|------|--------|----------|
-| D1 stall self-restart | ~1 day | P2 |
-| D4 gate_events table + API | ~2 days | P2 |
-| D6 trace_id in tasks + trace API | ~2 days | P1 |
-| D9 unified doc policy doc | ~1 day | P2 |
-| D10 contract-drift detection | ~3 days | P1 |
-
-**Total remaining Layer 0 effort: ~9 days**
+| Commit | Feature | Tests Added |
+|--------|---------|-------------|
+| `816bb67` | D6: trace_id/chain_id in tasks + trace API (schema v11) | +8 |
+| `659d0a7` | D10: drift_detector.py + gate integration | +8 |
+| `89dc07c` | Phase 3 replay validation (9 contract boundary cases) | +9 |
+| `42d320e` | D1: worker stall self-restart | +9 |
+| `11b2b9b` | D4: gate_events audit table + API (schema v12) | +11 |
+| `879f1a9` | D9: unified doc_policy.py + auto_chain refactor | +26 |
 
 ---
 
@@ -281,16 +270,16 @@ Prerequisite: All of Layer 1 + PM decomposition (5.1).
 ## 6. Dependency Graph (Updated)
 
 ```
-LAYER 0 (Stop Bleeding) -- MOSTLY DONE
-  D1 Worker claim fix .................. PARTIALLY FIXED
+LAYER 0 (Stop Bleeding) -- COMPLETE
+  D1 Worker claim fix .................. FIXED (42d320e)
   D2 Auto-chain timeout fix ............ FIXED
   D3 PM role mapping fix ............... FIXED
-  D4 Gate reason persistence ........... PARTIALLY FIXED
+  D4 Gate reason persistence ........... FIXED (11b2b9b)
   D5 Duplicate reply fix ............... FIXED
-  D6 Observability baseline ............ FIXED
+  D6 Observability baseline ............ FIXED (816bb67)
   D8 Test result contract .............. FIXED
-  D9 Doc-gate contradiction ............ PARTIALLY FIXED
-  D10 Contract-drift detection ......... NOT FIXED  <-- main remaining gap
+  D9 Doc-gate contradiction ............ FIXED (879f1a9)
+  D10 Contract-drift detection ......... FIXED (659d0a7)
       |
       | [Gate: PASSED -- task success > 85%, chain completes PM-->Merge]
       v
@@ -358,3 +347,4 @@ Prevention: Directly relevant tests must not be excluded or regressed without ex
 | 2026-03-31 | v2 | Restructured to stability-first (3 layers). Added decision gates, metrics, resolved questions, anti-patterns. |
 | 2026-04-01 | v2.1 | Added Governance Defect Classes section. |
 | 2026-04-04 | v3 | Baseline reconciliation complete (4cc1688). Updated all defect statuses. Layer 0: 7/10 fixed. Layer 1: 5/5 done. Archived v2 to docs/dev/roadmap-2026-03-31-archived.md. |
+| 2026-04-04 | v4 | Layer 0 COMPLETE (879f1a9). All 10 defects fixed. +71 new tests (658 total). Phase 3 replay validation done. |
