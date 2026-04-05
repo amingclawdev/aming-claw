@@ -14,77 +14,80 @@ from .models import FileHitPolicy, PropagationPolicy, VerificationPolicy, Impact
 # Used by checkpoint gate to verify doc consistency on code changes
 CODE_DOC_MAP = {
     "agent/telegram_gateway/": [
-        "docs/telegram-project-binding-design.md",
-        "docs/ai-agent-integration-guide.md",
+        "docs/architecture.md",
         "README.md",
     ],
     "agent/governance/server.py": [
-        "docs/ai-agent-integration-guide.md",
-        "docs/p0-3-design.md",
+        "docs/api/governance-api.md",
+        "docs/architecture.md",
         "README.md",
     ],
     "agent/governance/auto_chain.py": [
-        "docs/p0-3-design.md",
-        "docs/ai-agent-integration-guide.md",
-        "docs/human-intervention-guide.md",
+        "docs/governance/auto-chain.md",
+        "docs/governance/gates.md",
     ],
     "agent/governance/task_registry.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/api/governance-api.md",
         "README.md",
     ],
     "agent/governance/state_service.py": [
-        "docs/workflow-governance-architecture-v2.md",
-        "docs/p0-3-design.md",
+        "docs/governance/acceptance-graph.md",
+        "docs/governance/version-control.md",
     ],
     "agent/governance/role_service.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/config/role-permissions.md",
+        "docs/roles/README.md",
     ],
     "agent/governance/gatekeeper.py": [
-        "docs/production-guard.md",
+        "docs/governance/gates.md",
     ],
     "agent/executor_api.py": [
-        "docs/executor-api-guide.md",
+        "docs/api/executor-api.md",
     ],
     "agent/ai_lifecycle.py": [
-        "docs/architecture-v6-executor-driven.md",
+        "docs/architecture.md",
     ],
     "agent/deploy_chain.py": [
-        "docs/deployment-guide.md",
+        "docs/deployment.md",
     ],
     "agent/service_manager.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/architecture.md",
     ],
     "agent/executor_worker.py": [
-        "docs/ai-agent-integration-guide.md",
-        "docs/p0-3-design.md",
+        "docs/api/executor-api.md",
     ],
     "agent/governance/memory_backend.py": [
-        "docs/ai-agent-integration-guide.md",
-        "docs/prd-memory-coordinator-executor.md",
+        "docs/governance/memory.md",
     ],
     "agent/governance/memory_service.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/governance/memory.md",
     ],
     "agent/governance/conflict_rules.py": [
-        "docs/ai-agent-integration-guide.md",
-        "docs/human-intervention-guide.md",
+        "docs/governance/conflict-rules.md",
     ],
     "agent/governance/chain_context.py": [
-        "docs/prd-memory-coordinator-executor.md",
-        "docs/ai-agent-integration-guide.md",
+        "docs/governance/auto-chain.md",
     ],
     "agent/governance/db.py": [
-        "docs/p0-3-design.md",
-        "docs/ai-agent-integration-guide.md",
+        "docs/architecture.md",
     ],
     "agent/governance/impact_analyzer.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/governance/acceptance-graph.md",
     ],
     "agent/governance/observability.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/architecture.md",
     ],
     "agent/governance/preflight.py": [
-        "docs/ai-agent-integration-guide.md",
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/gate_policy.py": [
+        "docs/governance/gates.md",
+    ],
+    "agent/governance/graph.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/role_permissions.py": [
+        "docs/config/role-permissions.md",
     ],
 }
 

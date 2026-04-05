@@ -10,7 +10,22 @@ This directory contains the canonical role documentation for the Aming Claw proj
 | [pm.md](pm.md) | PM | Project Manager rules and output format |
 | [observer.md](observer.md) | Observer | Observer rules and monitoring behavior |
 | [dev.md](dev.md) | Dev | Developer agent guide and workflow |
-| [tester-qa.md](tester-qa.md) | Tester/QA | Tester and QA agent guide |
+| [tester.md](tester.md) | Tester | Tester agent guide |
+| [qa.md](qa.md) | QA | QA agent guide |
+| [gatekeeper.md](gatekeeper.md) | Gatekeeper | Gatekeeper role and gate override rules |
+
+## Permission Matrix
+
+| Permission | Observer | Coordinator | PM | Dev | Tester | QA | Gatekeeper |
+|-----------|----------|-------------|-----|-----|--------|-----|------------|
+| task.create | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| task.claim | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| task.complete | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| node.verify | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ |
+| node.baseline | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| gate.override | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+
+For the full permission schema and YAML migration plan, see [docs/config/role-permissions.md](../config/role-permissions.md).
 
 ## Migration Note
 

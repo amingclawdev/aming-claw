@@ -1,15 +1,11 @@
-# Configuration Documentation
+# Configuration Reference
 
-This directory will contain configuration documentation for the Aming Claw project.
+This directory contains schema documentation for all Aming Claw configuration files.
 
-## Planned Content
+## Configuration Files
 
-- Environment variable reference
-- Docker Compose configuration guide
-- MCP server configuration
-- Governance settings reference
-
-## Migration Note
-
-This directory was created on 2026-04-05 as part of Phase 1 documentation restructuring.
-Configuration documentation will be added in subsequent phases.
+| File | Description |
+|------|-------------|
+| [aming-claw-yaml.md](aming-claw-yaml.md) | `.aming-claw.yaml` project configuration schema |
+| [mcp-json.md](mcp-json.md) | `.mcp.json` MCP server configuration schema |
+| [role-permissions.md](role-permissions.md) | Role permission schema and YAML migration plan |
