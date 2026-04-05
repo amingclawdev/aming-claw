@@ -202,11 +202,11 @@ class TestLoadTaskTrace:
 
 
 class TestSchemaVersion:
-    """AC3: SCHEMA_VERSION in db.py equals 11."""
+    """AC3: SCHEMA_VERSION in db.py >= 11 (trace_id was added in v11)."""
 
-    def test_schema_version_is_11(self):
+    def test_schema_version_at_least_11(self):
         from agent.governance.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 11
+        assert SCHEMA_VERSION >= 11
 
 
 class TestMigrationV10ToV11:

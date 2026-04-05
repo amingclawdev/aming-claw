@@ -15,6 +15,11 @@ import re
 import traceback
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 from .observability import new_trace_id, structured_log
+from .doc_policy import (
+    is_dev_artifact as _is_dev_note,
+    is_governance_internal_repair as _is_governance_internal_repair,
+    _GOVERNANCE_INTERNAL_PREFIXES,
+)
 
 log = logging.getLogger(__name__)
 
@@ -987,46 +992,6 @@ def _gate_post_pm(conn, project_id, result, metadata):
             result[field] = prd.get(field) or metadata.get(field)
 
     return True, "ok"
-
-
-def _is_dev_note(path: str) -> bool:
-    """Return True for docs/dev/** paths — informal dev notes, not formal docs."""
-    normalized = path.replace("\\", "/")
-    return normalized.startswith("docs/dev/")
-
-
-_GOVERNANCE_INTERNAL_PREFIXES = (
-    "agent/governance/",
-    "agent/role_permissions.py",
-)
-
-
-def _is_governance_internal_repair(metadata: dict, changed_files: list) -> bool:
-    """Return True when all target_files and changed_files are governance-internal.
-
-    Governance-internal paths are:
-      - agent/governance/*
-      - agent/role_permissions.py
-      - agent/tests/test_* (co-located test files)
-
-    When True, the doc consistency gate is skipped to avoid the oscillation loop
-    where governance repairs are demanded docs they cannot add without triggering
-    the unrelated-files gate.
-    """
-    target_files = metadata.get("target_files", []) or []
-    all_files = list(target_files) + list(changed_files or [])
-    if not all_files:
-        return False
-    for f in all_files:
-        normalized = f.replace("\\", "/")
-        # Allow governance paths
-        if any(normalized.startswith(prefix) for prefix in _GOVERNANCE_INTERNAL_PREFIXES):
-            continue
-        # Allow co-located test files
-        if "/tests/test_" in normalized or normalized.startswith("agent/tests/test_"):
-            continue
-        return False
-    return True
 
 
 def _gate_checkpoint(conn, project_id, result, metadata):
