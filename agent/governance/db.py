@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -183,6 +183,19 @@ CREATE TABLE IF NOT EXISTS chain_events (
 );
 CREATE INDEX IF NOT EXISTS idx_chain_events_root ON chain_events(root_task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_chain_events_task ON chain_events(task_id, event_type, ts);
+
+-- Gate events audit trail (queryable gate history per task)
+CREATE TABLE IF NOT EXISTS gate_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    gate_name     TEXT NOT NULL,
+    passed        INTEGER NOT NULL,
+    reason        TEXT,
+    trace_id      TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gate_events_project_task ON gate_events(project_id, task_id);
 """
 
 
@@ -586,7 +599,23 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
             pass  # Column already exists
         c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_trace ON tasks(project_id, trace_id)")
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11}
+    def _migrate_v11_to_v12(c):
+        """Add gate_events table for queryable gate audit trail."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS gate_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id    TEXT NOT NULL,
+                task_id       TEXT NOT NULL,
+                gate_name     TEXT NOT NULL,
+                passed        INTEGER NOT NULL,
+                reason        TEXT,
+                trace_id      TEXT,
+                created_at    TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_gate_events_project_task ON gate_events(project_id, task_id)")
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)

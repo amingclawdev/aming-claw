@@ -1668,6 +1668,25 @@ def handle_task_trace(ctx: RequestContext):
     return {"tasks": tasks, "count": len(tasks), "trace_id": trace_id}
 
 
+@route("GET", "/api/task/{project_id}/{task_id}/gates")
+def handle_task_gates(ctx: RequestContext):
+    """List all gate events for a specific task."""
+    project_id = ctx.get_project_id()
+    task_id = ctx.path_params.get("task_id", "")
+    if not task_id:
+        raise GovernanceError("task_id is required", 400)
+    with DBContext(project_id) as conn:
+        rows = conn.execute(
+            """SELECT id, gate_name, passed, reason, trace_id, created_at
+               FROM gate_events
+               WHERE project_id = ? AND task_id = ?
+               ORDER BY created_at ASC""",
+            (project_id, task_id),
+        ).fetchall()
+    events = [dict(r) for r in rows]
+    return {"task_id": task_id, "gate_events": events, "count": len(events)}
+
+
 @route("GET", "/api/runtime/{project_id}")
 def handle_runtime(ctx: RequestContext):
     """Runtime projection — read-only view from Task Registry. No state of its own."""

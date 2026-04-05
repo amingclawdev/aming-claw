@@ -132,6 +132,21 @@ def _load_task_trace(conn, task_id):
         return None, None
 
 
+def _record_gate_event(conn, project_id, task_id, gate_name, passed, reason, trace_id):
+    """Insert a row into gate_events for audit trail."""
+    from datetime import datetime, timezone
+    try:
+        conn.execute(
+            "INSERT INTO gate_events (project_id, task_id, gate_name, passed, reason, trace_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project_id, task_id, gate_name, 1 if passed else 0,
+             reason, trace_id,
+             datetime.now(timezone.utc).isoformat()),
+        )
+    except Exception:
+        log.debug("auto_chain: failed to record gate_event for %s/%s (non-critical)", gate_name, task_id, exc_info=True)
+
+
 def _load_task_metadata(conn, project_id, task_id):
     if not task_id or not hasattr(conn, "execute"):
         return {}
@@ -474,6 +489,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     # Pre-gate: version check — warn on server lag but don't block chain
     ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
+    _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
     if not ver_passed:
         # Only dirty-workspace failures reach here (server-version lag is now warning-only)
         log.info("auto_chain: version gate blocked for task %s: %s", task_id, ver_reason)
@@ -555,6 +571,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     # Run gate check
     gate_fn = _GATES[gate_fn_name]
     passed, reason = gate_fn(conn, project_id, result, metadata)
+    _record_gate_event(conn, project_id, task_id, gate_fn_name, passed, reason, _trace_id)
     if not passed:
         workflow_improvement = _maybe_create_workflow_improvement_task(
             conn, project_id, task_id, task_type, reason, metadata, result
