@@ -1030,5 +1030,34 @@ def run() -> None:
             time.sleep(3)
 
 
+class TelegramGateway:
+    """Adapter that wraps module-level Telegram functions into NotificationGateway interface.
+
+    Implements the NotificationGateway ABC from agent.notification_gateway.
+    We use duck-typing compatible interface rather than direct inheritance to
+    avoid circular imports when gateway.py is used standalone in Docker.
+    """
+
+    def send_message(self, chat_id: str, text: str) -> None:
+        send_text(chat_id, text)
+
+    def send_reply(self, chat_id: str, reply_to_id: str, text: str) -> None:
+        send_text(chat_id, text, reply_to_message_id=reply_to_id)
+
+    def get_updates(self, offset: int = 0) -> list:
+        data = poll_updates(offset)
+        if data.get("ok"):
+            return data.get("result", [])
+        return []
+
+
+# Register as NotificationGateway subclass (virtual) to satisfy isinstance checks
+try:
+    from agent.notification_gateway import NotificationGateway
+    NotificationGateway.register(TelegramGateway)
+except ImportError:
+    pass  # standalone Docker mode — ABC not available
+
+
 if __name__ == "__main__":
     run()

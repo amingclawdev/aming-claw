@@ -6,9 +6,12 @@ Dual-write pattern:
   Redis down: degrade to pure SQLite, no service interruption
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +22,7 @@ try:
 except ImportError:
     HAS_REDIS = False
     _redis_lib = None
+    log.warning("redis package not installed — Redis features disabled, using SQLite-only mode")
 
 
 class RedisClient:
@@ -65,10 +69,10 @@ class RedisClient:
 
     # --- Key-Value Cache ---
 
-    def get(self, key: str) -> str | None:
+    def get(self, key: str) -> Optional[str]:
         return self._safe(lambda: self._client.get(key))
 
-    def get_json(self, key: str) -> dict | None:
+    def get_json(self, key: str) -> Optional[dict]:
         raw = self.get(key)
         if raw is None:
             return None
@@ -96,7 +100,7 @@ class RedisClient:
             return True
         return self._safe(_do, False)
 
-    def hgetall(self, name: str) -> dict | None:
+    def hgetall(self, name: str) -> Optional[dict]:
         result = self._safe(lambda: self._client.hgetall(name))
         return result if result else None
 
@@ -105,7 +109,7 @@ class RedisClient:
 
     # --- Idempotency (SET NX + TTL) ---
 
-    def check_idempotency(self, key: str) -> dict | None:
+    def check_idempotency(self, key: str) -> Optional[dict]:
         return self.get_json(f"idem:{key}")
 
     def store_idempotency(self, key: str, response: dict, ttl_sec: int = 86400) -> bool:
@@ -134,7 +138,7 @@ class RedisClient:
     def cache_session(self, session_id: str, session_data: dict, ttl_sec: int = 86400) -> bool:
         return self.set_json(f"session:{session_id}", session_data, ttl_sec)
 
-    def get_cached_session(self, session_id: str) -> dict | None:
+    def get_cached_session(self, session_id: str) -> Optional[dict]:
         return self.get_json(f"session:{session_id}")
 
     def invalidate_session(self, session_id: str) -> bool:
@@ -143,7 +147,7 @@ class RedisClient:
     def cache_token_session(self, token_hash: str, session_id: str, ttl_sec: int = 86400) -> bool:
         return self.set(f"token:{token_hash}", session_id, ttl_sec)
 
-    def get_session_by_token(self, token_hash: str) -> str | None:
+    def get_session_by_token(self, token_hash: str) -> Optional[str]:
         return self.get(f"token:{token_hash}")
 
     def update_heartbeat(self, session_id: str, ttl_sec: int = 600) -> bool:
@@ -157,7 +161,7 @@ class RedisClient:
 
 
 # Global singleton
-_instance: RedisClient | None = None
+_instance: Optional[RedisClient] = None
 
 
 def get_redis() -> RedisClient:

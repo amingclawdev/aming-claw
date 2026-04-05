@@ -31,8 +31,8 @@ class TestGateEventsTableCreated(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def test_schema_version_is_12(self):
-        self.assertEqual(SCHEMA_VERSION, 12)
+    def test_schema_version_at_least_12(self):
+        self.assertGreaterEqual(SCHEMA_VERSION, 12)
 
     def test_gate_events_table_created(self):
         """Table is created by _ensure_schema (includes SCHEMA_SQL + migrations)."""

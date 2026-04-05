@@ -3,26 +3,35 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aming-claw-governance"
+name = "aming-claw"
 version = "0.1.0"
-description = "Host-first governance service for the aming-claw workflow platform"
+description = "Governance-driven workflow platform"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
   "requests==2.32.3",
   "PyYAML>=6.0",
   "networkx>=3.0",
-  "redis>=5.0",
+  "click>=8.0",
 ]
 
+[project.optional-dependencies]
+redis = ["redis>=5.0"]
+docker = ["docker>=7.0"]
+full = ["redis>=5.0", "docker>=7.0"]
+
 [project.scripts]
+aming-claw = "agent.cli:main"
 aming-governance = "agent.governance.server:main"
 aming-governance-host = "start_governance:main"
 
 [tool.setuptools]
-py-modules = ["start_governance"]
+py-modules = ["start_governance", "aming_claw"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent*"]
 namespaces = true
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.json"]
