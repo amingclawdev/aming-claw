@@ -1,0 +1,292 @@
+"""Tests for auto_chain routing integration (AC5, AC6, AC10).
+
+Covers backward compatibility: CHAIN dict still works, linear routing
+preserved when graph has default policies, and end-to-end dispatch.
+"""
+
+import json
+import sqlite3
+import pytest
+from unittest.mock import patch, MagicMock
+
+import sys
+import os
+
+_agent_dir = os.path.join(os.path.dirname(__file__), "..")
+if _agent_dir not in sys.path:
+    sys.path.insert(0, _agent_dir)
+
+
+def _make_in_memory_db():
+    """Create an in-memory SQLite DB with minimal schema for testing."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    for ddl in [
+        """CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT, action TEXT, actor TEXT, ok INTEGER,
+            ts TEXT, task_id TEXT, details_json TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS node_state (
+            project_id TEXT, node_id TEXT, verify_status TEXT DEFAULT 'pending',
+            PRIMARY KEY (project_id, node_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY, project_id TEXT, type TEXT,
+            status TEXT DEFAULT 'queued', metadata_json TEXT,
+            trace_id TEXT, chain_id TEXT, created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS gate_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT, task_id TEXT, gate_name TEXT,
+            passed INTEGER, reason TEXT, trace_id TEXT, created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS project_version (
+            project_id TEXT PRIMARY KEY, chain_version TEXT,
+            git_head TEXT, dirty_files TEXT, updated_at TEXT,
+            updated_by TEXT, max_subtasks INTEGER DEFAULT 5
+        )""",
+    ]:
+        conn.execute(ddl)
+    conn.commit()
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# AC5: CHAIN dict backward compat
+# ---------------------------------------------------------------------------
+
+class TestAC5_ChainDictPreserved:
+    """CHAIN dict is preserved and works when no graph is loaded."""
+
+    def test_chain_dict_structure(self):
+        from governance.auto_chain import CHAIN
+        assert "pm" in CHAIN
+        assert "dev" in CHAIN
+        assert "test" in CHAIN
+        assert "qa" in CHAIN
+        assert "gatekeeper" in CHAIN
+        assert "merge" in CHAIN
+        assert "deploy" in CHAIN
+
+    def test_chain_dict_pm_to_dev(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["pm"]
+        assert next_type == "dev"
+
+    def test_chain_dict_dev_to_test(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["dev"]
+        assert next_type == "test"
+
+    def test_chain_dict_test_to_qa(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["test"]
+        assert next_type == "qa"
+
+    def test_chain_dict_qa_to_gatekeeper(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["qa"]
+        assert next_type == "gatekeeper"
+
+    def test_chain_dict_gatekeeper_to_merge(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["gatekeeper"]
+        assert next_type == "merge"
+
+    def test_chain_dict_merge_to_deploy(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["merge"]
+        assert next_type == "deploy"
+
+    def test_chain_dict_deploy_terminal(self):
+        from governance.auto_chain import CHAIN
+        gate_fn, next_type, builder = CHAIN["deploy"]
+        assert next_type is None
+
+
+# ---------------------------------------------------------------------------
+# AC6: Default graph policies → same linear chain
+# ---------------------------------------------------------------------------
+
+class TestAC6_DefaultGraphLinear:
+    """Graph with default policies produces same linear chain."""
+
+    def test_dispatch_returns_none_for_default_policies(self):
+        """dispatch_next_stage returns None when all policies are default,
+        signaling the caller to use the linear CHAIN dict."""
+        from governance.auto_chain import dispatch_next_stage
+        from governance.graph import AcceptanceGraph
+        from governance.models import NodeDef
+
+        conn = _make_in_memory_db()
+        graph = AcceptanceGraph()
+        node = NodeDef(
+            id="L1.1", title="Test", layer="L1",
+            verify_level=1, gate_mode="auto",
+            primary=["agent/foo.py"],
+        )
+        graph.G.add_node(node.id, **node.to_dict())
+
+        next_stage, skipped, policies = dispatch_next_stage(
+            conn, "test-proj", "task-1", "dev",
+            {"changed_files": ["agent/foo.py"]},
+            {"related_nodes": ["L1.1"]},
+            "tr-default",
+            graph=graph,
+        )
+        # None means "use CHAIN dict" which gives pm→dev→test→qa→gk→merge→deploy
+        assert next_stage is None
+
+    def test_linear_chain_sequence_matches_chain_dict(self):
+        """Verify the full linear chain sequence matches CHAIN dict."""
+        from governance.auto_chain import CHAIN
+
+        # Walk CHAIN from pm to deploy
+        sequence = []
+        current = "pm"
+        while current is not None:
+            sequence.append(current)
+            _, next_type, _ = CHAIN[current]
+            current = next_type
+        assert sequence == ["pm", "dev", "test", "qa", "gatekeeper", "merge", "deploy"]
+
+
+# ---------------------------------------------------------------------------
+# AC10: No regression in dispatch_next_stage
+# ---------------------------------------------------------------------------
+
+class TestAC10_NoRegression:
+    """Existing chain works end-to-end (no regression)."""
+
+    def test_chain_lookup_tables_exist(self):
+        from governance.auto_chain import _GATES, _BUILDERS
+        assert "_gate_post_pm" in _GATES
+        assert "_gate_checkpoint" in _GATES
+        assert "_gate_t2_pass" in _GATES
+        assert "_gate_qa_pass" in _GATES
+        assert "_gate_gatekeeper_pass" in _GATES
+        assert "_gate_release" in _GATES
+        assert "_gate_deploy_pass" in _GATES
+
+        assert "_build_dev_prompt" in _BUILDERS
+        assert "_build_test_prompt" in _BUILDERS
+        assert "_build_qa_prompt" in _BUILDERS
+        assert "_build_gatekeeper_prompt" in _BUILDERS
+        assert "_build_merge_prompt" in _BUILDERS
+        assert "_build_deploy_prompt" in _BUILDERS
+        assert "_finalize_chain" in _BUILDERS
+
+    def test_gate_functions_callable(self):
+        from governance.auto_chain import _GATES
+        for name, fn in _GATES.items():
+            assert callable(fn), f"Gate {name} is not callable"
+
+    def test_builder_functions_callable(self):
+        from governance.auto_chain import _BUILDERS
+        for name, fn in _BUILDERS.items():
+            assert callable(fn), f"Builder {name} is not callable"
+
+    def test_max_chain_depth_preserved(self):
+        from governance.auto_chain import MAX_CHAIN_DEPTH
+        assert MAX_CHAIN_DEPTH == 10
+
+    def test_dispatch_next_stage_function_exists(self):
+        from governance.auto_chain import dispatch_next_stage
+        assert callable(dispatch_next_stage)
+
+
+# ---------------------------------------------------------------------------
+# AC7: Routing audit for linear chain too
+# ---------------------------------------------------------------------------
+
+class TestAC7_LinearChainAudit:
+    """Linear chain routing also gets audit entries."""
+
+    def test_no_graph_audit_written(self):
+        from governance.auto_chain import dispatch_next_stage
+        conn = _make_in_memory_db()
+
+        dispatch_next_stage(
+            conn, "test-proj", "task-1", "dev",
+            {}, {}, "tr-linear-audit", graph=None,
+        )
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE action='routing_decision'"
+        ).fetchall()
+        assert len(rows) >= 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["routing_mode"] == "linear_chain"
+        assert details["trace_id"] == "tr-linear-audit"
+
+    def test_pre_dev_stage_audit(self):
+        """PM stage should also get audit entry."""
+        from governance.auto_chain import dispatch_next_stage
+        from governance.graph import AcceptanceGraph
+
+        conn = _make_in_memory_db()
+        graph = AcceptanceGraph()
+
+        dispatch_next_stage(
+            conn, "test-proj", "task-1", "pm",
+            {}, {}, "tr-pm-audit", graph=graph,
+        )
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE action='routing_decision'"
+        ).fetchall()
+        assert len(rows) >= 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["current_stage"] == "pm"
+        assert details["reason"] == "pre_dev_stage"
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+class TestEdgeCases:
+    """Edge cases for routing logic."""
+
+    def test_empty_verify_requires(self):
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = _make_in_memory_db()
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", [])
+        assert satisfied
+        assert blocking == []
+
+    def test_node_not_in_node_state_blocks(self):
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = _make_in_memory_db()
+        satisfied, blocking = _check_verify_requires_satisfied(
+            conn, "test-proj", ["L99.99"]
+        )
+        assert not satisfied
+        assert "L99.99" in blocking
+
+    def test_derive_stages_merge_always_present(self):
+        from governance.auto_chain import _derive_chain_stages_from_policies
+        # Even with all skip+zero, merge is always included
+        stages = _derive_chain_stages_from_policies([
+            {"node_id": "L1.1", "gate_mode": "skip", "verify_level": 0}
+        ])
+        assert "merge" in stages
+
+    def test_audit_routing_skip_safe_on_db_error(self):
+        """_audit_routing_skip should not raise even if DB fails."""
+        from governance.auto_chain import _audit_routing_skip
+        # Pass a mock that raises on execute
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("DB error")
+        # Should not raise
+        _audit_routing_skip(mock_conn, "proj", "task", "tr-x", {"test": True})
+
+    def test_audit_routing_decision_safe_on_db_error(self):
+        """_audit_routing_decision should not raise even if DB fails."""
+        from governance.auto_chain import _audit_routing_decision
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("DB error")
+        _audit_routing_decision(mock_conn, "proj", "task", "tr-x", {"test": True})

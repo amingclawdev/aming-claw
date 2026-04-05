@@ -3,6 +3,7 @@
 The graph is the "rule layer": node definitions, deps edges, gate policies.
 It changes rarely (only when nodes are added/removed).
 """
+from __future__ import annotations
 
 import re
 import json
@@ -483,6 +484,44 @@ class AcceptanceGraph:
                     vl = 1
             max_vl = max(max_vl, vl)
         return max_vl
+
+    # --- Routing Policy (R1, R2) ---
+
+    def get_node_routing_policy(self, node_id: str) -> dict:
+        """Return routing-relevant policy for a node.
+
+        Returns dict with:
+          - gate_mode: str (auto/skip/manual/explicit/conditional)
+          - verify_level: int
+          - gates: list of gate requirement dicts
+          - verify_requires: list of node IDs that must be verified first
+        """
+        if node_id not in self.G:
+            raise NodeNotFoundError(node_id)
+        data = self.G.nodes[node_id]
+        vl = data.get("verify_level", 1)
+        if isinstance(vl, str):
+            try:
+                vl = int(vl)
+            except ValueError:
+                vl = 1
+        return {
+            "node_id": node_id,
+            "gate_mode": data.get("gate_mode", "auto"),
+            "verify_level": vl,
+            "gates": data.get("gates", []),
+            "verify_requires": data.get("verify_requires", []),
+        }
+
+    def get_routing_policies_for_nodes(self, node_ids: list[str]) -> list[dict]:
+        """Return routing policies for multiple nodes."""
+        policies = []
+        for nid in node_ids:
+            try:
+                policies.append(self.get_node_routing_policy(nid))
+            except NodeNotFoundError:
+                log.warning("get_routing_policies: node %s not found, skipping", nid)
+        return policies
 
     # --- Export ---
 

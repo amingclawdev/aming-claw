@@ -125,6 +125,8 @@ class GateMode(Enum):
     AUTO        = "auto"       # Gates auto-derived from deps with verify >= L3
     EXPLICIT    = "explicit"   # Gates manually specified
     CONDITIONAL = "conditional"  # Gates with conditions
+    SKIP        = "skip"       # Bypass QA/gatekeeper stages entirely
+    MANUAL      = "manual"     # Require manual intervention for gates
 
 
 class GatePolicy(Enum):

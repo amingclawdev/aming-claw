@@ -118,6 +118,7 @@ class NodeDef:
     guard: bool = False
     version: str = ""
     gates: list = field(default_factory=list)  # list of GateRequirement dicts
+    verify_requires: list = field(default_factory=list)  # list of node IDs that must be verified first (R4)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -138,6 +139,7 @@ class NodeDef:
             guard=d.get("guard", False),
             version=d.get("version", ""),
             gates=d.get("gates", []),
+            verify_requires=d.get("verify_requires", []),
         )
 
 

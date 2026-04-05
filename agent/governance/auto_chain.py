@@ -108,6 +108,255 @@ CHAIN = {
 
 # Maximum chain depth to prevent infinite loops
 MAX_CHAIN_DEPTH = 10
+
+# ---------------------------------------------------------------------------
+# Graph-Path-Driven Routing (Roadmap §5.5)
+# ---------------------------------------------------------------------------
+
+# Linear chain stages after dev (used for graph-driven routing derivation)
+_POST_DEV_STAGES = ["test", "qa", "gatekeeper", "merge"]
+
+
+def _audit_routing_decision(conn, project_id, task_id, trace_id, decision):
+    """Write routing decision to audit_log (R6/AC7)."""
+    try:
+        conn.execute(
+            "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?)",
+            (
+                project_id,
+                "routing_decision",
+                "auto-chain",
+                1,
+                task_id,
+                json.dumps({**decision, "trace_id": trace_id}),
+            ),
+        )
+    except Exception:
+        log.debug("audit routing_decision failed (non-critical)", exc_info=True)
+
+
+def _audit_routing_skip(conn, project_id, task_id, trace_id, skip_info):
+    """Write routing skip to audit_log (R3/AC1/AC2)."""
+    try:
+        conn.execute(
+            "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?)",
+            (
+                project_id,
+                "routing_skip",
+                "auto-chain",
+                1,
+                task_id,
+                json.dumps({**skip_info, "trace_id": trace_id}),
+            ),
+        )
+    except Exception:
+        log.debug("audit routing_skip failed (non-critical)", exc_info=True)
+
+
+def _check_verify_requires_satisfied(conn, project_id, verify_requires):
+    """Check if all verify_requires nodes are verified (AC4).
+
+    Returns (satisfied: bool, blocking_nodes: list[str]).
+    """
+    if not verify_requires:
+        return True, []
+    blocking = []
+    for req_nid in verify_requires:
+        try:
+            row = conn.execute(
+                "SELECT verify_status FROM node_state WHERE project_id = ? AND node_id = ?",
+                (project_id, req_nid),
+            ).fetchone()
+            if row is None:
+                blocking.append(req_nid)
+                continue
+            status = (row["verify_status"] or "pending").strip()
+            if status not in ("qa_pass", "t2_pass"):
+                blocking.append(req_nid)
+        except Exception:
+            blocking.append(req_nid)
+    return len(blocking) == 0, blocking
+
+
+def _derive_chain_stages_from_policies(policies):
+    """Derive which chain stages to execute based on node policies (R2/R3).
+
+    Given a list of node routing policies, determine the minimal set of
+    chain stages needed. Uses the most restrictive policy (if ANY node
+    requires a stage, it's included).
+
+    Returns list of stage names in order.
+    """
+    if not policies:
+        return list(_POST_DEV_STAGES)  # fallback to full chain
+
+    needs_test = False
+    needs_qa = False
+    needs_gatekeeper = False
+    all_skip = True
+
+    for p in policies:
+        gm = p.get("gate_mode", "auto")
+        vl = p.get("verify_level", 1)
+
+        if gm != "skip":
+            all_skip = False
+
+        # verify_level > 0 means test stage needed
+        if vl > 0:
+            needs_test = True
+
+        # gate_mode != skip means QA and gatekeeper needed
+        if gm != "skip":
+            needs_qa = True
+            needs_gatekeeper = True
+
+    stages = []
+    if needs_test:
+        stages.append("test")
+    if needs_qa:
+        stages.append("qa")
+    if needs_gatekeeper:
+        stages.append("gatekeeper")
+    stages.append("merge")  # merge is always needed
+
+    return stages
+
+
+def dispatch_next_stage(conn, project_id, task_id, current_stage,
+                        result, metadata, trace_id, graph=None):
+    """Graph-driven routing: determine next stage based on node policies (R2/R5).
+
+    When graph is available and nodes have custom policies, derive the chain
+    stages dynamically. Falls back to CHAIN dict when graph is None or
+    all nodes use default policies (AC5/AC6).
+
+    Returns (next_stage: str|None, skipped_stages: list[str], policies: list[dict]).
+    """
+    # R5: No graph → use linear CHAIN
+    if graph is None:
+        _audit_routing_decision(conn, project_id, task_id, trace_id, {
+            "current_stage": current_stage,
+            "routing_mode": "linear_chain",
+            "reason": "no_graph_loaded",
+        })
+        return None, [], []  # Signal caller to use CHAIN dict
+
+    # Only apply graph routing after dev stage
+    if current_stage not in ("dev", "test", "qa", "gatekeeper"):
+        _audit_routing_decision(conn, project_id, task_id, trace_id, {
+            "current_stage": current_stage,
+            "routing_mode": "linear_chain",
+            "reason": "pre_dev_stage",
+        })
+        return None, [], []  # Use CHAIN dict for pm→dev
+
+    # Get affected nodes from metadata
+    changed_files = result.get("changed_files", metadata.get("changed_files", []))
+    related_nodes = metadata.get("related_nodes", [])
+
+    # Try to get routing policies from graph
+    policies = []
+    if related_nodes:
+        try:
+            policies = graph.get_routing_policies_for_nodes(related_nodes)
+        except Exception:
+            pass
+
+    if not policies and changed_files:
+        try:
+            affected = graph.affected_nodes_by_files(changed_files)
+            if affected:
+                policies = graph.get_routing_policies_for_nodes(list(affected))
+        except Exception:
+            pass
+
+    if not policies:
+        _audit_routing_decision(conn, project_id, task_id, trace_id, {
+            "current_stage": current_stage,
+            "routing_mode": "linear_chain",
+            "reason": "no_affected_nodes",
+        })
+        return None, [], []
+
+    # AC6: Check if all nodes have default policies (auto + verify_level>=1)
+    all_default = all(
+        p.get("gate_mode", "auto") == "auto" and p.get("verify_level", 1) >= 1
+        for p in policies
+    )
+    if all_default:
+        _audit_routing_decision(conn, project_id, task_id, trace_id, {
+            "current_stage": current_stage,
+            "routing_mode": "linear_chain",
+            "reason": "all_nodes_default_policy",
+            "node_count": len(policies),
+        })
+        return None, [], policies
+
+    # AC4: Check verify_requires ordering
+    for p in policies:
+        vr = p.get("verify_requires", [])
+        if vr:
+            satisfied, blocking = _check_verify_requires_satisfied(conn, project_id, vr)
+            if not satisfied:
+                _audit_routing_decision(conn, project_id, task_id, trace_id, {
+                    "current_stage": current_stage,
+                    "routing_mode": "blocked_by_verify_requires",
+                    "node_id": p["node_id"],
+                    "blocking_nodes": blocking,
+                })
+                # Return special signal for blocking
+                return "blocked", [], policies
+
+    # Derive stages from policies
+    derived_stages = _derive_chain_stages_from_policies(policies)
+    full_stages = list(_POST_DEV_STAGES)
+    skipped = [s for s in full_stages if s not in derived_stages]
+
+    # Log skip reasons for auditing
+    for p in policies:
+        gm = p.get("gate_mode", "auto")
+        vl = p.get("verify_level", 1)
+        if gm == "skip":
+            _audit_routing_skip(conn, project_id, task_id, trace_id, {
+                "node_id": p["node_id"],
+                "gate_mode": gm,
+                "skip": "qa,gatekeeper",
+                "reason": "gate_mode=skip bypasses QA/gatekeeper",
+            })
+        if vl == 0:
+            _audit_routing_skip(conn, project_id, task_id, trace_id, {
+                "node_id": p["node_id"],
+                "verify_level": vl,
+                "skip": "test",
+                "reason": "verify_level=0 skips test stage",
+            })
+
+    # Determine next stage from derived_stages based on current position
+    if current_stage == "dev":
+        next_stage = derived_stages[0] if derived_stages else None
+    else:
+        try:
+            idx = derived_stages.index(current_stage)
+            next_stage = derived_stages[idx + 1] if idx + 1 < len(derived_stages) else None
+        except ValueError:
+            next_stage = None
+
+    _audit_routing_decision(conn, project_id, task_id, trace_id, {
+        "current_stage": current_stage,
+        "routing_mode": "graph_driven",
+        "derived_stages": derived_stages,
+        "skipped_stages": skipped,
+        "next_stage": next_stage,
+        "policies": [{"node_id": p["node_id"], "gate_mode": p.get("gate_mode"),
+                       "verify_level": p.get("verify_level")} for p in policies],
+    })
+
+    return next_stage, skipped, policies
+
+
 _TEST_FILE_PATTERN = re.compile(r"(agent/tests/[A-Za-z0-9_./-]+\.py)")
 
 
@@ -854,9 +1103,57 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             _trace_id, _chain_id, depth,
         )
 
+    # --- Graph-driven routing (R2): try graph-based next-stage derivation ---
+    _graph_next = None
+    _graph_skipped = []
+    _graph_policies = []
+    try:
+        from . import project_service
+        _graph = project_service.load_project_graph(project_id)
+    except Exception:
+        _graph = None
+
+    if _graph is not None:
+        _graph_next, _graph_skipped, _graph_policies = dispatch_next_stage(
+            conn, project_id, task_id, task_type, result, metadata, _trace_id, _graph,
+        )
+
+        # Handle blocked by verify_requires (AC4)
+        if _graph_next == "blocked":
+            log.info("auto_chain: routing blocked by verify_requires for task %s", task_id)
+            return {"routing_blocked": True, "reason": "verify_requires not satisfied"}
+
+        # If graph routing returned a specific next stage, override CHAIN lookup
+        if _graph_next is not None:
+            next_type = _graph_next
+            # Find the matching builder and gate for the overridden next_type
+            for _chain_type, (_gfn, _ntype, _bname) in CHAIN.items():
+                if _ntype == next_type:
+                    builder_name = _bname
+                    break
+            # If next_type is in CHAIN as a key (e.g. "merge"), use its gate
+            if next_type in CHAIN:
+                pass  # builder already found above or use current stage's
+
+    # R6/AC7: Audit every routing decision
+    _audit_routing_decision(conn, project_id, task_id, _trace_id, {
+        "current_stage": task_type,
+        "next_stage": next_type,
+        "routing_mode": "graph_driven" if _graph_next else "linear_chain",
+        "skipped_stages": _graph_skipped,
+    })
+
     # Create next stage task (with dedup check)
     builder_fn = _BUILDERS[builder_name]
     prompt, task_meta = builder_fn(task_id, result, metadata)
+
+    # Attach graph routing policies to metadata for downstream stages
+    if _graph_policies:
+        task_meta["_graph_routing_policies"] = [
+            {"node_id": p["node_id"], "gate_mode": p.get("gate_mode"),
+             "verify_level": p.get("verify_level")}
+            for p in _graph_policies
+        ]
 
     # M6: Dedup — check if next stage already exists for this parent
     from . import task_registry

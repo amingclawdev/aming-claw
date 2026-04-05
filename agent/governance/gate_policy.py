@@ -73,6 +73,30 @@ def check_all_gates(
     return len(unsatisfied) == 0, unsatisfied
 
 
+def get_node_specific_gates(
+    graph,
+    node_id: str,
+) -> list[GateRequirement]:
+    """Get node-specific gates from the acceptance graph (R1/AC3).
+
+    When a node defines custom gates, return only those gates.
+    This ensures check_all_gates receives node-specific gates, not global defaults.
+
+    Args:
+        graph: AcceptanceGraph instance (may be None).
+        node_id: The node to get gates for.
+
+    Returns:
+        List of GateRequirement for the node. Empty if graph is None or node not found.
+    """
+    if graph is None:
+        return []
+    try:
+        return graph.get_gates(node_id)
+    except Exception:
+        return []
+
+
 def check_gates_or_raise(
     node_id: str,
     gates: list[GateRequirement],

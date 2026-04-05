@@ -241,16 +241,24 @@ class ImpactAnalyzer:
                 if pattern in cf or cf == pattern:
                     related_docs.update(doc_list)
 
-        # Build affected_nodes list with node details
+        # Build affected_nodes list with node details (R8: include gate_mode and verify_level)
         affected_nodes = []
         for nid in ordered:
             try:
                 nd = self.graph.get_node(nid)
+                vl = nd.get("verify_level", 1)
+                if isinstance(vl, str):
+                    try:
+                        vl = int(vl)
+                    except ValueError:
+                        vl = 1
                 affected_nodes.append({
                     "node_id": nid,
                     "title": nd.get("title", ""),
                     "primary": nd.get("primary", []),
-                    "verify_level": nd.get("verify_level", 1),
+                    "verify_level": vl,
+                    "gate_mode": nd.get("gate_mode", "auto"),
+                    "verify_requires": nd.get("verify_requires", []),
                     "is_direct": nid in direct_hit,
                 })
             except Exception:
