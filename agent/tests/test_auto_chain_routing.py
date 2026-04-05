@@ -290,3 +290,89 @@ class TestEdgeCases:
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = Exception("DB error")
         _audit_routing_decision(mock_conn, "proj", "task", "tr-x", {"test": True})
+
+
+# ---------------------------------------------------------------------------
+# AC7-AC9: Version gate block visibility
+# ---------------------------------------------------------------------------
+
+class TestGateBlockVisibility:
+    """Tests for B1/B6: auto_chain gate block visibility in responses."""
+
+    def _make_db_with_project(self, project_id="test-proj"):
+        """Create in-memory DB with project_version row."""
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
+            "VALUES (?, 'abc123', 'abc123', '[]')",
+            (project_id,),
+        )
+        conn.commit()
+        return conn
+
+    @patch("governance.auto_chain._gate_version_check")
+    @patch("governance.auto_chain._publish_event")
+    def test_ac7_gate_blocked_returns_gate_blocked_true(self, mock_pub, mock_gate):
+        """AC7: When _gate_version_check returns (False, reason), dispatch returns
+        gate_blocked=True and dispatched is not True."""
+        from governance.auto_chain import _do_chain
+
+        conn = self._make_db_with_project()
+        mock_gate.return_value = (False, "dirty workspace (2 files)")
+
+        result = _do_chain(conn, "test-proj", "task-1", "dev", {}, {"chain_depth": 0})
+
+        assert result["gate_blocked"] is True
+        assert result.get("dispatched") is not True
+        assert result.get("reason") == "dirty workspace (2 files)"
+
+    @patch("governance.auto_chain._gate_version_check")
+    @patch("governance.auto_chain._publish_event")
+    def test_ac8_audit_log_inserted_on_gate_block(self, mock_pub, mock_gate):
+        """AC8: When gate blocks, audit_log row with action='auto_chain_gate_blocked'
+        is inserted."""
+        from governance.auto_chain import _do_chain
+
+        conn = self._make_db_with_project()
+        mock_gate.return_value = (False, "server version mismatch")
+
+        _do_chain(conn, "test-proj", "task-1", "dev", {}, {"chain_depth": 0})
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE action='auto_chain_gate_blocked'"
+        ).fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["project_id"] == "test-proj"
+        assert row["task_id"] == "task-1"
+        details = json.loads(row["details_json"])
+        assert "gate_reason" in details
+        assert details["gate_reason"] == "server version mismatch"
+
+    @patch("governance.auto_chain._gate_version_check")
+    @patch("governance.auto_chain._publish_event")
+    def test_ac9_log_warning_on_gate_block(self, mock_pub, mock_gate):
+        """AC9: log.warning is called (not log.info) when gate blocks dispatch."""
+        from governance.auto_chain import _do_chain
+
+        conn = self._make_db_with_project()
+        mock_gate.return_value = (False, "dirty workspace (3 files)")
+
+        with patch("governance.auto_chain.log") as mock_log:
+            _do_chain(conn, "test-proj", "task-1", "dev", {}, {"chain_depth": 0})
+
+            # Verify log.warning was called with the gate block message
+            warning_calls = mock_log.warning.call_args_list
+            gate_block_warnings = [
+                c for c in warning_calls
+                if "version gate blocked" in str(c)
+            ]
+            assert len(gate_block_warnings) >= 1, (
+                f"Expected log.warning with 'version gate blocked', "
+                f"got warning calls: {warning_calls}"
+            )
+            # Verify it includes task_id and project_id
+            call_str = str(gate_block_warnings[0])
+            assert "task-1" in call_str
+            assert "test-proj" in call_str
