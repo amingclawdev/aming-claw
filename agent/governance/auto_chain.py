@@ -741,11 +741,10 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     gate_fn_name, next_type, builder_name = CHAIN[task_type]
 
-    # Pre-gate: version check — warn on server lag but don't block chain
+    # Pre-gate: version check — blocks on stale server or dirty workspace
     ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
     _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
     if not ver_passed:
-        # Only dirty-workspace failures reach here (server-version lag is now warning-only)
         log.info("auto_chain: version gate blocked for task %s: %s", task_id, ver_reason)
         _publish_event("gate.blocked", {
             "project_id": project_id, "task_id": task_id,
@@ -1415,11 +1414,25 @@ def on_subtask_terminal_failure(conn, project_id, task_id):
 # ---------------------------------------------------------------------------
 
 def _gate_version_check(conn, project_id, result, metadata):
-    """Pre-gate: verify the workspace is clean and governance code is current."""
+    """Pre-gate: verify the workspace is clean and governance code is current.
+
+    Returns (True, reason) to pass, (False, reason) to block.
+    Blocking conditions (return False):
+      - SERVER_VERSION != git HEAD (stale server — restart required)
+      - Dirty workspace with non-ignored files (uncommitted changes)
+    Bypass conditions (return True even if mismatch):
+      - _DISABLE_VERSION_GATE=True (development override)
+      - metadata.skip_version_check=True (task-level bypass)
+      - metadata.observer_merge=True (Observer manual merge flow)
+      - Reconciliation bypass (structured reconciliation lane)
+      - Governed dirty-workspace chain (legacy compat)
+    """
     if _DISABLE_VERSION_GATE:
         return True, "version gate disabled (_DISABLE_VERSION_GATE=True)"
     if metadata.get("skip_version_check"):
-        return True, "skipped"
+        return True, "skipped (task metadata)"
+    if metadata.get("observer_merge"):
+        return True, "observer merge bypass"
     if not hasattr(conn, "execute"):
         return True, "no db-capable connection, skipping"
 
@@ -1445,9 +1458,9 @@ def _gate_version_check(conn, project_id, result, metadata):
         _DIRTY_IGNORE = (".claude/", ".claude\\")
         dirty_files = [f for f in dirty_files if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
         if dirty_files:
-            log.warning("version_check: dirty workspace (%d files: %s) — chain continues as warning",
+            log.warning("version_check: dirty workspace (%d files: %s) — blocking chain",
                         len(dirty_files), dirty_files[:5])
-            return True, f"dirty workspace warning ({len(dirty_files)} files)"
+            return False, f"dirty workspace ({len(dirty_files)} files: {dirty_files[:3]})"
 
         from .server import SERVER_VERSION
         import subprocess
@@ -1461,9 +1474,11 @@ def _gate_version_check(conn, project_id, result, metadata):
         if SERVER_VERSION == "unknown":
             return True, "server version unavailable, skipping"
         if SERVER_VERSION != head:
-            log.warning("version_check: server version (%s) behind git HEAD (%s) — chain continues",
+            log.warning("version_check: server version (%s) behind git HEAD (%s) — blocking chain. "
+                        "Restart governance service to resolve.",
                         SERVER_VERSION, head)
-            return True, f"server version lag ({SERVER_VERSION} != {head}), warning only"
+            return False, (f"server version ({SERVER_VERSION}) != git HEAD ({head}). "
+                           f"Restart governance service to update.")
         return True, f"version match: {SERVER_VERSION}"
     except Exception as e:
         log.warning("version_check failed (non-fatal): %s", e)

@@ -17,8 +17,8 @@ class TestVersionGateRound4(unittest.TestCase):
         mock_server.SERVER_VERSION = version
         return mock.patch.dict("sys.modules", {"governance.server": mock_server})
 
-    def test_dirty_workspace_is_warning_not_blocker(self):
-        """D5: dirty workspace (non-.claude files) is warning-only, not a blocker."""
+    def test_dirty_workspace_blocks_chain(self):
+        """Dirty workspace (non-.claude files) blocks the chain."""
         from governance import auto_chain
 
         conn = mock.Mock()
@@ -33,8 +33,8 @@ class TestVersionGateRound4(unittest.TestCase):
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, {})
 
-        self.assertTrue(passed)
-        self.assertIn("dirty workspace warning", reason)
+        self.assertFalse(passed)
+        self.assertIn("dirty workspace", reason)
 
     def test_claude_config_dirty_files_are_ignored(self):
         """D5: .claude/ files are filtered out of dirty_files entirely."""
@@ -80,7 +80,17 @@ class TestVersionGateRound4(unittest.TestCase):
             passed, reason = auto_chain._gate_version_check(mock.Mock(), "aming-claw", {}, {"skip_version_check": True})
 
         self.assertTrue(passed)
-        self.assertEqual(reason, "skipped")
+        self.assertIn("skipped", reason)
+
+    def test_observer_merge_bypasses_gate(self):
+        """observer_merge=True in metadata bypasses the version gate."""
+        from governance import auto_chain
+
+        with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False):
+            passed, reason = auto_chain._gate_version_check(mock.Mock(), "aming-claw", {}, {"observer_merge": True})
+
+        self.assertTrue(passed)
+        self.assertIn("observer merge bypass", reason)
 
     def test_governed_dirty_workspace_chain_bypasses_gate_via_parent_metadata(self):
         from governance import auto_chain
@@ -115,8 +125,7 @@ class TestVersionGateRound4(unittest.TestCase):
 
     # --- AC4: reconciliation bypass requires observer_authorized ---
     def test_reconciliation_bypass_requires_observer_authorized(self):
-        """AC4: _gate_version_check blocks when metadata has reconciliation_lane='A'
-        but observer_authorized is missing/false."""
+        """AC4: without reconciliation bypass, dirty workspace blocks."""
         from governance import auto_chain
 
         conn = mock.Mock()
@@ -128,18 +137,18 @@ class TestVersionGateRound4(unittest.TestCase):
 
         metadata_no_auth = {
             "reconciliation_lane": "A",
-            # observer_authorized is missing
+            # observer_authorized is missing — reconciliation bypass won't trigger
         }
         with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False), \
              self._patch_server_version("abc1234"), \
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata_no_auth)
 
-        # Dirty workspace is now warning-only (D5), so gate passes regardless of reconciliation auth
-        self.assertTrue(passed)
-        self.assertIn("dirty workspace warning", reason)
+        # Dirty workspace blocks (no bypass triggered)
+        self.assertFalse(passed)
+        self.assertIn("dirty workspace", reason)
 
-        # Also test with observer_authorized=False — still passes since dirty is warning-only
+        # Also test with observer_authorized=False — still blocks
         metadata_false_auth = {
             "reconciliation_lane": "A",
             "observer_authorized": False,
@@ -149,8 +158,8 @@ class TestVersionGateRound4(unittest.TestCase):
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata_false_auth)
 
-        self.assertTrue(passed)
-        self.assertIn("dirty workspace warning", reason)
+        self.assertFalse(passed)
+        self.assertIn("dirty workspace", reason)
 
     # --- AC5: reconciliation bypass passes with full policy ---
     def test_reconciliation_bypass_passes_with_full_policy(self):
@@ -178,10 +187,9 @@ class TestVersionGateRound4(unittest.TestCase):
         self.assertIn("reconciliation-bypass", reason)
         self.assertIn("task-observer-001", reason)
 
-    # --- AC6 (D3 update): server version mismatch is now warning-only ---
-    def test_server_version_mismatch_is_warning_only(self):
-        """D3: _gate_version_check warns but does NOT block when SERVER_VERSION != HEAD.
-        Only dirty-workspace failures should block."""
+    # --- Server version mismatch now blocks (restored from D3 warning-only) ---
+    def test_server_version_mismatch_blocks_chain(self):
+        """SERVER_VERSION != HEAD blocks the chain. Restart service to resolve."""
         from governance import auto_chain
 
         conn = mock.Mock()
@@ -191,14 +199,26 @@ class TestVersionGateRound4(unittest.TestCase):
             "dirty_files": "[]",
         }
 
-        metadata = {}  # no reconciliation fields at all
+        metadata = {}
         with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False), \
              self._patch_server_version("abc1234"), \
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="def5678\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata)
 
+        self.assertFalse(passed)
+        self.assertIn("server version", reason)
+        self.assertIn("Restart", reason)
+
+    def test_server_version_mismatch_bypassed_by_observer_merge(self):
+        """observer_merge metadata lets chain proceed despite version mismatch."""
+        from governance import auto_chain
+
+        metadata = {"observer_merge": True}
+        with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False):
+            passed, reason = auto_chain._gate_version_check(mock.Mock(), "aming-claw", {}, metadata)
+
         self.assertTrue(passed)
-        self.assertIn("warning only", reason)
+        self.assertIn("observer merge bypass", reason)
 
     # --- Test RECONCILIATION_BYPASS_POLICY structure (AC1) ---
     def test_reconciliation_bypass_policy_structure(self):
