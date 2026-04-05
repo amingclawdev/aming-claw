@@ -302,11 +302,18 @@ class ToolDispatcher:
 
         # --- Executor tools ---
         if name == "executor_status":
+            result = {}
             if self._svc:
-                return self._svc.status()
+                result = self._svc.status()
+            # R9: Include worker pool status if available
             if self._pool:
-                return self._pool.status()
-            return {"mode": "external", "message": "No executor manager configured"}
+                pool_status = self._pool.status()
+                result.update(pool_status)
+            elif hasattr(self._svc, '_worker_pool_status'):
+                result.update(self._svc._worker_pool_status())
+            if not result:
+                return {"mode": "external", "message": "No executor manager configured"}
+            return result
 
         if name == "executor_scale":
             if self._svc:

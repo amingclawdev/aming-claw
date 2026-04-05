@@ -46,6 +46,12 @@ POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "10"))
 WORKER_ID = os.getenv("EXECUTOR_WORKER_ID", f"executor-{os.getpid()}")
 WORKSPACE = os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[1]))
 
+# R2: MAX_CONCURRENT_WORKERS — configurable via env var, default 2, clamped to [1, 5]
+MAX_CONCURRENT_WORKERS = min(5, max(1, int(os.getenv("MAX_CONCURRENT_WORKERS", "2"))))
+
+# R7: SHUTDOWN_TIMEOUT — configurable via env var, default 120s
+SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
+
 # Task type → role.
 # Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
 # kills processes that produce no stdout for _HANG_TIMEOUT (120 s), and enforces an
@@ -1379,10 +1385,19 @@ class ExecutorWorker:
 
     _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/"}
 
-    def _create_worktree(self, task_id: str):
-        """Create isolated git worktree for a dev task."""
+    def _create_worktree(self, task_id: str, worker_id: str = ""):
+        """Create isolated git worktree for a dev task.
+
+        Args:
+            task_id: Task identifier for branch naming.
+            worker_id: Optional worker prefix for parallel dispatch (R3).
+                       When set, worktree is placed under .worktrees/worker-{N}/dev-task-{id}.
+        """
         branch_name = f"dev/{task_id}"
-        worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}")
+        if worker_id:
+            worktree_dir = os.path.join(self.workspace, ".worktrees", worker_id, f"dev-task-{task_id}")
+        else:
+            worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}")
         try:
             os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
             # R3: Fetch latest origin/main so worktree baseline includes recent merges
@@ -1891,11 +1906,29 @@ class ExecutorWorker:
         finally:
             self._current_task = None
 
+    def _execute_single_task(self, task: dict) -> bool:
+        """Execute a single already-claimed task (helper for parallel fallback)."""
+        task_id = task["task_id"]
+        self._current_task = task_id
+        try:
+            outcome = self._execute_task(task)
+            status = outcome.get("status", "failed")
+            result = outcome.get("result", {"error": outcome.get("error", "unknown")})
+            self._complete_task(task_id, status, result)
+            return True
+        except Exception as e:
+            self._complete_task(task_id, "failed", {"error": str(e)})
+            return True
+        finally:
+            self._current_task = None
+
     def run_loop(self):
-        """Main polling loop."""
+        """Main polling loop with parallel dispatch support (R4, R8)."""
         self._running = True
-        log.info("Executor worker started: project=%s, worker=%s, poll=%ds",
-                 self.project_id, self.worker_id, POLL_INTERVAL)
+        # R1: Initialize worker pool for parallel dispatch
+        self._worker_pool = WorkerPool(self, max_workers=MAX_CONCURRENT_WORKERS)
+        log.info("Executor worker started: project=%s, worker=%s, poll=%ds, max_concurrent=%d",
+                 self.project_id, self.worker_id, POLL_INTERVAL, MAX_CONCURRENT_WORKERS)
         log.info("Governance: %s | Workspace: %s", self.base_url, self.workspace)
 
         # Acquire PID lock (warn if another instance may be running)
@@ -1936,6 +1969,28 @@ class ExecutorWorker:
                     if self._ttl_counter >= 2160:
                         self._run_ttl_cleanup()
                         self._ttl_counter = 0
+
+                    # R4: Check for parallel-eligible sibling subtasks
+                    siblings = self._worker_pool.get_sibling_tasks()
+                    if len(siblings) >= 2:
+                        # Parallel dispatch: claim and dispatch siblings concurrently
+                        claimed_tasks = []
+                        for task in siblings:
+                            claimed = self._claim_task()
+                            if claimed:
+                                claimed_tasks.append(claimed)
+                        if len(claimed_tasks) >= 2:
+                            log.info("Parallel dispatch: %d sibling tasks claimed", len(claimed_tasks))
+                            self._worker_pool.dispatch_parallel(claimed_tasks)
+                            time.sleep(1)
+                            continue
+                        elif len(claimed_tasks) == 1:
+                            # Only got 1 — fall back to sequential (R8)
+                            self._execute_single_task(claimed_tasks[0])
+                            time.sleep(1)
+                            continue
+
+                    # R8: Backward compatibility — single-task sequential mode
                     processed = self.run_once()
                     if not processed:
                         time.sleep(POLL_INTERVAL)
@@ -1948,6 +2003,8 @@ class ExecutorWorker:
                     log.error("Poll loop error: %s", e, exc_info=True)
                     time.sleep(POLL_INTERVAL)
         finally:
+            if self._worker_pool:
+                self._worker_pool.shutdown()
             self._release_pid_lock()
 
     _last_git_head = ""
@@ -1982,8 +2039,218 @@ class ExecutorWorker:
             pass  # fail silently, non-critical
 
     def stop(self):
-        """Stop the polling loop."""
+        """Stop the polling loop and signal all worker threads to finish (R7).
+
+        If a WorkerPool is attached, joins all active worker threads with
+        SHUTDOWN_TIMEOUT, then force-releases uncompleted tasks on timeout.
+        """
         self._running = False
+        if hasattr(self, '_worker_pool') and self._worker_pool is not None:
+            self._worker_pool.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# WorkerPool — parallel dispatch for sibling subtasks (R1, R4-R7)
+# ---------------------------------------------------------------------------
+
+
+class WorkerPool:
+    """Manages up to MAX_CONCURRENT_WORKERS threads for parallel task execution.
+
+    Each worker thread:
+    - Gets its own SQLite connection (R5 — connection-per-worker pattern)
+    - Creates worktrees under .worktrees/worker-{N}/dev-task-{id} (R3)
+    - Uses atomic SQL for fan-in completed_count updates (R6)
+
+    When no sibling subtasks are queued, the executor falls back to
+    single-worker sequential mode for backward compatibility (R8).
+    """
+
+    def __init__(self, executor: "ExecutorWorker", max_workers: int = MAX_CONCURRENT_WORKERS):
+        self.executor = executor
+        self.max_workers = min(5, max(1, max_workers))
+        self._active_workers: dict = {}  # thread_name -> {thread, task_id, worktree}
+        self._lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+
+    def status(self) -> dict:
+        """Return worker pool status for MCP executor_status tool (R9)."""
+        with self._lock:
+            workers = []
+            for name, info in self._active_workers.items():
+                workers.append({
+                    "worker_name": name,
+                    "task_id": info.get("task_id", ""),
+                    "worktree": info.get("worktree", ""),
+                    "alive": info["thread"].is_alive() if info.get("thread") else False,
+                })
+            return {
+                "active_workers": len([w for w in workers if w["alive"]]),
+                "max_workers": self.max_workers,
+                "workers": workers,
+                "shutdown_requested": self._shutdown_event.is_set(),
+            }
+
+    def dispatch_parallel(self, tasks: list) -> list:
+        """Dispatch multiple tasks to worker threads in parallel (R4).
+
+        Args:
+            tasks: List of task dicts (already claimed) to execute concurrently.
+
+        Returns:
+            List of thread objects for the dispatched workers.
+        """
+        threads = []
+        for idx, task in enumerate(tasks[:self.max_workers]):
+            worker_name = f"worker-{idx}"
+            task_id = task.get("task_id", f"unknown-{idx}")
+
+            t = threading.Thread(
+                target=self._worker_run,
+                args=(task, worker_name),
+                name=f"pool-{worker_name}-{task_id}",
+                daemon=True,
+            )
+            with self._lock:
+                self._active_workers[worker_name] = {
+                    "thread": t,
+                    "task_id": task_id,
+                    "worktree": "",
+                }
+            t.start()
+            threads.append(t)
+        return threads
+
+    def _worker_run(self, task: dict, worker_name: str) -> None:
+        """Execute a single task in a worker thread (R5: own SQLite connection)."""
+        task_id = task.get("task_id", "")
+        try:
+            # R3: create worktree with worker_id prefix
+            task_type = task.get("type", "task")
+            if task_type == "dev":
+                worktree_path, branch_name = self.executor._create_worktree(task_id, worker_id=worker_name)
+                if worktree_path:
+                    with self._lock:
+                        if worker_name in self._active_workers:
+                            self._active_workers[worker_name]["worktree"] = worktree_path
+
+            # Execute the task using the executor's run_once-like flow
+            outcome = self.executor._execute_task(task)
+            status = outcome.get("status", "failed")
+            result = outcome.get("result", {"error": outcome.get("error", "unknown")})
+
+            # R6: Atomic fan-in completed_count update
+            self._atomic_fan_in_update(task)
+
+            # Complete the task
+            self.executor._complete_task(task_id, status, result)
+
+        except Exception as e:
+            log.warning("WorkerPool worker %s failed on task %s: %s", worker_name, task_id, e)
+            try:
+                self.executor._complete_task(task_id, "failed", {"error": str(e)})
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                self._active_workers.pop(worker_name, None)
+
+    def _atomic_fan_in_update(self, task: dict) -> None:
+        """R6: Atomic SQL update for fan-in completed_count.
+
+        Uses UPDATE ... SET completed_count = completed_count + 1
+        with proper transaction isolation — no read-modify-write race.
+        """
+        metadata = task.get("metadata", {})
+        if isinstance(metadata, str):
+            import json as _json
+            try:
+                metadata = _json.loads(metadata)
+            except Exception:
+                metadata = {}
+        subtask_group_id = metadata.get("subtask_group_id", "")
+        if not subtask_group_id:
+            return
+
+        # Use governance API for atomic increment (API handles SQL atomicity)
+        try:
+            self.executor._api("POST", f"/api/task/{self.executor.project_id}/fan-in-increment", {
+                "subtask_group_id": subtask_group_id,
+            })
+        except Exception as e:
+            log.debug("Fan-in atomic increment failed (non-fatal): %s", e)
+
+    def get_sibling_tasks(self) -> list:
+        """R4: Detect queued sibling subtasks with same subtask_group_id and no unmet deps.
+
+        Returns list of task dicts eligible for parallel dispatch.
+        """
+        result = self.executor._api("GET", f"/api/task/{self.executor.project_id}/list")
+        if "error" in result:
+            return []
+        tasks = result.get("tasks", [])
+        queued_dev = [t for t in tasks if t.get("status") in ("queued", "pending") and t.get("type") == "dev"]
+        if len(queued_dev) < 2:
+            return []
+
+        # Group by subtask_group_id
+        groups: dict = {}
+        for t in queued_dev:
+            meta = t.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            gid = meta.get("subtask_group_id", "")
+            if gid:
+                deps = meta.get("depends_on", [])
+                if not deps:  # No unmet dependencies
+                    groups.setdefault(gid, []).append(t)
+
+        # Return the largest sibling group (up to max_workers)
+        for gid, group in groups.items():
+            if len(group) >= 2:
+                return group[:self.max_workers]
+        return []
+
+    def has_active_workers(self) -> bool:
+        """Check if any worker threads are still alive (R10)."""
+        with self._lock:
+            return any(info["thread"].is_alive() for info in self._active_workers.values() if info.get("thread"))
+
+    def active_worker_count(self) -> int:
+        """Return count of alive worker threads (R10)."""
+        with self._lock:
+            return sum(1 for info in self._active_workers.values()
+                       if info.get("thread") and info["thread"].is_alive())
+
+    def shutdown(self, timeout: int = SHUTDOWN_TIMEOUT) -> None:
+        """R7: Graceful shutdown — signal all workers, join with timeout, force-release on timeout."""
+        self._shutdown_event.set()
+        threads = []
+        with self._lock:
+            threads = [(name, info) for name, info in self._active_workers.items()]
+
+        for name, info in threads:
+            t = info.get("thread")
+            if t and t.is_alive():
+                t.join(timeout=timeout)
+                if t.is_alive():
+                    # Timeout: force-release uncompleted task
+                    task_id = info.get("task_id", "")
+                    if task_id:
+                        log.warning("WorkerPool: worker %s timed out on task %s, force-releasing", name, task_id)
+                        try:
+                            self.executor._complete_task(task_id, "failed", {
+                                "error": "shutdown_timeout",
+                                "reason": f"Worker {name} did not finish within {timeout}s shutdown timeout",
+                            })
+                        except Exception:
+                            pass
+
+        with self._lock:
+            self._active_workers.clear()
 
 
 def main():

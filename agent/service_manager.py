@@ -150,6 +150,9 @@ class ServiceManager:
         self._restart_times: list = []               # monotonic timestamps for circuit-breaker window
         self._circuit_breaker_tripped: bool = False
 
+        # R10: Worker pool awareness — track external worker threads
+        self._worker_pool = None  # Set by executor when WorkerPool is initialized
+
     # ------------------------------------------------------------------
     # start / stop
     # ------------------------------------------------------------------
@@ -334,7 +337,7 @@ class ServiceManager:
         else:
             health = "healthy"
 
-        return {
+        result = {
             "pid": pid,
             "running": running,
             "uptime_s": uptime_s,
@@ -345,6 +348,21 @@ class ServiceManager:
             "health": health,
             "circuit_breaker": self._circuit_breaker_tripped,
         }
+        # R10: Include worker pool status if available
+        pool_status = self._worker_pool_status()
+        if pool_status:
+            result.update(pool_status)
+        return result
+
+    def set_worker_pool(self, pool) -> None:
+        """R10: Register a WorkerPool instance for lifecycle monitoring."""
+        self._worker_pool = pool
+
+    def _worker_pool_status(self) -> dict:
+        """R10: Get worker pool status if pool is registered."""
+        if self._worker_pool and hasattr(self._worker_pool, 'status'):
+            return self._worker_pool.status()
+        return {}
 
     # ------------------------------------------------------------------
     # Monitor loop
@@ -389,7 +407,17 @@ class ServiceManager:
                     continue
 
                 if proc.poll() is None:
-                    # Still alive — nothing to do
+                    # Still alive — also check worker threads (R10)
+                    if self._worker_pool and hasattr(self._worker_pool, 'active_worker_count'):
+                        try:
+                            worker_count = self._worker_pool.active_worker_count()
+                            if worker_count > 0:
+                                log.debug(
+                                    "ServiceManager._monitor_loop: %d active worker thread(s)",
+                                    worker_count,
+                                )
+                        except Exception:
+                            pass
                     continue
 
                 # ---- Process has died ----
