@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Path bootstrap so we can import utils regardless of CWD
@@ -246,16 +249,51 @@ def rebuild_governance() -> tuple[bool, str]:
 # 3b. restart_local_governance (fallback for non-Docker environments)
 # ---------------------------------------------------------------------------
 
+def _is_port_free(port: int) -> bool:
+    """Check whether *port* is available for binding (R4: port release verification)."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _read_stderr_log(stderr_path: str | Path, max_bytes: int = 2000) -> str:
+    """Read and return the tail of the stderr log file (R5: include stderr on failure)."""
+    try:
+        p = Path(stderr_path)
+        if p.exists():
+            content = p.read_text(encoding="utf-8", errors="replace")
+            if len(content) > max_bytes:
+                return f"...truncated...\n{content[-max_bytes:]}"
+            return content
+    except Exception:
+        pass
+    return ""
+
+
 def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
     """Kill and restart governance as a local Python process.
 
     Fallback when Docker is not available or Docker rebuild fails.
     Returns (success, output_summary).
+
+    Fixes applied (B7):
+    - R1: stderr redirected to temp log file for diagnosis
+    - R2: proc.poll() detects immediate crash before health check
+    - R3: 4-attempt health check retry loop (matching rebuild_governance)
+    - R4: port-free verification between kill and start
+    - R5: stderr log content included in failure summary
+    - R6: log.warning on restart failure
     """
+    import tempfile
     import time as _time
     output_lines: list[str] = []
+    stderr_path = None
 
-    # Step 1: Find PID listening on the port
+    # Step 1: Find and kill PID listening on the port
     try:
         if sys.platform == "win32":
             result = subprocess.run(
@@ -274,7 +312,6 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
                     capture_output=True, timeout=10,
                 )
                 output_lines.append(f"killed PID {pid}")
-                _time.sleep(1)
             else:
                 output_lines.append(f"no process found on port {port}")
         else:
@@ -290,41 +327,105 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
                     output_lines.append(f"killed PID {p}")
                 except Exception:
                     pass
-            if pids:
-                _time.sleep(1)
     except Exception as exc:
         output_lines.append(f"kill step failed: {exc}")
 
+    # R4: Wait for port release (Windows TIME_WAIT can hold for seconds)
+    for _wait in range(10):  # up to 5s (10 x 0.5s)
+        if _is_port_free(port):
+            if _wait > 0:
+                output_lines.append(f"port {port} released after {_wait * 0.5:.1f}s")
+            break
+        _time.sleep(0.5)
+    else:
+        output_lines.append(f"port {port} still held after 5s — proceeding anyway")
+
     # Step 2: Restart the governance server
+    # R1: Redirect stderr to temp file for diagnosis (not DEVNULL)
     try:
+        stderr_fd = tempfile.NamedTemporaryFile(
+            mode="w", prefix="governance_stderr_", suffix=".log",
+            delete=False,
+        )
+        stderr_path = stderr_fd.name
         repo_root = Path(__file__).resolve().parent.parent
         python_exe = sys.executable or "python"
         proc = subprocess.Popen(
             [python_exe, "-m", "agent.governance.server"],
             cwd=str(repo_root),
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_fd,
             start_new_session=True,
         )
+        stderr_fd.close()  # Process owns the fd now via inheritance
         output_lines.append(f"started PID {proc.pid}")
+        output_lines.append(f"stderr log: {stderr_path}")
     except Exception as exc:
         output_lines.append(f"start failed: {exc}")
+        log.warning("restart_local_governance: start failed: %s", exc)
         return False, "\n".join(output_lines)
 
-    # Step 3: Health check
-    _time.sleep(3)
+    # R2: Check for immediate crash before health check
+    _time.sleep(1)
+    exit_code = proc.poll()
+    if exit_code is not None:
+        stderr_content = _read_stderr_log(stderr_path)
+        output_lines.append(f"process crashed immediately (exit code {exit_code})")
+        if stderr_content:
+            output_lines.append(f"stderr:\n{stderr_content}")
+        log.warning(
+            "restart_local_governance: process PID %d crashed immediately (exit=%d), stderr: %s",
+            proc.pid, exit_code, stderr_content[:500],
+        )
+        return False, "\n".join(output_lines)
+
+    # Step 3: R3: Health check with retry (4 attempts, 5s between, 10s timeout)
     try:
         import requests
-        resp = requests.get(f"http://localhost:{port}/api/health", timeout=5)
-        if resp.status_code == 200:
-            output_lines.append("[health] governance OK")
-            return True, "\n".join(output_lines)
-        else:
-            output_lines.append(f"[health] HTTP {resp.status_code}")
-            return False, "\n".join(output_lines)
+
+        for attempt in range(4):  # 0, 1, 2, 3 — up to ~20s total wait
+            if attempt > 0:
+                _time.sleep(5)
+            # R2: Also check process is still alive during retries
+            if proc.poll() is not None:
+                stderr_content = _read_stderr_log(stderr_path)
+                output_lines.append(
+                    f"process died during health check (exit code {proc.returncode})"
+                )
+                if stderr_content:
+                    output_lines.append(f"stderr:\n{stderr_content}")
+                log.warning(
+                    "restart_local_governance: process died during health check (exit=%s), stderr: %s",
+                    proc.returncode, stderr_content[:500],
+                )
+                return False, "\n".join(output_lines)
+            try:
+                resp = requests.get(f"http://localhost:{port}/api/health", timeout=10)
+                if resp.status_code == 200:
+                    output_lines.append(f"[health] governance OK (attempt {attempt + 1})")
+                    return True, "\n".join(output_lines)
+                elif attempt < 3:
+                    continue
+                else:
+                    output_lines.append(
+                        f"[health] HTTP {resp.status_code} after {attempt + 1} attempts"
+                    )
+            except Exception:
+                if attempt < 3:
+                    continue
+                raise
     except Exception as exc:
-        output_lines.append(f"[health] unreachable: {exc}")
-        return False, "\n".join(output_lines)
+        output_lines.append(f"[health] unreachable after 4 attempts: {exc}")
+
+    # R5/R6: Failure path — include stderr log and log warning
+    stderr_content = _read_stderr_log(stderr_path)
+    if stderr_content:
+        output_lines.append(f"stderr:\n{stderr_content}")
+    log.warning(
+        "restart_local_governance: health check failed after 4 attempts. PID=%s, stderr: %s",
+        proc.pid, stderr_content[:500] if stderr_content else "(empty)",
+    )
+    return False, "\n".join(output_lines)
 
 
 # ---------------------------------------------------------------------------
