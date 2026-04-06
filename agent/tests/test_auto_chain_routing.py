@@ -376,3 +376,171 @@ class TestGateBlockVisibility:
             call_str = str(gate_block_warnings[0])
             assert "task-1" in call_str
             assert "test-proj" in call_str
+
+
+# ---------------------------------------------------------------------------
+# B2: skip_version_check access control + audit trail
+# ---------------------------------------------------------------------------
+
+class TestVersionGateBypassAccessControl:
+    """Tests for skip_version_check operator_id/bypass_reason validation."""
+
+    def test_bypass_rejected_when_operator_id_missing(self):
+        """skip_version_check is ignored when operator_id is missing."""
+        from governance.auto_chain import _gate_version_check
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
+            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
+        )
+        conn.commit()
+
+        metadata = {"skip_version_check": True, "bypass_reason": "testing"}
+        with patch("governance.auto_chain.log") as mock_log, \
+             patch("governance.auto_chain.SERVER_VERSION", "abc123", create=True), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="abc123\n")
+            passed, reason = _gate_version_check(conn, "test-proj", {}, metadata)
+
+        # Should NOT have returned early with bypass — falls through to normal check
+        # The warning should have been logged
+        warning_calls = mock_log.warning.call_args_list
+        skip_warnings = [c for c in warning_calls if "skip_version_check ignored" in str(c)]
+        assert len(skip_warnings) >= 1, f"Expected skip_version_check warning, got: {warning_calls}"
+
+    def test_bypass_rejected_when_bypass_reason_missing(self):
+        """skip_version_check is ignored when bypass_reason is missing."""
+        from governance.auto_chain import _gate_version_check
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
+            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
+        )
+        conn.commit()
+
+        metadata = {"skip_version_check": True, "operator_id": "admin"}
+        with patch("governance.auto_chain.log") as mock_log, \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="abc123\n")
+            passed, reason = _gate_version_check(conn, "test-proj", {}, metadata)
+
+        warning_calls = mock_log.warning.call_args_list
+        skip_warnings = [c for c in warning_calls if "skip_version_check ignored" in str(c)]
+        assert len(skip_warnings) >= 1, f"Expected skip_version_check warning, got: {warning_calls}"
+
+    def test_bypass_rejected_when_both_missing(self):
+        """skip_version_check is ignored when both fields are missing."""
+        from governance.auto_chain import _gate_version_check
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
+            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
+        )
+        conn.commit()
+
+        metadata = {"skip_version_check": True}
+        with patch("governance.auto_chain.log") as mock_log, \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="abc123\n")
+            passed, reason = _gate_version_check(conn, "test-proj", {}, metadata)
+
+        warning_calls = mock_log.warning.call_args_list
+        skip_warnings = [c for c in warning_calls if "skip_version_check ignored" in str(c)]
+        assert len(skip_warnings) >= 1
+
+
+class TestVersionGateBypassAudit:
+    """Tests for version_gate_bypass audit trail."""
+
+    def test_audit_row_inserted_on_valid_bypass(self):
+        """When operator_id and bypass_reason are valid, audit row is inserted."""
+        from governance.auto_chain import _audit_version_gate_bypass
+        conn = _make_in_memory_db()
+
+        _audit_version_gate_bypass(conn, "test-proj", "task-1", "admin-user", "hotfix deploy", "dev")
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE action='version_gate_bypass'"
+        ).fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["project_id"] == "test-proj"
+        assert row["task_id"] == "task-1"
+        assert row["actor"] == "admin-user"
+        details = json.loads(row["details_json"])
+        assert details["bypass_reason"] == "hotfix deploy"
+        assert details["task_type"] == "dev"
+
+    def test_valid_bypass_returns_true(self):
+        """_gate_version_check returns True when skip_version_check has valid credentials."""
+        from governance.auto_chain import _gate_version_check
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
+            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
+        )
+        conn.commit()
+
+        metadata = {
+            "skip_version_check": True,
+            "operator_id": "admin",
+            "bypass_reason": "emergency fix",
+        }
+        passed, reason = _gate_version_check(conn, "test-proj", {}, metadata)
+        assert passed is True
+        assert reason == "skipped (task metadata)"
+
+        # Verify audit row was inserted
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE action='version_gate_bypass'"
+        ).fetchall()
+        assert len(rows) == 1
+
+
+class TestVersionGateBypassFrequency:
+    """Tests for high bypass frequency warning."""
+
+    def test_high_frequency_warning_logged(self):
+        """When >3 bypasses in 24h, a warning is logged."""
+        from governance.auto_chain import _audit_version_gate_bypass
+        conn = _make_in_memory_db()
+
+        # Insert 3 existing bypass events
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+                "VALUES (?, 'version_gate_bypass', 'prev-op', 1, datetime('now'), ?, '{}')",
+                ("test-proj", f"task-prev-{i}"),
+            )
+        conn.commit()
+
+        # 4th bypass should trigger the warning
+        with patch("governance.auto_chain.log") as mock_log:
+            _audit_version_gate_bypass(conn, "test-proj", "task-4", "admin", "test reason", "dev")
+
+        warning_calls = mock_log.warning.call_args_list
+        freq_warnings = [c for c in warning_calls if "high bypass frequency" in str(c)]
+        assert len(freq_warnings) == 1, f"Expected 1 high frequency warning, got: {warning_calls}"
+
+    def test_no_warning_at_3_or_fewer(self):
+        """When <=3 bypasses in 24h, no warning is logged."""
+        from governance.auto_chain import _audit_version_gate_bypass
+        conn = _make_in_memory_db()
+
+        # Insert 2 existing bypass events
+        for i in range(2):
+            conn.execute(
+                "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+                "VALUES (?, 'version_gate_bypass', 'prev-op', 1, datetime('now'), ?, '{}')",
+                ("test-proj", f"task-prev-{i}"),
+            )
+        conn.commit()
+
+        # 3rd bypass should NOT trigger the warning
+        with patch("governance.auto_chain.log") as mock_log:
+            _audit_version_gate_bypass(conn, "test-proj", "task-3", "admin", "test reason", "dev")
+
+        warning_calls = mock_log.warning.call_args_list
+        freq_warnings = [c for c in warning_calls if "high bypass frequency" in str(c)]
+        assert len(freq_warnings) == 0, f"Expected no frequency warning, got: {warning_calls}"

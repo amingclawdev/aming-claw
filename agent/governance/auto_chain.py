@@ -94,6 +94,40 @@ def _audit_reconciliation_bypass(conn, project_id, task_id, observer_task_id, la
     except Exception:
         log.debug("audit reconciliation_bypass failed (non-critical)", exc_info=True)
 
+
+def _audit_version_gate_bypass(conn, project_id, task_id, operator_id, bypass_reason, task_type):
+    """Write version_gate_bypass event to audit_log and check frequency."""
+    try:
+        conn.execute(
+            "INSERT INTO audit_log (project_id, action, actor, ok, ts, task_id, details_json) "
+            "VALUES (?, ?, ?, ?, datetime('now'), ?, ?)",
+            (
+                project_id,
+                "version_gate_bypass",
+                operator_id,
+                1,
+                task_id,
+                json.dumps({
+                    "bypass_reason": bypass_reason,
+                    "task_type": task_type,
+                }),
+            ),
+        )
+        # R3: Check bypass frequency in last 24 hours
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM audit_log "
+            "WHERE action='version_gate_bypass' AND project_id=? "
+            "AND ts >= datetime('now', '-24 hours')",
+            (project_id,),
+        ).fetchone()
+        count = row[0] if row else 0
+        if count > 3:
+            log.warning("high bypass frequency: %d version_gate_bypass events for project %s in last 24h",
+                        count, project_id)
+    except Exception:
+        log.debug("audit version_gate_bypass failed (non-critical)", exc_info=True)
+
+
 # Chain definition: task_type → (gate_fn, next_type, prompt_builder)
 # next_type=None means terminal stage (deploy trigger)
 CHAIN = {
@@ -1459,7 +1493,22 @@ def _gate_version_check(conn, project_id, result, metadata):
     if _DISABLE_VERSION_GATE:
         return True, "version gate disabled (_DISABLE_VERSION_GATE=True)"
     if metadata.get("skip_version_check"):
-        return True, "skipped (task metadata)"
+        operator_id = metadata.get("operator_id", "")
+        bypass_reason = metadata.get("bypass_reason", "")
+        if not isinstance(operator_id, str) or not operator_id.strip():
+            missing = ["operator_id"]
+            if not isinstance(bypass_reason, str) or not bypass_reason.strip():
+                missing.append("bypass_reason")
+            log.warning("skip_version_check ignored — missing required fields: %s (task metadata: %s)",
+                        missing, {k: metadata.get(k) for k in ("skip_version_check", "operator_id", "bypass_reason")})
+        elif not isinstance(bypass_reason, str) or not bypass_reason.strip():
+            log.warning("skip_version_check ignored — missing required fields: %s (task metadata: %s)",
+                        ["bypass_reason"], {k: metadata.get(k) for k in ("skip_version_check", "operator_id", "bypass_reason")})
+        else:
+            task_id = metadata.get("task_id") or metadata.get("parent_task_id") or "unknown"
+            task_type = metadata.get("task_type", "unknown")
+            _audit_version_gate_bypass(conn, project_id, task_id, operator_id.strip(), bypass_reason.strip(), task_type)
+            return True, "skipped (task metadata)"
     if metadata.get("observer_merge"):
         return True, "observer merge bypass"
     if not hasattr(conn, "execute"):
