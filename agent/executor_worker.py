@@ -140,7 +140,7 @@ class ExecutorWorker:
     def _claim_task(self) -> Optional[Dict]:
         """Try to claim next queued task."""
         result = self._api("POST", f"/api/task/{self.project_id}/claim",
-                           {"worker_id": self.worker_id})
+                           {"worker_id": self.worker_id, "caller_pid": os.getpid()})
         if "error" in result or "task" not in result:
             return None
         task_pair = result["task"]
@@ -1980,7 +1980,7 @@ class ExecutorWorker:
                         self._sync_counter = 0
                     # Recover stale claimed tasks every 30th poll (~5 min)
                     self._recover_counter += 1
-                    if self._recover_counter >= 30:
+                    if self._recover_counter >= 12:
                         self._recover_stale_leases()
                         self._recover_counter = 0
                     # TTL memory cleanup every 2160th poll (~6h)

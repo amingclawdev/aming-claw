@@ -286,8 +286,9 @@ class AILifecycleManager:
         with self._lock:
             self._sessions[session_id] = session
 
-        # Run CLI in background thread using subprocess.run (not Popen).
-        # Popen + poll() has Windows pipe deadlock issues with Claude CLI.
+        # Run CLI in background thread using Popen + communicate().
+        # communicate() avoids pipe deadlock (same as subprocess.run internally).
+        # Popen gives us immediate PID access for tracking/kill.
         def _run():
             try:
                 # Save input for replay/debug
@@ -305,37 +306,43 @@ class AILifecycleManager:
                 except Exception:
                     pass
 
-                _al_log(f"subprocess.run starting: {' '.join(cmd[:6])}...")
-                result = subprocess.run(
-                    cmd,
-                    input=stdin_prompt,
-                    capture_output=True,
+                _al_log(f"Popen starting: {' '.join(cmd[:6])}...")
+                popen_kwargs = dict(
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=_MAX_TIMEOUT,
                     cwd=cwd,
                     env=env,
                 )
-                session.stdout = result.stdout
-                session.stderr = result.stderr
-                session.exit_code = result.returncode
-                session.status = "completed" if result.returncode == 0 else "failed"
+                # On Windows, create a new process group for clean tree-kill
+                if os.name == "nt":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                proc = subprocess.Popen(cmd, **popen_kwargs)
+                session.pid = proc.pid
+                _al_log(f"Popen started: pid={proc.pid}")
+                stdout_data, stderr_data = proc.communicate(timeout=_MAX_TIMEOUT)
+                session.stdout = stdout_data or ""
+                session.stderr = stderr_data or ""
+                session.exit_code = proc.returncode
+                session.status = "completed" if proc.returncode == 0 else "failed"
                 if provider == "openai" and os.path.exists(output_last):
                     try:
                         session.stdout = Path(output_last).read_text(encoding="utf-8")
                     except Exception:
                         pass
-                _al_log(f"subprocess.run done: rc={result.returncode} stdout={len(result.stdout)} stderr={len(result.stderr)}")
+                _al_log(f"Popen done: rc={proc.returncode} stdout={len(session.stdout)} stderr={len(session.stderr)}")
                 # Save output for debug
                 try:
                     _output_path = os.path.join(workspace or os.getcwd(), "shared-volume", "codex-tasks", "logs",
                                                 f"output-{session_id.replace('ai-','')}.txt")
                     with open(_output_path, "w", encoding="utf-8") as _f:
-                        _f.write(f"=== STATUS: {session.status} rc={result.returncode} elapsed={time.time()-session.started_at:.1f}s ===\n\n")
-                        _f.write(f"=== STDOUT ({len(result.stdout)} chars) ===\n")
-                        _f.write(result.stdout)
-                        if result.stderr:
-                            _f.write(f"\n\n=== STDERR ({len(result.stderr)} chars) ===\n")
-                            _f.write(result.stderr)
+                        _f.write(f"=== STATUS: {session.status} rc={proc.returncode} elapsed={time.time()-session.started_at:.1f}s ===\n\n")
+                        _f.write(f"=== STDOUT ({len(session.stdout)} chars) ===\n")
+                        _f.write(session.stdout)
+                        if session.stderr:
+                            _f.write(f"\n\n=== STDERR ({len(session.stderr)} chars) ===\n")
+                            _f.write(session.stderr)
                 except Exception:
                     pass
             except subprocess.TimeoutExpired:
@@ -343,19 +350,25 @@ class AILifecycleManager:
                 session.exit_code = -1
                 session.stdout = ""
                 session.stderr = "Timeout exceeded"
-                _al_log(f"subprocess.run TIMEOUT after {_MAX_TIMEOUT}s")
+                _al_log(f"Popen TIMEOUT after {_MAX_TIMEOUT}s")
+                # Kill the process on timeout
+                try:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
             except FileNotFoundError:
                 session.status = "failed"
                 session.exit_code = -1
                 session.stdout = ""
                 session.stderr = f"CLI not found: {cmd[0]}"
-                _al_log(f"subprocess.run ERROR: CLI not found: {cmd[0]}")
+                _al_log(f"Popen ERROR: CLI not found: {cmd[0]}")
             except Exception as e:
                 session.status = "failed"
                 session.exit_code = -1
                 session.stdout = ""
                 session.stderr = str(e)
-                _al_log(f"subprocess.run ERROR: {e}")
+                _al_log(f"Popen ERROR: {e}")
             finally:
                 # Cleanup prompt file
                 try:
@@ -403,15 +416,23 @@ class AILifecycleManager:
         }
 
     def kill_session(self, session_id: str, reason: str = "") -> bool:
-        """Force-terminate an AI process."""
+        """Force-terminate an AI process (tree-kill on Windows)."""
         session = self._sessions.get(session_id)
         if not session or session.pid == 0:
             return False
 
         try:
-            os.kill(session.pid, signal.SIGTERM)
+            pid = session.pid
+            if os.name == "nt":
+                # Windows: taskkill /F /T kills entire process tree
+                subprocess.call(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
             session.status = "killed"
-            pass  # log.info removed — blocks in MCP subprocess
             return True
         except (ProcessLookupError, OSError):
             return False

@@ -1618,8 +1618,9 @@ def handle_task_claim(ctx: RequestContext):
                 worker_id = session.get("principal_id", worker_id)
         except Exception:
             pass
+    caller_pid = int(ctx.body.get("caller_pid", 0) or 0)
     with DBContext(project_id) as conn:
-        task = task_registry.claim_task(conn, project_id, worker_id)
+        task = task_registry.claim_task(conn, project_id, worker_id, caller_pid=caller_pid)
         if task is None:
             return {"task": None, "message": "No tasks available"}
         return {"task": task}

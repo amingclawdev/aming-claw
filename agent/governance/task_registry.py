@@ -194,8 +194,13 @@ def claim_task(
     project_id: str,
     assigned_to: str,
     worker_id: str = "",
+    caller_pid: int = 0,
 ) -> tuple[dict, str] | tuple[None, str]:
     """Claim the next available task with fencing token.
+
+    Args:
+        caller_pid: PID of the calling process (executor). Stored as worker_pid
+                    for liveness checks during stale recovery. 0 = unknown.
 
     Returns (task_dict, fence_token) or (None, "") if no tasks.
     """
@@ -217,6 +222,9 @@ def claim_task(
     fence_token = f"fence-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     lease_expires = _utc_iso_after(300)  # 5 min lease
 
+    # Use caller_pid if provided, otherwise fall back to current process PID
+    effective_pid = caller_pid if caller_pid else os.getpid()
+
     # CAS update: only queued → claimed
     result = conn.execute(
         """UPDATE tasks SET status = 'claimed', execution_status = 'claimed',
@@ -229,7 +237,7 @@ def claim_task(
            )
            WHERE task_id = ? AND execution_status IN ('queued')""",
         (assigned_to, now, now, attempt_num,
-         fence_token, worker_id or assigned_to, lease_expires, str(os.getpid()),
+         fence_token, worker_id or assigned_to, lease_expires, str(effective_pid),
          task_id),
     )
     if result.rowcount == 0:
@@ -669,9 +677,36 @@ def update_progress(conn: sqlite3.Connection, task_id: str,
     return {"task_id": task_id, "phase": phase, "percent": percent}
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running.
+
+    Uses os.kill(pid, 0) which checks existence without sending a signal.
+    Returns False for pid <= 0.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we don't have permission to signal it
+        return True
+    except OSError:
+        return False
+
+
 def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
-    """Recover tasks with expired leases — re-queue them."""
+    """Recover tasks with expired leases or dead worker PIDs — re-queue them.
+
+    Phase 1: Re-queue tasks with expired leases (original behavior).
+    Phase 2: Check worker_pid liveness for claimed tasks with unexpired leases.
+              Re-queue if the worker PID is dead. Skip if pid=0 (unknown).
+    """
     now = _utc_iso()
+
+    # Phase 1: Expired lease recovery
     rows = conn.execute(
         """SELECT task_id FROM tasks
            WHERE project_id = ? AND execution_status IN ('claimed', 'running')
@@ -686,9 +721,38 @@ def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
             (row["task_id"],),
         )
         recovered += 1
-        log.info("Recovered stale task: %s", row["task_id"])
+        log.info("Recovered stale task (expired lease): %s", row["task_id"])
 
-    return {"recovered": recovered}
+    # Phase 2: PID liveness check for claimed tasks with valid leases
+    live_rows = conn.execute(
+        """SELECT task_id, json_extract(metadata_json, '$.worker_pid') as worker_pid
+           FROM tasks
+           WHERE project_id = ? AND execution_status IN ('claimed', 'running')
+             AND (json_extract(metadata_json, '$.lease_expires_at') >= ? OR
+                  json_extract(metadata_json, '$.lease_expires_at') IS NULL)""",
+        (project_id, now),
+    ).fetchall()
+
+    pid_recovered = 0
+    for row in live_rows:
+        raw_pid = row["worker_pid"]
+        if not raw_pid:
+            continue  # No PID recorded, skip
+        try:
+            pid = int(raw_pid)
+        except (ValueError, TypeError):
+            continue
+        if pid == 0:
+            continue  # Unknown PID, skip
+        if not _is_pid_alive(pid):
+            conn.execute(
+                "UPDATE tasks SET execution_status = 'queued', status = 'queued' WHERE task_id = ?",
+                (row["task_id"],),
+            )
+            pid_recovered += 1
+            log.info("Recovered stale task (dead PID %d): %s", pid, row["task_id"])
+
+    return {"recovered": recovered + pid_recovered, "expired_lease": recovered, "dead_pid": pid_recovered}
 
 
 def list_tasks(

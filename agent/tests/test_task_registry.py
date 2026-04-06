@@ -381,5 +381,185 @@ class TestRetryOnDbLock(unittest.TestCase):
         self.assertAlmostEqual(sleep_calls[2], 0.9, places=2)
 
 
+class TestCallerPid(unittest.TestCase):
+    """B4: caller_pid parameter in claim_task stores correct PID in metadata."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _make_conn(self.tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_caller_pid_stored_in_metadata(self):
+        """AC5: caller_pid is stored as worker_pid in task metadata."""
+        from agent.governance.task_registry import create_task, claim_task
+        task = create_task(self.conn, "proj", "test", task_type="dev")
+        self.conn.commit()
+        claimed, fence = claim_task(self.conn, "proj", "w1", caller_pid=12345)
+        self.conn.commit()
+
+        self.assertIsNotNone(claimed)
+        row = self.conn.execute(
+            "SELECT metadata_json FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        meta = json.loads(row["metadata_json"])
+        self.assertEqual(meta["worker_pid"], "12345")
+
+    def test_caller_pid_zero_uses_os_getpid(self):
+        """When caller_pid=0, falls back to os.getpid()."""
+        from agent.governance.task_registry import create_task, claim_task
+        task = create_task(self.conn, "proj", "test", task_type="dev")
+        self.conn.commit()
+        claimed, fence = claim_task(self.conn, "proj", "w1", caller_pid=0)
+        self.conn.commit()
+
+        self.assertIsNotNone(claimed)
+        row = self.conn.execute(
+            "SELECT metadata_json FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        meta = json.loads(row["metadata_json"])
+        self.assertEqual(meta["worker_pid"], str(os.getpid()))
+
+    def test_default_caller_pid_uses_os_getpid(self):
+        """Default (no caller_pid) uses os.getpid()."""
+        from agent.governance.task_registry import create_task, claim_task
+        task = create_task(self.conn, "proj", "test", task_type="dev")
+        self.conn.commit()
+        claimed, fence = claim_task(self.conn, "proj", "w1")
+        self.conn.commit()
+
+        self.assertIsNotNone(claimed)
+        row = self.conn.execute(
+            "SELECT metadata_json FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        meta = json.loads(row["metadata_json"])
+        self.assertEqual(meta["worker_pid"], str(os.getpid()))
+
+
+class TestIsPidAlive(unittest.TestCase):
+    """B4: _is_pid_alive helper for PID liveness checks."""
+
+    def test_current_process_is_alive(self):
+        """Current process PID should be alive."""
+        from agent.governance.task_registry import _is_pid_alive
+        self.assertTrue(_is_pid_alive(os.getpid()))
+
+    def test_zero_pid_is_not_alive(self):
+        """PID 0 should return False."""
+        from agent.governance.task_registry import _is_pid_alive
+        self.assertFalse(_is_pid_alive(0))
+
+    def test_negative_pid_is_not_alive(self):
+        """Negative PID should return False."""
+        from agent.governance.task_registry import _is_pid_alive
+        self.assertFalse(_is_pid_alive(-1))
+
+    def test_nonexistent_pid_is_not_alive(self):
+        """A very high PID that doesn't exist should return False."""
+        from agent.governance.task_registry import _is_pid_alive
+        # Use a PID unlikely to exist
+        self.assertFalse(_is_pid_alive(4999999))
+
+
+class TestRecoverStalePidCheck(unittest.TestCase):
+    """B4: recover_stale_tasks Phase 2 — PID liveness check."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _make_conn(self.tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_dead_pid_task_recovered(self):
+        """Task with dead worker PID is re-queued."""
+        from agent.governance.task_registry import create_task, claim_task, recover_stale_tasks
+        task = create_task(self.conn, "proj", "test", task_type="dev")
+        self.conn.commit()
+        # Claim with a PID that doesn't exist
+        claimed, fence = claim_task(self.conn, "proj", "w1", caller_pid=4999999)
+        self.conn.commit()
+
+        # Set lease far in the future so Phase 1 doesn't recover it
+        self.conn.execute(
+            "UPDATE tasks SET metadata_json = json_set(metadata_json, '$.lease_expires_at', '2099-01-01T00:00:00Z') WHERE task_id = ?",
+            (task["task_id"],),
+        )
+        self.conn.commit()
+
+        result = recover_stale_tasks(self.conn, "proj")
+        self.conn.commit()
+        self.assertGreaterEqual(result["dead_pid"], 1)
+
+        # Task should be re-queued
+        row = self.conn.execute(
+            "SELECT execution_status FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(row["execution_status"], "queued")
+
+    def test_alive_pid_task_not_recovered(self):
+        """Task with alive worker PID is NOT re-queued."""
+        from agent.governance.task_registry import create_task, claim_task, recover_stale_tasks
+        task = create_task(self.conn, "proj", "test", task_type="dev")
+        self.conn.commit()
+        # Claim with current process PID (alive)
+        claimed, fence = claim_task(self.conn, "proj", "w1", caller_pid=os.getpid())
+        self.conn.commit()
+
+        # Set lease far in the future so Phase 1 doesn't recover it
+        self.conn.execute(
+            "UPDATE tasks SET metadata_json = json_set(metadata_json, '$.lease_expires_at', '2099-01-01T00:00:00Z') WHERE task_id = ?",
+            (task["task_id"],),
+        )
+        self.conn.commit()
+
+        result = recover_stale_tasks(self.conn, "proj")
+        self.assertEqual(result["dead_pid"], 0)
+
+        # Task should still be claimed
+        row = self.conn.execute(
+            "SELECT execution_status FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(row["execution_status"], "claimed")
+
+    def test_zero_pid_skipped(self):
+        """Task with worker_pid=0 is skipped in Phase 2."""
+        from agent.governance.task_registry import create_task, claim_task, recover_stale_tasks
+        task = create_task(self.conn, "proj", "test", task_type="dev")
+        self.conn.commit()
+
+        # Manually set worker_pid to "0" and keep lease valid
+        claimed, fence = claim_task(self.conn, "proj", "w1")
+        self.conn.commit()
+        self.conn.execute(
+            """UPDATE tasks SET metadata_json = json_set(metadata_json,
+                '$.worker_pid', '0',
+                '$.lease_expires_at', '2099-01-01T00:00:00Z')
+               WHERE task_id = ?""",
+            (task["task_id"],),
+        )
+        self.conn.commit()
+
+        result = recover_stale_tasks(self.conn, "proj")
+        self.assertEqual(result["dead_pid"], 0)
+
+        # Task should still be claimed
+        row = self.conn.execute(
+            "SELECT execution_status FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(row["execution_status"], "claimed")
+
+
 if __name__ == "__main__":
     unittest.main()
