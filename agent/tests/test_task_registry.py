@@ -1,6 +1,7 @@
 """Tests for task_registry complete_task — async auto_chain dispatch."""
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -312,6 +313,72 @@ class TestVersionDriftWarning(unittest.TestCase):
         self.assertNotIn("version_warning", result)
         self.assertIn("task_id", result)
         self.assertEqual(result["status"], "queued")
+
+
+class TestRetryOnDbLock(unittest.TestCase):
+    """B5: Retry-with-backoff for sqlite3.OperationalError('database is locked')."""
+
+    def test_succeeds_after_transient_lock(self):
+        """AC8: Retry succeeds after a transient DB lock."""
+        from agent.governance.task_registry import _retry_on_db_lock
+        call_count = [0]
+
+        def flaky():
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        with mock.patch("agent.governance.task_registry.time.sleep"):
+            result = _retry_on_db_lock(flaky, _context="test")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(call_count[0], 3)  # 2 failures + 1 success
+
+    def test_non_lock_error_not_retried(self):
+        """AC9: Non-lock OperationalErrors propagate immediately."""
+        from agent.governance.task_registry import _retry_on_db_lock
+        call_count = [0]
+
+        def bad():
+            call_count[0] += 1
+            raise sqlite3.OperationalError("no such table: tasks")
+
+        with self.assertRaises(sqlite3.OperationalError) as ctx:
+            _retry_on_db_lock(bad, _context="test")
+
+        self.assertIn("no such table", str(ctx.exception))
+        self.assertEqual(call_count[0], 1)  # no retry
+
+    def test_raises_after_max_retries(self):
+        """AC10: After max retries exhausted, raises original error."""
+        from agent.governance.task_registry import _retry_on_db_lock
+
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch("agent.governance.task_registry.time.sleep"):
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                _retry_on_db_lock(always_locked, _context="test")
+
+        self.assertIn("database is locked", str(ctx.exception))
+
+    def test_exponential_backoff_delays(self):
+        """Verify exponential backoff timing: 0.1, 0.3, 0.9."""
+        from agent.governance.task_registry import _retry_on_db_lock
+        sleep_calls = []
+
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch("agent.governance.task_registry.time.sleep", side_effect=lambda d: sleep_calls.append(d)):
+            with self.assertRaises(sqlite3.OperationalError):
+                _retry_on_db_lock(always_locked, _context="test")
+
+        self.assertEqual(len(sleep_calls), 3)
+        self.assertAlmostEqual(sleep_calls[0], 0.1, places=2)
+        self.assertAlmostEqual(sleep_calls[1], 0.3, places=2)
+        self.assertAlmostEqual(sleep_calls[2], 0.9, places=2)
 
 
 if __name__ == "__main__":

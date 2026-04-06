@@ -19,6 +19,39 @@ import uuid
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# DB lock retry helper (B5)
+# ---------------------------------------------------------------------------
+
+_DB_LOCK_MAX_RETRIES = 3
+_DB_LOCK_BASE_DELAY = 0.1  # seconds; backoff = base * 3^attempt
+
+
+def _retry_on_db_lock(func, *args, _context: str = "", **kwargs):
+    """Retry *func* on sqlite3.OperationalError('database is locked').
+
+    Uses exponential backoff: 0.1s, 0.3s, 0.9s.
+    Only retries on 'database is locked'; all other errors propagate immediately.
+    """
+    last_err: sqlite3.OperationalError | None = None
+    for attempt in range(_DB_LOCK_MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc):
+                raise
+            last_err = exc
+            if attempt < _DB_LOCK_MAX_RETRIES:
+                delay = _DB_LOCK_BASE_DELAY * (3 ** attempt)
+                log.warning(
+                    "DB lock retry %d/%d (%s): waiting %.2fs — %s",
+                    attempt + 1, _DB_LOCK_MAX_RETRIES, _context, delay, exc,
+                )
+                time.sleep(delay)
+    # All retries exhausted
+    raise last_err  # type: ignore[misc]
+
+
 EXECUTION_STATUSES = {
     "queued", "claimed", "running", "waiting_human", "blocked",
     "succeeded", "failed", "cancelled", "timed_out", "enqueue_failed",
@@ -327,26 +360,27 @@ def complete_task(
                 details={"task_id": task_id, "result_keys": list(result_obj.keys())},
             )
 
-    conn.execute(
-        """UPDATE tasks SET status = ?, execution_status = ?,
-           notification_status = ?,
-           completed_at = ?, updated_at = ?,
-           result_json = ?, error_message = ?
-           WHERE task_id = ?""",
-        (exec_status, exec_status, notify_status,
-         now, now,
-         json.dumps(result or {}, ensure_ascii=False), error_message,
-         task_id),
-    )
+    def _do_complete_updates():
+        conn.execute(
+            """UPDATE tasks SET status = ?, execution_status = ?,
+               notification_status = ?,
+               completed_at = ?, updated_at = ?,
+               result_json = ?, error_message = ?
+               WHERE task_id = ?""",
+            (exec_status, exec_status, notify_status,
+             now, now,
+             json.dumps(result or {}, ensure_ascii=False), error_message,
+             task_id),
+        )
+        conn.execute(
+            """UPDATE task_attempts SET status = ?, completed_at = ?,
+               result_json = ?, error_message = ?
+               WHERE task_id = ? AND status = 'running'""",
+            (status, now, json.dumps(result or {}, ensure_ascii=False),
+             error_message, task_id),
+        )
 
-    # Update attempt
-    conn.execute(
-        """UPDATE task_attempts SET status = ?, completed_at = ?,
-           result_json = ?, error_message = ?
-           WHERE task_id = ? AND status = 'running'""",
-        (status, now, json.dumps(result or {}, ensure_ascii=False),
-         error_message, task_id),
-    )
+    _retry_on_db_lock(_do_complete_updates, _context=f"complete_task({task_id})")
 
     result_summary = str(result)[:200] if result else "{}"
     log.info("task.complete: %s status=%s exec_status=%s by=%s result=%s",
@@ -453,17 +487,24 @@ def _dispatch_auto_chain_success(
     try:
         from . import auto_chain
         from .db import get_connection
-        conn = get_connection(project_id)
-        try:
-            return auto_chain.on_task_completed(
-                conn, project_id, task_id,
-                task_type=task_type,
-                status=exec_status,
-                result=result,
-                metadata=metadata,
-            )
-        finally:
-            conn.close()
+
+        def _do_chain_success():
+            conn = get_connection(project_id)
+            try:
+                return auto_chain.on_task_completed(
+                    conn, project_id, task_id,
+                    task_type=task_type,
+                    status=exec_status,
+                    result=result,
+                    metadata=metadata,
+                )
+            finally:
+                conn.close()
+
+        return _retry_on_db_lock(
+            _do_chain_success,
+            _context=f"auto_chain_success({task_id})",
+        )
     except Exception:
         log.error(
             "auto_chain.on_task_completed failed for task %s (project=%s, type=%s)",
@@ -489,17 +530,24 @@ def _dispatch_auto_chain_failed(
     try:
         from . import auto_chain
         from .db import get_connection
-        conn = get_connection(project_id)
-        try:
-            return auto_chain.on_task_failed(
-                conn, project_id, task_id,
-                task_type=task_type,
-                result=result,
-                metadata=metadata,
-                reason=reason,
-            )
-        finally:
-            conn.close()
+
+        def _do_chain_failed():
+            conn = get_connection(project_id)
+            try:
+                return auto_chain.on_task_failed(
+                    conn, project_id, task_id,
+                    task_type=task_type,
+                    result=result,
+                    metadata=metadata,
+                    reason=reason,
+                )
+            finally:
+                conn.close()
+
+        return _retry_on_db_lock(
+            _do_chain_failed,
+            _context=f"auto_chain_failed({task_id})",
+        )
     except Exception:
         log.error(
             "auto_chain.on_task_failed failed for task %s (project=%s, type=%s)",
