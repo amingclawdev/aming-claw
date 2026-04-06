@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -54,6 +55,38 @@ def _is_observer_mode(conn: sqlite3.Connection, project_id: str) -> bool:
         return bool(row and row["observer_mode"])
     except Exception:
         return False
+
+
+def _check_version_drift(conn: sqlite3.Connection, project_id: str) -> str | None:
+    """Check if git HEAD differs from chain_version. Returns warning string or None.
+
+    Advisory only — any exception is caught and returns None.
+    """
+    try:
+        row = conn.execute(
+            "SELECT chain_version FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        if not row or not row["chain_version"]:
+            return None
+        chain_short = row["chain_version"][:7]
+
+        head_full = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+        head_short = head_full[:7]
+
+        if head_short != chain_short:
+            log.warning("HEAD (%s) != CHAIN_VERSION (%s); auto_chain dispatch may be blocked", head_short, chain_short)
+            return (
+                f"HEAD ({head_short}) != CHAIN_VERSION ({chain_short}); "
+                f"auto_chain dispatch may be blocked"
+            )
+        return None
+    except Exception:
+        return None
 
 
 def create_task(
@@ -103,7 +136,8 @@ def create_task(
 
     log.info("Task created: %s (project: %s, type: %s, status: %s, retry_round: %d, trace_id: %s)",
              task_id, project_id, task_type, initial_status, retry_round, trace_id)
-    return {
+
+    result = {
         "task_id": task_id,
         "project_id": project_id,
         "status": initial_status,
@@ -113,6 +147,13 @@ def create_task(
         "trace_id": trace_id,
         "chain_id": chain_id,
     }
+
+    # Advisory version drift warning (B3) — never blocks task creation
+    drift_warning = _check_version_drift(conn, project_id)
+    if drift_warning:
+        result["version_warning"] = drift_warning
+
+    return result
 
 
 def claim_task(
