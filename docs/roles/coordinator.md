@@ -1,5 +1,7 @@
 # Coordinator Role Specification
 
+> **2026-04-07 (B10):** Dev task worktree failure now returns a failed result instead of silently falling back to the main workspace. Coordinators may see retry chains triggered by worktree creation failures.
+
 ## Role Definition
 
 The coordinator is the **central decision-making role** in the governance pipeline. All user messages enter the coordinator directly (no gateway pre-classification). The coordinator decides what to do with each message.

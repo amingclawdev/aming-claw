@@ -2,6 +2,8 @@
 
 > **Canonical document** for the Tester role in the Aming Claw governance pipeline.
 
+> **2026-04-07 (B10):** Dev tasks now fail fast on worktree creation failure. Test `test_executor_stall.py::TestWorktreeFailure` covers this behavior.
+
 ## Role Definition
 
 The Tester is responsible for running automated tests (T1 unit + T2 integration) and marking acceptance graph nodes from `pending` to `t2_pass`. The Tester operates within the auto-chain pipeline as the stage after Dev.

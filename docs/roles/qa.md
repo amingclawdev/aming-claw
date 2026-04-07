@@ -2,6 +2,8 @@
 
 > **Canonical document** for the QA role in the Aming Claw governance pipeline.
 
+> **2026-04-07 (B10):** Dev tasks now fail fast on worktree creation failure instead of falling back to main workspace. QA should verify that failed dev tasks with worktree errors are properly retried by auto-chain.
+
 ## Role Definition
 
 The QA agent is responsible for end-to-end verification, acceptance criteria review, and marking acceptance graph nodes from `t2_pass` to `qa_pass`. QA operates within the auto-chain pipeline as the stage after Test.

@@ -1,5 +1,7 @@
 # PM Role Specification
 
+> **2026-04-07 (B10):** Dev tasks now fail fast on worktree creation failure. PM PRDs should account for potential worktree retry scenarios in acceptance criteria.
+
 ## Role Definition
 
 The PM (Product Manager) role transforms coordinator requests into structured PRDs with defined scope, acceptance criteria, and verification methods. PM is the first stage in the auto-chain: PM -> Dev -> Test -> QA -> Merge.

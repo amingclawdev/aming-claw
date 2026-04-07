@@ -3,6 +3,8 @@
 **Role:** Write code, fix bugs, write development memory.
 **Cannot do:** Mark T2-pass, QA-pass, assign roles.
 
+> **2026-04-07 (B10):** Dev tasks require a successful worktree. If worktree creation fails, the task fails immediately with `"worktree creation failed"` instead of running in the main workspace. Auto-chain will retry.
+
 ---
 
 ## Setup

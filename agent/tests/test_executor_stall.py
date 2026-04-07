@@ -178,6 +178,57 @@ class TestStallRecovery:
         assert worker._consecutive_empty_polls == 0
 
 
+class TestWorktreeFailure:
+    """Dev task must fail fast when worktree creation fails (B10)."""
+
+    def test_worktree_creation_failure_returns_failed(self, worker):
+        """When _create_worktree returns (None, None) for a dev task,
+        _execute_task must return a failed result, not fall back to main workspace."""
+        task = {
+            "task_id": "task-worktree-fail",
+            "type": "dev",
+            "prompt": "implement X",
+            "metadata": {},
+        }
+
+        worker._create_worktree = MagicMock(return_value=(None, None))
+
+        with patch("executor_worker.log") as mock_log:
+            result = worker._execute_task(task)
+
+        assert result["status"] == "failed"
+        assert "worktree creation failed" in result["error"]
+        assert "worktree" in result["error"]
+
+        # Verify warning was logged
+        warning_calls = [
+            c for c in mock_log.warning.call_args_list
+            if "worktree" in str(c).lower() and "fail" in str(c).lower()
+        ]
+        assert len(warning_calls) >= 1, "Expected log.warning mentioning worktree failure"
+
+    def test_worktree_creation_success_proceeds(self, worker):
+        """When _create_worktree succeeds, _execute_task should NOT return early."""
+        task = {
+            "task_id": "task-worktree-ok",
+            "type": "dev",
+            "prompt": "implement X",
+            "metadata": {},
+        }
+
+        worker._create_worktree = MagicMock(return_value=("/tmp/wt", "dev/task-worktree-ok"))
+        # Mock _run_claude_session to avoid real CLI calls
+        worker._run_claude_session = MagicMock(return_value={
+            "status": "succeeded",
+            "result": {"summary": "ok"},
+        })
+        worker._remove_worktree = MagicMock()
+
+        result = worker._execute_task(task)
+        # Should NOT be a worktree failure
+        assert result.get("error", "") == "" or "worktree creation failed" not in result.get("error", "")
+
+
 class TestStallThresholdConfig:
     """EXECUTOR_STALL_THRESHOLD is configurable."""
 

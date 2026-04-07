@@ -200,7 +200,7 @@ class TestExecutorDevPromptRound4(unittest.TestCase):
         worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=os.getcwd())
         worker._lifecycle = FakeLifecycle()
 
-        with mock.patch.object(worker, "_create_worktree", return_value=(None, None)), \
+        with mock.patch.object(worker, "_create_worktree", return_value=("/tmp/fake-worktree", "fake-branch")), \
              mock.patch.object(worker, "_build_prompt", return_value="Implement fix"), \
              mock.patch.object(worker, "_report_progress"), \
              mock.patch.object(worker, "_write_memory"):

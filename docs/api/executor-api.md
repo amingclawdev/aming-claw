@@ -2,6 +2,8 @@
 
 > **2026-03-26 update:** executor_api.py no longer depends on old executor.py or workspace_registry.py (deleted). `/cleanup-orphans`, `/workspaces`, `/workspaces/resolve` endpoints are now stubs returning degraded responses. `/coordinator/chat` endpoint is deprecated.
 
+> **2026-04-07 update (B10):** Dev tasks now fail fast when worktree creation fails instead of falling back to the main workspace. `_execute_task()` returns `{"status": "failed", "error": "worktree creation failed: <reason>"}` so auto-chain can retry safely.
+
 > Executor HTTP API (port 40100) runs on the host machine.
 > Used for Claude Code session direct monitoring and debugging the execution chain.
 

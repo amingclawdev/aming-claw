@@ -257,7 +257,13 @@ class ExecutorWorker:
                 execution_workspace = worktree_path
                 _timing(f"worktree: created {worktree_path}")
             else:
-                _timing("worktree: creation failed, fallback to main workspace")
+                reason = "worktree creation returned (None, None)"
+                log.warning(f"worktree creation failed for dev task {task_id}: {reason}")
+                _timing("worktree: creation failed, returning error")
+                return {
+                    "status": "failed",
+                    "error": f"worktree creation failed: {reason}",
+                }
         elif task_type in ("test", "qa"):
             inherited_worktree = metadata.get("_worktree", "")
             inherited_branch = metadata.get("_branch", "")
