@@ -95,6 +95,8 @@
 | B8 | _gate_checkpoint blocks docs/dev/ as unrelated | 1f080bf | 2026-04-07 |
 | B9 | Gate retry prompt lacks test failure detail | 6ffa422 | 2026-04-07 |
 | G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
+| G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
+| G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
 
 ---
 
@@ -181,7 +183,7 @@ Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
 
 ## New Gaps (from Step 7 observation)
 
-### G4: PM does not use graph impact to populate doc_impact [OPEN]
+### G4: PM does not use graph impact to populate doc_impact [FIXED]
 
 - **Symptom**: PM receives graph impact data (via 6d injection into prompt) but outputs `doc_impact: {}` even when graph shows `related_docs: [auto-chain.md, gates.md]`.
 - **Impact**: 5a `_gate_post_pm` correctly detects the gap (writes `doc_gap_observation` audit), but the doc information doesn't flow to dev prompt. Dev agent doesn't know which docs to update.
@@ -196,7 +198,7 @@ Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
 - **Fix proposal**: Inject gate rules into retry prompt: "IMPORTANT: checkpoint gate only allows changes to these files: {allowed_list}. Any other files will be blocked."
 - **File**: `agent/governance/auto_chain.py` (retry prompt builder)
 
-### G6: _get_graph_doc_associations doesn't work for doc-only tasks [OPEN]
+### G6: _get_graph_doc_associations doesn't work for doc-only tasks [FIXED]
 
 - **Symptom**: 5a `_gate_post_pm` observation doesn't fire when `target_files` are all docs (no code). Graph lookup does `primary ∩ target_files` which is empty for doc paths.
 - **Root cause**: `_get_graph_doc_associations` only checks `primary` field (code files). For doc-only tasks, should also check `secondary` field (docs) — this is the reverse direction that `match_secondary=True` in ImpactAnalyzer already supports.

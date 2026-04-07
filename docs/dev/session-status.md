@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-07 (B8+B9+B10+G5 fixed, Step 7 observation continuing)
-> Updated by: Observer session (fe0772f → 6ffa422)
+> Last updated: 2026-04-07 (All Round 1-3 bugs fixed, Step 7 observation complete)
+> Updated by: Observer session (fe0772f → 272dfa6)
 
 ---
 
@@ -15,12 +15,12 @@ New session? Read this first, then follow links for details.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Governance | Running | Port 40000, PID 43792, version 6ffa422 |
-| Executor | Running | Auto-claims aggressively, observer_mode ON |
-| Git HEAD | 6ffa422 | `fix(B9+G5): enrich retry prompt with test detail and scope constraint` |
-| chain_version | 6ffa422 | Synced ✅ |
+| Governance | Running | Port 40000, PID 43792, version 272dfa6 (needs restart) |
+| Executor | Running | observer_mode ON |
+| Git HEAD | 272dfa6 | `fix(G4+G6): bidirectional graph lookup and auto-populate doc_impact` |
+| chain_version | 272dfa6 | Synced ✅ |
 | Graph | 29 nodes (1 qa_pass), 34 edges | governance.auto_chain promoted to qa_pass |
-| Tests | 932 pass, 2 pre-existing failures | Full L0-L4 regression verified |
+| Tests | 937 pass, 2 pre-existing failures | Full L0-L4 regression verified |
 
 ## Bug Backlog
 
@@ -38,6 +38,8 @@ All bugs from 2026-04-05/06 sessions are **FIXED**:
 | B8 _gate_checkpoint blocks docs/dev/ | _is_dev_note() exemption in unrelated-file loop | 1f080bf |
 | B9 retry prompt lacks test detail | Gate reason includes command + output excerpt | 6ffa422 |
 | G5 retry missing scope rules | SCOPE CONSTRAINT block in retry prompt | 6ffa422 |
+| G4 PM doc_impact not from graph | Auto-populate in _gate_post_pm | 272dfa6 |
+| G6 Graph lookup not bidirectional | secondary→primary reverse lookup | 272dfa6 |
 
 ## Active Work
 
@@ -58,8 +60,9 @@ Progress:
   - Observation task 2 (B10 fix): PM✅ Dev×2✅ Test✅ QA✅ → merged (3ffe09a)
   - Observation task 3 (B8 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain (1f080bf)
   - Observation task 4 (B9+G5 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain (6ffa422)
-  - B8+B9+B10+G5 FIXED. Remaining: G4, G6
-  - Total tasks observed: ~28 (prev 11 + B8 chain 9 + B9+G5 chain 8)
+  - Observation task 5 (G4+G6 fix): PM✅ Dev(manual)✅ Test✅ QA✅ Merge✅ → full chain (272dfa6)
+  - ALL backlog items FIXED: B8, B9, B10, G4, G5, G6
+  - Total tasks observed: ~35 (prev 11 + B8 9 + B9+G5 8 + G4+G6 7)
 - [ ] Step 8: Hard gate switch
 
 ### Key Files Changed This Session
