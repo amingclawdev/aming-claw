@@ -1850,6 +1850,8 @@ def _gate_checkpoint(conn, project_id, result, metadata):
                         and basename.endswith(".py"):
                     if any(basename.startswith(prefix) for prefix in _allowed_test_prefixes):
                         continue
+            if _is_dev_note(f):
+                continue
             unrelated.append(f)
         if unrelated:
             return False, f"Unrelated files modified: {unrelated}"
