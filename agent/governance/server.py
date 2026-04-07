@@ -1315,7 +1315,9 @@ def handle_impact(ctx: RequestContext):
     project_id = ctx.get_project_id()
     files_str = ctx.query.get("files", "")
     files = [f.strip() for f in files_str.split(",") if f.strip()] if files_str else []
-    include_secondary = ctx.query.get("file_policy", "") == "primary+secondary"
+    # file_policy query param: "primary_only" disables secondary matching
+    # Default: match both primary and secondary (doc/test reverse traceability)
+    primary_only = ctx.query.get("file_policy", "") == "primary_only"
 
     graph = project_service.load_project_graph(project_id)
 
@@ -1330,7 +1332,7 @@ def handle_impact(ctx: RequestContext):
         analyzer = ImpactAnalyzer(graph, get_status)
         request = ImpactAnalysisRequest(
             changed_files=files,
-            file_policy=FileHitPolicy(match_primary=True, match_secondary=include_secondary),
+            file_policy=FileHitPolicy(match_primary=True, match_secondary=not primary_only),
         )
         return analyzer.analyze(request)
 

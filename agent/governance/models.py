@@ -218,7 +218,7 @@ class Session:
 @dataclass
 class FileHitPolicy:
     match_primary: bool = True
-    match_secondary: bool = False
+    match_secondary: bool = True   # enable doc/test reverse traceability by default
     match_config_glob: list = field(default_factory=list)
 
     @classmethod
@@ -227,7 +227,7 @@ class FileHitPolicy:
             return cls()
         return cls(
             match_primary=d.get("match_primary", True),
-            match_secondary=d.get("match_secondary", False),
+            match_secondary=d.get("match_secondary", True),
             match_config_glob=d.get("match_config_glob", []),
         )
 
