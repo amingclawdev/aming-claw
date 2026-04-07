@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-07 (Step 7 observation in progress)
-> Updated by: Observer session (ec61556 → fe0772f)
+> Last updated: 2026-04-07 (B8+B10 fixed, Step 7 observation continuing)
+> Updated by: Observer session (fe0772f → 1f080bf)
 
 ---
 
@@ -15,12 +15,12 @@ New session? Read this first, then follow links for details.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Governance | Running | Port 40000, restart with `python -m agent.governance.server` |
-| Executor | Running (PID 31808) | Auto-claims aggressively, observer_mode needed for manual claim |
-| Git HEAD | fe0772f | `docs: add B8-B10 + G4-G6 from Step 7 workflow observation` |
-| chain_version | fe0772f | Synced ✅ |
-| Graph | 29 nodes, 34 edges | Rebuilt 2026-04-06, old 119 nodes waived |
-| Tests | 923 pass, 2 pre-existing failures | Full L0-L4 regression verified |
+| Governance | Running | Port 40000, PID 36884, version 1f080bf |
+| Executor | Running | Auto-claims aggressively, observer_mode ON |
+| Git HEAD | 1f080bf | `B8: Add _is_dev_note() check in _gate_checkpoint` |
+| chain_version | 1f080bf | Synced ✅ |
+| Graph | 29 nodes (1 qa_pass), 34 edges | governance.auto_chain promoted to qa_pass |
+| Tests | 925 pass, 2 pre-existing failures | Full L0-L4 regression verified |
 
 ## Bug Backlog
 
@@ -34,8 +34,8 @@ All bugs from 2026-04-05/06 sessions are **FIXED**:
 | B4 CLI subprocess PID tracking | Popen + PID liveness recovery | dd5d940 |
 | B5 DB lock no retry | Retry-with-backoff (3 retries, exp backoff) | a413b9d |
 | B7 deploy restart silent fail | stderr capture + retry + port check | ac873e9 |
-
-**`docs/dev/bug-and-fix-backlog.md` is STALE** — still shows B1-B7 as OPEN. Update it.
+| B10 worktree fallback contaminates main | Dev fail-fast on worktree failure | 3ffe09a |
+| B8 _gate_checkpoint blocks docs/dev/ | _is_dev_note() exemption in unrelated-file loop | 1f080bf |
 
 ## Active Work
 
@@ -53,9 +53,11 @@ Progress:
 - [x] Step 6: Level 4 changes (b858962) — executor test scriptification + PM graph impact
 - [ ] **Step 7: Observation period** ← IN PROGRESS
   - Observation task 1 (doc reorg): PM✅ Dev×3(gate blocked) — found B8 bug
-  - Observation task 2 (B10 fix): PM✅ Dev×2✅ Test✅ QA✅ → node state retry → auto-healing (11 tasks, 2 still running)
-  - B8-B10 + G4-G6 recorded in bug-and-fix-backlog.md
-  - Round 1b (B8 fix) pending
+  - Observation task 2 (B10 fix): PM✅ Dev×2✅ Test✅ QA✅ → merged (3ffe09a)
+  - Observation task 3 (B8 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain success (1f080bf)
+  - B8+B10 FIXED, B9+G4-G6 remaining in backlog
+  - B8 chain: 6 tasks (PM+Dev+Test+QA+Merge + 3 auto-repair cancelled)
+  - Total tasks observed: ~20 (prev session 11 + this session 9)
 - [ ] Step 8: Hard gate switch
 
 ### Key Files Changed This Session

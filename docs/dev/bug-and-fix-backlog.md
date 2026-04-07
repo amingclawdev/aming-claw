@@ -91,6 +91,8 @@
 | D5 | Dirty workspace gate blocks auto_chain (.claude/ paths) | 1ea497f | 2026-03-31 |
 | D6 | Merge task fails without _branch/_worktree metadata | 20baea3 | 2026-03-31 |
 | D7 | Coordinator duplicate reply | c931792 | 2026-03-31 |
+| B10 | Executor worktree fallback contaminates main tree | 3ffe09a | 2026-04-07 |
+| B8 | _gate_checkpoint blocks docs/dev/ as unrelated | 1f080bf | 2026-04-07 |
 
 ---
 
@@ -142,7 +144,7 @@ Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
 
 ## New Bugs (from Step 7 observation, 2026-04-07)
 
-### B8: _gate_checkpoint blocks docs/dev/ files as "unrelated" [OPEN] [P1]
+### B8: _gate_checkpoint blocks docs/dev/ files as "unrelated" [FIXED] [P1]
 
 - **Symptom**: Any dev task that moves/creates files in `docs/dev/` (non-governed) gets blocked by checkpoint gate: "Unrelated files modified: [docs/dev/archive/...]"
 - **Root cause**: `_gate_checkpoint` unrelated-file loop (auto_chain.py ~line 1840) doesn't skip `docs/dev/` paths. `_is_dev_note()` is imported and used at line 1909 (doc consistency check) but NOT in the unrelated-file loop.
@@ -161,7 +163,7 @@ Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
   2. Retry prompt should carry forward `test_results` from previous attempt
 - **File**: `agent/governance/auto_chain.py` (gate + retry prompt builder)
 
-### B10: Executor worktree fallback silently contaminates main tree [OPEN] [P0]
+### B10: Executor worktree fallback silently contaminates main tree [FIXED] [P0]
 
 - **Symptom**: After dev task workflow, main tree has staged changes (`git status` shows `M agent/governance/auto_chain.py` etc.) that no one committed. These changes block subsequent version gate checks.
 - **Root cause**: `executor_worker._execute_task` line 207-217: when `_create_worktree()` fails, `execution_workspace` falls back to `self.workspace` (main tree) **silently**. Claude CLI then writes directly to main tree. Executor's `git add` (line 352) stages changes in main's index.
