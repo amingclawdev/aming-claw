@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-07 (Step 3 Level 1 complete)
-> Updated by: Observer session (ec61556 → 474b941)
+> Last updated: 2026-04-07 (Steps 3-6 complete, ready for observation)
+> Updated by: Observer session (ec61556 → b858962)
 
 ---
 
@@ -17,10 +17,10 @@ New session? Read this first, then follow links for details.
 |-----------|--------|---------|
 | Governance | Running | Port 40000, restart with `python -m agent.governance.server` |
 | Executor | Running (PID 31808) | Auto-claims aggressively, observer_mode needed for manual claim |
-| Git HEAD | 474b941 | `feat(L1): _infer_doc_associations + pending_nodes table (Step 3a+3b)` |
-| chain_version | 474b941 | Synced ✅ |
+| Git HEAD | b858962 | `feat(L4): executor test scriptification + PM graph impact (Step 6)` |
+| chain_version | b858962 | Synced ✅ |
 | Graph | 29 nodes, 34 edges | Rebuilt 2026-04-06, old 119 nodes waived |
-| Tests | 168 L0+L1 pass, 905 full (2 pre-existing failures) | Step 3 verified |
+| Tests | 923 pass, 2 pre-existing failures | Full L0-L4 regression verified |
 
 ## Bug Backlog
 
@@ -48,8 +48,11 @@ Progress:
 - [x] Step 1: Bootstrap graph (29 nodes, 71 tests, 42 docs mapped)
 - [x] Step 2: Verify Level 0 (276 tests pass)
 - [x] Step 3: Level 1 changes (474b941) — _infer_doc_associations + pending_nodes
-- [ ] **Step 4: Verify Level 2** ← NEXT (run L2 tests, no code changes)
-- [ ] Step 5-8: See execution record
+- [x] Step 4: Level 2 verified (27/27 pass)
+- [x] Step 5: Level 3 changes (0c854b8) — graph-aware doc governance (observation)
+- [x] Step 6: Level 4 changes (b858962) — executor test scriptification + PM graph impact
+- [ ] **Step 7: Observation period** ← NEXT (8+ real tasks, collect precision/recall)
+- [ ] Step 8: Hard gate switch
 
 ### Key Files Changed This Session
 

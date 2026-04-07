@@ -2,7 +2,7 @@
 
 > Plan: [plan-graph-driven-doc.md](../governance/plan-graph-driven-doc.md)
 > Started: 2026-04-06
-> Status: Step 3 DONE (474b941), Step 4 next
+> Status: Step 6 DONE (b858962), ready for Step 7 observation
 
 ---
 
@@ -41,17 +41,30 @@ Executor note: PID 31808/44892 auto-claimed dev tasks before observer could clai
 Observer_mode enabled after first race, but task_release→claim still lost to executor.
 Workaround: implemented directly in main tree, completed task via MCP API.
 
-## Step 4: Verify L2 [NO CODE]
+## Step 4: Verify L2 [NO CODE] — DONE
 
-- [ ] All Level 2 tests green
+- [x] All Level 2 tests green (27/27 pass)
 
-## Step 5: Level 3 [WORKFLOW]
+## Step 5: Level 3 [WORKFLOW] — DONE (0c854b8)
 
-- [ ] AC-L3.1 — AC-L3.11 (see plan)
+- [x] 5a: _gate_post_pm warns on unclassified graph docs (observation)
+- [x] 5b: _build_dev_prompt merges graph-derived docs into doc_impact
+- [x] 5c: _gate_checkpoint allows graph docs + observation doc check
+- [x] 5d: _build_qa_prompt injects "Graph Consistency Check" section
+- [x] 5e: _gate_qa_pass observes graph doc coverage
+- [x] 5f: _audit_doc_gap writes audit trail for doc gaps
+- [x] 5g: _gate_release stores proposed_nodes in pending_nodes (P4)
+- [x] 5h: reconcile phase_diff detects stale_doc_refs + unmapped_docs
+- [x] 269/269 Level 0-3 tests pass
 
-## Step 6: Level 4 [WORKFLOW]
+## Step 6: Level 4 [WORKFLOW] — DONE (b858962)
 
-- [ ] AC-L4.1 — AC-L4.8 (see plan)
+- [x] 6a: _execute_test() runs pytest as subprocess, pre-flight file check
+- [x] 6b: TASK_ROLE_MAP["test"] = "script" (no Claude CLI for tests)
+- [x] 6c: _parse_pytest_output() extracts passed/failed/errors
+- [x] 6d: PM prompt graph impact injection via /api/impact
+- [x] 6e: command_argv (shell=False) / command_shell (shell=True) / shlex fallback
+- [x] 923/923 full regression pass (2 pre-existing failures unchanged)
 
 ## Step 7: Observation [NO CODE]
 
