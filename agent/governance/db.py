@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -196,6 +196,22 @@ CREATE TABLE IF NOT EXISTS gate_events (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gate_events_project_task ON gate_events(project_id, task_id);
+
+-- Pending nodes: inferred doc associations awaiting human review (P4)
+CREATE TABLE IF NOT EXISTS pending_nodes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    doc_path      TEXT NOT NULL,
+    confidence    REAL NOT NULL DEFAULT 0.0,
+    reason        TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created_at    TEXT NOT NULL,
+    reviewed_at   TEXT,
+    reviewed_by   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_nodes_project ON pending_nodes(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_pending_nodes_node ON pending_nodes(project_id, node_id);
 """
 
 
@@ -652,7 +668,26 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13}
+    def _migrate_v13_to_v14(c):
+        """Add pending_nodes table for inferred doc associations (P4)."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_nodes (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id    TEXT NOT NULL,
+                node_id       TEXT NOT NULL,
+                doc_path      TEXT NOT NULL,
+                confidence    REAL NOT NULL DEFAULT 0.0,
+                reason        TEXT,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                created_at    TEXT NOT NULL,
+                reviewed_at   TEXT,
+                reviewed_by   TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pending_nodes_project ON pending_nodes(project_id, status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pending_nodes_node ON pending_nodes(project_id, node_id)")
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)

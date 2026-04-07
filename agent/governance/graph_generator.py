@@ -357,6 +357,102 @@ def _build_dependency_edges(
     return list(edges)
 
 
+def _infer_doc_associations(
+    nodes: List[Dict[str, Any]],
+    workspace_path: str,
+) -> List[Dict[str, Any]]:
+    """Infer doc associations for graph nodes by matching docs/ files.
+
+    Returns candidate associations flagged with inferred=True (P4/P5).
+    Candidates require human confirmation before being added to the graph.
+
+    Match strategies (by confidence):
+      0.9 — exact stem match (e.g. reconcile.py ↔ reconcile.md)
+      0.5 — partial stem overlap (e.g. auto_chain.py ↔ chain-design.md)
+      0.3 — keyword match in doc's first 500 chars
+    """
+    ws = Path(workspace_path)
+    docs_dir = ws / "docs"
+    if not docs_dir.is_dir():
+        return []
+
+    # Collect all .md files under docs/
+    doc_files: List[str] = []
+    for root, _dirs, files in os.walk(str(docs_dir)):
+        for fname in files:
+            if fname.endswith(".md"):
+                rel = _normalize_path(str(Path(root, fname).relative_to(ws)))
+                doc_files.append(rel)
+
+    candidates: List[Dict[str, Any]] = []
+
+    for node in nodes:
+        node_id = node.get("node_id", "")
+        # Extract stems from primary files
+        primary_stems: Set[str] = set()
+        for pf in node.get("primary", []):
+            stem = Path(pf).stem.lower().replace("_", "-")
+            if stem and stem != "__init__":
+                primary_stems.add(stem)
+                # Also add without common prefixes/suffixes
+                for prefix in ("test-", "test_"):
+                    if stem.startswith(prefix):
+                        primary_stems.add(stem[len(prefix):])
+
+        if not primary_stems:
+            continue
+
+        for doc_path in doc_files:
+            doc_stem = Path(doc_path).stem.lower().replace("_", "-")
+            best_confidence = 0.0
+            best_reason = ""
+
+            # Strategy 1: exact stem match
+            if doc_stem in primary_stems:
+                best_confidence = 0.9
+                best_reason = f"exact stem match: {doc_stem}"
+            else:
+                # Strategy 2: partial overlap (substring or shared word parts)
+                for ps in primary_stems:
+                    if ps in doc_stem or doc_stem in ps:
+                        if len(min(ps, doc_stem, key=len)) >= 3:
+                            best_confidence = max(best_confidence, 0.5)
+                            best_reason = f"partial overlap: {ps} ~ {doc_stem}"
+                    else:
+                        # Word-level overlap: split on - and check shared words
+                        ps_words = set(ps.split("-"))
+                        doc_words = set(doc_stem.split("-"))
+                        shared = ps_words & doc_words - {"", "the", "a", "an"}
+                        if shared and len(shared) >= 1 and any(len(w) >= 3 for w in shared):
+                            best_confidence = max(best_confidence, 0.5)
+                            best_reason = f"word overlap: {shared} in {ps} ~ {doc_stem}"
+
+                # Strategy 3: keyword match in doc content
+                if best_confidence < 0.5:
+                    try:
+                        full = ws / doc_path.replace("/", os.sep)
+                        with open(str(full), "r", encoding="utf-8", errors="ignore") as f:
+                            head = f.read(500).lower()
+                        for ps in primary_stems:
+                            if ps.replace("-", "_") in head or ps.replace("-", " ") in head:
+                                best_confidence = max(best_confidence, 0.3)
+                                best_reason = f"keyword '{ps}' in first 500 chars"
+                                break
+                    except OSError:
+                        pass
+
+            if best_confidence > 0:
+                candidates.append({
+                    "node_id": node_id,
+                    "doc_path": doc_path,
+                    "confidence": best_confidence,
+                    "reason": best_reason,
+                    "inferred": True,
+                })
+
+    return candidates
+
+
 def generate_graph(
     workspace_path: str,
     scan_depth: int = 3,
@@ -429,12 +525,16 @@ def generate_graph(
             if related:
                 code_doc_map[f] = related
 
+    # Infer doc associations (P4 candidates)
+    inferred_docs = _infer_doc_associations(raw_nodes, workspace_path)
+
     result: Dict[str, Any] = {
         "graph": graph,
         "node_count": len(raw_nodes),
         "edge_count": edge_count,
         "layers": layers,
         "code_doc_map": code_doc_map,
+        "inferred_docs": inferred_docs,
     }
     if warning:
         result["warning"] = warning
