@@ -18,7 +18,8 @@
       "Bash(powershell -Command \"\\(Get-CimInstance Win32_Process -Filter ''ProcessId=30664''\\).CommandLine\")",
       "Bash(curl -s http://localhost:40000/api/health)",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f''''Nodes: {d.get\\(\"\"total_nodes\"\"\\)} | {d.get\\(\"\"by_status\"\"\\)}''''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''agent/mcp/server.py''\\).read\\(\\)\\); ast.parse\\(open\\(''agent/mcp/tools.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''agent/mcp/server.py''\\).read\\(\\)\\); ast.parse\\(open\\(''agent/mcp/tools.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(grep -rn \"should_require_docs\\\\|get_related_docs\" /c/Users/z5866/Documents/amingclaw/aming_claw/agent/governance/ --include=*.py)"
     ]
   }
 }

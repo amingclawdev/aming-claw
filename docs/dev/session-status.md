@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-06
-> Updated by: Observer session (dd5d940 → 3de15f1)
+> Last updated: 2026-04-06 (post manual-fix verify)
+> Updated by: Observer session (dd5d940 → 2111c39)
 
 ---
 
@@ -17,8 +17,8 @@ New session? Read this first, then follow links for details.
 |-----------|--------|---------|
 | Governance | Running | Port 40000, restart with `python -m agent.governance.server` |
 | Executor | NOT running | Start with `python -m agent.executor_worker` |
-| Git HEAD | 3de15f1 | `docs: graph-driven doc governance plan + graph rebuild` |
-| chain_version | dd5d940 | Needs sync after commit — run version-sync + version-update |
+| Git HEAD | 2111c39 | `docs: session navigation chain + status handoff` |
+| chain_version | 2111c39 | Synced ✅ |
 | Graph | 29 nodes, 34 edges | Rebuilt 2026-04-06, old 119 nodes waived |
 | Tests | 905 pass, 2 pre-existing failures | Full regression verified |
 
