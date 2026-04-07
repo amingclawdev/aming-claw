@@ -96,6 +96,8 @@ class DiffReport:
     orphan_nodes: list[str] = field(default_factory=list)
     unmapped_files: list[str] = field(default_factory=list)
     healthy_nodes: list[str] = field(default_factory=list)
+    stale_doc_refs: list[RefSuggestion] = field(default_factory=list)  # 5h
+    unmapped_docs: list[str] = field(default_factory=list)  # 5h
     stats: dict = field(default_factory=dict)
 
 
@@ -295,12 +297,32 @@ def phase_diff(graph: AcceptanceGraph, file_set: set[str],
     # Unmapped files: in filesystem but not referenced by any node
     report.unmapped_files = sorted(file_set - all_referenced)
 
+    # 5h: Stale doc refs — secondary refs pointing to missing docs
+    for ref in report.stale_refs:
+        if ref.field == "secondary" and (ref.old_path.startswith("docs/") or ref.old_path.endswith(".md")):
+            report.stale_doc_refs.append(ref)
+
+    # 5h: Unmapped docs — docs/ files not referenced by any node's secondary
+    all_secondary = set()
+    for node_id in graph.list_nodes():
+        try:
+            node_data = graph.get_node(node_id)
+        except Exception:
+            continue
+        for s in node_data.get("secondary", []):
+            all_secondary.add(s)
+    doc_files_in_fs = {f for f in file_set if f.startswith("docs/") and f.endswith(".md")
+                       and not f.startswith("docs/dev/")}  # exclude informal dev docs
+    report.unmapped_docs = sorted(doc_files_in_fs - all_secondary)
+
     report.stats = {
         "total_nodes": graph.node_count(),
         "stale_count": len(report.stale_refs),
         "orphan_count": len(report.orphan_nodes),
         "unmapped_count": len(report.unmapped_files),
         "healthy_count": len(report.healthy_nodes),
+        "stale_doc_count": len(report.stale_doc_refs),
+        "unmapped_doc_count": len(report.unmapped_docs),
     }
 
     return report

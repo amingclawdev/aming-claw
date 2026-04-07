@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 # Restore to False before production use.
 _DISABLE_VERSION_GATE = False
 
+# Graph-driven doc governance: observation mode flag (Step 5, P1 principle)
+# When True, graph doc checks log warnings instead of blocking.
+_GRAPH_DOC_OBSERVATION_MODE = True
+
 # ---------------------------------------------------------------------------
 # Reconciliation Bypass Policy (R1)
 # ---------------------------------------------------------------------------
@@ -142,6 +146,89 @@ CHAIN = {
 
 # Maximum chain depth to prevent infinite loops
 MAX_CHAIN_DEPTH = 10
+
+# ---------------------------------------------------------------------------
+# Graph-Driven Doc Governance Helpers (Step 5)
+# ---------------------------------------------------------------------------
+
+
+def _get_graph_doc_associations(project_id, target_files):
+    """Query graph for doc associations of target_files.
+
+    Returns list of doc paths that the graph considers related to the changed code.
+    Uses confirmed secondary associations from graph nodes.
+    """
+    try:
+        from .graph import AcceptanceGraph
+        state_root = os.path.join(
+            os.environ.get("SHARED_VOLUME_PATH",
+                           os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
+            "codex-tasks", "state", "governance", project_id)
+        graph_path = os.path.join(state_root, "graph.json")
+        if not os.path.exists(graph_path):
+            return []
+        graph = AcceptanceGraph()
+        graph.load(graph_path)
+        docs = set()
+        target_set = set(target_files) if target_files else set()
+        for node_id in graph.list_nodes():
+            try:
+                node_data = graph.get_node(node_id)
+            except Exception:
+                continue
+            primary = node_data.get("primary", [])
+            if any(f in target_set for f in primary):
+                for s in node_data.get("secondary", []):
+                    if s.endswith(".md"):
+                        docs.add(s)
+        return sorted(docs)
+    except Exception:
+        log.debug("_get_graph_doc_associations failed (non-critical)", exc_info=True)
+        return []
+
+
+def _audit_doc_gap(conn, project_id, task_id, stage, missing_docs, changed_files):
+    """Audit doc gap observation (5f). Writes to audit_index for later analysis."""
+    try:
+        from .audit_service import record
+        record(
+            conn, project_id,
+            event="doc_gap_observation",
+            actor="auto-chain",
+            ok=True,  # observation, not failure
+            node_ids=None,
+            request_id="",
+            stage=stage,
+            task_id=task_id,
+            missing_docs=sorted(missing_docs) if missing_docs else [],
+            changed_files=changed_files[:10] if changed_files else [],
+            observation_mode=True,
+        )
+    except Exception:
+        log.debug("_audit_doc_gap failed (non-critical)", exc_info=True)
+
+
+def _store_proposed_nodes(conn, project_id, proposed_nodes):
+    """Store proposed_nodes into pending_nodes table (5g, P4)."""
+    if not proposed_nodes:
+        return 0
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for pn in proposed_nodes:
+        node_id = pn.get("node_id", "")
+        for doc in pn.get("docs", []):
+            try:
+                conn.execute(
+                    "INSERT INTO pending_nodes (project_id, node_id, doc_path, confidence, reason, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+                    (project_id, node_id, doc, pn.get("confidence", 0.5), pn.get("reason", "proposed by chain"), now),
+                )
+                count += 1
+            except Exception:
+                log.debug("_store_proposed_nodes insert failed", exc_info=True)
+    return count
+
 
 # ---------------------------------------------------------------------------
 # Graph-Path-Driven Routing (Roadmap §5.5)
@@ -1641,6 +1728,23 @@ def _gate_post_pm(conn, project_id, result, metadata):
         if not _check_subtask_dag_acyclic(subtasks):
             return False, "cyclic dependency in subtask depends_on"
 
+    # === 5a: Graph doc classification validation (observation mode) ===
+    target_files = (result.get("target_files") or prd.get("target_files")
+                    or metadata.get("target_files") or [])
+    graph_docs = _get_graph_doc_associations(project_id, target_files)
+    if graph_docs:
+        doc_impact = result.get("doc_impact") or prd.get("doc_impact") or {}
+        declared_docs = set()
+        if isinstance(doc_impact, dict):
+            declared_docs.update(doc_impact.get("files", []))
+        unclassified = [d for d in graph_docs if d not in declared_docs]
+        if unclassified and _GRAPH_DOC_OBSERVATION_MODE:
+            log.warning(
+                "post_pm_gate: graph links %d doc(s) to target_files but PM did not classify them: %s",
+                len(unclassified), unclassified[:5],
+            )
+            _audit_doc_gap(conn, project_id, metadata.get("parent_task_id", ""), "post_pm", set(unclassified), target_files)
+
     # === Merge all fields into result for downstream ===
     for field in ("target_files", "verification", "acceptance_criteria",
                   "test_files", "proposed_nodes", "doc_impact", "skip_reasons",
@@ -1719,6 +1823,10 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     doc_impact = metadata.get("doc_impact", {})
     if isinstance(doc_impact, dict):
         allowed.update(doc_impact.get("files", []) or [])
+    # 5c: Also allow graph-linked docs
+    graph_docs = _get_graph_doc_associations(project_id, list(target))
+    if graph_docs:
+        allowed.update(graph_docs)
     # R1/R2: Derive allowed test files from target_files stems.
     # For each target file with stem S, allow changed files matching
     # tests/test_{S}*.py (under any parent directory or agent/tests/).
@@ -1818,6 +1926,17 @@ def _gate_checkpoint(conn, project_id, result, metadata):
                             bootstrap_reason, sorted(missing_docs))
             else:
                 return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files."
+    # 5c: Observation-mode graph doc check
+    if graph_docs and _GRAPH_DOC_OBSERVATION_MODE:
+        doc_files_in_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
+        graph_docs_missing = set(graph_docs) - doc_files_in_changed
+        if graph_docs_missing:
+            log.warning(
+                "checkpoint_gate: graph-linked docs not updated (observation): %s",
+                sorted(graph_docs_missing)[:5],
+            )
+            _audit_doc_gap(conn, project_id, metadata.get("parent_task_id", ""), "checkpoint", graph_docs_missing, changed)
+
     # Node gate is temporarily non-blocking while the governance graph catches
     # up with node-by-node local development. Keep the signal in logs only.
     related_nodes = _normalize_related_nodes(metadata.get("related_nodes", []))
@@ -1905,6 +2024,21 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 )
             else:
                 return False, f"qa_pass gate blocked — {reason}"
+    # 5e: Graph doc verification (observation mode)
+    if _GRAPH_DOC_OBSERVATION_MODE:
+        target_files = metadata.get("target_files", [])
+        graph_docs = _get_graph_doc_associations(project_id, target_files)
+        if graph_docs:
+            changed = metadata.get("changed_files", [])
+            doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
+            graph_docs_missing = set(graph_docs) - doc_files_changed
+            if graph_docs_missing:
+                log.warning(
+                    "qa_gate: graph-linked docs not updated (observation): %s",
+                    sorted(graph_docs_missing)[:5],
+                )
+                _audit_doc_gap(conn, project_id, metadata.get("parent_task_id", ""), "qa_pass", graph_docs_missing, changed)
+
     # M2: QA passed → write success pattern memory
     _write_chain_memory(
         conn, project_id, "qa_decision",
@@ -1966,6 +2100,14 @@ def _gate_release(conn, project_id, result, metadata):
     if related_nodes:
         _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
                            {"type": "merge_complete", "producer": "auto-chain"})
+
+    # 5g: Store proposed_nodes into pending_nodes (P4 — not directly to graph)
+    proposed_nodes = metadata.get("proposed_nodes", [])
+    if proposed_nodes:
+        count = _store_proposed_nodes(conn, project_id, proposed_nodes)
+        if count > 0:
+            log.info("release_gate: stored %d proposed node(s) in pending_nodes", count)
+
     return True, "ok"
 
 
@@ -2037,6 +2179,21 @@ def _build_dev_prompt(task_id, result, metadata):
                     requirements = parent_result.get("requirements", requirements)
         except Exception:
             pass
+    # 5b: Merge graph-derived docs into doc_impact
+    graph_docs = _get_graph_doc_associations(
+        metadata.get("project_id", "aming-claw"), target_files)
+    if graph_docs:
+        if isinstance(doc_impact, dict):
+            existing = set(doc_impact.get("files", []))
+            new_docs = [d for d in graph_docs if d not in existing]
+            if new_docs:
+                doc_impact = dict(doc_impact)  # copy
+                doc_impact["files"] = list(existing | set(new_docs))
+                doc_impact.setdefault("changes", []).append(
+                    f"Graph-linked docs added: {new_docs[:5]}")
+        else:
+            doc_impact = {"files": graph_docs, "changes": ["Graph-derived doc associations"]}
+
     out_meta = {
         **metadata,  # preserves skip_doc_check, changed_files, related_nodes, etc.
         "target_files": target_files,
@@ -2108,6 +2265,17 @@ def _build_qa_prompt(task_id, result, metadata):
             "Include in your result:\n"
             "  criteria_results: [{criterion: \"<text>\", passed: true/false, evidence: \"<why>\"}]\n"
             "Only set recommendation='qa_pass' if ALL criteria pass."
+        )
+    # 5d: Graph consistency check injection
+    graph_docs = _get_graph_doc_associations(
+        metadata.get("project_id", "aming-claw"),
+        metadata.get("target_files", []))
+    if graph_docs:
+        prompt_parts.append(
+            f"\n## Graph Consistency Check\n"
+            f"The graph links these docs to the changed code: {json.dumps(graph_docs)}\n"
+            f"Verify: are these docs still consistent with the code changes? "
+            f"If not, note which docs need updates in your review."
         )
     prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
     prompt = "\n".join(prompt_parts)

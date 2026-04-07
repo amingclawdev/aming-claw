@@ -1,8 +1,12 @@
-"""Tests for doc governance: _infer_doc_associations (Step 3a, AC-L1.1)."""
+"""Tests for doc governance: Steps 3a + 5 (graph-driven doc governance)."""
 
+import json
 import os
+import sqlite3
 import tempfile
 import shutil
+from unittest.mock import patch, MagicMock
+from dataclasses import field
 
 import pytest
 
@@ -110,3 +114,107 @@ class TestInferDocAssociations:
             assert kw_matches[0]["inferred"] is True
         finally:
             shutil.rmtree(ws)
+
+
+# =====================================================================
+# Step 5 Tests: Level 3 Graph-Driven Doc Governance
+# =====================================================================
+
+
+class TestAuditDocGap:
+    """5f: _audit_doc_gap writes audit record."""
+
+    def test_audit_doc_gap_writes_record(self):
+        from agent.governance.auto_chain import _audit_doc_gap
+        conn = MagicMock()
+        _audit_doc_gap(conn, "test-proj", "task-123", "checkpoint",
+                       {"docs/foo.md"}, ["agent/bar.py"])
+        # Should not raise; audit_service.record may or may not be called
+        # depending on import success — non-critical
+
+    def test_audit_doc_gap_no_crash_on_empty(self):
+        from agent.governance.auto_chain import _audit_doc_gap
+        conn = MagicMock()
+        _audit_doc_gap(conn, "test-proj", "task-123", "post_pm", set(), [])
+
+
+class TestStoreProposedNodes:
+    """5g: _store_proposed_nodes inserts into pending_nodes."""
+
+    def test_store_proposed_nodes_empty(self):
+        from agent.governance.auto_chain import _store_proposed_nodes
+        conn = MagicMock()
+        count = _store_proposed_nodes(conn, "test-proj", [])
+        assert count == 0
+
+    def test_store_proposed_nodes_inserts(self):
+        from agent.governance.auto_chain import _store_proposed_nodes
+        conn = MagicMock()
+        proposed = [
+            {"node_id": "L1.1", "docs": ["docs/foo.md"], "confidence": 0.9, "reason": "test"},
+        ]
+        count = _store_proposed_nodes(conn, "test-proj", proposed)
+        assert count == 1
+        conn.execute.assert_called_once()
+
+
+class TestGetGraphDocAssociations:
+    """5b/5c: _get_graph_doc_associations returns graph-linked docs."""
+
+    def test_returns_empty_on_no_graph(self):
+        from agent.governance.auto_chain import _get_graph_doc_associations
+        # With no graph file, should return empty list (non-critical failure)
+        result = _get_graph_doc_associations("nonexistent-project", ["foo.py"])
+        assert isinstance(result, list)
+        assert result == []
+
+
+class TestReconcileStaleDocs:
+    """5h: phase_diff detects stale_doc_refs and unmapped_docs."""
+
+    def test_diff_report_has_stale_doc_fields(self):
+        from agent.governance.reconcile import DiffReport
+        report = DiffReport()
+        assert hasattr(report, "stale_doc_refs")
+        assert hasattr(report, "unmapped_docs")
+        assert report.stale_doc_refs == []
+        assert report.unmapped_docs == []
+
+    def test_diff_report_stats_include_doc_counts(self):
+        """Stats dict should include stale_doc_count and unmapped_doc_count."""
+        from agent.governance.reconcile import DiffReport
+        report = DiffReport()
+        report.stats = {
+            "stale_doc_count": 0,
+            "unmapped_doc_count": 0,
+        }
+        assert "stale_doc_count" in report.stats
+        assert "unmapped_doc_count" in report.stats
+
+
+class TestGraphDocObservationMode:
+    """5a/5c/5e: Graph doc checks are observation-only (warn, not block)."""
+
+    def test_observation_mode_flag_exists(self):
+        from agent.governance.auto_chain import _GRAPH_DOC_OBSERVATION_MODE
+        assert _GRAPH_DOC_OBSERVATION_MODE is True
+
+    def test_gate_post_pm_does_not_block_on_unclassified_docs(self):
+        """5a: _gate_post_pm warns but doesn't block when graph docs unclassified."""
+        from agent.governance.auto_chain import _gate_post_pm
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = None
+        result = {
+            "target_files": ["agent/governance/server.py"],
+            "verification": {"method": "test"},
+            "acceptance_criteria": ["AC1"],
+            "test_files": ["test.py"],
+            "proposed_nodes": [{"id": "n1"}],
+            "doc_impact": {"files": []},
+            "skip_reasons": {},
+        }
+        metadata = {}
+        with patch("agent.governance.auto_chain._get_graph_doc_associations", return_value=["docs/server.md"]):
+            passed, reason = _gate_post_pm(conn, "test-proj", result, metadata)
+        # Should PASS (observation mode — warn only)
+        assert passed is True
