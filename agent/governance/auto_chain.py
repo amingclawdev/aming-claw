@@ -177,10 +177,16 @@ def _get_graph_doc_associations(project_id, target_files):
             except Exception:
                 continue
             primary = node_data.get("primary", [])
+            secondary = node_data.get("secondary", [])
+            # Forward: code target → find related docs
             if any(f in target_set for f in primary):
-                for s in node_data.get("secondary", []):
+                for s in secondary:
                     if s.endswith(".md"):
                         docs.add(s)
+            # Reverse (G6): doc target → find related code/doc files
+            if any(f in target_set for f in secondary):
+                for p in primary:
+                    docs.add(p)
         return sorted(docs)
     except Exception:
         log.debug("_get_graph_doc_associations failed (non-critical)", exc_info=True)
@@ -1680,6 +1686,16 @@ def _gate_post_pm(conn, project_id, result, metadata):
                     or metadata.get("target_files") or [])
     if not target_files:
         return False, "PRD target_files is empty"
+
+    # G4: Auto-populate doc_impact from graph if PM left it empty
+    doc_impact = result.get("doc_impact") or prd.get("doc_impact")
+    if not doc_impact or (isinstance(doc_impact, dict) and not doc_impact.get("files")):
+        graph_docs = _get_graph_doc_associations(project_id, target_files)
+        if graph_docs:
+            result["doc_impact"] = {
+                "files": graph_docs,
+                "changes": ["Auto-populated from graph associations"],
+            }
 
     # === Soft-mandatory: provide OR explain in skip_reasons ===
     skip_reasons = result.get("skip_reasons", prd.get("skip_reasons", {}))
