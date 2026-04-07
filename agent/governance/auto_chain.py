@@ -1115,9 +1115,19 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     metadata.get("parent_task_id", task_id),
                     metadata,
                 )
+                # Build allowed files list for scope constraint
+                allowed = set(metadata.get("target_files", []))
+                allowed.update(metadata.get("test_files", []))
+                doc_files = (metadata.get("doc_impact") or {}).get("files", [])
+                allowed.update(doc_files)
+                if allowed:
+                    scope_line = f"SCOPE CONSTRAINT: Checkpoint gate only allows changes to: {sorted(allowed)}. Changes to any other files will be blocked as 'unrelated'.\n\n"
+                else:
+                    scope_line = ""
                 retry_prompt = (
                     f"Previous attempt ({task_id}) was blocked by gate.\n"
                     f"Gate reason: {retry_reason}\n\n"
+                    f"{scope_line}"
                     "IMPORTANT: Do not assume previous blockers still exist. "
                     "Re-verify all alleged blockers against current source before reporting them as remaining issues.\n\n"
                     "Fix the issue described above and retry.\n"
@@ -1858,7 +1868,12 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     # Syntax check: verify test_results if available
     test_results = result.get("test_results", {})
     if test_results.get("ran") and test_results.get("failed", 0) > 0:
-        return False, f"Dev tests failed: {test_results.get('failed')} failures"
+        cmd = test_results.get('command', 'unknown')
+        output_excerpt = str(test_results.get('output', ''))[:500]
+        detail = f"Dev tests failed: {test_results.get('failed')} failures. Command: {cmd}"
+        if output_excerpt:
+            detail += f". Output excerpt: {output_excerpt}"
+        return False, detail
     # --- Contract-drift detection (D10) --- warn-only ---
     try:
         from .drift_detector import detect_drift, findings_to_json

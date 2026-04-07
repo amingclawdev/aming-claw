@@ -360,5 +360,117 @@ class TestCheckpointGateRound5(unittest.TestCase):
         self.assertIn("Lane C", reason)
 
 
+class TestB9GateReasonEnrichment(unittest.TestCase):
+    """B9: Gate reason for test failures includes command and output excerpt."""
+
+    def test_gate_reason_includes_command_and_output(self):
+        from governance.auto_chain import _gate_checkpoint
+
+        metadata = {"target_files": ["agent/foo.py"]}
+        result = {
+            "changed_files": ["agent/foo.py"],
+            "test_results": {
+                "ran": True,
+                "failed": 2,
+                "command": "pytest agent/tests/test_foo.py -q",
+                "output": "FAILED test_foo::test_bar - AssertionError",
+            },
+        }
+        passed, reason = _gate_checkpoint(None, "test-proj", result, metadata)
+        self.assertFalse(passed)
+        self.assertIn("Command: pytest agent/tests/test_foo.py -q", reason)
+        self.assertIn("Output excerpt: FAILED test_foo::test_bar", reason)
+
+    def test_gate_reason_default_command_when_missing(self):
+        from governance.auto_chain import _gate_checkpoint
+
+        metadata = {"target_files": ["agent/foo.py"]}
+        result = {
+            "changed_files": ["agent/foo.py"],
+            "test_results": {"ran": True, "failed": 1},
+        }
+        passed, reason = _gate_checkpoint(None, "test-proj", result, metadata)
+        self.assertFalse(passed)
+        self.assertIn("Command: unknown", reason)
+
+
+class TestG5ScopeConstraintInRetryPrompt(unittest.TestCase):
+    """G5: Retry prompt includes SCOPE CONSTRAINT when metadata has target_files."""
+
+    def test_retry_prompt_contains_scope_constraint(self):
+        from governance import auto_chain
+        import governance.task_registry as task_registry
+
+        metadata = {
+            "parent_task_id": "task-parent",
+            "target_files": ["agent/foo.py"],
+            "test_files": ["agent/tests/test_foo.py"],
+            "requirements": ["R1"],
+            "acceptance_criteria": ["AC1"],
+            "verification": {"command": "pytest agent/tests/test_foo.py -q"},
+            "doc_impact": {"files": ["docs/foo.md"], "changes": ["Update foo docs"]},
+            "_gate_retry_count": 0,
+            "chain_depth": 0,
+        }
+
+        class DummyTaskRegistry:
+            last_prompt = ""
+
+            @staticmethod
+            def create_task(conn, project_id, prompt, task_type, created_by, metadata, **kwargs):
+                DummyTaskRegistry.last_prompt = prompt
+                return {"task_id": "task-retry-scope", "prompt": prompt, "metadata": metadata}
+
+        with mock.patch.object(task_registry, "create_task", DummyTaskRegistry.create_task), \
+             mock.patch.object(auto_chain, "_GATES", {"_gate_checkpoint": lambda *a: (False, "some failure")}), \
+             mock.patch.object(auto_chain, "_BUILDERS", {"test_builder": lambda *a: ("", {})}), \
+             mock.patch.object(auto_chain, "CHAIN", {"dev": ("_gate_checkpoint", "test", "test_builder")}), \
+             mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_write_chain_memory"), \
+             mock.patch.object(auto_chain, "_try_verify_update"):
+            result = {"changed_files": ["agent/foo.py"], "test_results": {"ran": True, "failed": 0}}
+            auto_chain._do_chain(object(), "aming-claw", "task-dev-scope", "dev", result, metadata)
+
+        retry_prompt = DummyTaskRegistry.last_prompt
+        self.assertIn("SCOPE CONSTRAINT", retry_prompt)
+        self.assertIn("agent/foo.py", retry_prompt)
+        self.assertIn("agent/tests/test_foo.py", retry_prompt)
+        self.assertIn("docs/foo.md", retry_prompt)
+
+    def test_retry_prompt_no_scope_when_no_files(self):
+        from governance import auto_chain
+        import governance.task_registry as task_registry
+
+        metadata = {
+            "parent_task_id": "task-parent",
+            "requirements": ["R1"],
+            "acceptance_criteria": ["AC1"],
+            "verification": {"command": "pytest -q"},
+            "_gate_retry_count": 0,
+            "chain_depth": 0,
+        }
+
+        class DummyTaskRegistry:
+            last_prompt = ""
+
+            @staticmethod
+            def create_task(conn, project_id, prompt, task_type, created_by, metadata, **kwargs):
+                DummyTaskRegistry.last_prompt = prompt
+                return {"task_id": "task-retry-noscope", "prompt": prompt, "metadata": metadata}
+
+        with mock.patch.object(task_registry, "create_task", DummyTaskRegistry.create_task), \
+             mock.patch.object(auto_chain, "_GATES", {"_gate_checkpoint": lambda *a: (False, "some failure")}), \
+             mock.patch.object(auto_chain, "_BUILDERS", {"test_builder": lambda *a: ("", {})}), \
+             mock.patch.object(auto_chain, "CHAIN", {"dev": ("_gate_checkpoint", "test", "test_builder")}), \
+             mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_write_chain_memory"), \
+             mock.patch.object(auto_chain, "_try_verify_update"):
+            result = {"changed_files": [], "test_results": {"ran": True, "failed": 0}}
+            auto_chain._do_chain(object(), "aming-claw", "task-dev-noscope", "dev", result, metadata)
+
+        retry_prompt = DummyTaskRegistry.last_prompt
+        self.assertNotIn("SCOPE CONSTRAINT", retry_prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
