@@ -2,7 +2,7 @@
 
 > Plan: [plan-graph-driven-doc.md](../governance/plan-graph-driven-doc.md)
 > Started: 2026-04-06
-> Status: Step 3 pending (need context window for workflow)
+> Status: Step 3 DONE (474b941), Step 4 next
 
 ---
 
@@ -25,9 +25,21 @@
 
 - [x] All Level 0 tests green — 276 passed in 30.22s
 
-## Step 3: Level 1 [WORKFLOW+MANUAL]
+## Step 3: Level 1 [WORKFLOW+MANUAL] — DONE (474b941)
 
-- [ ] AC-L1.1 — AC-L1.3 (see plan)
+- [x] AC-L1.1: `_infer_doc_associations()` returns `list[dict]` with `inferred=True` (5 tests)
+  - Three-tier confidence: 0.9 exact stem, 0.5 word overlap, 0.3 keyword
+  - Integrated into `generate_graph()` via `inferred_docs` key
+  - PM task via executor (succeeded), dev task observer-implemented (executor stuck)
+- [x] AC-L1.2: `pending_nodes` table exists after DDL (schema v14, migration v13→v14)
+  - Columns: id, project_id, node_id, doc_path, confidence, reason, status, created_at, reviewed_at, reviewed_by
+  - Manual fix method (schema change)
+- [x] AC-L1.3: All Level 0 + Level 1 tests pass (168/168)
+  - Level 0: 79 pass | Level 1: 84 pass | New: 5 pass
+
+Executor note: PID 31808/44892 auto-claimed dev tasks before observer could claim.
+Observer_mode enabled after first race, but task_release→claim still lost to executor.
+Workaround: implemented directly in main tree, completed task via MCP API.
 
 ## Step 4: Verify L2 [NO CODE]
 
