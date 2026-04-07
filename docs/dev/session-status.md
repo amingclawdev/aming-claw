@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-07 (Steps 3-6 complete, ready for observation)
-> Updated by: Observer session (ec61556 → b858962)
+> Last updated: 2026-04-07 (Step 7 observation in progress)
+> Updated by: Observer session (ec61556 → fe0772f)
 
 ---
 
@@ -17,8 +17,8 @@ New session? Read this first, then follow links for details.
 |-----------|--------|---------|
 | Governance | Running | Port 40000, restart with `python -m agent.governance.server` |
 | Executor | Running (PID 31808) | Auto-claims aggressively, observer_mode needed for manual claim |
-| Git HEAD | b858962 | `feat(L4): executor test scriptification + PM graph impact (Step 6)` |
-| chain_version | b858962 | Synced ✅ |
+| Git HEAD | fe0772f | `docs: add B8-B10 + G4-G6 from Step 7 workflow observation` |
+| chain_version | fe0772f | Synced ✅ |
 | Graph | 29 nodes, 34 edges | Rebuilt 2026-04-06, old 119 nodes waived |
 | Tests | 923 pass, 2 pre-existing failures | Full L0-L4 regression verified |
 
@@ -51,7 +51,11 @@ Progress:
 - [x] Step 4: Level 2 verified (27/27 pass)
 - [x] Step 5: Level 3 changes (0c854b8) — graph-aware doc governance (observation)
 - [x] Step 6: Level 4 changes (b858962) — executor test scriptification + PM graph impact
-- [ ] **Step 7: Observation period** ← NEXT (8+ real tasks, collect precision/recall)
+- [ ] **Step 7: Observation period** ← IN PROGRESS
+  - Observation task 1 (doc reorg): PM✅ Dev×3(gate blocked) — found B8 bug
+  - Observation task 2 (B10 fix): PM✅ Dev×2✅ Test✅ QA✅ → node state retry → auto-healing (11 tasks, 2 still running)
+  - B8-B10 + G4-G6 recorded in bug-and-fix-backlog.md
+  - Round 1b (B8 fix) pending
 - [ ] Step 8: Hard gate switch
 
 ### Key Files Changed This Session
