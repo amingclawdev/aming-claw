@@ -10,6 +10,10 @@ For a full architectural overview, see [Architecture](docs/architecture.md).
 
 ---
 
+## Session Entry Point
+
+**New session? Start here →** [docs/dev/session-status.md](docs/dev/session-status.md) — Current system state, active work, and next steps.
+
 ## Get Started
 
 1. **[Architecture](docs/architecture.md)** — System design, service topology, and data flow

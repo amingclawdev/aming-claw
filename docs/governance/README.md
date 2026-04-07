@@ -27,8 +27,19 @@ This directory contains governance-related documentation for the Aming Claw proj
 | [conflict-rules.md](conflict-rules.md) | Task conflict detection: 5-rule engine |
 | [memory.md](memory.md) | Memory backend: FTS5 + semantic search |
 
+## Current Status
+
+**Quick links for new sessions:**
+
+| What | Where |
+|------|-------|
+| **Session handoff** | [docs/dev/session-status.md](../dev/session-status.md) |
+| **Bug backlog** | [docs/dev/bug-and-fix-backlog.md](../dev/bug-and-fix-backlog.md) |
+| **Active execution** | [docs/dev/current-graph-doc-2026-04-06.md](../dev/current-graph-doc-2026-04-06.md) |
+| **Graph health** | 29 nodes, 905 tests pass — run `mcp__aming-claw__preflight_check` |
+
 ## Active Plans
 
-| File | Status | Execution Record |
-|------|--------|-----------------|
-| [plan-graph-driven-doc.md](plan-graph-driven-doc.md) | IN PROGRESS | [current-graph-doc-2026-04-06](../dev/current-graph-doc-2026-04-06.md) |
+| Plan | Status | Execution Record | Next Step |
+|------|--------|-----------------|-----------|
+| [plan-graph-driven-doc.md](plan-graph-driven-doc.md) | Step 2 ✅ | [current-graph-doc-2026-04-06](../dev/current-graph-doc-2026-04-06.md) | Step 3: Level 1 changes |
