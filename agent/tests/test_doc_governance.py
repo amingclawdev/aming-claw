@@ -199,6 +199,32 @@ class TestGraphDocObservationMode:
         from agent.governance.auto_chain import _GRAPH_DOC_OBSERVATION_MODE
         assert _GRAPH_DOC_OBSERVATION_MODE is True
 
+    def test_parse_pytest_output_extracts_counts(self):
+        """6c: _parse_pytest_output extracts passed/failed from summary line."""
+        from agent.executor_worker import _parse_pytest_output
+        report = _parse_pytest_output("5 passed, 2 failed in 1.5s", "", 1)
+        assert report["passed"] == 5
+        assert report["failed"] == 2
+        assert report["tool"] == "pytest"
+
+    def test_parse_pytest_output_fallback_exit_code(self):
+        """6c: Falls back to exit code when no summary line."""
+        from agent.executor_worker import _parse_pytest_output
+        report = _parse_pytest_output("", "some error", 1)
+        assert report["failed"] == 1
+        assert report["passed"] == 0
+
+    def test_parse_pytest_output_exit_zero(self):
+        """6c: Exit code 0 with no summary → assumed pass."""
+        from agent.executor_worker import _parse_pytest_output
+        report = _parse_pytest_output("", "", 0)
+        assert report["passed"] == 1
+
+    def test_task_role_map_test_is_script(self):
+        """6b: TASK_ROLE_MAP['test'] should be 'script'."""
+        from agent.executor_worker import TASK_ROLE_MAP
+        assert TASK_ROLE_MAP["test"] == "script"
+
     def test_gate_post_pm_does_not_block_on_unclassified_docs(self):
         """5a: _gate_post_pm warns but doesn't block when graph docs unclassified."""
         from agent.governance.auto_chain import _gate_post_pm

@@ -32,20 +32,8 @@ class TestBuildTestPromptRound1(unittest.TestCase):
 
 class TestTesterExecutionRound1(unittest.TestCase):
     def test_test_session_reuses_inherited_worktree(self):
+        """Test tasks run as scripts (6a/6b) using inherited worktree."""
         worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=os.getcwd())
-
-        fake_session = MagicMock()
-        fake_session.pid = 123
-        fake_session.status = "completed"
-        fake_session.stderr = ""
-        fake_session.stdout = '{"schema_version":"v1","summary":"ok","test_report":{"passed":1,"failed":0,"tool":"pytest","command":"pytest agent/tests/test_foo.py -q"}}'
-        fake_session.session_id = "sess-test-1"
-
-        fake_lifecycle = MagicMock()
-        fake_lifecycle.create_session.return_value = fake_session
-        fake_lifecycle.wait_for_output.return_value = {"status": "completed", "elapsed_sec": 1.0}
-        fake_lifecycle.extend_deadline = MagicMock()
-        worker._lifecycle = fake_lifecycle
 
         task = {
             "task_id": "task-test-1",
@@ -60,18 +48,23 @@ class TestTesterExecutionRound1(unittest.TestCase):
             },
         }
 
-        with patch.object(worker, "_build_prompt", wraps=worker._build_prompt), \
-             patch.object(worker, "_get_git_changed_files", return_value=["agent/foo.py"]), \
-             patch.object(worker, "_write_memory"), \
-             patch("subprocess.run") as mock_run:
+        fake_proc = MagicMock()
+        fake_proc.stdout = "1 passed in 0.5s"
+        fake_proc.stderr = ""
+        fake_proc.returncode = 0
+
+        with patch("subprocess.run", return_value=fake_proc) as mock_run, \
+             patch("os.path.isfile", return_value=True):
             result = worker._execute_task(task)
 
         self.assertEqual(result["status"], "succeeded")
-        self.assertEqual(fake_lifecycle.create_session.call_args.kwargs["workspace"], os.getcwd())
         self.assertEqual(result["result"]["_worktree"], os.getcwd())
         self.assertEqual(result["result"]["_branch"], "dev/task-dev-1")
         self.assertEqual(result["result"]["changed_files"], ["agent/foo.py"])
-        mock_run.assert_called()
+        mock_run.assert_called_once()
+        # Verify subprocess was called with correct cwd (inherited worktree)
+        call_kwargs = mock_run.call_args
+        self.assertEqual(call_kwargs.kwargs.get("cwd"), os.getcwd())
 
     def test_tester_prompt_includes_required_verification_command(self):
         worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=os.getcwd())

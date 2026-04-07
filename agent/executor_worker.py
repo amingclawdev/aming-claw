@@ -61,7 +61,7 @@ _DEFAULT_TASK_ROLE_MAP = {
     "coordinator": "coordinator",
     "pm":    "pm",
     "dev":   "dev",
-    "test":  "tester",
+    "test":  "script",  # 6b: test tasks run as scripts, not AI
     "qa":    "qa",
     "gatekeeper": "gatekeeper",
     "merge": "script",  # handled by _execute_merge, no AI
@@ -87,7 +87,48 @@ def _build_task_role_map():
 
 
 TASK_ROLE_MAP = _build_task_role_map()
-# Merge is script-based, see _execute_merge()
+# Merge/test are script-based, see _execute_merge()/_execute_test()
+
+
+def _parse_pytest_output(stdout: str, stderr: str, returncode: int) -> dict:
+    """6c: Parse pytest output into structured test_report.
+
+    Extracts passed/failed/error counts from pytest's summary line.
+    Falls back to exit code if summary line is not found.
+    """
+    import re
+    report = {"tool": "pytest", "passed": 0, "failed": 0, "errors": 0}
+
+    # Try to parse pytest summary: "X passed, Y failed, Z error" etc.
+    combined = stdout + "\n" + stderr
+    # Match patterns like "5 passed", "2 failed", "1 error", "3 warnings"
+    passed_m = re.search(r"(\d+)\s+passed", combined)
+    failed_m = re.search(r"(\d+)\s+failed", combined)
+    error_m = re.search(r"(\d+)\s+error", combined)
+
+    if passed_m:
+        report["passed"] = int(passed_m.group(1))
+    if failed_m:
+        report["failed"] = int(failed_m.group(1))
+    if error_m:
+        report["errors"] = int(error_m.group(1))
+
+    # Extract command from first line or fallback
+    cmd_m = re.search(r"^(pytest|python -m pytest)\s.*$", combined, re.MULTILINE)
+    if cmd_m:
+        report["command"] = cmd_m.group(0)[:200]
+
+    # Fallback: if no counts found, use exit code
+    if not passed_m and not failed_m and not error_m:
+        if returncode == 0:
+            report["passed"] = 1  # at least something passed
+            report["summary"] = "exit code 0 (assumed pass)"
+        else:
+            report["failed"] = 1
+            report["summary"] = f"exit code {returncode}"
+            report["stderr"] = stderr[:500] if stderr else ""
+
+    return report
 
 # Stall detection: after N consecutive empty polls with queued tasks, force-restart poll loop.
 EXECUTOR_STALL_THRESHOLD = int(os.getenv("EXECUTOR_STALL_THRESHOLD", "20"))
@@ -198,11 +239,13 @@ class ExecutorWorker:
             pass
         _timing("report_progress: done")
 
-        # Merge/deploy are script operations, not AI
+        # Merge/deploy/test are script operations, not AI
         if task_type == "merge":
             return self._execute_merge(task_id, metadata)
         if task_type == "deploy":
             return self._execute_deploy(task_id, metadata)
+        if task_type == "test":
+            return self._execute_test(task_id, metadata)
 
         worktree_path = None
         branch_name = None
@@ -427,6 +470,101 @@ class ExecutorWorker:
                 })
         except Exception as e:
             log.warning("Memory write failed (non-fatal): %s", e)
+
+    def _execute_test(self, task_id: str, metadata: dict) -> dict:
+        """6a: Test is a script operation — run pytest directly, no Claude CLI.
+
+        Pre-flight checks verify test files exist before running.
+        Supports command_argv (shell=False) and command_shell (shell=True).
+        """
+        import subprocess as _sp
+        import shlex
+
+        # Determine execution workspace (inherit worktree from dev stage)
+        execution_workspace = self.workspace
+        inherited_worktree = metadata.get("_worktree", "")
+        if inherited_worktree and os.path.isdir(inherited_worktree):
+            execution_workspace = inherited_worktree
+
+        # 6a: Pre-flight file check — verify test files exist
+        test_files = metadata.get("test_files", [])
+        verification = metadata.get("verification", {})
+        if not test_files and isinstance(verification, dict):
+            cmd_str = verification.get("command", "")
+            if cmd_str:
+                # Extract test file paths from command
+                test_files = [p for p in cmd_str.split() if p.endswith(".py")]
+
+        missing = [f for f in test_files if not os.path.isfile(os.path.join(execution_workspace, f))]
+        if missing:
+            return {
+                "status": "failed",
+                "result": {
+                    "error": f"Pre-flight: test files missing: {missing}",
+                    "test_report": {"passed": 0, "failed": 0, "errors": 1, "tool": "pre-flight"},
+                },
+            }
+
+        # 6e: Build command — prefer command_argv, fallback to command_shell, then shlex
+        command_argv = metadata.get("command_argv")
+        command_shell = metadata.get("command_shell")
+        use_shell = False
+
+        if command_argv and isinstance(command_argv, list):
+            cmd = command_argv
+        elif command_shell and isinstance(command_shell, str):
+            cmd = command_shell
+            use_shell = True
+        elif isinstance(verification, dict) and verification.get("command"):
+            cmd_str = verification["command"]
+            try:
+                cmd = shlex.split(cmd_str)
+            except ValueError:
+                cmd = cmd_str
+                use_shell = True
+        else:
+            # Default: run all test files with pytest
+            cmd = ["python", "-m", "pytest"] + test_files + ["-v", "--tb=short"]
+
+        log.info("test_script: running command in %s: %s (shell=%s)", execution_workspace, cmd, use_shell)
+
+        try:
+            proc = _sp.run(
+                cmd,
+                cwd=execution_workspace,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                shell=use_shell,
+            )
+            report = _parse_pytest_output(proc.stdout, proc.stderr, proc.returncode)
+            result = {
+                "test_report": report,
+                "changed_files": metadata.get("changed_files", []),
+                "_worktree": inherited_worktree,
+                "_branch": metadata.get("_branch", ""),
+            }
+            if report.get("failed", 0) == 0 and report.get("errors", 0) == 0:
+                return {"status": "succeeded", "result": result}
+            else:
+                result["error"] = f"Tests failed: {report.get('failed',0)} failures, {report.get('errors',0)} errors"
+                return {"status": "failed", "result": result}
+        except _sp.TimeoutExpired:
+            return {
+                "status": "failed",
+                "result": {
+                    "error": "Test execution timed out (300s)",
+                    "test_report": {"passed": 0, "failed": 0, "errors": 1, "tool": "pytest", "timeout": True},
+                },
+            }
+        except Exception as e:
+            return {
+                "status": "failed",
+                "result": {
+                    "error": f"Test execution error: {e}",
+                    "test_report": {"passed": 0, "failed": 0, "errors": 1, "tool": "pytest"},
+                },
+            }
 
     def _execute_merge(self, task_id: str, metadata: dict) -> dict:
         """Merge is a script operation.
@@ -905,6 +1043,30 @@ class ExecutorWorker:
                     except Exception:
                         parts.append(f"\n### {tf} (file not found or unreadable)")
                 _bp_log(f"target files preview: {len(target_files)} files")
+
+            # 6d: Graph impact for target_files
+            if target_files:
+                try:
+                    import requests as _req2
+                    impact = _req2.post(
+                        f"{self.base_url}/api/impact/{self.project_id}",
+                        json={"files": ",".join(target_files[:10])},
+                        timeout=5,
+                    ).json()
+                    affected = impact.get("affected_nodes", [])
+                    if affected:
+                        parts.append(f"\n## Graph Impact Analysis ({len(affected)} affected nodes)")
+                        for node in affected[:8]:
+                            parts.append(
+                                f"  - {node.get('node_id','')}: {node.get('title','')} "
+                                f"(L{node.get('verify_level','?')}, {node.get('gate_mode','auto')})"
+                            )
+                        related_docs = impact.get("related_docs", [])
+                        if related_docs:
+                            parts.append(f"  Related docs: {related_docs[:5]}")
+                except Exception:
+                    pass
+                _bp_log("graph impact query done")
 
             # 6. Project structure
             parts.append("\n## Project Structure")
