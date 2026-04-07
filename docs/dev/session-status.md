@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-07 (B8+B10 fixed, Step 7 observation continuing)
-> Updated by: Observer session (fe0772f → 1f080bf)
+> Last updated: 2026-04-07 (B8+B9+B10+G5 fixed, Step 7 observation continuing)
+> Updated by: Observer session (fe0772f → 6ffa422)
 
 ---
 
@@ -15,12 +15,12 @@ New session? Read this first, then follow links for details.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Governance | Running | Port 40000, PID 36884, version 1f080bf |
+| Governance | Running | Port 40000, PID 43792, version 6ffa422 |
 | Executor | Running | Auto-claims aggressively, observer_mode ON |
-| Git HEAD | 1f080bf | `B8: Add _is_dev_note() check in _gate_checkpoint` |
-| chain_version | 1f080bf | Synced ✅ |
+| Git HEAD | 6ffa422 | `fix(B9+G5): enrich retry prompt with test detail and scope constraint` |
+| chain_version | 6ffa422 | Synced ✅ |
 | Graph | 29 nodes (1 qa_pass), 34 edges | governance.auto_chain promoted to qa_pass |
-| Tests | 925 pass, 2 pre-existing failures | Full L0-L4 regression verified |
+| Tests | 932 pass, 2 pre-existing failures | Full L0-L4 regression verified |
 
 ## Bug Backlog
 
@@ -36,6 +36,8 @@ All bugs from 2026-04-05/06 sessions are **FIXED**:
 | B7 deploy restart silent fail | stderr capture + retry + port check | ac873e9 |
 | B10 worktree fallback contaminates main | Dev fail-fast on worktree failure | 3ffe09a |
 | B8 _gate_checkpoint blocks docs/dev/ | _is_dev_note() exemption in unrelated-file loop | 1f080bf |
+| B9 retry prompt lacks test detail | Gate reason includes command + output excerpt | 6ffa422 |
+| G5 retry missing scope rules | SCOPE CONSTRAINT block in retry prompt | 6ffa422 |
 
 ## Active Work
 
@@ -54,10 +56,10 @@ Progress:
 - [ ] **Step 7: Observation period** ← IN PROGRESS
   - Observation task 1 (doc reorg): PM✅ Dev×3(gate blocked) — found B8 bug
   - Observation task 2 (B10 fix): PM✅ Dev×2✅ Test✅ QA✅ → merged (3ffe09a)
-  - Observation task 3 (B8 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain success (1f080bf)
-  - B8+B10 FIXED, B9+G4-G6 remaining in backlog
-  - B8 chain: 6 tasks (PM+Dev+Test+QA+Merge + 3 auto-repair cancelled)
-  - Total tasks observed: ~20 (prev session 11 + this session 9)
+  - Observation task 3 (B8 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain (1f080bf)
+  - Observation task 4 (B9+G5 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain (6ffa422)
+  - B8+B9+B10+G5 FIXED. Remaining: G4, G6
+  - Total tasks observed: ~28 (prev 11 + B8 chain 9 + B9+G5 chain 8)
 - [ ] Step 8: Hard gate switch
 
 ### Key Files Changed This Session

@@ -93,6 +93,8 @@
 | D7 | Coordinator duplicate reply | c931792 | 2026-03-31 |
 | B10 | Executor worktree fallback contaminates main tree | 3ffe09a | 2026-04-07 |
 | B8 | _gate_checkpoint blocks docs/dev/ as unrelated | 1f080bf | 2026-04-07 |
+| B9 | Gate retry prompt lacks test failure detail | 6ffa422 | 2026-04-07 |
+| G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 
 ---
 
@@ -153,7 +155,7 @@ Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
 - **File**: `agent/governance/auto_chain.py`
 - **Executor produced correct fix** (worktree `dev-task-1775571887-b94c2a`, commit `cc71cc2`) but chain couldn't complete due to B9+B10.
 
-### B9: Gate retry prompt lacks test failure detail [OPEN] [P1]
+### B9: Gate retry prompt lacks test failure detail [FIXED] [P1]
 
 - **Symptom**: When `_gate_checkpoint` blocks with "Dev tests failed: N failures", the retry dev task prompt only says "Dev tests failed: 1 failures" — no test name, no error message, no stack trace.
 - **Root cause**: `_gate_checkpoint` returns `(False, f"Dev tests failed: {failed} failures")` without including `test_results` detail. The retry prompt builder (`_build_dev_prompt` retry path) only receives `gate_reason` string, not the structured result.
@@ -187,7 +189,7 @@ Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
 - **Fix proposal**: Either (a) auto-populate `doc_impact` from graph in `_gate_post_pm` if PM left it empty, or (b) strengthen PM prompt to explicitly require copying graph-linked docs into `doc_impact`.
 - **File**: `agent/governance/auto_chain.py` (`_gate_post_pm` or `_build_dev_prompt`)
 
-### G5: Retry dev prompt doesn't explain gate scope rules [OPEN]
+### G5: Retry dev prompt doesn't explain gate scope rules [FIXED]
 
 - **Symptom**: Dev agent on retry modifies files outside `target_files` (evidence.py, project_service.py, state_service.py) — scope creep. Gate correctly blocks, but the next retry has the same problem.
 - **Root cause**: Retry prompt says "Fix the issue described above and retry" but doesn't explain that `_gate_checkpoint` enforces `changed_files ⊆ target_files + test_files + doc_impact.files`. Dev agent doesn't know the constraint.
