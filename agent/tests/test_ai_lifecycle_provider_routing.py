@@ -56,7 +56,7 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
         )
 
         self.assertEqual(dev_cmd[dev_cmd.index("--max-turns") + 1], "40")
-        self.assertEqual(tester_cmd[tester_cmd.index("--max-turns") + 1], "20")
+        self.assertEqual(tester_cmd[tester_cmd.index("--max-turns") + 1], "40")
         self.assertEqual(gatekeeper_cmd[gatekeeper_cmd.index("--max-turns") + 1], "20")
 
         qa_cmd = AILifecycleManager._build_claude_command(
@@ -67,7 +67,7 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
             context={},
             prompt="qa review",
         )
-        self.assertEqual(qa_cmd[qa_cmd.index("--max-turns") + 1], "20")
+        self.assertEqual(qa_cmd[qa_cmd.index("--max-turns") + 1], "40")
 
     def test_claude_command_raises_dev_turn_cap_for_heavy_workflow_task(self):
         from ai_lifecycle import AILifecycleManager
