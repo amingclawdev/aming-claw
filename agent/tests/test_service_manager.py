@@ -425,5 +425,126 @@ class TestHostDefaults(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# _check_restart_signal() — signal file consumption
+# ---------------------------------------------------------------------------
+
+
+class TestCheckRestartSignal(unittest.TestCase):
+    """Tests for signal file consumption (AC1-AC6)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.state_dir = Path(self.tmpdir) / "codex-tasks" / "state"
+        self.state_dir.mkdir(parents=True)
+        self.signal_file = self.state_dir / "manager_signal.json"
+
+        self.mgr = ServiceManager(
+            project_id="test-proj",
+            governance_url="http://localhost:40006",
+            executor_cmd=["echo", "hello"],
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _patch_signal_path(self):
+        """Return a patch that makes _signal_file_path() return our temp path."""
+        return patch("service_manager._signal_file_path", return_value=self.signal_file)
+
+    @patch("service_manager.subprocess.Popen")
+    def test_restart_signal_stops_and_starts_executor(self, mock_popen):
+        """AC4: valid restart signal triggers stop+start and deletes file."""
+        fake1 = _make_fake_process(pid=1000)
+        fake2 = _make_fake_process(pid=2000)
+        mock_popen.side_effect = [fake1, fake2]
+
+        self.mgr.start()
+        # Write a valid restart signal
+        self.signal_file.write_text('{"action": "restart"}', encoding="utf-8")
+
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        # New process should be spawned
+        self.assertEqual(self.mgr._process.pid, 2000)
+        # Signal file should be deleted (R3)
+        self.assertFalse(self.signal_file.exists())
+
+    def test_missing_signal_file_noop(self):
+        """AC5: missing file causes no error."""
+        self.assertFalse(self.signal_file.exists())
+        with self._patch_signal_path():
+            # Should not raise
+            self.mgr._check_restart_signal()
+
+    @patch("service_manager.subprocess.Popen")
+    def test_malformed_json_deletes_file(self, mock_popen):
+        """AC6: invalid JSON logs warning and deletes the corrupt file."""
+        fake = _make_fake_process(pid=3000)
+        mock_popen.return_value = fake
+
+        self.signal_file.write_text("NOT VALID JSON {{{", encoding="utf-8")
+
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        # File should be deleted
+        self.assertFalse(self.signal_file.exists())
+        # Process should NOT have been restarted (no popen call)
+        mock_popen.assert_not_called()
+
+    @patch("service_manager.subprocess.Popen")
+    def test_restart_does_not_increment_circuit_breaker(self, mock_popen):
+        """R5: signal-triggered restart must NOT count toward circuit breaker."""
+        fake1 = _make_fake_process(pid=4000)
+        fake2 = _make_fake_process(pid=5000)
+        mock_popen.side_effect = [fake1, fake2]
+
+        self.mgr.start()
+        restart_count_before = self.mgr.restart_count
+        restart_times_before = len(self.mgr._restart_times)
+
+        self.signal_file.write_text('{"action": "restart"}', encoding="utf-8")
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        # Circuit breaker counters should be unchanged
+        self.assertEqual(self.mgr.restart_count, restart_count_before)
+        self.assertEqual(len(self.mgr._restart_times), restart_times_before)
+        self.assertFalse(self.mgr._circuit_breaker_tripped)
+
+    @patch("service_manager.subprocess.Popen")
+    def test_unknown_action_ignored(self, mock_popen):
+        """Signal with action != 'restart' is silently ignored."""
+        fake = _make_fake_process(pid=6000)
+        mock_popen.return_value = fake
+        self.mgr.start()
+
+        self.signal_file.write_text('{"action": "shutdown"}', encoding="utf-8")
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        # File should still exist (not consumed)
+        self.assertTrue(self.signal_file.exists())
+        # Process unchanged
+        self.assertEqual(self.mgr._process.pid, 6000)
+
+    @patch("service_manager.subprocess.Popen")
+    def test_empty_json_object_ignored(self, mock_popen):
+        """Signal file with empty JSON object is ignored (no action key)."""
+        fake = _make_fake_process(pid=7000)
+        mock_popen.return_value = fake
+        self.mgr.start()
+
+        self.signal_file.write_text('{}', encoding="utf-8")
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        self.assertTrue(self.signal_file.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

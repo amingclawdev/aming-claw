@@ -22,6 +22,7 @@ Design notes
   been confirmed running, so it can safely call ``send_text`` / Telegram helpers.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -97,6 +98,11 @@ def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) 
 
 def _shared_log_dir() -> Path:
     return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "logs"
+
+
+def _signal_file_path() -> Path:
+    """Path to the manager restart signal file (manager_signal.json)."""
+    return Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume"))) / "codex-tasks" / "state" / "manager_signal.json"
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +401,9 @@ class ServiceManager:
             if not self._running:
                 break
 
+            # R1: Check for restart signal on each cycle
+            self._check_restart_signal()
+
             with self._lock:
                 proc = self._process
                 if proc is None:
@@ -480,6 +489,65 @@ class ServiceManager:
                     log.error(
                         "ServiceManager._monitor_loop: failed to restart executor: %s", exc
                     )
+
+    def _check_restart_signal(self) -> None:
+        """Read manager_signal.json; if action==restart, stop+start executor (R1-R5).
+
+        * Missing file → no-op (R4/AC5).
+        * Malformed JSON → log warning, delete corrupt file (R4/AC6).
+        * Valid restart signal → stop current executor, start fresh one, delete
+          signal file.  Does NOT increment circuit breaker (R5).
+        """
+        signal_path = _signal_file_path()
+        if not signal_path.exists():
+            return
+
+        # Read and parse the signal file
+        try:
+            raw = signal_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning(
+                "ServiceManager._check_restart_signal: malformed signal file (%s); deleting",
+                exc,
+            )
+            try:
+                signal_path.unlink()
+            except OSError:
+                pass
+            return
+        except OSError as exc:
+            log.debug("ServiceManager._check_restart_signal: cannot read signal file: %s", exc)
+            return
+
+        action = data.get("action") if isinstance(data, dict) else None
+        if action != "restart":
+            log.debug(
+                "ServiceManager._check_restart_signal: unknown action %r; ignoring", action
+            )
+            return
+
+        # R2: Perform intentional restart (R5: do NOT count toward circuit breaker)
+        log.info("ServiceManager._check_restart_signal: restart signal received; restarting executor")
+        with self._lock:
+            self._stop_locked()
+            try:
+                self._process = self._spawn_executor_process()
+                self._start_time = time.monotonic()
+                log.info(
+                    "ServiceManager._check_restart_signal: executor restarted (PID %d)",
+                    self._process.pid,
+                )
+            except Exception as exc:
+                log.error(
+                    "ServiceManager._check_restart_signal: failed to restart executor: %s", exc
+                )
+
+        # R3: Delete signal file after consumption
+        try:
+            signal_path.unlink()
+        except OSError:
+            pass
 
     def _clear_pycache(self) -> None:
         """Walk the workspace and remove every ``__pycache__`` directory found."""
