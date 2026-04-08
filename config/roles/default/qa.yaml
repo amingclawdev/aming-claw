@@ -1,6 +1,6 @@
 version: "1.0"
 role: qa
-max_turns: 20
+max_turns: 40
 tools:
   - Read
   - Grep
