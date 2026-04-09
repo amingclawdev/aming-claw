@@ -130,5 +130,36 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
         self.assertIn("TASK", prompt)
 
 
+class TestB14StdinPromptPassedToCommunicate(unittest.TestCase):
+    """B14: proc.communicate() must pass input=stdin_prompt to Claude CLI."""
+
+    @patch("ai_lifecycle.subprocess.Popen")
+    def test_communicate_receives_stdin_prompt(self, mock_popen):
+        from ai_lifecycle import AILifecycleManager
+
+        fake_proc = mock_popen.return_value
+        fake_proc.pid = 999
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = ('{"result":"ok"}', "")
+
+        mgr = AILifecycleManager()
+        session = mgr.create_session(
+            role="pm",
+            prompt="Analyze this requirement",
+            context={},
+            project_id="test-proj",
+            workspace=tempfile.gettempdir(),
+        )
+        mgr.wait_for_output(session.session_id)
+
+        # The key assertion: communicate was called WITH input= containing the prompt
+        fake_proc.communicate.assert_called_once()
+        call_kwargs = fake_proc.communicate.call_args
+        # input= can be positional or keyword
+        input_val = call_kwargs.kwargs.get("input") or (call_kwargs.args[0] if call_kwargs.args else None)
+        self.assertIsNotNone(input_val, "communicate() must be called with input= parameter")
+        self.assertIn("Analyze this requirement", input_val)
+
+
 if __name__ == "__main__":
     unittest.main()

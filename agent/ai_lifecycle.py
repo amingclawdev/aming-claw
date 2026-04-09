@@ -321,7 +321,7 @@ class AILifecycleManager:
                 proc = subprocess.Popen(cmd, **popen_kwargs)
                 session.pid = proc.pid
                 _al_log(f"Popen started: pid={proc.pid}")
-                stdout_data, stderr_data = proc.communicate(timeout=_MAX_TIMEOUT)
+                stdout_data, stderr_data = proc.communicate(input=stdin_prompt, timeout=_MAX_TIMEOUT)
                 session.stdout = stdout_data or ""
                 session.stderr = stderr_data or ""
                 session.exit_code = proc.returncode
