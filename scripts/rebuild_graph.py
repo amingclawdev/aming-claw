@@ -17,8 +17,9 @@ def scan_files():
                   if "/dev/" not in f and "/archive/" not in f)
     tests = sorted(f.replace(os.sep, "/") for f in glob.glob("agent/tests/*.py", recursive=True)
                    if os.path.basename(f).startswith("test_"))
+    yamls = sorted(f.replace(os.sep, "/") for f in glob.glob("config/**/*.yaml", recursive=True))
     source = [f for f in py if "/tests/" not in f]
-    return source, docs, tests
+    return source, docs, tests, yamls
 
 
 def build_nodes(source_files):
@@ -208,10 +209,23 @@ def match_docs(doc_files, nodes):
 def main():
     os.chdir(Path(__file__).resolve().parent.parent)
 
-    source_files, doc_files, test_files = scan_files()
+    source_files, doc_files, test_files, yaml_files = scan_files()
     nodes = build_nodes(source_files)
     test_mapping, unmatched_tests = match_tests(test_files, nodes)
     doc_mapping, unmapped_docs = match_docs(doc_files, nodes)
+
+    # Map YAML config files as secondary to owning nodes
+    YAML_CONFIG_OWNERS = {
+        "config/roles/": ["agent.executor", "agent.ai_lifecycle", "agent.config"],
+        "config/": ["governance.gov_misc"],
+    }
+    for yf in yaml_files:
+        for prefix, owner_nodes in YAML_CONFIG_OWNERS.items():
+            if yf.startswith(prefix):
+                for nid in owner_nodes:
+                    if nid in nodes and yf not in nodes[nid]["secondary"]:
+                        nodes[nid]["secondary"].append(yf)
+                break
 
     # Also check README.md at root
     if os.path.exists("README.md") and "README.md" not in doc_mapping:
