@@ -146,6 +146,7 @@ def restart_executor() -> bool:
             "requested_at": utc_iso(),
         }
         save_json(signal_path, payload)
+        log.info("restart_executor: wrote restart signal → %s", signal_path)
         return True
     except Exception as exc:  # noqa: BLE001
         _log_error("restart_executor", exc)

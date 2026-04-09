@@ -7,6 +7,7 @@ AC8: Tests cover:
   (d) stderr content included in failure summary
 """
 import json
+import logging
 import socket
 import subprocess
 import tempfile
@@ -200,6 +201,35 @@ class TestRestartLocalGovernance:
         assert ok is False
         assert "Address already in use" in summary
         assert "unreachable after 4 attempts" in summary
+
+
+# ---------------------------------------------------------------------------
+# Tests: restart_executor signal write + logging
+# ---------------------------------------------------------------------------
+
+class TestRestartExecutorWritesSignal:
+    """R2: restart_executor writes valid signal file and logs."""
+
+    @patch("agent.deploy_chain._state_dir")
+    def test_restart_executor_writes_signal(self, mock_state_dir, tmp_path, caplog):
+        """AC3+AC4: signal file has correct keys and log line emitted."""
+        from agent.deploy_chain import restart_executor
+
+        mock_state_dir.return_value = tmp_path
+
+        with caplog.at_level(logging.INFO, logger="agent.deploy_chain"):
+            result = restart_executor()
+
+        assert result is True
+
+        signal_file = tmp_path / "manager_signal.json"
+        assert signal_file.exists()
+
+        data = json.loads(signal_file.read_text())
+        assert data["action"] == "restart"
+        assert "requested_at" in data
+
+        assert any("wrote restart signal" in rec.message for rec in caplog.records)
 
 
 class TestRestartLocalGovernanceLogging:
