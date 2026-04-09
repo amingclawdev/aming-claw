@@ -1635,8 +1635,8 @@ def _gate_version_check(conn, project_id, result, metadata):
             (project_id,),
         ).fetchone()
         dirty_files = json.loads(row["dirty_files"] or "[]") if row and row["dirty_files"] else []
-        # Filter out tool-local config files that aren't project code
-        _DIRTY_IGNORE = (".claude/", ".claude\\")
+        # Filter out tool-local config and worktree paths that aren't project code
+        _DIRTY_IGNORE = (".claude/", ".claude\\", ".worktrees/", ".worktrees\\")
         dirty_files = [f for f in dirty_files if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
         if dirty_files:
             log.warning("version_check: dirty workspace (%d files: %s) — blocking chain",

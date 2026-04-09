@@ -2210,7 +2210,10 @@ class ExecutorWorker:
                 ["git", "diff", "--name-only"],
                 cwd=self.workspace, timeout=5
             ).decode().strip()
-            dirty = [f for f in diff.splitlines() if f.strip()] if diff else []
+            # Filter out worktree paths — they are not real dirty state in main
+            _IGNORE = (".claude/", ".claude\\", ".worktrees/", ".worktrees\\")
+            dirty = [f for f in diff.splitlines()
+                     if f.strip() and not any(f.startswith(p) for p in _IGNORE)]
 
             # Only write to DB if state changed (avoid unnecessary DB contention)
             if head == self._last_git_head and dirty == self._last_dirty:
