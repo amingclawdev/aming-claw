@@ -2060,7 +2060,7 @@ class ExecutorWorker:
             # Write completion result to timing file
             chain_msg = ""
             if chain.get("gate_blocked"):
-                chain_msg = f"gate_blocked: {chain['reason']}"
+                chain_msg = f"gate_blocked: {chain.get('reason') or chain.get('gate_reason') or 'unknown'}"
             elif chain.get("task_id"):
                 chain_msg = f"chain: {task_id} -> {chain['task_id']} ({chain.get('type')})"
             elif chain.get("deploy"):

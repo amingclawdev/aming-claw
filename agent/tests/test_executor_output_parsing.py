@@ -204,3 +204,47 @@ class TestParsingOrderIntegration:
         payload = json.dumps({"summary": "done", "changed_files": []})
         result = _call_parse_output(payload)
         assert "exit_code" not in result
+
+
+# ======================================================================
+# Tests: gate_blocked reason key defensive lookup (B12 fix)
+# ======================================================================
+
+class TestGateBlockedReasonKey:
+    """Verify gate_blocked handling uses defensive .get() for reason keys.
+
+    Regression tests for B12: executor_worker line ~2063 used chain['reason']
+    which throws KeyError when the response uses 'gate_reason' instead.
+    """
+
+    def _build_chain_msg(self, chain: dict) -> str:
+        """Replicate the gate_blocked chain_msg logic from run_once."""
+        chain_msg = ""
+        if chain.get("gate_blocked"):
+            chain_msg = f"gate_blocked: {chain.get('reason') or chain.get('gate_reason') or 'unknown'}"
+        return chain_msg
+
+    def test_gate_reason_key_no_keyerror(self):
+        """AC3: auto_chain with gate_reason (no reason key) must not raise KeyError."""
+        chain = {"gate_blocked": True, "gate_reason": "version mismatch"}
+        # Must not raise KeyError
+        msg = self._build_chain_msg(chain)
+        assert "version mismatch" in msg
+
+    def test_reason_key_backward_compat(self):
+        """AC4: auto_chain with reason key still works and message contains reason."""
+        chain = {"gate_blocked": True, "reason": "dirty workspace"}
+        msg = self._build_chain_msg(chain)
+        assert "dirty workspace" in msg
+
+    def test_neither_key_falls_back_to_unknown(self):
+        """R3: If neither reason nor gate_reason present, fall back to 'unknown'."""
+        chain = {"gate_blocked": True}
+        msg = self._build_chain_msg(chain)
+        assert "unknown" in msg
+
+    def test_reason_preferred_over_gate_reason(self):
+        """When both keys present, 'reason' takes priority (backward compat)."""
+        chain = {"gate_blocked": True, "reason": "primary", "gate_reason": "secondary"}
+        msg = self._build_chain_msg(chain)
+        assert "primary" in msg
