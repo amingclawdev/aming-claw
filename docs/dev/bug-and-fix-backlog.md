@@ -2,7 +2,7 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-07 (B1-B7 FIXED, B8-B10 + G4-G6 added from Step 7 observation)
+> Last updated: 2026-04-09 (full audit: B1-B14 status reconciled, G1-G10 added, O1-O3 optimization)
 
 ---
 
@@ -11,76 +11,12 @@
 | Tag | Meaning |
 |-----|---------|
 | `OPEN` | Confirmed, not yet fixed |
-| `FIXED` | Fix committed |
+| `FIXED` | Fix committed to main |
 | `WONTFIX` | By design or deferred indefinitely |
-| `WORKAROUND` | Has temporary bypass, root fix pending |
 
 ---
 
-## Active Bugs
-
-### B1: auto_chain dispatch silently fails on dirty workspace [OPEN] [P0]
-
-- **Symptom**: `task_complete` returns `auto_chain.dispatched: true` but no next-stage task is created.
-- **Root cause**: `_gate_version_check()` in auto_chain.py L1416-1486 reads `dirty_files` from DB. Non-.claude dirty files cause gate to return False. The dispatch thread catches the block but does not surface it to the task_complete response.
-- **Reproduced**: 3 times in 2026-04-05 session (PM->Dev, Dev->Test, QA->next all silently blocked by `server.py` being staged).
-- **Impact**: Every chain breaks silently after any stage completes. Observer must manually create each next-stage task.
-- **Related**: D5 fix (1ea497f) filtered `.claude/` paths but didn't fix the core issue of silent failure.
-- **Fix proposal**:
-  1. `task_complete` response should include `gate_blocked: true` + `gate_reason` when dispatch is attempted but blocked.
-  2. auto_chain dispatch should log WARNING (not just debug) when gate blocks.
-  3. Consider: gate should distinguish "dirty from pending feature work" vs "dirty from unknown manual edits".
-
-### B2: skip_version_check has no access control or audit [OPEN] [P1]
-
-- **Symptom**: Any task_create caller can set `metadata.skip_version_check: true` to bypass version gate entirely.
-- **Root cause**: auto_chain.py L1432 does a bare `metadata.get("skip_version_check")` with no authorization, no audit log, no rate limit.
-- **Impact**: Version gate can be circumvented trivially. Bypass leaves no trace in governance DB. Observer bypass during 2026-04-05 session was not audited.
-- **Contrast**: `reconciliation_lane` bypass (L1440-1444) correctly has: allowed_lanes whitelist, observer_authorized check, audit_action logged. `skip_version_check` has none of these.
-- **Fix proposal**:
-  1. Require `operator_id` + `bypass_reason` when `skip_version_check` is set.
-  2. Write audit row: `INSERT INTO governance_events (action='version_gate_bypass', operator, reason, task_id, timestamp)`.
-  3. Add bypass counter per project; alert if >3 bypasses in 24h.
-
-### B3: Version gate only enforces at auto_chain dispatch, not at task_create [OPEN] [P1]
-
-- **Symptom**: Dirty workspace blocks auto_chain from creating next-stage tasks, but manual `task_create` + `skip_version_check` bypasses entirely.
-- **Root cause**: `_gate_version_check()` is only called inside auto_chain dispatch logic. `task_create` endpoint has no gate check.
-- **Impact**: Gate is a recommendation, not an enforcement. Any API caller can create tasks in a dirty state.
-- **Fix proposal**:
-  1. Add optional gate check in `task_create` handler: if dirty workspace and no bypass flag, return warning (not block, to avoid breaking emergency flows).
-  2. Or: tag tasks created during dirty state with `created_during_dirty: true` so downstream stages know.
-
-### B4: Executor CLI hangs on dev/qa tasks (progress stays 0%) [OPEN] [P2]
-
-- **Symptom**: Executor claims dev/qa tasks, spawns Claude CLI subprocess, but progress never updates from 0%. Lease expires, task stays in `claimed` state.
-- **Observed**: dev task (task-1775409544-abc75b) hung for >5min. qa task (task-1775409979-bd9fe6) hung for >4min. test task succeeded normally (~50s).
-- **Root cause**: Unknown. Possible causes:
-  - dev/qa role prompts are too large for CLI subprocess
-  - CLI subprocess hits permission/tool restriction
-  - Worktree isolation not working (dev task needs file write access)
-- **Impact**: Executor cannot autonomously complete dev or qa stages. Observer must intervene.
-- **Fix proposal**: Add executor CLI subprocess logging (stdout/stderr capture to file for post-mortem).
-
-### B5: DB lock on task_complete (intermittent) [WORKAROUND] [P2]
-
-- **Symptom**: `task_complete` returns `"error": "database is locked"`.
-- **Reproduced**: 1 time during QA complete in 2026-04-05 session. Retry after 5s succeeded.
-- **Root cause**: SQLite WAL lock contention between executor worker thread and MCP request handler.
-- **Workaround**: Retry after short delay (3-5s).
-- **Fix proposal**: Add retry-with-backoff in task_complete handler (up to 3 retries, 1s/2s/4s).
-
-### B6: auto_chain dispatch reports dispatched:true when actually blocked [OPEN] [P0]
-
-- **Symptom**: `task_complete` response contains `auto_chain: {dispatched: true}` but no task was created.
-- **Root cause**: The dispatch function returns True before the gate check, or the gate check failure is caught and swallowed.
-- **Impact**: Caller (executor or observer) has no way to know the chain broke. Must poll task_list to discover the gap.
-- **Related**: B1 (same root cause, different symptom surface).
-- **Fix proposal**: `auto_chain.dispatched` should be `false` when gate blocks, with `gate_reason` field.
-
----
-
-## Fixed Bugs (Reference)
+## Fixed Bugs
 
 | ID | Description | Fix Commit | Date |
 |----|-------------|------------|------|
@@ -91,116 +27,177 @@
 | D5 | Dirty workspace gate blocks auto_chain (.claude/ paths) | 1ea497f | 2026-03-31 |
 | D6 | Merge task fails without _branch/_worktree metadata | 20baea3 | 2026-03-31 |
 | D7 | Coordinator duplicate reply | c931792 | 2026-03-31 |
-| B10 | Executor worktree fallback contaminates main tree | 3ffe09a | 2026-04-07 |
+| B1/B6 | auto_chain dispatch silently fails / reports dispatched:true | 8652f51 | 2026-04-05 |
+| B2 | skip_version_check no access control or audit | efd7740 | 2026-04-05 |
+| B3 | Version gate only at dispatch, not task_create | abc9795 | 2026-04-05 |
+| B4 | Executor CLI hangs on dev/qa tasks | dd5d940 | 2026-04-05 |
+| B5 | DB lock on task_complete (intermittent) | a413b9d | 2026-04-05 |
+| B7 | Deploy restart silent fail | ac873e9 | 2026-04-05 |
 | B8 | _gate_checkpoint blocks docs/dev/ as unrelated | 1f080bf | 2026-04-07 |
 | B9 | Gate retry prompt lacks test failure detail | 6ffa422 | 2026-04-07 |
-| G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
+| B10 | Executor worktree fallback contaminates main tree | 3ffe09a | 2026-04-07 |
+| B11 | ServiceManager does not consume restart signal | eff196f | 2026-04-08 |
+| B12 | KeyError 'reason' in executor run_once after task_complete | ee9d9bb | 2026-04-09 |
+| B13 | Dead tester.yaml + ungoverned YAML configs (G7 combined) | 9faa28a | 2026-04-09 |
+| B14 | Claude CLI gets empty stdin — communicate() missing input= | d71baa6 | 2026-04-09 |
 | G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
+| G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 | G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
+| G7 | config/roles/*.yaml not in acceptance graph | 9faa28a | 2026-04-09 |
 
 ---
 
-## Fix Priority Matrix
+## Open Bugs
+
+### B15: Version gate blocks chain after every dev task [OPEN] [P0]
+
+- **Symptom**: Every dev task completion triggers version gate block ("dirty workspace N files"). Auto-chain stops, no test/QA task created. Observer must manually create next stage.
+- **Root cause**: Executor stages changed files in worktree via `git add`. Governance's periodic git sync sees worktree changes as dirty files in `project_version.dirty_files`. Version gate reads dirty_files, finds non-zero, blocks.
+- **Impact**: No chain ever completes autonomously through dev→test without manual intervention. This is the #1 process friction.
+- **Related**: D5 filtered `.claude/` paths, but worktree changes still bleed through.
+- **Fix proposal**: Version gate should filter files that exist in active worktrees, OR the executor's git sync should only report files dirty in main workspace (not worktrees).
+- **File**: `agent/governance/auto_chain.py` (`_gate_version_check`)
+
+### B16: No retry mechanism for version gate blocks [OPEN] [P0]
+
+- **Symptom**: When version gate blocks (`dirty workspace` or `HEAD != CHAIN_VERSION`), the chain returns `{"gate_blocked": True}` and dies. No retry scheduled, no delayed re-check.
+- **Root cause**: Version gate is a pre-gate with no retry logic. Checkpoint gate has retry (up to 2), but version gate is all-or-nothing.
+- **Impact**: Every transient dirty state (worktree files, governance restart pending) permanently kills the chain. Observer must intervene.
+- **Fix proposal**: Add delayed retry (e.g. wait 30s then re-check) or "wait for clean" loop for version gate blocks that are likely transient.
+- **File**: `agent/governance/auto_chain.py` (`_do_chain`)
+
+### B17: task.completed event publishes AFTER version gate [OPEN] [P1]
+
+- **Symptom**: `chain_events` table has zero entries since 2026-04-05. ChainContextStore never receives task completions.
+- **Root cause**: `_publish_event("task.completed")` is at line 915 in `_do_chain`, AFTER `_gate_version_check` at line 872. When gate blocks (returns at line 910), the event is never published. Since gate blocks ~95% of the time (B15), almost no completions reach chain_context.
+- **Impact**: Runtime context store is empty. Crash recovery has nothing to replay. Chain audit trail missing for 4 days.
+- **Fix proposal**: Move `_publish_event("task.completed")` BEFORE the version gate check. Task completion is a fact regardless of whether the chain progresses.
+- **File**: `agent/governance/auto_chain.py` (line 915 → move to ~line 870)
+
+### B18: User API task_create does not publish task.created event [OPEN] [P2]
+
+- **Symptom**: Root PM tasks created via `POST /api/task/create` are invisible to chain_context until they complete. Chain context bootstraps them on completion as a workaround.
+- **Root cause**: `handle_task_create()` in server.py creates the task in DB but never publishes `task.created` to event bus. Only auto-chain publishes `task.created` (line 1351).
+- **Impact**: Chain context has incomplete view of chains. Recovery misses root tasks.
+- **Fix proposal**: Add `_publish_event("task.created", {...})` in `handle_task_create()` after DB insert.
+- **File**: `agent/governance/server.py`
+
+### B19: Governance server not restarted by deploy [OPEN] [P1]
+
+- **Symptom**: After merge, governance server version stays stale. Version gate blocks all subsequent chains with "server version != git HEAD".
+- **Root cause**: Deploy task calls `restart_executor()` (signal file) and `rebuild_governance()` (Docker). But deploy task never runs because chain dies at merge stage (B15/B16). Even when deploy runs, governance restart requires Docker or manual process kill — not covered by ServiceManager signal.
+- **Impact**: Governance must be manually restarted after every merge. Combined with B15/B16, this means the full chain never completes autonomously.
+- **Fix proposal**: Either (a) add governance to ServiceManager signal mechanism, or (b) governance reads version from git dynamically instead of caching at startup.
+- **File**: `agent/deploy_chain.py`, `agent/service_manager.py`
+
+---
+
+## Design Gaps
+
+### G1: No dirty-workspace root cause classification [OPEN] [P3]
+
+- **Current**: Gate sees `dirty_files` → block. No distinction between worktree files, staged changes, or stale refs.
+- **Desired**: Classify dirty cause and suggest action.
+
+### G2: No pre-flight advisory at task_create [OPEN] [P3]
+
+- **Current**: Version gate only fires at auto_chain dispatch. Manual task_create has no warning.
+- **Desired**: `task_create` returns advisory warnings.
+
+### G3: Chain context doesn't track bypass history [OPEN] [P3]
+
+- **Current**: Chain events don't record bypass flags.
+- **Desired**: Audit trail for all gate bypasses.
+
+### G8: PM does not populate related_nodes from graph [OPEN] [P1]
+
+- **Symptom**: `related_nodes` is empty throughout every chain. PM doesn't set it, auto-chain doesn't infer it from `target_files`. The qa_pass graph gate and gatekeeper have nothing to check against.
+- **Impact**: Graph node verification is bypassed for every chain. Nodes can reach merge without qa_pass verification.
+- **Root cause**: `_build_dev_prompt` does NOT infer `related_nodes` from graph. PM prompt doesn't require it. Auto-chain passes empty list.
+- **Fix proposal**: In `_gate_post_pm` or `_build_dev_prompt`, auto-populate `related_nodes` from graph by looking up which nodes own the `target_files`.
+- **File**: `agent/governance/auto_chain.py`
+
+### G9: Observer SOP missing for manual task creation [OPEN] [P2]
+
+- **Symptom**: When observer must manually create a task to bypass a gate block, metadata chain breaks (target_files, changed_files, related_nodes all missing).
+- **Impact**: Downstream stages (QA, gatekeeper) have no graph data to verify.
+- **Root cause**: No documented SOP for manual task creation. Observer doesn't know to fetch parent task metadata from DB.
+- **Fix proposal**: Add to `docs/governance/manual-fix-sop.md`: "When manually creating a task, fetch parent task's metadata_json and copy target_files, changed_files, related_nodes, verification, test_files, _worktree, _branch."
+- **File**: `docs/governance/manual-fix-sop.md`
+
+### G10: Graph not rebuilt after rebuild_graph.py changes [OPEN] [P2]
+
+- **Symptom**: `scripts/rebuild_graph.py` was updated (G7) to scan YAML configs, but `graph.json` was never rebuilt. YAML configs not in graph.
+- **Root cause**: PM AC said "running rebuild_graph.py includes YAML" but dev only modified the script, didn't execute it. No AC verified actual `graph.json` contents.
+- **Fix proposal**: Run `python scripts/rebuild_graph.py` + `python scripts/apply_graph.py`. Add AC to future graph-related PRDs: "graph.json contains expected secondary files."
+- **File**: `shared-volume/codex-tasks/state/governance/aming-claw/graph.json`
+
+---
+
+## Optimizations (Architecture)
+
+### O1: Consolidate to runtime context as single source of truth [OPEN] [P1]
+
+- **Current**: Two parallel data paths — metadata propagation (`{**metadata}` in `create_task`) and event bus → chain_context. Metadata is primary, chain_context is broken (B17).
+- **Problem**: Metadata propagation has no role-based filtering, grows unbounded, breaks on manual task creation.
+- **Proposed**: Use `ChainContextStore.get_chain(task_id, role)` as the single source. Already has role-based visibility (`ROLE_VISIBLE_STAGES`, `ROLE_RESULT_FIELDS`), stage history, and DB persistence.
+- **Blockers**: B17 (events not published), B18 (API tasks invisible), builder functions read from metadata not context.
+- **Migration**: Phase 1: fix B17+B18 (events flow). Phase 2: builders read context with metadata fallback. Phase 3: remove metadata propagation.
+- **File**: `agent/governance/auto_chain.py`, `agent/governance/chain_context.py`
+
+### O2: Version gate should filter worktree dirty files [OPEN] [P1]
+
+- **Current**: `_gate_version_check` reads `project_version.dirty_files` which includes files from active worktrees.
+- **Proposed**: Filter dirty files against active worktrees before blocking. If all dirty files are in worktrees, don't block.
+- **Related**: B15 (every dev task triggers block).
+- **File**: `agent/governance/auto_chain.py`
+
+### O3: Governance should read version from git dynamically [OPEN] [P2]
+
+- **Current**: `SERVER_VERSION` cached at startup. Any commit after startup causes mismatch.
+- **Proposed**: Read `git rev-parse --short HEAD` on each version check, or re-read on each API call.
+- **Related**: B19 (governance not restarted by deploy).
+- **File**: `agent/governance/server.py`
+
+---
+
+## Stale Docs (from audit 2026-04-09)
+
+15 manual commits left graph-linked docs stale. Highest priority:
+
+| Doc | Times Skipped | Status |
+|-----|---------------|--------|
+| `docs/governance/auto-chain.md` | 5x | OPEN — B8/B9/G4/G5/G6/B1 changes not documented |
+| `docs/api/executor-api.md` | 3x | OPEN — L4/B10/B12 changes not documented |
+| `docs/roles/tester.md` | 4x | FIXED (9faa28a) — rewritten for script-based execution |
+| `docs/roles/*.md` (coordinator, dev, qa, pm) | 2x each | OPEN — minor behavioral notes missing |
+| `docs/deployment.md` | 1x | OPEN — B7 changes not documented |
+
+---
+
+## Priority Summary
 
 ```
-            Impact
-            High          Medium        Low
-Effort  ┌─────────────┬─────────────┬───────────┐
-Easy    │ B6 (return  │ B5 (retry)  │           │
-        │ correct     │             │           │
-        │ dispatched) │             │           │
-        ├─────────────┼─────────────┼───────────┤
-Medium  │ B1 (gate    │ B2 (audit)  │           │
-        │ feedback)   │ B3 (create  │           │
-        │             │ gate check) │           │
-        ├─────────────┼─────────────┼───────────┤
-Hard    │ B4 (executor│             │           │
-        │ CLI debug)  │             │           │
-        └─────────────┴─────────────┴───────────┘
+P0 (blocking autonomy):
+  B15  Version gate blocks after every dev task
+  B16  No retry for version gate blocks
 
-Recommended fix order: B6 → B1 → B5 → B2 → B3 → B4
+P1 (chain quality):
+  B17  task.completed not published (chain_context dead)
+  B19  Governance not restarted by deploy
+  G8   related_nodes not auto-populated from graph
+  O1   Consolidate to runtime context single source
+  O2   Filter worktree dirty files from version gate
+
+P2 (observability + process):
+  B18  API task_create missing task.created event
+  G9   Observer SOP for manual task creation
+  G10  Graph.json not rebuilt after script change
+  O3   Governance dynamic version read
+
+P3 (low priority):
+  G1   Dirty workspace classification
+  G2   Pre-flight advisory
+  G3   Bypass history tracking
+  Stale docs (auto-chain.md, executor-api.md, role docs)
 ```
-
----
-
-## Design Gaps (Not Bugs, But Missing Features)
-
-### G1: No dirty-workspace root cause classification
-
-- **Current**: Gate sees `dirty_files` -> block. No distinction between "pending feature commit" vs "unknown manual edit" vs "stale node refs".
-- **Desired**: Gate should classify dirty cause and suggest action:
-  - Untracked new files -> "commit pending feature"
-  - Staged changes -> "complete pending commit"
-  - Graph refs stale -> "run reconcile"
-  - Mixed -> "commit first, then reconcile if needed"
-
-### G2: No "pre-flight before task_create" advisory
-
-- **Current**: Version gate only fires at auto_chain dispatch time. Manual task_create has no warning.
-- **Desired**: `task_create` returns advisory `warnings: ["dirty workspace: server.py uncommitted"]` so caller can decide.
-
-### G3: Chain context doesn't track bypass history
-
-- **Current**: Chain events don't record which tasks used bypass flags.
-- **Desired**: Chain audit trail includes all bypass events, enabling post-mortem "this chain had 3 gate bypasses".
-
----
-
-## New Bugs (from Step 7 observation, 2026-04-07)
-
-### B8: _gate_checkpoint blocks docs/dev/ files as "unrelated" [FIXED] [P1]
-
-- **Symptom**: Any dev task that moves/creates files in `docs/dev/` (non-governed) gets blocked by checkpoint gate: "Unrelated files modified: [docs/dev/archive/...]"
-- **Root cause**: `_gate_checkpoint` unrelated-file loop (auto_chain.py ~line 1840) doesn't skip `docs/dev/` paths. `_is_dev_note()` is imported and used at line 1909 (doc consistency check) but NOT in the unrelated-file loop.
-- **Fix**: Add `if _is_dev_note(f): continue` before `unrelated.append(f)`. 2-line change.
-- **Discovered**: Step 7 observation task — doc reorganization workflow. Gate correctly blocked but `docs/dev/` should be exempt.
-- **File**: `agent/governance/auto_chain.py`
-- **Executor produced correct fix** (worktree `dev-task-1775571887-b94c2a`, commit `cc71cc2`) but chain couldn't complete due to B9+B10.
-
-### B9: Gate retry prompt lacks test failure detail [FIXED] [P1]
-
-- **Symptom**: When `_gate_checkpoint` blocks with "Dev tests failed: N failures", the retry dev task prompt only says "Dev tests failed: 1 failures" — no test name, no error message, no stack trace.
-- **Root cause**: `_gate_checkpoint` returns `(False, f"Dev tests failed: {failed} failures")` without including `test_results` detail. The retry prompt builder (`_build_dev_prompt` retry path) only receives `gate_reason` string, not the structured result.
-- **Impact**: Retry dev agent is "blind" — must re-run all tests to discover which one failed. This wastes ~5 minutes per retry and causes scope creep (dev agent modifies unrelated files trying to fix unknown failure).
-- **Fix proposal**:
-  1. `_gate_checkpoint` should include failed test name/error in gate_reason string
-  2. Retry prompt should carry forward `test_results` from previous attempt
-- **File**: `agent/governance/auto_chain.py` (gate + retry prompt builder)
-
-### B10: Executor worktree fallback silently contaminates main tree [FIXED] [P0]
-
-- **Symptom**: After dev task workflow, main tree has staged changes (`git status` shows `M agent/governance/auto_chain.py` etc.) that no one committed. These changes block subsequent version gate checks.
-- **Root cause**: `executor_worker._execute_task` line 207-217: when `_create_worktree()` fails, `execution_workspace` falls back to `self.workspace` (main tree) **silently**. Claude CLI then writes directly to main tree. Executor's `git add` (line 352) stages changes in main's index.
-- **Evidence**: Three different executor workers (PID 44892, 59308, 31808) claimed consecutive dev tasks. Main tree index was modified at 11:08 (11 min after last worktree commit). 4 staged files include `test_e2e_coordinator.py` and `test_test_report_gate.py` — not in any task's target_files.
-- **Impact**: Main tree pollution → dirty workspace → version gate blocks all future chains → cascading failure.
-- **Fix proposal**:
-  1. `_create_worktree` failure should be FATAL for dev tasks (return error, don't fall back)
-  2. If fallback is needed, require explicit `allow_main_tree=true` in metadata
-  3. Log WARNING when falling back to main tree
-- **File**: `agent/executor_worker.py`
-
----
-
-## New Gaps (from Step 7 observation)
-
-### G4: PM does not use graph impact to populate doc_impact [FIXED]
-
-- **Symptom**: PM receives graph impact data (via 6d injection into prompt) but outputs `doc_impact: {}` even when graph shows `related_docs: [auto-chain.md, gates.md]`.
-- **Impact**: 5a `_gate_post_pm` correctly detects the gap (writes `doc_gap_observation` audit), but the doc information doesn't flow to dev prompt. Dev agent doesn't know which docs to update.
-- **Root cause**: 6d injects graph impact as text in PM prompt, but PM doesn't parse it into structured `doc_impact` output. PM treats it as context, not as a field to populate.
-- **Fix proposal**: Either (a) auto-populate `doc_impact` from graph in `_gate_post_pm` if PM left it empty, or (b) strengthen PM prompt to explicitly require copying graph-linked docs into `doc_impact`.
-- **File**: `agent/governance/auto_chain.py` (`_gate_post_pm` or `_build_dev_prompt`)
-
-### G5: Retry dev prompt doesn't explain gate scope rules [FIXED]
-
-- **Symptom**: Dev agent on retry modifies files outside `target_files` (evidence.py, project_service.py, state_service.py) — scope creep. Gate correctly blocks, but the next retry has the same problem.
-- **Root cause**: Retry prompt says "Fix the issue described above and retry" but doesn't explain that `_gate_checkpoint` enforces `changed_files ⊆ target_files + test_files + doc_impact.files`. Dev agent doesn't know the constraint.
-- **Fix proposal**: Inject gate rules into retry prompt: "IMPORTANT: checkpoint gate only allows changes to these files: {allowed_list}. Any other files will be blocked."
-- **File**: `agent/governance/auto_chain.py` (retry prompt builder)
-
-### G6: _get_graph_doc_associations doesn't work for doc-only tasks [FIXED]
-
-- **Symptom**: 5a `_gate_post_pm` observation doesn't fire when `target_files` are all docs (no code). Graph lookup does `primary ∩ target_files` which is empty for doc paths.
-- **Root cause**: `_get_graph_doc_associations` only checks `primary` field (code files). For doc-only tasks, should also check `secondary` field (docs) — this is the reverse direction that `match_secondary=True` in ImpactAnalyzer already supports.
-- **Fix proposal**: Replace `_get_graph_doc_associations` with `ImpactAnalyzer.analyze(match_secondary=True)` call.
-- **File**: `agent/governance/auto_chain.py`
