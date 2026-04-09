@@ -38,7 +38,6 @@ _DEFAULT_CLAUDE_ROLE_TURN_CAPS = {
     "coordinator": "1",
     "pm": "60",
     "dev": "40",
-    "tester": "40",
     "qa": "40",
     "gatekeeper": "20",
 }

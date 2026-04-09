@@ -59,10 +59,10 @@ class TestYAMLLoad:
         assert isinstance(config.permissions, RolePermissions)
         assert config.prompt_template  # non-empty
 
-    def test_load_all_seven_roles(self):
-        """AC2: All 7 YAML files load."""
+    def test_load_all_six_roles(self):
+        """AC2: All 6 YAML files load (tester archived)."""
         configs = load_all_role_configs(config_base=_CONFIG_DIR)
-        assert len(configs) == 7
+        assert len(configs) == 6
         for role in KNOWN_ROLES:
             assert role in configs, f"Missing config for role: {role}"
 
@@ -166,7 +166,7 @@ class TestBackwardCompat:
         assert "coordinator" in _DEFAULT_ROLE_PERMISSIONS
         assert "dev" in _DEFAULT_ROLE_PERMISSIONS
         assert "pm" in _DEFAULT_ROLE_PROMPTS
-        assert "tester" in _DEFAULT_ROLE_VERIFY_LIMITS
+        assert "tester" in _DEFAULT_ROLE_VERIFY_LIMITS  # Python defaults still have tester for backward compat
 
     def test_missing_yaml_returns_none(self):
         """load_role_config returns None for missing YAML (fallback path)."""
@@ -189,7 +189,7 @@ class TestPromptMatch:
         from agent.role_permissions import _DEFAULT_ROLE_PROMPTS
         configs = load_all_role_configs(config_base=_CONFIG_DIR)
 
-        for role in ("pm", "coordinator", "dev", "tester", "qa", "gatekeeper"):
+        for role in ("pm", "coordinator", "dev", "qa", "gatekeeper"):
             yaml_prompt = configs[role].prompt_template
             py_prompt = _DEFAULT_ROLE_PROMPTS[role]
             assert yaml_prompt == py_prompt, (
@@ -246,6 +246,8 @@ class TestVerifyLimitsMatch:
         configs = load_all_role_configs(config_base=_CONFIG_DIR)
 
         for role, expected_limits in _DEFAULT_ROLE_VERIFY_LIMITS.items():
+            if role == "tester":
+                continue  # tester archived — no YAML config
             assert role in configs, f"Role {role} not in YAML configs"
             yaml_limits = configs[role].verify_limits
             assert yaml_limits == expected_limits, (
@@ -265,6 +267,8 @@ class TestPermissionsMatch:
         configs = load_all_role_configs(config_base=_CONFIG_DIR)
 
         for role, expected in _DEFAULT_ROLE_PERMISSIONS.items():
+            if role == "tester":
+                continue  # tester archived — no YAML config
             assert role in configs, f"Role {role} not in YAML configs"
             yaml_allowed = configs[role].permissions.allowed
             yaml_denied = configs[role].permissions.denied

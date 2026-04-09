@@ -24,7 +24,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_BASE = Path(os.getenv("ROLE_CONFIG_DIR", str(_PROJECT_ROOT / "config" / "roles")))
 
 # All known roles
-KNOWN_ROLES = ("coordinator", "pm", "dev", "tester", "qa", "gatekeeper", "observer")
+KNOWN_ROLES = ("coordinator", "pm", "dev", "qa", "gatekeeper", "observer")
 
 # Required fields in every YAML config
 _REQUIRED_FIELDS = {"version", "role", "max_turns", "permissions", "prompt_template"}

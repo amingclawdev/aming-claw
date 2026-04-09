@@ -56,7 +56,7 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
         )
 
         self.assertEqual(dev_cmd[dev_cmd.index("--max-turns") + 1], "40")
-        self.assertEqual(tester_cmd[tester_cmd.index("--max-turns") + 1], "40")
+        self.assertNotIn("--max-turns", tester_cmd)
         self.assertEqual(gatekeeper_cmd[gatekeeper_cmd.index("--max-turns") + 1], "20")
 
         qa_cmd = AILifecycleManager._build_claude_command(
