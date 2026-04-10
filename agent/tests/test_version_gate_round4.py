@@ -231,5 +231,135 @@ class TestVersionGateRound4(unittest.TestCase):
         self.assertEqual(RECONCILIATION_BYPASS_POLICY["audit_action"], "reconciliation_bypass")
 
 
+    # --- AC7: New tests for task.completed before gate, dirty retry, non-dirty skip, retry success ---
+
+    def test_task_completed_publishes_before_gate_check(self):
+        """AC7a/AC5: task.completed event is published even when version gate blocks."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        # _load_task_trace
+        conn.execute.return_value.fetchone.return_value = None
+
+        publish_calls = []
+        orig_publish = auto_chain._publish_event
+
+        def _track_publish(event_name, payload):
+            publish_calls.append(event_name)
+            return orig_publish(event_name, payload)
+
+        with mock.patch.object(auto_chain, "_publish_event", side_effect=_track_publish), \
+             mock.patch.object(auto_chain, "_gate_version_check", return_value=(False, "HEAD != chain_version")), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"):
+            result = auto_chain._do_chain(conn, "aming-claw", "task-1", "pm", {}, {"chain_depth": 0})
+
+        # task.completed must appear before gate.blocked
+        self.assertIn("task.completed", publish_calls)
+        self.assertIn("gate.blocked", publish_calls)
+        tc_idx = publish_calls.index("task.completed")
+        gb_idx = publish_calls.index("gate.blocked")
+        self.assertLess(tc_idx, gb_idx, "task.completed must be published before gate.blocked")
+        self.assertTrue(result.get("gate_blocked"))
+
+    def test_dirty_workspace_triggers_one_retry(self):
+        """AC7b/AC2: dirty workspace reason triggers exactly one retry with 10s sleep."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = None
+
+        call_count = [0]
+
+        def _fake_gate(c, pid, res, meta):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (False, "dirty workspace: some_file.py")
+            # Second call also fails (persistent dirty)
+            return (False, "dirty workspace: some_file.py")
+
+        with mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_gate_version_check", side_effect=_fake_gate), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"), \
+             mock.patch("time.sleep") as mock_sleep:
+            result = auto_chain._do_chain(conn, "aming-claw", "task-1", "pm", {}, {"chain_depth": 0})
+
+        # Gate called exactly twice (initial + 1 retry)
+        self.assertEqual(call_count[0], 2)
+        # Slept ~10s
+        mock_sleep.assert_called_once_with(10)
+        # Still blocked after retry
+        self.assertTrue(result.get("gate_blocked"))
+
+    def test_non_dirty_block_skips_retry(self):
+        """AC7c/AC4: non-dirty block reason (e.g. HEAD mismatch) gets no retry."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = None
+
+        call_count = [0]
+
+        def _fake_gate(c, pid, res, meta):
+            call_count[0] += 1
+            return (False, "HEAD != chain_version")
+
+        with mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_gate_version_check", side_effect=_fake_gate), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"), \
+             mock.patch("time.sleep") as mock_sleep:
+            result = auto_chain._do_chain(conn, "aming-claw", "task-1", "pm", {}, {"chain_depth": 0})
+
+        # Gate called only once — no retry
+        self.assertEqual(call_count[0], 1)
+        mock_sleep.assert_not_called()
+        self.assertTrue(result.get("gate_blocked"))
+
+    def test_dirty_workspace_retry_success_proceeds(self):
+        """AC7d: if retry succeeds after dirty workspace, chain proceeds normally."""
+        from governance import auto_chain
+
+        call_count = [0]
+
+        def _fake_gate(c, pid, res, meta):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (False, "dirty workspace: some_file.py")
+            return (True, "version match")
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = None
+
+        # We need to mock the stage-specific gate and builder too
+        # _do_chain after version gate calls the stage gate (e.g. _gate_post_pm)
+        # Let's just verify it doesn't return gate_blocked
+        with mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_gate_version_check", side_effect=_fake_gate), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"), \
+             mock.patch("time.sleep") as mock_sleep, \
+             mock.patch.object(auto_chain, "_gate_post_pm", return_value=(False, "test gate fail")):
+            result = auto_chain._do_chain(conn, "aming-claw", "task-1", "pm", {}, {"chain_depth": 0})
+
+        # Gate called twice, sleep called once
+        self.assertEqual(call_count[0], 2)
+        mock_sleep.assert_called_once_with(10)
+        # Version gate passed on retry — if blocked, it's the stage gate, not version_check
+        if result.get("gate_blocked"):
+            # The block must NOT be from version_check (that passed on retry)
+            self.assertNotEqual(result.get("stage"), "version_check",
+                                "version gate should have passed on retry")
+
+
 if __name__ == "__main__":
     unittest.main()
