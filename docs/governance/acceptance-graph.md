@@ -760,6 +760,16 @@ L9.11  Gateway Token Proxy  [impl:pending] [verify:pending] v5.0
       secondary:[]
       test:[]
       description: Gateway holds project_token and proxies all API calls. CLI session only needs project_id without managing tokens itself
+
+L9.12  audit_process — Audit Process Documentation  [impl:done] [verify:pending] v1.0
+      deps:[]
+      gate_mode: manual
+      verify: L9
+      test_coverage: none
+      primary:[docs/governance/audit-process.md]
+      secondary:[docs/dev/audit-process.md]
+      test:[]
+      description: Chain full-process audit procedure — end-to-end verification of task state transitions, gate checks, timeline, and merge idempotency
 ```
 
 ## L10 — Runtime Layer (v5 P0, depends on L7+L9)
