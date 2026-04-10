@@ -1594,7 +1594,7 @@ def _gate_version_check(conn, project_id, result, metadata):
 
     Returns (True, reason) to pass, (False, reason) to block.
     Blocking conditions (return False):
-      - SERVER_VERSION != git HEAD (stale server — restart required)
+      - server version != git HEAD (stale server — restart required)
       - Dirty workspace with non-ignored files (uncommitted changes)
     Bypass conditions (return True even if mismatch):
       - _DISABLE_VERSION_GATE=True (development override)
@@ -1653,7 +1653,7 @@ def _gate_version_check(conn, project_id, result, metadata):
                         len(dirty_files), dirty_files[:5])
             return False, f"dirty workspace ({len(dirty_files)} files: {dirty_files[:3]})"
 
-        from .server import SERVER_VERSION
+        from .server import get_server_version
         import subprocess
         head = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -1662,15 +1662,16 @@ def _gate_version_check(conn, project_id, result, metadata):
         ).stdout.strip()
         if not head or head == "unknown":
             return True, "git HEAD unavailable, skipping"
-        if SERVER_VERSION == "unknown":
+        server_ver = get_server_version()
+        if server_ver == "unknown":
             return True, "server version unavailable, skipping"
-        if SERVER_VERSION != head:
+        if server_ver != head:
             log.warning("version_check: server version (%s) behind git HEAD (%s) — blocking chain. "
                         "Restart governance service to resolve.",
-                        SERVER_VERSION, head)
-            return False, (f"server version ({SERVER_VERSION}) != git HEAD ({head}). "
+                        server_ver, head)
+            return False, (f"server version ({server_ver}) != git HEAD ({head}). "
                            f"Restart governance service to update.")
-        return True, f"version match: {SERVER_VERSION}"
+        return True, f"version match: {server_ver}"
     except Exception as e:
         log.warning("version_check failed (non-fatal): %s", e)
         return True, f"version check skipped: {e}"
@@ -2429,7 +2430,7 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
     """Terminal stage after deploy succeeds.
 
     R4: Call version-sync then version-update to advance chain_version.
-    R5: Verify SERVER_VERSION == new HEAD; warn if stale.
+    R5: Verify server version == new HEAD; warn if stale.
     """
     import subprocess as _sp
 
@@ -2443,21 +2444,22 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
         log.warning("_finalize_chain: version-sync/update failed: %s", e)
         finalize_result["version_sync_error"] = str(e)
 
-    # --- R5: verify SERVER_VERSION == new HEAD ---
+    # --- R5: verify server version == new HEAD ---
     try:
-        from .server import SERVER_VERSION
+        from .server import get_server_version
         new_head = _sp.run(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5,
             cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         ).stdout.strip()
-        if new_head and new_head != "unknown" and SERVER_VERSION != new_head:
+        server_ver = get_server_version()
+        if new_head and new_head != "unknown" and server_ver != new_head:
             finalize_result["restart_required"] = True
-            finalize_result["stale_server_version"] = SERVER_VERSION
+            finalize_result["stale_server_version"] = server_ver
             finalize_result["expected_version"] = new_head
             log.warning(
-                "_finalize_chain: SERVER_VERSION (%s) != HEAD (%s) — restart_required=true",
-                SERVER_VERSION, new_head,
+                "_finalize_chain: server version (%s) != HEAD (%s) — restart_required=true",
+                server_ver, new_head,
             )
     except Exception as e:
         log.debug("_finalize_chain: version verify failed: %s", e)

@@ -41,20 +41,29 @@ import signal
 import subprocess
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 
-# --- Server Version (git commit hash at startup) ---
-def _get_git_version():
-    """Read current git commit hash."""
+# --- Server Version (dynamic with 30s cache) ---
+_version_cache = {"value": "unknown", "ts": 0}
+
+
+def get_server_version():
+    """Return current git HEAD hash, cached for 30 seconds."""
+    if time.time() - _version_cache["ts"] < 30:
+        return _version_cache["value"]
     try:
-        result = subprocess.run(
+        head = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5,
             cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        )
-        return result.stdout.strip() if result.returncode == 0 else "unknown"
+        ).stdout.strip()
+        _version_cache["value"] = head or "unknown"
+        _version_cache["ts"] = time.time()
     except Exception:
-        return "unknown"
+        pass
+    return _version_cache["value"]
 
-SERVER_VERSION = _get_git_version()
+
+# Backward compatibility alias
+SERVER_VERSION = get_server_version()
 SERVER_PID = os.getpid()
 
 
@@ -1857,7 +1866,7 @@ def handle_task_recover(ctx: RequestContext):
 @route("GET", "/api/health")
 def handle_health(ctx: RequestContext):
     return {"status": "ok", "service": "governance", "port": PORT,
-            "version": SERVER_VERSION, "pid": SERVER_PID}
+            "version": get_server_version(), "pid": SERVER_PID}
 
 
 @route("GET", "/api/version-check/{project_id}")
@@ -2873,7 +2882,7 @@ def main():
 
     # PID lock — kill old process, prevent zombies
     _acquire_pid_lock()
-    print(f"Governance v{SERVER_VERSION} (PID {SERVER_PID})")
+    print(f"Governance v{get_server_version()} (PID {SERVER_PID})")
 
     # Enable Redis Pub/Sub bridge for EventBus
     from .event_bus import get_event_bus
