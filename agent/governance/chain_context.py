@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Chain Context Store — event-sourced task chain runtime context.
 
 Provides in-memory runtime state for auto-chain task progression.

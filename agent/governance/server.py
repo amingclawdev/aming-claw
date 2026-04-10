@@ -1542,6 +1542,16 @@ def handle_audit_violations(ctx: RequestContext):
 
 # --- Task Registry ---
 
+
+def _publish_event(event_name, payload):
+    """Best-effort event publish to event bus (mirrors auto_chain pattern)."""
+    try:
+        from . import event_bus
+        event_bus._bus.publish(event_name, payload)
+    except Exception:
+        pass
+
+
 @route("POST", "/api/task/{project_id}/create")
 def handle_task_create(ctx: RequestContext):
     """Create a task. Auth optional — uses principal_id if token provided, else 'anonymous'.
@@ -1609,6 +1619,16 @@ def handle_task_create(ctx: RequestContext):
             max_attempts=int(ctx.body.get("max_attempts", 3)),
             metadata=metadata,
         )
+    # Best-effort publish task.created event to event bus
+    try:
+        _publish_event("task.created", {
+            "task_id": result.get("task_id"),
+            "project_id": project_id,
+            "type": task_type,
+            "created_by": created_by,
+        })
+    except Exception:
+        pass
     # Attach rule decision to response
     if rule_decision:
         result["rule_decision"] = rule_decision
