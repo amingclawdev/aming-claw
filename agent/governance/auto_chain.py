@@ -893,6 +893,15 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                    project_id=project_id, task_id=task_id,
                    trace_id=_trace_id, chain_id=_chain_id)
 
+    # Invalidate version cache for merge tasks so version gate sees fresh HEAD
+    if task_type == "merge":
+        try:
+            from agent.governance.server import _version_cache
+            _version_cache["ts"] = 0
+            log.debug("auto_chain: invalidated _version_cache for merge task %s", task_id)
+        except Exception:
+            pass
+
     # Pre-gate: version check — blocks on stale server or dirty workspace
     ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
     _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)

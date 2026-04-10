@@ -523,6 +523,8 @@ class ExecutorWorker:
             use_shell = True
         elif isinstance(verification, dict) and verification.get("command"):
             cmd_str = verification["command"]
+            # Normalize bare pytest → python -m pytest (Windows PATH issue)
+            cmd_str = cmd_str.replace("pytest ", "python -m pytest ", 1) if cmd_str.startswith("pytest ") else cmd_str
             try:
                 cmd = shlex.split(cmd_str)
             except ValueError:
