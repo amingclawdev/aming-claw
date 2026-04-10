@@ -163,6 +163,7 @@ class TestReconciliationBypassPolicy(unittest.TestCase):
         # Create a mock server module to avoid importing the real one (Py3.10+ syntax)
         mock_server = _types.ModuleType("governance.server")
         mock_server.SERVER_VERSION = "oldvers1"
+        mock_server.get_server_version = lambda: "oldvers1"
         with patch("subprocess.run", return_value=SimpleNamespace(stdout="newhead1\n", returncode=0)), \
              patch.dict("sys.modules", {"governance.server": mock_server}):
             result = _finalize_chain(conn, "test-proj", "task-merge-1", {"report": {"success": True}}, {})
