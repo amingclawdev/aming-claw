@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-07 (All Round 1-3 bugs fixed, Step 7 observation complete)
-> Updated by: Observer session (fe0772f → 272dfa6)
+> Last updated: 2026-04-10 (ALL bugs resolved, system fully autonomous)
+> Updated by: Observer session (6a4e694 → 8ab5bce)
 
 ---
 
@@ -15,83 +15,85 @@ New session? Read this first, then follow links for details.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Governance | Running | Port 40000, PID 43792, version 272dfa6 (needs restart) |
-| Executor | Running | observer_mode ON |
-| Git HEAD | 272dfa6 | `fix(G4+G6): bidirectional graph lookup and auto-populate doc_impact` |
-| chain_version | 272dfa6 | Synced ✅ |
-| Graph | 29 nodes (1 qa_pass), 34 edges | governance.auto_chain promoted to qa_pass |
-| Tests | 937 pass, 2 pre-existing failures | Full L0-L4 regression verified |
+| Governance | Running | Port 40000, dynamic version via `get_server_version()` (no restart needed after commits) |
+| Executor | Running via ServiceManager | Restarts on deploy signal, `test=script` path active |
+| Git HEAD | 8ab5bce | `Auto-merge: task-1775801397-d8a028` (B20 backlog update) |
+| chain_version | 8ab5bce | Synced |
+| Graph | 29 nodes (3 qa_pass, 5 t2_pass) | YAML configs as secondary (G7) |
+| Tests | 963+ pass, 2 pre-existing failures | Full regression verified |
 
-## Bug Backlog
+## Milestone: Fully Autonomous Chain
 
-All bugs from 2026-04-05/06 sessions are **FIXED**:
+**2026-04-10**: First fully autonomous PM→Dev→Test→QA→Gatekeeper→Merge→Deploy chain completed with zero observer intervention. Deploy task ran `restart_executor()`, ServiceManager consumed signal, executor restarted with fresh code.
 
-| Bug | Fix | Commit |
-|-----|-----|--------|
-| B1/B6 auto_chain silent failure | Synchronous dispatch + audit | 8652f51 |
-| B2 skip_version_check no audit | operator_id + bypass_reason required | efd7740 |
-| B3 version gate only at dispatch | Advisory warning at task_create | abc9795 |
-| B4 CLI subprocess PID tracking | Popen + PID liveness recovery | dd5d940 |
-| B5 DB lock no retry | Retry-with-backoff (3 retries, exp backoff) | a413b9d |
-| B7 deploy restart silent fail | stderr capture + retry + port check | ac873e9 |
-| B10 worktree fallback contaminates main | Dev fail-fast on worktree failure | 3ffe09a |
-| B8 _gate_checkpoint blocks docs/dev/ | _is_dev_note() exemption in unrelated-file loop | 1f080bf |
-| B9 retry prompt lacks test detail | Gate reason includes command + output excerpt | 6ffa422 |
-| G5 retry missing scope rules | SCOPE CONSTRAINT block in retry prompt | 6ffa422 |
-| G4 PM doc_impact not from graph | Auto-populate in _gate_post_pm | 272dfa6 |
-| G6 Graph lookup not bidirectional | secondary→primary reverse lookup | 272dfa6 |
+## All Bugs Fixed (this session: B11-B20, G7-G10, O2-O3)
 
-## Active Work
+| ID | Description | Fix | Method |
+|----|-------------|-----|--------|
+| B11 | ServiceManager no signal consumption | eff196f | Chain |
+| B12 | KeyError on chain gate_reason | ee9d9bb | Chain |
+| B13 | Dead tester.yaml + YAML not in graph | 9faa28a | Chain |
+| B14 | Claude CLI empty stdin (communicate missing input=) | d71baa6 | Manual (chicken-and-egg) |
+| B15 | Version gate blocks on worktree dirty files | 44ab315 | Manual SOP (chicken-and-egg) |
+| B16 | No retry for version gate blocks | 8f84d82 | Chain |
+| B17 | task.completed publishes after version gate | 8f84d82 | Chain |
+| B18 | API task_create missing task.created event | 0235786 | Chain |
+| B19 | Governance version stale after commits | 6810a37 | Chain |
+| B20 | Staged/untracked leaks block ff-only merge | 2bd20f9 | Manual (chicken-and-egg) |
+| G7 | config/roles/*.yaml not in graph | 9faa28a | Chain |
+| G8 | related_nodes not auto-populated | 8f84d82 | Chain |
+| G9 | Observer SOP for manual task metadata | 79f9c39 | Chain |
+| G10 | Graph rebuild mapping | 79f9c39 | Chain |
+| O2 | Version gate worktree filter | 44ab315 | Manual |
+| O3 | Dynamic get_server_version() | 6810a37 | Chain |
 
-### Graph-Driven Doc Governance (in progress)
+Manual fixes: 4 (B14, B15, B19, B20) — all chicken-and-egg deadlocks where the bug prevented the chain from running.
+Chain fixes: 12 — delivered through autonomous PM→Dev→Test→QA→Merge pipeline.
 
-**Plan**: [docs/governance/plan-graph-driven-doc.md](../governance/plan-graph-driven-doc.md)
-**Execution**: [docs/dev/current-graph-doc-2026-04-06.md](current-graph-doc-2026-04-06.md)
+## What Works Without Observer
 
-Progress:
-- [x] Step 1: Bootstrap graph (29 nodes, 71 tests, 42 docs mapped)
-- [x] Step 2: Verify Level 0 (276 tests pass)
-- [x] Step 3: Level 1 changes (474b941) — _infer_doc_associations + pending_nodes
-- [x] Step 4: Level 2 verified (27/27 pass)
-- [x] Step 5: Level 3 changes (0c854b8) — graph-aware doc governance (observation)
-- [x] Step 6: Level 4 changes (b858962) — executor test scriptification + PM graph impact
-- [ ] **Step 7: Observation period** ← IN PROGRESS
-  - Observation task 1 (doc reorg): PM✅ Dev×3(gate blocked) — found B8 bug
-  - Observation task 2 (B10 fix): PM✅ Dev×2✅ Test✅ QA✅ → merged (3ffe09a)
-  - Observation task 3 (B8 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain (1f080bf)
-  - Observation task 4 (B9+G5 fix): PM✅ Dev✅ Test✅ QA✅ Merge✅ → full chain (6ffa422)
-  - Observation task 5 (G4+G6 fix): PM✅ Dev(manual)✅ Test✅ QA✅ Merge✅ → full chain (272dfa6)
-  - ALL backlog items FIXED: B8, B9, B10, G4, G5, G6
-  - Total tasks observed: ~35 (prev 11 + B8 9 + B9+G5 8 + G4+G6 7)
-- [ ] Step 8: Hard gate switch
+| Capability | Status | Notes |
+|------------|--------|-------|
+| PM→Dev dispatch | ✅ | Auto-chain creates dev task |
+| Dev execution in worktree | ✅ | Claude CLI with proper stdin (B14) |
+| Dev→Test dispatch | ✅ | Version gate passes (B15+B16+B19) |
+| Test via script path | ✅ | `_execute_test()` subprocess pytest, ~15s |
+| Test→QA dispatch | ✅ | Auto-chain |
+| QA review | ✅ | Claude CLI, checks acceptance criteria |
+| QA→Gatekeeper dispatch | ✅ | Graph gate with related_nodes (G8) |
+| Gatekeeper→Merge dispatch | ✅ | Auto-chain |
+| Merge with worktree cleanup | ✅ | ff-only after staged/untracked cleanup (B20) |
+| Merge→Deploy dispatch | ✅ | Version cache invalidation before gate |
+| Deploy executor restart | ✅ | ServiceManager signal consumption (B11) |
 
-### Key Files Changed This Session
+## Remaining Items (P3, optional, next session)
 
-| File | What Changed |
+| Item | Description |
 |------|-------------|
-| agent/ai_lifecycle.py | B4: subprocess.run → Popen, session.pid exposed |
-| agent/governance/task_registry.py | B3 advisory warning, B5 retry, B4 caller_pid + PID recovery |
-| agent/governance/auto_chain.py | B1/B6 synchronous dispatch, B2 skip audit |
-| agent/governance/server.py | B4 caller_pid forwarding |
-| agent/executor_worker.py | B4 caller_pid + recovery interval |
-| agent/deploy_chain.py | B7 restart stderr + retry |
-| docs/governance/implementation-process.md | NEW: document lifecycle |
-| docs/governance/plan-graph-driven-doc.md | NEW: doc governance plan v5 |
-| scripts/rebuild_graph.py | NEW: graph rebuild mapping |
-| scripts/apply_graph.py | NEW: apply mapping to graph.json |
+| O1 Phase 2-3 | Consolidate runtime context as single source (builders read from chain_context) |
+| G1 | Dirty-workspace root cause classification |
+| G2 | Pre-flight advisory at task_create |
+| G3 | Chain context bypass tracking |
+| Stale role docs | docs/roles/coordinator.md, dev.md, qa.md, pm.md — minor notes |
 
-## Memory Notes
-
-**MEMORY.md is STALE** — not updated for this session's fixes. Key facts to add:
-- All B1-B7 bugs fixed (commits above)
-- Graph rebuilt: 119 stale nodes → 29 clean nodes
-- Document-first process established (implementation-process.md)
-- Test count: 66 core tests + 905 full regression
+These are architecture improvements, not bugs. System works correctly without them.
 
 ## Process Reference
 
-| Process | Document |
-|---------|----------|
-| Implementation lifecycle | [docs/governance/implementation-process.md](../governance/implementation-process.md) |
+| Document | Path |
+|----------|------|
+| Bug backlog | [docs/dev/bug-and-fix-backlog.md](bug-and-fix-backlog.md) |
 | Manual fix SOP | [docs/governance/manual-fix-sop.md](../governance/manual-fix-sop.md) |
-| All governance docs | [docs/governance/README.md](../governance/README.md) |
+| Implementation process | [docs/governance/implementation-process.md](../governance/implementation-process.md) |
+| Graph-driven doc plan | [docs/governance/plan-graph-driven-doc.md](../governance/plan-graph-driven-doc.md) |
+| Auto-chain docs | [docs/governance/auto-chain.md](../governance/auto-chain.md) |
+| Executor API | [docs/api/executor-api.md](../api/executor-api.md) |
+
+## Starting a New Session
+
+1. Check `curl http://localhost:40000/api/health` — governance running?
+2. Check ServiceManager executor — `tail shared-volume/codex-tasks/logs/service-manager-executor-*.err.log`
+3. If either down: start governance (`python -m agent.governance.server &`), then start ServiceManager (see executor startup in session notes)
+4. Run `preflight_check` via MCP — should return `ok: true`
+5. Create PM task — chain runs autonomously from there
+6. Observer mode OFF by default — only enable if you need to inspect/hold tasks
