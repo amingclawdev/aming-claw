@@ -690,6 +690,29 @@ class ExecutorWorker:
                                          cwd=integration_worktree, capture_output=True, text=True, timeout=5)
                     merge_commit = rev.stdout.strip()
 
+                    # B20: Clean leaked staged/untracked files before ff-only merge
+                    try:
+                        # Unstage any leaked files from worktree contamination
+                        subprocess.run(["git", "reset", "HEAD", "--"],
+                                       cwd=self.workspace, capture_output=True, timeout=10)
+                        # Remove untracked files that conflict with merge
+                        merge_files = subprocess.run(
+                            ["git", "diff", "--name-only", "HEAD", merge_commit],
+                            cwd=integration_worktree, capture_output=True, text=True, timeout=10
+                        ).stdout.strip().splitlines()
+                        for f in merge_files:
+                            untracked = os.path.join(self.workspace, f)
+                            if os.path.exists(untracked):
+                                tracked = subprocess.run(
+                                    ["git", "ls-files", f],
+                                    cwd=self.workspace, capture_output=True, text=True, timeout=5
+                                ).stdout.strip()
+                                if not tracked:
+                                    os.remove(untracked)
+                                    log.info("merge: removed untracked %s before ff-only", f)
+                    except Exception as e:
+                        log.warning("merge: pre-ff cleanup failed (non-fatal): %s", e)
+
                     # Advance real workspace main to the merge commit via ff-only
                     ff_proc = subprocess.run(
                         ["git", "merge", "--ff-only", merge_commit],
@@ -2208,14 +2231,24 @@ class ExecutorWorker:
                 cwd=self.workspace, timeout=5
             ).decode().strip()
 
+            # Check both unstaged and staged changes (worktree leaks stage to main index)
             diff = subprocess.check_output(
                 ["git", "diff", "--name-only"],
                 cwd=self.workspace, timeout=5
             ).decode().strip()
+            cached = subprocess.check_output(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=self.workspace, timeout=5
+            ).decode().strip()
+            all_dirty = set()
+            if diff:
+                all_dirty.update(diff.splitlines())
+            if cached:
+                all_dirty.update(cached.splitlines())
             # Filter out worktree paths — they are not real dirty state in main
             _IGNORE = (".claude/", ".claude\\", ".worktrees/", ".worktrees\\")
-            dirty = [f for f in diff.splitlines()
-                     if f.strip() and not any(f.startswith(p) for p in _IGNORE)]
+            dirty = sorted(f for f in all_dirty
+                           if f.strip() and not any(f.startswith(p) for p in _IGNORE))
 
             # Only write to DB if state changed (avoid unnecessary DB contention)
             if head == self._last_git_head and dirty == self._last_dirty:
