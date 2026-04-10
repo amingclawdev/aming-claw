@@ -45,6 +45,7 @@
 | B17 | task.completed event publishes after version gate | 8f84d82 | 2026-04-10 |
 | B18 | API task_create missing task.created event | 0235786 | 2026-04-10 |
 | B19 | Governance version stale after commits | 6810a37 | 2026-04-10 |
+| B20 | Clean staged/untracked leaks before merge | 2bd20f9 | 2026-04-10 |
 | G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
 | G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 | G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
