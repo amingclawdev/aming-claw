@@ -1635,7 +1635,7 @@ def _gate_version_check(conn, project_id, result, metadata):
             (project_id,),
         ).fetchone()
         dirty_files = json.loads(row["dirty_files"] or "[]") if row and row["dirty_files"] else []
-        # Filter out tool-local config and worktree paths that aren't project code
+        # B15 worktree filter: exclude tool-local config and worktree paths from dirty check
         _DIRTY_IGNORE = (".claude/", ".claude\\", ".worktrees/", ".worktrees\\")
         dirty_files = [f for f in dirty_files if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
         if dirty_files:
@@ -1696,6 +1696,33 @@ def _gate_post_pm(conn, project_id, result, metadata):
                 "files": graph_docs,
                 "changes": ["Auto-populated from graph associations"],
             }
+
+    # G8: Auto-populate related_nodes from graph when PM left it empty
+    if not result.get("related_nodes") and target_files:
+        try:
+            from .graph import AcceptanceGraph
+            state_root = os.path.join(
+                os.environ.get("SHARED_VOLUME_PATH",
+                               os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
+                "codex-tasks", "state", "governance", project_id)
+            graph_path = os.path.join(state_root, "graph.json")
+            if os.path.exists(graph_path):
+                graph = AcceptanceGraph()
+                graph.load(graph_path)
+                target_set = set(target_files)
+                matched_nodes = []
+                for node_id in graph.list_nodes():
+                    try:
+                        node_data = graph.get_node(node_id)
+                    except Exception:
+                        continue
+                    primary = node_data.get("primary", [])
+                    if any(f in target_set for f in primary):
+                        matched_nodes.append(node_id)
+                if matched_nodes:
+                    result["related_nodes"] = matched_nodes
+        except Exception:
+            pass  # G8: graph lookup failure is non-critical
 
     # === Soft-mandatory: provide OR explain in skip_reasons ===
     skip_reasons = result.get("skip_reasons", prd.get("skip_reasons", {}))
