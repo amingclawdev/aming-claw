@@ -868,9 +868,43 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     gate_fn_name, next_type, builder_name = CHAIN[task_type]
 
+    # Emit task.completed to chain context store BEFORE gate check (R1)
+    # so completion events are always recorded regardless of gate outcome
+    _publish_event("task.completed", {
+        "project_id": project_id, "task_id": task_id,
+        "result": result, "type": task_type,
+    })
+    # A1: Audit task.completed lifecycle event
+    try:
+        from . import audit_service
+        audit_service.record(
+            conn, project_id, f"{task_type}.completed",
+            actor="auto-chain",
+            ok=True,
+            node_ids=metadata.get("related_nodes", []),
+            task_id=task_id,
+            chain_depth=depth,
+            trace_id=_trace_id,
+        )
+    except Exception:
+        log.debug("auto_chain: audit task.completed failed (non-critical)", exc_info=True)
+    # R6: structured_log with trace_id for gate transitions
+    structured_log("info", f"{task_type}.completed",
+                   project_id=project_id, task_id=task_id,
+                   trace_id=_trace_id, chain_id=_chain_id)
+
     # Pre-gate: version check — blocks on stale server or dirty workspace
     ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
     _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
+
+    # R2: Single-retry for dirty workspace — wait 10s then retry once (R4: max 1 retry)
+    if not ver_passed and "dirty workspace" in ver_reason:
+        import time
+        log.info("auto_chain: dirty workspace detected for task %s, retrying in 10s...", task_id)
+        time.sleep(10)
+        ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
+        _record_gate_event(conn, project_id, task_id, "version_check_retry", ver_passed, ver_reason, _trace_id)
+
     if not ver_passed:
         # R2: Log at WARNING level with task_id, project_id, gate_reason, dirty_files
         _dirty_files = []
@@ -910,30 +944,6 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         return {"gate_blocked": True, "dispatched": False, "stage": "version_check", "reason": ver_reason}
     else:
         log.debug("auto_chain: version check passed for task %s: %s", task_id, ver_reason)
-
-    # Emit task.completed to chain context store
-    _publish_event("task.completed", {
-        "project_id": project_id, "task_id": task_id,
-        "result": result, "type": task_type,
-    })
-    # A1: Audit task.completed lifecycle event
-    try:
-        from . import audit_service
-        audit_service.record(
-            conn, project_id, f"{task_type}.completed",
-            actor="auto-chain",
-            ok=True,
-            node_ids=metadata.get("related_nodes", []),
-            task_id=task_id,
-            chain_depth=depth,
-            trace_id=_trace_id,
-        )
-    except Exception:
-        log.debug("auto_chain: audit task.completed failed (non-critical)", exc_info=True)
-    # R6: structured_log with trace_id for gate transitions
-    structured_log("info", f"{task_type}.completed",
-                   project_id=project_id, task_id=task_id,
-                   trace_id=_trace_id, chain_id=_chain_id)
 
     # M1: PM completes → persist full PRD to memory for future dev/qa recall
     if task_type == "pm":
