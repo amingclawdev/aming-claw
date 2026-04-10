@@ -2,7 +2,7 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-10 (ALL P0-P2 bugs and gaps resolved)
+> Last updated: 2026-04-10 (B21-B22 added from chain task-1775801122-39f7dc)
 
 ---
 
@@ -59,6 +59,20 @@
 ---
 
 ## Open Items (P3 — low priority, next session)
+
+### B21: 并发 merge 竞争 [OPEN] [P2]
+
+- **Status**: Open. Idempotent guard catches it, but race window exists.
+- **Symptom**: 多个 executor 同时尝试 ff-only merge main，首次失败需重试。幂等守卫兜住但有竞争窗口。
+- **Discovered**: chain task-1775801122-39f7dc, task-1775801420
+- **File**: `agent/governance/merge.py` (推测) — merge 幂等锁机制
+
+### B22: 任务扇出 bug [OPEN] [P2]
+
+- **Status**: Open. Extra tasks complete safely in replay mode but waste resources.
+- **Symptom**: dispatcher 对下游任务（merge/gatekeeper/deploy/qa）重复派发，预期各 1 个但实际产生多个。
+- **Discovered**: chain task-1775801122-39f7dc（与 B21 同一 chain）
+- **File**: `agent/governance/auto_chain.py` — dispatch 去重逻辑
 
 ### O1: Consolidate runtime context as single source of truth [OPEN] [P3]
 
