@@ -183,10 +183,12 @@ def _get_graph_doc_associations(project_id, target_files):
                 for s in secondary:
                     if s.endswith(".md"):
                         docs.add(s)
-            # Reverse (G6): doc target → find related code/doc files
+            # Reverse (G6): doc target → find related doc files only
+            # R4: Never add primary code files (.py) to docs set
             if any(f in target_set for f in secondary):
                 for p in primary:
-                    docs.add(p)
+                    if p.endswith(".md"):
+                        docs.add(p)
         return sorted(docs)
     except Exception:
         log.debug("_get_graph_doc_associations failed (non-critical)", exc_info=True)
@@ -1712,6 +1714,8 @@ def _gate_post_pm(conn, project_id, result, metadata):
     doc_impact = result.get("doc_impact") or prd.get("doc_impact")
     if not doc_impact or (isinstance(doc_impact, dict) and not doc_impact.get("files")):
         graph_docs = _get_graph_doc_associations(project_id, target_files)
+        # R2: Filter to only .md files — code files must never appear in doc_impact
+        graph_docs = [f for f in graph_docs if f.endswith(".md")]
         if graph_docs:
             result["doc_impact"] = {
                 "files": graph_docs,
@@ -1982,7 +1986,8 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
     doc_impact = metadata.get("doc_impact", {})
     if isinstance(doc_impact, dict) and "files" in doc_impact:
-        expected_docs = set(doc_impact.get("files") or [])
+        # R3: Defensive filter — only .md files are valid expected docs
+        expected_docs = {f for f in (doc_impact.get("files") or []) if f.endswith(".md")}
     else:
         expected_docs = get_related_docs(code_files)
     # docs/dev/** are informal dev notes — never enforce them as formal docs

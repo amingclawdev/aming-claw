@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from agent.governance.auto_chain import (
     _is_governance_internal_repair,
     _gate_checkpoint,
+    _get_graph_doc_associations,
 )
 
 
@@ -245,3 +246,78 @@ class TestGateCheckpointGovernanceExemption:
         }
         passed, reason = _gate_checkpoint(conn, "test", result, metadata)
         assert passed is True, f"Expected pass but got: {reason}"
+
+
+# ---------------------------------------------------------------------------
+# Test doc_impact filtering (AC1-AC4 for graph doc association fix)
+# ---------------------------------------------------------------------------
+
+class TestDocImpactFiltering:
+    """Tests for R2/R3/R4: .md-only filtering in doc associations and gates."""
+
+    def test_get_graph_doc_associations_returns_only_md(self, tmp_path, monkeypatch):
+        """AC1: _get_graph_doc_associations returns ONLY .md paths."""
+        graph_data = {
+            "nodes": {
+                "L1.1": {
+                    "primary": ["agent/governance/auto_chain.py"],
+                    "secondary": ["docs/governance/auto-chain.md"],
+                },
+                "L1.2": {
+                    "primary": ["agent/governance/graph.py", "agent/governance/graph_generator.py"],
+                    "secondary": ["docs/governance/auto-chain.md"],
+                },
+            }
+        }
+        state_dir = tmp_path / "codex-tasks" / "state" / "governance" / "test-proj"
+        state_dir.mkdir(parents=True)
+        (state_dir / "graph.json").write_text(json.dumps(graph_data))
+        monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path))
+
+        # Target a doc file to trigger reverse G6 lookup
+        result = _get_graph_doc_associations("test-proj", ["docs/governance/auto-chain.md"])
+        for f in result:
+            assert f.endswith(".md"), f"Non-.md file in result: {f}"
+
+    def test_checkpoint_gate_filters_py_from_expected_docs(self):
+        """AC3: expected_docs filters out .py even if doc_impact.files has them."""
+        conn = _make_db()
+        result = {
+            "changed_files": ["agent/governance/auto_chain.py"],
+            "test_results": {"ran": True, "passed": 5, "failed": 0},
+        }
+        metadata = {
+            "target_files": ["agent/governance/auto_chain.py"],
+            "doc_impact": {
+                "files": [
+                    "docs/governance/auto-chain.md",
+                    "agent/governance/graph.py",
+                    "agent/governance/server.py",
+                ],
+                "changes": ["test"],
+            },
+        }
+        passed, reason = _gate_checkpoint(conn, "test", result, metadata)
+        assert passed is True, f"Expected pass but got: {reason}"
+
+    def test_auto_chain_target_not_blocked_by_graph_py(self):
+        """AC4: dev task with target_files=['agent/governance/auto_chain.py']
+        does NOT get blocked by graph.py appearing in expected_docs."""
+        conn = _make_db()
+        result = {
+            "changed_files": ["agent/governance/auto_chain.py"],
+            "test_results": {"ran": True, "passed": 5, "failed": 0},
+        }
+        metadata = {
+            "target_files": ["agent/governance/auto_chain.py"],
+            "doc_impact": {
+                "files": [
+                    "agent/governance/graph.py",
+                    "agent/governance/graph_generator.py",
+                    "agent/governance/server.py",
+                ],
+                "changes": ["Auto-populated from graph associations"],
+            },
+        }
+        passed, reason = _gate_checkpoint(conn, "test", result, metadata)
+        assert passed is True, f"Blocked by .py in expected_docs: {reason}"
