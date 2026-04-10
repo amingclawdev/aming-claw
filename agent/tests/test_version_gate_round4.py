@@ -55,6 +55,25 @@ class TestVersionGateRound4(unittest.TestCase):
         self.assertTrue(passed)
         self.assertIn("version match", reason)  # No dirty files after filtering
 
+    def test_docs_dev_dirty_files_are_ignored(self):
+        """B23: docs/dev/ files are filtered out of dirty_files (non-governed path)."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = {
+            "chain_version": "abc1234",
+            "git_head": "abc1234",
+            "dirty_files": '["docs/dev/manual-fix-current-2026-04-10.md"]',
+        }
+
+        with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False), \
+             self._patch_server_version("abc1234"), \
+             mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
+            passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, {})
+
+        self.assertTrue(passed)
+        self.assertIn("version match", reason)  # docs/dev/ filtered — no dirty files remain
+
     def test_clean_workspace_and_matching_server_pass(self):
         from governance import auto_chain
 
