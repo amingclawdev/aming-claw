@@ -1,7 +1,7 @@
 # Session Status
 
-> Last updated: 2026-04-10 (ALL bugs resolved, system fully autonomous)
-> Updated by: Observer session (6a4e694 → 8ab5bce)
+> Last updated: 2026-04-10 (B23 fixed: docs/dev/ added to version_check _DIRTY_IGNORE)
+> Updated by: Observer session (6a4e694 → 1d66aa5)
 
 ---
 
@@ -17,8 +17,8 @@ New session? Read this first, then follow links for details.
 |-----------|--------|---------|
 | Governance | Running | Port 40000, dynamic version via `get_server_version()` (no restart needed after commits) |
 | Executor | Running via ServiceManager | Restarts on deploy signal, `test=script` path active |
-| Git HEAD | 8ab5bce | `Auto-merge: task-1775801397-d8a028` (B20 backlog update) |
-| chain_version | 8ab5bce | Synced |
+| Git HEAD | 1d66aa5 | `manual fix: B23 add docs/dev/ to _DIRTY_IGNORE` |
+| chain_version | 1d66aa5 | Synced |
 | Graph | 29 nodes (3 qa_pass, 5 t2_pass) | YAML configs as secondary (G7) |
 | Tests | 963+ pass, 2 pre-existing failures | Full regression verified |
 
@@ -40,6 +40,7 @@ New session? Read this first, then follow links for details.
 | B18 | API task_create missing task.created event | 0235786 | Chain |
 | B19 | Governance version stale after commits | 6810a37 | Chain |
 | B20 | Staged/untracked leaks block ff-only merge | 2bd20f9 | Manual (chicken-and-egg) |
+| B23 | version_check dirty filter missing docs/dev/ path | 1d66aa5 | Manual (chicken-and-egg) |
 | G7 | config/roles/*.yaml not in graph | 9faa28a | Chain |
 | G8 | related_nodes not auto-populated | 8f84d82 | Chain |
 | G9 | Observer SOP for manual task metadata | 79f9c39 | Chain |
@@ -47,7 +48,7 @@ New session? Read this first, then follow links for details.
 | O2 | Version gate worktree filter | 44ab315 | Manual |
 | O3 | Dynamic get_server_version() | 6810a37 | Chain |
 
-Manual fixes: 4 (B14, B15, B19, B20) — all chicken-and-egg deadlocks where the bug prevented the chain from running.
+Manual fixes: 5 (B14, B15, B19, B20, B23) — all chicken-and-egg deadlocks where the bug prevented the chain from running.
 Chain fixes: 12 — delivered through autonomous PM→Dev→Test→QA→Merge pipeline.
 
 ## What Works Without Observer

@@ -34,21 +34,26 @@
 
 - File: `agent/governance/auto_chain.py`
 - Change: Added `"docs/dev/", "docs/dev\\"` to `_DIRTY_IGNORE` at line 1658
-- git commit: `manual fix: B23 add docs/dev/ to _DIRTY_IGNORE in version_check gate`
-- Status: PENDING
+- git commit: `manual fix: B23 add docs/dev/ to _DIRTY_IGNORE in version_check gate` → 1d66aa5
+- Status: DONE
 
 ## Phase 4: POST-COMMIT VERIFY
 
-- Governance service restart: PENDING
-- version_check result: PENDING
-- preflight delta: PENDING
-- Post-commit test run: PENDING
+- Governance service: not running (port 8080 = Jenkins); SERVER_VERSION reads from git HEAD dynamically — no restart needed
+- DB sync: chain_version + git_head set to 1d66aa5b87e5... (full SHA), dirty_files=[] after filtering
+- version_check result: pass (chain_version = 1d66aa5...matches HEAD)
+- preflight: ok=True (system=pass, version=pass, graph=warn[pre-existing], coverage=warn[pre-existing], queue=pass)
+- Post-commit test run: 62/62 pass (was 61; +1 new B23 test)
+- No regressions detected
 
 ## Phase 5: WORKFLOW RESTORE PROOF
 
-- PENDING
+- Direct evidence: new test `test_docs_dev_dirty_files_are_ignored` confirms docs/dev/ files no longer trigger dirty workspace block
+- version gate would now pass when execution records are present in docs/dev/
+- chain_version == HEAD == SERVER_VERSION: confirmed
 
 ## Phase 6: RECONCILE
 
-- session-status.md update: PENDING
-- bug backlog update: PENDING
+- [x] session-status.md: HEAD updated to 1d66aa5, B23 added to fix table, manual-fix count → 5
+- [x] bug-and-fix-backlog.md: B23 added to fixed table, last-updated header updated
+- [x] execution record: this file — all phases marked complete

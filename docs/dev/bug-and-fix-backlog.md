@@ -2,7 +2,7 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-10 (B21-B22 added from chain task-1775801122-39f7dc)
+> Last updated: 2026-04-10 (B23 fixed: docs/dev/ added to _DIRTY_IGNORE)
 
 ---
 
@@ -46,6 +46,7 @@
 | B18 | API task_create missing task.created event | 0235786 | 2026-04-10 |
 | B19 | Governance version stale after commits | 6810a37 | 2026-04-10 |
 | B20 | Clean staged/untracked leaks before merge | 2bd20f9 | 2026-04-10 |
+| B23 | version_check dirty filter missing docs/dev/ non-governed path | 1d66aa5 | 2026-04-10 |
 | G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
 | G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 | G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
