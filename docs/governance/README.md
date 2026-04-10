@@ -17,6 +17,7 @@ This directory contains governance-related documentation for the Aming Claw proj
 | [implementation-process.md](implementation-process.md) | Document lifecycle: proposal → plan → execution record |
 | [manual-fix-sop.md](manual-fix-sop.md) | Manual fix standard operating procedure (v3) |
 | [version-control.md](version-control.md) | Version gate and chain_version lifecycle |
+| [audit-process.md](audit-process.md) | Chain full-process audit procedure |
 
 ## Rules & Policies
 
