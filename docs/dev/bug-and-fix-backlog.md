@@ -2,7 +2,7 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-10 (B24-B27 added from chain task-1775855010-7fcf8b audit)
+> Last updated: 2026-04-10 (B22 fix directions B22a/B22b/B22c added)
 
 ---
 
@@ -98,10 +98,14 @@
 
 ### B22: 任务扇出 bug [OPEN] [P2]
 
-- **Status**: Open. Extra tasks complete safely in replay mode but waste resources.
-- **Symptom**: dispatcher 对下游任务（merge/gatekeeper/deploy/qa）重复派发，预期各 1 个但实际产生多个。
-- **Discovered**: chain task-1775801122-39f7dc（与 B21 同一 chain）
-- **File**: `agent/governance/auto_chain.py` — dispatch 去重逻辑
+- **Status**: Open. Extra tasks complete safely in replay mode but waste resources. Root cause confirmed 2026-04-10.
+- **Symptom**: dispatcher 对下游任务（merge/gatekeeper/deploy/qa）重复派发，预期各 1 个但实际产生多个。auto-chain 创建的 PM/Dev 任务也出现重复链路（B22 扇出），今日 queue 中观察到同一 chain 内多个同 type 任务并存。
+- **Discovered**: chain task-1775801122-39f7dc（原始发现）；chain task-1775855702-7e72b9 等多条链路（2026-04-10 再现）
+- **File**: `agent/governance/auto_chain.py` — dispatch 去重逻辑；`agent/governance/conflict_rules.py`；`agent/governance/server.py`
+- **Fix directions** (3 sub-items):
+  - **B22a** — `auto_chain.py` dispatch 去重：派发下游任务前查询 `WHERE chain_id=? AND type=? AND status IN ('queued','claimed')`，已存在则跳过派发，不重复创建
+  - **B22b** — `conflict_rules.py` Rule 2 实现补全：补充 same-file + same-operation → `duplicate` 分支（当前 `_check_file_conflict` 只处理 `OPPOSITE_OPS`，同操作重叠未实现）
+  - **B22c** — `server.py:1596` auto-chain 冲突检测豁免范围收窄：当前 `created_by not in ("auto-chain", "auto-chain-retry")` 完全豁免所有 auto-chain 任务，至少同 `chain_id + type` 重复应触发检测
 
 ### O1: Consolidate runtime context as single source of truth [OPEN] [P3]
 
