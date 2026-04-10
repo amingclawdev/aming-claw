@@ -676,7 +676,40 @@ Manual Fix SOP (this document)
 
 ---
 
-## 12. Codex Review Adoption Log
+## 12. Metadata Propagation (G9)
+
+When performing a manual fix that spans multiple phases or creates follow-up tasks, the following task metadata fields **must** be preserved and carried forward. Losing any of these fields breaks the auto-chain's ability to track lineage and enforce governance.
+
+### Required Metadata Fields
+
+| Field | Purpose | Propagation Rule |
+|-------|---------|-----------------|
+| `target_files` | Files the task is allowed to modify; used by checkpoint gate to verify scope | Copy verbatim from the originating PM task into every subsequent stage (dev, test, QA, merge). Never narrow or expand without a new PM decision |
+| `acceptance_criteria` | Grep/script-based checks that the QA stage evaluates | Copy verbatim from PM result. Do not paraphrase — QA agents parse these literally |
+| `chain_context` | Event-sourced runtime context linking all stages in a chain (see Phase 8) | Serialized JSON blob; pass as-is via `chain_context` field in task metadata. Never manually edit — auto_chain appends stage events automatically |
+| `ref_id` | Entity reference ID linking the task to a governance graph node or memory entity | Preserve across retries and manual re-creations. If a manual fix replaces a failed task, reuse the original `ref_id` so lineage remains connected |
+| `_branch` | Git branch name for the worktree where changes live | Required by merge stage. If manually creating a merge task, extract from the dev task's result metadata |
+| `_worktree` | Filesystem path to the isolated worktree | Required by merge stage for cherry-pick/merge operations. Must point to a valid worktree; verify with `git worktree list` before propagating |
+
+### Propagation Checklist (per phase)
+
+1. **Phase 0 (Assess):** Record the originating task's metadata snapshot — capture `target_files`, `acceptance_criteria`, `chain_context`, and `ref_id` before making any changes
+2. **Phase 3 (Commit):** Include metadata field names in the commit message body for audit traceability
+3. **Phase 4 (Post-commit):** When creating follow-up verification tasks (Rule R3), copy `target_files` and `acceptance_criteria` from the original PM task
+4. **Phase 5 (Workflow Restore):** When creating test tasks to prove workflow restoration, include `chain_context` so the test task links back to the manual fix chain
+
+### Anti-Patterns
+
+| Anti-Pattern | Consequence | Prevention |
+|-------------|-------------|------------|
+| Omitting `target_files` from dev task | Checkpoint gate cannot verify scope → gate_blocked | Always copy from PM result |
+| Manually editing `chain_context` JSON | Corrupts event-sourced history → chain context archive unusable | Let auto_chain manage; only read, never write |
+| Creating merge task without `_branch`/`_worktree` | Merge stage cannot locate changes → merge fails with "no worktree" error (D6 fix) | Extract from dev task result; verify worktree exists |
+| Reusing `ref_id` from an unrelated task | Governance graph links unrelated changes → false impact analysis | Only reuse `ref_id` from the same logical chain |
+
+---
+
+## 13. Codex Review Adoption Log
 
 | # | Suggestion | Adopted | Detail |
 |---|-----------|:-------:|--------|
@@ -690,7 +723,7 @@ Manual Fix SOP (this document)
 
 ---
 
-## 13. v3 Dogfooding Findings (MF-2026-04-05-001)
+## 14. v3 Dogfooding Findings (MF-2026-04-05-001)
 
 Executing MF-2026-04-05-001 using SOP v2 revealed 5 gaps. Each gap is now covered by a new mandatory rule:
 

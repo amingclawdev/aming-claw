@@ -1,7 +1,7 @@
 # Auto-Chain — Automated Stage Progression
 
 > **Canonical governance topic document** — How the auto-chain pipeline orchestrates task stages.
-> Last updated: 2026-04-05 | Phase 2 Documentation Consolidation
+> Last updated: 2026-04-10 | Phase 2 Documentation Consolidation + B/G-series updates
 
 ## Overview
 
@@ -149,3 +149,74 @@ Each auto-chain run maintains event-sourced runtime context:
 - Auto-archive of failed chain context for debugging
 
 See `agent/governance/auto_chain.py` for the `ChainContext` class.
+
+## Retry Budget Per-Stage (B8)
+
+Each stage in the auto-chain has an independent retry budget rather than a single global retry counter. This ensures that a flaky test stage does not exhaust retries intended for other stages.
+
+- **Default budget:** 2 retries per stage (configurable via `CHAIN_RETRY_BUDGET` env var)
+- **Budget tracking:** Stored in `pipeline_retry_budget.json`, keyed by `{chain_id}:{stage}`
+- **Exhaustion behavior:** When a stage's budget reaches 0, the entire chain is marked `failed` and the chain context is archived (see B9)
+- **Reset:** Budget resets when a new chain starts; retries from a previous chain do not carry over
+
+## Chain Context Archive on Failure (B9)
+
+When a chain fails (budget exhausted, unrecoverable gate error, or manual cancellation), the full `ChainContext` is archived for post-mortem analysis:
+
+- **Archive location:** `chain_context` field in the failed task's metadata, plus a snapshot written to the governance audit log
+- **Contents:** Complete event-sourced history — every stage transition, gate check result, retry attempt, and timing data
+- **Retention:** Archives are never automatically deleted; they serve as the primary debugging artifact for failed chains
+- **Access:** Query via `GET /api/audit/{pid}/log?limit=N` filtering for `event_type=chain_archived`
+
+## Observer Hold Auto-Release (B16)
+
+When `observer_mode=ON`, auto-created tasks enter `observer_hold` status. The B16 enhancement adds an automatic release timer to prevent tasks from being indefinitely held:
+
+- **Default timeout:** 30 minutes (configurable via `OBSERVER_HOLD_TIMEOUT_SEC`)
+- **Behavior on timeout:** Task status transitions from `observer_hold` → `queued`, allowing the executor to claim it
+- **Notification:** A Telegram notification is sent to the observer when auto-release triggers, including the task ID and hold duration
+- **Override:** Observer can set `hold_indefinite=true` on a specific task to exempt it from auto-release
+
+## Gate Failure Event Bus (B17)
+
+Gate failures now publish structured events to an in-process event bus, enabling decoupled consumers to react to failures:
+
+- **Event schema:** `{event_type: "gate_failure", task_id, stage, gate_name, failure_reason, timestamp}`
+- **Consumers:** Audit logger (always active), Telegram notifier (configurable), memory writer (records failure patterns)
+- **Purpose:** Eliminates the need for polling-based gate failure detection; consumers subscribe once and receive events in real-time
+- **Implementation:** Uses Python `queue.Queue` in `auto_chain.py`; consumers run on the governance service's thread pool
+
+## Preflight Self-Check Integration (G4)
+
+Before dispatching any new stage task, the auto-chain now runs a preflight self-check to verify system health:
+
+- **Checks performed:** DB connectivity, governance service health, git repo integrity, executor reachability, coverage mapping completeness
+- **Blocking vs warning:** Only DB connectivity and governance health are blocking; others are warnings logged to audit
+- **Failure behavior:** If a blocking check fails, stage dispatch is deferred (not failed) and retried on the next poll cycle
+- **Implementation:** Calls `preflight_check()` from `agent/governance/preflight.py`
+
+## Version Gate Downgrade (G5)
+
+The version gate check (`chain_version == git HEAD`) has been downgraded from a hard blocker to a warning:
+
+- **Previous behavior (pre-D3/G5):** Version mismatch caused `_gate_version_check()` to return `False`, silently blocking all auto-chain dispatch
+- **Current behavior:** Version mismatch logs a warning and allows dispatch to proceed. The warning is recorded in the chain context and audit log
+- **Rationale:** Version mismatches are common during active development (e.g., executor syncs HEAD every 60s) and rarely indicate a real problem. Hard blocking caused more harm (silent chain stalls) than the mismatch itself
+
+## Dedup Guards (G6)
+
+Enhanced dedup guards prevent duplicate task creation beyond the original D4 fix:
+
+- **Stage-level dedup:** Before creating a next-stage task, checks for any existing task in the same chain with the same stage type and `pending`/`claimed`/`observer_hold` status
+- **Cross-chain dedup:** Prevents creating a new chain for the same `ref_id` if an active chain already exists
+- **Race condition protection:** Uses atomic DB transactions with `SELECT ... FOR UPDATE` semantics (SQLite serialized mode) to prevent TOCTOU races
+- **Logging:** Every dedup hit is logged with the duplicate task ID and the existing task ID that prevented creation
+
+## Dirty Workspace Filter Enhancement (G8)
+
+Extends the D5 dirty workspace filter with additional exclusion patterns and smarter handling:
+
+- **Extended exclusions:** Beyond `.claude/` paths, now also filters `*.pyc`, `__pycache__/`, `.pytest_cache/`, and other build artifacts
+- **Configurable patterns:** Exclusion patterns are read from `DIRTY_FILTER_PATTERNS` env var (comma-separated globs), defaulting to the built-in list
+- **Remaining dirty handling:** After filtering, if dirty files remain, they are logged as warnings with file paths but do not block dispatch (consistent with G5 downgrade philosophy)
+- **Audit trail:** Filtered files are recorded in the chain context so post-mortem analysis can distinguish "genuinely dirty" from "filtered noise"

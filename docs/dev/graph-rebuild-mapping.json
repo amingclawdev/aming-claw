@@ -21,9 +21,7 @@
       "test": [
         "agent/tests/test_notification_gateway.py",
         "agent/tests/test_task_orchestrator_autochain.py",
-        "agent/tests/test_utils.py",
-        "agent/tests/test_coordinator_decisions.py",
-        "agent/tests/test_e2e_coordinator.py"
+        "agent/tests/test_utils.py"
       ],
       "secondary": [],
       "layer": "L2"
@@ -35,7 +33,14 @@
       "test": [
         "agent/tests/test_ai_lifecycle_provider_routing.py"
       ],
-      "secondary": [],
+      "secondary": [
+        "config/roles/default/coordinator.yaml",
+        "config/roles/default/dev.yaml",
+        "config/roles/default/gatekeeper.yaml",
+        "config/roles/default/observer.yaml",
+        "config/roles/default/pm.yaml",
+        "config/roles/default/qa.yaml"
+      ],
       "layer": "L2"
     },
     "agent.cli": {
@@ -60,7 +65,13 @@
       ],
       "secondary": [
         "docs/config/aming-claw-yaml.md",
-        "docs/config/role-permissions.md"
+        "docs/config/role-permissions.md",
+        "config/roles/default/coordinator.yaml",
+        "config/roles/default/dev.yaml",
+        "config/roles/default/gatekeeper.yaml",
+        "config/roles/default/observer.yaml",
+        "config/roles/default/pm.yaml",
+        "config/roles/default/qa.yaml"
       ],
       "layer": "L2"
     },
@@ -100,13 +111,7 @@
         "agent/tests/test_executor_output_parsing.py",
         "agent/tests/test_executor_stall.py",
         "agent/tests/test_executor_worker_claim_stability.py",
-        "agent/tests/test_executor_worker_pid_lock_round1.py",
-        "agent/tests/test_deploy_round3.py",
-        "agent/tests/test_dev_contract_round4.py",
-        "agent/tests/test_dev_worktree_round3.py",
-        "agent/tests/test_merge_round2.py",
-        "agent/tests/test_parallel_lane_metadata_round1.py",
-        "agent/tests/test_test_contract_round1.py"
+        "agent/tests/test_executor_worker_pid_lock_round1.py"
       ],
       "secondary": [
         "docs/api/executor-api.md",
@@ -117,7 +122,13 @@
         "docs/roles/dev.md",
         "docs/roles/pm.md",
         "docs/roles/qa.md",
-        "docs/roles/tester.md"
+        "docs/roles/tester.md",
+        "config/roles/default/coordinator.yaml",
+        "config/roles/default/dev.yaml",
+        "config/roles/default/gatekeeper.yaml",
+        "config/roles/default/observer.yaml",
+        "config/roles/default/pm.yaml",
+        "config/roles/default/qa.yaml"
       ],
       "layer": "L3"
     },
@@ -141,8 +152,7 @@
         "agent/mcp/tools.py"
       ],
       "test": [
-        "agent/tests/test_gate_events.py",
-        "agent/tests/test_parallel_dispatch.py"
+        "agent/tests/test_gate_events.py"
       ],
       "secondary": [
         "docs/config/mcp-json.md"
@@ -165,12 +175,8 @@
       ],
       "test": [
         "agent/tests/test_auto_chain_dedup.py",
-        "agent/tests/test_auto_chain_routing.py",
-        "agent/tests/test_doc_restructuring_phase3.py",
-        "agent/tests/test_gate_contradiction.py",
-        "agent/tests/test_governance_host_migration_round1.py",
-        "agent/tests/test_notification_dedup.py",
-        "agent/tests/test_version_gate_round4.py"
+        "agent/tests/test_auto_chain_related_nodes.py",
+        "agent/tests/test_auto_chain_routing.py"
       ],
       "secondary": [
         "docs/governance/auto-chain.md"
@@ -192,8 +198,7 @@
         "agent/governance/conflict_rules.py"
       ],
       "test": [
-        "agent/tests/test_conflict_rules.py",
-        "agent/tests/test_verify_spec.py"
+        "agent/tests/test_conflict_rules.py"
       ],
       "secondary": [
         "docs/governance/conflict-rules.md"
@@ -205,9 +210,7 @@
         "agent/governance/db.py"
       ],
       "test": [
-        "agent/tests/test_governance_db.py",
-        "agent/tests/test_e2e_full_chain.py",
-        "agent/tests/test_subtask_decomposition.py"
+        "agent/tests/test_governance_db.py"
       ],
       "secondary": [],
       "layer": "L2"
@@ -270,10 +273,7 @@
         "agent/tests/test_governance_permissions.py",
         "agent/tests/test_governance_session_persistence.py",
         "agent/tests/test_llm_utils.py",
-        "agent/tests/test_role_config.py",
-        "agent/tests/test_governance_role.py",
-        "agent/tests/test_package_install.py",
-        "agent/tests/test_replay_validation.py"
+        "agent/tests/test_role_config.py"
       ],
       "secondary": [],
       "layer": "L2"
@@ -286,13 +286,13 @@
       "test": [
         "agent/tests/test_governance_graph.py",
         "agent/tests/test_graph_generator.py",
-        "agent/tests/test_graph_routing.py",
-        "agent/tests/test_bootstrap.py"
+        "agent/tests/test_graph_routing.py"
       ],
       "secondary": [
         "docs/dev/archive/toolbox-acceptance-graph.md",
-        "docs/dev/graph-driven-doc-governance.md",
-        "docs/governance/acceptance-graph.md"
+        "docs/dev/current-graph-doc-2026-04-06.md",
+        "docs/governance/acceptance-graph.md",
+        "docs/governance/plan-graph-driven-doc.md"
       ],
       "layer": "L2"
     },
@@ -311,8 +311,7 @@
         "agent/governance/memory_service.py"
       ],
       "test": [
-        "agent/tests/test_memory_backend.py",
-        "agent/tests/test_memory_promote.py"
+        "agent/tests/test_memory_backend.py"
       ],
       "secondary": [
         "docs/governance/memory.md"
@@ -326,9 +325,7 @@
         "agent/governance/errors.py"
       ],
       "test": [
-        "agent/tests/test_governance_enums.py",
-        "agent/tests/test_dev_contract_round2.py",
-        "agent/tests/test_governance_state.py"
+        "agent/tests/test_governance_enums.py"
       ],
       "secondary": [],
       "layer": "L2"
@@ -375,6 +372,7 @@
         "agent/governance/server.py"
       ],
       "test": [
+        "agent/tests/test_get_server_version.py",
         "agent/tests/test_observer_node_governance_round1.py"
       ],
       "secondary": [
@@ -426,10 +424,7 @@
       ],
       "test": [
         "agent/tests/test_task_registry.py",
-        "agent/tests/test_task_registry_escalate.py",
-        "agent/tests/test_test_report_gate.py",
-        "agent/tests/test_trace_chain.py",
-        "agent/tests/test_workflow_self_repair_round1.py"
+        "agent/tests/test_task_registry_escalate.py"
       ],
       "secondary": [],
       "layer": "L2"
@@ -439,6 +434,7 @@
     "agent/tests/test_ai_lifecycle_provider_routing.py": "agent.ai_lifecycle",
     "agent/tests/test_aming_config.py": "agent.config",
     "agent/tests/test_auto_chain_dedup.py": "governance.auto_chain",
+    "agent/tests/test_auto_chain_related_nodes.py": "governance.auto_chain",
     "agent/tests/test_auto_chain_routing.py": "governance.auto_chain",
     "agent/tests/test_chain_context.py": "governance.chain_context",
     "agent/tests/test_cli.py": "governance.gov_misc",
@@ -455,6 +451,7 @@
     "agent/tests/test_executor_worker_claim_stability.py": "agent.executor",
     "agent/tests/test_executor_worker_pid_lock_round1.py": "agent.executor",
     "agent/tests/test_gate_events.py": "agent.mcp",
+    "agent/tests/test_get_server_version.py": "governance.server",
     "agent/tests/test_governance_db.py": "governance.db",
     "agent/tests/test_governance_doc_generator.py": "governance.doc_policy",
     "agent/tests/test_governance_enums.py": "governance.models",
@@ -525,13 +522,13 @@
       "method": "inferred",
       "inferred": true
     },
-    "docs/dev/executor-evolution.md": {
-      "node": "agent.executor",
+    "docs/dev/current-graph-doc-2026-04-06.md": {
+      "node": "governance.graph",
       "method": "inferred",
       "inferred": true
     },
-    "docs/dev/graph-driven-doc-governance.md": {
-      "node": "governance.graph",
+    "docs/dev/executor-evolution.md": {
+      "node": "agent.executor",
       "method": "inferred",
       "inferred": true
     },
@@ -623,6 +620,11 @@
       "node": "governance.memory",
       "method": "manual_map"
     },
+    "docs/governance/plan-graph-driven-doc.md": {
+      "node": "governance.graph",
+      "method": "inferred",
+      "inferred": true
+    },
     "docs/governance/prd-full.md": {
       "node": "governance.server",
       "method": "manual_map"
@@ -668,7 +670,37 @@
       "method": "manual_map"
     }
   },
-  "unmatched_tests": [],
+  "unmatched_tests": [
+    "agent/tests/test_bootstrap.py",
+    "agent/tests/test_checkpoint_gate.py",
+    "agent/tests/test_coordinator_decisions.py",
+    "agent/tests/test_deploy_round3.py",
+    "agent/tests/test_dev_contract_round2.py",
+    "agent/tests/test_dev_contract_round4.py",
+    "agent/tests/test_dev_worktree_round3.py",
+    "agent/tests/test_doc_governance.py",
+    "agent/tests/test_doc_restructuring_phase3.py",
+    "agent/tests/test_e2e_coordinator.py",
+    "agent/tests/test_e2e_full_chain.py",
+    "agent/tests/test_gate_contradiction.py",
+    "agent/tests/test_governance_host_migration_round1.py",
+    "agent/tests/test_governance_role.py",
+    "agent/tests/test_governance_state.py",
+    "agent/tests/test_memory_promote.py",
+    "agent/tests/test_merge_round2.py",
+    "agent/tests/test_notification_dedup.py",
+    "agent/tests/test_package_install.py",
+    "agent/tests/test_parallel_dispatch.py",
+    "agent/tests/test_parallel_lane_metadata_round1.py",
+    "agent/tests/test_replay_validation.py",
+    "agent/tests/test_subtask_decomposition.py",
+    "agent/tests/test_test_contract_round1.py",
+    "agent/tests/test_test_report_gate.py",
+    "agent/tests/test_trace_chain.py",
+    "agent/tests/test_verify_spec.py",
+    "agent/tests/test_version_gate_round4.py",
+    "agent/tests/test_workflow_self_repair_round1.py"
+  ],
   "unmapped_docs": [
     "docs/api/README.md",
     "docs/config/README.md",
@@ -692,6 +724,7 @@
     "docs/dev/governance-host-migration-2026-03-30.md",
     "docs/dev/manual-fix-current-2026-04-05-002.md",
     "docs/dev/manual-fix-current-2026-04-05.md",
+    "docs/dev/manual-fix-current-2026-04-06.md",
     "docs/dev/manual-fix-sop.md",
     "docs/dev/migration-map.md",
     "docs/dev/observer/README.md",
@@ -707,6 +740,7 @@
     "docs/dev/session-handoff-2026-04-01-reboot-recovery.md",
     "docs/dev/session-handoff-2026-04-01.md",
     "docs/dev/session-handoff-2026-04-04-baseline-reconciliation.md",
+    "docs/dev/session-status.md",
     "docs/dev/test-iteration-2026-03-30.md",
     "docs/dev/workflow-autonomy-roadmap-2026-03-31-archived.md",
     "docs/dev/workflow-autonomy-roadmap.md",
@@ -714,376 +748,16 @@
     "docs/dev/workflow-gap-decision-2026-03-30.md",
     "docs/dev/workflow-self-repair-iteration-2026-03-30.md",
     "docs/governance/README.md",
+    "docs/governance/implementation-process.md",
     "docs/roles/README.md"
   ],
   "stats": {
     "total_nodes": 29,
     "source_mapped": 80,
     "source_total": 84,
-    "tests_mapped": 44,
-    "tests_total": 71,
-    "docs_mapped": 42,
-    "docs_total": 86
-  },
-  "edges": [
-    {
-      "from": "agent.agent_misc",
-      "to": "agent.deploy"
-    },
-    {
-      "from": "agent.agent_misc",
-      "to": "governance.db"
-    },
-    {
-      "from": "agent.agent_misc",
-      "to": "governance.services"
-    },
-    {
-      "from": "governance.db",
-      "to": "governance.memory"
-    },
-    {
-      "from": "governance.db",
-      "to": "governance.observability"
-    },
-    {
-      "from": "governance.db",
-      "to": "governance.reconcile"
-    },
-    {
-      "from": "governance.db",
-      "to": "governance.server"
-    },
-    {
-      "from": "governance.db",
-      "to": "governance.services"
-    },
-    {
-      "from": "governance.doc_policy",
-      "to": "governance.auto_chain"
-    },
-    {
-      "from": "governance.evidence",
-      "to": "governance.state_service"
-    },
-    {
-      "from": "governance.gatekeeper",
-      "to": "governance.state_service"
-    },
-    {
-      "from": "governance.gov_misc",
-      "to": "governance.auto_chain"
-    },
-    {
-      "from": "governance.gov_misc",
-      "to": "governance.server"
-    },
-    {
-      "from": "governance.gov_misc",
-      "to": "governance.services"
-    },
-    {
-      "from": "governance.gov_misc",
-      "to": "governance.state_service"
-    },
-    {
-      "from": "governance.graph",
-      "to": "governance.reconcile"
-    },
-    {
-      "from": "governance.graph",
-      "to": "governance.services"
-    },
-    {
-      "from": "governance.impact_analyzer",
-      "to": "governance.server"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.evidence"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.gatekeeper"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.gov_misc"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.graph"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.impact_analyzer"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.memory"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.reconcile"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.server"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.services"
-    },
-    {
-      "from": "governance.models",
-      "to": "governance.state_service"
-    },
-    {
-      "from": "governance.observability",
-      "to": "governance.auto_chain"
-    },
-    {
-      "from": "governance.server",
-      "to": "agent.executor"
-    },
-    {
-      "from": "governance.server",
-      "to": "agent.gateway"
-    },
-    {
-      "from": "governance.server",
-      "to": "agent.mcp"
-    },
-    {
-      "from": "governance.services",
-      "to": "governance.reconcile"
-    },
-    {
-      "from": "governance.services",
-      "to": "governance.server"
-    }
-  ],
-  "dropped_edges": [],
-  "topo_order": [
-    "agent.agent_misc",
-    "agent.ai_lifecycle",
-    "agent.cli",
-    "agent.config",
-    "agent.context",
-    "agent.service_manager",
-    "governance.chain_context",
-    "governance.conflict_rules",
-    "governance.doc_policy",
-    "governance.models",
-    "governance.preflight",
-    "governance.task_registry",
-    "agent.deploy",
-    "governance.db",
-    "governance.evidence",
-    "governance.gatekeeper",
-    "governance.gov_misc",
-    "governance.graph",
-    "governance.impact_analyzer",
-    "governance.memory",
-    "governance.observability",
-    "governance.state_service",
-    "governance.services",
-    "governance.auto_chain",
-    "governance.reconcile",
-    "governance.server",
-    "agent.executor",
-    "agent.gateway",
-    "agent.mcp"
-  ],
-  "roots": [
-    "agent.agent_misc",
-    "agent.ai_lifecycle",
-    "agent.cli",
-    "agent.config",
-    "agent.context",
-    "agent.service_manager",
-    "governance.chain_context",
-    "governance.conflict_rules",
-    "governance.doc_policy",
-    "governance.models",
-    "governance.preflight",
-    "governance.task_registry"
-  ],
-  "leaves": [
-    "agent.ai_lifecycle",
-    "agent.cli",
-    "agent.config",
-    "agent.context",
-    "agent.deploy",
-    "agent.executor",
-    "agent.gateway",
-    "agent.mcp",
-    "agent.service_manager",
-    "governance.auto_chain",
-    "governance.chain_context",
-    "governance.conflict_rules",
-    "governance.memory",
-    "governance.preflight",
-    "governance.reconcile",
-    "governance.state_service",
-    "governance.task_registry"
-  ],
-  "critical_path": [
-    "agent.agent_misc",
-    "governance.db",
-    "governance.services",
-    "governance.server",
-    "agent.gateway"
-  ],
-  "verification_levels": {
-    "0": [
-      "agent.agent_misc",
-      "agent.ai_lifecycle",
-      "agent.cli",
-      "agent.config",
-      "agent.context",
-      "agent.service_manager",
-      "governance.chain_context",
-      "governance.conflict_rules",
-      "governance.doc_policy",
-      "governance.models",
-      "governance.preflight",
-      "governance.task_registry"
-    ],
-    "1": [
-      "agent.deploy",
-      "governance.db",
-      "governance.evidence",
-      "governance.gatekeeper",
-      "governance.gov_misc",
-      "governance.graph",
-      "governance.impact_analyzer"
-    ],
-    "2": [
-      "governance.memory",
-      "governance.observability",
-      "governance.services",
-      "governance.state_service"
-    ],
-    "3": [
-      "governance.auto_chain",
-      "governance.reconcile",
-      "governance.server"
-    ],
-    "4": [
-      "agent.executor",
-      "agent.gateway",
-      "agent.mcp"
-    ]
-  },
-  "test_assignments": {
-    "agent/tests/test_bootstrap.py": {
-      "node": "governance.graph",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_coordinator_decisions.py": {
-      "node": "agent.agent_misc",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_deploy_round3.py": {
-      "node": "agent.executor",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_dev_contract_round2.py": {
-      "node": "governance.models",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_dev_contract_round4.py": {
-      "node": "agent.executor",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_dev_worktree_round3.py": {
-      "node": "agent.executor",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_doc_restructuring_phase3.py": {
-      "node": "governance.auto_chain",
-      "reason": "default (integration test)"
-    },
-    "agent/tests/test_e2e_coordinator.py": {
-      "node": "agent.agent_misc",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_e2e_full_chain.py": {
-      "node": "governance.db",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_gate_contradiction.py": {
-      "node": "governance.auto_chain",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_governance_host_migration_round1.py": {
-      "node": "governance.auto_chain",
-      "reason": "default (integration test)"
-    },
-    "agent/tests/test_governance_role.py": {
-      "node": "governance.gov_misc",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_governance_state.py": {
-      "node": "governance.models",
-      "reason": "import match (score=3)"
-    },
-    "agent/tests/test_memory_promote.py": {
-      "node": "governance.memory",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_merge_round2.py": {
-      "node": "agent.executor",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_notification_dedup.py": {
-      "node": "governance.auto_chain",
-      "reason": "default (integration test)"
-    },
-    "agent/tests/test_package_install.py": {
-      "node": "governance.gov_misc",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_parallel_dispatch.py": {
-      "node": "agent.mcp",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_parallel_lane_metadata_round1.py": {
-      "node": "agent.executor",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_replay_validation.py": {
-      "node": "governance.gov_misc",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_subtask_decomposition.py": {
-      "node": "governance.db",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_test_contract_round1.py": {
-      "node": "agent.executor",
-      "reason": "import match (score=2)"
-    },
-    "agent/tests/test_test_report_gate.py": {
-      "node": "governance.task_registry",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_trace_chain.py": {
-      "node": "governance.task_registry",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_verify_spec.py": {
-      "node": "governance.conflict_rules",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_version_gate_round4.py": {
-      "node": "governance.auto_chain",
-      "reason": "import match (score=1)"
-    },
-    "agent/tests/test_workflow_self_repair_round1.py": {
-      "node": "governance.task_registry",
-      "reason": "import match (score=1)"
-    }
+    "tests_mapped": 46,
+    "tests_total": 75,
+    "docs_mapped": 43,
+    "docs_total": 90
   }
 }

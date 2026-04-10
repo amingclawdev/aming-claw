@@ -41,7 +41,8 @@ curl http://localhost:40100/status
 
 | Endpoint | Description | Body |
 |----------|-------------|------|
-| `/task/{id}/pause` | Pause running task | None |
+| `/task/{id}/pause` | Pause running task (B12) | None |
+| `/task/{id}/resume` | Resume paused task (B12) | None |
 | `/task/{id}/cancel` | Cancel task | None |
 | `/task/{id}/retry` | Retry failed task | None |
 | `/cleanup-orphans` | ~~Clean up zombie processes~~ **stub, returns degraded** | None |
@@ -311,5 +312,46 @@ end of full scan cycle → _skipped_tasks.clear()
 - `/task/{id}/cancel` will terminate AI process, use with caution
 - `/cleanup-orphans` is now a stub (old executor.py's `_EXECUTOR_SPAWNED_PIDS` mechanism removed)
 
+## Worktree Isolation (L4)
+
+Dev tasks execute in isolated git worktrees to prevent interference between concurrent tasks and protect the main workspace:
+
+- **Worktree creation:** When the executor claims a dev task, it creates a new git worktree via `git worktree add` on a dedicated branch (`dev/task-{task_id}`)
+- **Isolation guarantee:** Each dev task operates on its own filesystem copy; changes in one task cannot affect another task or the main workspace
+- **Merge flow:** After QA passes, the merge stage cherry-picks or merges from the worktree branch back to `main`
+- **Cleanup:** Worktrees are removed after successful merge or chain failure via `git worktree remove`
+- **Fail-fast (B10):** If worktree creation fails (e.g., disk full, git lock), the task immediately fails with `{"status": "failed", "error": "worktree creation failed: <reason>"}` instead of falling back to the main workspace. This ensures auto-chain can retry cleanly
+
+## Session Timeout (B11)
+
+AI sessions (Claude CLI subprocesses) are subject to configurable timeout limits to prevent runaway processes:
+
+- **Configuration:** `SESSION_TIMEOUT_SEC` env var (default: 600 seconds / 10 minutes)
+- **Per-role overrides:** `_CLAUDE_ROLE_TURN_CAPS` dict allows different timeouts per role (e.g., PM gets 60 turns, coordinator gets 30)
+- **Timeout behavior:** When a session exceeds its timeout, the subprocess is terminated with SIGTERM, then SIGKILL after a 10-second grace period
+- **Task effect:** Timed-out tasks are marked `failed` with `exec_status=timeout` and may be retried if retry budget allows (see B8)
+- **Monitoring:** Active session durations are visible via `GET /sessions` endpoint (`elapsed_sec` field)
+
+## Task Pause/Resume Lifecycle (B12)
+
+Tasks can be paused and resumed via the executor API, enabling manual intervention without cancellation:
+
+- **Pause:** `POST /task/{id}/pause` — suspends the AI session (SIGSTOP on Unix, process suspension on Windows). Task status transitions to `paused`
+- **Resume:** `POST /task/{id}/resume` — resumes the AI session (SIGCONT). Task status transitions back to `claimed`
+- **State preservation:** The AI session's context is preserved during pause; no work is lost
+- **Timeout interaction:** The session timeout clock is paused while the task is paused, so paused time does not count toward the timeout limit
+- **Use cases:** Pausing a dev task to inspect intermediate results, temporarily freeing system resources, or waiting for external dependencies
+
+## Spin Loop Enhancement: `_skipped_tasks` (B14)
+
+The `_skipped_tasks` mechanism has been enhanced to provide better diagnostics and prevent edge-case spin loops:
+
+- **Skip reason tracking:** Each entry in `_skipped_tasks` now records the reason for skipping (e.g., `workspace_busy`, `dependency_unmet`, `retry_cooldown`)
+- **Graduated backoff:** Tasks that are repeatedly skipped across multiple scan cycles get progressively longer cooldown periods (1s → 2s → 4s → max 30s)
+- **Monitoring endpoint:** Skip statistics are included in the `GET /status` response under `skipped_tasks_count` and `skip_reasons` breakdown
+- **Auto-clear conditions:** Beyond the full-scan-cycle clear, `_skipped_tasks` entries are also cleared when: (a) the blocking condition resolves (e.g., workspace becomes free), (b) the task's retry budget is exhausted (task fails instead of being skipped), or (c) a manual `POST /task/{id}/retry` is issued
+
 ## Changelog
+- 2026-04-10: Added worktree isolation (L4), session timeout (B11), task pause/resume (B12), spin loop enhancement (B14) documentation
+- 2026-04-07: Added fail-fast worktree (B10) behavior documentation
 - 2026-03-26: Old Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules), unified to use governance API
