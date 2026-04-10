@@ -2,7 +2,7 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-10 (B23 fixed: docs/dev/ added to _DIRTY_IGNORE)
+> Last updated: 2026-04-10 (B24-B27 added from chain task-1775855010-7fcf8b audit)
 
 ---
 
@@ -60,6 +60,34 @@
 ---
 
 ## Open Items (P3 — low priority, next session)
+
+### B24: PM verification.command 语法错误 [OPEN] [P1]
+
+- **Status**: Open.
+- **Symptom**: PM 生成的验证命令将多条 shell 命令用 `&&` 串联后作为 `diff` 的参数传入（`diff a.md b.md && grep ...`），导致 diff 收到多余操作数报错，test 阶段 100% 失败（`diff: extra operand '&&'`）。
+- **Discovered**: chain `task-1775855010-7fcf8b`，两次 test 任务均因此失败（attempts=3）。
+- **File**: PM 提示词 / `agent/governance/auto_chain.py` — PM 生成 `verification.command` 的逻辑，需拆分为独立 shell 步骤而非 `&&` 串联整体作为单条命令。
+
+### B25: chain_events 记录不完整 [OPEN] [P2]
+
+- **Status**: Open.
+- **Symptom**: 全链路（PM→Dev→Test→QA→GK→Merge）仅产生 2 条 chain_events（`task.created` + `dev.completed`），缺失 `test.completed`、`qa.completed`、`gatekeeper.completed`、`merge.completed`、`chain.completed` 等事件。
+- **Discovered**: chain `task-1775855010-7fcf8b`。
+- **File**: `agent/governance/auto_chain.py` 或 chain_events 写入路径 — 事件发布逻辑存在缺失分支。
+
+### B26: node_state updated_by 为空字符串 [OPEN] [P2]
+
+- **Status**: Open.
+- **Symptom**: 节点状态变更时 `updated_by` 字段写入空字符串而非合法 task_id，违反审计可追溯性要求。
+- **Discovered**: `governance.graph`、`governance.reconcile`、`governance.services`、`governance.doc_policy` 4 个节点，均在 chain `task-1775855010-7fcf8b` 执行窗口内更新。
+- **File**: `agent/governance/` — `node_state` 写入逻辑，`updated_by` 未正确传递调用方 task_id。
+
+### B27: Dev changed_files 元数据漏报 [OPEN] [P2]
+
+- **Status**: Open.
+- **Symptom**: Dev 创建了 `docs/governance/audit-process.md` 但未将其加入 `result_json.changed_files` 声明，导致 `_gate_checkpoint` 误判该文件"未更新"并阻断链路，需 observer bypass 才能继续。
+- **Discovered**: chain `task-1775855010-7fcf8b`，dev 任务 `task-1775855091-2e761b` 和 `task-1775857046-400dca` 均漏报。
+- **File**: Dev executor 提示词 / `agent/governance/auto_chain.py` — Dev 完成后收集 `changed_files` 的逻辑，需包含新建文件。
 
 ### B21: 并发 merge 竞争 [OPEN] [P2]
 
