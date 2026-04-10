@@ -10,11 +10,11 @@ sys.path.insert(0, agent_dir)
 
 class TestVersionGateRound4(unittest.TestCase):
     def _patch_server_version(self, version):
-        """Helper to patch SERVER_VERSION without importing governance.server."""
-        # Create a mock module to avoid importing the real server (which has Py3.10+ syntax deps)
+        """Helper to patch SERVER_VERSION and get_server_version without importing governance.server."""
         import types
         mock_server = types.ModuleType("governance.server")
         mock_server.SERVER_VERSION = version
+        mock_server.get_server_version = lambda: version
         return mock.patch.dict("sys.modules", {"governance.server": mock_server})
 
     def test_dirty_workspace_blocks_chain(self):
