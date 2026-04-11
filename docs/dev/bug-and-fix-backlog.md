@@ -2,14 +2,14 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-11 (B28b manual fix committed ad44e1a)
+> Last updated: 2026-04-11 (B28a manual fix committed 59ca4f8)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : ~~B27~~（done）→ ~~B28b~~（done）→ B28a（retry scope）→ B24（重发链路）
+P1   : ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
 P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）
 P3   : gate 报错优化 / skip_reason 枚举审计
@@ -60,6 +60,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B23 | version_check dirty filter missing docs/dev/ non-governed path | 1d66aa5 | 2026-04-10 |
 | B27 | Dev changed_files misses untracked new files | bd77c14 | 2026-04-11 |
 | B28b | QA executor no structured output validation | ad44e1a | 2026-04-11 |
+| B28a | Retry dev SCOPE CONSTRAINT missing prev dev changed_files | 59ca4f8 | 2026-04-11 |
 | G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
 | G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 | G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
@@ -84,9 +85,9 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **Fix**: `docs/governance/manual-fix-sop.md` 增加 R11：每次 manual fix commit 后必须调用 `POST /api/version-sync/{project_id}` + `POST /api/version-update/{project_id}`，验证 `GET /api/version-check` 返回 `ok: true`。Governance 离线时可直接更新 `project_version` 表（需在 governance 重启后通过 version-check 验证）。
 - **Fix commit**: aaaab1b（SOP R11 写入，本次 commit）
 
-### B28a: Retry dev SCOPE CONSTRAINT 不继承前序 dev changed_files [OPEN] [P1]
+### B28a: Retry dev SCOPE CONSTRAINT 不继承前序 dev changed_files [FIXED]
 
-- **Status**: Open.
+- **Status**: Fixed. Commit 59ca4f8.
 - **Symptom**: retry dev 的 SCOPE CONSTRAINT `allowed` 文件列表仅从 PM 静态元数据（`target_files` + `test_files` + `doc_impact.files`）构建，不包含前序 dev 已修改的文件。若前序 dev 修改了 PM 未列出的文件（如角色文档），retry dev 被禁止再次修改这些文件，导致 `_gate_checkpoint` 反复失败，形成无限循环。
 - **Discovered**: chain `task-1775862217-e742de`（B24 修复链路），retry dev 任务 `task-1775869844` 因缺失 `config/roles/dev.yaml` 等角色文档而 checkpoint FAIL。
 - **Root cause**: `auto_chain.py:1145-1149` — `allowed` 集合只读 PM metadata，未查询 `chain_events` 中前序 dev 的 `changed_files`。
@@ -177,4 +178,4 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ## Test Count
 
-984 tests pass (9 new: B28b×6 + B28b chain_context×3), 5 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block), 3 skipped.
+993 tests pass (B28a +9: chain_context×5 + dev_contract_round4×4; B28b +9), 5 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block), 3 skipped.

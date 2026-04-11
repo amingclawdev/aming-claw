@@ -62,19 +62,20 @@ pytest agent/tests/test_chain_context.py -v
 
 ## Phase 4: POST-COMMIT VERIFY
 
-[ ] Governance version matches HEAD  
-[ ] version-check ok  
-[ ] full test suite
+[x] Governance running (pid 110076, auto-refreshed to 59ca4f8)  
+[x] version-check ok: true (head=59ca4f85, chain=59ca4f85)  
+[x] 44 new tests pass (test_chain_context +8, test_dev_contract_round4 +4 retry_scope)
 
 ---
 
 ## Phase 5: WORKFLOW RESTORE PROOF
 
-[ ] Queue empty, governance healthy
+[x] Queue empty (0 active tasks), governance healthy
 
 ---
 
 ## Phase 6: RECONCILE + R11
 
-[ ] version-sync + version-update  
-[ ] version-check ok: true
+[x] version-sync (git_head=59ca4f85)  
+[x] version-update (chain_version=59ca4f85, updated_by=init)  
+[x] version-check ok: true
