@@ -61,6 +61,22 @@
 
 ## Open Items (P3 — low priority, next session)
 
+### B28a: Retry dev SCOPE CONSTRAINT 不继承前序 dev changed_files [OPEN] [P1]
+
+- **Status**: Open.
+- **Symptom**: retry dev 的 SCOPE CONSTRAINT `allowed` 文件列表仅从 PM 静态元数据（`target_files` + `test_files` + `doc_impact.files`）构建，不包含前序 dev 已修改的文件。若前序 dev 修改了 PM 未列出的文件（如角色文档），retry dev 被禁止再次修改这些文件，导致 `_gate_checkpoint` 反复失败，形成无限循环。
+- **Discovered**: chain `task-1775862217-e742de`（B24 修复链路），retry dev 任务 `task-1775869844` 因缺失 `config/roles/dev.yaml` 等角色文档而 checkpoint FAIL。
+- **Root cause**: `auto_chain.py:1145-1149` — `allowed` 集合只读 PM metadata，未查询 `chain_events` 中前序 dev 的 `changed_files`。
+- **Fix**: `chain_context.py` 新增 `get_accumulated_changed_files(chain_id, project_id)` accessor（DB fallback + 内存路径），`auto_chain.py` retry 路径调用此 accessor 扩充 `allowed`。详见 O1 migration plan Phase 1b。
+
+### B28b: QA executor 无结构化输出校验 [OPEN] [P1]
+
+- **Status**: Open.
+- **Symptom**: QA agent 输出自然语言或非 JSON 文本时，`_parse_output()` 返回 raw fallback `{"summary":..., "exit_code":...}`，`recommendation=None`，`_gate_qa_pass` 静默失败而非直接 fail。导致链路无意义循环（QA→fail→retry dev→checkpoint fail→...）。
+- **Discovered**: chain `task-1775862217-e742de`，QA 任务 `task-1775868111` result_json 缺少 `recommendation` 字段。
+- **Root cause**: `executor_worker.py:377-392` — `_is_raw_fallback` 仅检查 terminal CLI 错误，无 QA 专用结构化输出校验；QA prompt builder (`:1248`) 若 `test_report` 为空则 QA agent 输出自然语言。
+- **Fix**: executor_worker.py QA session 后增加硬校验：非 JSON 或缺少 `recommendation` → 立即返回 `{"status":"failed","error":"structured_output_invalid:..."}` 并写入 gate_events。详见 O1 migration plan Phase 1b。
+
 ### B24: PM verification.command 语法错误 [OPEN] [P1]
 
 - **Status**: Open.
