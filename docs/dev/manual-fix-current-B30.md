@@ -75,22 +75,39 @@ else:
 
 ## Phase 3 — COMMIT
 
-**Commit hash**: [TO BE FILLED]
+**Commit hash**: `e3145f1`
+- `agent/governance/auto_chain.py`: exemption block for merge/deploy at L904-915
+- `agent/tests/test_version_gate_round4.py`: +3 B30 tests (19 total, all pass)
+- `agent/tests/test_auto_chain_version_cache.py`: rewritten to verify B30 pattern
+- `docs/dev/manual-fix-current-B30.md`: this file (SOP R7)
 
 ---
 
 ## Phase 4 — POST-COMMIT VERIFY
 
-[TO BE FILLED]
+- Governance restart: OK (PID 12174, version e3145f1)
+- version-sync: OK (HEAD e3145f1, dirty_files=[])
+- version-update: OK (chain_version=e3145f1, updated_by=merge-service)
+- version-check: `ok: True, dirty: False, head=e3145f1, chain_ver=e3145f1`
+- Full test suite: **1003 passed**, 7 pre-existing failures (unchanged), 3 skipped
+- No regressions introduced by B30
 
 ---
 
 ## Phase 5 — WORKFLOW RESTORE PROOF
 
-[TO BE FILLED]
+- Test task created: `task-1775943321-e48c92` (type=pm)
+- version_warning: **none** (gate passes without bypass — B30 confirmed working)
+- Status: queued → cancelled (immediately cancelled after proof)
+- Result: RESTORED
 
 ---
 
 ## Phase 6 — SESSION STATUS + BACKLOG UPDATE
 
-[TO BE FILLED]
+- Commit: `e3145f1`
+- Backlog B30 status: OPEN → FIXED
+- chain_version in DB: `e3145f1` (synced via version-update after commit)
+- Version gate: ok=True, dirty=False
+- All P1 bugs now fixed: B29, B27, B28b, B28a, B30
+- Next: B24 re-issue (PM→Dev→Test→QA→Gatekeeper→Merge→Deploy should complete without intervention)

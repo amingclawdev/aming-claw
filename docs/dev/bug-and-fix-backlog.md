@@ -2,14 +2,14 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-11 (B28a manual fix committed 59ca4f8)
+> Last updated: 2026-04-11 (B30 manual fix committed e3145f1; all P1 bugs fixed)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ B24（重发链路）
+P1   : ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
 P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）
 P3   : gate 报错优化 / skip_reason 枚举审计
@@ -72,6 +72,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | O2 | Version gate filter worktree dirty files | 44ab315 | 2026-04-09 |
 | O3 | Governance dynamic version read (no restart) | 6810a37 | 2026-04-10 |
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
+| B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
 
 ---
 
@@ -178,4 +179,4 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ## Test Count
 
-993 tests pass (B28a +9: chain_context×5 + dev_contract_round4×4; B28b +9), 5 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block), 3 skipped.
+1003 tests pass (B30 +10: version_gate_round4×3 + auto_chain_version_cache×4 rewritten + net +3 new), 7 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block, test_try_verify_update_returns_true_on_success, test_try_verify_update_returns_false_on_exception), 3 skipped.
