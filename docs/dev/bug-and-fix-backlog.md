@@ -2,14 +2,14 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-11 (B24 注明重发条件；修复顺序更新)
+> Last updated: 2026-04-11 (B29 manual fix committed 4525406；优先级更新)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : B29（version gate 审计）→ B27（changed_files 采集）→ B28b（QA 硬校验）→ B28a（retry scope）→ B24（重发链路）
+P1   : B27（changed_files 采集）→ B28b（QA 硬校验）→ B28a（retry scope）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
 P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）
 P3   : gate 报错优化 / skip_reason 枚举审计
@@ -67,6 +67,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | G10 | Graph rebuild mapping updated | 79f9c39 | 2026-04-10 |
 | O2 | Version gate filter worktree dirty files | 44ab315 | 2026-04-09 |
 | O3 | Governance dynamic version read (no restart) | 6810a37 | 2026-04-10 |
+| B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
 
 ---
 
@@ -117,15 +118,6 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **Discovered**: chain `task-1775855010-7fcf8b`，dev 任务 `task-1775855091-2e761b` 和 `task-1775857046-400dca` 均漏报。
 - **File**: Dev executor 提示词 / `agent/governance/auto_chain.py` — Dev 完成后收集 `changed_files` 的逻辑，需包含新建文件。
 
-### B29: version gate 审计能力被 B19 动态 HEAD 读取削弱 [OPEN] [P1]
-
-- **Status**: Open.
-- **Symptom**: B19 将 `get_server_version()` 改为动态读取 git HEAD（30s 缓存），解决了 governance 重启后版本过时的死锁问题，但副作用是任何 git commit（包括 manual fix、Observer 文档提交、直接 push）都会被 governance 感知为合法版本，`chain_version` 也随之自动同步，绕过了 version gate"只认 workflow merge 版本"的原始设计意图。
-- **Impact**: Observer 直接 push 或 manual fix commit 后，下一条 PM 任务的 `version_check` 会以新 HEAD 为基准通过，而该 HEAD 并非经过完整 PM→Dev→Test→QA→Gatekeeper→Merge 链路审核的版本。审计追溯性削弱。
-- **Discovered**: 2026-04-11 B19 副作用分析，chain `task-1775862217-e742de` 恢复期间 Observer 手动 commit 后 chain_version 自动推进。
-- **Fix**: governance 重启时从 DB 读取 `chain_version`（上次 Deploy 成功时写入）作为版本基准，而非读 git HEAD；`chain_version` 只在 Deploy 阶段成功后更新。`get_server_version()` 仍可动态读 HEAD 用于 `health` 等信息性端点，但 version gate 的 `expected_version` 锚点改为 DB 中的 `chain_version`。
-- **File**: `agent/governance/server.py`（`get_server_version`）、`agent/governance/chain_context.py` 或专用 `chain_version` 存储表 — version gate 基准读取逻辑。
-
 ### B21: 并发 merge 竞争 [OPEN] [P2]
 
 - **Status**: Open. Idempotent guard catches it, but race window exists.
@@ -174,4 +166,4 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ## Test Count
 
-963 tests pass, 2 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted).
+971 tests pass, 5 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block), 3 skipped.
