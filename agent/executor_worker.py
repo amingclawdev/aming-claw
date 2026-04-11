@@ -552,11 +552,16 @@ class ExecutorWorker:
             cmd_str = verification["command"]
             # Normalize bare pytest → python -m pytest (Windows PATH issue)
             cmd_str = cmd_str.replace("pytest ", "python -m pytest ", 1) if cmd_str.startswith("pytest ") else cmd_str
-            try:
-                cmd = shlex.split(cmd_str)
-            except ValueError:
+            # R1: shell operators (&&, ||, ;, |) require shell=True to be parsed
+            if any(op in cmd_str for op in ("&&", "||", ";", "|")):
                 cmd = cmd_str
                 use_shell = True
+            else:
+                try:
+                    cmd = shlex.split(cmd_str)
+                except ValueError:
+                    cmd = cmd_str
+                    use_shell = True
         else:
             # Default: run all test files with pytest
             cmd = ["python", "-m", "pytest"] + test_files + ["-v", "--tb=short"]
