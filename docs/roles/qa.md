@@ -4,6 +4,8 @@
 
 > **2026-04-07 (B10):** Dev tasks now fail fast on worktree creation failure instead of falling back to main workspace. QA should verify that failed dev tasks with worktree errors are properly retried by auto-chain.
 
+> **2026-04-11 (B24):** QA output must now include a `recommendation` field with value in `{qa_pass, reject, merge_pass}`. Missing or invalid recommendation causes immediate task failure with `structured_output_invalid` error instead of silent pass-through.
+
 ## Role Definition
 
 The QA agent is responsible for end-to-end verification, acceptance criteria review, and marking acceptance graph nodes from `t2_pass` to `qa_pass`. QA operates within the auto-chain pipeline as the stage after Test.

@@ -5,6 +5,8 @@
 
 > **2026-04-07 (B10):** Dev tasks require a successful worktree. If worktree creation fails, the task fails immediately with `"worktree creation failed"` instead of running in the main workspace. Auto-chain will retry.
 
+> **2026-04-11 (B24):** Retry dev tasks now receive a `SCOPE CONSTRAINT` line listing allowed files from `get_retry_scope()` (target_files + test_files + doc_impact.files + prior changed_files). Verification commands with shell operators (`&&`, `||`, `;`, `|`) are executed with `shell=True`.
+
 ---
 
 ## Setup

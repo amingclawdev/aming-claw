@@ -6,6 +6,8 @@
 
 > **2026-04-07 (B10):** Dev tasks now fail fast on worktree creation failure. Test `test_executor_stall.py::TestWorktreeFailure` covers this behavior.
 
+> **2026-04-11 (B24):** Verification commands containing shell operators (`&&`, `||`, `;`, `|`) are now executed with `shell=True` to prevent `WinError`/syntax errors on Windows. Test stage uses `use_shell` detection from executor_worker.
+
 ## Stage Definition
 
 The Tester stage runs automated tests (T1 unit + T2 integration) via script-based execution and marks acceptance graph nodes from `pending` to `t2_pass`. It operates within the auto-chain pipeline as the stage after Dev. No AI agent turn cap is allocated; the executor runs `pytest` directly.
