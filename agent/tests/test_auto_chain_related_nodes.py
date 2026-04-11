@@ -2,6 +2,8 @@
 
 Covers AC2 (graph lookup populates related_nodes), AC3 (skip when already set),
 AC4 (graph failure is non-critical).
+
+Also covers QA gate verify_update failure propagation (AC5 from PRD task-1775870604).
 """
 
 import json
@@ -202,3 +204,111 @@ class TestG8RelatedNodes:
 
         assert passed is True
         assert not result.get("related_nodes")
+
+
+class TestQAGateVerifyUpdateFailure:
+    """AC5: _gate_qa_pass propagates _try_verify_update failure reason."""
+
+    def test_verify_update_exception_surfaces_in_gate_reason(self):
+        """When verify_update raises, _gate_qa_pass returns failure with the exception text."""
+        from governance.auto_chain import _gate_qa_pass
+
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
+            ("test-proj", "abc123", "abc123"),
+        )
+        conn.commit()
+
+        result = {"recommendation": "qa_pass", "review_summary": "looks good"}
+        metadata = {"related_nodes": ["L1.3"]}
+
+        error_msg = "Evidence validation: e2e_report requires passed>0"
+        with patch(
+            "governance.auto_chain._try_verify_update",
+            return_value=(False, f"verify_update failed for nodes ['L1.3']: {error_msg}"),
+        ):
+            passed, reason = _gate_qa_pass(conn, "test-proj", result, metadata)
+
+        assert passed is False
+        assert "verify_update failed" in reason
+        assert error_msg in reason
+        assert "L1.3" in reason
+
+    def test_verify_update_success_proceeds_to_check_nodes(self):
+        """When verify_update succeeds, _gate_qa_pass proceeds to _check_nodes_min_status."""
+        from governance.auto_chain import _gate_qa_pass
+
+        conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
+            ("test-proj", "abc123", "abc123"),
+        )
+        # Insert node at qa_pass so _check_nodes_min_status passes
+        conn.execute(
+            "INSERT INTO node_state (project_id, node_id, verify_status) VALUES (?,?,?)",
+            ("test-proj", "L1.3", "qa_pass"),
+        )
+        conn.commit()
+
+        result = {"recommendation": "qa_pass", "review_summary": "looks good"}
+        metadata = {"related_nodes": ["L1.3"]}
+
+        with patch(
+            "governance.auto_chain._try_verify_update",
+            return_value=(True, ""),
+        ):
+            passed, reason = _gate_qa_pass(conn, "test-proj", result, metadata)
+
+        assert passed is True
+
+    def test_try_verify_update_returns_true_on_success(self):
+        """AC1: _try_verify_update returns (True, '') on success."""
+        from governance.auto_chain import _try_verify_update
+
+        conn = _make_in_memory_db()
+        metadata = {"related_nodes": ["L1.3"]}
+
+        mock_state_service = MagicMock()
+        mock_state_service.verify_update.return_value = None  # success
+
+        with patch.dict("sys.modules", {
+            "governance.state_service": mock_state_service,
+            "governance.graph": MagicMock(AcceptanceGraph=MagicMock()),
+        }), patch("governance.auto_chain.os.path.exists", return_value=False):
+            ok, err = _try_verify_update(conn, "test-proj", metadata, "qa_pass", "qa", {"type": "e2e_report"})
+
+        assert ok is True
+        assert err == ""
+
+    def test_try_verify_update_returns_false_on_exception(self):
+        """AC1/AC4: _try_verify_update returns (False, error_msg) on exception and logs warning."""
+        from governance.auto_chain import _try_verify_update
+
+        conn = _make_in_memory_db()
+        metadata = {"related_nodes": ["L1.3"]}
+
+        mock_state_service = MagicMock()
+        mock_state_service.verify_update.side_effect = ValueError("RBAC denied")
+
+        with patch.dict("sys.modules", {
+            "governance.state_service": mock_state_service,
+            "governance.graph": MagicMock(AcceptanceGraph=MagicMock()),
+        }), patch("governance.auto_chain.os.path.exists", return_value=False):
+            ok, err = _try_verify_update(conn, "test-proj", metadata, "qa_pass", "qa", {"type": "e2e_report"})
+
+        assert ok is False
+        assert "verify_update failed" in err
+        assert "RBAC denied" in err
+        assert "L1.3" in err
+
+    def test_try_verify_update_no_related_nodes(self):
+        """_try_verify_update returns (True, '') when no related_nodes."""
+        from governance.auto_chain import _try_verify_update
+
+        conn = _make_in_memory_db()
+        metadata = {"related_nodes": []}
+
+        ok, err = _try_verify_update(conn, "test-proj", metadata, "qa_pass", "qa", {})
+        assert ok is True
+        assert err == ""

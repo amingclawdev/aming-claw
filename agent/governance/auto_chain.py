@@ -2094,10 +2094,12 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 return False, f"QA approved overall but {len(failed_criteria)} criteria failed: {names}"
     # Update nodes FIRST (QA passed → promote to qa_pass)
     # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
-    _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
+    vu_ok, vu_err = _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
                        {"type": "e2e_report", "producer": "auto-chain",
                         "summary": {"passed": 1, "failed": 0,
                                     "review": result.get("review_summary", "auto-chain QA pass")}})
+    if not vu_ok:
+        return False, f"qa_pass gate blocked — {vu_err}"
     # Then verify nodes reached qa_pass
     related_nodes = metadata.get("related_nodes", [])
     if related_nodes:
@@ -2641,10 +2643,10 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
 
 
 def _try_verify_update(conn, project_id, metadata, target_status, role, evidence_dict):
-    """Best-effort node status update. Non-blocking on failure."""
+    """Best-effort node status update. Returns (True, "") on success, (False, error_msg) on failure."""
     related = _normalize_related_nodes(metadata.get("related_nodes", []))
     if not related:
-        return
+        return True, ""
     try:
         from . import state_service
         from .graph import AcceptanceGraph
@@ -2667,9 +2669,11 @@ def _try_verify_update(conn, project_id, metadata, target_status, role, evidence
             evidence_dict=evidence_dict,
         )
         log.info("auto_chain: nodes %s → %s", related, target_status)
+        return True, ""
     except Exception as e:
         log.warning("auto_chain: verify_update %s failed (non-blocking): %s", target_status, e,
                     exc_info=True)
+        return False, f"verify_update failed for nodes {related}: {e}"
 
 
 def _publish_event(event_name, payload):
