@@ -200,5 +200,51 @@ class TestChainContextRecovery(unittest.TestCase):
         self.assertEqual(store1.get_original_prompt("r2"), "build it")
 
 
+class TestGetLatestTestReport(unittest.TestCase):
+    """B28b: ChainContextStore.get_latest_test_report accessor."""
+
+    def setUp(self):
+        self.store = ChainContextStore()
+
+    def _build_chain_with_test_report(self, test_report):
+        """Build a pm→dev→test→qa chain with test_report on the test stage."""
+        for tid, ttype, parent in [
+            ("t-pm", "pm", ""),
+            ("t-dev", "dev", "t-pm"),
+            ("t-test", "test", "t-dev"),
+            ("t-qa", "qa", "t-test"),
+        ]:
+            self.store.on_task_created({
+                "task_id": tid, "type": ttype,
+                "parent_task_id": parent, "prompt": "p", "project_id": "proj",
+            })
+        self.store.on_task_completed({
+            "task_id": "t-test", "type": "test",
+            "result": {"test_report": test_report, "summary": "ok"},
+            "project_id": "proj",
+        })
+
+    def test_returns_test_report_for_qa_task(self):
+        """get_latest_test_report returns test_report when QA is in-chain."""
+        tr = {"passed": 10, "failed": 0, "tool": "pytest"}
+        self._build_chain_with_test_report(tr)
+        result = self.store.get_latest_test_report("t-qa")
+        self.assertEqual(result, tr)
+
+    def test_returns_none_when_no_test_stage_completed(self):
+        """get_latest_test_report returns None when test stage not yet completed."""
+        self.store.on_task_created({
+            "task_id": "t-pm2", "type": "pm",
+            "parent_task_id": "", "prompt": "p", "project_id": "proj",
+        })
+        result = self.store.get_latest_test_report("t-pm2")
+        self.assertIsNone(result)
+
+    def test_returns_none_for_unknown_task_id(self):
+        """get_latest_test_report returns None for task_id not in memory (no project_id)."""
+        result = self.store.get_latest_test_report("unknown-task-xyz")
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

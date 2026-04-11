@@ -313,6 +313,61 @@ class ChainContextStore:
             chain = self._chains.get(root_id)
             return chain.state if chain else None
 
+    def get_latest_test_report(self, task_id: str, project_id: str = "") -> dict | None:
+        """Get the most recent test_report for the chain containing task_id.
+
+        Memory-first: walks chain stages for the latest test stage with a
+        non-empty test_report in result_core.
+
+        DB fallback: queries chain_events if the chain is not in memory
+        (TODO:B25-remove — remove DB path once chain_events emission is complete).
+
+        Returns None if no test stage with test_report is found.
+        """
+        with self._lock:
+            root_id = self._task_to_root.get(task_id)
+            if root_id:
+                chain = self._chains.get(root_id)
+                if chain:
+                    test_report = None
+                    for stage in chain.stages.values():
+                        if stage.task_type == "test" and stage.result_core:
+                            tr = stage.result_core.get("test_report")
+                            if tr:
+                                test_report = tr
+                    return test_report
+
+        # TODO:B25-remove: DB fallback — only needed until chain_events is complete
+        pid = project_id
+        if not pid:
+            return None
+        try:
+            from .db import get_connection
+            conn = get_connection(pid)
+            rows = conn.execute(
+                "SELECT payload_json FROM chain_events "
+                "WHERE root_task_id = ("
+                "  SELECT root_task_id FROM chain_events WHERE task_id = ? LIMIT 1"
+                ") AND event_type = 'task.completed' "
+                "ORDER BY ts DESC",
+                (task_id,),
+            ).fetchall()
+            conn.close()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                    tr = payload.get("result", {}).get("test_report")
+                    if tr:
+                        return tr
+                except Exception:
+                    continue
+        except Exception:
+            log.debug(
+                "chain_context: get_latest_test_report DB fallback failed for %s",
+                task_id, exc_info=True,
+            )
+        return None
+
     # ── Archive ──
 
     def archive_chain(self, task_id: str, project_id: str = ""):

@@ -391,6 +391,33 @@ class ExecutorWorker:
                     },
                 }
 
+        # B28b: QA hard validation — non-JSON or missing/invalid recommendation must fail
+        # immediately so the gate receives a clean failure instead of a silent None.
+        if task_type == "qa":
+            if _is_raw_fallback:
+                _err = "structured_output_invalid:no_json"
+                return {
+                    "status": "failed",
+                    "error": _err,
+                    "result": {"error": _err, "summary": "QA output is not valid JSON"},
+                }
+            _rec = result.get("recommendation")
+            if _rec is None:
+                _err = "structured_output_invalid:missing_recommendation"
+                return {
+                    "status": "failed",
+                    "error": _err,
+                    "result": {"error": _err, "summary": "QA output missing recommendation field"},
+                }
+            _VALID_QA_RECS = {"qa_pass", "reject", "merge_pass"}
+            if _rec not in _VALID_QA_RECS:
+                _err = f"structured_output_invalid:invalid_recommendation:{_rec}"
+                return {
+                    "status": "failed",
+                    "error": _err,
+                    "result": {"error": _err, "summary": f"QA recommendation '{_rec}' is not valid"},
+                }
+
         # Always overwrite/set changed_files from git diff (ground truth)
         # IMPORTANT: git diff is authoritative; always set even if _parse_output
         # returned its own changed_files (it may be stale or from AI hallucination)
