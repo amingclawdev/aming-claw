@@ -1,7 +1,9 @@
 # Auto-Chain — Automated Stage Progression
 
 > **Canonical governance topic document** — How the auto-chain pipeline orchestrates task stages.
-> Last updated: 2026-04-10 | Phase 2 Documentation Consolidation + B/G-series updates
+> Last updated: 2026-04-11 | Phase 2 Documentation Consolidation + B/G-series updates + B24 chain integrity
+
+> **2026-04-11 (B24):** Chain integrity verification — retry dev prompts now include `SCOPE CONSTRAINT` populated by `get_retry_scope()` which accumulates changed_files from prior dev attempts. Version gate remains warning-only for merge/deploy stages (D3/B29/B30 fixes preserved).
 
 ## Overview
 

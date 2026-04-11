@@ -2,6 +2,8 @@
 
 > **2026-04-07 (B10):** Dev tasks now fail fast on worktree creation failure. PM PRDs should account for potential worktree retry scenarios in acceptance criteria.
 
+> **2026-04-11 (B24):** Chain integrity verification — PM `doc_impact.files` are now included in the retry scope constraint. Dev retries receive the full allowed file list via `get_retry_scope()` so gate rejections for missing doc updates are avoided.
+
 ## Role Definition
 
 The PM (Product Manager) role transforms coordinator requests into structured PRDs with defined scope, acceptance criteria, and verification methods. PM is the first stage in the auto-chain: PM -> Dev -> Test -> QA -> Merge.

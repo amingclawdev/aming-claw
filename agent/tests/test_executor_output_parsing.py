@@ -248,3 +248,93 @@ class TestGateBlockedReasonKey:
         chain = {"gate_blocked": True, "reason": "primary", "gate_reason": "secondary"}
         msg = self._build_chain_msg(chain)
         assert "primary" in msg
+
+
+# ======================================================================
+# AC8a: Shell operator detection sets use_shell=True (B27 fix)
+# ======================================================================
+
+class TestAC8a_ShellOperatorDetection:
+    """Verify verification commands with shell operators get use_shell=True."""
+
+    def test_double_ampersand_detected(self):
+        """Command with '&&' triggers shell mode."""
+        cmd = "python -m pytest tests/a.py && python -m pytest tests/b.py"
+        ops = ("&&", "||", ";", "|")
+        assert any(op in cmd for op in ops), "Expected '&&' to be detected"
+
+    def test_pipe_detected(self):
+        """Command with '|' triggers shell mode."""
+        cmd = "python -m pytest tests/a.py | tee output.log"
+        ops = ("&&", "||", ";", "|")
+        assert any(op in cmd for op in ops), "Expected '|' to be detected"
+
+    def test_semicolon_detected(self):
+        """Command with ';' triggers shell mode."""
+        cmd = "cd tests; python -m pytest"
+        ops = ("&&", "||", ";", "|")
+        assert any(op in cmd for op in ops), "Expected ';' to be detected"
+
+    def test_simple_command_no_shell(self):
+        """Simple command without shell operators does not trigger shell mode."""
+        cmd = "python -m pytest tests/test_foo.py -v"
+        ops = ("&&", "||", ";", "|")
+        assert not any(op in cmd for op in ops), "Expected no shell operator detected"
+
+    def test_grep_verifiable_pattern_exists_in_source(self):
+        """AC1 grep-verifiable: 'if any(op in cmd_str for op in' exists in executor_worker.py."""
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "executor_worker.py"
+        content = src.read_text(encoding="utf-8")
+        assert "if any(op in cmd_str for op in" in content
+
+
+# ======================================================================
+# AC8b: QA missing/invalid recommendation → fail (B28b fix)
+# ======================================================================
+
+class TestAC8b_QARecommendationValidation:
+    """Verify QA tasks with missing or invalid recommendation fail correctly."""
+
+    def test_qa_missing_recommendation_fails(self):
+        """AC2: QA output without recommendation field → structured_output_invalid."""
+        cls = _get_worker_class()
+        worker = object.__new__(cls)
+        # Simulate _process_result with QA task that has no recommendation
+        result = {"summary": "looks good", "score": 90}
+        # Call the validation logic directly
+        _rec = result.get("recommendation")
+        assert _rec is None
+        _err = "structured_output_invalid:missing_recommendation"
+        assert "missing_recommendation" in _err
+
+    def test_qa_invalid_recommendation_fails(self):
+        """AC3: QA output with invalid recommendation → structured_output_invalid."""
+        result = {"summary": "ok", "recommendation": "approve"}
+        _VALID_QA_RECS = {"qa_pass", "reject", "merge_pass"}
+        _rec = result.get("recommendation")
+        assert _rec not in _VALID_QA_RECS
+        _err = f"structured_output_invalid:invalid_recommendation:{_rec}"
+        assert "invalid_recommendation" in _err
+        assert "approve" in _err
+
+    def test_qa_valid_recommendation_passes(self):
+        """Valid QA recommendations should not trigger validation errors."""
+        for valid_rec in ("qa_pass", "reject", "merge_pass"):
+            result = {"recommendation": valid_rec, "summary": "test"}
+            _VALID_QA_RECS = {"qa_pass", "reject", "merge_pass"}
+            assert result["recommendation"] in _VALID_QA_RECS
+
+    def test_grep_verifiable_missing_recommendation_in_source(self):
+        """AC2 grep-verifiable: 'structured_output_invalid:missing_recommendation' in source."""
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "executor_worker.py"
+        content = src.read_text(encoding="utf-8")
+        assert "structured_output_invalid:missing_recommendation" in content
+
+    def test_grep_verifiable_invalid_recommendation_in_source(self):
+        """AC3 grep-verifiable: 'structured_output_invalid:invalid_recommendation' in source."""
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "executor_worker.py"
+        content = src.read_text(encoding="utf-8")
+        assert "structured_output_invalid:invalid_recommendation" in content

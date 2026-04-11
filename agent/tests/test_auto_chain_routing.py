@@ -544,3 +544,65 @@ class TestVersionGateBypassFrequency:
         warning_calls = mock_log.warning.call_args_list
         freq_warnings = [c for c in warning_calls if "high bypass frequency" in str(c)]
         assert len(freq_warnings) == 0, f"Expected no frequency warning, got: {warning_calls}"
+
+
+# ---------------------------------------------------------------------------
+# AC8c: Retry scope includes prior changed_files (B28a)
+# ---------------------------------------------------------------------------
+
+class TestAC8c_RetryScopeIncludesPriorChangedFiles:
+    """get_retry_scope() returns union of target_files + test_files
+    + doc_impact.files + accumulated changed_files from prior dev stages."""
+
+    def test_retry_scope_includes_target_and_test_files(self):
+        from governance.chain_context import ChainContextStore
+        store = ChainContextStore()
+        metadata = {
+            "target_files": ["agent/foo.py", "agent/bar.py"],
+            "test_files": ["agent/tests/test_foo.py"],
+            "doc_impact": {"files": ["docs/api/foo.md"]},
+        }
+        scope = store.get_retry_scope("chain-1", "test-proj", metadata)
+        assert "agent/foo.py" in scope
+        assert "agent/bar.py" in scope
+        assert "agent/tests/test_foo.py" in scope
+        assert "docs/api/foo.md" in scope
+
+    def test_retry_scope_includes_accumulated_changed_files(self):
+        from governance.chain_context import ChainContextStore
+        store = ChainContextStore()
+        # Simulate a prior dev stage via event-based API
+        # 1) Create root PM task
+        store.on_task_created({
+            "task_id": "task-root", "type": "pm",
+            "project_id": "test-proj", "prompt": "PRD",
+        })
+        # 2) Create dev task as child
+        store.on_task_created({
+            "task_id": "task-dev1", "type": "dev",
+            "parent_task_id": "task-root",
+            "project_id": "test-proj", "prompt": "implement",
+        })
+        # 3) Complete dev task with changed_files
+        store.on_task_completed({
+            "task_id": "task-dev1", "type": "dev",
+            "project_id": "test-proj",
+            "result": {"changed_files": ["agent/extra.py", "agent/new_module.py"]},
+        })
+        # The chain_id is the root task_id
+        chain_id = "task-root"
+        metadata = {
+            "target_files": ["agent/foo.py"],
+            "test_files": [],
+        }
+        scope = store.get_retry_scope(chain_id, "test-proj", metadata)
+        assert "agent/foo.py" in scope
+        assert "agent/extra.py" in scope
+        assert "agent/new_module.py" in scope
+
+    def test_retry_scope_empty_metadata_fallback(self):
+        from governance.chain_context import ChainContextStore
+        store = ChainContextStore()
+        scope = store.get_retry_scope("chain-empty", "test-proj", {})
+        assert isinstance(scope, set)
+        assert len(scope) == 0
