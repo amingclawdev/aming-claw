@@ -302,7 +302,13 @@ def _check_verify_requires_satisfied(conn, project_id, verify_requires):
                 blocking.append(req_nid)
                 continue
             status = (row["verify_status"] or "pending").strip()
-            if status not in ("qa_pass", "t2_pass"):
+            try:
+                rank = _STATUS_ORDER.index(status)
+            except ValueError:
+                blocking.append(req_nid)
+                continue
+            # t2_pass is the minimum acceptable status (rank 2)
+            if rank < _STATUS_ORDER.index("t2_pass"):
                 blocking.append(req_nid)
         except Exception:
             blocking.append(req_nid)
