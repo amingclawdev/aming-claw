@@ -58,6 +58,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B19 | Governance version stale after commits | 6810a37 | 2026-04-10 |
 | B20 | Clean staged/untracked leaks before merge | 2bd20f9 | 2026-04-10 |
 | B23 | version_check dirty filter missing docs/dev/ non-governed path | 1d66aa5 | 2026-04-10 |
+| B27 | Dev changed_files misses untracked new files | bd77c14 | 2026-04-11 |
 | G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
 | G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 | G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
