@@ -1148,11 +1148,11 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     metadata.get("parent_task_id", task_id),
                     metadata,
                 )
-                # Build allowed files list for scope constraint
-                allowed = set(metadata.get("target_files", []))
-                allowed.update(metadata.get("test_files", []))
-                doc_files = (metadata.get("doc_impact") or {}).get("files", [])
-                allowed.update(doc_files)
+                # Build allowed files list for scope constraint (B28a: includes prev dev changed_files)
+                from .chain_context import get_store as _get_ctx_store
+                allowed = _get_ctx_store().get_retry_scope(_chain_id, project_id, metadata)
+                if not allowed:
+                    allowed = set(metadata.get("target_files", []))  # final fallback
                 if allowed:
                     scope_line = f"SCOPE CONSTRAINT: Checkpoint gate only allows changes to: {sorted(allowed)}. Changes to any other files will be blocked as 'unrelated'.\n\n"
                 else:

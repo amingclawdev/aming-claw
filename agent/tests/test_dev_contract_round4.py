@@ -472,5 +472,84 @@ class TestG5ScopeConstraintInRetryPrompt(unittest.TestCase):
         self.assertNotIn("SCOPE CONSTRAINT", retry_prompt)
 
 
+class TestRetryScope(unittest.TestCase):
+    """B28a: get_retry_scope covers files missed by PM metadata."""
+
+    def setUp(self):
+        from governance.chain_context import ChainContextStore
+        self.store = ChainContextStore()
+
+    def _setup_chain(self, dev_changed_files):
+        for tid, ttype, parent in [
+            ("chain-pm", "pm", ""),
+            ("chain-dev", "dev", "chain-pm"),
+        ]:
+            self.store.on_task_created({
+                "task_id": tid, "type": ttype,
+                "parent_task_id": parent,
+                "prompt": "fix verification command",
+                "project_id": "test-proj",
+            })
+        self.store.on_task_completed({
+            "task_id": "chain-dev", "type": "dev",
+            "result": {"changed_files": dev_changed_files, "summary": "done"},
+            "project_id": "test-proj",
+        })
+
+    def test_retry_scope_includes_role_docs_not_in_pm_metadata(self):
+        """B28a core case: dev modified role docs not declared in PM target_files."""
+        self._setup_chain([
+            "agent/executor_worker.py",
+            "config/roles/dev.yaml",
+            "config/roles/qa.yaml",
+        ])
+        pm_metadata = {
+            "target_files": ["agent/executor_worker.py"],
+            "test_files": ["agent/tests/test_foo.py"],
+            "doc_impact": {"files": []},
+        }
+        scope = self.store.get_retry_scope("chain-pm", "test-proj", pm_metadata)
+        self.assertIn("agent/executor_worker.py", scope)
+        self.assertIn("agent/tests/test_foo.py", scope)
+        self.assertIn("config/roles/dev.yaml", scope)
+        self.assertIn("config/roles/qa.yaml", scope)
+
+    def test_retry_scope_deduplicates_files(self):
+        """Files in both PM metadata and dev changed_files appear once."""
+        self._setup_chain(["agent/executor_worker.py", "docs/api/executor-api.md"])
+        pm_metadata = {
+            "target_files": ["agent/executor_worker.py"],
+            "test_files": [],
+            "doc_impact": {"files": ["docs/api/executor-api.md"]},
+        }
+        scope = self.store.get_retry_scope("chain-pm", "test-proj", pm_metadata)
+        self.assertIsInstance(scope, set)
+        self.assertIn("agent/executor_worker.py", scope)
+        self.assertIn("docs/api/executor-api.md", scope)
+
+    def test_accumulated_empty_without_completed_dev(self):
+        """No completed dev → accumulated files is empty."""
+        for tid, ttype, parent in [
+            ("p2-pm", "pm", ""),
+            ("p2-dev", "dev", "p2-pm"),
+        ]:
+            self.store.on_task_created({
+                "task_id": tid, "type": ttype,
+                "parent_task_id": parent, "prompt": "p", "project_id": "test-proj",
+            })
+        files = self.store.get_accumulated_changed_files("p2-pm", "test-proj")
+        self.assertEqual(files, [])
+
+    def test_scope_equals_pm_metadata_when_no_dev_history(self):
+        """No prior dev → scope equals PM target_files."""
+        self.store.on_task_created({
+            "task_id": "solo-pm", "type": "pm",
+            "parent_task_id": "", "prompt": "p", "project_id": "test-proj",
+        })
+        pm_metadata = {"target_files": ["agent/foo.py"]}
+        scope = self.store.get_retry_scope("solo-pm", "test-proj", pm_metadata)
+        self.assertIn("agent/foo.py", scope)
+
+
 if __name__ == "__main__":
     unittest.main()

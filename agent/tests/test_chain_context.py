@@ -200,6 +200,101 @@ class TestChainContextRecovery(unittest.TestCase):
         self.assertEqual(store1.get_original_prompt("r2"), "build it")
 
 
+class TestGetAccumulatedChangedFiles(unittest.TestCase):
+    """B28a: ChainContextStore.get_accumulated_changed_files accessor."""
+
+    def setUp(self):
+        self.store = ChainContextStore()
+
+    def test_returns_union_of_dev_changed_files(self):
+        """Accumulates changed_files from multiple dev stages."""
+        for tid, ttype, parent in [
+            ("t-pm", "pm", ""),
+            ("t-dev1", "dev", "t-pm"),
+            ("t-dev2", "dev", "t-dev1"),
+        ]:
+            self.store.on_task_created({
+                "task_id": tid, "type": ttype,
+                "parent_task_id": parent, "prompt": "p", "project_id": "proj",
+            })
+        self.store.on_task_completed({
+            "task_id": "t-dev1", "type": "dev",
+            "result": {"changed_files": ["agent/foo.py", "docs/api/x.md"]},
+            "project_id": "proj",
+        })
+        self.store.on_task_completed({
+            "task_id": "t-dev2", "type": "dev",
+            "result": {"changed_files": ["agent/bar.py", "agent/foo.py"]},
+            "project_id": "proj",
+        })
+        # chain_id is the root task id
+        files = self.store.get_accumulated_changed_files("t-pm", "proj")
+        self.assertIn("agent/foo.py", files)
+        self.assertIn("agent/bar.py", files)
+        self.assertIn("docs/api/x.md", files)
+        self.assertEqual(len(files), 3)  # deduped
+
+    def test_returns_empty_for_unknown_chain(self):
+        files = self.store.get_accumulated_changed_files("unknown-chain", "")
+        self.assertEqual(files, [])
+
+
+class TestGetRetryScope(unittest.TestCase):
+    """B28a: ChainContextStore.get_retry_scope accessor."""
+
+    def setUp(self):
+        self.store = ChainContextStore()
+
+    def _build_chain_with_dev(self, dev_changed):
+        for tid, ttype, parent in [
+            ("r-pm", "pm", ""),
+            ("r-dev", "dev", "r-pm"),
+        ]:
+            self.store.on_task_created({
+                "task_id": tid, "type": ttype,
+                "parent_task_id": parent, "prompt": "p", "project_id": "proj",
+            })
+        self.store.on_task_completed({
+            "task_id": "r-dev", "type": "dev",
+            "result": {"changed_files": dev_changed},
+            "project_id": "proj",
+        })
+
+    def test_combines_pm_metadata_with_dev_changed(self):
+        """retry scope = PM target_files + prev dev changed_files."""
+        self._build_chain_with_dev(["config/roles/dev.yaml", "docs/api/x.md"])
+        base_metadata = {
+            "target_files": ["agent/executor_worker.py"],
+            "test_files": ["agent/tests/test_foo.py"],
+            "doc_impact": {"files": ["docs/api/executor-api.md"]},
+        }
+        scope = self.store.get_retry_scope("r-pm", "proj", base_metadata)
+        self.assertIn("agent/executor_worker.py", scope)
+        self.assertIn("agent/tests/test_foo.py", scope)
+        self.assertIn("docs/api/executor-api.md", scope)
+        self.assertIn("config/roles/dev.yaml", scope)
+        self.assertIn("docs/api/x.md", scope)
+
+    def test_empty_dev_history_returns_pm_only(self):
+        """No prev dev → scope equals PM metadata only."""
+        for tid, ttype, parent in [("n-pm", "pm", "")]:
+            self.store.on_task_created({
+                "task_id": tid, "type": ttype,
+                "parent_task_id": parent, "prompt": "p", "project_id": "proj",
+            })
+        base_metadata = {"target_files": ["agent/foo.py"], "test_files": [], "doc_impact": {}}
+        scope = self.store.get_retry_scope("n-pm", "proj", base_metadata)
+        self.assertEqual(scope, {"agent/foo.py"})
+
+    def test_additive_only_never_removes_pm_files(self):
+        """Dev changed_files only adds to scope, never removes PM files."""
+        self._build_chain_with_dev(["config/roles/dev.yaml"])
+        base_metadata = {"target_files": ["agent/executor_worker.py"]}
+        scope = self.store.get_retry_scope("r-pm", "proj", base_metadata)
+        self.assertIn("agent/executor_worker.py", scope)  # PM file preserved
+        self.assertIn("config/roles/dev.yaml", scope)    # dev file added
+
+
 class TestGetLatestTestReport(unittest.TestCase):
     """B28b: ChainContextStore.get_latest_test_report accessor."""
 

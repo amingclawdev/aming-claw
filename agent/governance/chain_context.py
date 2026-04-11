@@ -44,7 +44,7 @@ ROLE_VISIBLE_STAGES = {
 ROLE_RESULT_FIELDS = {
     "pm":          [],
     "dev":         ["target_files", "requirements", "acceptance_criteria",
-                    "verification", "prd"],
+                    "verification", "prd", "changed_files"],  # +changed_files: retry scope (B28a)
     "test":        ["changed_files", "target_files"],
     "qa":          ["test_report", "changed_files", "acceptance_criteria"],
     "merge":       ["changed_files", "test_report"],
@@ -367,6 +367,66 @@ class ChainContextStore:
                 task_id, exc_info=True,
             )
         return None
+
+    def get_accumulated_changed_files(self, chain_id: str, project_id: str) -> list[str]:
+        """Union of changed_files from all predecessor dev stages in the chain.
+
+        Memory-first: reads result_core of dev stages already in memory.
+        DB fallback: queries tasks table if the chain is not in memory or has no
+        dev stages with result_core (TODO:B25-remove — remove after chain_events
+        emission is complete).
+        """
+        result: set[str] = set()
+        with self._lock:
+            chain = self._chains.get(chain_id)
+            if chain:
+                for stage in chain.stages.values():
+                    if stage.task_type == "dev" and stage.result_core:
+                        result.update(stage.result_core.get("changed_files", []))
+                if result:
+                    return sorted(result)
+
+        # TODO:B25-remove: DB fallback when chain not in memory or result_core missing
+        if not project_id:
+            return []
+        try:
+            from .db import get_connection
+            conn = get_connection(project_id)
+            rows = conn.execute(
+                "SELECT result_json FROM tasks "
+                "WHERE chain_id=? AND type='dev' AND status='succeeded'",
+                (chain_id,),
+            ).fetchall()
+            conn.close()
+            for row in rows:
+                try:
+                    result.update(
+                        (json.loads(row["result_json"] or "{}")).get("changed_files", [])
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            log.debug(
+                "chain_context: get_accumulated_changed_files DB fallback failed for %s",
+                chain_id, exc_info=True,
+            )
+        return sorted(result)
+
+    def get_retry_scope(
+        self, chain_id: str, project_id: str, base_metadata: dict
+    ) -> set[str]:
+        """Complete allowed-file set for a retry dev task.
+
+        = PM declared files (target_files + test_files + doc_impact.files)
+          UNION all previous dev changed_files in this chain.
+
+        Additive-only: never removes files that PM declared.
+        """
+        allowed: set[str] = set(base_metadata.get("target_files", []))
+        allowed.update(base_metadata.get("test_files", []) or [])
+        allowed.update((base_metadata.get("doc_impact") or {}).get("files", []) or [])
+        allowed.update(self.get_accumulated_changed_files(chain_id, project_id))
+        return allowed
 
     # ── Archive ──
 
