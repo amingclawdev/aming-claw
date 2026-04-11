@@ -1688,7 +1688,7 @@ class ExecutorWorker:
             )
             files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
 
-            # Also include untracked files that are new (not yet in HEAD)
+            # Also include staged new files (added to index but not yet in HEAD)
             result2 = subprocess.run(
                 ["git", "diff", "--name-only", "--diff-filter=A", "--cached"],
                 cwd=repo_cwd,
@@ -1698,9 +1698,19 @@ class ExecutorWorker:
             )
             new_files = [f.strip() for f in result2.stdout.splitlines() if f.strip()]
 
-            # Merge, preserving order, dedup
+            # Also include untracked new files (created but not yet staged)
+            result3 = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=repo_cwd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            untracked_files = [f.strip() for f in result3.stdout.splitlines() if f.strip()]
+
+            # Merge all three, preserving order, dedup
             seen = set(files)
-            for f in new_files:
+            for f in new_files + untracked_files:
                 if f not in seen:
                     files.append(f)
                     seen.add(f)

@@ -53,12 +53,29 @@ class TestDevWorktreeRound3(unittest.TestCase):
 
         proc1 = MagicMock(returncode=0, stdout="agent/foo.py\n")
         proc2 = MagicMock(returncode=0, stdout="")
+        proc3 = MagicMock(returncode=0, stdout="")
 
-        with patch("subprocess.run", side_effect=[proc1, proc2]) as mock_run:
+        with patch("subprocess.run", side_effect=[proc1, proc2, proc3]) as mock_run:
             files = worker._get_git_changed_files(cwd="C:/repo/worktree")
 
         self.assertEqual(files, ["agent/foo.py"])
         self.assertEqual(mock_run.call_args_list[0].kwargs["cwd"], "C:/repo/worktree")
+
+    def test_git_changed_files_includes_untracked_new_files(self):
+        """B27: untracked new files (git ls-files --others) must appear in changed_files."""
+        worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace="C:/repo/main")
+
+        proc1 = MagicMock(returncode=0, stdout="agent/existing.py\n")  # modified tracked
+        proc2 = MagicMock(returncode=0, stdout="agent/staged_new.py\n")  # staged new
+        proc3 = MagicMock(returncode=0, stdout="agent/untracked_new.py\n")  # untracked new
+
+        with patch("subprocess.run", side_effect=[proc1, proc2, proc3]):
+            files = worker._get_git_changed_files(cwd="C:/repo/worktree")
+
+        self.assertIn("agent/existing.py", files)
+        self.assertIn("agent/staged_new.py", files)
+        self.assertIn("agent/untracked_new.py", files)
+        self.assertEqual(len(files), 3)
 
 
 if __name__ == "__main__":
