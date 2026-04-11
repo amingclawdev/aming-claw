@@ -65,6 +65,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | G8 | related_nodes not auto-populated from graph | 8f84d82 | 2026-04-10 |
 | G9 | Observer SOP for manual task metadata | 79f9c39 | 2026-04-10 |
 | G10 | Graph rebuild mapping updated | 79f9c39 | 2026-04-10 |
+| G11 | manual-fix-sop missing chain_version sync step | aaaab1b | 2026-04-11 |
 | O2 | Version gate filter worktree dirty files | 44ab315 | 2026-04-09 |
 | O3 | Governance dynamic version read (no restart) | 6810a37 | 2026-04-10 |
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
@@ -72,6 +73,14 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 ---
 
 ## Open Items (P3 — low priority, next session)
+
+### G11: manual-fix-sop Phase 4 遗漏 chain_version 同步步骤 [FIXED]
+
+- **Status**: Fixed. SOP R11 已添加。
+- **Symptom**: manual fix commit 后 chain_version 未更新，version gate（`chain_version != git HEAD`）阻断后续所有 workflow 任务。
+- **Root cause**: manual-fix-sop.md Phase 4（POST-COMMIT VERIFY）只要求重启 governance + version_check，未明确要求调用 `version-sync` + `version-update` 将 chain_version 推进到新 HEAD。Deploy 阶段自动调用这两步，但 manual fix 绕过了 Deploy，导致 chain_version 停留在旧值。
+- **Fix**: `docs/governance/manual-fix-sop.md` 增加 R11：每次 manual fix commit 后必须调用 `POST /api/version-sync/{project_id}` + `POST /api/version-update/{project_id}`，验证 `GET /api/version-check` 返回 `ok: true`。Governance 离线时可直接更新 `project_version` 表（需在 governance 重启后通过 version-check 验证）。
+- **Fix commit**: aaaab1b（SOP R11 写入，本次 commit）
 
 ### B28a: Retry dev SCOPE CONSTRAINT 不继承前序 dev changed_files [OPEN] [P1]
 
