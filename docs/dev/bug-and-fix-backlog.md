@@ -2,7 +2,18 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-11 (B29 added; B25 P1.5, B27 P1)
+> Last updated: 2026-04-11 (B24 注明重发条件；修复顺序更新)
+
+---
+
+## 修复优先级顺序
+
+```
+P1   : B29（version gate 审计）→ B27（changed_files 采集）→ B28b（QA 硬校验）→ B28a（retry scope）→ B24（重发链路）
+P1.5 : B25（chain_context recovery）
+P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）
+P3   : gate 报错优化 / skip_reason 枚举审计
+```
 
 ---
 
@@ -79,9 +90,10 @@
 
 ### B24: PM verification.command 语法错误 [OPEN] [P1]
 
-- **Status**: Open.
+- **Status**: Open. Dev 修复已通过测试（chain `task-1775862217-e742de` test: 23/0），但链路未完成 deploy 阶段（governance 崩溃导致中断）。等 B29 修复后重新发起完整链路验证。
 - **Symptom**: PM 生成的验证命令将多条 shell 命令用 `&&` 串联后作为 `diff` 的参数传入（`diff a.md b.md && grep ...`），导致 diff 收到多余操作数报错，test 阶段 100% 失败（`diff: extra operand '&&'`）。
 - **Discovered**: chain `task-1775855010-7fcf8b`，两次 test 任务均因此失败（attempts=3）。
+- **Fix status**: Dev 修复已在 `agent/executor_worker.py` 提交（chain `task-1775862217-e742de`，dev 任务通过，test 23/0）。待 B29 修复后重发 PM 任务完成 merge/deploy。
 - **File**: PM 提示词 / `agent/governance/auto_chain.py` — PM 生成 `verification.command` 的逻辑，需拆分为独立 shell 步骤而非 `&&` 串联整体作为单条命令。
 
 ### B25: chain_events 记录不完整 [OPEN] [P1.5]
