@@ -206,9 +206,9 @@ class TestVersionGateRound4(unittest.TestCase):
         self.assertIn("reconciliation-bypass", reason)
         self.assertIn("task-observer-001", reason)
 
-    # --- Server version mismatch now blocks (restored from D3 warning-only) ---
+    # --- B29: chain_version mismatch blocks (anchored to DB, not dynamic server HEAD) ---
     def test_server_version_mismatch_blocks_chain(self):
-        """SERVER_VERSION != HEAD blocks the chain. Restart service to resolve."""
+        """chain_version (DB) != git HEAD blocks the chain. Deploy workflow to update."""
         from governance import auto_chain
 
         conn = mock.Mock()
@@ -220,13 +220,12 @@ class TestVersionGateRound4(unittest.TestCase):
 
         metadata = {}
         with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False), \
-             self._patch_server_version("abc1234"), \
              mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="def5678\n", returncode=0)):
             passed, reason = auto_chain._gate_version_check(conn, "aming-claw", {}, metadata)
 
         self.assertFalse(passed)
-        self.assertIn("server version", reason)
-        self.assertIn("Restart", reason)
+        self.assertIn("chain_version", reason)
+        self.assertIn("Deploy", reason)
 
     def test_server_version_mismatch_bypassed_by_observer_merge(self):
         """observer_merge metadata lets chain proceed despite version mismatch."""

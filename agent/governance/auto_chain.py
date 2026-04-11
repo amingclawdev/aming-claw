@@ -1665,7 +1665,6 @@ def _gate_version_check(conn, project_id, result, metadata):
                         len(dirty_files), dirty_files[:5])
             return False, f"dirty workspace ({len(dirty_files)} files: {dirty_files[:3]})"
 
-        from .server import get_server_version
         import subprocess
         head = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -1674,16 +1673,19 @@ def _gate_version_check(conn, project_id, result, metadata):
         ).stdout.strip()
         if not head or head == "unknown":
             return True, "git HEAD unavailable, skipping"
-        server_ver = get_server_version()
-        if server_ver == "unknown":
-            return True, "server version unavailable, skipping"
-        if server_ver != head:
-            log.warning("version_check: server version (%s) behind git HEAD (%s) — blocking chain. "
-                        "Restart governance service to resolve.",
-                        server_ver, head)
-            return False, (f"server version ({server_ver}) != git HEAD ({head}). "
-                           f"Restart governance service to update.")
-        return True, f"version match: {server_ver}"
+        # B29: anchor version gate to DB chain_version (set only by successful Deploy),
+        # not to get_server_version() which dynamically reads git HEAD (B19 side-effect).
+        # This prevents manual Observer commits from silently advancing the gate baseline.
+        chain_ver = (row["chain_version"] or "").strip() if row else ""
+        if not chain_ver or chain_ver == "unknown":
+            return True, "chain_version unavailable in DB, skipping"
+        if chain_ver != head:
+            log.warning("version_check: chain_version (%s) != git HEAD (%s) — blocking chain. "
+                        "Complete a full workflow Deploy to update chain_version.",
+                        chain_ver, head)
+            return False, (f"chain_version ({chain_ver}) != git HEAD ({head}). "
+                           f"Complete workflow Deploy to update chain_version.")
+        return True, f"version match: {chain_ver}"
     except Exception as e:
         log.warning("version_check failed (non-fatal): %s", e)
         return True, f"version check skipped: {e}"
