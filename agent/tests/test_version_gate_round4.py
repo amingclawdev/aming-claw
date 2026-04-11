@@ -379,5 +379,82 @@ class TestVersionGateRound4(unittest.TestCase):
                                 "version gate should have passed on retry")
 
 
+    # --- B30: merge/deploy exempt from version gate ---
+
+    def test_merge_task_skips_version_check(self):
+        """B30: merge task bypasses version gate (merge produces the new commit itself)."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = None
+        gate_called = [False]
+
+        def _fake_gate(c, pid, res, meta):
+            gate_called[0] = True
+            return (False, "chain_version (abc) != git HEAD (def)")
+
+        with mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_gate_version_check", side_effect=_fake_gate), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"), \
+             mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False):
+            result = auto_chain._do_chain(conn, "aming-claw", "task-merge-1", "merge", {}, {"chain_depth": 0})
+
+        # _gate_version_check must NOT have been called for merge
+        self.assertFalse(gate_called[0], "_gate_version_check should be skipped for merge")
+        # Chain should not be gate_blocked
+        self.assertFalse(result.get("gate_blocked"), "merge task should not be blocked by version gate")
+
+    def test_deploy_task_skips_version_check(self):
+        """B30: deploy task bypasses _gate_version_check (deploy updates chain_version)."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = None
+        gate_called = [False]
+
+        def _fake_gate(c, pid, res, meta):
+            gate_called[0] = True
+            return (False, "chain_version (abc) != git HEAD (def)")
+
+        with mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_gate_version_check", side_effect=_fake_gate), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"), \
+             mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False):
+            auto_chain._do_chain(conn, "aming-claw", "task-deploy-1", "deploy", {}, {"chain_depth": 0})
+
+        # _gate_version_check must NOT have been called for deploy
+        self.assertFalse(gate_called[0], "_gate_version_check should be skipped for deploy")
+
+    def test_pm_task_still_checked_by_version_gate(self):
+        """B30: pm task is still subject to version gate (exemption is merge/deploy only)."""
+        from governance import auto_chain
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = None
+        gate_called = [False]
+
+        def _fake_gate(c, pid, res, meta):
+            gate_called[0] = True
+            return (False, "chain_version (abc) != git HEAD (def)")
+
+        with mock.patch.object(auto_chain, "_publish_event"), \
+             mock.patch.object(auto_chain, "_gate_version_check", side_effect=_fake_gate), \
+             mock.patch.object(auto_chain, "_record_gate_event"), \
+             mock.patch.object(auto_chain, "_normalize_related_nodes", return_value=[]), \
+             mock.patch.object(auto_chain, "_load_task_trace", return_value=("trace1", "chain1")), \
+             mock.patch.object(auto_chain, "structured_log"), \
+             mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False):
+            result = auto_chain._do_chain(conn, "aming-claw", "task-pm-1", "pm", {}, {"chain_depth": 0})
+
+        self.assertTrue(gate_called[0], "_gate_version_check MUST be called for pm")
+        self.assertTrue(result.get("gate_blocked"), "pm should still be blocked by version gate")
+
+
 if __name__ == "__main__":
     unittest.main()

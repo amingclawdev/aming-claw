@@ -1,123 +1,113 @@
-"""Tests for version cache invalidation after merge tasks in _do_chain.
+"""Tests for B30: merge/deploy version gate exemption in _do_chain.
+
+B30 replaced the old _version_cache invalidation approach with a direct
+exemption: merge and deploy task types skip _gate_version_check entirely.
 
 Verifies that:
-1. Merge task completion invalidates _version_cache (ts=0)
-2. Non-merge task types do NOT invalidate the cache
-3. Cache invalidation appears BEFORE _gate_version_check in source
-4. Cache invalidation is wrapped in try/except
+1. Merge task completion skips _gate_version_check (version-advancing op)
+2. Deploy task completion skips _gate_version_check (updates chain_version)
+3. Non-exempt types (pm, dev) still run _gate_version_check
+4. Exemption is gated by `if task_type in ("merge", "deploy"):` in source
 """
 
 from __future__ import annotations
 
-import ast
-import inspect
 import os
 import re
 import sys
-import textwrap
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-# Ensure agent package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 def _get_auto_chain_source_path() -> str:
-    """Return the absolute path to auto_chain.py."""
     return os.path.join(
         os.path.dirname(__file__), "..", "governance", "auto_chain.py"
     )
 
 
 class TestMergeInvalidatesVersionCache:
-    """AC1/AC4: After merge task completes, _version_cache['ts'] is set to 0."""
+    """B30 AC1: merge task skips version gate (replaces old cache-invalidation approach)."""
 
     def test_merge_invalidates_cache(self):
-        """When task_type=='merge', the source code sets _version_cache['ts'] = 0."""
+        """B30: merge task type is exempt from _gate_version_check in source."""
         src_path = _get_auto_chain_source_path()
         with open(src_path, "r", encoding="utf-8") as f:
             source = f.read()
 
-        # Verify that inside the merge block, _version_cache["ts"] is set to 0
-        # This simulates the runtime behavior: after merge, cache ts is reset
+        # B30: exemption block must exist: if task_type in ("merge", "deploy"):
         pattern = re.compile(
-            r'if\s+task_type\s*==\s*"merge"\s*:.*?_version_cache\[.*?ts.*?\]\s*=\s*0',
-            re.DOTALL,
+            r'if\s+task_type\s+in\s+\("merge",\s*"deploy"\)',
         )
-        match = pattern.search(source)
-        assert match is not None, (
-            "Expected _version_cache['ts'] = 0 inside merge task_type block"
+        assert pattern.search(source), (
+            'Expected `if task_type in ("merge", "deploy"):` exemption block in source'
         )
 
-        # Also verify the import path is correct (agent.governance.server)
-        import_pattern = re.compile(
-            r'from\s+agent\.governance\.server\s+import\s+_version_cache'
+        # And the exemption must set ver_passed = True
+        exempt_pattern = re.compile(
+            r'if\s+task_type\s+in\s+\("merge",\s*"deploy"\).*?ver_passed\s*,\s*ver_reason\s*=\s*True',
+            re.DOTALL,
         )
-        assert import_pattern.search(source), (
-            "Expected import of _version_cache from agent.governance.server"
+        assert exempt_pattern.search(source), (
+            "Expected ver_passed = True inside merge/deploy exemption block"
         )
 
 
 class TestNonMergeNoOp:
-    """AC3/AC4: Non-merge task types do NOT invalidate the version cache."""
+    """B30 AC2: non-exempt types still call _gate_version_check."""
 
     def test_source_only_invalidates_for_merge(self):
-        """The invalidation block is gated by `if task_type == "merge":`."""
+        """The _gate_version_check call is in the else branch of the exemption."""
         src_path = _get_auto_chain_source_path()
         with open(src_path, "r", encoding="utf-8") as f:
             source = f.read()
 
-        # Find the _version_cache["ts"] = 0 assignment
-        # It must be inside an `if task_type == "merge":` block
-        pattern = re.compile(
-            r'if\s+task_type\s*==\s*"merge"\s*:.*?_version_cache\[.*?ts.*?\]\s*=\s*0',
+        # The else branch must call _gate_version_check
+        else_gate_pattern = re.compile(
+            r'else\s*:\s*\n\s*#.*version check.*\n\s*ver_passed.*=\s*_gate_version_check\(',
             re.DOTALL,
         )
-        assert pattern.search(source), (
-            "Expected _version_cache['ts'] = 0 inside an `if task_type == 'merge':` block"
+        assert else_gate_pattern.search(source), (
+            "Expected _gate_version_check call in else branch of merge/deploy exemption"
         )
 
 
 class TestSourcePositionCheck:
-    """AC1/AC4: _version_cache invalidation appears BEFORE _gate_version_check call."""
+    """B30 AC3: exemption block appears before the stage gate check."""
 
     def test_cache_invalidation_before_gate_check(self):
-        """In auto_chain.py source, the cache reset must precede _gate_version_check."""
+        """In auto_chain.py source, the merge/deploy exemption precedes stage gate_fn call."""
         src_path = _get_auto_chain_source_path()
         with open(src_path, "r", encoding="utf-8") as f:
             source = f.read()
 
-        cache_pos = source.find('_version_cache["ts"] = 0')
-        if cache_pos == -1:
-            cache_pos = source.find("_version_cache['ts'] = 0")
-        assert cache_pos != -1, "_version_cache ts=0 assignment not found in source"
+        exempt_pos = source.find('if task_type in ("merge", "deploy"):')
+        assert exempt_pos != -1, 'merge/deploy exemption block not found in source'
 
-        gate_pos = source.find("_gate_version_check(")
-        assert gate_pos != -1, "_gate_version_check call not found in source"
+        gate_fn_pos = source.find("gate_fn = _GATES[gate_fn_name]")
+        assert gate_fn_pos != -1, "_GATES lookup not found in source"
 
-        assert cache_pos < gate_pos, (
-            f"Cache invalidation (pos {cache_pos}) must appear before "
-            f"_gate_version_check (pos {gate_pos})"
+        assert exempt_pos < gate_fn_pos, (
+            f"Exemption (pos {exempt_pos}) must appear before stage gate_fn call (pos {gate_fn_pos})"
         )
 
 
 class TestTryExceptWrap:
-    """AC2/AC4: Cache invalidation is wrapped in try/except."""
+    """B30 AC4: exemption block records a gate event for audit trail."""
 
     def test_cache_invalidation_has_try_except(self):
-        """The _version_cache invalidation block must be inside try/except."""
+        """The merge/deploy exemption path calls _record_gate_event for auditability."""
         src_path = _get_auto_chain_source_path()
         with open(src_path, "r", encoding="utf-8") as f:
             source = f.read()
 
-        # Find the merge block and verify it contains try/except wrapping
-        # the _version_cache assignment
-        pattern = re.compile(
-            r'if\s+task_type\s*==\s*"merge"\s*:\s*\n\s*try\s*:.*?_version_cache.*?ts.*?=\s*0.*?\n\s*except\s+Exception',
+        # After the exemption ver_passed=True, _record_gate_event must still be called
+        audit_pattern = re.compile(
+            r'if\s+task_type\s+in\s+\("merge",\s*"deploy"\).*?_record_gate_event\(',
             re.DOTALL,
         )
-        assert pattern.search(source), (
-            "Expected _version_cache invalidation wrapped in try/except "
-            "inside the merge task_type block"
+        assert audit_pattern.search(source), (
+            "Expected _record_gate_event call inside merge/deploy exemption block (audit trail)"
         )

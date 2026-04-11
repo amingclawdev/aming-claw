@@ -901,18 +901,18 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                    project_id=project_id, task_id=task_id,
                    trace_id=_trace_id, chain_id=_chain_id)
 
-    # Invalidate version cache for merge tasks so version gate sees fresh HEAD
-    if task_type == "merge":
-        try:
-            from agent.governance.server import _version_cache
-            _version_cache["ts"] = 0
-            log.debug("auto_chain: invalidated _version_cache for merge task %s", task_id)
-        except Exception:
-            pass
-
-    # Pre-gate: version check — blocks on stale server or dirty workspace
-    ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
-    _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
+    # B30: merge produces a new commit advancing HEAD past chain_version; deploy updates
+    # chain_version itself.  Both are version-advancing operations that must not be blocked
+    # by the version gate (which anchors to chain_version per B29 fix). Gate remains active
+    # for pm / dev / test / qa / gatekeeper.
+    if task_type in ("merge", "deploy"):
+        ver_passed, ver_reason = True, f"version_check skipped for {task_type} (version-advancing op)"
+        log.debug("auto_chain: %s", ver_reason)
+        _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
+    else:
+        # Pre-gate: version check — blocks on stale server or dirty workspace
+        ver_passed, ver_reason = _gate_version_check(conn, project_id, result, metadata)
+        _record_gate_event(conn, project_id, task_id, "version_check", ver_passed, ver_reason, _trace_id)
 
     # R2: Single-retry for dirty workspace — wait 10s then retry once (R4: max 1 retry)
     if not ver_passed and "dirty workspace" in ver_reason:
