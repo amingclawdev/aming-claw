@@ -2,7 +2,7 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-10 (B22 fix directions B22a/B22b/B22c added)
+> Last updated: 2026-04-11 (B29 added; B25 P1.5, B27 P1)
 
 ---
 
@@ -84,7 +84,7 @@
 - **Discovered**: chain `task-1775855010-7fcf8b`，两次 test 任务均因此失败（attempts=3）。
 - **File**: PM 提示词 / `agent/governance/auto_chain.py` — PM 生成 `verification.command` 的逻辑，需拆分为独立 shell 步骤而非 `&&` 串联整体作为单条命令。
 
-### B25: chain_events 记录不完整 [OPEN] [P2]
+### B25: chain_events 记录不完整 [OPEN] [P1.5]
 
 - **Status**: Open.
 - **Symptom**: 全链路（PM→Dev→Test→QA→GK→Merge）仅产生 2 条 chain_events（`task.created` + `dev.completed`），缺失 `test.completed`、`qa.completed`、`gatekeeper.completed`、`merge.completed`、`chain.completed` 等事件。
@@ -98,12 +98,21 @@
 - **Discovered**: `governance.graph`、`governance.reconcile`、`governance.services`、`governance.doc_policy` 4 个节点，均在 chain `task-1775855010-7fcf8b` 执行窗口内更新。
 - **File**: `agent/governance/` — `node_state` 写入逻辑，`updated_by` 未正确传递调用方 task_id。
 
-### B27: Dev changed_files 元数据漏报 [OPEN] [P2]
+### B27: Dev changed_files 元数据漏报 [OPEN] [P1]
 
 - **Status**: Open.
 - **Symptom**: Dev 创建了 `docs/governance/audit-process.md` 但未将其加入 `result_json.changed_files` 声明，导致 `_gate_checkpoint` 误判该文件"未更新"并阻断链路，需 observer bypass 才能继续。
 - **Discovered**: chain `task-1775855010-7fcf8b`，dev 任务 `task-1775855091-2e761b` 和 `task-1775857046-400dca` 均漏报。
 - **File**: Dev executor 提示词 / `agent/governance/auto_chain.py` — Dev 完成后收集 `changed_files` 的逻辑，需包含新建文件。
+
+### B29: version gate 审计能力被 B19 动态 HEAD 读取削弱 [OPEN] [P1]
+
+- **Status**: Open.
+- **Symptom**: B19 将 `get_server_version()` 改为动态读取 git HEAD（30s 缓存），解决了 governance 重启后版本过时的死锁问题，但副作用是任何 git commit（包括 manual fix、Observer 文档提交、直接 push）都会被 governance 感知为合法版本，`chain_version` 也随之自动同步，绕过了 version gate"只认 workflow merge 版本"的原始设计意图。
+- **Impact**: Observer 直接 push 或 manual fix commit 后，下一条 PM 任务的 `version_check` 会以新 HEAD 为基准通过，而该 HEAD 并非经过完整 PM→Dev→Test→QA→Gatekeeper→Merge 链路审核的版本。审计追溯性削弱。
+- **Discovered**: 2026-04-11 B19 副作用分析，chain `task-1775862217-e742de` 恢复期间 Observer 手动 commit 后 chain_version 自动推进。
+- **Fix**: governance 重启时从 DB 读取 `chain_version`（上次 Deploy 成功时写入）作为版本基准，而非读 git HEAD；`chain_version` 只在 Deploy 阶段成功后更新。`get_server_version()` 仍可动态读 HEAD 用于 `health` 等信息性端点，但 version gate 的 `expected_version` 锚点改为 DB 中的 `chain_version`。
+- **File**: `agent/governance/server.py`（`get_server_version`）、`agent/governance/chain_context.py` 或专用 `chain_version` 存储表 — version gate 基准读取逻辑。
 
 ### B21: 并发 merge 竞争 [OPEN] [P2]
 
