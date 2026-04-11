@@ -374,6 +374,100 @@ class TestCheckNodesMissingVsInsufficientStatus(unittest.TestCase):
         self.assertNotIn("L1.3", reason)
 
 
+class TestCheckVerifyRequiresSatisfied(unittest.TestCase):
+    """Tests for _check_verify_requires_satisfied gate predicate (verify_requires)."""
+
+    def _make_conn(self, nodes_in_db):
+        """Create a mock connection returning verify_status for given nodes."""
+        from unittest.mock import Mock
+
+        def execute_side_effect(sql, params=None):
+            result = Mock()
+            if "verify_status" in sql:
+                node_id = params[1] if params and len(params) > 1 else None
+                if node_id in nodes_in_db:
+                    result.fetchone.return_value = {"verify_status": nodes_in_db[node_id]}
+                else:
+                    result.fetchone.return_value = None
+            else:
+                result.fetchone.return_value = None
+            return result
+
+        conn = Mock()
+        conn.execute = Mock(side_effect=execute_side_effect)
+        return conn
+
+    def test_ac2_waived_node_not_blocking(self):
+        """AC2: node with verify_status='waived' does NOT appear in blocking list."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "waived"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertTrue(satisfied, f"Expected satisfied but got blocking: {blocking}")
+        self.assertEqual(blocking, [])
+
+    def test_ac3_pending_node_blocks(self):
+        """AC3: node with verify_status='pending' appears in blocking list."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "pending"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertFalse(satisfied)
+        self.assertIn("L1.1", blocking)
+
+    def test_ac3_failed_node_blocks(self):
+        """AC3: node with verify_status='failed' appears in blocking list."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "failed"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertFalse(satisfied)
+        self.assertIn("L1.1", blocking)
+
+    def test_qa_pass_not_blocking(self):
+        """qa_pass node satisfies verify_requires."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "qa_pass"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertTrue(satisfied)
+
+    def test_t2_pass_not_blocking(self):
+        """t2_pass node satisfies verify_requires."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "t2_pass"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertTrue(satisfied)
+
+    def test_testing_node_blocks(self):
+        """testing node does NOT satisfy verify_requires."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "testing"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertFalse(satisfied)
+        self.assertIn("L1.1", blocking)
+
+    def test_missing_node_blocks(self):
+        """Node not in DB is treated as blocking."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1"])
+        self.assertFalse(satisfied)
+        self.assertIn("L1.1", blocking)
+
+    def test_empty_verify_requires_satisfied(self):
+        """Empty verify_requires list is always satisfied."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", [])
+        self.assertTrue(satisfied)
+
+    def test_mixed_statuses(self):
+        """Mix of waived (pass) and pending (block) — only pending blocks."""
+        from governance.auto_chain import _check_verify_requires_satisfied
+        conn = self._make_conn({"L1.1": "waived", "L1.2": "pending"})
+        satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", ["L1.1", "L1.2"])
+        self.assertFalse(satisfied)
+        self.assertNotIn("L1.1", blocking)
+        self.assertIn("L1.2", blocking)
+
+
 if __name__ == "__main__":
     unittest.main()
 
