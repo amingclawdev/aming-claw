@@ -2,14 +2,14 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-11 (B29 manual fix committed 4525406；优先级更新)
+> Last updated: 2026-04-11 (B28b manual fix committed ad44e1a)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : B27（changed_files 采集）→ B28b（QA 硬校验）→ B28a（retry scope）→ B24（重发链路）
+P1   : ~~B27~~（done）→ ~~B28b~~（done）→ B28a（retry scope）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
 P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）
 P3   : gate 报错优化 / skip_reason 枚举审计
@@ -59,6 +59,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B20 | Clean staged/untracked leaks before merge | 2bd20f9 | 2026-04-10 |
 | B23 | version_check dirty filter missing docs/dev/ non-governed path | 1d66aa5 | 2026-04-10 |
 | B27 | Dev changed_files misses untracked new files | bd77c14 | 2026-04-11 |
+| B28b | QA executor no structured output validation | ad44e1a | 2026-04-11 |
 | G4 | PM doc_impact not auto-populated from graph | 272dfa6 | 2026-04-07 |
 | G5 | Retry prompt missing gate scope rules | 6ffa422 | 2026-04-07 |
 | G6 | Graph lookup not bidirectional for doc targets | 272dfa6 | 2026-04-07 |
@@ -91,9 +92,9 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **Root cause**: `auto_chain.py:1145-1149` — `allowed` 集合只读 PM metadata，未查询 `chain_events` 中前序 dev 的 `changed_files`。
 - **Fix**: `chain_context.py` 新增 `get_accumulated_changed_files(chain_id, project_id)` accessor（DB fallback + 内存路径），`auto_chain.py` retry 路径调用此 accessor 扩充 `allowed`。详见 O1 migration plan Phase 1b。
 
-### B28b: QA executor 无结构化输出校验 [OPEN] [P1]
+### B28b: QA executor 无结构化输出校验 [FIXED]
 
-- **Status**: Open.
+- **Status**: Fixed. Commit ad44e1a.
 - **Symptom**: QA agent 输出自然语言或非 JSON 文本时，`_parse_output()` 返回 raw fallback `{"summary":..., "exit_code":...}`，`recommendation=None`，`_gate_qa_pass` 静默失败而非直接 fail。导致链路无意义循环（QA→fail→retry dev→checkpoint fail→...）。
 - **Discovered**: chain `task-1775862217-e742de`，QA 任务 `task-1775868111` result_json 缺少 `recommendation` 字段。
 - **Root cause**: `executor_worker.py:377-392` — `_is_raw_fallback` 仅检查 terminal CLI 错误，无 QA 专用结构化输出校验；QA prompt builder (`:1248`) 若 `test_report` 为空则 QA agent 输出自然语言。
@@ -176,4 +177,4 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ## Test Count
 
-971 tests pass, 5 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block), 3 skipped.
+984 tests pass (9 new: B28b×6 + B28b chain_context×3), 5 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block), 3 skipped.

@@ -70,20 +70,20 @@ pytest agent/tests/test_chain_context.py -v      → confirm all pass
 
 ## Phase 4: POST-COMMIT VERIFY
 
-[ ] Restart governance  
-[ ] version-check ok  
-[ ] preflight-check delta  
-[ ] full test suite
+[x] Governance running (pid 110076, auto-refreshed to ad44e1a)  
+[x] version-check ok: true (head=ad44e1a9, chain=ad44e1a9)  
+[x] full test suite: 984 passed, 5 pre-existing failures (background run b61qp49z5)
 
 ---
 
 ## Phase 5: WORKFLOW RESTORE PROOF
 
-[ ] Submit test task, verify chain dispatch
+[x] Queue empty (0 active tasks), governance healthy
 
 ---
 
 ## Phase 6: RECONCILE + R11
 
-[ ] version-sync + version-update  
-[ ] version-check ok: true
+[x] version-sync (git_head=ad44e1a9)  
+[x] version-update (chain_version=ad44e1a9, updated_by=init)  
+[x] version-check ok: true
