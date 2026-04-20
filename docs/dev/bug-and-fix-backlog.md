@@ -76,7 +76,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | 42258ee | 2026-04-20 |
 | B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | 0d4689c | 2026-04-20 |
 | B35 | _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked | 651626c + a01ad54 | 2026-04-20 |
-| B36 | Retry prompt SCOPE CONSTRAINT wider than gate enforces — dev ping-pong | (OPEN) | 2026-04-20 |
+| B36 | Retry prompt SCOPE CONSTRAINT wider than gate enforces — dev ping-pong | 1748485 | 2026-04-20 |
 | B37 | Governance graph incomplete for MF-2026-04-20-001 affected nodes (related_docs empty, agent.deploy orphan_pending, reconcile.py unmapped) | (OPEN) | 2026-04-20 |
 | B38 | observer.md missing "Scheduled Health Audit & Backlog Maintenance" flow section | (OPEN) | 2026-04-20 |
 | B39 | Backlog-driven scheduled execution — cron reads chain-trigger blocks from backlog and creates PM tasks | (OPEN) | 2026-04-20 |
@@ -243,19 +243,23 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **Lesson**: When correcting a false doc claim, do not introduce a replacement claim that hasn't been verified against code. This is a governance surface requiring a dry-run convention for doc-rewriting commits.
 - **Fix**: Already fixed in-repo; auto-memory correction is a separate out-of-repo operation (not a governance-tracked file).
 
-### B36: Retry prompt SCOPE CONSTRAINT wider than `_gate_checkpoint` enforces — dev ping-pong [OPEN] [P2]
+### B36: Retry prompt SCOPE CONSTRAINT wider than `_gate_checkpoint` enforces — dev ping-pong [FIXED] [P2]
 
 <!-- chain-trigger:
-status: OPEN
+status: FIXED
 needs_chain: false
 priority: P2
 bug_id: B36
-target_files: []
-test_files: []
-acceptance_criteria: []
+target_files: ["agent/governance/auto_chain.py"]
+test_files: ["agent/tests/test_checkpoint_gate.py"]
+acceptance_criteria:
+  - "AC1: Retry prompt and _gate_checkpoint share a single _compute_gate_static_allowed helper"
+  - "AC2: _scan_dependent_tests finds test files that import any target_file's module (1st-order)"
+  - "AC3: Gate inherits accumulated_changed_files on retry (parent_task_id set)"
+  - "AC4: Scope_line describes stem-prefix pattern explicitly instead of omitting it"
 chain_task_id: ""
-commit: ""
-note: "Design decision pending; do not auto-dispatch until fix approach chosen (gate-side vs prompt-side)."
+commit: "1748485"
+note: "Manual fix via SOP. Option (b)+(4): prompt/gate unified + 1st-order import scan. Transitive cases like B34 still uncaught — future PM-side hardening needed."
 -->
 
 - **Discovered**: 2026-04-20, immediately after B35 fix restored auto-chain dispatch. B34 chain `task-1776663975-34443e` retried Dev 3 times (01:56 / 02:02 / 02:08) ping-ponging on `agent/tests/test_executor_output_parsing.py`. Chain archived at 02:08:52.
