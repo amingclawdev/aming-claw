@@ -1909,9 +1909,9 @@ L4.28  Chain Robustness Fixes  [impl:done] [verify:pending] v4.2
       test_coverage: partial
       primary:[agent/governance/auto_chain.py, agent/governance/task_registry.py, agent/governance/db.py]
       secondary:[]
-      test:[agent/tests/test_governance_db.py]
+      test:[agent/tests/test_governance_db.py, agent/tests/test_checkpoint_gate.py]
       verify_level: 2
-      description: Three fixes — (1) pitfall memory dedup in _write_chain_memory prevents identical entries; (2) failed task auto-retry respects observer_mode (goes to observer_hold instead of queued); (3) DB migration v10 adds session_context table for coordinator session-level logging.
+      description: Chain robustness fixes — (1) pitfall memory dedup in _write_chain_memory prevents identical entries; (2) failed task auto-retry respects observer_mode (goes to observer_hold instead of queued); (3) DB migration v10 adds session_context table for coordinator session-level logging; (4) B36 — unify retry-prompt/gate allowed scope via _compute_gate_static_allowed helper + _scan_dependent_tests for 1st-order import discovery, prevents dev ping-pong on unrelated-file block; (5) B8/G4/G6 checkpoint gate: docs/dev exempt from unrelated-file blocking, doc_impact auto-populated from graph, bidirectional code↔doc lookup.
 
 L4.29  Coordinator Output Gate + Retry  [impl:done] [verify:pending] v4.2
       deps:[L4.25]
