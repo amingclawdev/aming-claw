@@ -93,8 +93,9 @@ These are architecture improvements, not bugs. System works correctly without th
 ## Starting a New Session
 
 1. Check `curl http://localhost:40000/api/health` — governance running?
-2. Check ServiceManager executor — `tail shared-volume/codex-tasks/logs/service-manager-executor-*.err.log`
-3. If either down: start governance (`python -m agent.governance.server &`), then start ServiceManager (see executor startup in session notes)
-4. Run `preflight_check` via MCP — should return `ok: true`
-5. Create PM task — chain runs autonomously from there
-6. Observer mode OFF by default — only enable if you need to inspect/hold tasks
+2. Check ServiceManager singleton — port 39103 should be bound (run `.\scripts\_check-status.ps1` or `netstat -ano | findstr :39103`). If no process owns port 39103, the executor is orphan/unsupervised even if its PID exists.
+3. Tail executor log — `tail shared-volume/codex-tasks/logs/service-manager-executor-*.err.log`
+4. If anything down: use the one-click launcher `.\start.ps1`, or start manually in order — (a) `python -m agent.governance.server --port 40000`, then (b) `.\scripts\start-manager.ps1 -Takeover` (which launches `agent/service_manager.py` and supervises `executor_worker`). The MCP server in `.mcp.json` uses `--workers 0` and does NOT start either service.
+5. Run `preflight_check` via MCP — should return `ok: true`
+6. Create PM task — chain runs autonomously from there
+7. Observer mode OFF by default — only enable if you need to inspect/hold tasks

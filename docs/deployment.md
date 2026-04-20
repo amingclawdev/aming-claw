@@ -1,7 +1,7 @@
 # Aming Claw — Deployment Guide
 
 > **Canonical deployment document** — Host-based deployment for development and production.
-> Last updated: 2026-04-05 | Phase 2 Documentation Consolidation
+> Last updated: 2026-04-20 | Correct MCP startup behavior (`--workers 0` does NOT auto-start executor)
 
 ## 1. Prerequisites
 
@@ -45,14 +45,14 @@ Optional Docker Dependencies
 
 ## 3. MCP Configuration (`.mcp.json`)
 
-The MCP server auto-starts the governance service and executor worker when a Claude Code session opens.
+The MCP server exposes the governance tools to Claude Code. It is configured with `--workers 0`, which means **the MCP server does NOT start the executor worker or the governance service**. Both must be started separately (see §4 and §5).
 
 ```json
 {
   "mcpServers": {
     "aming-claw": {
       "command": "python",
-      "args": ["agent/mcp_server.py"],
+      "args": ["-m", "agent.mcp", "--workers", "0"],
       "env": {
         "GOV_PROJECT_ID": "aming-claw",
         "MEMORY_BACKEND": "local"
@@ -62,22 +62,24 @@ The MCP server auto-starts the governance service and executor worker when a Cla
 }
 ```
 
-Place this file in the project root. Claude Code reads it automatically on session start.
+Place this file in the project root. Claude Code reads it automatically on session start, but it only wires up the MCP tools — process supervision is separate.
 
 ## 4. Governance Service Startup
 
-### Option A: Via MCP (Recommended)
+The governance service is a prerequisite for everything else (MCP, executor, gateway). Start it first.
 
-The MCP server starts the governance service automatically. No manual action needed — just open a Claude Code session.
+### Option A: One-click launcher (Recommended, Windows)
 
-### Option B: Manual Start
+```powershell
+# Starts governance + ServiceManager + Docker services in the correct order
+.\start.ps1
+```
+
+### Option B: Direct start
 
 ```bash
-# Start governance service directly
-python agent/governance/server.py --port 40000
-
-# Or via PowerShell script (Windows)
-.\scripts\start-governance.ps1
+# Start governance service directly on the host (not Docker)
+python -m agent.governance.server --port 40000
 ```
 
 ### Health Check
@@ -89,13 +91,30 @@ curl http://localhost:40000/api/health
 
 ## 5. Executor Lifecycle
 
-The executor worker is managed by the ServiceManager:
+The executor worker **must be launched under ServiceManager supervision**. The MCP server will NOT start it (because `.mcp.json` uses `--workers 0`). Orphan executors started by any other means have no crash recovery and no deploy-signal handling.
 
-1. **Auto-start** — MCP server starts ServiceManager, which starts executor worker
+### Starting ServiceManager (required)
+
+```powershell
+# Windows — acquires the singleton lock on port 39103 and supervises executor_worker
+.\scripts\start-manager.ps1 -Takeover
+```
+
+```bash
+# Cross-platform — equivalent direct invocation
+python -m agent.service_manager
+```
+
+Verify with `.\scripts\_check-status.ps1` — port 39103 must be bound by ServiceManager for the executor to be considered supervised.
+
+### Supervision behavior
+
+1. **Singleton lock** — ServiceManager holds port 39103; a second invocation without `-Takeover` exits immediately
 2. **Monitor** — ServiceManager checks executor health every 10s
 3. **Auto-restart** — If executor crashes, ServiceManager restarts it
 4. **Circuit breaker** — 5 restarts within 300s triggers OPEN state (stops restart attempts)
 5. **Crash recovery** — On startup, executor requeues orphaned claimed tasks
+6. **Deploy signal** — ServiceManager consumes `manager_signal.json` written by the Merge stage, which is how auto-chain restarts the executor after a deploy
 
 ### Manual Executor Control
 
@@ -111,9 +130,11 @@ The executor worker is managed by the ServiceManager:
 ### Session Exit
 
 When the Claude Code session ends:
-- MCP server shuts down
-- ServiceManager stops executor worker
-- Governance service continues running (if started separately)
+- MCP server shuts down (Claude Code child process exits)
+- **ServiceManager and executor continue running** — they are independent host processes, not children of the MCP server
+- Governance service also continues running
+
+To stop the full stack, either use `start.ps1` teardown (if it exposes one) or kill ServiceManager (which stops the supervised executor) and the governance process explicitly.
 
 ## 6. Telegram Gateway
 
@@ -232,14 +253,23 @@ merge task → cherry-pick to main → worktree cleaned up
 
 ### After Host Reboot
 
+```powershell
+# Option A (recommended): one-click launcher brings everything up in order
+.\start.ps1
+```
+
 ```bash
+# Option B: manual, step-by-step
 # 1. Start Docker services
 docker compose -f docker-compose.governance.yml up -d
 
-# 2. Start governance
-python agent/governance/server.py --port 40000
+# 2. Start governance (host, port 40000)
+python -m agent.governance.server --port 40000
 
-# 3. Open Claude Code session (auto-starts executor via MCP)
+# 3. Start ServiceManager (supervises executor)
+python -m agent.service_manager   # or: .\scripts\start-manager.ps1 -Takeover
+
+# 4. Open Claude Code session — MCP tools attach to the already-running services
 ```
 
 ### After Crash

@@ -139,7 +139,7 @@ defines `project_id: aming-claw`.
 
 Key differences from external project onboarding:
 - The governance server runs on the host (port 40000), not in Docker
-- MCP server auto-starts the executor via ServiceManager
+- The executor worker runs on the host under `agent/service_manager.py` supervision — **start it explicitly** via `.\scripts\start-manager.ps1 -Takeover` or `python -m agent.service_manager`. The MCP server does NOT start it (`.mcp.json` uses `--workers 0`). See [docs/deployment.md §5](deployment.md) for full details.
 - Role configs are in `config/roles/default/`
 - All code changes go through the auto-chain: PM → Dev → Test → QA → Gatekeeper → Merge
 
