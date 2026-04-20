@@ -2,17 +2,17 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-20 (B33/B36 → FIXED; B32 + B40 chain-trigger blocks fleshed out with full AC)
+> Last updated: 2026-04-20 (B41 P1 + B42 P3 added from B39 canary postmortem; B39 needs_chain→false pending B41)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : B40（version-update 无调用方认证）→ ~~B31~~（done）→ ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
+P1   : B41（Windows executor grep 缺失阻 Test 阶段）→ B40（version-update 无调用方认证）→ ~~B31~~（done）→ ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
 P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）→ B32（version-update updated_by 白名单 SOP 不一致）→ ~~B33~~（done）→ ~~B36~~（done）
-P3   : gate 报错优化 / skip_reason 枚举审计
+P3   : B42（Max OAuth 登录会话失效观测）→ gate 报错优化 / skip_reason 枚举审计
 ```
 
 ---
@@ -355,12 +355,18 @@ note: "Paused during dry-run phase. Enable after B39 architecture stabilized and
 
 <!-- chain-trigger:
 status: OPEN
-needs_chain: true
+needs_chain: false
 priority: P2
 bug_id: B39
 target_files: []
 test_files: []
 live_trigger_test: true
+canary_history:
+  - {run: 1, task_id: "task-1776706259-f12a35", outcome: "failed — 3x 401 (stale login session)"}
+  - {run: 2, task_id: "task-1776708235-bb671c", outcome: "failed — 3x 401 (stale login session)"}
+  - {run: 3, task_id: "task-1776715141-099cd1", outcome: "PM succeeded 12s after SM restart"}
+  - {run: 3-dev, task_id: "task-1776715335-ff7b98", outcome: "Dev succeeded 12s, worktree + backlog edit staged"}
+  - {run: 3-test, task_id: "task-1776715512-1f4092", outcome: "Test failed 3x — grep unavailable on Windows (B41)"}
 acceptance_criteria:
   - "AC1: Machine-parseable <!-- chain-trigger: ... --> YAML block format defined and documented in docs/dev/bug-and-fix-backlog.md (schema section)"
   - "AC2: State machine documented: OPEN → IN_CHAIN → (FIXED | BLOCKED). BLOCKED → OPEN requires interactive reset."
@@ -369,7 +375,7 @@ acceptance_criteria:
   - "AC5: Dry-run mode: cron logs 'would create PM for <bug_id>' without actually calling task_create, until dry-run phase ends."
 chain_task_id: ""
 commit: ""
-note: "Feature/architecture proposal. Not runnable until AC1 schema is written and dry-run validates parser correctness."
+note: "needs_chain flipped back to false 2026-04-20 after canary #3 proved PM→Dev works post-SM-restart but Test stage blocks on B41 (Windows grep). Re-flip to true only after B41 FIXED. Canary history preserved for audit."
 -->
 
 - **Discovered / Proposed**: 2026-04-20 conversation.
@@ -424,6 +430,66 @@ note: "AC drafted 2026-04-20 (observer). Recommended combo: AC1 (gap 3 close, lo
   - Recommended combo: **(b) + (c)**. (a) is risky because it breaks cron writeback without a replacement path.
 - **Related**: B26 (updated_by审计), B32 (SOP allowlist不一致). All three converge on "version-update endpoint auth model is under-specified". Consider bundled fix once design chosen.
 - **Test coverage gap**: no test asserts "external curl with fabricated task_id rejected" or "non-merge task_id rejected for updated_by=merge-service". Would live in `agent/tests/test_version_update_auth.py` (new file).
+
+### B41: Executor verification commands use Unix `grep` on Windows cmd.exe — Test stage blocks all doc-only chains [OPEN] [P1]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P1
+bug_id: B41
+target_files: ["agent/executor_worker.py", "agent/role_prompts.py"]
+test_files: ["agent/tests/test_verification_command_cross_platform.py"]
+acceptance_criteria:
+  - "AC1: PM role prompt instructs PRD authors to write cross-platform verification commands (python -c / pytest-based / PS-compatible) and explicitly forbids bare `grep`/`sed`/`awk` on the target_platform=windows path."
+  - "AC2: Test executor detects Unix-only commands in verification.command (grep/sed/awk/find prefix patterns) and either (a) auto-rewrites to python equivalent OR (b) fails fast with actionable error naming B41 instead of producing inscrutable cmd.exe output."
+  - "AC3: New regression test_verification_command_cross_platform.py covers: (i) `grep -n 'pattern' file.md` rejected or rewritten; (ii) `python -c \"...\"` passes through; (iii) pytest command passes through."
+  - "AC4: Existing PM regeneration paths (retry_context) updated to re-prompt with cross-platform guidance when previous test stage failed with 'is not recognized as an internal or external command'."
+chain_task_id: ""
+commit: ""
+note: "Surfaced by B39 canary run #3 (task-1776715512-1f4092): PM's PRD verification.command used `grep -n 'B40' docs/dev/bug-and-fix-backlog.md`; Windows test executor shelled to cmd.exe, which does not have grep. Test failed 3x with exit code 1 stderr='grep is not recognized'. Blocks every doc-only chain until fixed. Keep needs_chain=false until cross-platform policy agreed; then flip to true."
+-->
+
+- **Discovered**: 2026-04-20, during B39 canary run #3.
+- **Symptom**: `test` stage fails with `"'grep' is not recognized as an internal or external command, operable program or batch file."` stderr, exit code 1, passed=0, failed=1. Root cause is not the code under test — it is the `verification.command` field PM produced.
+- **Evidence** (`shared-volume/codex-tasks/logs/complete-task-1776715512-1f4092.txt`):
+  - `status: failed, complete_time: 2.1s, result_keys: ['test_report', 'changed_files', '_worktree', '_branch', 'error']`
+  - test_report.stderr: `"'grep' is not recognized as an internal or external command,\noperable program or batch file."`
+  - PM's PRD (`output-pm-1776715151-c63c7a.txt`) verification.command: `grep -n 'B40' docs/dev/bug-and-fix-backlog.md`.
+- **Scope / blast radius**: EVERY doc-only chain (bug filings, architecture docs, backlog edits) is blocked at Test stage because PM naturally reaches for `grep` as the shortest verification. B39's whole dry-run→live canary cycle cannot complete until this is fixed.
+- **Fix axes** (pick one or combine):
+  - **PM-side (prevention)**: role_prompts.py PM prompt adds explicit "Windows executor: use `python -c`, `pytest`, or `Select-String` in verification.command. Do not use grep/sed/awk/find." Cheap, but relies on PM discipline.
+  - **Executor-side (enforcement)**: executor_worker.py pre-scans verification.command; if it starts with `grep|sed|awk|find |tail |head ` and platform==windows, either auto-translate (`grep -n pattern file` → `python -c "import re,sys; ..."`) or fail with a B41-named actionable error.
+  - **Cross-platform shim**: ship a `scripts/grep-shim.ps1` on PATH for executor sessions that wraps Select-String. Least invasive but hides the portability problem.
+- **Recommended combo**: AC1 (PM prompt) + AC2 (executor fail-fast with auto-rewrite for grep-only case) + AC3 (test).
+- **Related**: B39 (canary blocked), B40 (auth gaps — shares `verification.command` surface area).
+- **Governance**: `agent/executor_worker.py` → node `executor.runtime`; `agent/role_prompts.py` → node `executor.prompts`. Both verify_level=4, gate=auto.
+
+### B42: Claude Max OAuth token binds to login session — stale ServiceManager chain returns 401 after re-login [OPEN] [P3]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P3
+bug_id: B42
+target_files: ["agent/service_manager.py", "scripts/start-manager.ps1"]
+test_files: []
+acceptance_criteria:
+  - "AC1: docs/governance/manual-fix-sop.md adds §15 'OAuth re-auth playbook': when executor tasks fail with 401 authentication_error, restart ServiceManager (.\\scripts\\start-manager.ps1 -Takeover) from a shell where `claude` (interactive) has authenticated successfully. Document the login-session binding phenomenon."
+  - "AC2: ServiceManager startup logs a one-line banner 'OAuth session bound at PID <ppid> ctime=<ts>' so operators can correlate auth failures with stale-session age."
+  - "AC3 (optional, deferred): executor detects 3x consecutive 401 in _build_claude_command runs → surfaces a single actionable warning log ('B42: possible stale OAuth session, restart ServiceManager') instead of silently failing tasks one by one."
+chain_task_id: ""
+commit: ""
+note: "Observational only — not a code bug, a Windows DPAPI/login-session artifact. File to avoid re-diagnosing next time executor hits 401 wall. Fix is documentation + operator-facing log, not behavior change."
+-->
+
+- **Discovered**: 2026-04-20, during B39 canary runs #1 and #2 (task-1776706259-f12a35 and task-1776708235-bb671c), both failed with 3x 401 `{"type":"authentication_error","message":"Invalid authentication credentials"}`. Run #3 succeeded immediately after `.\scripts\start-manager.ps1 -Takeover`.
+- **Hypothesis**: Windows DPAPI binds OAuth token decryption to the login session that wrote it. `~/.claude/.credentials.json` is DPAPI-encrypted. ServiceManager process tree (≥13h old, predating the day's `claude` interactive re-auth) inherited a session context that could no longer decrypt the refreshed token. Restarting ServiceManager from the current authenticated shell re-inherits the valid session.
+- **Why this matters**: The 401 does NOT look like a stale-session issue — it looks like bad credentials. Without B42 filed, next operator will re-login, test interactive `claude -p` (which works because spawned from current shell), and be confused why executor still fails. Documentation prevents ~30min of re-diagnosis.
+- **Not in scope**: making token refresh process-agnostic (Anthropic CLI concern), or detecting stale sessions reliably (would require DPAPI-aware probe).
+- **Workaround / operator SOP**: if executor PM/Dev tasks start failing with 401 en masse, run `.\scripts\start-manager.ps1 -Takeover` from a shell where `claude` interactive works. Do NOT re-run `claude /login` expecting executor to pick it up — ServiceManager must restart.
+- **Related**: B39 canary (provided the evidence); `project_service_lifecycle.md` (ServiceManager lifecycle doc).
+- **Governance**: `agent/service_manager.py`, `scripts/start-manager.ps1`, `docs/governance/manual-fix-sop.md` all at `governance.reconcile` (verify_level=4). AC1 is doc-only; AC2 is a single log line. Low blast radius.
 
 ---
 
