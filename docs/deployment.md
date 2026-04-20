@@ -105,11 +105,11 @@ The executor worker **must be launched under ServiceManager supervision**. The M
 python -m agent.service_manager
 ```
 
-Verify with `.\scripts\_check-status.ps1` — port 39103 must be bound by ServiceManager for the executor to be considered supervised.
+Verify with `tasklist /v /fi "imagename eq python.exe" | findstr service_manager` (Windows) or `pgrep -fa service_manager.py` (Unix). The executor is only properly supervised if its parent process is `agent/service_manager.py`.
 
 ### Supervision behavior
 
-1. **Singleton lock** — ServiceManager holds port 39103; a second invocation without `-Takeover` exits immediately
+1. **Singleton lock** — `start-manager.ps1` uses a named Windows mutex (`Global\aming_claw_manager`); a second launcher run without `-Takeover` exits. `agent/service_manager.py` itself does not bind a port, so verify supervision by process tree (see check above), not by checking any listener
 2. **Monitor** — ServiceManager checks executor health every 10s
 3. **Auto-restart** — If executor crashes, ServiceManager restarts it
 4. **Circuit breaker** — 5 restarts within 300s triggers OPEN state (stops restart attempts)

@@ -93,7 +93,7 @@ These are architecture improvements, not bugs. System works correctly without th
 ## Starting a New Session
 
 1. Check `curl http://localhost:40000/api/health` — governance running?
-2. Check ServiceManager singleton — port 39103 should be bound (run `.\scripts\_check-status.ps1` or `netstat -ano | findstr :39103`). If no process owns port 39103, the executor is orphan/unsupervised even if its PID exists.
+2. Check ServiceManager is supervising executor — `tasklist /v /fi "imagename eq python.exe" | findstr service_manager` (Windows) must show a running `agent/service_manager.py` process, and the `executor_worker.py` process's parent PID must match it. ServiceManager does NOT bind a TCP port, so supervision verification is by process tree, not netstat.
 3. Tail executor log — `tail shared-volume/codex-tasks/logs/service-manager-executor-*.err.log`
 4. If anything down: use the one-click launcher `.\start.ps1`, or start manually in order — (a) `python -m agent.governance.server --port 40000`, then (b) `.\scripts\start-manager.ps1 -Takeover` (which launches `agent/service_manager.py` and supervises `executor_worker`). The MCP server in `.mcp.json` uses `--workers 0` and does NOT start either service.
 5. Run `preflight_check` via MCP — should return `ok: true`

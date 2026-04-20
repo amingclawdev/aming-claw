@@ -2,16 +2,16 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-11 (B30 manual fix committed e3145f1; all P1 bugs fixed)
+> Last updated: 2026-04-20 (B31/B32/B33 filed — MF-2026-04-20-001 follow-ups)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
+P1   : B31（worktree submodule 脏过滤）→ ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
-P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）
+P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）→ B32（version-update updated_by 白名单 SOP 不一致）→ B33（docs 错误引用 port 39103）
 P3   : gate 报错优化 / skip_reason 枚举审计
 ```
 
@@ -174,6 +174,34 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 - `docs/roles/*.md` (coordinator, dev, qa, pm) — minor behavioral notes from B10/B12.
 - Low priority — core docs (auto-chain.md, executor-api.md, tester.md, manual-fix-sop.md) are current.
+
+### B31: Version gate dirty filter missing `.claude/worktrees/*` submodule refs [OPEN] [P1]
+
+- **Discovered**: 2026-04-20, MF-2026-04-20-001 follow-up. PM task `task-1776658117-adffde` succeeded but auto-chain silently failed to dispatch Dev — same pattern as Bug 7 / B15 / D5 / B23.
+- **Symptom**: `mcp__aming-claw__version_check` returns `dirty=true` with `dirty_files: [".claude/worktrees/compassionate-tu", ".claude/worktrees/happy-ardinghelli", ".claude/worktrees/zen-mendeleev"]`. Each of those paths is a git submodule (mode 160000) left behind by dev worktrees. They can never be cleaned while dev worktrees are in use.
+- **Impact**: Auto-chain dispatch path that reads this filtered output silently blocks next-stage task creation. Recurrence of B15/D5/B23 under a new path.
+- **Asymmetry to investigate**: `POST /api/version-sync/{project_id}` DOES filter these (`dirty_files: []` after sync), but `mcp__aming-claw__version_check` does NOT. Two code paths disagree — must be unified.
+- **Fix**: Extend the D5 `_DIRTY_IGNORE` list (or equivalent) to exclude `.claude/worktrees/**` in BOTH paths. Add regression test covering submodule mode 160000 refs.
+- **Fix files (estimate)**: `agent/governance/auto_chain.py` (or the module holding `_DIRTY_IGNORE`), `agent/governance/server.py` (version_check endpoint if separate), `agent/tests/test_version_gate_round4.py` or a new test file.
+- **Test**: `pytest agent/tests/ -k "dirty_filter or version_gate"` should cover new case where dirty_files includes worktree submodule paths.
+
+### B32: `version-update` API `updated_by` allowlist doesn't match SOP R11 prescription [OPEN] [P2]
+
+- **Discovered**: 2026-04-20, MF-2026-04-20-001. Manual fix attempted to call `POST /api/version-update/aming-claw` with `updated_by="manual-fix-2026-04-20-docs-mcp-startup"` per `docs/governance/manual-fix-sop.md` R11 guidance. Server rejected with `INVALID_UPDATED_BY`.
+- **Symptom**: [agent/governance/server.py:2015](../../agent/governance/server.py) whitelists only `{"auto-chain", "init", "register", "merge-service"}`. SOP R11 format `manual-fix-<slug>` is rejected.
+- **Impact**: Every manual fix must invent a workaround. Current workaround: use `updated_by="merge-service"` with `task_id` set to the originating PM task. This muddles the audit trail because "merge-service" implies a real merge stage, not a manual fix.
+- **Fix options (pick one)**:
+  - **A (preferred)**: Widen allowlist to accept prefix `manual-fix` with an additional audit record that includes `manual_fix_reason` field. Keeps SOP R11 as-written.
+  - **B**: Update SOP R11 to document `merge-service` + `task_id` as the canonical manual-fix path (and rename the concept in-SOP). Lower code change, but SOP bends to impl.
+- **Fix files**: `agent/governance/server.py:2015` (allowlist), optional `agent/governance/audit_service.py` (new audit field), or `docs/governance/manual-fix-sop.md` §13 R11 if option B.
+
+### B33: Self-introduced docs claim about port 39103 (non-existent supervisor port) [OPEN] [P2]
+
+- **Discovered**: 2026-04-20, immediately after commit `1bed264`. Editing docs to replace the old false "MCP auto-starts executor" claim, I introduced a NEW false claim that ServiceManager supervision can be verified by checking port 39103. `agent/service_manager.py` does not bind any TCP port — singleton protection is done via the `start-manager.ps1` launcher using a named Windows mutex (`Global\aming_claw_manager`).
+- **Partial fix in-flight**: Corrected in commit following MF-2026-04-20-001 R8 loop — `docs/deployment.md` §5 and `docs/dev/session-status.md` "Starting a New Session" now describe process-tree verification (tasklist/pgrep for `service_manager.py`) instead of port check.
+- **Remaining risk**: The out-of-repo auto-memory `project_service_lifecycle.md` (under `~/.claude/projects/.../memory/`) also contained the port 39103 claim. Needs same correction.
+- **Lesson**: When correcting a false doc claim, do not introduce a replacement claim that hasn't been verified against code. This is a governance surface requiring a dry-run convention for doc-rewriting commits.
+- **Fix**: Already fixed in-repo; auto-memory correction is a separate out-of-repo operation (not a governance-tracked file).
 
 ---
 
