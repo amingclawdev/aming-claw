@@ -509,6 +509,113 @@ def _extract_test_files_from_verification(verification):
     return list(dict.fromkeys(_TEST_FILE_PATTERN.findall(command)))
 
 
+# B36-fix(4): Project root for dependent-test scan.
+# This mirrors agent/governance/role_config.py's derivation (parents[2] of this file).
+_PROJECT_ROOT_FOR_SCAN = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+# Regex for import lines: captures module path after `from <x> import` or `import <x>`.
+_IMPORT_RE = re.compile(r"^\s*(?:from\s+(\S+)\s+import|import\s+(\S+))", re.MULTILINE)
+
+# Cache: (target_tuple) -> set of dependent test file paths. Cleared per-gate evaluation
+# is unnecessary since imports don't change within a gate check; scope is process-wide.
+_DEPENDENT_TESTS_CACHE: "dict[tuple, set[str]]" = {}
+
+
+def _scan_dependent_tests(target_files):
+    """B36-fix(4): Find test files that import any target file's module.
+
+    For each target like 'agent/role_permissions.py', derive the stem
+    ('role_permissions') and scan all tests/**/*.py for import lines referencing
+    a module whose dotted path contains that stem as a component. Returns a set
+    of POSIX-normalized relative paths (e.g. 'agent/tests/test_x.py').
+
+    Safe: on any IO error returns empty set. Bounded: reads only first 16KB of
+    each test file (imports are at top).
+    """
+    if not target_files:
+        return set()
+    stems = set()
+    for tf in target_files:
+        base = os.path.basename(tf.replace("\\", "/"))
+        stem, ext = os.path.splitext(base)
+        if ext != ".py" or not stem or stem == "__init__":
+            continue
+        stems.add(stem)
+    if not stems:
+        return set()
+
+    key = tuple(sorted(stems))
+    cached = _DEPENDENT_TESTS_CACHE.get(key)
+    if cached is not None:
+        return set(cached)
+
+    dependent = set()
+    root = _PROJECT_ROOT_FOR_SCAN
+    if not os.path.isdir(root):
+        _DEPENDENT_TESTS_CACHE[key] = set()
+        return set()
+
+    for dirpath, _dirnames, filenames in os.walk(root):
+        # Only look under directories named 'tests'
+        posix_dir = dirpath.replace("\\", "/")
+        if "/tests" not in posix_dir and not posix_dir.endswith("tests"):
+            continue
+        # Skip vendored/third-party trees AND worktree mirrors.
+        # Worktree mirrors live under .worktrees/ (top-level) or .claude/worktrees/.
+        # They contain duplicate test files that pollute the scan result.
+        if ("/.venv/" in posix_dir or "/node_modules/" in posix_dir
+                or "/.claude/" in posix_dir or "/.worktrees/" in posix_dir):
+            continue
+        for fn in filenames:
+            if not fn.startswith("test_") or not fn.endswith(".py"):
+                continue
+            abs_p = os.path.join(dirpath, fn)
+            try:
+                with open(abs_p, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(16384)
+            except Exception:
+                continue
+            for m in _IMPORT_RE.finditer(content):
+                module = m.group(1) or m.group(2)
+                if not module:
+                    continue
+                parts = module.split(".")
+                if stems & set(parts):
+                    rel = os.path.relpath(abs_p, root).replace("\\", "/")
+                    dependent.add(rel)
+                    break
+
+    _DEPENDENT_TESTS_CACHE[key] = set(dependent)
+    return dependent
+
+
+def _compute_gate_static_allowed(project_id, metadata):
+    """B36-fix(2): Single source of truth for gate's static allowed file set.
+
+    Called by both _gate_checkpoint AND the retry-prompt scope_line builder so
+    they cannot drift apart. Returns (target_set, allowed_set).
+
+    NOT included here (must be added by caller as applicable):
+      - stem-prefix dynamic tests (match against incoming changed files)
+      - accumulated_changed_files from prior succeeded dev stages (retry only)
+    """
+    target = set(metadata.get("target_files", []) or [])
+    allowed = set(target)
+    allowed.update(metadata.get("test_files", []) or [])
+    allowed.update(_extract_test_files_from_verification(metadata.get("verification", {})))
+    doc_impact = metadata.get("doc_impact", {})
+    if isinstance(doc_impact, dict):
+        allowed.update(doc_impact.get("files", []) or [])
+    graph_docs = _get_graph_doc_associations(project_id, list(target))
+    if graph_docs:
+        allowed.update(graph_docs)
+    # B36-fix(4): tests importing any target — prevents PM under-specification from ping-ponging dev
+    allowed.update(_scan_dependent_tests(list(target)))
+    return target, allowed
+
+
 def _load_task_trace(conn, task_id):
     """Load trace_id and chain_id from a task row."""
     if not task_id or not hasattr(conn, "execute"):
@@ -1152,13 +1259,36 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     metadata.get("parent_task_id", task_id),
                     metadata,
                 )
-                # Build allowed files list for scope constraint (B28a: includes prev dev changed_files)
+                # B36-fix(2): Build allowed list from the SAME helper gate uses —
+                # prompt and gate can no longer disagree.
                 from .chain_context import get_store as _get_ctx_store
-                allowed = _get_ctx_store().get_retry_scope(_chain_id, project_id, metadata)
+                _target, allowed = _compute_gate_static_allowed(project_id, metadata)
+                # B28a inheritance + B36-fix(1): accumulated files from prior succeeded dev stages
+                try:
+                    allowed.update(
+                        _get_ctx_store().get_accumulated_changed_files(_chain_id, project_id)
+                    )
+                except Exception:
+                    pass
                 if not allowed:
                     allowed = set(metadata.get("target_files", []))  # final fallback
                 if allowed:
-                    scope_line = f"SCOPE CONSTRAINT: Checkpoint gate only allows changes to: {sorted(allowed)}. Changes to any other files will be blocked as 'unrelated'.\n\n"
+                    # Gate also permits stem-prefix tests (tests/test_<stem>*.py) at evaluation
+                    # time. Describe as pattern since matched dynamically.
+                    _stems = sorted({
+                        os.path.splitext(os.path.basename(t.replace("\\", "/")))[0]
+                        for t in _target
+                    })
+                    pattern_note = (
+                        f" Plus any file under a tests/ directory matching pattern "
+                        f"tests/test_{{{'|'.join(_stems)}}}*.py."
+                        if _stems else ""
+                    )
+                    scope_line = (
+                        f"SCOPE CONSTRAINT: Checkpoint gate only allows changes to: "
+                        f"{sorted(allowed)}.{pattern_note} Changes to any other files "
+                        f"will be blocked as 'unrelated'.\n\n"
+                    )
                 else:
                     scope_line = ""
                 retry_prompt = (
@@ -1908,17 +2038,19 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     if not changed:
         return False, "No files changed"
 
-    target = set(metadata.get("target_files", []) or [])
-    allowed = set(target)
-    allowed.update(metadata.get("test_files", []) or [])
-    allowed.update(_extract_test_files_from_verification(metadata.get("verification", {})))
-    doc_impact = metadata.get("doc_impact", {})
-    if isinstance(doc_impact, dict):
-        allowed.update(doc_impact.get("files", []) or [])
-    # 5c: Also allow graph-linked docs
+    # B36-fix(2): single source of truth shared with retry-prompt scope_line
+    target, allowed = _compute_gate_static_allowed(project_id, metadata)
+    # graph_docs still needed downstream for observation-mode doc check
     graph_docs = _get_graph_doc_associations(project_id, list(target))
-    if graph_docs:
-        allowed.update(graph_docs)
+    # B36-fix(1): on retry, inherit accumulated_changed_files from prior succeeded
+    # dev stages so consecutive attempts can build on each other.
+    if metadata.get("parent_task_id"):
+        try:
+            from .chain_context import get_store as _get_ctx_store
+            _chain_id = metadata.get("chain_id") or metadata.get("parent_task_id")
+            allowed.update(_get_ctx_store().get_accumulated_changed_files(_chain_id, project_id))
+        except Exception:
+            log.debug("_gate_checkpoint: accumulated_changed_files lookup failed", exc_info=True)
     # R1/R2: Derive allowed test files from target_files stems.
     # For each target file with stem S, allow changed files matching
     # tests/test_{S}*.py (under any parent directory or agent/tests/).
