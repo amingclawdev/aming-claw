@@ -47,9 +47,10 @@ New session? Read this first, then follow links for details.
 | G10 | Graph rebuild mapping | 79f9c39 | Chain |
 | O2 | Version gate worktree filter | 44ab315 | Manual |
 | O3 | Dynamic get_server_version() | 6810a37 | Chain |
+| B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | TBD | Chain |
 
 Manual fixes: 5 (B14, B15, B19, B20, B23) — all chicken-and-egg deadlocks where the bug prevented the chain from running.
-Chain fixes: 12 — delivered through autonomous PM→Dev→Test→QA→Merge pipeline.
+Chain fixes: 13 — delivered through autonomous PM→Dev→Test→QA→Merge pipeline.
 
 ## What Works Without Observer
 

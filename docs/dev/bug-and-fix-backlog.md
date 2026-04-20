@@ -73,6 +73,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | O3 | Governance dynamic version read (no restart) | 6810a37 | 2026-04-10 |
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
 | B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
+| B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | TBD | 2026-04-20 |
 
 ---
 
@@ -175,7 +176,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - `docs/roles/*.md` (coordinator, dev, qa, pm) — minor behavioral notes from B10/B12.
 - Low priority — core docs (auto-chain.md, executor-api.md, tester.md, manual-fix-sop.md) are current.
 
-### B31: Version gate dirty filter missing `.claude/worktrees/*` submodule refs [OPEN] [P1]
+### B31: Version gate dirty filter missing `.claude/worktrees/*` submodule refs [FIXED] [P1]
 
 - **Discovered**: 2026-04-20, MF-2026-04-20-001 follow-up. PM task `task-1776658117-adffde` succeeded but auto-chain silently failed to dispatch Dev — same pattern as Bug 7 / B15 / D5 / B23.
 - **Symptom**: `mcp__aming-claw__version_check` returns `dirty=true` with `dirty_files: [".claude/worktrees/compassionate-tu", ".claude/worktrees/happy-ardinghelli", ".claude/worktrees/zen-mendeleev"]`. Each of those paths is a git submodule (mode 160000) left behind by dev worktrees. They can never be cleaned while dev worktrees are in use.
