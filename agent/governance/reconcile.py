@@ -638,7 +638,9 @@ def phase_verify(conn, project_id: str, candidate_graph: AcceptanceGraph,
             "SELECT chain_version, git_head FROM project_version WHERE project_id=?",
             (project_id,)).fetchone()
         if row and row["chain_version"] and row["git_head"]:
-            if row["chain_version"] == row["git_head"]:
+            # B35: tolerate short/full hash mismatch via prefix match
+            cv, gh = row["chain_version"], row["git_head"]
+            if cv.startswith(gh) or gh.startswith(cv):
                 report["version_test"] = {
                     "passed": True,
                     "chain_version": row["chain_version"],

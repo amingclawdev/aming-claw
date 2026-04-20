@@ -77,8 +77,9 @@ def check_version(conn, project_id: str) -> dict:
         issues = {}
         status = "pass"
 
-        # Version mismatch
-        if git_head and chain_ver and git_head != chain_ver:
+        # Version mismatch (B35: tolerate short/full hash via prefix match)
+        if (git_head and chain_ver
+            and not (git_head.startswith(chain_ver) or chain_ver.startswith(git_head))):
             issues["version_mismatch"] = {
                 "chain_version": chain_ver, "git_head": git_head
             }
