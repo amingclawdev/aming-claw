@@ -74,8 +74,12 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
 | B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
 | B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | 42258ee | 2026-04-20 |
-| B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | (see below) | 2026-04-20 |
-| B35 | _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked | TBD | 2026-04-20 |
+| B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | 0d4689c | 2026-04-20 |
+| B35 | _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked | 651626c + a01ad54 | 2026-04-20 |
+| B36 | Retry prompt SCOPE CONSTRAINT wider than gate enforces — dev ping-pong | (OPEN) | 2026-04-20 |
+| B37 | Governance graph incomplete for MF-2026-04-20-001 affected nodes (related_docs empty, agent.deploy orphan_pending, reconcile.py unmapped) | (OPEN) | 2026-04-20 |
+| B38 | observer.md missing "Scheduled Health Audit & Backlog Maintenance" flow section | (OPEN) | 2026-04-20 |
+| B39 | Backlog-driven scheduled execution — cron reads chain-trigger blocks from backlog and creates PM tasks | (OPEN) | 2026-04-20 |
 
 ---
 
@@ -200,16 +204,18 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ### B35: _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked [FIXED]
 
-- **Status**: Fixed. Commit TBD (this manual-fix chain).
+- **Status**: Fixed. Commits `651626c` (initial 3 sites) + `a01ad54` (extension: preflight + reconcile).
 - **Discovered**: 2026-04-20, while diagnosing why B34 PM task `task-1776663232-229299` succeeded but auto-chain failed to auto-dispatch Dev even after B31 fix + governance restart loaded B31 code.
 - **Symptom**: `auto_chain.py` log line `version_check: chain_version (07d34b29164201ada4522cf0add31e24a25bf7fb) != git HEAD (07d34b2) — blocking chain.` Auto-chain returned False from `_gate_version_check` and silently dropped all dispatches.
 - **Root cause**: `_gate_version_check` reads `head` via `git rev-parse --short HEAD` (7-char) but compares against `chain_version` stored in DB as 40-char full hash (from manual fix writes via `/api/version-update`). Straight string equality `chain_ver != head` always fails on length mismatch even when the short IS a prefix of the full.
 - **Why it bit us repeatedly**: `_finalize_version_sync` writes short hashes, so the native auto-chain path never saw this. Manual-fix SOP R11 required callers to PUT `chain_version` via `/api/version-update` with the full 40-char hash (because that's what `git rev-parse HEAD` produces without `--short`), causing the DB to hold a full hash while the gate reads short. Auto-chain after a manual-fix commit was therefore silently blocked, masking the real state with "auto-chain unreliable (Bug 7)" folklore.
-- **Fix**: Defensive prefix-match normalization — `chain_ver.startswith(head) or head.startswith(chain_ver)` in three places:
-  - `agent/governance/auto_chain.py:1690` (the critical gate)
-  - `agent/mcp/tools.py:360` (MCP version_check reporter — inverse bug, head was full, chain_ver could be short)
-  - `agent/executor_worker.py:651` (merge pre-merged detection)
-- **Files**: `agent/governance/auto_chain.py`, `agent/mcp/tools.py`, `agent/executor_worker.py`
+- **Fix**: Defensive prefix-match normalization — `chain_ver.startswith(head) or head.startswith(chain_ver)` in **five** places:
+  - `agent/governance/auto_chain.py:1690` (the critical gate) — commit `651626c`
+  - `agent/mcp/tools.py:360` (MCP version_check reporter — inverse bug, head was full, chain_ver could be short) — commit `651626c`
+  - `agent/executor_worker.py:651` (merge pre-merged detection) — commit `651626c`
+  - `agent/governance/preflight.py:81` (check_version) — commit `a01ad54`
+  - `agent/governance/reconcile.py:641` (version_test in update_version) — commit `a01ad54`
+- **Files**: `agent/governance/auto_chain.py`, `agent/mcp/tools.py`, `agent/executor_worker.py`, `agent/governance/preflight.py`, `agent/governance/reconcile.py`
 - **Lesson**: Auto-chain and manual-fix paths must agree on one canonical hash form. Prefix-match is a robust way to tolerate either end writing either form. Also: "auto-chain silently drops" has historically been treated as thread/WAL flakiness when the real cause is usually a gate returning False without surfacing the reason loud enough — `_gate_version_check` does log a WARNING, but the audit trail (`chain.dropped` event or similar) is absent.
 
 ### B34: QA recommendation allowlist mismatch between role prompt and executor validator [FIXED]
@@ -236,6 +242,119 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **Remaining risk**: The out-of-repo auto-memory `project_service_lifecycle.md` (under `~/.claude/projects/.../memory/`) also contained the port 39103 claim. Needs same correction.
 - **Lesson**: When correcting a false doc claim, do not introduce a replacement claim that hasn't been verified against code. This is a governance surface requiring a dry-run convention for doc-rewriting commits.
 - **Fix**: Already fixed in-repo; auto-memory correction is a separate out-of-repo operation (not a governance-tracked file).
+
+### B36: Retry prompt SCOPE CONSTRAINT wider than `_gate_checkpoint` enforces — dev ping-pong [OPEN] [P2]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P2
+bug_id: B36
+target_files: []
+test_files: []
+acceptance_criteria: []
+chain_task_id: ""
+commit: ""
+note: "Design decision pending; do not auto-dispatch until fix approach chosen (gate-side vs prompt-side)."
+-->
+
+- **Discovered**: 2026-04-20, immediately after B35 fix restored auto-chain dispatch. B34 chain `task-1776663975-34443e` retried Dev 3 times (01:56 / 02:02 / 02:08) ping-ponging on `agent/tests/test_executor_output_parsing.py`. Chain archived at 02:08:52.
+- **Symptom**: Dev retry prompt says "SCOPE CONSTRAINT: Checkpoint gate only allows changes to: [X...]" but gate blocks with `Unrelated files modified: [some file IN the advertised X set]`.
+- **Root cause**:
+  - Retry prompt's allowed set (`auto_chain.py:1157`): `_get_ctx_store().get_retry_scope(...)` — returns chain-context-inherited union including prior devs' `changed_files` (B28a inheritance).
+  - Gate's allowed set (`auto_chain.py:1911-1921`, `_gate_checkpoint`): target_files ∪ test_files ∪ verification-extracted tests ∪ doc_impact.files ∪ graph-linked docs ∪ stem-prefix test matches. **Does not consult `get_retry_scope`.**
+  - Result: prompt tells Dev "you may touch X"; gate then says "X is unrelated."
+- **Why Dev cannot satisfy**: For B34 specifically, target `role_permissions.py` changes `VALID_QA_RECOMMENDATIONS` which breaks tests in `test_executor_output_parsing.py`. Gate's stem-prefix matcher doesn't match this test to any target stem. Dev must choose: modify the test (scope-block) or leave tests broken (verification-fail). No winning move.
+- **Fix options (not yet decided)**:
+  - (a) Gate-side: have `_gate_checkpoint` also consult `get_retry_scope` for retries. Risk: inheritance unbounded across long chains.
+  - (b) Retry-prompt-side: narrow advertised scope to exactly what the gate computes. Means retry-prompt stops lying, but B28a's benefit (inheriting prior fixes) is lost.
+  - (c) PM-side: harden PM to include all tests importing any target_file in test_files. Addresses root under-specification.
+  - Preferred: (b) + (c).
+- **Files (tentative)**: `agent/governance/auto_chain.py` (1157 + 1911-1921 regions)
+- **Observer workaround**: When ≥2 consecutive same-reason dev retries show the same file in "Unrelated files modified", cancel chain and refile PM with expanded test_files.
+- **Memory**: `~/.claude/projects/.../memory/project_b36_retry_scope_mismatch.md`
+
+### B37: Governance graph incomplete for MF-2026-04-20-001 affected nodes [OPEN] [P3]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P3
+bug_id: B37
+target_files: []
+test_files: []
+acceptance_criteria: []
+chain_task_id: ""
+commit: ""
+note: "Observation-only during dry-run phase; fix scope requires design review (E1-E4 may split into separate tickets)."
+-->
+
+- **Discovered**: 2026-04-20, during post-hoc governance audit of commits `1bed264` + `077d22c` + `696e710` (MF-2026-04-20-001 chain).
+- **Symptom**: Commit message `1bed264` declares "Affected governance nodes: agent.deploy, governance.server, agent.gateway, agent.mcp", but MCP `wf_impact` on the 3 changed doc files returns `related_docs: []` — no node has the doc files mapped.
+- **Findings**:
+  - **E1** `related_docs` empty across all 4 affected nodes. Graph-doc mapping for docs/deployment.md, docs/onboarding.md, docs/dev/session-status.md is absent.
+  - **E2** `agent.deploy` in preflight `orphan_pending` list 14+ hours after MF commit — node still `pending`, no verification chain registered.
+  - **E3** `verify_requires: []` across all 4 nodes. Transitive relationships (agent.gateway/mcp → governance.server) are reverse-inferred from CODE_DOC_MAP, not declared.
+  - **E4** `agent/governance/reconcile.py` and 48 other `agent/**.py` files in preflight `unmapped_files` (not in CODE_DOC_MAP). B35 extension `a01ad54` modified reconcile.py with no node trail.
+  - **E5** 119/148 nodes `waived` (80%). Not introduced here — systemic.
+- **Impact**: MF commits are commit-level compliant but governance-layer disconnected. Future chain touching same docs won't auto-trigger node verification. Audit trail for agent.deploy verification is missing.
+- **Fix scope (tentative, not yet committed)**: E1 + E4 require graph-generator changes (risks B36 ping-pong); E2 is pure node-state promotion (low risk, may be walked alone); E3 is graph declaration edit; E5 is strategy review (out of scope).
+- **Prerequisite**: Before setting `needs_chain: true`, verify target graph files are in CODE_DOC_MAP (avoid B36) and split into sub-tickets per E1/E2/E3/E4.
+
+### B38: `docs/roles/observer.md` missing "Scheduled Health Audit & Backlog Maintenance" flow section [OPEN] [P2]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P2
+bug_id: B38
+target_files:
+  - docs/roles/observer.md
+test_files:
+  - agent/tests/test_reconcile.py
+acceptance_criteria:
+  - "AC1: docs/roles/observer.md contains a new section titled 'Standard Flow: Scheduled Health Audit & Backlog Maintenance'"
+  - "AC2: Section covers trigger (cron schedule), principle (read-only on state), steps (health check, queue classification, graph audit, decision tree, log record), budget limits, prohibited actions, chain-trigger block format"
+  - "AC3: Section distinguishes Interactive observer (judgment) from Scheduled observer (mechanical) responsibilities per B39 architecture"
+  - "AC4: Global 'Prohibited Actions' list extended with scheduled-flow-specific prohibitions (no AC writing, no observer.md self-modification)"
+chain_task_id: ""
+commit: ""
+note: "Paused during dry-run phase. Enable after B39 architecture stabilized and B36 fixed."
+-->
+
+- **Discovered**: 2026-04-20, during discussion of cron-driven observer flow.
+- **Symptom**: observer.md describes 4 chain-stage takeover flows (Coordinator/PM/Dev/Test/QA/Merge) but does not document the autonomous scheduled observer loop that currently runs via MCP scheduled-tasks `amingclaw-workflow`.
+- **Impact**: The logic of scheduled observer lives only in the scheduled-task prompt (in-memory, not in repo). No git blame, no review, no rollback. Operators cannot discover it by reading the role doc.
+- **Governance**: `docs/roles/observer.md` → node `governance.reconcile` (verify_level=4, gate_mode=auto). Must go through PM→Dev chain. test_file `agent/tests/test_reconcile.py` per wf_impact.
+
+### B39: Backlog-driven scheduled execution — cron reads chain-trigger blocks, not hardcoded logic [OPEN] [P2]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P2
+bug_id: B39
+target_files: []
+test_files: []
+acceptance_criteria:
+  - "AC1: Machine-parseable <!-- chain-trigger: ... --> YAML block format defined and documented in docs/dev/bug-and-fix-backlog.md (schema section)"
+  - "AC2: State machine documented: OPEN → IN_CHAIN → (FIXED | BLOCKED). BLOCKED → OPEN requires interactive reset."
+  - "AC3: Scheduled observer cron prompt reduced to: health check + chain-trigger scan + state-machine transition. No judgment logic."
+  - "AC4: Idempotency guarantee: cron checks task_list for live tasks matching bug_id before creating PM."
+  - "AC5: Dry-run mode: cron logs 'would create PM for <bug_id>' without actually calling task_create, until dry-run phase ends."
+chain_task_id: ""
+commit: ""
+note: "Feature/architecture proposal. Not runnable until AC1 schema is written and dry-run validates parser correctness."
+-->
+
+- **Discovered / Proposed**: 2026-04-20 conversation.
+- **Motivation**: Current scheduled-task prompt (~120 lines) embeds both judgment logic and mechanical task-creation. Failures in either part leave no audit trail. Moving judgment to interactive session (with chain-trigger blocks in backlog) leaves cron as a deterministic parser+trigger, observable via git history.
+- **Architecture**:
+  - Interactive session (human + Claude) writes OPEN entries with complete chain-trigger metadata (target_files, test_files, AC).
+  - Scheduled session (cron) parses backlog, transitions OPEN→IN_CHAIN when creating PM, IN_CHAIN→FIXED on merge, IN_CHAIN→BLOCKED on 3x gate fail or archive.
+  - Backlog is the work queue; git history is the audit log.
+- **Dry-run plan**: Phase 1 (current) — cron only reads and logs what it "would" do. Phase 2 — enable for one ticket as pilot. Phase 3 — general rollout after B36 resolved.
+- **Dependencies**: B36 fix recommended before Phase 2 (else cron will trigger ping-pongs); B38 documents the flow.
 
 ---
 
