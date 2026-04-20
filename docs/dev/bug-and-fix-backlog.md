@@ -177,6 +177,97 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ---
 
+## Manual Fix Audit Log
+
+### MF-2026-04-20-001 — Correct stale MCP auto-start claims in startup docs
+
+```yaml
+manual_fix_id:          MF-2026-04-20-001
+timestamp:              2026-04-20T04:19:00Z
+operator:               observer (scheduled workflow maintenance)
+trigger_scenario:       dirty_workspace_blocking_chain
+bypass_used:            none (no skip_version_check; commit proceeded via normal git)
+
+changed_files:
+  - docs/deployment.md (modified, +54/-20)
+  - docs/onboarding.md (modified, +1/-1)
+  - docs/dev/session-status.md (modified, +7/-3)
+  - docs/dev/manual-fix-current-2026-04-20.md (new, R7 execution record)
+
+classification:
+  scope:                B (4 nodes)
+  danger:               Low (docs only, no code, no deletions)
+  combined_level:       B-Low
+
+reported_impact:
+  - agent.deploy         (direct, verify_level=2, gate=auto)
+  - governance.server    (direct, verify_level=4, gate=auto)
+  - agent.gateway        (transitive, verify_level=5, gate=auto)
+  - agent.mcp            (transitive, verify_level=5, gate=auto)
+
+actual_impact:
+  - All 4 are doc-only references; no functional code in any of these
+    nodes was changed. All gate_mode=auto, so no R3 explicit
+    verification task required.
+
+false_positive_nodes:   0 (all nodes genuinely reference the changed docs)
+
+pre_commit_checks:
+  - version_check baseline: HEAD=8541b18, chain_version=8541b18, dirty=true
+    (3 .claude/worktrees/* submodule refs — pre-existing, not part of this fix)
+  - preflight baseline: ok=true, 0 blockers, 3 warnings
+    (version sync stale 358s, 16 orphan pending, 49 unmapped)
+  - wf_impact: 4 nodes, all auto
+  - No tests run: docs have no module test coverage (documented under B-Low)
+
+commit_hash:            1bed264
+
+post_commit_checks:
+  - governance dynamic version: reads 1bed264 (B19/O3 working, no restart needed)
+  - version-sync: ok=true, dirty_files=[] (worktree submodules filtered at sync layer)
+  - version-update: ok=true, chain_version=1bed264
+    (NOTE: R11 prescribes updated_by='manual-fix-...' but server allowlist
+     only accepts auto-chain|init|register|merge-service. Used merge-service
+     with task_id=task-1776658117-adffde; see followup_needed below.)
+  - preflight delta: ok=true, 2 warnings (version stale warning cleared, no new blockers)
+  - MCP version_check: still reports dirty=true because it reads a
+    different code path than version-sync; the .claude/worktrees/*
+    submodule refs are not filtered there. This is the underlying
+    structural issue and is itself now a backlog item.
+
+workflow_restore_result: PARTIAL
+  - Underlying cause (.claude/worktrees/* dirty in MCP version_check)
+    remains. Auto-chain dispatch may or may not still be blocked
+    depending on which gate path runs.
+  - A full PM->Dev restore test was not executed because the orphan
+    executor (no ServiceManager supervision as of this session) plus
+    persistent submodule dirty state would produce an ambiguous result.
+  - Recommended follow-up: (a) restart the executor under ServiceManager
+    so crash recovery and deploy signals work, (b) extend the D5 dirty
+    filter used by MCP version_check to cover `.claude/worktrees/*`.
+
+followup_needed:
+  - BUG-FOLLOWUP-A (P1): MCP version_check / auto_chain gate reads a
+    code path that does not filter .claude/worktrees/* submodule refs.
+    D5 filter only excludes .claude/settings.local.json. Dev worktrees
+    leave these dirty permanently. Silently blocks auto-chain dispatch
+    (Bug 7 pattern recurrence).
+  - BUG-FOLLOWUP-B (P2): SOP R11 documents updated_by='manual-fix-<slug>'
+    but server.py:2015 allowlist rejects it. Either (a) widen the server
+    allowlist to accept 'manual-fix' / 'manual-fix-*' with audit trail,
+    or (b) update the SOP to say 'merge-service' is the allowed value
+    for manual-fix POST /api/version-update calls.
+  - BUG-FOLLOWUP-C (P1): Current executor is orphan (no ServiceManager
+    parent). Needs `.\scripts\start-manager.ps1 -Takeover` run before
+    next chain attempt. The three doc fixes in this commit tell future
+    operators/agents how to verify this (port 39103 supervision check).
+  - Out-of-repo MEMORY.md auto-memory still contains the false claim
+    "MCP server (.mcp.json) auto-starts executor_worker via ServiceManager".
+    Must be corrected via memory tools (separate action, not a git commit).
+```
+
+---
+
 ## Test Count
 
 1003 tests pass (B30 +10: version_gate_round4×3 + auto_chain_version_cache×4 rewritten + net +3 new), 7 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block, test_try_verify_update_returns_true_on_success, test_try_verify_update_returns_false_on_exception), 3 skipped.
