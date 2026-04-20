@@ -1177,6 +1177,13 @@ class ExecutorWorker:
                 "- Use Read/Grep to verify file paths exist before listing them\n"
                 "- Read at most 3-5 key files, then output the JSON\n"
                 "- Do NOT output actions, reply, or schema_version fields\n"
+                "\nverification.command constraints (CRITICAL — Windows cmd.exe executor):\n"
+                "- MUST be a single invocation of `pytest ...` or `python -c \"...\"` (or `python -m <module>`).\n"
+                "- MUST NOT use Unix-only commands: grep, sed, awk, find, head, tail, cat, cut, xargs.\n"
+                "- MUST NOT use shell chaining/pipes: `&&`, `||`, `|`, `;`, `>`, redirect operators. Windows cmd treats these as arguments to the first command.\n"
+                "- For doc-string checks use `python -c \"import pathlib,sys; t=pathlib.Path('docs/x.md').read_text(encoding='utf-8'); assert 'PATTERN' in t; print('ok')\"`.\n"
+                "- For code behavior checks use a dedicated pytest test file under agent/tests/.\n"
+                "- If you need multiple checks, either (a) use one pytest file that asserts all of them, or (b) write a single `python -c` with multiple asserts — never chain shell commands.\n"
                 "Output ONLY the PRD JSON object."
             )
             _bp_log("format instruction appended")
