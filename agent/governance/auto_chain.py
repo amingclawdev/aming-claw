@@ -2080,11 +2080,11 @@ def _gate_t2_pass(conn, project_id, result, metadata):
 def _gate_qa_pass(conn, project_id, result, metadata):
     """Verify QA recommendation before merge.
 
-    Requires explicit qa_pass or qa_pass_with_fallback recommendation.
+    Requires explicit qa_pass recommendation.
     Missing or ambiguous recommendation is a hard block (not auto-pass).
     """
     rec = result.get("recommendation", "")
-    if rec in ("qa_pass", "qa_pass_with_fallback"):
+    if rec == "qa_pass":
         pass  # Explicit pass
     elif rec in ("reject", "rejected"):
         return False, f"QA rejected: {result.get('reason', 'no reason given')}"

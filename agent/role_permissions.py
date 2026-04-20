@@ -361,7 +361,7 @@ Output format (strict JSON):
 Your responsibilities:
 1. Review code changes
 2. Confirm test coverage
-3. Output an acceptance recommendation (qa_pass | qa_pass_with_fallback | reject)
+3. Output an acceptance recommendation (qa_pass | reject)
 
 System knowledge:
 - You are auto-triggered after Tester passes. No manual step is required to start you.
@@ -375,7 +375,7 @@ Output format (strict JSON):
 {
   "schema_version": "v1",
   "review_summary": "Review summary",
-  "recommendation": "qa_pass|qa_pass_with_fallback|reject",
+  "recommendation": "qa_pass|reject",
   "evidence": {"type": "e2e_report", "tool": "verify_loop"},
   "governance_status": "passed|passed_with_fallback|unavailable",
   "doc_updates_applied": [],

@@ -74,7 +74,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
 | B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
 | B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | 42258ee | 2026-04-20 |
-| B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | TBD | 2026-04-20 |
+| B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | (see below) | 2026-04-20 |
 | B35 | _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked | TBD | 2026-04-20 |
 
 ---
@@ -212,18 +212,22 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **Files**: `agent/governance/auto_chain.py`, `agent/mcp/tools.py`, `agent/executor_worker.py`
 - **Lesson**: Auto-chain and manual-fix paths must agree on one canonical hash form. Prefix-match is a robust way to tolerate either end writing either form. Also: "auto-chain silently drops" has historically been treated as thread/WAL flakiness when the real cause is usually a gate returning False without surfacing the reason loud enough — `_gate_version_check` does log a WARNING, but the audit trail (`chain.dropped` event or similar) is absent.
 
-### B34: QA recommendation allowlist mismatch between role prompt and executor validator [OPEN] [P2]
+### B34: QA recommendation allowlist mismatch between role prompt and executor validator [FIXED]
 
+- **Status**: Fixed. Manual fix (chicken-and-egg: chain was stuck retrying Dev on this same bug — 3 consecutive dev retries at 01:55-02:08 Z, none dispatched to Test, per executor log).
 - **Discovered**: 2026-04-20, during B31 manual-fix chain QA stage (task-1776661464-ddf790). QA AI returned `recommendation: "qa_pass_with_fallback"` and was rejected with `structured_output_invalid:invalid_recommendation:qa_pass_with_fallback`. Second retry returned malformed JSON entirely.
-- **Root cause**: Three different specs give three different allowlists:
+- **Root cause**: Three specs disagreed:
   - `agent/role_permissions.py:364,378` (QA system prompt): `qa_pass | qa_pass_with_fallback | reject`
-  - `agent/executor_worker.py:412` (validator): `{"qa_pass", "reject", "merge_pass"}`
-  - `agent/governance/auto_chain.py:2088,2376` (gate): `qa_pass | reject`
-- **Impact**: QA Claude follows role prompt, outputs `qa_pass_with_fallback`, validator rejects, task fails. Forces observer takeover (precedent in B31 manual fix — observer claimed + completed QA manually with qa_pass).
-- **Fix options**:
-  - A: Standardize allowlist to `{"qa_pass", "reject"}` (drop `qa_pass_with_fallback` from role prompt, drop `merge_pass` from validator which appears unused).
-  - B: Add `qa_pass_with_fallback` to validator + gate if there's actual semantic meaning (probably not — grep shows no downstream consumer treats it differently from qa_pass).
-- **Fix files**: `agent/role_permissions.py:364,378`, `agent/executor_worker.py:412` — minimal change, one allowlist constant shared between prompt-builder and validator.
+  - `agent/executor_worker.py:412` (validator, shared QA+Gatekeeper): `{"qa_pass", "reject", "merge_pass"}`
+  - `agent/governance/auto_chain.py:2087` (QA gate): `qa_pass | qa_pass_with_fallback | reject`
+  - Validator never accepted `qa_pass_with_fallback`, but QA prompt instructed Claude to emit it. `merge_pass` is Gatekeeper-only (correct in validator's union set).
+- **Impact**: QA Claude followed role prompt, outputed `qa_pass_with_fallback`, validator rejected, task failed. Forced observer takeover on every chain.
+- **Fix (option A)**: Drop vestigial `qa_pass_with_fallback` entirely. Standardize QA to `{qa_pass, reject}`. Validator unchanged — its `{qa_pass, reject, merge_pass}` is the correct union of QA and Gatekeeper acceptance values.
+- **Fix files**:
+  - `agent/role_permissions.py:364,378` — QA prompt prose + JSON example
+  - `agent/governance/auto_chain.py:2083,2087` — `_gate_qa_pass` docstring + accepted recs
+- **No test updates needed**: grep shows no test references `qa_pass_with_fallback`. Validator-shared union of `{qa_pass, reject, merge_pass}` still passes all 6 `test_qa_output_validation.py` cases; 104 tests in `test_governance_gate_policy.py + test_executor_output_parsing.py + test_auto_chain_routing.py` all pass.
+- **Pre-existing unrelated failure**: `test_qa_gatekeeper_round1.py::TestQaGateRound2::test_governed_dirty_workspace_lane_defers_related_node_qa_block` fails both before and after this fix due to a MagicMock unpacking issue at line 2111 (`_try_verify_update` mocked without return_value tuple). Not caused by B34 fix.
 
 ### B33: Self-introduced docs claim about port 39103 (non-existent supervisor port) [OPEN] [P2]
 
