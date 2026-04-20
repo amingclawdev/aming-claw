@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 # Restore to False before production use.
 _DISABLE_VERSION_GATE = False
 
+# B15/B23/B31: Prefixes filtered from dirty_files before version gate evaluation.
+# Paths matching any prefix are tool-local or non-governed and must not block chain.
+_DIRTY_IGNORE = (".claude/", ".claude\\", ".worktrees/", ".worktrees\\", "docs/dev/", "docs/dev\\")
+
 # Graph-driven doc governance: observation mode flag (Step 5, P1 principle)
 # When True, graph doc checks log warnings instead of blocking.
 _GRAPH_DOC_OBSERVATION_MODE = True
@@ -1662,9 +1666,7 @@ def _gate_version_check(conn, project_id, result, metadata):
             (project_id,),
         ).fetchone()
         dirty_files = json.loads(row["dirty_files"] or "[]") if row and row["dirty_files"] else []
-        # B15 worktree filter: exclude tool-local config and worktree paths from dirty check
-        # B23: also exclude docs/dev/ (non-governed path; execution records written here must not block chain)
-        _DIRTY_IGNORE = (".claude/", ".claude\\", ".worktrees/", ".worktrees\\", "docs/dev/", "docs/dev\\")
+        # B15/B23/B31: filter tool-local / non-governed paths (module-level _DIRTY_IGNORE)
         dirty_files = [f for f in dirty_files if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
         if dirty_files:
             log.warning("version_check: dirty workspace (%d files: %s) — blocking chain",

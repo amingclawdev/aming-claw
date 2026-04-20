@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -454,6 +455,110 @@ class TestVersionGateRound4(unittest.TestCase):
 
         self.assertTrue(gate_called[0], "_gate_version_check MUST be called for pm")
         self.assertTrue(result.get("gate_blocked"), "pm should still be blocked by version gate")
+
+
+    # --- B31: worktree submodule dirty filter ---
+
+    def test_worktree_submodule_dirty_filter_only_worktrees(self):
+        """B31/AC2: Only .claude/worktrees/* in dirty_files → handle_version_check returns ok=true, dirty_files=[]."""
+        from governance import server as gov_server
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = {
+            "chain_version": "abc1234",
+            "git_head": "abc1234",
+            "dirty_files": json.dumps([
+                ".claude/worktrees/compassionate-tu",
+                ".claude/worktrees/happy-ardinghelli",
+                ".claude/worktrees/zen-mendeleev",
+            ]),
+            "updated_at": "2026-04-20T00:00:00Z",
+            "git_synced_at": "2026-04-20T00:00:00Z",
+        }
+
+        ctx = mock.Mock()
+        ctx.get_project_id.return_value = "aming-claw"
+
+        with mock.patch.object(gov_server, "get_connection", return_value=conn), \
+             mock.patch.object(gov_server, "_utc_now", return_value="2026-04-20T00:00:00Z"):
+            result = gov_server.handle_version_check(ctx)
+
+        self.assertTrue(result["ok"], f"Expected ok=true, got: {result}")
+        self.assertEqual(result["dirty_files"], [])
+        self.assertFalse(result["dirty"])
+
+    def test_worktree_submodule_dirty_filter_mixed(self):
+        """B31/AC3: Mixed worktree + real dirty → returns only real dirty file."""
+        from governance import server as gov_server
+
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = {
+            "chain_version": "abc1234",
+            "git_head": "abc1234",
+            "dirty_files": json.dumps([
+                ".claude/worktrees/compassionate-tu",
+                "agent/foo.py",
+                ".claude/settings.local.json",
+            ]),
+            "updated_at": "2026-04-20T00:00:00Z",
+            "git_synced_at": "2026-04-20T00:00:00Z",
+        }
+
+        ctx = mock.Mock()
+        ctx.get_project_id.return_value = "aming-claw"
+
+        with mock.patch.object(gov_server, "get_connection", return_value=conn), \
+             mock.patch.object(gov_server, "_utc_now", return_value="2026-04-20T00:00:00Z"):
+            result = gov_server.handle_version_check(ctx)
+
+        self.assertFalse(result["ok"], f"Expected ok=false with real dirty files, got: {result}")
+        self.assertEqual(result["dirty_files"], ["agent/foo.py"])
+        self.assertTrue(result["dirty"])
+
+    def test_worktree_submodule_dirty_filter_auto_chain_agrees(self):
+        """B31/AC3: auto_chain._gate_version_check agrees with server filter on same DB state."""
+        from governance import auto_chain
+        from governance import server as gov_server
+
+        worktree_only_dirty = json.dumps([
+            ".claude/worktrees/compassionate-tu",
+            ".claude/worktrees/happy-ardinghelli",
+        ])
+
+        # Test auto_chain path
+        conn_ac = mock.Mock()
+        conn_ac.execute.return_value.fetchone.return_value = {
+            "chain_version": "abc1234",
+            "git_head": "abc1234",
+            "dirty_files": worktree_only_dirty,
+        }
+
+        with mock.patch.object(auto_chain, "_DISABLE_VERSION_GATE", False), \
+             self._patch_server_version("abc1234"), \
+             mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="abc1234\n", returncode=0)):
+            ac_passed, ac_reason = auto_chain._gate_version_check(conn_ac, "aming-claw", {}, {})
+
+        # Test server path
+        conn_srv = mock.Mock()
+        conn_srv.execute.return_value.fetchone.return_value = {
+            "chain_version": "abc1234",
+            "git_head": "abc1234",
+            "dirty_files": worktree_only_dirty,
+            "updated_at": "2026-04-20T00:00:00Z",
+            "git_synced_at": "2026-04-20T00:00:00Z",
+        }
+
+        ctx = mock.Mock()
+        ctx.get_project_id.return_value = "aming-claw"
+
+        with mock.patch.object(gov_server, "get_connection", return_value=conn_srv), \
+             mock.patch.object(gov_server, "_utc_now", return_value="2026-04-20T00:00:00Z"):
+            srv_result = gov_server.handle_version_check(ctx)
+
+        # Both must agree: worktree-only dirty → pass/ok
+        self.assertTrue(ac_passed, f"auto_chain should pass, got reason: {ac_reason}")
+        self.assertTrue(srv_result["ok"], f"server should return ok=true, got: {srv_result}")
+        self.assertEqual(srv_result["dirty_files"], [])
 
 
 if __name__ == "__main__":
