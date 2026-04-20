@@ -331,11 +331,12 @@ note: "Paused during dry-run phase. Enable after B39 architecture stabilized and
 
 <!-- chain-trigger:
 status: OPEN
-needs_chain: false
+needs_chain: true
 priority: P2
 bug_id: B39
 target_files: []
 test_files: []
+live_trigger_test: true
 acceptance_criteria:
   - "AC1: Machine-parseable <!-- chain-trigger: ... --> YAML block format defined and documented in docs/dev/bug-and-fix-backlog.md (schema section)"
   - "AC2: State machine documented: OPEN → IN_CHAIN → (FIXED | BLOCKED). BLOCKED → OPEN requires interactive reset."
