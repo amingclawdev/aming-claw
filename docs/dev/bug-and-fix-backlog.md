@@ -73,7 +73,8 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | O3 | Governance dynamic version read (no restart) | 6810a37 | 2026-04-10 |
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
 | B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
-| B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | TBD | 2026-04-20 |
+| B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | 42258ee | 2026-04-20 |
+| B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | TBD | 2026-04-20 |
 
 ---
 
@@ -195,6 +196,19 @@ P3   : gate 报错优化 / skip_reason 枚举审计
   - **A (preferred)**: Widen allowlist to accept prefix `manual-fix` with an additional audit record that includes `manual_fix_reason` field. Keeps SOP R11 as-written.
   - **B**: Update SOP R11 to document `merge-service` + `task_id` as the canonical manual-fix path (and rename the concept in-SOP). Lower code change, but SOP bends to impl.
 - **Fix files**: `agent/governance/server.py:2015` (allowlist), optional `agent/governance/audit_service.py` (new audit field), or `docs/governance/manual-fix-sop.md` §13 R11 if option B.
+
+### B34: QA recommendation allowlist mismatch between role prompt and executor validator [OPEN] [P2]
+
+- **Discovered**: 2026-04-20, during B31 manual-fix chain QA stage (task-1776661464-ddf790). QA AI returned `recommendation: "qa_pass_with_fallback"` and was rejected with `structured_output_invalid:invalid_recommendation:qa_pass_with_fallback`. Second retry returned malformed JSON entirely.
+- **Root cause**: Three different specs give three different allowlists:
+  - `agent/role_permissions.py:364,378` (QA system prompt): `qa_pass | qa_pass_with_fallback | reject`
+  - `agent/executor_worker.py:412` (validator): `{"qa_pass", "reject", "merge_pass"}`
+  - `agent/governance/auto_chain.py:2088,2376` (gate): `qa_pass | reject`
+- **Impact**: QA Claude follows role prompt, outputs `qa_pass_with_fallback`, validator rejects, task fails. Forces observer takeover (precedent in B31 manual fix — observer claimed + completed QA manually with qa_pass).
+- **Fix options**:
+  - A: Standardize allowlist to `{"qa_pass", "reject"}` (drop `qa_pass_with_fallback` from role prompt, drop `merge_pass` from validator which appears unused).
+  - B: Add `qa_pass_with_fallback` to validator + gate if there's actual semantic meaning (probably not — grep shows no downstream consumer treats it differently from qa_pass).
+- **Fix files**: `agent/role_permissions.py:364,378`, `agent/executor_worker.py:412` — minimal change, one allowlist constant shared between prompt-builder and validator.
 
 ### B33: Self-introduced docs claim about port 39103 (non-existent supervisor port) [OPEN] [P2]
 
