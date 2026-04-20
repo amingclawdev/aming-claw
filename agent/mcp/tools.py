@@ -356,8 +356,10 @@ class ToolDispatcher:
                     result["ok"] = False
                     result["message"] = (result.get("message", "") + "; " if result.get("message") else "") + f"{len(result['dirty_files'])} uncommitted files"
                 # Also check HEAD vs chain_version
+                # B35: normalize short/full hash mismatch — short is a prefix of full.
                 chain_ver = result.get("chain_version", "")
-                if chain_ver and chain_ver != "(not set)" and head != chain_ver:
+                if (chain_ver and chain_ver != "(not set)"
+                    and not (head.startswith(chain_ver) or chain_ver.startswith(head))):
                     result["ok"] = False
                     commits = subprocess.check_output(
                         ["git", "log", "--oneline", f"{chain_ver}..HEAD"],

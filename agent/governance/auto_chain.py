@@ -1687,7 +1687,11 @@ def _gate_version_check(conn, project_id, result, metadata):
         chain_ver = (row["chain_version"] or "").strip() if row else ""
         if not chain_ver or chain_ver == "unknown":
             return True, "chain_version unavailable in DB, skipping"
-        if chain_ver != head:
+        # B35: `head` is short (7 chars) from `git rev-parse --short`, but chain_version
+        # may be full (40 chars) if a manual-fix SOP wrote via /api/version-update with
+        # the full hash. Short git hashes are unique prefixes of full hashes, so compare
+        # via prefix match in either direction.
+        if not (chain_ver.startswith(head) or head.startswith(chain_ver)):
             log.warning("version_check: chain_version (%s) != git HEAD (%s) — blocking chain. "
                         "Complete a full workflow Deploy to update chain_version.",
                         chain_ver, head)

@@ -75,6 +75,7 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
 | B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | 42258ee | 2026-04-20 |
 | B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | TBD | 2026-04-20 |
+| B35 | _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked | TBD | 2026-04-20 |
 
 ---
 
@@ -196,6 +197,20 @@ P3   : gate 报错优化 / skip_reason 枚举审计
   - **A (preferred)**: Widen allowlist to accept prefix `manual-fix` with an additional audit record that includes `manual_fix_reason` field. Keeps SOP R11 as-written.
   - **B**: Update SOP R11 to document `merge-service` + `task_id` as the canonical manual-fix path (and rename the concept in-SOP). Lower code change, but SOP bends to impl.
 - **Fix files**: `agent/governance/server.py:2015` (allowlist), optional `agent/governance/audit_service.py` (new audit field), or `docs/governance/manual-fix-sop.md` §13 R11 if option B.
+
+### B35: _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked [FIXED]
+
+- **Status**: Fixed. Commit TBD (this manual-fix chain).
+- **Discovered**: 2026-04-20, while diagnosing why B34 PM task `task-1776663232-229299` succeeded but auto-chain failed to auto-dispatch Dev even after B31 fix + governance restart loaded B31 code.
+- **Symptom**: `auto_chain.py` log line `version_check: chain_version (07d34b29164201ada4522cf0add31e24a25bf7fb) != git HEAD (07d34b2) — blocking chain.` Auto-chain returned False from `_gate_version_check` and silently dropped all dispatches.
+- **Root cause**: `_gate_version_check` reads `head` via `git rev-parse --short HEAD` (7-char) but compares against `chain_version` stored in DB as 40-char full hash (from manual fix writes via `/api/version-update`). Straight string equality `chain_ver != head` always fails on length mismatch even when the short IS a prefix of the full.
+- **Why it bit us repeatedly**: `_finalize_version_sync` writes short hashes, so the native auto-chain path never saw this. Manual-fix SOP R11 required callers to PUT `chain_version` via `/api/version-update` with the full 40-char hash (because that's what `git rev-parse HEAD` produces without `--short`), causing the DB to hold a full hash while the gate reads short. Auto-chain after a manual-fix commit was therefore silently blocked, masking the real state with "auto-chain unreliable (Bug 7)" folklore.
+- **Fix**: Defensive prefix-match normalization — `chain_ver.startswith(head) or head.startswith(chain_ver)` in three places:
+  - `agent/governance/auto_chain.py:1690` (the critical gate)
+  - `agent/mcp/tools.py:360` (MCP version_check reporter — inverse bug, head was full, chain_ver could be short)
+  - `agent/executor_worker.py:651` (merge pre-merged detection)
+- **Files**: `agent/governance/auto_chain.py`, `agent/mcp/tools.py`, `agent/executor_worker.py`
+- **Lesson**: Auto-chain and manual-fix paths must agree on one canonical hash form. Prefix-match is a robust way to tolerate either end writing either form. Also: "auto-chain silently drops" has historically been treated as thread/WAL flakiness when the real cause is usually a gate returning False without surfacing the reason loud enough — `_gate_version_check` does log a WARNING, but the audit trail (`chain.dropped` event or similar) is absent.
 
 ### B34: QA recommendation allowlist mismatch between role prompt and executor validator [OPEN] [P2]
 

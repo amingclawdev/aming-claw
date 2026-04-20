@@ -648,7 +648,8 @@ class ExecutorWorker:
                 )
                 vc_data = json.loads(vc_resp.read())
                 chain_ver = vc_data.get("chain_version", "")
-                if chain_ver and chain_ver != head_rev:
+                # B35: tolerate short/full hash mismatch via prefix match
+                if chain_ver and not (chain_ver.startswith(head_rev) or head_rev.startswith(chain_ver)):
                     log.info("merge: no isolation branch but HEAD (%s) ahead of chain_version (%s) — treating as pre-merged",
                              head_rev, chain_ver)
                     return {"status": "succeeded", "result": {
