@@ -2,16 +2,16 @@
 
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-20 (B40 filed — version-update auth bypass surfaced during B36 manual fix)
+> Last updated: 2026-04-20 (B33/B36 → FIXED; B32 + B40 chain-trigger blocks fleshed out with full AC)
 
 ---
 
 ## 修复优先级顺序
 
 ```
-P1   : B40（version-update 无调用方认证）→ B31（worktree submodule 脏过滤）→ ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
+P1   : B40（version-update 无调用方认证）→ ~~B31~~（done）→ ~~B27~~（done）→ ~~B28b~~（done）→ ~~B28a~~（done）→ ~~B29~~（done）→ ~~B30~~（done）→ B24（重发链路）
 P1.5 : B25（chain_context recovery）
-P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）→ B32（version-update updated_by 白名单 SOP 不一致）→ B33（docs 错误引用 port 39103）
+P2   : O1 Phase-2b（builder 全面迁移）→ B21（并发 merge）→ B22（任务扇出）→ B26（updated_by）→ B32（version-update updated_by 白名单 SOP 不一致）→ ~~B33~~（done）→ ~~B36~~（done）
 P3   : gate 报错优化 / skip_reason 枚举审计
 ```
 
@@ -74,8 +74,10 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 | B29 | version gate audit weakened by B19 dynamic HEAD read | 4525406 | 2026-04-11 |
 | B30 | B29 side-effect: merge/deploy self-locked by version gate | e3145f1 | 2026-04-11 |
 | B31 | Version gate dirty filter missing .claude/worktrees/* submodule refs | 42258ee | 2026-04-20 |
+| B33 | Self-introduced port 39103 claim in startup docs (non-existent supervisor port) | 1bed264 | 2026-04-20 |
 | B34 | QA recommendation allowlist mismatch (prompt vs validator vs gate) | 0d4689c | 2026-04-20 |
 | B35 | _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked | 651626c + a01ad54 | 2026-04-20 |
+| B36 | Retry prompt SCOPE CONSTRAINT wider than _gate_checkpoint enforces — dev ping-pong | 1748485 (bypass — see MF-2026-04-20-002) | 2026-04-20 |
 | B36 | Retry prompt SCOPE CONSTRAINT wider than gate enforces — dev ping-pong | 1748485 | 2026-04-20 |
 | B37 | Governance graph incomplete for MF-2026-04-20-001 affected nodes (related_docs empty, agent.deploy orphan_pending, reconcile.py unmapped) | (OPEN) | 2026-04-20 |
 | B38 | observer.md missing "Scheduled Health Audit & Backlog Maintenance" flow section | (OPEN) | 2026-04-20 |
@@ -194,13 +196,32 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 
 ### B32: `version-update` API `updated_by` allowlist doesn't match SOP R11 prescription [OPEN] [P2]
 
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P2
+bug_id: B32
+target_files: ["agent/governance/server.py"]
+test_files: ["agent/tests/test_version_update_auth.py"]
+acceptance_criteria:
+  - "AC1: Option A (preferred): server.py:2018 allowlist accepts prefix 'manual-fix' (any updated_by starting with 'manual-fix-'), rejecting shorter bare 'manual-fix' as ambiguous (must include slug)."
+  - "AC2: New audit field `manual_fix_reason` required when updated_by matches prefix 'manual-fix-'; endpoint returns 400 MANUAL_FIX_REASON_MISSING if absent."
+  - "AC3: Regression test: POST with updated_by='manual-fix-demo' + manual_fix_reason='test' succeeds; POST without reason returns 400; POST with updated_by='merge-service' unchanged (backwards compat)."
+  - "AC4: audit_service.record for version.update_attempt includes manual_fix_reason in details when present."
+  - "AC5: docs/governance/manual-fix-sop.md §13 R11 unchanged (option A = code matches SOP as-written)."
+chain_task_id: ""
+commit: ""
+note: "Design choice deferred — Option A (widen allowlist, preferred per entry) chosen in AC above. If user prefers Option B (SOP bends to impl, flip needs_chain=true with revised AC listing only doc changes)."
+-->
+
 - **Discovered**: 2026-04-20, MF-2026-04-20-001. Manual fix attempted to call `POST /api/version-update/aming-claw` with `updated_by="manual-fix-2026-04-20-docs-mcp-startup"` per `docs/governance/manual-fix-sop.md` R11 guidance. Server rejected with `INVALID_UPDATED_BY`.
-- **Symptom**: [agent/governance/server.py:2015](../../agent/governance/server.py) whitelists only `{"auto-chain", "init", "register", "merge-service"}`. SOP R11 format `manual-fix-<slug>` is rejected.
-- **Impact**: Every manual fix must invent a workaround. Current workaround: use `updated_by="merge-service"` with `task_id` set to the originating PM task. This muddles the audit trail because "merge-service" implies a real merge stage, not a manual fix.
+- **Symptom**: [agent/governance/server.py:2018](../../agent/governance/server.py) whitelists only `{"auto-chain", "init", "register", "merge-service"}`. SOP R11 format `manual-fix-<slug>` is rejected.
+- **Impact**: Every manual fix must invent a workaround. Current workaround: use `updated_by="merge-service"` with `task_id` set to the originating PM task. This muddles the audit trail because "merge-service" implies a real merge stage, not a manual fix. **Note**: B40 gap #3 (task.type not enforced) compounds this — `merge-service` bypass works even without a real merge task; any fabricated task_id passes.
 - **Fix options (pick one)**:
-  - **A (preferred)**: Widen allowlist to accept prefix `manual-fix` with an additional audit record that includes `manual_fix_reason` field. Keeps SOP R11 as-written.
+  - **A (preferred, in AC above)**: Widen allowlist to accept prefix `manual-fix-<slug>` with additional required `manual_fix_reason` audit field. Keeps SOP R11 as-written.
   - **B**: Update SOP R11 to document `merge-service` + `task_id` as the canonical manual-fix path (and rename the concept in-SOP). Lower code change, but SOP bends to impl.
-- **Fix files**: `agent/governance/server.py:2015` (allowlist), optional `agent/governance/audit_service.py` (new audit field), or `docs/governance/manual-fix-sop.md` §13 R11 if option B.
+- **Dependencies**: Should ideally land WITH B40 (unified endpoint auth). If B40 fix lands first with option (b)+(c), B32 becomes trivial — `manual-fix` just becomes one more allowed role in the updated_by↔role binding table.
+- **Fix files**: `agent/governance/server.py:2018` (allowlist), `agent/governance/audit_service.py` (new audit field), new test file `agent/tests/test_version_update_auth.py`.
 
 ### B35: _gate_version_check compares short git HEAD vs full chain_version — auto-chain silently blocked [FIXED]
 
@@ -235,13 +256,12 @@ P3   : gate 报错优化 / skip_reason 枚举审计
 - **No test updates needed**: grep shows no test references `qa_pass_with_fallback`. Validator-shared union of `{qa_pass, reject, merge_pass}` still passes all 6 `test_qa_output_validation.py` cases; 104 tests in `test_governance_gate_policy.py + test_executor_output_parsing.py + test_auto_chain_routing.py` all pass.
 - **Pre-existing unrelated failure**: `test_qa_gatekeeper_round1.py::TestQaGateRound2::test_governed_dirty_workspace_lane_defers_related_node_qa_block` fails both before and after this fix due to a MagicMock unpacking issue at line 2111 (`_try_verify_update` mocked without return_value tuple). Not caused by B34 fix.
 
-### B33: Self-introduced docs claim about port 39103 (non-existent supervisor port) [OPEN] [P2]
+### B33: Self-introduced docs claim about port 39103 (non-existent supervisor port) [FIXED] [P2]
 
-- **Discovered**: 2026-04-20, immediately after commit `1bed264`. Editing docs to replace the old false "MCP auto-starts executor" claim, I introduced a NEW false claim that ServiceManager supervision can be verified by checking port 39103. `agent/service_manager.py` does not bind any TCP port — singleton protection is done via the `start-manager.ps1` launcher using a named Windows mutex (`Global\aming_claw_manager`).
-- **Partial fix in-flight**: Corrected in commit following MF-2026-04-20-001 R8 loop — `docs/deployment.md` §5 and `docs/dev/session-status.md` "Starting a New Session" now describe process-tree verification (tasklist/pgrep for `service_manager.py`) instead of port check.
-- **Remaining risk**: The out-of-repo auto-memory `project_service_lifecycle.md` (under `~/.claude/projects/.../memory/`) also contained the port 39103 claim. Needs same correction.
+- **Status**: Fixed in-repo via commit `1bed264` (MF-2026-04-20-001 R8 loop). Auto-memory `project_service_lifecycle.md` also updated out-of-repo to describe process-tree verification (`tasklist/pgrep for service_manager.py`) instead of port check.
+- **Discovered**: 2026-04-20, immediately after commit `1bed264`. Editing docs to replace the old false "MCP auto-starts executor" claim, a NEW false claim was introduced that ServiceManager supervision can be verified by checking port 39103. `agent/service_manager.py` does not bind any TCP port — singleton protection is done via the `start-manager.ps1` launcher using a named Windows mutex (`Global\aming_claw_manager`).
+- **Fix files**: `docs/deployment.md` §5, `docs/dev/session-status.md` "Starting a New Session". Out-of-repo auto-memory also corrected.
 - **Lesson**: When correcting a false doc claim, do not introduce a replacement claim that hasn't been verified against code. This is a governance surface requiring a dry-run convention for doc-rewriting commits.
-- **Fix**: Already fixed in-repo; auto-memory correction is a separate out-of-repo operation (not a governance-tracked file).
 
 ### B36: Retry prompt SCOPE CONSTRAINT wider than `_gate_checkpoint` enforces — dev ping-pong [FIXED] [P2]
 
@@ -368,12 +388,18 @@ status: OPEN
 needs_chain: false
 priority: P1
 bug_id: B40
-target_files: []
-test_files: []
-acceptance_criteria: []
+target_files: ["agent/governance/server.py"]
+test_files: ["agent/tests/test_version_update_auth.py"]
+acceptance_criteria:
+  - "AC1 (gap 3 — task.type enforcement): when updated_by in ('auto-chain', 'merge-service') AND task_id provided AND task_row found in DB, reject if task.type != 'merge' with new error TASK_TYPE_NOT_MERGE. Implements at server.py:2037-2049 by adding task_row['type'] != 'merge' check after status check."
+  - "AC2 (gap 2 — fabricated task_id narrowed): when updated_by='merge-service' AND task_id provided AND task_row is None, reject with TASK_NOT_FOUND instead of 'allow (backward compat)' branch. Exception: empty task_id still allowed for init/register paths. Removes server.py:2047 backwards-compat comment + allow-path."
+  - "AC3 (gap 1 — token documentation): README + manual-fix-sop.md §13 document that prod deployments SHOULD set VERSION_UPDATE_TOKEN env var. Code unchanged in this fix — making token mandatory is deferred (breaks dev local workflow). Added warn log at startup if token unset."
+  - "AC4 (cron writeback path preserved): new updated_by value 'cron-writeback' added to allowlist, paired with AC1/AC2 exemption (does NOT require task_id or task.type='merge'). audit_service records actor='cron-writeback' for forensics. Documented in docs/governance/manual-fix-sop.md §14 (new)."
+  - "AC5 (tests): new agent/tests/test_version_update_auth.py covers: (i) merge-service + non-merge succeeded task → 400 TASK_TYPE_NOT_MERGE; (ii) merge-service + fabricated task_id → 400 TASK_NOT_FOUND; (iii) cron-writeback + empty task_id → 200 ok; (iv) auto-chain + merge task + succeeded → 200 ok (happy path regression)."
+  - "AC6 (B32 compatibility): if B32 Option A landed first (manual-fix-<slug>), that path gets its own exemption in AC1/AC2 similar to cron-writeback. If B32 not yet landed, leave server allowlist at current 4 entries + cron-writeback = 5 total."
 chain_task_id: ""
 commit: ""
-note: "Design choice pending: (a) close fabricated-task-id loophole, (b) enforce task.type=merge, (c) require VERSION_UPDATE_TOKEN in prod. Needs interactive design decision before PM task created."
+note: "AC drafted 2026-04-20 (observer). Recommended combo: AC1 (gap 3 close, low-risk) + AC4 (cron path legit) + AC5 (tests). AC2 is higher risk — may break other fake task_id callers we haven't discovered. Leave needs_chain=false until user approves AC set and prioritizes vs B32."
 -->
 
 - **Discovered**: 2026-04-20 during B36 manual-fix post-mortem.
