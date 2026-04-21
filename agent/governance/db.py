@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -212,6 +212,27 @@ CREATE TABLE IF NOT EXISTS pending_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_nodes_project ON pending_nodes(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_pending_nodes_node ON pending_nodes(project_id, node_id);
+
+-- Backlog bugs (DB-first backlog storage, OPT-DB-BACKLOG)
+CREATE TABLE IF NOT EXISTS backlog_bugs (
+    bug_id              TEXT PRIMARY KEY,
+    title               TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'OPEN',
+    priority            TEXT NOT NULL DEFAULT 'P3',
+    target_files        TEXT NOT NULL DEFAULT '[]',
+    test_files          TEXT NOT NULL DEFAULT '[]',
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    chain_task_id       TEXT NOT NULL DEFAULT '',
+    "commit"            TEXT NOT NULL DEFAULT '',
+    discovered_at       TEXT NOT NULL DEFAULT '',
+    fixed_at            TEXT NOT NULL DEFAULT '',
+    details_md          TEXT NOT NULL DEFAULT '',
+    chain_trigger_json  TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backlog_bugs_status ON backlog_bugs(status);
+CREATE INDEX IF NOT EXISTS idx_backlog_bugs_priority ON backlog_bugs(priority);
 """
 
 
@@ -687,7 +708,31 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
         c.execute("CREATE INDEX IF NOT EXISTS idx_pending_nodes_project ON pending_nodes(project_id, status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pending_nodes_node ON pending_nodes(project_id, node_id)")
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14}
+    def _migrate_v14_to_v15(c):
+        """Add backlog_bugs table for DB-first backlog storage (OPT-DB-BACKLOG)."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS backlog_bugs (
+                bug_id              TEXT PRIMARY KEY,
+                title               TEXT NOT NULL DEFAULT '',
+                status              TEXT NOT NULL DEFAULT 'OPEN',
+                priority            TEXT NOT NULL DEFAULT 'P3',
+                target_files        TEXT NOT NULL DEFAULT '[]',
+                test_files          TEXT NOT NULL DEFAULT '[]',
+                acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+                chain_task_id       TEXT NOT NULL DEFAULT '',
+                "commit"            TEXT NOT NULL DEFAULT '',
+                discovered_at       TEXT NOT NULL DEFAULT '',
+                fixed_at            TEXT NOT NULL DEFAULT '',
+                details_md          TEXT NOT NULL DEFAULT '',
+                chain_trigger_json  TEXT NOT NULL DEFAULT '{}',
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_backlog_bugs_status ON backlog_bugs(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_backlog_bugs_priority ON backlog_bugs(priority)")
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)

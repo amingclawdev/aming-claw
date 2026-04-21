@@ -2599,11 +2599,49 @@ def _build_deploy_prompt(task_id, result, metadata):
     }
 
 
+def _try_backlog_close_via_db(project_id, bug_id, commit_hash):
+    """Attempt to close a backlog bug via the DB-first REST endpoint.
+
+    Called from merge-stage finalize path when metadata.bug_id is set.
+    On success returns True. On 404 or connection error, logs a warning
+    (grep for 'backlog.*fallback' or 'backlog.*404') and returns False.
+    """
+    import urllib.request
+    import urllib.error
+
+    gov_url = os.environ.get("GOVERNANCE_URL", "http://localhost:40000").rstrip("/")
+    url = f"{gov_url}/api/backlog/{project_id}/{bug_id}/close"
+    data = json.dumps({"commit": commit_hash, "actor": "auto-chain"}).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status < 300:
+                log.info("backlog close: bug %s closed with commit %s", bug_id, commit_hash)
+                return True
+            log.warning("backlog close: unexpected status %d for bug %s — fallback to md", resp.status, bug_id)
+            return False
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            log.warning("backlog close: bug %s returned 404 — backlog fallback to md path", bug_id)
+        else:
+            log.warning("backlog close: HTTP %d for bug %s — backlog fallback to md path", exc.code, bug_id)
+        return False
+    except Exception as exc:
+        log.warning("backlog close: connection error for bug %s (%s) — backlog fallback to md path", bug_id, exc)
+        return False
+
+
 def _finalize_chain(conn, project_id, task_id, result, metadata):
     """Terminal stage after deploy succeeds.
 
     R4: Call version-sync then version-update to advance chain_version.
     R5: Verify server version == new HEAD; warn if stale.
+    R6 (OPT-DB-BACKLOG): Close backlog bug via DB if metadata.bug_id is set.
     """
     import subprocess as _sp
 
@@ -2636,6 +2674,15 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
             )
     except Exception as e:
         log.debug("_finalize_chain: version verify failed: %s", e)
+
+    # --- R6 (OPT-DB-BACKLOG): close backlog bug if metadata.bug_id set ---
+    bug_id = metadata.get("bug_id", "")
+    if bug_id:
+        commit_hash = result.get("merge_commit", metadata.get("merge_commit", ""))
+        closed = _try_backlog_close_via_db(project_id, bug_id, commit_hash)
+        finalize_result["backlog_closed"] = closed
+        if closed:
+            finalize_result["backlog_bug_id"] = bug_id
 
     return finalize_result
 

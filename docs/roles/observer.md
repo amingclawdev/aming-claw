@@ -259,6 +259,38 @@ docker logs -f <governance-container> 2>&1 | grep -E "memory\.|task\.|API |chain
 
 ---
 
+## Backlog storage migration
+
+The project backlog is now stored DB-first in the `backlog_bugs` table (governance DB schema v15). This decouples backlog storage from git, preventing manual commits to `docs/dev/bug-and-fix-backlog.md` from bumping HEAD and silently killing in-flight auto-chain stages (root cause of B47).
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `backlog_list` | List backlog bugs for a project, optionally filtered by status/priority |
+| `backlog_get` | Get details of a single backlog bug by ID |
+| `backlog_upsert` | Create or update a backlog bug entry (idempotent ON CONFLICT) |
+| `backlog_close` | Close a backlog bug (set status=FIXED with commit hash) |
+
+### REST Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/backlog/{pid}` | List bugs (?status=&priority=) |
+| GET | `/api/backlog/{pid}/{bug_id}` | Single bug detail (404 if missing) |
+| POST | `/api/backlog/{pid}/{bug_id}` | Upsert bug |
+| POST | `/api/backlog/{pid}/{bug_id}/close` | Close bug |
+
+### Backward compatibility
+
+The existing markdown backlog file (`docs/dev/bug-and-fix-backlog.md`) remains functional for in-flight chains. The merge-stage finalize path first attempts to close bugs via the DB endpoint; on 404 or connection error, it falls back gracefully to the md-edit path. No existing md-handling code has been removed.
+
+### ETL migration
+
+Use `python scripts/etl-backlog-md-to-db.py --dry-run` to preview, then `--apply` to bulk-import existing md bugs into the DB. The script is idempotent.
+
+---
+
 ## Prohibited Actions
 
 - Directly `sqlite3.connect()` governance.db — WAL lock

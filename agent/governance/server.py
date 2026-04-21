@@ -2862,6 +2862,154 @@ _DOCS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Backlog Endpoints (OPT-DB-BACKLOG)
+# ---------------------------------------------------------------------------
+
+@route("GET", "/api/backlog/{project_id}")
+def handle_backlog_list(ctx: RequestContext):
+    """List backlog bugs, optionally filtered by ?status= and ?priority=."""
+    pid = ctx.path_params["project_id"]
+    status_filter = ctx.query.get("status", "")
+    priority_filter = ctx.query.get("priority", "")
+    conn = get_connection(pid)
+    try:
+        sql = "SELECT * FROM backlog_bugs WHERE 1=1"
+        params = []
+        if status_filter:
+            sql += " AND status = ?"
+            params.append(status_filter)
+        if priority_filter:
+            sql += " AND priority = ?"
+            params.append(priority_filter)
+        sql += " ORDER BY created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
+        bugs = [dict(r) for r in rows]
+        return {"bugs": bugs, "count": len(bugs)}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/backlog/{project_id}/{bug_id}")
+def handle_backlog_get(ctx: RequestContext):
+    """Get a single backlog bug by ID. Returns 404 if missing."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+        return dict(row)
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/backlog/{project_id}/{bug_id}")
+def handle_backlog_upsert(ctx: RequestContext):
+    """Upsert a backlog bug (ON CONFLICT DO UPDATE)."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    body = ctx.body
+    now = _utc_now()
+    conn = get_connection(pid)
+    try:
+        conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, target_files, test_files,
+                acceptance_criteria, chain_task_id, "commit", discovered_at,
+                fixed_at, details_md, chain_trigger_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(bug_id) DO UPDATE SET
+                 title = excluded.title,
+                 status = excluded.status,
+                 priority = excluded.priority,
+                 target_files = excluded.target_files,
+                 test_files = excluded.test_files,
+                 acceptance_criteria = excluded.acceptance_criteria,
+                 chain_task_id = excluded.chain_task_id,
+                 "commit" = excluded."commit",
+                 discovered_at = excluded.discovered_at,
+                 fixed_at = excluded.fixed_at,
+                 details_md = excluded.details_md,
+                 chain_trigger_json = excluded.chain_trigger_json,
+                 updated_at = excluded.updated_at
+            """,
+            (
+                bug_id,
+                body.get("title", ""),
+                body.get("status", "OPEN"),
+                body.get("priority", "P3"),
+                json.dumps(body.get("target_files", [])),
+                json.dumps(body.get("test_files", [])),
+                json.dumps(body.get("acceptance_criteria", [])),
+                body.get("chain_task_id", ""),
+                body.get("commit", ""),
+                body.get("discovered_at", ""),
+                body.get("fixed_at", ""),
+                body.get("details_md", ""),
+                json.dumps(body.get("chain_trigger_json", {})),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        # Audit: backlog_upsert event
+        try:
+            audit_service.record(
+                conn, pid, "backlog_upsert",
+                actor=body.get("actor", "api"),
+                bug_id=bug_id,
+            )
+            conn.commit()
+        except Exception:
+            pass  # best-effort audit
+        return {"ok": True, "bug_id": bug_id, "action": "upserted"}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/backlog/{project_id}/{bug_id}/close")
+def handle_backlog_close(ctx: RequestContext):
+    """Close a backlog bug: set status=FIXED, commit, fixed_at."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    body = ctx.body
+    now = _utc_now()
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT bug_id FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status = 'FIXED',
+                   "commit" = ?,
+                   fixed_at = ?,
+                   updated_at = ?
+               WHERE bug_id = ?""",
+            (body.get("commit", ""), now, now, bug_id),
+        )
+        conn.commit()
+        # Audit: backlog_close event
+        try:
+            audit_service.record(
+                conn, pid, "backlog_close",
+                actor=body.get("actor", "auto-chain"),
+                bug_id=bug_id,
+            )
+            conn.commit()
+        except Exception:
+            pass  # best-effort audit
+        return {"ok": True, "bug_id": bug_id, "status": "FIXED", "fixed_at": now}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/docs")
 def handle_docs_index(ctx: RequestContext):
     """Return available documentation sections."""

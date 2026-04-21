@@ -113,6 +113,68 @@ TOOLS: list[dict] = [
             "required": ["project_id", "node_id", "kind", "content"],
         },
     },
+    # --- Backlog tools (OPT-DB-BACKLOG) ---
+    {
+        "name": "backlog_list",
+        "description": "List backlog bugs for a project, optionally filtered by status and priority.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project identifier."},
+                "status": {"type": "string", "description": "Filter by status (e.g. OPEN, FIXED)."},
+                "priority": {"type": "string", "description": "Filter by priority (e.g. P1, P2, P3)."},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "backlog_get",
+        "description": "Get details of a single backlog bug by ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "description": "Project identifier."},
+                "bug_id": {"type": "string", "description": "Bug identifier (e.g. B47)."},
+            },
+            "required": ["project_id", "bug_id"],
+        },
+    },
+    {
+        "name": "backlog_upsert",
+        "description": "Create or update a backlog bug entry.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "title": {"type": "string"},
+                "status": {"type": "string"},
+                "priority": {"type": "string"},
+                "target_files": {"type": "array", "items": {"type": "string"}},
+                "test_files": {"type": "array", "items": {"type": "string"}},
+                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "chain_task_id": {"type": "string"},
+                "commit": {"type": "string"},
+                "discovered_at": {"type": "string"},
+                "details_md": {"type": "string"},
+                "chain_trigger_json": {"type": "object"},
+            },
+            "required": ["project_id", "bug_id"],
+        },
+    },
+    {
+        "name": "backlog_close",
+        "description": "Close a backlog bug (set status=FIXED with commit hash).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "commit": {"type": "string", "description": "Git commit hash that fixes the bug."},
+            },
+            "required": ["project_id", "bug_id"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -176,6 +238,34 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     if name == "gov_memory_write":
         pid = args["project_id"]
         return _http("POST", f"/api/wf/{pid}/memory", args)
+
+    # --- Backlog tools (OPT-DB-BACKLOG) ---
+    if name == "backlog_list":
+        pid = args["project_id"]
+        qs = ""
+        parts = []
+        if args.get("status"):
+            parts.append(f"status={args['status']}")
+        if args.get("priority"):
+            parts.append(f"priority={args['priority']}")
+        if parts:
+            qs = "?" + "&".join(parts)
+        return _http("GET", f"/api/backlog/{pid}{qs}")
+
+    if name == "backlog_get":
+        pid = args["project_id"]
+        bug_id = args["bug_id"]
+        return _http("GET", f"/api/backlog/{pid}/{bug_id}")
+
+    if name == "backlog_upsert":
+        pid = args["project_id"]
+        bug_id = args["bug_id"]
+        return _http("POST", f"/api/backlog/{pid}/{bug_id}", args)
+
+    if name == "backlog_close":
+        pid = args["project_id"]
+        bug_id = args["bug_id"]
+        return _http("POST", f"/api/backlog/{pid}/{bug_id}/close", args)
 
     raise ValueError(f"Unknown tool: {name!r}")
 
