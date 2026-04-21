@@ -611,15 +611,15 @@ test_files: []
   - Tooling: wrapper script `scripts/safe-commit.ps1` that runs `git commit` + `version-sync` + `version-update` sequentially with mutual timeout; refuses to commit if `task_list claimed+queued > 0`
 - **Immediate action taken**: Manually spawned qa task (task-id TBD) with preserved chain metadata (parent_task_id=test task, chain_depth=6, _worktree/_branch from dev task). Chain continues qa→gatekeeper→merge with remaining 4-stage budget.
 
-### OPT-DB-BACKLOG: Move `bug-and-fix-backlog.md` into governance DB table [PROPOSED] [P3]
+### OPT-DB-BACKLOG: Move `bug-and-fix-backlog.md` into governance DB table [LANDED phase1] (3a7be63) [P3]
 
 <!-- chain-trigger:
-status: PROPOSED
+status: LANDED
 needs_chain: false
 priority: P3
 bug_id: OPT-DB-BACKLOG
-target_files: []
-test_files: []
+target_files: ["agent/governance/db.py", "agent/governance/server.py", "agent/governance/mcp_server.py", "agent/governance/auto_chain.py", "scripts/etl-backlog-md-to-db.py", "docs/roles/observer.md"]
+test_files: ["agent/tests/test_backlog_db.py"]
 -->
 
 - **Motivation**: B47 root cause is that metadata edits (backlog, audit log) share the same HEAD as code. Every backlog commit bumps HEAD and can silently kill an in-flight chain. Decoupling metadata from git removes the hazard at the source.
@@ -654,6 +654,53 @@ test_files: []
   5. Verify `version_check.ok == true` before returning
 - **Cost**: ~80 LoC PowerShell + 3-line whitelist change in version-update endpoint (accept `updated_by="manual-fix"`). ~1 iteration.
 - **Recommendation**: Land this in a small chain right after B47 diagnosis; use it as the official way for observer/operator to commit backlog/doc changes until OPT-DB-BACKLOG ships.
+
+### B48: ServiceManager spawns overlapping executors; new worker's `_recover_stuck_tasks` overwrites live claimed tasks [OPEN] [P1]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P1
+bug_id: B48
+target_files: ["agent/service_manager.py", "agent/executor_worker.py"]
+test_files: []
+-->
+
+- **Discovered**: 2026-04-21 during OPT-DB-BACKLOG chain. Cron `amingclaw-workflow` (`*/17 * * * *` + jitter=494s) spawned takeover executors while the previous executor was mid-task. Timeline:
+  - 04:20:56 executor PID 2568 started
+  - 04:24:27 executor PID 30420 started — log shows `_acquire_pid_lock: another executor instance appears to be running (PID 2568); proceeding anyway`
+  - 04:39:48 executor PID 40508 started — same "proceeding anyway" warning
+  - Each new worker called `_recover_stuck_tasks` on startup, marked the actively-claimed task (task-1776745238-b18385, dev stage, Claude CLI ~12min mid-run) as `executor_crash_recovery`, clobbering the live lease and blocking completion. The dev worker did finish (700s, 7 files staged in worktree) but `task_complete` was silently rejected because fence_token had been invalidated.
+- **Symptom**: dev task shows succeeded in `timing-*.txt` log with real diff, but `task_list` shows it in `executor_crash_recovery` state, chain halted, no spawn of next stage. Worktree under `.worktrees/dev-task-<id>` still contains the real work.
+- **Root cause**: `_acquire_pid_lock` is advisory ("proceeding anyway") rather than enforcing. Cron-driven ServiceManager takeover assumes prior SM is dead, but startup SOP (`start-manager.ps1 -Takeover`) spawns a new SM + new executor every cron fire. With 17-min cadence and tasks occasionally running >17min, overlap is guaranteed.
+- **Related**: B47 (HEAD-advance silent drop — different code path but same family: in-flight chain destroyed by observer-visible concurrent action). Interacts with fence_token lease system: stale lease from Worker A is still "claimed" when Worker B's recovery sweep fires, which then invalidates the token.
+- **Why this matters**: Any chain whose dev/test stage exceeds the cron interval (17 min) will be silently killed. Explains today's OPT-DB-BACKLOG stall despite dev work completing successfully. Workflow self-bootstrap is unreliable until this is fixed.
+- **Proposed fix direction**:
+  - Option A: `_acquire_pid_lock` should **fail hard** if prior executor is alive (check PID + lock file + recent heartbeat in governance DB). Cron takeover should be a no-op when an executor is already healthy, not a spawn.
+  - Option B: `_recover_stuck_tasks` should skip tasks whose `claimed_at + fence_ttl > now` (i.e., lease still valid) instead of blind sweep. Only recover tasks whose lease has actually expired.
+  - Option C (preferred): both. A prevents the root condition (overlapping workers), B makes the recovery sweep safe even if A fails.
+- **Workaround** (until B48 lands): disable `amingclaw-workflow` cron during long chains; only restart ServiceManager manually when observer confirms executor is dead.
+
+### B49: Governance checkpoint gate demands updates to deleted doc `docs/executor-api-guide.md`; acceptance_graph still references it [OPEN] [P1]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P1
+bug_id: B49
+target_files: ["docs/governance/acceptance-graph.md"]
+test_files: []
+-->
+
+- **Discovered**: 2026-04-21 during OPT-DB-BACKLOG recovery. After B48-induced dev failure, attempted retry task was rejected by `checkpoint_gate` with doc-consistency error: "required doc `docs/executor-api-guide.md` not updated". The file was deleted in commit c4752fa ("delete 29 redirect stubs and superseded files after restructuring") but the acceptance_graph still lists it in one or more nodes' `docs:` field.
+- **Symptom**: Gate demands edits to a file that no longer exists → any chain whose wf_impact touches those nodes is permanently blocked until graph is patched or file is re-created.
+- **Root cause**: When `delete-redirect-stubs` cleanup ran, it removed files from disk but did not sweep `docs/governance/acceptance-graph.md` for dangling `docs:` references. The gate checker assumes graph references are ground truth and does not fall back to "skip if file absent".
+- **Proposed fix direction**:
+  - Option A: grep acceptance-graph.md for every `docs:` entry, confirm file exists on disk, delete dangling references. Preventive sweep.
+  - Option B: gate's doc-consistency check should treat "referenced doc does not exist" as a graph-integrity warning (logged, not blocking) rather than a chain-fatal error. Defensive.
+  - Option C (preferred): both. A fixes today's block; B prevents the next file-rename from recreating the same failure mode.
+- **Related**: B49 is the file-deletion analogue of B48's concurrent-worker trap — both are "chain gets silently killed by out-of-band state mutation the gate wasn't written to tolerate". Graph integrity belongs to the same family as B47 (HEAD-vs-chain drift) and the Bug 7 "silent drop" family.
+- **Workaround**: before any retry chain, grep graph for `docs/executor-api-guide.md` and delete those lines; or observer-bypass with doc_consistency_override in gatekeeper metadata.
 
 ---
 
@@ -824,4 +871,4 @@ followup_needed:
 
 ## Test Count
 
-1003 tests pass (B30 +10: version_gate_round4×3 + auto_chain_version_cache×4 rewritten + net +3 new), 7 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block, test_try_verify_update_returns_true_on_success, test_try_verify_update_returns_false_on_exception), 3 skipped.
+1026 tests pass (OPT-DB-BACKLOG phase1 +23 test_backlog_db; B30 +10: version_gate_round4×3 + auto_chain_version_cache×4 rewritten + net +3 new), 7 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block, test_try_verify_update_returns_true_on_success, test_try_verify_update_returns_false_on_exception), 3 skipped.
