@@ -493,6 +493,51 @@ note: "Observational only — not a code bug, a Windows DPAPI/login-session arti
 
 ---
 
+### B43: Executor subprocess inherits `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` from Claude Code desktop parent — Dev stage hits `ConnectionRefused` [FIXED] (2570f05) [P1]
+
+<!-- chain-trigger:
+status: FIXED
+needs_chain: false
+priority: P1
+bug_id: B43
+target_files: ["agent/ai_lifecycle.py"]
+test_files: []
+chain_task_id: ""
+commit: "2570f05"
+-->
+
+- **Discovered**: 2026-04-20, during Stage 1 workflow self-bootstrap. Dev task-1776727183-a02e52 for B41 AC2 failed after 181s with `API Error: Unable to connect to API (ConnectionRefused)`. PM tasks on the same shell worked fine.
+- **Root cause**: When ServiceManager is spawned from a terminal running under Claude Code desktop, the environment includes `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` (plus `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`, etc.). The executor subprocess inherits these vars and invokes `claude -p`, which attempts to delegate to a nonexistent localhost IPC owned by the desktop app's parent process → immediate ConnectionRefused. PM succeeded because its shorter prompt hit the OAuth fallback path first; Dev's longer prompt reached the managed-by-host codepath.
+- **Fix** (`2570f05`): `agent/ai_lifecycle.py` env scrub extended from 2 to 7 vars — adds `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`, `CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES`, `CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL`. Preserves `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Verification**: Post-fix, Dev task-1776735440-69d66c ran cleanly in 186s, Claude CLI spawned without ConnectionRefused.
+- **Related**: B42 (OAuth token binding) — same family of subprocess env contamination from Claude Code desktop. Together they explain the "works in my shell, fails in SM" class of auth/connection failures.
+- **Governance**: `agent/ai_lifecycle.py` at governance-internal (bypasses full chain per `_GOVERNANCE_INTERNAL_PREFIXES`). Fix is 5 added strings in an existing blocklist. No test added — the failure mode requires Claude Code desktop parent context which is hard to reproduce in CI.
+
+---
+
+### B44: `_gate_t2_pass` hard-blocks on impact-enriched `related_nodes` — chain self-repair loop on stale graph-drift nodes [FIXED] (4e20f21) [P1]
+
+<!-- chain-trigger:
+status: FIXED
+needs_chain: false
+priority: P1
+bug_id: B44
+target_files: ["agent/governance/auto_chain.py"]
+test_files: ["agent/tests/test_t2_pass_gate_deferral.py"]
+chain_task_id: "task-1776735731-2ca54a"
+commit: "4e20f21"
+-->
+
+- **Discovered**: 2026-04-20, during Stage 1 workflow self-bootstrap for B41 AC2/AC3. Dev+Test succeeded (26/0 pytest pass), but `_gate_t2_pass` blocked promotion with `related_nodes not yet at t2_pass: [L4.25, L4.29, L4.30, L4.34, L4.35, L4.37, L4.40]`. These nodes are stale graph drift from prior manual-fix commits (B27/B28a/B28b/B29/B30/B33/B34/B35/B35ext/B36) that did not walk the workflow to produce `t2_pass` events.
+- **Chicken-and-egg**: The workflow's `create_pm_task` repair loop generated the correct fix at iteration 7 (modify `_gate_t2_pass` to defer when over-broad), but the fix can only take effect after merge+SM reload, and the same gate blocks merge. Dev chain hit `chain_depth=5/10` across 4 retry cycles without breakout.
+- **Fix** (`4e20f21`): Landed the workflow-generated iter-7 patch manually. `_gate_t2_pass` now captures `(vu_ok, vu_err)` from `_try_verify_update`; when `_check_nodes_min_status` finds pending nodes, it emits a `log.warning('t2_pass_gate: deferring related_nodes ...')` and returns `(True, 'ok')` instead of blocking. Two warning modes: verify_update failure vs over-broad impact-enriched neighbors. Matches the existing deferral pattern in `_gate_checkpoint` and `_gate_qa_pass`. **Test failures (`report.failed > 0`) still hard-block** — deferral only applies to node-status checks, not test result validation.
+- **Test** (`agent/tests/test_t2_pass_gate_deferral.py`, 6 tests): happy path (no warning), vu_ok=False defer, over-broad defer, test-failures hard-block, missing test_report hard-block, no related_nodes edge case.
+- **Why this matters**: without B44, any new chain whose `related_nodes` overlap with stale graph nodes triggers infinite self-repair loops until `MAX_CHAIN_DEPTH=10`. The fix allows workflow self-bootstrap on projects with drift-affected governance graphs — critical prerequisite for cron observer mode.
+- **Related**: B41 (the chain that surfaced the issue), B35/B36 (prior graph-drift symptoms), `_gate_checkpoint` deferral pattern (D5), `feedback_governance_db_is_event_log.md` (drift can only be cleared by re-verifying, not by writing state directly).
+- **Governance**: `agent/governance/auto_chain.py` at governance-internal (bypasses full chain). Single-function change; 18 LoC in gate, 218 LoC of tests. Low blast radius — deferral only activates when a hard block would have fired.
+
+---
+
 ## Manual Fix Audit Log
 
 ### MF-2026-04-20-001 — Correct stale MCP auto-start claims in startup docs
