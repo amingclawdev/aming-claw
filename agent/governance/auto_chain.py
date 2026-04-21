@@ -1218,19 +1218,34 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 if workflow_improvement:
                     out["workflow_improvement_task_id"] = workflow_improvement["task_id"]
                 return out
+            # OPT-BACKLOG-CH2: fallback-fill missing bug_id from chain store
+            # before creating retry task. Protects against in-process metadata
+            # drops between stages (e.g. test→dev hop losing parent's metadata).
+            _dev_retry_meta = {
+                **metadata,
+                "parent_task_id": task_id,
+                "chain_depth": depth + 1,
+                "failure_reason": failure_reason,
+                "retry_from_stage": task_type,
+                "_original_prompt": original_prompt,
+            }
+            if not _dev_retry_meta.get("bug_id"):
+                try:
+                    from .chain_context import get_store as _get_ctx_store_bug
+                    _chain_bug = _get_ctx_store_bug().get_bug_id(task_id)
+                    if _chain_bug:
+                        _dev_retry_meta["bug_id"] = _chain_bug
+                        log.info("auto_chain: CH2 fallback-filled bug_id=%s for dev-retry of %s",
+                                 _chain_bug, task_id)
+                except Exception:
+                    log.debug("auto_chain: CH2 bug_id fallback failed for %s", task_id, exc_info=True)
+
             dev_retry = task_registry.create_task(
                 conn, project_id,
                 prompt=stage_retry_prompt,
                 task_type="dev",
                 created_by="auto-chain-stage-retry",
-                metadata={
-                    **metadata,
-                    "parent_task_id": task_id,
-                    "chain_depth": depth + 1,
-                    "failure_reason": failure_reason,
-                    "retry_from_stage": task_type,
-                    "_original_prompt": original_prompt,
-                },
+                metadata=_dev_retry_meta,
                 trace_id=_trace_id,
                 chain_id=_chain_id,
             )
@@ -1354,6 +1369,20 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             _retry_meta.pop("_branch", None)
             # R1: Remove inherited failure_reason from grandparent — only current gate reason kept
             _retry_meta.pop("failure_reason", None)
+
+            # OPT-BACKLOG-CH2: fallback-fill missing bug_id from chain store. Retries
+            # inherit parent's metadata via {**metadata} above, but if bug_id was
+            # dropped somewhere upstream, the chain-level store still knows it.
+            if not _retry_meta.get("bug_id"):
+                try:
+                    from .chain_context import get_store as _get_ctx_store_bug2
+                    _chain_bug = _get_ctx_store_bug2().get_bug_id(task_id)
+                    if _chain_bug:
+                        _retry_meta["bug_id"] = _chain_bug
+                        log.info("auto_chain: CH2 fallback-filled bug_id=%s for %s same-stage-retry of %s",
+                                 _chain_bug, task_type, task_id)
+                except Exception:
+                    log.debug("auto_chain: CH2 bug_id fallback failed for %s", task_id, exc_info=True)
 
             retry_task = task_registry.create_task(
                 conn, project_id,
@@ -1521,6 +1550,9 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     log.info("auto_chain: %s→%s | %s → %s",
              task_type, next_type, task_id, new_task.get("task_id"))
+    # OPT-BACKLOG-CH2: forward metadata.bug_id in task.created payload so
+    # chain_context.on_task_created can populate chain.bug_id (first-write-wins).
+    # Retry paths then fallback-fill from chain store when metadata is lost.
     _publish_event("task.created", {
         "project_id": project_id,
         "parent_task_id": task_id,
@@ -1528,6 +1560,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         "type": next_type,
         "prompt": prompt,
         "source": "auto-chain",
+        "metadata": {"bug_id": task_meta.get("bug_id", "")},
     })
     return new_task
 

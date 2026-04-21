@@ -146,3 +146,66 @@ via `_hv_log` (file-based, written to `shared-volume/codex-tasks/logs/coordinato
 ### Observer note
 
 Before this autotag landed, observers had to manually set `metadata.bug_id` on every coordinator task. That discipline remains valid — the autotag is a fallback for cases where the observer forgets or for AI-driven flows that cite the ID in prose. Pre-declaring the backlog entry (see `docs/dev/manual-fix-sop.md` §13) plus passing `metadata.bug_id` explicitly is still the canonical form.
+
+---
+
+## OPT-BACKLOG-CH2: Chain-Level bug_id Propagation
+
+**Added:** 2026-04-21 | **Source:** `ChainContext.bug_id` + `get_bug_id` in `agent/governance/chain_context.py`; retry-metadata fallback in `agent/governance/auto_chain.py` | **Graph node:** L4.43 (backlog-as-chain-source policy, same as CH1)
+
+### Purpose
+
+CH1 makes sure the **first** coord→PM hop carries `metadata.bug_id`. But that tag only survives as long as the in-process metadata dict survives. Any of these can drop it:
+
+- A retry task builds new metadata from a parent whose `bug_id` was already stripped.
+- A gate-block reflex re-dispatches from a stage that lost the field in transit.
+- The governance process restarts, and the replay path has to reconstitute context from `chain_events` rather than a live dict.
+
+CH2 makes `bug_id` durable at the **chain** level. Once any task in the chain announces a `bug_id` via its `task.created` event, the `ChainContextStore` memorizes it on the `ChainContext` (first-write-wins). Retry code paths fall back to this chain-level tag when their own metadata comes up empty.
+
+### Contract
+
+- **`ChainContext.bug_id`** — `Optional[str]`, defaults to `None`. Listed in `__slots__`, so typos raise `AttributeError` instead of silently appearing.
+- **First-write-wins** — `on_task_created` only sets `chain.bug_id` if it is currently `None` and the incoming `payload.metadata.bug_id` is a non-empty string. Subsequent stages with a different `bug_id` do **not** overwrite. (Defensive behavior: unexpected override usually means bug swap mid-chain, which is a caller bug.)
+- **Read API** — `ChainContextStore.get_bug_id(task_id) -> Optional[str]`. Resolves any `task_id` in the chain to the shared chain-level `bug_id`. Returns `None` for unknown tasks or chains without a tag.
+- **Serialization** — `get_chain(...)` includes `"bug_id": <value>` only when set. Backward compatible: existing callers who never asked for the field still see the same shape.
+
+### Event payload shape
+
+`auto_chain._dispatch_next_stage` publishes `task.created` with:
+
+```json
+{
+  "project_id": "...",
+  "parent_task_id": "...",
+  "task_id": "...",
+  "type": "dev",
+  "prompt": "...",
+  "source": "auto-chain",
+  "metadata": {"bug_id": "<forwarded>"}
+}
+```
+
+The `metadata` key is new as of CH2 and is the signal `chain_context.on_task_created` reads. Older payloads without `metadata` are still valid — `bug_id` simply stays `None` until some later stage introduces it.
+
+### Retry-path fallback (the whole point)
+
+Two retry sites in `auto_chain.py` now fallback-fill before calling `task_registry.create_task`:
+
+1. **Cross-stage retry** (test/qa failure → dev retry, around line 1221): if the reconstructed retry metadata lacks `bug_id`, consult `get_store().get_bug_id(task_id)` and inject it.
+2. **Same-stage retry** (gate-block reflex, around line 1344): same pattern, applied after stripping `_worktree`/`_branch`/`failure_reason`.
+
+Both paths emit an `auto_chain: CH2 fallback-filled bug_id=...` log line on success so the fallback is observable.
+
+### Crash recovery
+
+`ChainContextStore.recover_from_db` replays persisted `chain_events` through the same `on_task_created` handler. Because our `task.created` payloads now include `metadata.bug_id`, replay reconstitutes the chain's `bug_id` automatically — no separate recovery codepath needed. Events written before CH2 (no `metadata` key) leave `bug_id` as `None`; those chains predate the feature and do not benefit from it.
+
+### Relationship with CH1
+
+CH1 is the **source** (autotag the coordinator task). CH2 is the **sink's insurance** (keep the tag alive through retries and restarts). Together they close the loop: every chain starts with a `bug_id`, every chain preserves it, and the merge-stage backlog-close helper (`_try_backlog_close_via_db`) never runs dry.
+
+### Test coverage
+
+- `agent/tests/test_chain_context_bugid.py` — 19 tests covering field presence, `__slots__` enforcement, first-write-wins, empty/non-string rejection, late-arrival population, cross-stage read, serialize round-trip, retry-fallback simulation, crash-recovery replay, idempotency.
+- `agent/tests/test_chain_context.py` — 25 regression tests continue to pass (no behavior change for chains without `bug_id`).

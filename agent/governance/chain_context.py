@@ -101,6 +101,7 @@ class ChainContext:
     __slots__ = (
         "root_task_id", "project_id", "stages",
         "current_stage", "state", "created_at", "updated_at",
+        "bug_id",  # OPT-BACKLOG-CH2: chain-level bug_id for retry inheritance
     )
 
     def __init__(self, root_task_id, project_id):
@@ -111,6 +112,10 @@ class ChainContext:
         self.state = "running"
         self.created_at = _utc_iso()
         self.updated_at = self.created_at
+        # OPT-BACKLOG-CH2: first-write-wins bug_id, populated by on_task_created
+        # from payload.metadata.bug_id. Once set, never overwritten for the life
+        # of the chain. Used by retry paths to fallback-fill missing metadata.bug_id.
+        self.bug_id = None
 
 
 class ChainContextStore:
@@ -131,6 +136,13 @@ class ChainContextStore:
         task_type = payload.get("type", "task")
         prompt = payload.get("prompt", "")
         project_id = payload.get("project_id", "")
+        # OPT-BACKLOG-CH2: extract bug_id from payload.metadata for first-write-wins
+        _meta = payload.get("metadata") or {}
+        incoming_bug_id = _meta.get("bug_id") if isinstance(_meta, dict) else None
+        if incoming_bug_id is not None and not isinstance(incoming_bug_id, str):
+            incoming_bug_id = None  # Only accept non-empty strings
+        if not incoming_bug_id:
+            incoming_bug_id = None
 
         with self._lock:
             # Skip if already registered (idempotent)
@@ -152,6 +164,10 @@ class ChainContextStore:
             chain.current_stage = task_id
             chain.updated_at = _utc_iso()
             self._task_to_root[task_id] = root_id
+
+            # OPT-BACKLOG-CH2: first-write-wins bug_id at chain level
+            if incoming_bug_id and chain.bug_id is None:
+                chain.bug_id = incoming_bug_id
 
         self._persist_event(root_id, task_id, "task.created", payload, project_id)
 
@@ -312,6 +328,20 @@ class ChainContextStore:
                 return None
             chain = self._chains.get(root_id)
             return chain.state if chain else None
+
+    def get_bug_id(self, task_id: str) -> str | None:
+        """Get chain-level bug_id for any task in chain (OPT-BACKLOG-CH2).
+
+        Returns the chain's first-write-wins bug_id, or None if unknown/unset.
+        Used by auto_chain retry paths as a fallback when retry metadata lost
+        its inherited bug_id (e.g. in-process metadata dict dropped).
+        """
+        with self._lock:
+            root_id = self._task_to_root.get(task_id)
+            if not root_id:
+                return None
+            chain = self._chains.get(root_id)
+            return chain.bug_id if chain else None
 
     def get_latest_test_report(self, task_id: str, project_id: str = "") -> dict | None:
         """Get the most recent test_report for the chain containing task_id.
@@ -548,7 +578,7 @@ class ChainContextStore:
 
             stages.append(stage_dict)
 
-        return {
+        out = {
             "root_task_id": chain.root_task_id,
             "project_id": chain.project_id,
             "state": chain.state,
@@ -558,6 +588,10 @@ class ChainContextStore:
             "created_at": chain.created_at,
             "updated_at": chain.updated_at,
         }
+        # OPT-BACKLOG-CH2: include bug_id only when set (backward compatible)
+        if chain.bug_id:
+            out["bug_id"] = chain.bug_id
+        return out
 
     # ── DB Persistence ──
 
