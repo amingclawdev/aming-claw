@@ -578,6 +578,83 @@ commit: "7b7f6df"
 - **Related**: B44 (t2_pass deferral — same family of gate-vs-reality mismatch); B45 (workspace resolution); `preflight.py` and `reconcile.py` are the two code paths that write `verify_status='waived'`.
 - **Governance**: `agent/governance/state_service.py` is governance-internal (bypasses full chain). 7 LoC function change + 20 LoC regression test (`test_b46_waived_to_qa_pass_is_noop`). All 13 `test_governance_state.py` tests pass. Low blast radius — change only affects the no-op early-exit path; all real transitions still execute `check_transition` → evidence validation → gate check → audit.
 
+### B47: auto_chain silently drops next-stage spawn when a manual commit bumps HEAD during an in-flight chain window [OPEN] [P1]
+
+<!-- chain-trigger:
+status: OPEN
+needs_chain: false
+priority: P1
+bug_id: B47
+target_files: ["agent/governance/auto_chain.py", "scripts/start-governance.ps1"]
+test_files: []
+-->
+
+- **Discovered**: 2026-04-21 02:45Z, during B41-AC2 Stage 1 self-bootstrap chain. Reproducer timeline:
+  - 02:43:40Z `version-update` → chain_version=7b7f6df (aligned with HEAD)
+  - 02:44:~Z manual `git commit fc6c014` (`docs: file B46 [FIXED] in backlog`) → HEAD advances, chain_version stays 7b7f6df
+  - 02:45:33Z `test` task (task-1776739361-4d7f20) completes successfully; auto_chain *should* spawn `qa` → **no qa task created**, no failure event, no retry task, no governance log
+  - 02:46:11Z `version-update` → chain_version=fc6c014 (realigned, too late)
+- **Symptom**: `task_list` shows 0 claimed, 0 queued. Test task's completion log shows `chain: ` (empty) + `status: succeeded`. Chain silently halts at the post-test→qa transition.
+- **Why D3 does not save this**: D3 (942b5de) downgraded the **dirty-workspace** check to warning-only. The silent drop here is in a *different* code path (next-stage spawn version comparison); it is not covered by D3. Also confirmed: `docs/dev/` is already in `_DIRTY_IGNORE`, so this is not a dirty-file issue.
+- **Related**: Bug 7 family ("silent drop"). Prior members — D5 (dirty `.claude/settings.local.json`), B31 (`.claude/worktrees/*` submodule refs), B35 (short vs full hash compare). B47 is the 4th member of the family: **HEAD advance during active chain**.
+- **Why this matters**: Any manual commit (doc update, backlog edit, hotfix) during an active chain window can silently kill the chain without any visible error. Observer cannot detect the drop because nothing is emitted to logs or events. Blocks unattended workflow self-bootstrap, because a well-meaning observer editing the backlog between stages will brick the chain.
+- **Diagnosis gap**: `scripts/start-governance.ps1` does not redirect stdout/stderr to a log file. Current governance (PID 60052) writes nothing to disk. Investigating B47's exact code path requires:
+  1. Patch `start-governance.ps1` to redirect stdout + stderr to `shared-volume/codex-tasks/logs/governance-<pid>.log`
+  2. Restart governance
+  3. Reproduce silent drop (manual commit during chain)
+  4. Grep for `version_check:` / `spawn_next_stage` / relevant stack trace
+- **Proposed fix direction** (pending diagnosis):
+  - Option A: `spawn_next_stage` reads HEAD live (via `git rev-parse`) rather than DB `chain_version`, and compares only "is the worktree broken" — never blocks on HEAD≠chain_version
+  - Option B: Atomic `post_commit_hook` that wraps `git commit` + `version-sync` + `version-update` → eliminates the mismatch window at the source (shifts burden to developer tooling)
+- **Proposed workarounds** (until B47 lands):
+  - Rule: **do not `git commit` while any chain has in-flight tasks** (claimed, queued, or within the current chain_depth budget)
+  - Tooling: wrapper script `scripts/safe-commit.ps1` that runs `git commit` + `version-sync` + `version-update` sequentially with mutual timeout; refuses to commit if `task_list claimed+queued > 0`
+- **Immediate action taken**: Manually spawned qa task (task-id TBD) with preserved chain metadata (parent_task_id=test task, chain_depth=6, _worktree/_branch from dev task). Chain continues qa→gatekeeper→merge with remaining 4-stage budget.
+
+### OPT-DB-BACKLOG: Move `bug-and-fix-backlog.md` into governance DB table [PROPOSED] [P3]
+
+<!-- chain-trigger:
+status: PROPOSED
+needs_chain: false
+priority: P3
+bug_id: OPT-DB-BACKLOG
+target_files: []
+test_files: []
+-->
+
+- **Motivation**: B47 root cause is that metadata edits (backlog, audit log) share the same HEAD as code. Every backlog commit bumps HEAD and can silently kill an in-flight chain. Decoupling metadata from git removes the hazard at the source.
+- **Alternative to gitignoring `docs/dev/`**: gitignoring loses git blame + PR review + other-workspace visibility. DB-backed backlog keeps all of these via `audit_service` + MCP query interface, and observer/cron already speak DB-first.
+- **Proposal sketch**:
+  - Schema: `backlog_bugs(id, bug_id, title, status, priority, target_files, test_files, chain_trigger_yaml, discovered_at, fixed_at, fixed_commit, details_md)`; `backlog_audit(bug_id, action, actor, ts, before/after JSON)` via existing audit_service
+  - MCP tools: `backlog_list`, `backlog_upsert`, `backlog_close` (observer-authored)
+  - Observer/cron reads DB directly instead of parsing `docs/dev/bug-and-fix-backlog.md`
+  - One-time ETL: parse current markdown → DB rows
+  - markdown file kept as read-only summary, auto-generated from DB nightly (for human review / PR context)
+- **Cost**: ~400 LoC (schema + CRUD + ETL + tests + doc rewrite), 2–3 iterations. Medium blast radius.
+- **Recommendation**: Do this **alongside cron observer GA**, not before. Until B47 is diagnosed and fixed (or a safe-commit wrapper exists), enforce the manual rule "no commits during active chain".
+- **Priority rationale**: P3 because B47 fix (HEAD-live comparison) resolves the immediate pain at ~40 LoC; DB backlog is an architectural improvement, not a workaround.
+
+### OPT-SAFE-COMMIT: `scripts/safe-commit.ps1` wrapper (atomic commit + version-sync + version-update) [PROPOSED] [P2]
+
+<!-- chain-trigger:
+status: PROPOSED
+needs_chain: false
+priority: P2
+bug_id: OPT-SAFE-COMMIT
+target_files: ["scripts/safe-commit.ps1"]
+test_files: []
+-->
+
+- **Motivation**: Close the HEAD-vs-chain_version window to <1 second without waiting for B47's structural fix. Preserves current workflow (markdown backlog, normal git), adds a tooling guardrail.
+- **Behavior**:
+  1. Refuse to commit if `mcp__aming-claw__task_list claimed+queued > 0` (hard stop, human-visible error) — unless `-Force` flag passed (observer-authored exception)
+  2. Run `git commit` with user-supplied message
+  3. Immediately call `/api/version-sync/aming-claw` with new short HEAD
+  4. Immediately call `/api/version-update/aming-claw` with `updated_by="manual-fix"` (whitelist extension)
+  5. Verify `version_check.ok == true` before returning
+- **Cost**: ~80 LoC PowerShell + 3-line whitelist change in version-update endpoint (accept `updated_by="manual-fix"`). ~1 iteration.
+- **Recommendation**: Land this in a small chain right after B47 diagnosis; use it as the official way for observer/operator to commit backlog/doc changes until OPT-DB-BACKLOG ships.
+
 ---
 
 ## Manual Fix Audit Log
