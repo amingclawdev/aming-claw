@@ -193,7 +193,14 @@ def _get_graph_doc_associations(project_id, target_files):
                 for p in primary:
                     if p.endswith(".md"):
                         docs.add(p)
-        return sorted(docs)
+        # B49: Defensive filter — remove doc paths that no longer exist on disk
+        filtered = set()
+        for doc_path in docs:
+            if os.path.exists(doc_path):
+                filtered.add(doc_path)
+            else:
+                log.warning("Stale graph doc reference filtered: %s", doc_path)
+        return sorted(filtered)
     except Exception:
         log.debug("_get_graph_doc_associations failed (non-critical)", exc_info=True)
         return []
@@ -565,8 +572,13 @@ def _scan_dependent_tests(target_files):
         # Skip vendored/third-party trees AND worktree mirrors.
         # Worktree mirrors live under .worktrees/ (top-level) or .claude/worktrees/.
         # They contain duplicate test files that pollute the scan result.
-        if ("/.venv/" in posix_dir or "/node_modules/" in posix_dir
-                or "/.claude/" in posix_dir or "/.worktrees/" in posix_dir):
+        # B49: Use relative path from root so that running FROM a worktree doesn't
+        # self-exclude — only nested .worktrees/ subdirs are skipped.
+        rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
+        if ("/.venv/" in rel_dir or rel_dir.startswith(".venv")
+                or "/node_modules/" in rel_dir or rel_dir.startswith("node_modules")
+                or "/.claude/" in rel_dir or rel_dir.startswith(".claude")
+                or "/.worktrees/" in rel_dir or rel_dir.startswith(".worktrees")):
             continue
         for fn in filenames:
             if not fn.startswith("test_") or not fn.endswith(".py"):
