@@ -626,3 +626,116 @@ Manual Fix SOP (this document)
 | 5 | Structured audit template | **Full** | YAML template in S6 with 15 fields for analytics |
 | 6 | Clearer reconcile relationship | **Full** | S7 responsibility split diagram + correct order + wrong usage examples |
 | 7 | Bootstrap boundary clarification | **Full** | Option A adopted: bootstrap removed from manual fix scenarios, explicit exclusion in S1 |
+
+---
+
+## 13. Pre-declare flow (target model — governed by L4.43)
+
+> **Graph contract:** `L4.43` (`docs/dev/backlog-governance.md` §9) declares this section
+> as authoritative. Tracked by `OPT-BACKLOG-AS-CHAIN-SOURCE` (P1) Chain 6 for endpoint
+> support + Chain 7 for hook enforcement. Until Chain 6 lands, use `status=OPEN`
+> as the pre-declare placeholder (semantically equivalent to the future `MF_PLANNED`).
+
+### 13.1 The drift this eliminates
+
+Today's §6 writes the MF row **after** commit, with `status=FIXED`. Two failure modes:
+
+1. **Forget to write**: code on HEAD, no backlog row → audit blackhole.
+2. **Write then fail to commit**: `FIXED` row points at non-existent commit → ghost close.
+
+Symmetric to the chain path's "no `metadata.bug_id` → no close" (see B41 case study in
+`backlog-governance.md` §9.3).
+
+### 13.2 Target three-step flow
+
+```
+ Step 1: DECLARE INTENT (before any code edit)
+ ┌──────────────────────────────────────────────┐
+ │ POST /api/backlog/{pid}/MF-YYYY-MM-DD-NNN     │
+ │   status:   MF_PLANNED  (Chain 6+)            │
+ │            OR   OPEN   (interim)              │
+ │   priority: P0-P3                             │
+ │   title:    <one-line>                        │
+ │   target_files: [...]                         │
+ │   details_md: why + what                      │
+ │   actor:    observer-manual                    │
+ │                                              │
+ │ Effect: backlog row visible to other          │
+ │ observers as "in-flight"; prevents double-    │
+ │ fixing. Pre-commit hook (Chain 7) will verify │
+ │ this row exists and is non-terminal before    │
+ │ allowing the commit in step 2.                │
+ └──────────────────────┬───────────────────────┘
+                        v
+ Step 2: EDIT + COMMIT (normal §2 Phase 0-5, but:)
+ ┌──────────────────────────────────────────────┐
+ │ git commit -m "manual fix: ... [MF-YYYY...]"  │
+ │                                              │
+ │ - Commit message MUST cite the MF ID literally│
+ │   (so the hook can parse it).                │
+ │ - §2 Phase 0-5 checks still apply (scope,     │
+ │   danger matrix, workflow restore proof).    │
+ │ - Status stays MF_PLANNED until Step 3.      │
+ └──────────────────────┬───────────────────────┘
+                        v
+ Step 3: CLOSE
+ ┌──────────────────────────────────────────────┐
+ │ POST /api/backlog/{pid}/MF-YYYY-MM-DD-NNN/    │
+ │      close                                   │
+ │   commit: <short hash from step 2>           │
+ │   actor:  observer-manual                    │
+ │                                              │
+ │ Effect: status → FIXED; commit hash verified │
+ │ to exist in git log (Chain 5); audit row in  │
+ │ audit_log + chain_events.                    │
+ └──────────────────────────────────────────────┘
+```
+
+### 13.3 Relationship to §6 (structured audit record)
+
+§6 is **still required** — the pre-declare row in Step 1 carries the same fields plus
+`status: MF_PLANNED`. The `details_md` field holds the full audit template from §6.2.
+
+The close in Step 3 is an **additive step**, not a replacement for §6. It confirms the
+`fixed_at` timestamp and commit hash against the pre-declared intent.
+
+### 13.4 Interim discipline (until Chain 6/7 land)
+
+While the `MF_PLANNED` status and pre-commit hook don't yet exist:
+
+| Stage | What observer does | Why |
+|---|---|---|
+| Before edit | `POST /api/backlog/{pid}/MF-... status=OPEN` with full title + details_md | Row exists; other observers see "in progress" |
+| Commit | Standard §2 Phase 0-5; message cites MF ID | Audit trail complete |
+| After commit | `POST /api/backlog/{pid}/MF-.../close` with commit hash | Transitions OPEN → FIXED |
+
+Violation in the interim window is **not** a hook rejection (no hook yet), but is tracked
+via routine backlog-status audits — a row stuck in `OPEN` with no recent activity for
+>24h surfaces in the cron observer's weekly report (B39).
+
+### 13.5 Emergency bypass
+
+If governance container is down and a hotfix is required:
+
+1. Commit with `[emergency-fix] Reason: <specific text>` in the body (instead of MF ID).
+2. Append a JSON record to `.pending-mf-entries.jsonl` at repo root with the same fields
+   that Step 1 would have POSTed.
+3. When governance recovers, the outbox worker (Chain 7) replays the journal into
+   `backlog_bugs` and auto-appends a `details_md` note tagging the commit hash.
+
+Until the outbox worker lands, observer must manually POST the MF row after recovery and
+delete the journal entry.
+
+### 13.6 Dogfood: MF-2026-04-21-004
+
+The **first MF entry under this pre-declare flow** is `MF-2026-04-21-004` itself, which
+landed this §13 + L4.43 + B41 close. Its 3-step trace is recorded in the governance DB
+(`backlog_upsert` event for Step 1, `backlog_close` event for Step 3). Inspect via:
+
+```bash
+curl -s http://localhost:40000/api/backlog/aming-claw/MF-2026-04-21-004 | jq
+```
+
+This dogfood proves the pattern works with the current schema (`OPEN` as interim placeholder
+for `MF_PLANNED`). All future MF entries should follow the same shape until Chain 6 formalizes
+the state machine.

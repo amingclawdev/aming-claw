@@ -146,3 +146,104 @@ CREATE INDEX idx_backlog_priority ON backlog_bugs(priority);
 - ⏳ Phase 3 (not started): outbox-worker md regeneration; pre-commit lint; `--regen-md` flag in ETL script
 
 Related entries in backlog DB: `OPT-DB-BACKLOG`, `O1`, `B47`, `B48`.
+
+---
+
+## 9. Backlog-as-chain-source policy (graph contract L4.43)
+
+> **Governance node:** `L4.43` declares this section as authoritative contract. Implementation
+> tracked by `OPT-BACKLOG-AS-CHAIN-SOURCE` (P1). Until that OPT lands, the invariants below
+> are enforced by observer/coordinator discipline; the hook in §9.4 turns discipline into code.
+
+### 9.1 Four invariants
+
+| # | Invariant | Enforced by |
+|---|---|---|
+| I1 | Every main-branch commit must cite a backlog ID (`B\d+` / `MF-YYYY-MM-DD-NNN` / `OPT-[A-Z-]+`) in its message, OR mark itself `[trivial]` (touches only `.claude/`, docs-only), OR `[emergency-fix] Reason: <text>`. | Pre-commit hook (§9.4) |
+| I2 | Chain path: `bug_id` propagates through `chain_context` from coordinator → PM → Dev → Test → QA → Merge. Merge stage reads it from `chain_context`, not from individual task metadata. | `auto_chain._try_backlog_close_via_db` refactor (OPT Chain 2) |
+| I3 | MF path: backlog row is written **before** the first code edit (`status=MF_PLANNED`), then transitioned to `FIXED` after commit. No "fixed but OPEN" drift window. | `manual-fix-sop.md` §13 + hook (§9.4) |
+| I4 | `backlog_close` requires a commit hash that exists in `git log`. Row cannot be closed against a ghost commit. | Close endpoint validation (OPT Chain 5) |
+
+### 9.2 Unified state machine (chain + MF converge at FIXED)
+
+```
+                     OPEN
+                   ╱      ╲
+           [chain path]   [MF path]
+                ↓               ↓
+           PM_ACTIVE       MF_PLANNED
+                ↓               ↓
+           DEV_ACTIVE      MF_IN_PROGRESS  (optional; code being edited)
+                ↓               ↓
+           TEST_ACTIVE          │
+                ↓               │
+           QA_ACTIVE            │
+                ↓               │
+           MERGING              │
+                ↓               ↓
+                ╲              ╱
+                   FIXED  (commit hash attached, verified exists in git log)
+
+   Terminal failure (retries exhausted / abandoned):
+      → OPEN (+ last_failure_reason)  OR  CANCELLED (+ reason)
+```
+
+Schema v16 (landed in OPT Chain 3) adds columns: `chain_stage`, `last_failure_reason`, `stage_updated_at`.
+
+### 9.3 Why unified: the drift that motivated this
+
+B41 was the triggering case:
+- AC1 shipped via Manual Fix (`6afc22a`) — no chain finalize → no `backlog_close`
+- AC2/AC3 shipped via chain (`c762d54`) — chain had no `metadata.bug_id="B41"` (because B41 was flagged `needs_chain=false` at the time) → `auto_chain.py:2690` did not trigger close
+- Result: code fixed on HEAD, backlog row orphaned as OPEN for 2 days. Discovered by memory recall during a re-attempt.
+
+This is a systematic class: any time code lands without the `metadata.bug_id` linkage (manual fix, ad-hoc chain, observer takeover), the backlog drifts. Invariants I1–I4 close the loop.
+
+### 9.4 Physical enforcement: pre-commit hook (OPT Chain 7)
+
+```python
+# scripts/precommit-require-backlog-id.py (target)
+# - Parses commit message for B\d+ / MF-YYYY-MM-DD-NNN / OPT-[A-Z-]+
+# - If none: accepts [trivial] (staged files all under .claude/ or docs-only)
+#            accepts [emergency-fix] (requires `Reason: <text>` in body — logged for post-hoc MF)
+#            otherwise: REJECT with message pointing at this section
+# - If found: GETs /api/backlog/{pid}/{bug_id}
+#            REJECT if 404 (row must be pre-declared)
+#            REJECT if status in (FIXED, CANCELLED) (must re-open or use a new ID)
+# - On API unreachable (governance down): writes to .pending-mf-entries.jsonl
+#            and accepts the commit; entries are replayed when governance returns.
+```
+
+Until Chain 7 lands, discipline is: follow §13 of `manual-fix-sop.md` for MF path; ensure coordinator sets `metadata.bug_id` when user prompt names a backlog ID.
+
+### 9.5 Edge cases
+
+| Case | Handling |
+|---|---|
+| Governance container down, urgent hotfix | `[emergency-fix] Reason: <text>` commit; local `.pending-mf-entries.jsonl` journal; replay on recovery |
+| Rebase / cherry-pick | Commit message preserves bug ID; `close` endpoint is idempotent |
+| One commit fixes multiple bugs | `Fixes: B47, B48` in body; close endpoint accepts batch |
+| `.claude/worktrees/*` dirty (B31 pattern) | Hook treats as trivial; also in `_DIRTY_IGNORE` for gate |
+| Observer commits docs-only changes | `[trivial]` tag OR MF row (use MF when audit is wanted) |
+
+### 9.6 Implementation scope (tracked by OPT-BACKLOG-AS-CHAIN-SOURCE P1)
+
+8-chain breakdown (ordered to front-load MF-path fixes, since those leak most frequently):
+
+| # | Chain | What |
+|---|---|---|
+| 1 | coord-autotag | Coordinator parses user prompt for B/MF/OPT IDs and auto-sets `metadata.bug_id`. When no ID found but task will create code changes, auto-upserts a new backlog row with allocated ID. |
+| 2 | chain-context-bug-id | `bug_id` persisted in `chain_context`; each stage inherits. Merge reads from chain_context, not individual task metadata. |
+| 3 | backlog-stage-schema | Schema v16: `chain_stage`, `last_failure_reason`, `stage_updated_at`. Migration + MCP/REST projection. |
+| 4 | gate-stage-transitions | Each gate (PM/checkpoint/T2/QA/merge) emits `backlog.stage_update` event; backlog row follows the state machine in §9.2. |
+| 5 | close-commit-verify | `backlog_close` endpoint verifies commit hash exists in `git log`; rejects ghost-commit closes. Failure-rollback logic for terminal-failed chains. |
+| 6 | mf-predeclare-endpoint | `status=MF_PLANNED` and `MF_IN_PROGRESS` accepted by upsert endpoint; `manual-fix-sop.md` §13 becomes enforced. |
+| 7 | precommit-hook | `scripts/precommit-require-backlog-id.py` + install instructions + offline journal replay. |
+| 8 | sop-rewrite-dogfood | Rewrite `manual-fix-sop.md` front matter to describe pre-declare as the default; retire the "after-the-fact audit" language in §6. |
+
+### 9.7 Related
+
+- Graph node: `L4.43` (this section is its `primary`).
+- Backlog entry: `OPT-BACKLOG-AS-CHAIN-SOURCE` (P1).
+- Triggering incident: `B41` discovery via MF-2026-04-21-004.
+- MF SOP for pre-declare: `manual-fix-sop.md` §13.
