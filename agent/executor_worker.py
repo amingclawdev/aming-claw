@@ -23,6 +23,7 @@ Full chain verified: dev→test→qa→merge→deploy.
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -178,6 +179,39 @@ EXECUTOR_STALL_THRESHOLD = int(os.getenv("EXECUTOR_STALL_THRESHOLD", "20"))
 
 # Absolute ceiling passed to ai_lifecycle; actual enforcement is via heartbeat watchdog.
 MAX_SESSION_TIMEOUT = 1200
+
+
+# ---------------------------------------------------------------------------
+# OPT-BACKLOG-CH1-COORD-AUTOTAG: coordinator auto-extracts backlog ID from prompt
+# ---------------------------------------------------------------------------
+# Recognizes three ID shapes emitted by the governance backlog:
+#   - B\d+                       — bug IDs (e.g. B41)
+#   - MF-YYYY-MM-DD-NNN          — manual-fix IDs (e.g. MF-2026-04-21-004)
+#   - OPT-[A-Z0-9][A-Z0-9-]*     — optimization epic / sub-chain IDs
+#
+# The extraction is used by _handle_coordinator_v1's create_pm_task path to
+# inject metadata.bug_id into the PM task, so the downstream merge-stage
+# helper auto_chain._try_backlog_close_via_db can fire backlog close on merge.
+# Governed by graph node L4.43 (backlog-as-chain-source policy).
+_BACKLOG_ID_RE = re.compile(
+    r"\b("
+    r"B\d+"
+    r"|MF-\d{4}-\d{2}-\d{2}-\d{3}"
+    r"|OPT-[A-Z0-9][A-Z0-9-]*"
+    r")\b"
+)
+
+
+def _extract_backlog_id(text: str) -> Optional[str]:
+    """Return the first backlog ID found in *text*, or None if no match.
+
+    Recognizes B\\d+, MF-YYYY-MM-DD-NNN, and OPT-XXX patterns. Word-bounded so
+    substrings like ``MY-B42-LIB`` or ``OPTION-X`` do NOT match.
+    """
+    if not text:
+        return None
+    m = _BACKLOG_ID_RE.search(text)
+    return m.group(1) if m else None
 
 
 class ExecutorWorker:
@@ -1583,9 +1617,26 @@ class ExecutorWorker:
                     "convergence_lane",
                     "depends_on_lanes",
                     "allow_dirty_workspace_reconciliation",
+                    "bug_id",
                 ):
                     if key in parent_meta:
                         forwarded_meta[key] = parent_meta[key]
+
+                # OPT-BACKLOG-CH1-COORD-AUTOTAG: auto-extract bug_id from
+                # coordinator task prompt and inject into PM task metadata so
+                # auto_chain._try_backlog_close_via_db can fire backlog close
+                # on merge. Precedence (idempotent):
+                #   1. action dict explicit bug_id        (never overwritten)
+                #   2. parent_meta.bug_id (forwarded above, never overwritten)
+                #   3. prompt regex extraction            (fallback)
+                action_bug_id = action.get("bug_id")
+                if action_bug_id and "bug_id" not in forwarded_meta:
+                    forwarded_meta["bug_id"] = action_bug_id
+                if "bug_id" not in forwarded_meta:
+                    extracted = _extract_backlog_id(task.get("prompt") or "")
+                    if extracted:
+                        forwarded_meta["bug_id"] = extracted
+                        _hv_log(f"autotag: task={task_id} bug_id={extracted}")
 
                 _hv_log(f"action: create_pm_task target_files={target_files}")
 
