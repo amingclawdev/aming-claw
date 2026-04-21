@@ -1486,7 +1486,7 @@ L18.6  Integration Documentation  [impl:pending] [verify:pending] v6.1
       gates:[L18.2, L18.3, L18.4, L18.5]
       verify: L4
       test_coverage: none
-      primary:[docs/executor-api-guide.md]
+      primary:[docs/api/executor-api.md]
       secondary:[agent/governance/server.py]
       test:[]
       artifacts:
