@@ -538,6 +538,28 @@ commit: "4e20f21"
 
 ---
 
+### B45: `_resolve_workspace` falls back to hardcoded `/workspace` on host, causing spurious qa_pass Artifacts "missing test files" [FIXED] (f548296) [P1]
+
+<!-- chain-trigger:
+status: FIXED
+needs_chain: false
+priority: P1
+bug_id: B45
+target_files: ["agent/governance/artifacts.py"]
+test_files: []
+commit: "f548296"
+-->
+
+- **Discovered**: 2026-04-20, during Stage 1 workflow self-bootstrap after B44 landed. `_gate_qa_pass` blocked iter-7 B41-AC2 chain with `Artifacts check failed for L4.28: Missing test files: ['agent/tests/test_governance_db.py', 'agent/tests/test_checkpoint_gate.py']` even though both files exist in the working tree and on main.
+- **Root cause**: `.env` defines `WORKSPACE_PATH=/workspace` for Docker mode. When governance runs on host via `scripts/start-governance.ps1`, it sets `CODEX_WORKSPACE=<host path>` but does NOT override `WORKSPACE_PATH`. `agent/governance/artifacts.py::_resolve_workspace` then falls through to `os.environ.get("WORKSPACE_PATH", "/workspace")` which returns `/workspace`. On Windows host, `os.path.exists("/workspace/agent/tests/test_governance_db.py")` is `False`, so every node that declares `test:[...]` in `acceptance-graph.md` fails the qa_pass artifacts check. Confirmed via `GET /api/projects/aming-claw/config → "No .aming-claw.yaml or .aming-claw.json found at \\workspace"`.
+- **Chicken-and-egg vs B44**: The B44 fix made `_gate_t2_pass` defer, which unblocked the test stage, but then the chain advanced to qa stage where `_gate_qa_pass.verify_update → check_test_file` hits the workspace resolution bug. Without B45 fix, every post-test chain with graph-declared tests would loop on this.
+- **Fix** (`f548296`): In `_resolve_workspace`, before falling through to `WORKSPACE_PATH` env, prefer `CODEX_WORKSPACE` if it is set AND points to an existing directory. `start-governance.ps1` already sets `CODEX_WORKSPACE`, so host-mode resolves correctly without requiring users to edit `.env`. Docker mode unchanged (CODEX_WORKSPACE not set there; WORKSPACE_PATH=/workspace still wins, mounted at container root).
+- **Why this matters**: Running governance on host with a shared `.env` (Docker-oriented defaults) requires every artifact/test-file path check to resolve to the real workspace. Without B45, the governance graph's `test:` declarations are effectively unverifiable on host — breaking the qa_pass gate for any non-trivial chain and preventing workflow self-bootstrap regardless of B44.
+- **Related**: B44 (the predecessor gate block); `.env WORKSPACE_PATH=/workspace` literal (unchanged — kept for Docker); `scripts/start-governance.ps1` (sets `CODEX_WORKSPACE`).
+- **Governance**: `agent/governance/artifacts.py` at governance-internal (bypasses full chain). 4 LoC change, no new tests (config fallback; covered implicitly by any post-B45 qa_pass run). Low blast radius.
+
+---
+
 ## Manual Fix Audit Log
 
 ### MF-2026-04-20-001 — Correct stale MCP auto-start claims in startup docs
