@@ -268,7 +268,12 @@ class AILifecycleManager:
         env = dict(os.environ)
         if provider == "anthropic":
             env = {k: v for k, v in env.items()
-                   if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+                   if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+                                "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+                                "CLAUDE_CODE_EXECPATH",
+                                "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
+                                "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
+                                "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL")}
             env.pop("ANTHROPIC_API_KEY", None)
 
         # Create session object first (wait_for_output polls session.status)
