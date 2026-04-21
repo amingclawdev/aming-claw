@@ -172,6 +172,23 @@ class TestStateService(unittest.TestCase):
         state = state_service.get_node_status(self.conn, self.project_id, "L0.1")
         self.assertEqual(state["verify_status"], "waived")
 
+    def test_b46_waived_to_qa_pass_is_noop(self):
+        # B46: nodes already at WAIVED satisfy QA_PASS rank — verify_update to
+        # qa_pass should silently skip them instead of raising InvalidTransitionError.
+        evidence_waive = {"type": "manual_review", "summary": {"reason": "approved"}}
+        state_service.verify_update(
+            self.conn, self.project_id, self.graph,
+            ["L0.1"], "waived", self.coord_session, evidence_waive,
+        )
+        evidence_qa = {"type": "e2e_report", "summary": {"passed": 1}}
+        result = state_service.verify_update(
+            self.conn, self.project_id, self.graph,
+            ["L0.1"], "qa_pass", self.qa_session, evidence_qa,
+        )
+        self.assertNotIn("L0.1", result["updated_nodes"])
+        state = state_service.get_node_status(self.conn, self.project_id, "L0.1")
+        self.assertEqual(state["verify_status"], "waived")  # unchanged
+
     def test_get_summary(self):
         summary = state_service.get_summary(self.conn, self.project_id)
         self.assertEqual(summary["total_nodes"], 3)

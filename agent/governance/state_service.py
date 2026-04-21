@@ -8,7 +8,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .enums import VerifyStatus, Role
+from .enums import VerifyStatus, Role, status_satisfies
 from .models import Evidence
 from .errors import (
     NodeNotFoundError, ConflictError, ValidationError,
@@ -250,6 +250,11 @@ def verify_update(
         from_status = VerifyStatus.from_str(current["verify_status"])
         if from_status == target:
             continue  # No-op, already at target
+        # B46: waived ranks equal to qa_pass (enums.STATUS_ORDER). Treat any node
+        # already at >= target rank as a no-op instead of attempting a forbidden
+        # transition (e.g. waived -> qa_pass) that has no rule in TRANSITION_RULES.
+        if target in (VerifyStatus.T2_PASS, VerifyStatus.QA_PASS) and status_satisfies(from_status, target):
+            continue
 
         # 1. Permission check
         check_transition(from_status, target, role)
