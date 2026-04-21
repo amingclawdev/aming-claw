@@ -266,9 +266,38 @@ Resolution:
 
 ## 6. Structured Audit Record
 
-Every manual fix **must** produce a structured audit record in the following format. This record is appended to `docs/dev/bug-and-fix-backlog.md` under a new section `## Manual Fix Audit Log`.
+Every manual fix **must** produce a structured audit record. The record is written
+to the **`backlog_bugs` governance DB table** (authoritative source) via
+`POST /api/backlog/{pid}/{bug_id}` or `mcp__aming-claw__backlog_upsert`.
 
-### Template
+> **Deprecated:** appending to `docs/dev/bug-and-fix-backlog.md` directly is no
+> longer permitted. That file is now a read-only projection of the DB table
+> (see [`backlog-governance.md`](backlog-governance.md)). Any uncommitted md
+> edits are lost on next regeneration; committed edits bump HEAD and can silently
+> kill in-flight chains (B47 root cause).
+
+### Required write (MF entry)
+
+```bash
+curl -X POST "http://localhost:40000/api/backlog/aming-claw/MF-YYYY-MM-DD-NNN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title":            "<short one-line description>",
+    "status":           "FIXED",
+    "priority":         "P3",
+    "commit":           "<short git hash at fix time>",
+    "chain_task_id":    "<task-id triggered, if any>",
+    "target_files":     ["agent/governance/server.py", "..."],
+    "test_files":       ["agent/tests/test_X.py"],
+    "acceptance_criteria": ["<verifiable bullet>", "..."],
+    "discovered_at":    "2026-04-21T14:00:00Z",
+    "fixed_at":         "2026-04-21T14:06:00Z",
+    "details_md":       "<multi-line markdown with trigger / bypass / impact>",
+    "actor":            "observer-manual"
+  }'
+```
+
+### Template (for `details_md` content)
 
 ```yaml
 manual_fix_id:          MF-2026-04-05-001
@@ -513,7 +542,7 @@ Phase 5: WORKFLOW RESTORE PROOF
   $ Observe: auto_chain dispatched next stage (follow-up task exists in task_list)
   $ Record: workflow_restore_result = RESTORED
   $ observer_mode(false)
-  $ Write structured audit record to bug-and-fix-backlog.md
+  $ POST /api/backlog/{pid}/MF-YYYY-MM-DD-NNN  (structured audit; see Section 6)
 ```
 
 ---
@@ -574,7 +603,7 @@ Manual Fix SOP (this document)
   +-- After completion: Workflow resumes normal operation
   |   +-- All subsequent fixes return to Workflow
   |
-  +-- Audit: structured record in bug-and-fix-backlog.md
+  +-- Audit: POST /api/backlog/{pid}/MF-YYYY-MM-DD-NNN (DB-backed; see §6)
 ```
 
 | Flow | When to Use | Relationship |

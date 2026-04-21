@@ -1,8 +1,23 @@
 # Bug & Fix Backlog
 
+> **⚠️ READ-ONLY SNAPSHOT.** The authoritative backlog lives in the `backlog_bugs`
+> governance DB table. This file is a human-readable projection kept around for
+> historical context and PR review. **Do not hand-edit this file** — edits will be
+> overwritten on next regeneration and any commit bumps HEAD, which can silently
+> kill in-flight auto-chain stages (B47 root cause).
+>
+> **To add / update entries:**
+> - REST: `POST /api/backlog/{pid}/{bug_id}` (upsert), `POST /api/backlog/{pid}/{bug_id}/close`
+> - MCP:  `mcp__aming-claw__backlog_upsert`, `backlog_close`, `backlog_list`, `backlog_get`
+> - Bulk import from this file: `python scripts/etl-backlog-md-to-db.py --apply` (idempotent)
+>
+> **Governance contract:** see [`backlog-governance.md`](backlog-governance.md) for the
+> single-source-of-truth rules (who writes, who reads, how markdown is regenerated).
+>
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-20 (B41 P1 + B42 P3 added from B39 canary postmortem; B39 needs_chain→false pending B41)
+> Last updated: 2026-04-21 (DB backfill complete — 70 entries ETL'd into `backlog_bugs`;
+> this file is now a read-only projection)
 
 ---
 

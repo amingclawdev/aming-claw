@@ -259,9 +259,13 @@ docker logs -f <governance-container> 2>&1 | grep -E "memory\.|task\.|API |chain
 
 ---
 
-## Backlog storage migration
+## Backlog storage (DB is authoritative)
 
-The project backlog is now stored DB-first in the `backlog_bugs` table (governance DB schema v15). This decouples backlog storage from git, preventing manual commits to `docs/dev/bug-and-fix-backlog.md` from bumping HEAD and silently killing in-flight auto-chain stages (root cause of B47).
+The project backlog lives **exclusively** in the `backlog_bugs` governance DB table (schema v15+). The markdown file `docs/dev/bug-and-fix-backlog.md` is a **read-only** human-readable projection; direct edits to it are not permitted and are not read by auto-chain / cron / coordinator.
+
+> **Why DB-first**: every commit to the markdown file bumped HEAD, which could silently kill an in-flight auto-chain stage (B47 root cause). Storing backlog in the DB decouples metadata from git.
+
+See [`../dev/backlog-governance.md`](../dev/backlog-governance.md) for the full governance contract (who writes, who reads, how md is regenerated).
 
 ### MCP Tools
 
@@ -279,15 +283,31 @@ The project backlog is now stored DB-first in the `backlog_bugs` table (governan
 | GET | `/api/backlog/{pid}` | List bugs (?status=&priority=) |
 | GET | `/api/backlog/{pid}/{bug_id}` | Single bug detail (404 if missing) |
 | POST | `/api/backlog/{pid}/{bug_id}` | Upsert bug |
-| POST | `/api/backlog/{pid}/{bug_id}/close` | Close bug |
+| POST | `/api/backlog/{pid}/{bug_id}/close` | Close bug (sets status=FIXED, records commit) |
 
-### Backward compatibility
+### Writing entries — required form
 
-The existing markdown backlog file (`docs/dev/bug-and-fix-backlog.md`) remains functional for in-flight chains. The merge-stage finalize path first attempts to close bugs via the DB endpoint; on 404 or connection error, it falls back gracefully to the md-edit path. No existing md-handling code has been removed.
+All backlog writes go through the API. Example (MF entry):
 
-### ETL migration
+```bash
+curl -X POST "http://localhost:40000/api/backlog/aming-claw/MF-2026-04-21-001" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"...","status":"FIXED","priority":"P3","commit":"<short-hash>",
+       "target_files":["..."],"test_files":["..."],"actor":"observer-manual"}'
+```
 
-Use `python scripts/etl-backlog-md-to-db.py --dry-run` to preview, then `--apply` to bulk-import existing md bugs into the DB. The script is idempotent.
+**Do not** append entries to `bug-and-fix-backlog.md` directly — they will not be seen by downstream consumers and will bump HEAD on commit.
+
+### ETL (one-off re-sync from md)
+
+If legacy md edits exist (e.g. unmerged branch, historical import), re-sync with:
+
+```bash
+python scripts/etl-backlog-md-to-db.py --dry-run   # preview
+python scripts/etl-backlog-md-to-db.py --apply     # idempotent
+```
+
+The initial backfill was completed 2026-04-21 (70 entries ETL'd).
 
 ---
 
