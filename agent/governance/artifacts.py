@@ -49,7 +49,10 @@ def _resolve_workspace(project_id: str) -> str:
                 return wp
     except Exception:
         pass
-    # 3. Env fallback
+    # 3. Env fallback — prefer CODEX_WORKSPACE (host mode) over WORKSPACE_PATH (Docker-default /workspace)
+    codex_ws = os.environ.get("CODEX_WORKSPACE", "")
+    if codex_ws and os.path.isdir(codex_ws):
+        return codex_ws
     return os.environ.get("WORKSPACE_PATH", "/workspace")
 
 
