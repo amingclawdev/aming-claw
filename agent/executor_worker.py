@@ -130,6 +130,49 @@ def _parse_pytest_output(stdout: str, stderr: str, returncode: int) -> dict:
 
     return report
 
+
+# ---------------------------------------------------------------------------
+# B41 AC2: Fail-fast guard for non-portable verification commands
+# ---------------------------------------------------------------------------
+_BANNED_TOKENS = frozenset({"grep", "sed", "awk", "find", "head", "tail", "cat", "cut", "xargs"})
+_BANNED_OPS = (" && ", " || ", " | ", " ; ")
+
+
+def _assert_portable_verification_command(cmd: str):
+    """Reject Unix-only commands before subprocess execution.
+
+    Returns None on pass (safe to proceed), or a failure dict on rejection.
+    """
+    if not cmd or not cmd.strip():
+        return _b41_reject(cmd, "empty or whitespace-only command")
+
+    first_token = cmd.split()[0].strip("\"'`")
+    if first_token in _BANNED_TOKENS:
+        return _b41_reject(cmd, f"banned Unix command: {first_token}")
+
+    for op in _BANNED_OPS:
+        if op in cmd:
+            return _b41_reject(cmd, f"shell chaining operator: {op.strip()}")
+
+    return None
+
+
+def _b41_reject(cmd: str, reason: str) -> dict:
+    return {
+        "status": "failed",
+        "result": {
+            "test_report": {
+                "tool": "b41-guard",
+                "summary": f"B41: non-portable verification.command rejected: {reason}",
+                "passed": 0,
+                "failed": 1,
+                "command": cmd,
+            },
+            "error": f"B41: non-portable verification.command rejected: {reason}",
+        },
+    }
+
+
 # Stall detection: after N consecutive empty polls with queued tasks, force-restart poll loop.
 EXECUTOR_STALL_THRESHOLD = int(os.getenv("EXECUTOR_STALL_THRESHOLD", "20"))
 
@@ -565,6 +608,13 @@ class ExecutorWorker:
         else:
             # Default: run all test files with pytest
             cmd = ["python", "-m", "pytest"] + test_files + ["-v", "--tb=short"]
+
+        # B41 AC2: fail-fast guard for non-portable commands
+        cmd_for_guard = cmd if isinstance(cmd, str) else " ".join(cmd)
+        guard_result = _assert_portable_verification_command(cmd_for_guard)
+        if guard_result is not None:
+            log.warning("test_script: B41 guard rejected command: %s", cmd_for_guard)
+            return guard_result
 
         log.info("test_script: running command in %s: %s (shell=%s)", execution_workspace, cmd, use_shell)
 
