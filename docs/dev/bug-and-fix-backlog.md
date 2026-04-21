@@ -558,6 +558,26 @@ commit: "f548296"
 - **Related**: B44 (the predecessor gate block); `.env WORKSPACE_PATH=/workspace` literal (unchanged — kept for Docker); `scripts/start-governance.ps1` (sets `CODEX_WORKSPACE`).
 - **Governance**: `agent/governance/artifacts.py` at governance-internal (bypasses full chain). 4 LoC change, no new tests (config fallback; covered implicitly by any post-B45 qa_pass run). Low blast radius.
 
+### B46: `state_service.verify_update` raises `InvalidTransitionError` for `waived → qa_pass`, hard-blocking qa_pass gate whenever nodes were previously waived [FIXED] (7b7f6df) [P1]
+
+<!-- chain-trigger:
+status: FIXED
+needs_chain: false
+priority: P1
+bug_id: B46
+target_files: ["agent/governance/state_service.py"]
+test_files: ["agent/tests/test_governance_state.py"]
+commit: "7b7f6df"
+-->
+
+- **Discovered**: 2026-04-20 (UTC), during Stage 1 workflow self-bootstrap after B45 landed. Fresh B41-AC2 chain (`task-1776738109-30ff4f` PM → ... → `task-1776738532-9e17c4` qa) advanced PM→Dev→Test→QA correctly, then qa stage failed with `qa_pass gate blocked — verify_update failed for nodes ['L3.2','L4.25','L4.29','L4.30','L4.34','L4.35','L4.37','L4.40','L5.6']: No rule for transition waived -> qa_pass`. Chain-stage-retry spawned dev retry at depth=4, which would depth-exhaust before resolution.
+- **Root cause**: `agent/governance/permissions.py::TRANSITION_RULES` has no `(VerifyStatus.WAIVED, VerifyStatus.QA_PASS)` entry. But `agent/governance/enums.py::STATUS_ORDER` explicitly ranks `WAIVED = QA_PASS = 3` with a code comment reading `# waived is equivalent to qa_pass`. These 9 nodes had been waived in a prior session by `preflight-autofix` / `reconcile` (legitimate orphan-node handling). When `_gate_qa_pass` called `_try_verify_update` → `state_service.verify_update` → `check_transition(WAIVED, QA_PASS, qa)`, the transition-table lookup missed and raised `InvalidTransitionError`. The gate converted this to a hard retry, blowing chain_depth every cycle.
+- **Chicken-and-egg vs B44/B45**: B44 + B45 cleared the predecessor qa-blocking layers (t2 deferral + artifacts workspace resolution). This third layer was previously masked by the earlier blockers. Every sufficiently-long chain touching any node the preflight-autofix path ever waived would now surface B46.
+- **Fix** (`7b7f6df`): In `state_service.verify_update`, after the existing `from_status == target` no-op early-return, add: *if target is T2_PASS or QA_PASS and `status_satisfies(from_status, target)` is True, skip this node instead of calling `check_transition`*. Semantics match the existing STATUS_ORDER ranking (WAIVED already satisfies QA_PASS without a real state change). Does not weaken any other transition: FAILED rank=-1 still can't satisfy anything; forward T2→QA still runs through the real transition because T2_PASS does not satisfy QA_PASS (rank 2 < 3).
+- **Why this matters**: Without B46, any chain whose `related_nodes` intersect the preflight-waived pool hard-blocks at qa_pass indefinitely. This is the third of three sibling blockers preventing Stage 1 workflow self-bootstrap (alongside B44 and B45). With all three fixes live, the chain touching waived nodes can complete PM→Dev→Test→QA→Gatekeeper→Merge autonomously.
+- **Related**: B44 (t2_pass deferral — same family of gate-vs-reality mismatch); B45 (workspace resolution); `preflight.py` and `reconcile.py` are the two code paths that write `verify_status='waived'`.
+- **Governance**: `agent/governance/state_service.py` is governance-internal (bypasses full chain). 7 LoC function change + 20 LoC regression test (`test_b46_waived_to_qa_pass_is_noop`). All 13 `test_governance_state.py` tests pass. Low blast radius — change only affects the no-op early-exit path; all real transitions still execute `check_transition` → evidence validation → gate check → audit.
+
 ---
 
 ## Manual Fix Audit Log
