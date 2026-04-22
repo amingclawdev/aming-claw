@@ -159,6 +159,10 @@ class ServiceManager:
         # R10: Worker pool awareness — track external worker threads
         self._worker_pool = None  # Set by executor when WorkerPool is initialized
 
+        # Sidecar HTTP server (manager_http_server) state
+        self._sidecar_thread: Optional[threading.Thread] = None
+        self._sidecar_crashed: bool = False
+
     # ------------------------------------------------------------------
     # start / stop
     # ------------------------------------------------------------------
@@ -371,6 +375,43 @@ class ServiceManager:
         return {}
 
     # ------------------------------------------------------------------
+    # Sidecar HTTP server lifecycle (R4)
+    # ------------------------------------------------------------------
+
+    def _start_sidecar(self) -> None:
+        """Start the manager_http_server sidecar in a background thread.
+
+        R4: The sidecar runs in its own thread with its own asyncio event loop.
+        If the sidecar crashes, it sets _sidecar_crashed=True which causes
+        the main ServiceManager monitor loop to stop (crash-together semantics).
+        """
+        if self._sidecar_thread is not None and self._sidecar_thread.is_alive():
+            log.info("ServiceManager: sidecar already running")
+            return
+
+        self._sidecar_crashed = False
+
+        def _sidecar_runner():
+            """Thread target: run the manager_http_server; on crash, signal main loop."""
+            try:
+                from agent.manager_http_server import run_server
+                log.info("ServiceManager: sidecar thread starting manager_http_server")
+                run_server()
+            except Exception as exc:
+                log.error("ServiceManager: sidecar crashed: %s", exc)
+                self._sidecar_crashed = True
+                # Crash-together: signal the main loop to stop
+                self._running = False
+
+        self._sidecar_thread = threading.Thread(
+            target=_sidecar_runner,
+            name="manager-http-sidecar",
+            daemon=True,
+        )
+        self._sidecar_thread.start()
+        log.info("ServiceManager: sidecar thread started (manager_http_server on port 40101)")
+
+    # ------------------------------------------------------------------
     # Monitor loop
     # ------------------------------------------------------------------
 
@@ -399,6 +440,15 @@ class ServiceManager:
         while self._running:
             time.sleep(10)
             if not self._running:
+                break
+
+            # R4: Check sidecar health — crash-together semantics
+            if self._sidecar_crashed:
+                log.error(
+                    "ServiceManager._monitor_loop: sidecar crashed; stopping main loop "
+                    "(crash-together semantics)"
+                )
+                self._running = False
                 break
 
             # R1: Check for restart signal on each cycle
@@ -704,6 +754,9 @@ def main() -> None:
     os.environ.setdefault("GOVERNANCE_URL", args.governance_url)
     os.environ.setdefault("CODEX_WORKSPACE", args.workspace)
     _install_signal_handlers(manager.stop)
+
+    # R4: Start sidecar HTTP server before executor
+    manager._start_sidecar()
 
     manager.start()
     log.info(
