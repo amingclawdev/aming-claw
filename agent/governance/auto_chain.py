@@ -237,26 +237,58 @@ def _audit_doc_gap(conn, project_id, task_id, stage, missing_docs, changed_files
         log.debug("_audit_doc_gap failed (non-critical)", exc_info=True)
 
 
-def _store_proposed_nodes(conn, project_id, proposed_nodes):
-    """Store proposed_nodes into pending_nodes table (5g, P4)."""
-    if not proposed_nodes:
-        return 0
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    count = 0
-    for pn in proposed_nodes:
-        node_id = pn.get("node_id", "")
-        for doc in pn.get("docs", []):
-            try:
-                conn.execute(
-                    "INSERT INTO pending_nodes (project_id, node_id, doc_path, confidence, reason, status, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                    (project_id, node_id, doc, pn.get("confidence", 0.5), pn.get("reason", "proposed by chain"), now),
-                )
-                count += 1
-            except Exception:
-                log.debug("_store_proposed_nodes insert failed", exc_info=True)
-    return count
+# TODO-DEPRECATED: _store_proposed_nodes removed per OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT PR-A.
+# Replaced by graph.delta.proposed chain_events emission via _emit_graph_delta_event().
+# The pending_nodes table had no downstream consumer (pn['docs'] never populated by PM).
+
+
+def _emit_graph_delta_event(project_id, task_id, result):
+    """Emit graph.delta.proposed event if result contains non-empty graph_delta.
+
+    R1: graph_delta shape: {creates: [...], updates: [...], links: [...]}.
+    R2: Emits via ChainContextStore._persist_event for chain_events persistence.
+    R3: No event if graph_delta is missing, None, or all sub-arrays empty.
+    """
+    graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
+    if not graph_delta or not isinstance(graph_delta, dict):
+        return
+
+    # Normalize: default missing sub-arrays to []
+    creates = graph_delta.get("creates", [])
+    updates = graph_delta.get("updates", [])
+    links = graph_delta.get("links", [])
+
+    # R3: Skip if all sub-arrays are empty
+    if not creates and not updates and not links:
+        return
+
+    normalized_delta = {
+        "creates": creates,
+        "updates": updates,
+        "links": links,
+    }
+
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        # Find root_task_id for this task's chain
+        # _task_to_root maps task_id -> root_task_id
+        root_task_id = store._task_to_root.get(task_id, task_id)
+
+        store._persist_event(
+            root_task_id=root_task_id,
+            task_id=task_id,
+            event_type="graph.delta.proposed",
+            payload={
+                "source_task_id": task_id,
+                "graph_delta": normalized_delta,
+            },
+            project_id=project_id,
+        )
+        log.info("auto_chain: emitted graph.delta.proposed for task %s (%d creates, %d updates, %d links)",
+                 task_id, len(creates), len(updates), len(links))
+    except Exception:
+        log.debug("auto_chain: graph.delta.proposed emission failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +932,18 @@ def _render_dev_contract_prompt(source_task_id, metadata):
     if doc_impact:
         parts.append(f"\nDoc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
 
+    # R5: Document optional graph_delta field for dev results (not required)
+    proposed_nodes = metadata.get("proposed_nodes", [])
+    if proposed_nodes:
+        parts.append(
+            "\nOptional: Your result JSON MAY include a `graph_delta` field to propose graph changes. "
+            "Shape: {\"creates\": [{\"node_id\": \"...\", \"parent_layer\": \"...\", \"title\": \"...\", "
+            "\"deps\": [...], \"primary\": \"...\", \"description\": \"...\"}], "
+            "\"updates\": [{\"node_id\": \"...\", \"fields\": {}}], "
+            "\"links\": [{\"from_node\": \"...\", \"to_node\": \"...\", \"relation\": \"...\"}]}. "
+            "All sub-arrays default to []. Pure-refactor tasks may omit this field entirely."
+        )
+
     return "\n".join(parts)
 
 
@@ -1136,6 +1180,10 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         _try_verify_update(conn, project_id, metadata, "testing", "dev",
                            {"type": "dev_complete", "producer": "auto-chain",
                             "task_id": task_id})
+
+    # R2: Emit graph.delta.proposed event when dev result contains graph_delta
+    if task_type == "dev":
+        _emit_graph_delta_event(project_id, task_id, result)
 
     # Run gate check
     gate_fn = _GATES[gate_fn_name]
@@ -2400,12 +2448,8 @@ def _gate_release(conn, project_id, result, metadata):
         _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
                            {"type": "merge_complete", "producer": "auto-chain"})
 
-    # 5g: Store proposed_nodes into pending_nodes (P4 — not directly to graph)
-    proposed_nodes = metadata.get("proposed_nodes", [])
-    if proposed_nodes:
-        count = _store_proposed_nodes(conn, project_id, proposed_nodes)
-        if count > 0:
-            log.info("release_gate: stored %d proposed node(s) in pending_nodes", count)
+    # TODO-DEPRECATED: _store_proposed_nodes callsite removed per OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT PR-A.
+    # Graph delta is now emitted as chain_event in dev completion path via _emit_graph_delta_event().
 
     return True, "ok"
 
