@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 RESULT_CORE_FIELDS = [
     "target_files", "changed_files", "verification", "requirements",
     "acceptance_criteria", "test_report", "prd", "proposed_nodes",
-    "summary", "related_nodes",
+    "summary", "related_nodes", "graph_delta",
 ]
 
 # Role-based visibility: which stage types each role can see
@@ -523,10 +523,14 @@ class ChainContextStore:
             "task.retry": self.on_task_retry,
             "task.failed": self.on_task_failed,
         }
+        # R6: Events that are persisted but have no in-memory handler.
+        # They are preserved in chain_events and replayed without error.
+        passthrough_events = {"graph.delta.proposed"}
 
         count = 0
         for row in rows:
-            handler = handlers.get(row["event_type"])
+            evt_type = row["event_type"]
+            handler = handlers.get(evt_type)
             if handler:
                 try:
                     payload = json.loads(row["payload_json"])
@@ -534,7 +538,10 @@ class ChainContextStore:
                     count += 1
                 except Exception:
                     log.debug("chain_context: skip bad event %s/%s",
-                              row["task_id"], row["event_type"])
+                              row["task_id"], evt_type)
+            elif evt_type in passthrough_events:
+                # Preserved in DB, no in-memory state change needed
+                count += 1
 
         self._recovering = False
         log.info("chain_context: recovered %d events, %d active chains for %s",
