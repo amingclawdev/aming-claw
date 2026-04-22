@@ -690,6 +690,18 @@ class ExecutorWorker:
                 },
             }
 
+    @staticmethod
+    def _try_backlog_close_impl(project_id, bug_id, commit_hash, api_fn):
+        """Best-effort backlog close via governance API. Never raises."""
+        if not bug_id:
+            return
+        try:
+            api_fn("POST", f"/api/backlog/{project_id}/{bug_id}/close",
+                   {"commit": commit_hash, "actor": "executor-merge"})
+            log.info("backlog close: closed %s after merge commit %s", bug_id, commit_hash)
+        except Exception:
+            log.warning("backlog close failed for %s (non-fatal)", bug_id, exc_info=True)
+
     def _execute_merge(self, task_id: str, metadata: dict) -> dict:
         """Merge is a script operation.
 
@@ -988,6 +1000,12 @@ class ExecutorWorker:
                 })
             except Exception:
                 log.debug("Merge memory write failed (non-fatal)")
+
+            # OPT-BACKLOG: best-effort backlog close after successful merge (R3/AC6)
+            self._try_backlog_close_impl(
+                self.project_id, metadata.get("bug_id", ""),
+                commit_hash, self._api,
+            )
 
             return {"status": "succeeded", "result": {
                 "merge_commit": commit_hash,

@@ -1592,6 +1592,44 @@ def handle_task_create(ctx: RequestContext):
     if "intent_summary" not in metadata:
         metadata["intent_summary"] = prompt[:200]
 
+    # --- Backlog gate: check bug_id for code-change task types (R1/R4) ---
+    _CODE_CHANGE_TYPES = ("pm", "dev", "test", "qa", "gatekeeper", "merge", "deploy")
+    if task_type in _CODE_CHANGE_TYPES:
+        _has_bug_id = bool(metadata.get("bug_id"))
+        _force_bypass = metadata.get("force_no_backlog") is True
+        if _force_bypass:
+            # R4: observer bypass — audit the event
+            _bypass_reason = metadata.get("force_reason", "no reason given")
+            try:
+                _publish_event("backlog_gate.observer_bypass", {
+                    "project_id": project_id,
+                    "task_type": task_type,
+                    "force_reason": _bypass_reason,
+                    "created_by": created_by,
+                })
+                with DBContext(project_id) as _evt_conn:
+                    _evt_conn.execute(
+                        "INSERT INTO chain_events (chain_id, event_type, payload, created_at) "
+                        "VALUES (?, ?, ?, datetime('now'))",
+                        ("backlog_gate", "backlog_gate.observer_bypass",
+                         json.dumps({"project_id": project_id, "task_type": task_type,
+                                     "force_reason": _bypass_reason, "created_by": created_by})),
+                    )
+                    _evt_conn.commit()
+            except Exception:
+                log.debug("backlog_gate: failed to audit observer bypass", exc_info=True)
+            log.info("backlog_gate: observer bypass for %s task (reason: %s)", task_type, _bypass_reason)
+        elif not _has_bug_id:
+            _enforce_mode = os.environ.get("OPT_BACKLOG_ENFORCE", "warn")
+            log.warning("backlog_gate: missing bug_id for %s task in project %s (mode=%s)",
+                        task_type, project_id, _enforce_mode)
+            if _enforce_mode == "strict":
+                raise GovernanceError(
+                    "bug_id required",
+                    f"Task type '{task_type}' requires metadata.bug_id",
+                    status=422,
+                )
+
     # Run conflict rules for user-facing task types (not auto-chain internal)
     rule_decision = None
     if task_type in ("pm", "dev", "coordinator") and created_by not in ("auto-chain", "auto-chain-retry"):

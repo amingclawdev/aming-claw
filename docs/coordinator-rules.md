@@ -85,6 +85,36 @@ The coordinator itself is unaffected (it has no tools and does not run commands)
 
 ---
 
+## OPT-BACKLOG-TASK-MUST-FROM-BACKLOG: Task-Create Backlog Gate (Phase 1)
+
+**Added:** 2026-04-22 | **Source:** `handle_task_create` in `agent/governance/server.py` | **Bug:** OPT-BACKLOG-TASK-MUST-FROM-BACKLOG
+
+### Purpose
+
+Ensures every code-change task (`pm`, `dev`, `test`, `qa`, `gatekeeper`, `merge`, `deploy`) carries a `metadata.bug_id` linking it to a backlog entry. Phase 1 operates in **warn mode** (log warning, never reject). Strict mode (HTTP 422 rejection) exists in code but is activated only by setting `OPT_BACKLOG_ENFORCE=strict`.
+
+### Gate Logic
+
+1. If `task_type` is a code-change type AND `metadata.bug_id` is missing:
+   - **`OPT_BACKLOG_ENFORCE=warn`** (default): log `backlog_gate: missing bug_id` warning, allow creation.
+   - **`OPT_BACKLOG_ENFORCE=strict`**: reject with HTTP 422 `bug_id required`.
+2. If `metadata.force_no_backlog=true` AND `metadata.force_reason` is set: bypass gate, audit event `backlog_gate.observer_bypass` written to `chain_events`.
+3. Non-code-change types (e.g., `coordinator`, `task`) are not gated.
+
+### Observer Bypass
+
+Set `metadata.force_no_backlog: true` and `metadata.force_reason: "<reason>"` to skip the gate. The bypass is audited via event bus and `chain_events` table with event type `backlog_gate.observer_bypass`.
+
+### Invariant I2 Enforcement
+
+This gate is the **server-side** half of invariant I2 (bug_id propagation). The **chain-side** half is CH2 (see below) which propagates `bug_id` through stage transitions and retries via `chain_context`.
+
+### Test Coverage
+
+- `agent/tests/test_task_create_backlog_gate.py` — warn mode, strict mode, observer bypass, non-code types
+
+---
+
 ## OPT-BACKLOG-CH1: Backlog ID Auto-Tagging
 
 **Added:** 2026-04-21 | **Source:** `_extract_backlog_id` + `_handle_coordinator_v1` in `agent/executor_worker.py` | **Graph node:** L4.43 (backlog-as-chain-source policy)

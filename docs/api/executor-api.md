@@ -353,7 +353,30 @@ The `_skipped_tasks` mechanism has been enhanced to provide better diagnostics a
 - **Monitoring endpoint:** Skip statistics are included in the `GET /status` response under `skipped_tasks_count` and `skip_reasons` breakdown
 - **Auto-clear conditions:** Beyond the full-scan-cycle clear, `_skipped_tasks` entries are also cleared when: (a) the blocking condition resolves (e.g., workspace becomes free), (b) the task's retry budget is exhausted (task fails instead of being skipped), or (c) a manual `POST /task/{id}/retry` is issued
 
+## Merge-Stage Backlog Auto-Close (OPT-BACKLOG)
+
+**Added:** 2026-04-22 | **Source:** `_try_backlog_close_impl` in `agent/executor_worker.py`
+
+After a successful merge commit, the executor makes a **best-effort** call to close the associated backlog bug:
+
+```
+POST /api/backlog/{project_id}/{bug_id}/close
+Body: {"commit": "<merge_commit_hash>", "actor": "executor-merge"}
+```
+
+### Behavior
+
+- Only fires when `metadata.bug_id` is non-empty on the merge task.
+- The `bug_id` is propagated through the auto-chain pipeline via CH2 (chain-context bug_id propagation).
+- **Failure is non-fatal**: if the backlog close call fails (HTTP 500, 404, connection error), the merge task still returns `succeeded`. A warning is logged.
+- The merge result dict is unaffected by backlog close success/failure.
+
+### Test Coverage
+
+- `agent/tests/test_merge_backlog_auto_close.py` — success path, HTTP 500 non-fatal, missing bug_id skip
+
 ## Changelog
+- 2026-04-22: Added merge-stage backlog auto-close (OPT-BACKLOG) documentation
 - 2026-04-10: Added worktree isolation (L4), session timeout (B11), task pause/resume (B12), spin loop enhancement (B14) documentation
 - 2026-04-07: Added fail-fast worktree (B10) behavior documentation
 - 2026-03-26: Old Telegram bot system completely removed (bot_commands, coordinator, executor and 20 other modules), unified to use governance API
