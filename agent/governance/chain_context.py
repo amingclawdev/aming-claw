@@ -525,7 +525,13 @@ class ChainContextStore:
         }
         # R6: Events that are persisted but have no in-memory handler.
         # They are preserved in chain_events and replayed without error.
-        passthrough_events = {"graph.delta.proposed"}
+        # PR-C adds graph.delta.validated, graph.delta.committed, graph.delta.failed,
+        # and related_nodes.updated for gatekeeper graph delta commit flow.
+        passthrough_events = {
+            "graph.delta.proposed", "graph.delta.validated",
+            "graph.delta.committed", "graph.delta.failed",
+            "related_nodes.updated",
+        }
 
         count = 0
         for row in rows:

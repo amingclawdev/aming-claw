@@ -292,6 +292,298 @@ def _emit_graph_delta_event(project_id, task_id, result):
 
 
 # ---------------------------------------------------------------------------
+# Graph Delta Transactional Commit (PR-C: OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT)
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+
+
+def _commit_graph_delta(conn, project_id, metadata):
+    """Consume graph.delta.validated event and apply creates[]/updates[] to node_state.
+
+    Called from _gate_gatekeeper_pass on merge_pass. All writes occur in a
+    single transaction. On failure, rollback and emit graph.delta.failed.
+
+    R1: Transactional commit of creates[]/updates[]
+    R2: Node ID auto-generation for creates[] without explicit node_id
+    R3: Idempotency via event_id check
+    R4: Related-nodes carryforward after commit
+    R6: links[] logged as TODO/skipped (no edges table)
+    R7: Malformed creates[] (missing parent_layer) skipped with warning
+    """
+    root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        root_task_id = store._task_to_root.get(root_task_id, root_task_id)
+    except Exception:
+        pass
+
+    # Query for graph.delta.validated event (use passed-in conn — same DB)
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM chain_events "
+            "WHERE root_task_id = ? AND event_type = 'graph.delta.validated' "
+            "ORDER BY ts DESC LIMIT 1",
+            (root_task_id,),
+        ).fetchone()
+    except Exception:
+        log.debug("_commit_graph_delta: no chain_events table or query failed", exc_info=True)
+        return  # No validated event — nothing to commit
+
+    if not row:
+        return  # No graph.delta.validated event for this chain
+
+    try:
+        validated_payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+    except Exception:
+        log.warning("_commit_graph_delta: failed to parse validated payload")
+        return
+
+    # Extract the original proposed payload which contains graph_delta
+    proposed_payload = validated_payload.get("proposed_payload", {})
+    graph_delta = proposed_payload.get("graph_delta", {})
+    if not graph_delta:
+        return
+
+    creates = graph_delta.get("creates", [])
+    updates = graph_delta.get("updates", [])
+    links = graph_delta.get("links", [])
+
+    if not creates and not updates and not links:
+        return
+
+    # Generate event_id for idempotency
+    # Use source_task_id from proposed_payload as the source event identifier
+    source_event_id = proposed_payload.get("source_task_id", "")
+    event_id = str(_uuid.uuid4())
+
+    # R3: Idempotency check — look for prior graph.delta.committed with same root + source
+    if source_event_id:
+        try:
+            prior = conn.execute(
+                "SELECT payload_json FROM chain_events "
+                "WHERE root_task_id = ? AND event_type = 'graph.delta.committed' "
+                "ORDER BY ts DESC LIMIT 1",
+                (root_task_id,),
+            ).fetchone()
+            if prior:
+                prior_payload = json.loads(prior["payload_json"]) if isinstance(prior["payload_json"], str) else prior["payload_json"]
+                if prior_payload.get("source_event_id") == source_event_id:
+                    log.info("_commit_graph_delta: idempotent skip — already committed for source %s", source_event_id)
+                    return prior_payload.get("committed_node_ids", [])
+        except Exception:
+            log.debug("_commit_graph_delta: idempotency check failed", exc_info=True)
+
+    # R6: links[] — no edges table, log and skip
+    if links:
+        log.warning("_commit_graph_delta: TODO — links[] items skipped (no edges table in governance.db): %d items", len(links))
+
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    committed_node_ids = []
+
+    try:
+        # Begin transaction — conn should already be in autocommit=off mode
+        # We use the passed-in conn for transactional safety
+
+        # R2/R5: Process creates[]
+        for item in creates:
+            if not isinstance(item, dict):
+                log.warning("_commit_graph_delta: skipping non-dict creates item")
+                continue
+
+            parent_layer = item.get("parent_layer")
+            # R7: skip malformed items missing parent_layer
+            if parent_layer is None:
+                log.warning("_commit_graph_delta: skipping creates[] item with missing parent_layer: %s",
+                            item.get("title", "<untitled>"))
+                continue
+
+            try:
+                parent_layer = int(parent_layer)
+            except (ValueError, TypeError):
+                log.warning("_commit_graph_delta: skipping creates[] item with non-int parent_layer: %s", parent_layer)
+                continue
+
+            explicit_node_id = item.get("node_id")
+
+            if explicit_node_id:
+                # R2: Check collision
+                existing = conn.execute(
+                    "SELECT node_id FROM node_state WHERE project_id = ? AND node_id = ?",
+                    (project_id, explicit_node_id),
+                ).fetchone()
+                if existing:
+                    # AC5: Collision — reject entire batch
+                    raise ValueError(f"node_id collision: {explicit_node_id} already exists")
+                display_id = explicit_node_id
+            else:
+                # R2: Auto-generate node_id using existing pattern
+                prefix = f"L{parent_layer}."
+                existing_rows = conn.execute(
+                    "SELECT node_id FROM node_state WHERE project_id = ? AND node_id LIKE ?",
+                    (project_id, f"{prefix}%"),
+                ).fetchall()
+                max_index = 0
+                for r in existing_rows:
+                    try:
+                        idx = int(r["node_id"].split(".")[1])
+                        max_index = max(max_index, idx)
+                    except (ValueError, IndexError):
+                        pass
+                display_id = f"L{parent_layer}.{max_index + 1}"
+
+            # Insert node_state
+            conn.execute(
+                """INSERT OR IGNORE INTO node_state
+                   (project_id, node_id, verify_status, build_status, updated_at, version)
+                   VALUES (?, ?, 'pending', 'unknown', ?, 1)""",
+                (project_id, display_id, now),
+            )
+
+            # Record in node_history
+            try:
+                title = item.get("title", display_id)
+                conn.execute(
+                    """INSERT INTO node_history
+                       (project_id, node_id, from_status, to_status, role, evidence_json, session_id, ts, version)
+                       VALUES (?, ?, 'none', 'pending', 'auto-chain', ?, 'graph-delta-commit', ?, 1)""",
+                    (project_id, display_id,
+                     json.dumps({"title": title, "deps": item.get("deps", []),
+                                 "primary": item.get("primary", []),
+                                 "source": "graph.delta.committed"}),
+                     now),
+                )
+            except Exception:
+                pass  # History is nice-to-have
+
+            committed_node_ids.append(display_id)
+
+        # Process updates[]
+        for item in updates:
+            if not isinstance(item, dict):
+                continue
+            node_id = item.get("node_id")
+            if not node_id:
+                continue
+            fields = item.get("fields", {})
+            if not fields:
+                continue
+
+            # Only update if node exists
+            existing = conn.execute(
+                "SELECT verify_status, version FROM node_state WHERE project_id = ? AND node_id = ?",
+                (project_id, node_id),
+            ).fetchone()
+            if not existing:
+                log.warning("_commit_graph_delta: update target %s not found, skipping", node_id)
+                continue
+
+            # Apply field updates (limited to safe fields)
+            update_parts = []
+            update_vals = []
+            for field_name in ("verify_status", "build_status"):
+                if field_name in fields:
+                    update_parts.append(f"{field_name} = ?")
+                    update_vals.append(fields[field_name])
+            if update_parts:
+                update_parts.append("updated_at = ?")
+                update_vals.append(now)
+                update_parts.append("updated_by = ?")
+                update_vals.append("graph-delta-commit")
+                update_vals.extend([project_id, node_id])
+                conn.execute(
+                    f"UPDATE node_state SET {', '.join(update_parts)} WHERE project_id = ? AND node_id = ?",
+                    update_vals,
+                )
+
+            if node_id not in committed_node_ids:
+                committed_node_ids.append(node_id)
+
+        # AC3: Write graph.delta.committed event — write to same conn (transactional)
+        committed_payload = {
+            "event_id": event_id,
+            "source_event_id": source_event_id,
+            "committed_node_ids": committed_node_ids,
+            "creates_count": len(creates),
+            "updates_count": len(updates),
+            "links_skipped": len(links),
+        }
+        conn.execute(
+            "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+            "VALUES (?, ?, 'graph.delta.committed', ?, ?)",
+            (root_task_id, metadata.get("task_id", ""),
+             json.dumps(committed_payload, ensure_ascii=False), now),
+        )
+
+        # R4: Append committed node_ids to chain metadata related_nodes
+        if committed_node_ids:
+            try:
+                existing_related = metadata.get("related_nodes", [])
+                if isinstance(existing_related, str):
+                    try:
+                        existing_related = json.loads(existing_related)
+                    except Exception:
+                        existing_related = [existing_related] if existing_related else []
+                new_related = list(set(existing_related + committed_node_ids))
+                metadata["related_nodes"] = new_related
+
+                # Also persist related_nodes.updated event to same conn
+                conn.execute(
+                    "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+                    "VALUES (?, ?, 'related_nodes.updated', ?, ?)",
+                    (root_task_id, metadata.get("task_id", ""),
+                     json.dumps({"related_nodes": new_related, "added": committed_node_ids},
+                                ensure_ascii=False), now),
+                )
+            except Exception:
+                log.debug("_commit_graph_delta: related_nodes carryforward failed", exc_info=True)
+
+        log.info("_commit_graph_delta: committed %d nodes for chain %s: %s",
+                 len(committed_node_ids), root_task_id, committed_node_ids)
+        return committed_node_ids
+
+    except ValueError as ve:
+        # AC2/AC5: Collision or validation error — rollback
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        log.warning("_commit_graph_delta: batch rejected — %s", ve)
+        # Write graph.delta.failed event (post-rollback, new mini-transaction)
+        try:
+            conn.execute(
+                "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+                "VALUES (?, ?, 'graph.delta.failed', ?, ?)",
+                (root_task_id, metadata.get("task_id", ""),
+                 json.dumps({"error": str(ve), "event_id": event_id}, ensure_ascii=False), now),
+            )
+            conn.commit()
+        except Exception:
+            log.debug("_commit_graph_delta: failed event write failed", exc_info=True)
+        return None
+
+    except Exception as exc:
+        # AC2: Any other exception — rollback and emit failed event
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        log.warning("_commit_graph_delta: transaction failed — %s", exc, exc_info=True)
+        try:
+            conn.execute(
+                "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+                "VALUES (?, ?, 'graph.delta.failed', ?, ?)",
+                (root_task_id, metadata.get("task_id", ""),
+                 json.dumps({"error": str(exc), "event_id": event_id}, ensure_ascii=False), now),
+            )
+            conn.commit()
+        except Exception:
+            log.debug("_commit_graph_delta: failed event write failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Graph-Path-Driven Routing (Roadmap §5.5)
 # ---------------------------------------------------------------------------
 
@@ -355,6 +647,9 @@ def _check_verify_requires_satisfied(conn, project_id, verify_requires):
                 blocking.append(req_nid)
                 continue
             status = (row["verify_status"] or "pending").strip()
+            # AC10: rolled_back nodes don't block
+            if status in _NON_BLOCKING_STATUSES:
+                continue
             try:
                 rank = _STATUS_ORDER.index(status)
             except ValueError:
@@ -2466,6 +2761,13 @@ def _gate_gatekeeper_pass(conn, project_id, result, metadata):
             )
         except Exception:
             log.debug("gatekeeper ai record failed (non-critical)", exc_info=True)
+
+        # PR-C: Commit graph delta after gatekeeper passes (AC1)
+        try:
+            _commit_graph_delta(conn, project_id, metadata)
+        except Exception:
+            log.warning("_gate_gatekeeper_pass: graph delta commit failed (non-blocking)", exc_info=True)
+
         return True, "ok"
     if rec in ("reject", "rejected"):
         return False, f"Gatekeeper rejected merge: {result.get('reason', 'no reason given')}"
@@ -2994,6 +3296,10 @@ def _write_chain_memory(conn, project_id, kind, content, metadata, extra_structu
 # Status ordering for node_state validation
 _STATUS_ORDER = ["pending", "testing", "t2_pass", "qa_pass", "waived"]
 
+# AC10: Statuses that are treated as "not blocking" — soft-deleted nodes
+# don't block gates even though they aren't in the ordinal _STATUS_ORDER.
+_NON_BLOCKING_STATUSES = {"rolled_back"}
+
 
 def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
     """Verify every node in related_nodes has at least min_status in node_state.
@@ -3029,6 +3335,9 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
             log.warning("_check_nodes_min_status: node '%s' not found in DB for project '%s' — skipping", node_id, project_id)
             continue
         status = (row["verify_status"] or "pending").strip()
+        # AC10: rolled_back (soft-deleted) nodes never block gates
+        if status in _NON_BLOCKING_STATUSES:
+            continue
         try:
             rank = _STATUS_ORDER.index(status)
         except ValueError:

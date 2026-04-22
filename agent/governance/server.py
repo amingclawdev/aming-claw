@@ -1320,6 +1320,66 @@ def handle_node_delete(ctx: RequestContext):
     return {"deleted": len(deleted), "skipped": skipped, "reason": reason}
 
 
+@route("POST", "/api/wf/{project_id}/node-soft-delete")
+def handle_node_soft_delete(ctx: RequestContext):
+    """Soft-delete nodes by setting verify_status to 'rolled_back'.
+
+    PR-C scaffold: no production callsite yet. Sets status and writes audit record.
+
+    Body: {"node_ids": ["L1.1", "L1.2"], "reason": "rolled back by graph delta"}
+    """
+    project_id = ctx.get_project_id()
+    node_ids = ctx.body.get("node_ids", [])
+    reason = ctx.body.get("reason", "")
+    if not node_ids:
+        from .errors import GovernanceError
+        raise GovernanceError("missing node_ids array", "invalid_request")
+
+    now = __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+    updated = []
+    skipped = []
+
+    with DBContext(project_id) as conn:
+        for nid in node_ids:
+            row = conn.execute(
+                "SELECT verify_status, version FROM node_state WHERE project_id = ? AND node_id = ?",
+                (project_id, nid),
+            ).fetchone()
+            if not row:
+                skipped.append({"node_id": nid, "reason": "not found"})
+                continue
+
+            old_status = row["verify_status"]
+            new_version = row["version"] + 1
+            conn.execute(
+                """UPDATE node_state SET verify_status = 'rolled_back',
+                   updated_by = 'node-soft-delete', updated_at = ?, version = ?
+                   WHERE project_id = ? AND node_id = ?""",
+                (now, new_version, project_id, nid),
+            )
+
+            # Write audit record to node_history
+            try:
+                conn.execute(
+                    """INSERT INTO node_history
+                       (project_id, node_id, from_status, to_status, role, evidence_json, session_id, ts, version)
+                       VALUES (?, ?, ?, 'rolled_back', 'coordinator', ?, 'node-soft-delete', ?, ?)""",
+                    (project_id, nid, old_status,
+                     json.dumps({"reason": reason, "type": "soft_delete"}),
+                     now, new_version),
+                )
+            except Exception:
+                pass  # History is best-effort
+
+            updated.append(nid)
+
+        # Audit
+        audit_service.record(conn, project_id, "node.soft_delete",
+                             node_ids=updated, reason=reason)
+
+    return {"updated": updated, "skipped": skipped, "reason": reason}
+
+
 @route("GET", "/api/wf/{project_id}/impact")
 def handle_impact(ctx: RequestContext):
     project_id = ctx.get_project_id()
