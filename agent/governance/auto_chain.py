@@ -1376,9 +1376,23 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     )
                 else:
                     scope_line = ""
+                # PR-B/R4: Enrich dev retry with graph_delta_review issues if rejection was from QA graph delta review
+                _gd_retry_section = ""
+                if "graph delta rejected by QA" in reason or "graph_delta_review" in reason:
+                    _gd_review = result.get("graph_delta_review", {})
+                    if isinstance(_gd_review, dict):
+                        _gd_issues = _gd_review.get("issues", [])
+                        _gd_diff = _gd_review.get("suggested_diff", {})
+                        _gd_retry_section = (
+                            "\n## Graph Delta Review Rejection\n"
+                            f"QA graph_delta_review issues: {json.dumps(_gd_issues, ensure_ascii=False)}\n"
+                            f"QA suggested_diff: {json.dumps(_gd_diff, ensure_ascii=False)}\n"
+                            "Address the graph delta issues listed above in your retry.\n\n"
+                        )
                 retry_prompt = (
                     f"Previous attempt ({task_id}) was blocked by gate.\n"
                     f"Gate reason: {retry_reason}\n\n"
+                    f"{_gd_retry_section}"
                     f"{scope_line}"
                     "IMPORTANT: Do not assume previous blockers still exist. "
                     "Re-verify all alleged blockers against current source before reporting them as remaining issues.\n\n"
@@ -2339,6 +2353,42 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
             f"Got: {rec!r}. QA agent must set result.recommendation."
         )
+    # PR-B: graph.delta.proposed enforcement — check BEFORE criteria evaluation
+    _gd_proposed = _query_graph_delta_proposed(metadata)
+    if _gd_proposed:
+        gd_review = result.get("graph_delta_review")
+        if not gd_review or not isinstance(gd_review, dict):
+            return False, "graph.delta.proposed present but QA result omits graph_delta_review"
+        gd_decision = gd_review.get("decision", "")
+        if gd_decision == "reject":
+            issues = gd_review.get("issues", [])
+            return False, f"graph delta rejected by QA: {issues}"
+        if gd_decision == "pass":
+            # Write graph.delta.validated event to chain_events
+            try:
+                from .chain_context import get_store as _gd_store
+                store = _gd_store()
+                root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
+                root_task_id = store._task_to_root.get(root_task_id, root_task_id)
+                task_id_for_event = metadata.get("task_id", "")
+                store._persist_event(
+                    root_task_id=root_task_id,
+                    task_id=task_id_for_event,
+                    event_type="graph.delta.validated",
+                    payload={
+                        "source_task_id": task_id_for_event,
+                        "graph_delta_review": gd_review,
+                        "proposed_payload": _gd_proposed,
+                    },
+                    project_id=project_id,
+                )
+                log.info("auto_chain: wrote graph.delta.validated event for chain %s", root_task_id)
+            except Exception:
+                log.debug("auto_chain: graph.delta.validated write failed", exc_info=True)
+        else:
+            return False, f"graph_delta_review.decision must be 'pass' or 'reject', got: {gd_decision!r}"
+    # AC7: No graph.delta.proposed → graph_delta_review field not required (back-compat)
+
     # E2E1: Verify criteria_results when acceptance_criteria exist
     criteria = metadata.get("acceptance_criteria", [])
     criteria_results = result.get("criteria_results", [])
@@ -2582,6 +2632,40 @@ def _build_test_prompt(task_id, result, metadata):
     return prompt, meta
 
 
+def _query_graph_delta_proposed(metadata):
+    """Query chain_events for the latest graph.delta.proposed event on this chain's root_task_id.
+
+    Returns the event payload dict if found, None otherwise.
+    """
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        # Resolve root_task_id: chain_id in metadata is the PM root, or fallback to parent_task_id
+        root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id")
+        if not root_task_id:
+            return None
+        # Also check store's task_to_root mapping for better resolution
+        root_task_id = store._task_to_root.get(root_task_id, root_task_id)
+
+        from .db import get_connection
+        project_id = metadata.get("project_id", "aming-claw")
+        conn = get_connection(project_id)
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM chain_events "
+                "WHERE root_task_id = ? AND event_type = 'graph.delta.proposed' "
+                "ORDER BY ts DESC LIMIT 1",
+                (root_task_id,),
+            ).fetchone()
+            if row:
+                return json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("_query_graph_delta_proposed: lookup failed", exc_info=True)
+    return None
+
+
 def _build_qa_prompt(task_id, result, metadata):
     report = result.get("test_report", {})
     changed = result.get("changed_files", metadata.get("changed_files", []))
@@ -2619,6 +2703,24 @@ def _build_qa_prompt(task_id, result, metadata):
             f"The graph links these docs to the changed code: {json.dumps(graph_docs)}\n"
             f"Verify: are these docs still consistent with the code changes? "
             f"If not, note which docs need updates in your review."
+        )
+    # PR-B: Query chain_events for graph.delta.proposed and inject review instructions
+    _gd_proposed = _query_graph_delta_proposed(metadata)
+    if _gd_proposed:
+        prompt_parts.append(
+            "\n## Graph Delta Review\n"
+            "A graph.delta.proposed event was found for this chain. "
+            "You MUST review the proposed graph delta below and include a "
+            "'graph_delta_review' field in your result JSON.\n\n"
+            f"Proposed delta payload:\n{json.dumps(_gd_proposed, ensure_ascii=False, indent=2)}\n\n"
+            "Required result field:\n"
+            "  graph_delta_review: {\n"
+            '    decision: "pass" | "reject",\n'
+            "    issues: [\"<issue description>\", ...],  // empty list if decision is pass\n"
+            "    suggested_diff: {}  // optional corrections to the delta\n"
+            "  }\n"
+            "If decision is 'reject', list specific issues. "
+            "If decision is 'pass', issues should be an empty list."
         )
     prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
     prompt = "\n".join(prompt_parts)
