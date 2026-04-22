@@ -273,10 +273,14 @@ class AILifecycleManager:
                                 "CLAUDE_CODE_EXECPATH",
                                 "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
                                 "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
-                                "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL")}
+                                "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL",
+                                "CLAUDE_CODE_OAUTH_TOKEN")}
             env.pop("ANTHROPIC_API_KEY", None)
 
         # Create session object first (wait_for_output polls session.status)
+        # NOTE: pid=0 is a sentinel — do NOT log session.pid until pid != 0
+        # (Popen assigns the real PID at line ~326).  Any log line referencing
+        # pid=0 looks like a real process and confuses crash-recovery grep.
         session = AISession(
             session_id=session_id,
             role=role,
@@ -289,6 +293,9 @@ class AILifecycleManager:
         )
         with self._lock:
             self._sessions[session_id] = session
+            if session.pid != 0:
+                _al_log(f"Session registered: sid={session_id} pid={session.pid}")
+            # else: pid==0, suppress pid-dependent log until Popen assigns real PID
 
         # Run CLI in background thread using Popen + communicate().
         # communicate() avoids pipe deadlock (same as subprocess.run internally).

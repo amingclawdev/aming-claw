@@ -1966,6 +1966,16 @@ class ExecutorWorker:
         if stdout.startswith("Error:") and not stdout.lstrip().startswith("{"):
             return stdout.splitlines()[0].strip()
 
+        # R3: Classify JSON-shaped auth failure responses as terminal errors.
+        # Stale CLAUDE_CODE_OAUTH_TOKEN or expired API keys produce 401 / Unauthorized
+        # responses that should not be retried endlessly.
+        _auth_failure_patterns = ("unauthorized", "invalid_token", "authentication_error",
+                                  "token_expired", "auth_error")
+        if any(pat in lowered for pat in _auth_failure_patterns):
+            return f"Auth failure detected: {combined.splitlines()[0][:200]}"
+        if '"error"' in lowered and ("401" in combined or "403" in combined):
+            return f"Auth failure (HTTP 401/403): {combined.splitlines()[0][:200]}"
+
         return None
 
     # ------------------------------------------------------------------
@@ -1991,6 +2001,26 @@ class ExecutorWorker:
                 log.warning("_recover_stale_leases: re-queued %d orphaned task(s) with expired leases", recovered)
         except Exception as e:
             log.debug("_recover_stale_leases failed (non-fatal): %s", e)
+
+    def _check_auth_smoke_test(self) -> None:
+        """R4: Auth smoke test at startup — verify CLAUDE_CODE_OAUTH_TOKEN is not
+        present in our environment (it would be forwarded to child subprocesses
+        and cause 401 failures if stale).  Logs warning on failure but does NOT
+        block startup.
+        """
+        try:
+            stale_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            if stale_token:
+                log.warning(
+                    "_check_auth_smoke_test: CLAUDE_CODE_OAUTH_TOKEN found in "
+                    "executor env (%d chars) — child subprocesses will strip it "
+                    "via env-filter, but the launch env should be cleaned",
+                    len(stale_token),
+                )
+            else:
+                log.info("_check_auth_smoke_test: no stale CLAUDE_CODE_OAUTH_TOKEN in env (OK)")
+        except Exception as e:
+            log.warning("_check_auth_smoke_test failed (non-fatal): %s", e)
 
     def _recover_stuck_tasks(self) -> None:
         """Mark any 'claimed' tasks from a previous crash as failed.
@@ -2324,6 +2354,9 @@ class ExecutorWorker:
             self._release_pid_lock()
             return
         log.info("Governance: v%s (PID %s)", health.get("version", "?"), health.get("pid", "?"))
+
+        # R4: Auth smoke test — verify CLI can authenticate without stale token
+        self._check_auth_smoke_test()
 
         # Recover any tasks left in 'claimed' state from a previous crash
         self._recover_stuck_tasks()

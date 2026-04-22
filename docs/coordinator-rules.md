@@ -245,3 +245,68 @@ If neither check matches, the existing error ("no isolated merge metadata") is s
 - **Guard function:** Inside `_execute_merge()`, within the `if metadata.get('parent_task_id') and not branch:` block
 - **Subprocess calls:** `git log -1 --name-only --format= HEAD` (read-only, already used elsewhere)
 - **Test coverage:** `agent/tests/test_executor_worker_merge.py` (8 test functions covering AC1-AC5 plus edge cases)
+
+---
+
+## OPT-BACKLOG-QA-CLI-AUTH-TOKEN-STALE: Stale OAuth Token Env-Strip + Auth Hardening
+
+**Added:** 2026-04-22 | **Source:** `agent/ai_lifecycle.py` (env-strip tuple, lines ~269-277), `agent/executor_worker.py` (`_detect_terminal_cli_error`, `_check_auth_smoke_test`, `run_loop`) | **Bug:** OPT-BACKLOG-QA-CLI-AUTH-TOKEN-STALE
+
+### Background
+
+During MF-2026-04-21-005 reconcile, executor QA tasks failed 3x with 401 because `CLAUDE_CODE_OAUTH_TOKEN` inherited from service_manager launch env outlived Claude Code session rotation. Additionally, `pid=0` race in session creation confused logs, and `_detect_terminal_cli_error` did not classify JSON auth failures. This is chain #3 of MF-005 follow-ups; chains #1 (MERGE-D6-EXPLICIT-FLAG at 94edd28) and #2 (DIRTY-FILTER-CACHE at 05f45af) already landed.
+
+### Changes (5 requirements)
+
+#### R1: Env-Strip — CLAUDE_CODE_OAUTH_TOKEN
+
+`ai_lifecycle.create_session` strips env vars before passing them to `subprocess.Popen`. The exclusion tuple now includes `CLAUDE_CODE_OAUTH_TOKEN`:
+
+```python
+env = {k: v for k, v in env.items()
+       if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+                    ...,
+                    "CLAUDE_CODE_OAUTH_TOKEN")}
+```
+
+This prevents stale tokens inherited from the service_manager launch environment from being forwarded to Claude CLI subprocesses.
+
+#### R2: pid=0 Logging Guard
+
+`AISession` is created with `pid=0` as a sentinel before `subprocess.Popen` assigns the real PID. A guard now prevents logging `session.pid` when `pid == 0`, so crash-recovery log grep does not confuse sentinel values with real process IDs.
+
+#### R3: Auth Failure Classifier
+
+`executor_worker._detect_terminal_cli_error` now detects JSON-shaped auth failure responses:
+
+| Pattern | Example |
+|---------|---------|
+| `unauthorized` | `{"error":"Unauthorized"}` |
+| `invalid_token` | `{"error":"invalid_token"}` |
+| `authentication_error` | `authentication_error: bad credentials` |
+| `token_expired` | `{"error":"token_expired"}` |
+| HTTP 401/403 with `"error"` | `{"error":"auth failed","status":401}` |
+
+When detected, a descriptive string is returned instead of `None`, causing the task to be marked as a terminal failure rather than retried endlessly.
+
+#### R4: Auth Smoke Test at Startup
+
+`executor_worker.run_loop` now calls `_check_auth_smoke_test()` between the governance health check and `_recover_stuck_tasks`. This verifies `CLAUDE_CODE_OAUTH_TOKEN` is not present in the executor's own environment. Logs a warning if found but does **not** block startup.
+
+#### R5: Reclaim Cycle Durability
+
+The env-strip fix (R1) and auth classifier (R3) are stateless — they operate on each `create_session` / `_detect_terminal_cli_error` call independently. A reclaimed task (`_recover_stuck_tasks` → re-poll → re-claim → fresh `create_session`) gets a clean env without the stale token, because the strip tuple is evaluated at call time against `os.environ`.
+
+### Test Coverage
+
+| Test file | Tests | Covers |
+|-----------|-------|--------|
+| `agent/tests/test_auth_token_env_strip.py` | 4 | R1: env-strip tuple, child env verification |
+| `agent/tests/test_lifecycle_pid_race.py` | 3 | R2: pid=0 guard, sentinel documentation |
+| `agent/tests/test_auth_failure_classifier.py` | 10 | R3: auth patterns, 401/403, existing patterns |
+| `agent/tests/test_executor_auth_smoke.py` | 5 | R4: smoke test presence, warning/OK behavior |
+| `agent/tests/test_auth_reclaim_e2e.py` | 3 | R5: full reclaim cycle, token not in child env |
+
+### Coordinator Impact
+
+The coordinator itself is unaffected — it does not manage env vars or authenticate. The fix operates at the executor/lifecycle level. However, coordinator-dispatched tasks (dev, test, QA) benefit because their child CLI processes no longer inherit stale OAuth tokens.
