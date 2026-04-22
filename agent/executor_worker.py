@@ -741,6 +741,26 @@ class ExecutorWorker:
                         "changed_files": changed,
                         "pre_merged": True,
                     }}
+                # HEAD == chain_version: explicit pre_merged metadata flag
+                if metadata.get("pre_merged"):
+                    log.info("merge: explicit pre_merged flag, HEAD=%s", head_rev)
+                    return {"status": "succeeded", "result": {
+                        "pre_merged": True,
+                    }}
+                # HEAD == chain_version: check if changed_files present in HEAD commit
+                if changed:
+                    head_files_proc = subprocess.run(
+                        ["git", "log", "-1", "--name-only", "--format=", "HEAD"],
+                        cwd=self.workspace, capture_output=True, text=True, timeout=5,
+                    )
+                    head_files = {f.strip() for f in head_files_proc.stdout.splitlines() if f.strip()}
+                    if all(cf in head_files for cf in changed):
+                        log.info("merge: HEAD==chain_version and all changed_files in HEAD commit — pre-merged, HEAD=%s", head_rev)
+                        return {"status": "succeeded", "result": {
+                            "merge_commit": head_rev,
+                            "changed_files": changed,
+                            "pre_merged": True,
+                        }}
             except Exception as e:
                 log.warning("merge: pre-merge detection failed: %s", e)
             return {
