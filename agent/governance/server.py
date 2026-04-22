@@ -2079,6 +2079,7 @@ def handle_version_sync(ctx: RequestContext):
 @route("POST", "/api/version-update/{project_id}")
 def handle_version_update(ctx: RequestContext):
     """Update chain_version. 5-step validation: token + fields + lifecycle + version + audit."""
+    log.warning("DEPRECATED — handle_version_update will be locked to bootstrap-only in PR-3")
     pid = ctx.get_project_id()
     body = ctx.body or {}
 
@@ -2206,6 +2207,36 @@ def _audit_version_update(conn, pid, body, result, reason):
         )
     except Exception:
         pass  # audit failure should not block
+
+
+# --- Redeploy Endpoints (PR-2) ---
+
+@route("POST", "/api/governance/redeploy/executor")
+def handle_redeploy_executor(ctx: RequestContext):
+    """Redeploy executor via 5-step pipeline. See redeploy_handler.py."""
+    from .redeploy_handler import handle_redeploy_executor as _handler
+    return _handler(ctx)
+
+
+@route("POST", "/api/governance/redeploy/gateway")
+def handle_redeploy_gateway(ctx: RequestContext):
+    """Redeploy gateway via 5-step pipeline. See redeploy_handler.py."""
+    from .redeploy_handler import handle_redeploy_gateway as _handler
+    return _handler(ctx)
+
+
+@route("POST", "/api/governance/redeploy/coordinator")
+def handle_redeploy_coordinator(ctx: RequestContext):
+    """Redeploy coordinator via 5-step pipeline. See redeploy_handler.py."""
+    from .redeploy_handler import handle_redeploy_coordinator as _handler
+    return _handler(ctx)
+
+
+@route("POST", "/api/governance/redeploy/service_manager")
+def handle_redeploy_service_manager(ctx: RequestContext):
+    """Redeploy service_manager via 5-step pipeline. See redeploy_handler.py."""
+    from .redeploy_handler import handle_redeploy_service_manager as _handler
+    return _handler(ctx)
 
 
 @route("GET", "/api/metrics")

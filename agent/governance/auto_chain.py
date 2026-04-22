@@ -3152,11 +3152,24 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
     finalize_result = {"deploy": "completed", "report": report}
 
     # --- R4: version-sync then version-update ---
-    try:
-        _finalize_version_sync(conn, project_id, task_id)
-    except Exception as e:
-        log.warning("_finalize_chain: version-sync/update failed: %s", e)
-        finalize_result["version_sync_error"] = str(e)
+    # PR-2 (R11): chain_version DB write now owned by redeploy_handler.
+    # _finalize_version_sync is kept as fallback but skipped when redeploy
+    # handler already wrote chain_version (detected via report metadata).
+    redeploy_wrote_version = (
+        report.get("steps", {}).get("executor", {}).get("redeploy_result", {}).get("ok")
+        or report.get("steps", {}).get("governance", {}).get("redeploy_result", {}).get("ok")
+        or report.get("steps", {}).get("gateway", {}).get("redeploy_result", {}).get("ok")
+        or report.get("steps", {}).get("service_manager", {}).get("redeploy_result", {}).get("ok")
+    )
+    if redeploy_wrote_version:
+        log.info("_finalize_chain: skipping _finalize_version_sync — redeploy handler owns DB write (R11)")
+        finalize_result["version_sync_note"] = "skipped — redeploy handler owns DB write"
+    else:
+        try:
+            _finalize_version_sync(conn, project_id, task_id)
+        except Exception as e:
+            log.warning("_finalize_chain: version-sync/update failed: %s", e)
+            finalize_result["version_sync_error"] = str(e)
 
     # --- R5: verify server version == new HEAD ---
     try:

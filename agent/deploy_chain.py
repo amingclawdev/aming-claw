@@ -592,16 +592,86 @@ def smoke_test(affected_services: list[str] | None = None) -> dict[str, Any]:
 # 6. run_deploy
 # ---------------------------------------------------------------------------
 
+def _post_redeploy(target: str, task_id: str = "", expected_head: str = "",
+                   drain_grace_seconds: int = 5) -> dict[str, Any]:
+    """POST to the governance redeploy endpoint for a target service.
+
+    Returns the JSON response dict, or an error dict on failure.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"http://localhost:40000/api/governance/redeploy/{target}"
+    payload = json.dumps({
+        "task_id": task_id,
+        "expected_head": expected_head,
+        "drain_grace_seconds": drain_grace_seconds,
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            body = {"error": str(exc)}
+        return {"ok": False, **body}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = "",
+                                      drain_grace_seconds: int = 5) -> dict[str, Any]:
+    """POST to /api/manager/redeploy/governance (PR-1 service_manager endpoint)."""
+    import urllib.request
+    import urllib.error
+
+    url = "http://localhost:40200/api/manager/redeploy/governance"
+    payload = json.dumps({
+        "task_id": task_id,
+        "expected_head": expected_head,
+        "drain_grace_seconds": drain_grace_seconds,
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            body = {"error": str(exc)}
+        return {"ok": False, **body}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
-               skip_services: list[str] = None) -> dict[str, Any]:
-    """Full deploy orchestration.
+               skip_services: list[str] = None,
+               task_id: str = "", expected_head: str = "") -> dict[str, Any]:
+    """Full deploy orchestration with double-write (legacy + redeploy).
 
     Steps:
     1. Detect affected services from *changed_files*.
-    2. Restart each affected service.
-    3. Run smoke test.
-    4. Optionally notify via Telegram if *chat_id* is non-zero.
-    5. Persist a report to state/deploy_report_<ts>.json.
+    2. Check for unsupported dual-restart case (governance + service_manager).
+    3. For each affected service:
+       a. POST to redeploy endpoint (new path)
+       b. Call legacy restart function (old path)
+       c. Log both outcomes side-by-side
+    4. Run smoke test.
+    5. Optionally notify via Telegram if *chat_id* is non-zero.
+    6. Persist a report to state/deploy_report_<ts>.json.
 
     Returns a full report dict.
     """
@@ -630,27 +700,104 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
             _save_report(report)
             return report
 
-        # 2. Restart each service
+        # R10: Check for unsupported dual-restart case
+        if "governance" in affected and "service_manager" in affected:
+            report["success"] = False
+            report["error"] = (
+                "Cannot auto-redeploy governance + service_manager simultaneously. "
+                "See docs/dev/dual-restart-runbook.md for the manual procedure."
+            )
+            report["dual_restart_required"] = True
+            report["finished_at"] = utc_iso()
+            _save_report(report)
+            return report
+
+        # 2. Restart each service (double-write: redeploy + legacy)
         steps: dict[str, Any] = {}
 
+        # R6: For executor, mark task SUCCEEDED with redeploy_pending BEFORE kill
         if "executor" in affected:
-            ok = restart_executor()
-            steps["executor"] = {"success": ok}
+            # [redeploy] POST to redeploy endpoint
+            redeploy_result = _post_redeploy(
+                "executor", task_id=task_id,
+                expected_head=expected_head,
+            )
+            log.info("[redeploy] executor: %s", redeploy_result)
 
+            # R6: pre-SUCCESS write before executor kill
+            if task_id:
+                try:
+                    _mark_task_succeeded_pre_kill(task_id, project_id)
+                    log.info("[redeploy] executor: marked task %s SUCCEEDED with redeploy_pending", task_id)
+                except Exception as exc:
+                    log.warning("[redeploy] executor: pre-SUCCESS write failed: %s", exc)
+
+            # [legacy] existing restart path
+            ok = restart_executor()
+            log.info("[legacy] executor: success=%s", ok)
+
+            steps["executor"] = {
+                "success": ok,
+                "redeploy_result": redeploy_result,
+                "legacy_success": ok,
+            }
+
+        # R7: For governance, POST to /api/manager/redeploy/governance
         if "governance" in affected:
+            # [redeploy] POST to manager endpoint (PR-1)
+            redeploy_result = _post_manager_redeploy_governance(
+                task_id=task_id,
+                expected_head=expected_head,
+            )
+            log.info("[redeploy] governance: %s", redeploy_result)
+
+            # [legacy] existing restart path
             ok, summary = rebuild_governance()
             if not ok:
-                # Docker rebuild failed — try local process restart
                 ok2, summary2 = restart_local_governance()
                 if ok2:
                     ok, summary = ok2, f"docker failed ({summary}), local restart OK: {summary2}"
                 else:
                     summary = f"docker: {summary} | local: {summary2}"
-            steps["governance"] = {"success": ok, "summary": summary}
+            log.info("[legacy] governance: success=%s summary=%s", ok, summary[:200])
+
+            steps["governance"] = {
+                "success": ok,
+                "summary": summary,
+                "redeploy_result": redeploy_result,
+                "legacy_success": ok,
+            }
 
         if "gateway" in affected:
+            # [redeploy] POST to redeploy endpoint
+            redeploy_result = _post_redeploy(
+                "gateway", task_id=task_id,
+                expected_head=expected_head,
+            )
+            log.info("[redeploy] gateway: %s", redeploy_result)
+
+            # [legacy] existing restart path
             ok, summary = restart_gateway()
-            steps["gateway"] = {"success": ok, "summary": summary}
+            log.info("[legacy] gateway: success=%s", ok)
+
+            steps["gateway"] = {
+                "success": ok,
+                "summary": summary,
+                "redeploy_result": redeploy_result,
+                "legacy_success": ok,
+            }
+
+        # R9: For service_manager, governance performs restart via redeploy endpoint
+        if "service_manager" in affected:
+            redeploy_result = _post_redeploy(
+                "service_manager", task_id=task_id,
+                expected_head=expected_head,
+            )
+            log.info("[redeploy] service_manager: %s", redeploy_result)
+            steps["service_manager"] = {
+                "success": redeploy_result.get("ok", False),
+                "redeploy_result": redeploy_result,
+            }
 
         report["steps"] = steps
 
@@ -659,7 +806,6 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         report["smoke_test"] = smoke
 
         # R2: Single derivation — success = all steps OK AND smoke_test.all_pass
-        # No post-hoc override; structural correctness by construction.
         all_steps_ok = all(
             step.get("success", False) for step in steps.values()
         )
@@ -679,6 +825,33 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
     _save_report(report)
 
     return report
+
+
+def _mark_task_succeeded_pre_kill(task_id: str, project_id: str) -> None:
+    """Mark a task as SUCCEEDED with redeploy_pending note before executor kill (R6).
+
+    Best-effort: failure here does not block the deploy.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"http://localhost:40000/api/task/{project_id or 'aming-claw'}/complete"
+    payload = json.dumps({
+        "task_id": task_id,
+        "status": "succeeded",
+        "result": {"note": "redeploy_pending"},
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:
+        log.warning("_mark_task_succeeded_pre_kill: %s", exc)
 
 
 # ---------------------------------------------------------------------------
