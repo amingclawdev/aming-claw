@@ -406,7 +406,7 @@ def release_gate(
     # Determine acceptable statuses based on min_status
     status_order = ["pending", "testing", "t2_pass", "qa_pass"]
     min_idx = status_order.index(min_status) if min_status in status_order else 3
-    acceptable = set(status_order[min_idx:]) | {"waived"}
+    acceptable = set(status_order[min_idx:]) | {"waived", "rolled_back"}
 
     all_nodes = graph.list_nodes()
     check_nodes = all_nodes

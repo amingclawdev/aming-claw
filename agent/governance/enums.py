@@ -24,6 +24,7 @@ class VerifyStatus(Enum):
     FAILED  = "failed"
     WAIVED  = "waived"       # Manually exempted by coordinator
     SKIPPED = "skipped"      # Skipped due to unsatisfied gate
+    ROLLED_BACK = "rolled_back"  # Soft-deleted via node-soft-delete (PR-C)
 
     @classmethod
     def from_str(cls, s: str) -> "VerifyStatus":
@@ -44,6 +45,7 @@ class VerifyStatus(Enum):
             "skipped": cls.SKIPPED,
             "verify:skipped": cls.SKIPPED,
             "verify:pending": cls.PENDING,
+            "rolled_back": cls.ROLLED_BACK,
         }
         normalized = s.strip().lower() if s else "pending"
         if normalized in mapping:
@@ -63,6 +65,7 @@ STATUS_ORDER = {
     VerifyStatus.WAIVED:  3,  # waived is equivalent to qa_pass
     VerifyStatus.FAILED: -1,  # failed is always below minimum
     VerifyStatus.SKIPPED: -2,
+    VerifyStatus.ROLLED_BACK: -3,  # soft-deleted, never blocks gates
 }
 
 
