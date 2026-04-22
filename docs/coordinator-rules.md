@@ -209,3 +209,39 @@ CH1 is the **source** (autotag the coordinator task). CH2 is the **sink's insura
 
 - `agent/tests/test_chain_context_bugid.py` — 19 tests covering field presence, `__slots__` enforcement, first-write-wins, empty/non-string rejection, late-arrival population, cross-stage read, serialize round-trip, retry-fallback simulation, crash-recovery replay, idempotency.
 - `agent/tests/test_chain_context.py` — 25 regression tests continue to pass (no behavior change for chains without `bug_id`).
+
+---
+
+## OPT-BACKLOG-MERGE-D6-EXPLICIT-FLAG: Pre-Merged Detection for HEAD==chain_version
+
+**Added:** 2026-04-22 | **Source:** `_execute_merge` in `agent/executor_worker.py` (D6 detection block, lines ~706-774) | **Bug:** OPT-BACKLOG-MERGE-D6-EXPLICIT-FLAG
+
+### Background
+
+The D6 fix (20baea3) added pre-merge auto-detection for chained merge tasks that lack `_branch`/`_worktree` metadata. It works when `HEAD != chain_version` (indicating commits landed after the version checkpoint). However, when `HEAD == chain_version` — as happens when an observer-walked chain already committed everything before the merge stage runs — the detection fell through to a "no isolated merge metadata" error. MF-2026-04-21-005 merge was blocked by this on 2026-04-22.
+
+### New Detection Paths
+
+Two new checks are added inside the existing `if metadata.get('parent_task_id') and not branch:` guard, between the `HEAD != chain_version` return and the error return:
+
+1. **Explicit `pre_merged` flag (R2):** If `metadata.get("pre_merged")` is truthy, return success immediately with `pre_merged: True`. This allows upstream dispatchers (observers, auto-chain) to signal that the merge is already done without requiring changed_files verification.
+
+2. **Changed-files-in-HEAD detection (R1):** When `HEAD == chain_version` and `metadata.changed_files` is non-empty, run `git log -1 --name-only HEAD` to list files in the HEAD commit. If all `changed_files` appear in that list, treat as pre-merged and return success with `pre_merged: True` and `merge_commit: HEAD_short_hash`.
+
+If neither check matches, the existing error ("no isolated merge metadata") is still returned.
+
+### Decision Matrix
+
+| HEAD vs chain_version | `_already_merged` / `_merge_commit` | `pre_merged` flag | changed_files in HEAD | Result |
+|----------------------|--------------------------------------|-------------------|-----------------------|--------|
+| any | set | any | any | success (existing path, line 710) |
+| HEAD != chain_version | not set | any | any | success (existing D6, line 736) |
+| HEAD == chain_version | not set | True | any | success (new R2, line 745) |
+| HEAD == chain_version | not set | not set | all present | success (new R1, line 751) |
+| HEAD == chain_version | not set | not set | missing/empty | failed (error, line 766) |
+
+### Implementation
+
+- **Guard function:** Inside `_execute_merge()`, within the `if metadata.get('parent_task_id') and not branch:` block
+- **Subprocess calls:** `git log -1 --name-only --format= HEAD` (read-only, already used elsewhere)
+- **Test coverage:** `agent/tests/test_executor_worker_merge.py` (8 test functions covering AC1-AC5 plus edge cases)
