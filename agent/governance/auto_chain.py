@@ -3277,7 +3277,60 @@ def _gate_release(conn, project_id, result, metadata):
     # TODO-DEPRECATED: _store_proposed_nodes callsite removed per OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT PR-A.
     # Graph delta is now emitted as chain_event in dev completion path via _emit_graph_delta_event().
 
+    # R2: On merge-stage success, resolve pitfall memories linked to dev-retry ancestry
+    _resolve_pitfall_memories(conn, project_id, result, metadata)
+
     return True, "ok"
+
+
+def _resolve_pitfall_memories(conn, project_id, result, metadata):
+    """R2: Walk chain_events backward to locate pitfall memory_ids written during dev-retry
+    ancestry, then UPDATE those memories' resolution_commit and resolution_summary.
+
+    Best-effort — never blocks chain progress on failure.
+    """
+    try:
+        merge_commit = result.get("merge_commit", metadata.get("merge_commit", ""))
+        if not merge_commit:
+            return
+
+        root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
+        if not root_task_id:
+            return
+
+        # Find all pitfall memories linked to this chain's scope via module_id matching
+        target_files = metadata.get("target_files", [])
+        if not target_files:
+            return
+
+        # Build module prefixes from target_files
+        module_prefixes = []
+        for tf in target_files:
+            prefix = tf.replace("/", ".").replace("\\", ".")
+            module_prefixes.append(prefix)
+
+        # Query pitfall memories that match these modules and lack resolution
+        for prefix in module_prefixes:
+            try:
+                rows = conn.execute(
+                    "SELECT memory_id, content FROM memories "
+                    "WHERE project_id = ? AND kind = 'pitfall' AND status = 'active' "
+                    "AND module_id LIKE ? AND COALESCE(resolution_commit, '') = ''",
+                    (project_id, prefix + "%"),
+                ).fetchall()
+                for row in rows:
+                    summary = (row["content"] or "")[:120].replace("\n", " ")
+                    conn.execute(
+                        "UPDATE memories SET resolution_commit = ?, resolution_summary = ? "
+                        "WHERE memory_id = ?",
+                        (merge_commit, f"Resolved by merge {merge_commit[:8]}: {summary}", row["memory_id"]),
+                    )
+            except Exception:
+                log.debug("_resolve_pitfall_memories: prefix %s failed", prefix, exc_info=True)
+        conn.commit()
+        log.info("_resolve_pitfall_memories: resolved pitfalls for merge %s", merge_commit[:8])
+    except Exception:
+        log.debug("_resolve_pitfall_memories failed (non-critical)", exc_info=True)
 
 
 def _gate_deploy_pass(conn, project_id, result, metadata):
@@ -3313,6 +3366,112 @@ def _gate_deploy_pass(conn, project_id, result, metadata):
                 )
 
     return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Memory injection helpers for prompt builders (R3/R4/R5/R7)
+# ---------------------------------------------------------------------------
+
+def _inject_dev_memories(metadata):
+    """R3: Build '## Prior pitfalls in this scope' section for dev prompts.
+
+    Queries memory_service for kind IN (pitfall, pattern), top_k=5,
+    module_id prefix-matching target_files, excluding memories older than
+    30 days UNLESS resolution_commit is set. Returns section string or ''.
+    """
+    try:
+        from . import memory_service
+        from .db import get_connection
+        project_id = metadata.get("project_id", "aming-claw")
+        target_files = metadata.get("target_files", [])
+        if not target_files:
+            return ""
+        conn = get_connection(project_id)
+        try:
+            results = memory_service.search_memories_for_injection(
+                conn, project_id, target_files,
+                kinds=["pitfall", "pattern"],
+                top_k=5, max_age_days=30, include_resolved_old=True,
+            )
+        finally:
+            conn.close()
+        if not results:
+            return ""
+        lines = ["## Prior pitfalls in this scope"]
+        for m in results:
+            kind = m.get("kind", "pitfall")
+            content = (m.get("content") or m.get("summary") or "")[:200].replace("\n", " ")
+            rc = m.get("resolution_commit", "")
+            if rc:
+                lines.append(f"- [{kind}] {content} (fixed by commit {rc[:8]})")
+            else:
+                lines.append(f"- [{kind}] {content}")
+        return "\n".join(lines)
+    except Exception:
+        log.debug("_inject_dev_memories failed (graceful degradation)", exc_info=True)
+        return ""
+
+
+def _inject_qa_memories(metadata):
+    """R4: Build '## Prior QA decisions for similar scope' section for QA prompts."""
+    try:
+        from . import memory_service
+        from .db import get_connection
+        project_id = metadata.get("project_id", "aming-claw")
+        target_files = metadata.get("target_files", [])
+        if not target_files:
+            return ""
+        conn = get_connection(project_id)
+        try:
+            results = memory_service.search_memories_for_injection(
+                conn, project_id, target_files,
+                kinds=["qa_decision", "pattern", "failure_pattern"],
+                top_k=3, max_age_days=30, include_resolved_old=True,
+            )
+        finally:
+            conn.close()
+        if not results:
+            return ""
+        lines = ["## Prior QA decisions for similar scope"]
+        for m in results:
+            kind = m.get("kind", "qa_decision")
+            content = (m.get("content") or m.get("summary") or "")[:200].replace("\n", " ")
+            lines.append(f"- [{kind}] {content}")
+        return "\n".join(lines)
+    except Exception:
+        log.debug("_inject_qa_memories failed (graceful degradation)", exc_info=True)
+        return ""
+
+
+def _inject_gatekeeper_memories(metadata):
+    """R5: Build '## Prior decisions' section for gatekeeper prompts."""
+    try:
+        from . import memory_service
+        from .db import get_connection
+        project_id = metadata.get("project_id", "aming-claw")
+        target_files = metadata.get("target_files", [])
+        if not target_files:
+            return ""
+        conn = get_connection(project_id)
+        try:
+            results = memory_service.search_memories_for_injection(
+                conn, project_id, target_files,
+                kinds=["decision", "failure_pattern"],
+                top_k=3, max_age_days=30, include_resolved_old=True,
+            )
+        finally:
+            conn.close()
+        if not results:
+            return ""
+        lines = ["## Prior decisions"]
+        for m in results:
+            kind = m.get("kind", "decision")
+            content = (m.get("content") or m.get("summary") or "")[:200].replace("\n", " ")
+            lines.append(f"- [{kind}] {content}")
+        return "\n".join(lines)
+    except Exception:
+        log.debug("_inject_gatekeeper_memories failed (graceful degradation)", exc_info=True)
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -3376,6 +3535,10 @@ def _build_dev_prompt(task_id, result, metadata):
         "proposed_nodes": proposed_nodes,
     }
     prompt = _render_dev_contract_prompt(task_id, out_meta)
+    # R3/R7: Inject prior pitfalls section (graceful degradation)
+    pitfalls_section = _inject_dev_memories(out_meta)
+    if pitfalls_section:
+        prompt = pitfalls_section + "\n\n" + prompt
     return prompt, out_meta
 
 
@@ -3499,6 +3662,10 @@ def _build_qa_prompt(task_id, result, metadata):
             "If decision is 'pass', issues should be an empty list."
         )
     prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
+    # R4/R7: Inject prior QA decisions section (graceful degradation)
+    qa_memories = _inject_qa_memories(metadata)
+    if qa_memories:
+        prompt_parts.insert(0, qa_memories)
     prompt = "\n".join(prompt_parts)
     meta = {
         **metadata,  # preserves skip_doc_check and all other original task metadata
@@ -3519,6 +3686,8 @@ def _build_qa_prompt(task_id, result, metadata):
 
 
 def _build_gatekeeper_prompt(task_id, result, metadata):
+    # R5/R7: Inject prior decisions section (graceful degradation)
+    gk_memories = _inject_gatekeeper_memories(metadata)
     prompt = (
         f"Gatekeeper review for {task_id}.\n"
         "You are the final isolated acceptance check before merge.\n"
@@ -3534,6 +3703,8 @@ def _build_gatekeeper_prompt(task_id, result, metadata):
         "Respond with strict JSON: "
         "{\"schema_version\":\"v1\",\"review_summary\":\"...\",\"recommendation\":\"merge_pass|reject\",\"pm_alignment\":\"pass|partial|fail\",\"checked_requirements\":[\"R1\"],\"reason\":\"\"}"
     )
+    if gk_memories:
+        prompt = gk_memories + "\n\n" + prompt
     meta = {
         **metadata,
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes", result.get("related_nodes", []))),

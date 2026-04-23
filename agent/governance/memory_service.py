@@ -217,13 +217,119 @@ def query_all(project_id: str, active_only: bool = True) -> list[dict]:
 # ------------------------------------------------------------------
 
 def search_memories(conn: sqlite3.Connection, project_id: str, query: str, top_k: int = 5) -> list[dict]:
-    """Full-text search across memories."""
+    """Full-text search across memories.
+
+    Anti-pattern memories receive a rank boost (score multiplied by 1.5)
+    so they surface higher in results of equal relevance.
+    """
     backend = get_backend()
-    results = backend.search(conn, project_id, query, top_k)
+    # Fetch extra results to account for filtering after boost/re-sort
+    results = backend.search(conn, project_id, query, top_k * 2)
+
+    # R6/AC9: anti_pattern rank boost — FTS5 rank is negative (more negative = better),
+    # so multiplying by 1.5 makes it more negative = higher rank
+    for r in results:
+        if r.get("kind") == "anti_pattern":
+            r["score"] = r.get("score", 0.0) * 1.5
+
+    # Re-sort by boosted score (ascending — FTS5 rank is negative)
+    results.sort(key=lambda r: r.get("score", 0.0))
+    results = results[:top_k]
+
     ref_ids = [r.get("ref_id", "?") for r in results[:3]]
     log.info("memory.search: project=%s query=%r top_k=%d results=%d refs=%s",
              project_id, query[:80], top_k, len(results), ref_ids)
     return results
+
+
+def search_memories_for_injection(
+    conn: sqlite3.Connection,
+    project_id: str,
+    target_files: list,
+    kinds: list,
+    top_k: int = 5,
+    max_age_days: int = 30,
+    include_resolved_old: bool = True,
+) -> list[dict]:
+    """Query memories for prompt injection, filtering by kind, module prefix, and age.
+
+    Args:
+        target_files: Files to match module_id prefixes against.
+        kinds: Memory kinds to include (e.g. ['pitfall', 'pattern']).
+        top_k: Max results to return.
+        max_age_days: Exclude memories older than this unless they have resolution_commit.
+        include_resolved_old: If True, include old memories that have resolution_commit set.
+
+    Returns:
+        List of memory dicts, or empty list on any error.
+    """
+    from datetime import timedelta
+    try:
+        now_dt = datetime.now(timezone.utc)
+        cutoff = (now_dt - timedelta(days=max_age_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Build module prefixes from target_files for prefix matching
+        module_prefixes = []
+        for tf in (target_files or []):
+            # Convert path separators to dots to match module_id format
+            prefix = tf.replace("/", ".").replace("\\", ".")
+            module_prefixes.append(prefix)
+
+        # Build SQL with kind filter
+        kind_placeholders = ",".join("?" for _ in kinds)
+        params = [project_id] + list(kinds)
+
+        # Base query
+        sql = (
+            f"SELECT memory_id, ref_id, kind, module_id, content, summary, "
+            f"metadata_json, version, created_at, "
+            f"COALESCE(resolution_commit, '') as resolution_commit, "
+            f"COALESCE(resolution_summary, '') as resolution_summary "
+            f"FROM memories "
+            f"WHERE project_id = ? AND kind IN ({kind_placeholders}) AND status = 'active' "
+        )
+
+        # Age filter: exclude old memories without resolution_commit (AC7)
+        if include_resolved_old:
+            sql += "AND (created_at >= ? OR COALESCE(resolution_commit, '') != '') "
+        else:
+            sql += "AND created_at >= ? "
+        params.append(cutoff)
+
+        sql += "ORDER BY created_at DESC LIMIT ?"
+        # Fetch more to allow module filtering
+        params.append(top_k * 5)
+
+        rows = conn.execute(sql, params).fetchall()
+
+        results = []
+        for r in rows:
+            row_dict = {
+                "memory_id": r["memory_id"],
+                "ref_id": r["ref_id"],
+                "kind": r["kind"],
+                "module_id": r["module_id"],
+                "content": r["content"],
+                "summary": r["summary"],
+                "metadata": json.loads(r["metadata_json"]) if r["metadata_json"] else {},
+                "version": r["version"],
+                "created_at": r["created_at"],
+                "resolution_commit": r["resolution_commit"],
+                "resolution_summary": r["resolution_summary"],
+            }
+            # Module prefix matching: include if any target_file prefix matches
+            if module_prefixes:
+                mod_id = row_dict["module_id"]
+                if not any(mod_id.startswith(p) or p.startswith(mod_id) for p in module_prefixes):
+                    continue
+            results.append(row_dict)
+            if len(results) >= top_k:
+                break
+
+        return results
+    except Exception:
+        log.debug("search_memories_for_injection failed (graceful degradation)", exc_info=True)
+        return []
 
 
 def get_latest_by_ref(
@@ -240,6 +346,7 @@ def get_latest_by_ref(
 
 _PROMOTABLE_KINDS = {
     "failure_pattern", "architecture", "pattern", "rule", "decision", "knowledge",
+    "anti_pattern",
 }
 
 
