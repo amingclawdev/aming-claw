@@ -17,39 +17,7 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 
-def _make_in_memory_db():
-    """Create an in-memory SQLite DB with minimal schema for testing."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    for ddl in [
-        """CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT, action TEXT, actor TEXT, ok INTEGER,
-            ts TEXT, task_id TEXT, details_json TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS node_state (
-            project_id TEXT, node_id TEXT, verify_status TEXT DEFAULT 'pending',
-            PRIMARY KEY (project_id, node_id)
-        )""",
-        """CREATE TABLE IF NOT EXISTS tasks (
-            task_id TEXT PRIMARY KEY, project_id TEXT, type TEXT,
-            status TEXT DEFAULT 'queued', metadata_json TEXT,
-            trace_id TEXT, chain_id TEXT, created_at TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS gate_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT, task_id TEXT, gate_name TEXT,
-            passed INTEGER, reason TEXT, trace_id TEXT, created_at TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS project_version (
-            project_id TEXT PRIMARY KEY, chain_version TEXT,
-            git_head TEXT, dirty_files TEXT, updated_at TEXT,
-            updated_by TEXT, max_subtasks INTEGER DEFAULT 5
-        )""",
-    ]:
-        conn.execute(ddl)
-    conn.commit()
-    return conn
+# _make_in_memory_db removed — use the shared `isolated_gov_db` fixture from conftest.py
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +80,14 @@ class TestAC5_ChainDictPreserved:
 class TestAC6_DefaultGraphLinear:
     """Graph with default policies produces same linear chain."""
 
-    def test_dispatch_returns_none_for_default_policies(self):
+    def test_dispatch_returns_none_for_default_policies(self, isolated_gov_db):
         """dispatch_next_stage returns None when all policies are default,
         signaling the caller to use the linear CHAIN dict."""
         from governance.auto_chain import dispatch_next_stage
         from governance.graph import AcceptanceGraph
         from governance.models import NodeDef
 
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         graph = AcceptanceGraph()
         node = NodeDef(
             id="L1.1", title="Test", layer="L1",
@@ -203,9 +171,9 @@ class TestAC10_NoRegression:
 class TestAC7_LinearChainAudit:
     """Linear chain routing also gets audit entries."""
 
-    def test_no_graph_audit_written(self):
+    def test_no_graph_audit_written(self, isolated_gov_db):
         from governance.auto_chain import dispatch_next_stage
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
 
         dispatch_next_stage(
             conn, "test-proj", "task-1", "dev",
@@ -221,12 +189,12 @@ class TestAC7_LinearChainAudit:
         assert details["routing_mode"] == "linear_chain"
         assert details["trace_id"] == "tr-linear-audit"
 
-    def test_pre_dev_stage_audit(self):
+    def test_pre_dev_stage_audit(self, isolated_gov_db):
         """PM stage should also get audit entry."""
         from governance.auto_chain import dispatch_next_stage
         from governance.graph import AcceptanceGraph
 
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         graph = AcceptanceGraph()
 
         dispatch_next_stage(
@@ -251,16 +219,16 @@ class TestAC7_LinearChainAudit:
 class TestEdgeCases:
     """Edge cases for routing logic."""
 
-    def test_empty_verify_requires(self):
+    def test_empty_verify_requires(self, isolated_gov_db):
         from governance.auto_chain import _check_verify_requires_satisfied
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         satisfied, blocking = _check_verify_requires_satisfied(conn, "test-proj", [])
         assert satisfied
         assert blocking == []
 
-    def test_node_not_in_node_state_blocks(self):
+    def test_node_not_in_node_state_blocks(self, isolated_gov_db):
         from governance.auto_chain import _check_verify_requires_satisfied
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         satisfied, blocking = _check_verify_requires_satisfied(
             conn, "test-proj", ["L99.99"]
         )
@@ -299,25 +267,25 @@ class TestEdgeCases:
 class TestGateBlockVisibility:
     """Tests for B1/B6: auto_chain gate block visibility in responses."""
 
-    def _make_db_with_project(self, project_id="test-proj"):
-        """Create in-memory DB with project_version row."""
-        conn = _make_in_memory_db()
+    @staticmethod
+    def _seed_project_version(conn, project_id="test-proj"):
+        """Insert a project_version row into the given connection."""
         conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
-            "VALUES (?, 'abc123', 'abc123', '[]')",
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files, updated_at, updated_by) "
+            "VALUES (?, 'abc123', 'abc123', '[]', datetime('now'), 'test')",
             (project_id,),
         )
         conn.commit()
-        return conn
 
     @patch("governance.auto_chain._gate_version_check")
     @patch("governance.auto_chain._publish_event")
-    def test_ac7_gate_blocked_returns_gate_blocked_true(self, mock_pub, mock_gate):
+    def test_ac7_gate_blocked_returns_gate_blocked_true(self, mock_pub, mock_gate, isolated_gov_db):
         """AC7: When _gate_version_check returns (False, reason), dispatch returns
         gate_blocked=True and dispatched is not True."""
         from governance.auto_chain import _do_chain
 
-        conn = self._make_db_with_project()
+        conn = isolated_gov_db
+        self._seed_project_version(conn)
         mock_gate.return_value = (False, "dirty workspace (2 files)")
 
         result = _do_chain(conn, "test-proj", "task-1", "dev", {}, {"chain_depth": 0})
@@ -328,12 +296,13 @@ class TestGateBlockVisibility:
 
     @patch("governance.auto_chain._gate_version_check")
     @patch("governance.auto_chain._publish_event")
-    def test_ac8_audit_log_inserted_on_gate_block(self, mock_pub, mock_gate):
+    def test_ac8_audit_log_inserted_on_gate_block(self, mock_pub, mock_gate, isolated_gov_db):
         """AC8: When gate blocks, audit_log row with action='auto_chain_gate_blocked'
         is inserted."""
         from governance.auto_chain import _do_chain
 
-        conn = self._make_db_with_project()
+        conn = isolated_gov_db
+        self._seed_project_version(conn)
         mock_gate.return_value = (False, "server version mismatch")
 
         _do_chain(conn, "test-proj", "task-1", "dev", {}, {"chain_depth": 0})
@@ -352,11 +321,12 @@ class TestGateBlockVisibility:
 
     @patch("governance.auto_chain._gate_version_check")
     @patch("governance.auto_chain._publish_event")
-    def test_ac9_log_warning_on_gate_block(self, mock_pub, mock_gate):
+    def test_ac9_log_warning_on_gate_block(self, mock_pub, mock_gate, isolated_gov_db):
         """AC9: log.warning is called (not log.info) when gate blocks dispatch."""
         from governance.auto_chain import _do_chain
 
-        conn = self._make_db_with_project()
+        conn = isolated_gov_db
+        self._seed_project_version(conn)
         mock_gate.return_value = (False, "dirty workspace (3 files)")
 
         with patch("governance.auto_chain.log") as mock_log:
@@ -385,15 +355,19 @@ class TestGateBlockVisibility:
 class TestVersionGateBypassAccessControl:
     """Tests for skip_version_check operator_id/bypass_reason validation."""
 
-    def test_bypass_rejected_when_operator_id_missing(self):
-        """skip_version_check is ignored when operator_id is missing."""
-        from governance.auto_chain import _gate_version_check
-        conn = _make_in_memory_db()
+    @staticmethod
+    def _seed_project_version(conn):
         conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
-            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files, updated_at, updated_by) "
+            "VALUES (?, 'abc123', 'abc123', '[]', datetime('now'), 'test')", ("test-proj",),
         )
         conn.commit()
+
+    def test_bypass_rejected_when_operator_id_missing(self, isolated_gov_db):
+        """skip_version_check is ignored when operator_id is missing."""
+        from governance.auto_chain import _gate_version_check
+        conn = isolated_gov_db
+        self._seed_project_version(conn)
 
         metadata = {"skip_version_check": True, "bypass_reason": "testing"}
         with patch("governance.auto_chain.log") as mock_log, \
@@ -408,15 +382,11 @@ class TestVersionGateBypassAccessControl:
         skip_warnings = [c for c in warning_calls if "skip_version_check ignored" in str(c)]
         assert len(skip_warnings) >= 1, f"Expected skip_version_check warning, got: {warning_calls}"
 
-    def test_bypass_rejected_when_bypass_reason_missing(self):
+    def test_bypass_rejected_when_bypass_reason_missing(self, isolated_gov_db):
         """skip_version_check is ignored when bypass_reason is missing."""
         from governance.auto_chain import _gate_version_check
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
-            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        self._seed_project_version(conn)
 
         metadata = {"skip_version_check": True, "operator_id": "admin"}
         with patch("governance.auto_chain.log") as mock_log, \
@@ -428,15 +398,11 @@ class TestVersionGateBypassAccessControl:
         skip_warnings = [c for c in warning_calls if "skip_version_check ignored" in str(c)]
         assert len(skip_warnings) >= 1, f"Expected skip_version_check warning, got: {warning_calls}"
 
-    def test_bypass_rejected_when_both_missing(self):
+    def test_bypass_rejected_when_both_missing(self, isolated_gov_db):
         """skip_version_check is ignored when both fields are missing."""
         from governance.auto_chain import _gate_version_check
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
-            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        self._seed_project_version(conn)
 
         metadata = {"skip_version_check": True}
         with patch("governance.auto_chain.log") as mock_log, \
@@ -452,10 +418,10 @@ class TestVersionGateBypassAccessControl:
 class TestVersionGateBypassAudit:
     """Tests for version_gate_bypass audit trail."""
 
-    def test_audit_row_inserted_on_valid_bypass(self):
+    def test_audit_row_inserted_on_valid_bypass(self, isolated_gov_db):
         """When operator_id and bypass_reason are valid, audit row is inserted."""
         from governance.auto_chain import _audit_version_gate_bypass
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
 
         _audit_version_gate_bypass(conn, "test-proj", "task-1", "admin-user", "hotfix deploy", "dev")
         conn.commit()
@@ -472,13 +438,13 @@ class TestVersionGateBypassAudit:
         assert details["bypass_reason"] == "hotfix deploy"
         assert details["task_type"] == "dev"
 
-    def test_valid_bypass_returns_true(self):
+    def test_valid_bypass_returns_true(self, isolated_gov_db):
         """_gate_version_check returns True when skip_version_check has valid credentials."""
         from governance.auto_chain import _gate_version_check
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files) "
-            "VALUES (?, 'abc123', 'abc123', '[]')", ("test-proj",),
+            "INSERT INTO project_version (project_id, chain_version, git_head, dirty_files, updated_at, updated_by) "
+            "VALUES (?, 'abc123', 'abc123', '[]', datetime('now'), 'test')", ("test-proj",),
         )
         conn.commit()
 
@@ -501,10 +467,10 @@ class TestVersionGateBypassAudit:
 class TestVersionGateBypassFrequency:
     """Tests for high bypass frequency warning."""
 
-    def test_high_frequency_warning_logged(self):
+    def test_high_frequency_warning_logged(self, isolated_gov_db):
         """When >3 bypasses in 24h, a warning is logged."""
         from governance.auto_chain import _audit_version_gate_bypass
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
 
         # Insert 3 existing bypass events
         for i in range(3):
@@ -523,10 +489,10 @@ class TestVersionGateBypassFrequency:
         freq_warnings = [c for c in warning_calls if "high bypass frequency" in str(c)]
         assert len(freq_warnings) == 1, f"Expected 1 high frequency warning, got: {warning_calls}"
 
-    def test_no_warning_at_3_or_fewer(self):
+    def test_no_warning_at_3_or_fewer(self, isolated_gov_db):
         """When <=3 bypasses in 24h, no warning is logged."""
         from governance.auto_chain import _audit_version_gate_bypass
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
 
         # Insert 2 existing bypass events
         for i in range(2):
