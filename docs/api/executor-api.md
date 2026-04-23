@@ -375,7 +375,24 @@ Body: {"commit": "<merge_commit_hash>", "actor": "executor-merge"}
 
 - `agent/tests/test_merge_backlog_auto_close.py` — success path, HTTP 500 non-fatal, missing bug_id skip
 
+## Backlog Required Docs Field (schema v17)
+
+**Added:** 2026-04-23 | **Source:** `agent/governance/backlog_db.py`
+
+The `backlog_bugs` table now includes a `required_docs` field (TEXT, DEFAULT `'[]'`), storing a JSON array of document paths that must be updated when fixing the associated bug.
+
+### API Surface
+
+- **POST /api/backlog/{pid}/{bug_id}**: Accepts `required_docs` (JSON array) in the request body. Defaults to `[]` if omitted.
+- **GET /api/backlog/{pid}/{bug_id}**: Returns `required_docs` as a parsed JSON list.
+- **GET /api/backlog/{pid}**: Each bug row includes `required_docs` as a parsed JSON list.
+
+### Helper
+
+`get_backlog_required_docs(conn, project_id, bug_id) -> list[str]` in `agent/governance/backlog_db.py` provides direct DB access outside the HTTP server context. Handles missing column (pre-v17) gracefully by returning `[]`.
+
 ## Changelog
+- 2026-04-23: Added backlog required_docs field documentation (schema v17)
 - 2026-04-22: Added merge-stage backlog auto-close (OPT-BACKLOG) documentation
 - 2026-04-10: Added worktree isolation (L4), session timeout (B11), task pause/resume (B12), spin loop enhancement (B14) documentation
 - 2026-04-07: Added fail-fast worktree (B10) behavior documentation

@@ -3061,7 +3061,15 @@ def handle_backlog_list(ctx: RequestContext):
             params.append(priority_filter)
         sql += " ORDER BY created_at DESC"
         rows = conn.execute(sql, params).fetchall()
-        bugs = [dict(r) for r in rows]
+        bugs = []
+        for r in rows:
+            bug = dict(r)
+            # Parse required_docs from JSON string to list
+            try:
+                bug["required_docs"] = json.loads(bug.get("required_docs", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                bug["required_docs"] = []
+            bugs.append(bug)
         return {"bugs": bugs, "count": len(bugs)}
     finally:
         conn.close()
@@ -3079,7 +3087,13 @@ def handle_backlog_get(ctx: RequestContext):
         ).fetchone()
         if not row:
             raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
-        return dict(row)
+        result = dict(row)
+        # Parse required_docs from JSON string to list
+        try:
+            result["required_docs"] = json.loads(result.get("required_docs", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            result["required_docs"] = []
+        return result
     finally:
         conn.close()
 
@@ -3097,8 +3111,9 @@ def handle_backlog_upsert(ctx: RequestContext):
             """INSERT INTO backlog_bugs
                (bug_id, title, status, priority, target_files, test_files,
                 acceptance_criteria, chain_task_id, "commit", discovered_at,
-                fixed_at, details_md, chain_trigger_json, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fixed_at, details_md, chain_trigger_json, required_docs,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(bug_id) DO UPDATE SET
                  title = excluded.title,
                  status = excluded.status,
@@ -3112,6 +3127,7 @@ def handle_backlog_upsert(ctx: RequestContext):
                  fixed_at = excluded.fixed_at,
                  details_md = excluded.details_md,
                  chain_trigger_json = excluded.chain_trigger_json,
+                 required_docs = excluded.required_docs,
                  updated_at = excluded.updated_at
             """,
             (
@@ -3128,6 +3144,7 @@ def handle_backlog_upsert(ctx: RequestContext):
                 body.get("fixed_at", ""),
                 body.get("details_md", ""),
                 json.dumps(body.get("chain_trigger_json", {})),
+                json.dumps(body.get("required_docs", [])),
                 now,
                 now,
             ),
