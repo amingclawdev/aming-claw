@@ -618,18 +618,25 @@ class ChainContextStore:
                  event_type, task_id, root_task_id, list(payload.keys()) if payload else [])
 
         try:
-            from .db import get_connection
-            conn = get_connection(project_id)
-            conn.execute(
-                "INSERT INTO chain_events "
-                "(root_task_id, task_id, event_type, payload_json, ts) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (root_task_id, task_id, event_type,
-                 json.dumps(payload, ensure_ascii=False, default=str)[:20000],
-                 _utc_iso()),
-            )
-            conn.commit()
-            conn.close()
+            from .task_registry import _retry_on_db_lock
+
+            def _do_insert():
+                from .db import get_connection
+                conn = get_connection(project_id)
+                try:
+                    conn.execute(
+                        "INSERT INTO chain_events "
+                        "(root_task_id, task_id, event_type, payload_json, ts) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (root_task_id, task_id, event_type,
+                         json.dumps(payload, ensure_ascii=False, default=str)[:20000],
+                         _utc_iso()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            _retry_on_db_lock(_do_insert, _context=f"persist_{event_type}")
         except Exception:
             log.error("chain_context: persist event failed (%s/%s)",
                       task_id, event_type, exc_info=True)
