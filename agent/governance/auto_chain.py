@@ -1081,6 +1081,22 @@ def _should_defer_doc_gate_to_lane_c(conn, project_id, metadata):
     return False
 
 
+def _parse_pm_missing_fields(reason: str) -> list:
+    """Extract missing field names from a PM gate block reason string.
+
+    Handles both formats:
+      - 'PRD missing mandatory fields: [field1, field2]'
+      - 'PRD fields missing without skip_reasons: [field1, field2]...'
+    """
+    import re
+    # Match the bracketed list after the colon
+    m = re.search(r"(?:PRD missing mandatory fields|PRD fields missing without skip_reasons):\s*\[([^\]]*)\]", reason)
+    if m:
+        raw = m.group(1)
+        return [f.strip().strip("'\"") for f in raw.split(",") if f.strip()]
+    return []
+
+
 def _effective_dev_retry_reason(conn, project_id, metadata, reason):
     """Rewrite stale lane A/B gate reasons into actionable code-only guidance."""
     if not isinstance(reason, str):
@@ -1696,12 +1712,62 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                     f"{retry_contract}"
                 )
             else:
-                retry_prompt = (
-                    f"Previous attempt ({task_id}) was blocked by gate.\n"
-                    f"Gate reason: {reason}\n\n"
-                    f"Fix the issue described above and retry.\n"
-                    f"Original task: {original_prompt}"
+                # R8: Check if this is a PM task blocked for PRD missing fields
+                _is_pm_prd_missing = (
+                    task_type == "pm"
+                    and ("PRD missing mandatory fields" in reason
+                         or "PRD fields missing without skip_reasons" in reason)
                 )
+                if _is_pm_prd_missing:
+                    # R2: Parse missing fields from gate reason
+                    _pm_missing_fields = _parse_pm_missing_fields(reason)
+                    # R3: Show prior output keys
+                    _prior_keys = sorted(result.keys()) if isinstance(result, dict) else []
+                    # R7: Emit repeat regression event when new retry's count >= 2
+                    # (gate_retries is current count; new task gets gate_retries + 1)
+                    if gate_retries + 1 >= 2:
+                        try:
+                            from datetime import datetime, timezone
+                            conn.execute(
+                                "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+                                "VALUES (?, ?, 'pm.prd.repeat_regression', ?, ?)",
+                                (_chain_id, task_id,
+                                 json.dumps({"reason": reason, "gate_retry_count": gate_retries,
+                                             "missing_fields": _pm_missing_fields,
+                                             "prior_keys": _prior_keys},
+                                            ensure_ascii=False),
+                                 datetime.now(timezone.utc).isoformat()),
+                            )
+                        except Exception:
+                            log.debug("auto_chain: pm.prd.repeat_regression event write failed", exc_info=True)
+                    # R1, R4, R5, R6: Build structured PM retry prompt
+                    retry_prompt = (
+                        "[CRITICAL: PRD completeness gate blocked your prior output]\n\n"
+                        f"Missing fields: {', '.join(_pm_missing_fields)}\n"
+                        f"Your output contained keys: {_prior_keys}\n\n"
+                        "## Required PRD JSON Shape\n"
+                        "Your output MUST include ALL of the following fields:\n"
+                        "```json\n"
+                        "{\n"
+                        '  "target_files": ["path/to/file.py"],\n'
+                        '  "test_files": ["path/to/test_file.py"],\n'
+                        '  "acceptance_criteria": ["AC1: ..."],\n'
+                        '  "verification": {"method": "automated test", "command": "pytest ..."},\n'
+                        '  "requirements": ["R1: ..."],\n'
+                        '  "proposed_nodes": [{"node_id": "L3.x", "title": "...", "description": "..."}]\n'
+                        "}\n"
+                        "```\n\n"
+                        f"Gate reason: {reason}\n\n"
+                        f"Original task: {original_prompt}"
+                    )
+                else:
+                    # AC7: Generic fallback for non-PM or non-missing-field PM retries
+                    retry_prompt = (
+                        f"Previous attempt ({task_id}) was blocked by gate.\n"
+                        f"Gate reason: {reason}\n\n"
+                        f"Fix the issue described above and retry.\n"
+                        f"Original task: {original_prompt}"
+                    )
             from . import task_registry
             # Dedup: skip if an active same-stage retry already exists for this parent
             try:
