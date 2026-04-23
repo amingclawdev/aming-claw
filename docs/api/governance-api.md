@@ -815,6 +815,66 @@ This resolves the VERSION file bootstrap paradox: the commit changes HEAD, so th
 
 ---
 
+## Node Promote Backfill Endpoint
+
+### POST `/api/wf/{pid}/node-promote-backfill`
+
+**Added in:** A5 (commit 47423b6)
+
+Backfill evidence for nodes that were previously promoted (e.g., via `preflight-autofix` waive or manual observer action) without proper verification evidence. This endpoint provides a governed channel to retroactively attach evidence to nodes whose state was advanced without walking the full PM→Dev→Test→QA chain.
+
+**Use cases:**
+- Nodes waived by `preflight-autofix` that later receive real test coverage
+- Nodes promoted during manual-fix sessions that need audit-trail evidence
+- Bulk evidence backfill after graph reconciliation
+
+| Parameter | Location | Type | Required | Description |
+|-----------|----------|------|----------|-------------|
+| `pid` | path | string | yes | Project ID |
+| `nodes` | body | array[string] | yes | Node IDs to backfill evidence for |
+| `evidence` | body | object | yes | Standard evidence object (type, tool, summary) |
+| `backfill_reason` | body | string | yes | Why evidence is being backfilled (audit trail) |
+| `original_promotion` | body | object | no | Reference to the original promotion event (task_id, timestamp) |
+
+**Request:**
+
+```json
+POST /api/wf/aming-claw/node-promote-backfill
+Header: X-Gov-Token: gov-<coordinator-or-qa-token>
+
+{
+  "nodes": ["L4.25", "L4.29", "L4.30"],
+  "evidence": {
+    "type": "test_report",
+    "tool": "pytest",
+    "summary": {
+      "passed": 26,
+      "failed": 0,
+      "exit_code": 0
+    }
+  },
+  "backfill_reason": "Nodes were waived by preflight-autofix during B44 chain; now have real test coverage from B41-AC2 chain",
+  "original_promotion": {
+    "task_id": "task-1776738532-9e17c4",
+    "timestamp": "2026-04-20T12:00:00Z"
+  }
+}
+```
+
+**Responses:**
+
+| Status | Body | Condition |
+|--------|------|-----------|
+| `200` | `{"ok": true, "backfilled": 3, "nodes": ["L4.25","L4.29","L4.30"]}` | Evidence attached successfully |
+| `400` | `{"error": "missing_evidence", "message": "..."}` | Evidence object incomplete |
+| `400` | `{"error": "missing_backfill_reason", "message": "..."}` | No backfill_reason provided |
+| `403` | `{"error": "permission_denied", "message": "..."}` | Role not authorized for backfill |
+| `404` | `{"error": "node_not_found", "message": "..."}` | One or more node IDs not in graph |
+
+**Audit:** Every backfill is recorded in `audit_log` with `action='node_promote_backfill'`, including the `backfill_reason` and list of affected nodes.
+
+---
+
 ## Symmetric Redeploy Endpoints
 
 The governance service and the service manager expose mutual redeploy endpoints so

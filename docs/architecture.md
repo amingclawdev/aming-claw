@@ -277,9 +277,114 @@ Memory System                          Git Merge + Version Update
 Redis Pub/Sub → Telegram Reply
 ```
 
-## 10. Deployment Topology
+## 10. Symmetric Redeploy Architecture (PR-2: sm↔gov contract)
 
-See [docs/deployment.md](deployment.md) for complete deployment instructions.
+The governance service and service manager implement a **symmetric redeploy** contract where each service can restart the other, but neither can restart itself. This prevents the indeterminate state that occurs when a process attempts self-restart.
+
+### Contract Design
+
+```
+Service Manager (SM)                    Governance Service (GOV)
+    │                                        │
+    │  POST /api/manager/redeploy/governance │
+    │◄───────────────────────────────────────│  GOV requests SM to restart GOV
+    │                                        │
+    │  POST /api/governance/redeploy/service_manager
+    │───────────────────────────────────────►│  SM requests GOV to restart SM
+    │                                        │
+    │  POST /api/governance/redeploy/executor│
+    │───────────────────────────────────────►│  SM requests GOV to restart executor
+    │                                        │
+    │  POST /api/governance/redeploy/gateway │
+    │───────────────────────────────────────►│  SM requests GOV to restart gateway
+```
+
+### Mutual-Exclusion Invariant
+
+- **Governance** exposes `POST /api/governance/redeploy/{target}` for targets: `executor`, `gateway`, `coordinator`, `service_manager`. Self-targeting (`governance`) returns `400`.
+- **Service Manager** exposes `POST /api/manager/redeploy/governance`. Self-targeting (`service_manager`) returns `400`.
+- Deploy stage uses this contract: after merging code, it calls the appropriate redeploy endpoint based on which services' code changed, without requiring a full system restart.
+
+### Implementation (PR-2, commit fc025cd)
+
+- Governance-side: `agent/governance/server.py` — `/api/governance/redeploy/{target}` handler with lock, signal, spawn, health-check pipeline
+- Manager-side: `agent/service_manager.py` — `/api/manager/redeploy/governance` handler (PR-1, commit 3cac7d7)
+- Both endpoints share the same 5-step pipeline: validate → lock → signal → restart → health-check
+
+## 11. Auto-Infer Pipeline (A4a: dev → QA hook)
+
+The auto-infer pipeline automatically infers acceptance graph changes from dev task outputs. This replaces the manual process of updating `acceptance-graph.md` after code changes.
+
+### Pipeline Flow
+
+```
+Dev Task Completes
+    │
+    ▼
+Auto-Infer Hook (post-dev, pre-test)
+    │
+    ├── Dev provided explicit graph_delta?
+    │   ├── YES → validate schema → queue for merge-stage apply
+    │   └── NO  → infer from changed_files + CODE_DOC_MAP
+    │               ├── New files not in any node → propose "creates"
+    │               ├── Cross-node file changes   → propose "links"
+    │               └── Deleted files             → propose status updates
+    │
+    ▼
+QA Stage receives inferred delta as metadata
+    │
+    ▼
+Merge Stage applies accepted deltas to acceptance-graph.md
+```
+
+### Inference Rules
+
+| Condition | Inferred Action |
+|-----------|----------------|
+| New `.py` file under `agent/` not in CODE_DOC_MAP | Create node under parent layer matching directory |
+| Modified file mapped to node A, also imports module from node B | Link A → B with `DEPENDS_ON` relation |
+| File deleted that was sole mapping for a node | Update node status to `pending` review |
+| Test file added matching `test_*.py` pattern | Link to node via stem-prefix matching |
+
+### Key Files
+
+- `agent/governance/auto_chain.py` — hook integration point (post-dev gate)
+- `agent/governance/graph_delta.py` — delta inference engine
+- Base implementation: commit 3e1bc9d (A4a)
+- Diagnostic logging: commit 9200b87 (G1)
+
+## 12. Backfill Evidence Channel (A5)
+
+The backfill evidence channel provides a governed API for retroactively attaching verification evidence to nodes that were promoted without proper chain-walked evidence.
+
+### Problem
+
+Several code paths advance node state without full evidence:
+- `preflight-autofix` waives orphan pending nodes
+- `reconcile.py` bulk-promotes nodes during graph reconciliation
+- Manual-fix sessions promote nodes via observer bypass
+
+These nodes have the correct final state but lack audit-trail evidence, making governance forensics incomplete.
+
+### Solution (A5, commit 47423b6)
+
+`POST /api/wf/{pid}/node-promote-backfill` accepts:
+- List of node IDs to backfill
+- Standard evidence object (type, tool, summary)
+- `backfill_reason` for audit trail
+- Optional reference to original promotion event
+
+The endpoint validates that:
+1. All referenced nodes exist in the graph
+2. Evidence object meets standard structural requirements
+3. Caller has coordinator or QA role permissions
+4. A `backfill_reason` is provided (enforced, not optional)
+
+Every backfill operation is recorded in `audit_log` with `action='node_promote_backfill'`, maintaining full traceability even for retroactive evidence attachment.
+
+## 13. Deployment Topology
+
+See [deployment.md](deployment.md) for complete deployment instructions.
 
 **Minimum viable deployment:**
 - Host: Governance service + executor worker (via MCP)
