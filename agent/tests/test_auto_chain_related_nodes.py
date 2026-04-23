@@ -19,39 +19,7 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 
-def _make_in_memory_db():
-    """Create an in-memory SQLite DB with minimal schema for testing."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    for ddl in [
-        """CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT, action TEXT, actor TEXT, ok INTEGER,
-            ts TEXT, task_id TEXT, details_json TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS node_state (
-            project_id TEXT, node_id TEXT, verify_status TEXT DEFAULT 'pending',
-            PRIMARY KEY (project_id, node_id)
-        )""",
-        """CREATE TABLE IF NOT EXISTS tasks (
-            task_id TEXT PRIMARY KEY, project_id TEXT, type TEXT,
-            status TEXT DEFAULT 'queued', metadata_json TEXT,
-            trace_id TEXT, chain_id TEXT, created_at TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS gate_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT, task_id TEXT, gate_name TEXT,
-            passed INTEGER, reason TEXT, trace_id TEXT, created_at TEXT
-        )""",
-        """CREATE TABLE IF NOT EXISTS project_version (
-            project_id TEXT PRIMARY KEY, chain_version TEXT,
-            git_head TEXT, dirty_files TEXT, updated_at TEXT,
-            updated_by TEXT, max_subtasks INTEGER DEFAULT 5
-        )""",
-    ]:
-        conn.execute(ddl)
-    conn.commit()
-    return conn
+# _make_in_memory_db removed — use the shared `isolated_gov_db` fixture from conftest.py
 
 
 def _valid_prd_result(**overrides):
@@ -85,19 +53,24 @@ def _make_mock_graph(node_map):
     return mock_graph_cls, mock_instance
 
 
+def _seed_project_version(conn, project_id="test-proj"):
+    """Insert a project_version row into the given connection."""
+    conn.execute(
+        "INSERT INTO project_version (project_id, chain_version, git_head, updated_at, updated_by) VALUES (?,?,?, datetime('now'), 'test')",
+        (project_id, "abc123", "abc123"),
+    )
+    conn.commit()
+
+
 class TestG8RelatedNodes:
     """AC2: Graph lookup populates related_nodes when empty."""
 
-    def test_populates_from_graph_when_empty(self):
+    def test_populates_from_graph_when_empty(self, isolated_gov_db):
         """AC2: related_nodes populated from graph primary match."""
         from governance.auto_chain import _gate_post_pm
 
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
-            ("test-proj", "abc123", "abc123"),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        _seed_project_version(conn)
 
         result = _valid_prd_result(related_nodes=[])
 
@@ -115,16 +88,12 @@ class TestG8RelatedNodes:
 
         assert result["related_nodes"] == ["L9.12"]
 
-    def test_skips_when_already_set(self):
+    def test_skips_when_already_set(self, isolated_gov_db):
         """AC3: related_nodes not overwritten when already provided."""
         from governance.auto_chain import _gate_post_pm
 
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
-            ("test-proj", "abc123", "abc123"),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        _seed_project_version(conn)
 
         result = _valid_prd_result(related_nodes=["L9.12"])
 
@@ -142,16 +111,12 @@ class TestG8RelatedNodes:
         # Graph should NOT have been loaded
         mock_instance.load.assert_not_called()
 
-    def test_graph_failure_non_critical(self):
+    def test_graph_failure_non_critical(self, isolated_gov_db):
         """AC4: Graph failure doesn't block the gate."""
         from governance.auto_chain import _gate_post_pm
 
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
-            ("test-proj", "abc123", "abc123"),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        _seed_project_version(conn)
 
         result = _valid_prd_result(related_nodes=[])
 
@@ -172,16 +137,12 @@ class TestG8RelatedNodes:
         # related_nodes stays empty (falsy)
         assert not result.get("related_nodes")
 
-    def test_graph_exception_during_load(self):
+    def test_graph_exception_during_load(self, isolated_gov_db):
         """AC4 extended: Exception during graph.load() is caught silently."""
         from governance.auto_chain import _gate_post_pm
 
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
-            ("test-proj", "abc123", "abc123"),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        _seed_project_version(conn)
 
         result = _valid_prd_result(related_nodes=[])
 
@@ -209,16 +170,12 @@ class TestG8RelatedNodes:
 class TestQAGateVerifyUpdateFailure:
     """AC5: _gate_qa_pass propagates _try_verify_update failure reason."""
 
-    def test_verify_update_exception_surfaces_in_gate_reason(self):
+    def test_verify_update_exception_surfaces_in_gate_reason(self, isolated_gov_db):
         """When verify_update raises, _gate_qa_pass returns failure with the exception text."""
         from governance.auto_chain import _gate_qa_pass
 
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
-            ("test-proj", "abc123", "abc123"),
-        )
-        conn.commit()
+        conn = isolated_gov_db
+        _seed_project_version(conn)
 
         result = {"recommendation": "qa_pass", "review_summary": "looks good"}
         metadata = {"related_nodes": ["L1.3"]}
@@ -235,18 +192,15 @@ class TestQAGateVerifyUpdateFailure:
         assert error_msg in reason
         assert "L1.3" in reason
 
-    def test_verify_update_success_proceeds_to_check_nodes(self):
+    def test_verify_update_success_proceeds_to_check_nodes(self, isolated_gov_db):
         """When verify_update succeeds, _gate_qa_pass proceeds to _check_nodes_min_status."""
         from governance.auto_chain import _gate_qa_pass
 
-        conn = _make_in_memory_db()
-        conn.execute(
-            "INSERT INTO project_version (project_id, chain_version, git_head) VALUES (?,?,?)",
-            ("test-proj", "abc123", "abc123"),
-        )
+        conn = isolated_gov_db
+        _seed_project_version(conn)
         # Insert node at qa_pass so _check_nodes_min_status passes
         conn.execute(
-            "INSERT INTO node_state (project_id, node_id, verify_status) VALUES (?,?,?)",
+            "INSERT INTO node_state (project_id, node_id, verify_status, updated_at) VALUES (?,?,?, datetime('now'))",
             ("test-proj", "L1.3", "qa_pass"),
         )
         conn.commit()
@@ -262,11 +216,11 @@ class TestQAGateVerifyUpdateFailure:
 
         assert passed is True
 
-    def test_try_verify_update_returns_true_on_success(self):
+    def test_try_verify_update_returns_true_on_success(self, isolated_gov_db):
         """AC1: _try_verify_update returns (True, '') on success."""
         from governance.auto_chain import _try_verify_update
 
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         metadata = {"related_nodes": ["L1.3"]}
 
         mock_state_service = MagicMock()
@@ -281,11 +235,11 @@ class TestQAGateVerifyUpdateFailure:
         assert ok is True
         assert err == ""
 
-    def test_try_verify_update_returns_false_on_exception(self):
+    def test_try_verify_update_returns_false_on_exception(self, isolated_gov_db):
         """AC1/AC4: _try_verify_update returns (False, error_msg) on exception and logs warning."""
         from governance.auto_chain import _try_verify_update
 
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         metadata = {"related_nodes": ["L1.3"]}
 
         mock_state_service = MagicMock()
@@ -302,11 +256,11 @@ class TestQAGateVerifyUpdateFailure:
         assert "RBAC denied" in err
         assert "L1.3" in err
 
-    def test_try_verify_update_no_related_nodes(self):
+    def test_try_verify_update_no_related_nodes(self, isolated_gov_db):
         """_try_verify_update returns (True, '') when no related_nodes."""
         from governance.auto_chain import _try_verify_update
 
-        conn = _make_in_memory_db()
+        conn = isolated_gov_db
         metadata = {"related_nodes": []}
 
         ok, err = _try_verify_update(conn, "test-proj", metadata, "qa_pass", "qa", {})
