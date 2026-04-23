@@ -885,6 +885,26 @@ followup_needed:
 
 ---
 
+## OPT-BACKLOG-DOC-BACKFILL-SESSION — Backlog Rows (2026-04-23)
+
+The following 11 backlog items were filed during the doc-backfill optimization session (task-1776961301-7fc7a0). Each row references a specific gap discovered during the A1–A8 + G1 merge sequence.
+
+| Bug ID | Priority | Description |
+|--------|----------|-------------|
+| OPT-BACKLOG-DOC-BACKFILL-SESSION | P1 | Documentation backfill for A1–A8 + G1 merges — API docs, architecture sections, proposal status update |
+| OPT-BACKLOG-QA-CLI-AUTH-TOKEN-STALE | P0 | ai_lifecycle inherits stale CLAUDE_CODE_OAUTH_TOKEN from SM launch env; 401 in executor subprocess |
+| OPT-BACKLOG-MERGE-D6-EXPLICIT-FLAG | P1 | Merge handler D6 pre-merge auto-detect fails when HEAD==chain_version without _already_merged metadata |
+| OPT-BACKLOG-DEPLOY-SELFKILL | P0 | run_deploy calls restart_executor before restart_local_governance; Windows taskkill kills both processes |
+| OPT-BACKLOG-CHAIN-ENFORCEMENT | P1 | Policy enforcement for chain-bypass detection; draft at docs/dev/chain-enforcement-policy-proposal.md |
+| OPT-BACKLOG-GRAPH-COVERAGE | P2 | 84 unmapped agent/*.py files not in CODE_DOC_MAP; governance graph incomplete |
+| OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT | P0 | PM proposed_nodes silently dropped by QA gate; only related_nodes checked |
+| OPT-BACKLOG-A4B-VALIDATION | P2 | Structural validation layer for auto-infer graph deltas (deferred from A4a) |
+| OPT-BACKLOG-SYMMETRIC-REDEPLOY-TESTS | P2 | Integration tests for PR-2 symmetric redeploy sm↔gov contract |
+| OPT-BACKLOG-BACKFILL-EVIDENCE-AUDIT | P2 | Audit trail completeness for node-promote-backfill evidence submissions |
+| OPT-BACKLOG-DIAGNOSTIC-LOG-ROTATION | P3 | Log rotation policy for runtime-failure diagnostic logs (G1, commit 9200b87) |
+
+---
+
 ## Test Count
 
 1026 tests pass (OPT-DB-BACKLOG phase1 +23 test_backlog_db; B30 +10: version_gate_round4×3 + auto_chain_version_cache×4 rewritten + net +3 new), 7 pre-existing failures (test_e3_write_index_status, test_valid_test_success_accepted, test_reverse_lookup_doc_to_code, test_pm_to_deploy_chain_progresses_through_all_stages, test_governed_dirty_workspace_lane_defers_related_node_qa_block, test_try_verify_update_returns_true_on_success, test_try_verify_update_returns_false_on_exception), 3 skipped.
