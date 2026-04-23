@@ -561,7 +561,7 @@ def _commit_graph_delta(conn, project_id, metadata):
             conn.commit()
         except Exception:
             log.debug("_commit_graph_delta: failed event write failed", exc_info=True)
-        return None
+        raise
 
     except Exception as exc:
         # AC2: Any other exception — rollback and emit failed event
@@ -580,7 +580,7 @@ def _commit_graph_delta(conn, project_id, metadata):
             conn.commit()
         except Exception:
             log.debug("_commit_graph_delta: failed event write failed", exc_info=True)
-        return None
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -2829,10 +2829,19 @@ def _gate_gatekeeper_pass(conn, project_id, result, metadata):
             log.debug("gatekeeper ai record failed (non-critical)", exc_info=True)
 
         # PR-C: Commit graph delta after gatekeeper passes (AC1)
-        try:
-            _commit_graph_delta(conn, project_id, metadata)
-        except Exception:
-            log.warning("_gate_gatekeeper_pass: graph delta commit failed (non-blocking)", exc_info=True)
+        # R4: Escape hatch — skip graph delta validation if explicitly requested
+        if metadata.get("skip_graph_delta_validation") is True and metadata.get("skip_reason"):
+            log.warning(
+                "_gate_gatekeeper_pass: skipping graph delta validation — %s",
+                metadata["skip_reason"],
+            )
+        else:
+            try:
+                _commit_graph_delta(conn, project_id, metadata)
+            except Exception as exc:
+                # R1/R5: Graph delta failure blocks the gate
+                log.error("_gate_gatekeeper_pass: graph delta commit failed — %s", exc, exc_info=True)
+                return False, f"graph delta commit failed: {exc}"
 
         return True, "ok"
     if rec in ("reject", "rejected"):
