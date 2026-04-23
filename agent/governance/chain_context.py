@@ -614,6 +614,9 @@ class ChainContextStore:
         if self._recovering:
             return  # Don't write back to DB during replay
 
+        log.info("_persist_event: entry event_type=%s task_id=%s root_task_id=%s payload_keys=%s",
+                 event_type, task_id, root_task_id, list(payload.keys()) if payload else [])
+
         try:
             from .db import get_connection
             conn = get_connection(project_id)
@@ -628,7 +631,7 @@ class ChainContextStore:
             conn.commit()
             conn.close()
         except Exception:
-            log.debug("chain_context: persist event failed (%s/%s)",
+            log.error("chain_context: persist event failed (%s/%s)",
                       task_id, event_type, exc_info=True)
 
     def _project_id_for(self, root_task_id: str) -> str:

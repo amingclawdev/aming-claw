@@ -511,6 +511,8 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
         dl = graph_delta.get("links", [])
         dev_has_delta = bool(dc or du or dl)
 
+    log.info("_emit_or_infer_graph_delta: entry task=%s dev_has_delta=%s", task_id, dev_has_delta)
+
     # Load PM proposed_nodes from pm.prd.published chain_event
     pm_nodes = []
     try:
@@ -537,11 +539,14 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
         finally:
             conn.close()
     except Exception:
-        log.debug("_emit_or_infer_graph_delta: pm.prd.published lookup failed", exc_info=True)
+        log.error("_emit_or_infer_graph_delta: pm.prd.published lookup failed", exc_info=True)
+
+    log.info("_emit_or_infer_graph_delta: pm_nodes from chain_events count=%d", len(pm_nodes))
 
     changed_files = result.get("changed_files", metadata.get("changed_files", []))
 
     if dev_has_delta and not pm_nodes and not changed_files:
+        log.info("_emit_or_infer_graph_delta: early-return pure dev-emitted passthrough task=%s", task_id)
         # Pure dev-emitted: passthrough with source field
         _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted")
         return
@@ -555,6 +560,11 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
         pm_nodes, changed_files, graph_delta if dev_has_delta else None, dev_result_ctx
     )
 
+    log.info("_emit_or_infer_graph_delta: inference produced source=%s creates=%d updates=%d links=%d",
+             source, len(inferred_delta.get("creates", [])),
+             len(inferred_delta.get("updates", [])),
+             len(inferred_delta.get("links", [])))
+
     # Determine final source
     if dev_has_delta and source == "auto-inferred":
         # Dev had entries but inference didn't merge (no overlap case)
@@ -566,6 +576,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
 
     if not final_creates and not final_updates and not final_links:
         # Nothing to emit — still emit empty proposed for audit trail
+        log.info("_emit_or_infer_graph_delta: early-return empty inference task=%s dev_has_delta=%s", task_id, dev_has_delta)
         if dev_has_delta:
             _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted")
         return
@@ -597,7 +608,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
                  "(%d creates, %d updates, %d links)",
                  source, task_id, len(final_creates), len(final_updates), len(final_links))
     except Exception:
-        log.debug("auto_chain: graph.delta.proposed emission failed", exc_info=True)
+        log.error("auto_chain: graph.delta.proposed emission failed", exc_info=True)
 
     # R4: Emit graph.delta.inferred event when auto-inference path executed
     if source in ("auto-inferred", "dev-emitted+inferred-gaps"):
@@ -622,7 +633,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
             log.info("auto_chain: emitted graph.delta.inferred for task %s (rules: %s)",
                      task_id, [h.get("rule") for h in rule_hits])
         except Exception:
-            log.debug("auto_chain: graph.delta.inferred emission failed", exc_info=True)
+            log.error("auto_chain: graph.delta.inferred emission failed", exc_info=True)
 
 
 def _emit_graph_delta_event_with_source(project_id, task_id, result, source):
@@ -1846,6 +1857,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
         # R3: Emit pm.prd.published event when PM result has non-empty proposed_nodes
         proposed_nodes = result.get("proposed_nodes", [])
+        log.info("auto_chain: on_task_completed PM path proposed_nodes count=%d task=%s",
+                 len(proposed_nodes), task_id)
         if proposed_nodes:
             try:
                 from .chain_context import get_store
@@ -1868,7 +1881,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 log.info("auto_chain: emitted pm.prd.published for task %s (%d proposed_nodes)",
                          task_id, len(proposed_nodes))
             except Exception:
-                log.debug("auto_chain: pm.prd.published emission failed", exc_info=True)
+                log.error("auto_chain: pm.prd.published emission failed", exc_info=True)
 
     # M4: Test completes → write validation_result memory (marks dev decision as tested)
     if task_type == "test":
