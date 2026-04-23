@@ -292,6 +292,379 @@ def _emit_graph_delta_event(project_id, task_id, result):
 
 
 # ---------------------------------------------------------------------------
+# Graph Delta Auto-Infer (OPT-BACKLOG-GRAPH-DELTA-AUTO-INFER)
+# ---------------------------------------------------------------------------
+
+
+def _is_dev_doc(path):
+    """Return True if path matches docs/dev/** or is a dev-note artifact."""
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("docs/dev/"):
+        return True
+    return _is_dev_note(normalized)
+
+
+def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
+    """Infer graph_delta from PM proposed_nodes + dev changed_files.
+
+    Five deterministic rules:
+      Rule A: PM proposed_nodes whose primary appears in changed_files (excl .md)
+      Rule B: @route decorator grep on changed agent/**/*.py files
+      Rule D: Updates to existing graph nodes whose primary is in changed_files
+      Rule E: Dev override — dev entries replace inferred with same title/primary
+      Rule F: Discard creates[] where ALL primary files are docs/dev/** or dev-notes
+
+    Rules C (warn-only) and G (fuzzy title similarity) are explicitly SKIPPED.
+
+    Returns (graph_delta_dict, rule_hits_list, inferred_from_list).
+    """
+    creates = []
+    updates = []
+    links = []
+    rule_hits = []
+    inferred_from = []
+
+    # Normalize changed_files to forward-slash set
+    changed_set = {f.replace("\\", "/") for f in (changed_files or [])}
+    non_md_changed = {f for f in changed_set if not f.endswith(".md")}
+
+    # ---- Rule A: PM proposed_nodes with matching primary in changed_files ----
+    covered_primaries = set()
+    if pm_nodes:
+        inferred_from.append("pm_proposed_nodes")
+        for node in pm_nodes:
+            primaries = node.get("primary", [])
+            if isinstance(primaries, str):
+                primaries = [primaries]
+            matched = [p for p in primaries if p.replace("\\", "/") in non_md_changed]
+            if matched:
+                entry = {
+                    "node_id": node.get("node_id", ""),
+                    "title": node.get("title", ""),
+                    "parent_layer": node.get("parent_layer", ""),
+                    "primary": primaries,
+                    "deps": node.get("deps", []),
+                    "description": node.get("description", ""),
+                }
+                creates.append(entry)
+                covered_primaries.update(p.replace("\\", "/") for p in primaries)
+                rule_hits.append({"rule": "A", "entry_title": entry["title"],
+                                  "matched_files": matched})
+
+    # ---- Rule B: @route decorator grep on changed agent/**/*.py ----
+    py_agent_files = [f for f in non_md_changed
+                      if f.startswith("agent/") and f.endswith(".py")
+                      and f.replace("\\", "/") not in covered_primaries]
+    if py_agent_files:
+        inferred_from.append("route_decorator_grep")
+        route_re = re.compile(
+            r'@(?:\w+\.)?(?:route|get|post|put|delete|patch)\(\s*["\']([^"\']+)["\']',
+            re.IGNORECASE,
+        )
+        for fpath in py_agent_files:
+            try:
+                abs_path = fpath
+                if not os.path.isabs(fpath):
+                    abs_path = os.path.join(os.getcwd(), fpath)
+                if not os.path.exists(abs_path):
+                    continue
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+                for m in route_re.finditer(content):
+                    path_str = m.group(1)
+                    # Determine method from decorator name
+                    dec_match = re.search(r'@(?:\w+\.)?(\w+)\(', m.group(0))
+                    method = dec_match.group(1).upper() if dec_match else "ROUTE"
+                    if method == "ROUTE":
+                        method = "ANY"
+                    title = "HTTP endpoint: %s %s" % (method, path_str)
+                    creates.append({
+                        "node_id": "",
+                        "title": title,
+                        "parent_layer": "",
+                        "primary": [fpath],
+                        "deps": [],
+                        "description": "Auto-inferred from @route decorator",
+                    })
+                    rule_hits.append({"rule": "B", "entry_title": title,
+                                      "file": fpath})
+            except Exception:
+                log.debug("Rule B: failed to scan %s", fpath, exc_info=True)
+
+    # ---- Rule D: Updates to existing graph nodes whose primary is in changed_files ----
+    if changed_set:
+        inferred_from.append("existing_graph_nodes")
+        try:
+            from . import project_service
+            graph = project_service.load_project_graph(
+                dev_result.get("project_id", "aming-claw") if isinstance(dev_result, dict) else "aming-claw"
+            )
+            if graph:
+                # Collect pm_update_node_ids to skip (Rule D exception)
+                pm_update_ids = set()
+                if dev_delta and isinstance(dev_delta, dict):
+                    for u in dev_delta.get("updates", []):
+                        nid = u.get("node_id", "")
+                        if nid:
+                            pm_update_ids.add(nid)
+                task_id = dev_result.get("task_id", "") if isinstance(dev_result, dict) else ""
+                for node_id in graph.list_nodes():
+                    if node_id in pm_update_ids:
+                        continue
+                    try:
+                        node_data = graph.get_node(node_id)
+                    except Exception:
+                        continue
+                    node_primaries = node_data.get("primary", [])
+                    if isinstance(node_primaries, str):
+                        node_primaries = [node_primaries]
+                    touched = [p for p in node_primaries if p.replace("\\", "/") in changed_set]
+                    if touched:
+                        updates.append({
+                            "node_id": node_id,
+                            "fields": {"touched_by": task_id},
+                        })
+                        rule_hits.append({"rule": "D", "node_id": node_id,
+                                          "touched_files": touched})
+        except Exception:
+            log.debug("Rule D: graph lookup failed", exc_info=True)
+
+    # ---- Rule E: Dev override — merge dev entries with inferred ----
+    source = "auto-inferred"
+    if dev_delta and isinstance(dev_delta, dict):
+        dev_creates = dev_delta.get("creates", [])
+        dev_updates = dev_delta.get("updates", [])
+        dev_links = dev_delta.get("links", [])
+
+        if dev_creates or dev_updates or dev_links:
+            # Dev provided some entries — merge
+            # Build lookup keys for dev entries
+            dev_title_set = set()
+            dev_primary_set = set()
+            for dc in dev_creates:
+                t = dc.get("title", "")
+                if t:
+                    dev_title_set.add(t)
+                for p in (dc.get("primary", []) if isinstance(dc.get("primary"), list) else [dc.get("primary", "")]):
+                    if p:
+                        dev_primary_set.add(p.replace("\\", "/"))
+
+            # Filter inferred creates: remove those matching dev by title or primary
+            filtered_creates = []
+            for ic in creates:
+                ic_title = ic.get("title", "")
+                ic_primaries = ic.get("primary", [])
+                if isinstance(ic_primaries, str):
+                    ic_primaries = [ic_primaries]
+                ic_pset = {p.replace("\\", "/") for p in ic_primaries}
+                if ic_title in dev_title_set:
+                    continue
+                if ic_pset & dev_primary_set:
+                    continue
+                filtered_creates.append(ic)
+
+            # Dev entries take priority, inferred fill gaps
+            creates = list(dev_creates) + filtered_creates
+
+            # For updates: dev overrides by node_id
+            dev_update_ids = {u.get("node_id") for u in dev_updates}
+            filtered_updates = [u for u in updates if u.get("node_id") not in dev_update_ids]
+            updates = list(dev_updates) + filtered_updates
+
+            links = list(dev_links) + links
+            source = "dev-emitted+inferred-gaps"
+
+    # ---- Rule F: Discard creates where ALL primary files are dev docs ----
+    final_creates = []
+    for entry in creates:
+        primaries = entry.get("primary", [])
+        if isinstance(primaries, str):
+            primaries = [primaries]
+        if primaries and all(_is_dev_doc(p) for p in primaries):
+            rule_hits.append({"rule": "F", "discarded_title": entry.get("title", ""),
+                              "reason": "all primaries are dev docs"})
+            continue
+        final_creates.append(entry)
+    creates = final_creates
+
+    delta = {"creates": creates, "updates": updates, "links": links}
+    return delta, rule_hits, inferred_from, source
+
+
+def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
+    """Emit graph.delta.proposed, auto-inferring if dev omitted graph_delta.
+
+    Replaces direct _emit_graph_delta_event() call to ensure graph.delta.proposed
+    is ALWAYS emitted at dev→QA transition.
+
+    Case A: Dev provided non-empty graph_delta → passthrough with source='dev-emitted'
+    Case B: Dev omitted graph_delta → auto-infer from PM proposed_nodes + changed_files
+    Case A+B: Dev provided partial + inference fills gaps → source='dev-emitted+inferred-gaps'
+    """
+    graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
+
+    # Normalize dev delta
+    dev_has_delta = False
+    if graph_delta and isinstance(graph_delta, dict):
+        dc = graph_delta.get("creates", [])
+        du = graph_delta.get("updates", [])
+        dl = graph_delta.get("links", [])
+        dev_has_delta = bool(dc or du or dl)
+
+    # Load PM proposed_nodes from pm.prd.published chain_event
+    pm_nodes = []
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        root_task_id = store._task_to_root.get(task_id, task_id)
+        # Also try chain_id from metadata
+        if metadata.get("chain_id"):
+            root_task_id = metadata["chain_id"]
+        root_task_id = store._task_to_root.get(root_task_id, root_task_id)
+
+        from .db import get_connection
+        conn = get_connection(project_id)
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM chain_events "
+                "WHERE root_task_id = ? AND event_type = 'pm.prd.published' "
+                "ORDER BY ts DESC LIMIT 1",
+                (root_task_id,),
+            ).fetchone()
+            if row:
+                payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+                pm_nodes = payload.get("proposed_nodes", [])
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("_emit_or_infer_graph_delta: pm.prd.published lookup failed", exc_info=True)
+
+    changed_files = result.get("changed_files", metadata.get("changed_files", []))
+
+    if dev_has_delta and not pm_nodes and not changed_files:
+        # Pure dev-emitted: passthrough with source field
+        _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted")
+        return
+
+    # Run inference
+    dev_result_ctx = dict(result) if isinstance(result, dict) else {}
+    dev_result_ctx["project_id"] = project_id
+    dev_result_ctx["task_id"] = task_id
+
+    inferred_delta, rule_hits, inferred_from, source = _infer_graph_delta(
+        pm_nodes, changed_files, graph_delta if dev_has_delta else None, dev_result_ctx
+    )
+
+    # Determine final source
+    if dev_has_delta and source == "auto-inferred":
+        # Dev had entries but inference didn't merge (no overlap case)
+        source = "dev-emitted"
+
+    final_creates = inferred_delta.get("creates", [])
+    final_updates = inferred_delta.get("updates", [])
+    final_links = inferred_delta.get("links", [])
+
+    if not final_creates and not final_updates and not final_links:
+        # Nothing to emit — still emit empty proposed for audit trail
+        if dev_has_delta:
+            _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted")
+        return
+
+    # Emit graph.delta.proposed with source
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        root_task_id = store._task_to_root.get(task_id, task_id)
+        if metadata.get("chain_id"):
+            root_task_id = store._task_to_root.get(metadata["chain_id"], metadata["chain_id"])
+
+        store._persist_event(
+            root_task_id=root_task_id,
+            task_id=task_id,
+            event_type="graph.delta.proposed",
+            payload={
+                "source_task_id": task_id,
+                "source": source,
+                "graph_delta": {
+                    "creates": final_creates,
+                    "updates": final_updates,
+                    "links": final_links,
+                },
+            },
+            project_id=project_id,
+        )
+        log.info("auto_chain: emitted graph.delta.proposed (source=%s) for task %s "
+                 "(%d creates, %d updates, %d links)",
+                 source, task_id, len(final_creates), len(final_updates), len(final_links))
+    except Exception:
+        log.debug("auto_chain: graph.delta.proposed emission failed", exc_info=True)
+
+    # R4: Emit graph.delta.inferred event when auto-inference path executed
+    if source in ("auto-inferred", "dev-emitted+inferred-gaps"):
+        try:
+            from .chain_context import get_store
+            store = get_store()
+            root_task_id = store._task_to_root.get(task_id, task_id)
+            if metadata.get("chain_id"):
+                root_task_id = store._task_to_root.get(metadata["chain_id"], metadata["chain_id"])
+
+            store._persist_event(
+                root_task_id=root_task_id,
+                task_id=task_id,
+                event_type="graph.delta.inferred",
+                payload={
+                    "source": source,
+                    "inferred_from": inferred_from,
+                    "rule_hits": rule_hits,
+                },
+                project_id=project_id,
+            )
+            log.info("auto_chain: emitted graph.delta.inferred for task %s (rules: %s)",
+                     task_id, [h.get("rule") for h in rule_hits])
+        except Exception:
+            log.debug("auto_chain: graph.delta.inferred emission failed", exc_info=True)
+
+
+def _emit_graph_delta_event_with_source(project_id, task_id, result, source):
+    """Emit graph.delta.proposed with explicit source field (passthrough for dev-emitted)."""
+    graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
+    if not graph_delta or not isinstance(graph_delta, dict):
+        return
+
+    creates = graph_delta.get("creates", [])
+    updates = graph_delta.get("updates", [])
+    links = graph_delta.get("links", [])
+
+    if not creates and not updates and not links:
+        return
+
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        root_task_id = store._task_to_root.get(task_id, task_id)
+
+        store._persist_event(
+            root_task_id=root_task_id,
+            task_id=task_id,
+            event_type="graph.delta.proposed",
+            payload={
+                "source_task_id": task_id,
+                "source": source,
+                "graph_delta": {
+                    "creates": creates,
+                    "updates": updates,
+                    "links": links,
+                },
+            },
+            project_id=project_id,
+        )
+        log.info("auto_chain: emitted graph.delta.proposed (source=%s) for task %s",
+                 source, task_id)
+    except Exception:
+        log.debug("auto_chain: graph.delta.proposed emission failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Graph Delta Transactional Commit (PR-C: OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT)
 # ---------------------------------------------------------------------------
 
@@ -1471,6 +1844,32 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 extra_structured={"task_id": task_id, "chain_stage": "pm"},
             )
 
+        # R3: Emit pm.prd.published event when PM result has non-empty proposed_nodes
+        proposed_nodes = result.get("proposed_nodes", [])
+        if proposed_nodes:
+            try:
+                from .chain_context import get_store
+                store = get_store()
+                root_task_id = store._task_to_root.get(task_id, task_id)
+                store._persist_event(
+                    root_task_id=root_task_id,
+                    task_id=task_id,
+                    event_type="pm.prd.published",
+                    payload={
+                        "proposed_nodes": proposed_nodes,
+                        "test_files": result.get("test_files", []),
+                        "target_files": result.get("target_files", []),
+                        "requirements": prd.get("requirements", result.get("requirements", [])),
+                        "acceptance_criteria": result.get("acceptance_criteria",
+                                                          prd.get("acceptance_criteria", [])),
+                    },
+                    project_id=project_id,
+                )
+                log.info("auto_chain: emitted pm.prd.published for task %s (%d proposed_nodes)",
+                         task_id, len(proposed_nodes))
+            except Exception:
+                log.debug("auto_chain: pm.prd.published emission failed", exc_info=True)
+
     # M4: Test completes → write validation_result memory (marks dev decision as tested)
     if task_type == "test":
         report = result.get("test_report", {})
@@ -1492,9 +1891,9 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                            {"type": "dev_complete", "producer": "auto-chain",
                             "task_id": task_id})
 
-    # R2: Emit graph.delta.proposed event when dev result contains graph_delta
+    # R2: Emit graph.delta.proposed event (auto-infer if dev omitted graph_delta)
     if task_type == "dev":
-        _emit_graph_delta_event(project_id, task_id, result)
+        _emit_or_infer_graph_delta(project_id, task_id, result, metadata)
 
     # Run gate check
     gate_fn = _GATES[gate_fn_name]
