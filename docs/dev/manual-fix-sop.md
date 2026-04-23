@@ -290,6 +290,7 @@ curl -X POST "http://localhost:40000/api/backlog/aming-claw/MF-YYYY-MM-DD-NNN" \
     "target_files":     ["agent/governance/server.py", "..."],
     "test_files":       ["agent/tests/test_X.py"],
     "acceptance_criteria": ["<verifiable bullet>", "..."],
+    "required_docs":    ["docs/dev/backlog-governance.md"],
     "discovered_at":    "2026-04-21T14:00:00Z",
     "fixed_at":         "2026-04-21T14:06:00Z",
     "details_md":       "<multi-line markdown with trigger / bypass / impact>",

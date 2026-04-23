@@ -116,6 +116,7 @@ CREATE TABLE backlog_bugs (
   fixed_at              TEXT,                     -- ISO-8601
   details_md            TEXT,                     -- free-form markdown
   chain_trigger_json    TEXT,                     -- JSON: {needs_chain, priority, ...}
+  required_docs         TEXT DEFAULT '[]',        -- JSON array of doc paths required by this bug
   created_at            TEXT NOT NULL,
   updated_at            TEXT NOT NULL
 );
@@ -136,6 +137,23 @@ CREATE INDEX idx_backlog_priority ON backlog_bugs(priority);
   "test_files":   ["agent/tests/test_executor_recovery.py"]
 }
 ```
+
+`required_docs` field (added in schema v17): JSON array of doc file paths that must be updated when fixing this bug. Used by V3 strict mode validation to enforce documentation requirements.
+
+Example upsert payload with `required_docs`:
+
+```bash
+curl -X POST "http://localhost:40000/api/backlog/aming-claw/OPT-EXAMPLE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Example with required docs",
+    "status": "OPEN",
+    "priority": "P1",
+    "required_docs": ["docs/dev/backlog-governance.md", "docs/api/executor-api.md"]
+  }'
+```
+
+**Helper function:** `agent/governance/backlog_db.py` exports `get_backlog_required_docs(conn, project_id, bug_id) -> list[str]` for querying required docs outside the HTTP server context.
 
 ---
 

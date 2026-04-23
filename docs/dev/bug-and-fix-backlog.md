@@ -16,7 +16,8 @@
 >
 > Maintained by: Observer
 > Created: 2026-04-05
-> Last updated: 2026-04-21 (DB backfill complete — 70 entries ETL'd into `backlog_bugs`;
+> Last updated: 2026-04-23 (schema v17: added `required_docs` field — JSON array of doc paths
+> required by each bug; DB backfill complete — 70 entries ETL'd into `backlog_bugs`;
 > this file is now a read-only projection)
 
 ---
