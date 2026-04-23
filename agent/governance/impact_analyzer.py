@@ -89,6 +89,189 @@ CODE_DOC_MAP = {
     "agent/role_permissions.py": [
         "docs/config/role-permissions.md",
     ],
+    # --- Additions below: cover all agent/**/*.py modules >30 significant lines ---
+    # Governance modules
+    "agent/governance/redeploy_handler.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/artifacts.py": [
+        "docs/api/governance-api.md",
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/doc_generator.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/audit_service.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/evidence.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/event_bus.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/session_context.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/drift_detector.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/doc_policy.py": [
+        "docs/governance/gates.md",
+    ],
+    "agent/governance/project_service.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/reconcile.py": [
+        "docs/governance/auto-chain.md",
+    ],
+    "agent/governance/mcp_server.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/failure_classifier.py": [
+        "docs/governance/auto-chain.md",
+    ],
+    "agent/governance/client.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/coverage_check.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/graph_generator.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/token_service.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/redis_client.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/agent_lifecycle.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/enums.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/errors.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/idempotency.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/governance/llm_utils.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/models.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/governance/outbox.py": [
+        "docs/architecture.md",
+    ],
+    "agent/governance/permissions.py": [
+        "docs/config/role-permissions.md",
+    ],
+    "agent/governance/role_config.py": [
+        "docs/config/role-permissions.md",
+    ],
+    "agent/governance/session_persistence.py": [
+        "docs/architecture.md",
+    ],
+    # MCP modules
+    "agent/mcp/server.py": [
+        "docs/architecture.md",
+    ],
+    "agent/mcp/executor.py": [
+        "docs/architecture.md",
+    ],
+    "agent/mcp/tools.py": [
+        "docs/architecture.md",
+    ],
+    "agent/mcp/events.py": [
+        "docs/architecture.md",
+    ],
+    # Main agent modules
+    "agent/manager_http_server.py": [
+        "docs/api/governance-api.md",
+    ],
+    "agent/_patch_locales.py": [
+        "docs/architecture.md",
+    ],
+    "agent/ai_output_parser.py": [
+        "docs/architecture.md",
+    ],
+    "agent/backends.py": [
+        "docs/architecture.md",
+    ],
+    "agent/cli.py": [
+        "docs/architecture.md",
+    ],
+    "agent/config.py": [
+        "docs/architecture.md",
+    ],
+    "agent/context_assembler.py": [
+        "docs/architecture.md",
+    ],
+    "agent/context_store.py": [
+        "docs/architecture.md",
+    ],
+    "agent/decision_validator.py": [
+        "docs/governance/gates.md",
+    ],
+    "agent/evidence_collector.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/execution_sandbox.py": [
+        "docs/architecture.md",
+    ],
+    "agent/executor.py": [
+        "docs/api/executor-api.md",
+    ],
+    "agent/graph_validator.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/i18n.py": [
+        "docs/architecture.md",
+    ],
+    "agent/memory_write_guard.py": [
+        "docs/governance/memory.md",
+    ],
+    "agent/notification_gateway.py": [
+        "docs/architecture.md",
+    ],
+    "agent/observability.py": [
+        "docs/architecture.md",
+    ],
+    "agent/pipeline_config.py": [
+        "docs/architecture.md",
+    ],
+    "agent/project_config.py": [
+        "docs/architecture.md",
+    ],
+    "agent/task_orchestrator.py": [
+        "docs/architecture.md",
+    ],
+    "agent/task_state_machine.py": [
+        "docs/governance/acceptance-graph.md",
+    ],
+    "agent/utils.py": [
+        "docs/architecture.md",
+    ],
+    "agent/workspace_queue.py": [
+        "docs/architecture.md",
+    ],
+    # Telegram gateway submodules (supplement directory prefix entry)
+    "agent/telegram_gateway/chat_proxy.py": [
+        "docs/architecture.md",
+    ],
+    "agent/telegram_gateway/gateway.py": [
+        "docs/architecture.md",
+    ],
+    "agent/telegram_gateway/gov_event_listener.py": [
+        "docs/architecture.md",
+    ],
+    "agent/telegram_gateway/message_worker.py": [
+        "docs/architecture.md",
+    ],
 }
 
 

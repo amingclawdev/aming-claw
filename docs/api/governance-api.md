@@ -815,6 +815,78 @@ This resolves the VERSION file bootstrap paradox: the commit changes HEAD, so th
 
 ---
 
+## Symmetric Redeploy Endpoints
+
+The governance service and the service manager expose mutual redeploy endpoints so
+that each service can restart the other without restarting itself.
+
+### POST `/api/governance/redeploy/{target}`
+
+**Governance-side endpoint** (port 40006). Triggers a redeploy of a named target service.
+
+| Parameter | Location | Type | Description |
+|-----------|----------|------|-------------|
+| `target` | path | string | One of: `executor`, `gateway`, `coordinator`, `service_manager` |
+
+**Pipeline** (5 steps):
+1. **Validate target** — reject unknown targets with `404`; reject self-targeting (`governance`) with `400`
+2. **Acquire lock** — mutual-exclusion guard prevents concurrent redeploys
+3. **Signal stop** — send graceful shutdown signal to the target process
+4. **Restart** — spawn the target service via the configured restart method
+5. **Health check** — poll the target's health endpoint until healthy or timeout
+
+**Responses:**
+
+| Status | Body | Condition |
+|--------|------|-----------|
+| `200` | `{"ok": true, "target": "<target>", "restarted": true}` | Redeploy succeeded |
+| `400` | `{"error": "self_target", "message": "Governance cannot redeploy itself"}` | `target` is `governance` — use the manager endpoint instead |
+| `404` | `{"error": "unknown_target", "message": "Unknown redeploy target: <target>"}` | `target` not in allowed set |
+| `500` | `{"error": "redeploy_failed", "message": "..."}` | Restart or health check failed |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:40006/api/governance/redeploy/executor
+```
+
+### POST `/api/manager/redeploy/governance`
+
+**Service-manager-side endpoint** (manager HTTP sidecar). Triggers a redeploy of
+the governance service itself. Because governance cannot restart itself, the
+service manager provides this complementary endpoint.
+
+| Parameter | Location | Type | Description |
+|-----------|----------|------|-------------|
+| `target` | path | string | Must be `governance` |
+
+**Responses:**
+
+| Status | Body | Condition |
+|--------|------|-----------|
+| `200` | `{"ok": true, "target": "governance", "restarted": true}` | Governance restarted successfully |
+| `400` | `{"error": "self_target", "message": "Service manager cannot redeploy itself via this endpoint"}` | `target` is `service_manager` |
+| `404` | `{"error": "unknown_target", "message": "Unknown redeploy target: <target>"}` | `target` not recognized |
+| `500` | `{"error": "redeploy_failed", "message": "..."}` | Restart failed |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:40007/api/manager/redeploy/governance
+```
+
+### Mutual-Exclusion Guards
+
+| Service | Cannot redeploy | Use instead |
+|---------|----------------|-------------|
+| **Governance** (`/api/governance/redeploy/`) | itself (`governance`) — returns `400` | `POST /api/manager/redeploy/governance` on the service manager |
+| **Service Manager** (`/api/manager/redeploy/`) | itself (`service_manager`) — returns `400` | `POST /api/governance/redeploy/service_manager` on governance |
+
+This ensures no service attempts a self-restart, which would leave it in an
+indeterminate state.
+
+---
+
 ## Changelog
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: P1-P3 optimization — memory injection all task types; index_status tracking + flush-index; conflict_policy enforcement; TTL cleanup endpoint; orphan task recovery; role-split guides (guide-dev-agent.md, guide-tester-qa.md, guide-coordinator.md)
