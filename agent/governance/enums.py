@@ -139,11 +139,12 @@ class GatePolicy(Enum):
 
 
 class EvidenceType(Enum):
-    TEST_REPORT   = "test_report"
-    E2E_REPORT    = "e2e_report"
-    ERROR_LOG     = "error_log"
-    COMMIT_REF    = "commit_ref"
-    MANUAL_REVIEW = "manual_review"
+    TEST_REPORT       = "test_report"
+    E2E_REPORT        = "e2e_report"
+    ERROR_LOG         = "error_log"
+    COMMIT_REF        = "commit_ref"
+    MANUAL_REVIEW     = "manual_review"
+    BACKFILL_EVIDENCE = "backfill_evidence"
 
 
 class MemoryKind(Enum):

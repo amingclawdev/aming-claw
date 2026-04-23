@@ -217,6 +217,24 @@ def _validate_commit_ref(e: Evidence) -> None:
         )
 
 
+def _validate_backfill_evidence(e: Evidence) -> None:
+    """Validate backfill_evidence: must have merge_commit, backfill_ref, retroactive flag."""
+    merge_commit = e.summary.get("merge_commit", "")
+    if not merge_commit:
+        raise InvalidEvidenceError(
+            "backfill_evidence must contain merge_commit in summary",
+        )
+    backfill_ref = e.summary.get("backfill_ref", "")
+    if not backfill_ref:
+        raise InvalidEvidenceError(
+            "backfill_evidence must contain backfill_ref in summary",
+        )
+    if not e.summary.get("retroactive"):
+        raise InvalidEvidenceError(
+            "backfill_evidence must have retroactive=True in summary",
+        )
+
+
 # Transition -> (required evidence type, validator function)
 EVIDENCE_RULES: dict[tuple, dict] = {
     (VerifyStatus.PENDING, VerifyStatus.T2_PASS): {
@@ -235,6 +253,12 @@ EVIDENCE_RULES: dict[tuple, dict] = {
         "required_type": "commit_ref",
         "validator": _validate_commit_ref,
     },
+}
+
+# Backfill evidence: pending → qa_pass bypass (for nodes with backfill_ref metadata)
+EVIDENCE_RULES[(VerifyStatus.PENDING, VerifyStatus.QA_PASS)] = {
+    "required_type": "backfill_evidence",
+    "validator": _validate_backfill_evidence,
 }
 
 # Transitions to FAILED accept any error_log from any prior status

@@ -1380,6 +1380,54 @@ def handle_node_soft_delete(ctx: RequestContext):
     return {"updated": updated, "skipped": skipped, "reason": reason}
 
 
+@route("POST", "/api/wf/{project_id}/node-promote-backfill")
+def handle_node_promote_backfill(ctx: RequestContext):
+    """Promote a backfilled node from pending → qa_pass.
+
+    Body: {
+        "node_id": "L7.6",
+        "merge_commit": "abc1234",
+        "operator_id": "observer-1",
+        "reason": "BF-005 historical backfill"
+    }
+
+    Role check: only observer or coordinator allowed.
+    Returns 403 if node lacks backfill_ref, 400 if merge_commit invalid, 200 on success.
+    """
+    project_id = ctx.get_project_id()
+    node_id = ctx.body.get("node_id", "")
+    merge_commit = ctx.body.get("merge_commit", "")
+    operator_id = ctx.body.get("operator_id", "")
+    reason = ctx.body.get("reason", "")
+
+    if not node_id or not merge_commit:
+        return 400, {"error": "node_id and merge_commit are required"}
+
+    with DBContext(project_id) as conn:
+        session = ctx.require_auth(conn)
+        role = session.get("role", "")
+        if role not in ("observer", "coordinator"):
+            from .errors import PermissionDeniedError
+            raise PermissionDeniedError(
+                role, "node-promote-backfill",
+                {"detail": "Only observer or coordinator can promote backfill nodes"},
+            )
+
+        try:
+            result = state_service.promote_backfill_node(
+                conn=conn,
+                project_id=project_id,
+                node_id=node_id,
+                merge_commit=merge_commit,
+                operator_id=operator_id or session.get("principal_id", "anonymous"),
+                reason=reason,
+            )
+            conn.commit()
+            return 200, result
+        except GovernanceError:
+            raise
+
+
 @route("GET", "/api/wf/{project_id}/impact")
 def handle_impact(ctx: RequestContext):
     project_id = ctx.get_project_id()
