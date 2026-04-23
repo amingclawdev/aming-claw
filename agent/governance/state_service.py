@@ -5,7 +5,9 @@ All mutations go through SQLite transactions with audit logging.
 """
 
 import json
+import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 
 from .enums import VerifyStatus, Role, status_satisfies
@@ -581,4 +583,169 @@ def rollback(conn: sqlite3.Connection, project_id: str, target_version: int, ses
         "rolled_back_to": target_version,
         "nodes_affected": len(changes),
         "changes": changes,
+    }
+
+
+def promote_backfill_node(
+    conn: sqlite3.Connection,
+    project_id: str,
+    node_id: str,
+    merge_commit: str,
+    operator_id: str,
+    reason: str,
+) -> dict:
+    """Promote a backfilled node from pending → qa_pass.
+
+    Validates:
+    1. Node exists and has backfill_ref in graph metadata.
+    2. merge_commit exists in git log.
+    3. Writes backfill_evidence, transitions pending → qa_pass, writes audit.
+
+    Args:
+        conn: SQLite connection.
+        project_id: Project identifier.
+        node_id: Node to promote.
+        merge_commit: Git merge commit hash to validate.
+        operator_id: Who is performing the promotion.
+        reason: Human-readable reason.
+
+    Returns:
+        Dict with node_id, status, evidence info.
+
+    Raises:
+        ValidationError: If backfill_ref missing or merge_commit not in git log.
+        NodeNotFoundError: If node doesn't exist.
+    """
+    # 1. Check node exists in DB
+    current = get_node_status(conn, project_id, node_id)
+    if current is None:
+        raise NodeNotFoundError(node_id)
+
+    from_status = VerifyStatus.from_str(current["verify_status"])
+    if from_status != VerifyStatus.PENDING:
+        raise ValidationError(
+            f"Node {node_id} is at {from_status.value}, not pending. "
+            f"Only pending nodes can be promoted via backfill.",
+            {"node_id": node_id, "current_status": from_status.value},
+        )
+
+    # 2. Validate backfill_ref from graph metadata
+    try:
+        from . import project_service
+        graph = project_service.load_project_graph(project_id)
+        node_data = graph.get_node(node_id)
+    except Exception:
+        node_data = {}
+
+    backfill_ref = node_data.get("backfill_ref", "")
+    if not backfill_ref:
+        raise ValidationError(
+            f"Node {node_id} lacks backfill_ref metadata. "
+            f"Only backfilled nodes can be promoted via this path.",
+            {"node_id": node_id},
+        )
+
+    # 3. Validate merge_commit in git log
+    try:
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        result = subprocess.run(
+            ["git", "cat-file", "-t", merge_commit],
+            capture_output=True, text=True, timeout=10,
+            cwd=repo_root,
+        )
+        if result.returncode != 0 or "commit" not in result.stdout.strip():
+            raise ValidationError(
+                f"merge_commit {merge_commit!r} not found in git log.",
+                {"merge_commit": merge_commit},
+            )
+    except subprocess.TimeoutExpired:
+        raise ValidationError(
+            "Git validation timed out.",
+            {"merge_commit": merge_commit},
+        )
+    except ValidationError:
+        raise
+    except Exception as e:
+        raise ValidationError(
+            f"Git validation failed: {e}",
+            {"merge_commit": merge_commit},
+        )
+
+    # 4. Build backfill_evidence
+    evidence = Evidence.from_dict({
+        "type": "backfill_evidence",
+        "summary": {
+            "merge_commit": merge_commit,
+            "backfill_ref": backfill_ref,
+            "retroactive": True,
+            "reason": reason,
+            "operator_id": operator_id,
+        },
+    })
+
+    # 5. Validate evidence via the rules engine
+    from .evidence import validate_evidence as _validate_evidence
+    _validate_evidence(from_status, VerifyStatus.QA_PASS, evidence)
+
+    # 6. Transition pending → qa_pass
+    now = _utc_iso()
+    new_version = current["version"] + 1
+    conn.execute(
+        """UPDATE node_state
+           SET verify_status = ?, evidence_json = ?, updated_by = ?,
+               updated_at = ?, version = ?
+           WHERE project_id = ? AND node_id = ? AND version = ?""",
+        (
+            VerifyStatus.QA_PASS.value, evidence.to_json(), operator_id,
+            now, new_version,
+            project_id, node_id, current["version"],
+        ),
+    )
+
+    if conn.execute("SELECT changes()").fetchone()[0] == 0:
+        raise ConflictError(details={
+            "node_id": node_id,
+            "expected_version": current["version"],
+        })
+
+    # 7. Write history
+    conn.execute(
+        """INSERT INTO node_history
+           (project_id, node_id, from_status, to_status, role, evidence_json, session_id, ts, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            project_id, node_id, from_status.value, VerifyStatus.QA_PASS.value,
+            "observer", evidence.to_json(), operator_id,
+            now, new_version,
+        ),
+    )
+
+    # 8. Audit entry with action=backfill.promoted
+    audit_service.record(
+        conn, project_id, "backfill.promoted",
+        actor=operator_id,
+        node_ids=[node_id],
+        merge_commit=merge_commit,
+        backfill_ref=backfill_ref,
+        reason=reason,
+    )
+
+    # 9. Event
+    event_payload = {
+        "project_id": project_id,
+        "node_id": node_id,
+        "from": from_status.value,
+        "to": VerifyStatus.QA_PASS.value,
+        "merge_commit": merge_commit,
+        "backfill_ref": backfill_ref,
+    }
+    event_bus.publish("backfill.promoted", event_payload)
+
+    return {
+        "node_id": node_id,
+        "status": VerifyStatus.QA_PASS.value,
+        "from_status": from_status.value,
+        "merge_commit": merge_commit,
+        "backfill_ref": backfill_ref,
+        "version": new_version,
     }
