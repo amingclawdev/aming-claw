@@ -1877,6 +1877,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                                                           prd.get("acceptance_criteria", [])),
                     },
                     project_id=project_id,
+                    conn=conn,  # MF-2026-04-24-001: share caller transaction
                 )
                 log.info("auto_chain: emitted pm.prd.published for task %s (%d proposed_nodes)",
                          task_id, len(proposed_nodes))
@@ -3154,6 +3155,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                         "proposed_payload": _gd_proposed,
                     },
                     project_id=project_id,
+                    conn=conn,  # MF-2026-04-24-001: share caller transaction
                 )
                 log.info("auto_chain: wrote graph.delta.validated event for chain %s", root_task_id)
             except Exception:

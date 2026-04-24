@@ -626,31 +626,60 @@ class ChainContextStore:
     # ── DB Persistence ──
 
     def _persist_event(self, root_task_id: str, task_id: str,
-                       event_type: str, payload: dict, project_id: str):
-        """Append event to chain_events table. Non-blocking, best-effort."""
+                       event_type: str, payload: dict, project_id: str,
+                       conn: sqlite3.Connection | None = None):
+        """Append event to chain_events table. Non-blocking, best-effort.
+
+        MF-2026-04-24-001: conn param added to break the 3-conn contention in
+        auto_chain.on_task_completed. When caller passes their open conn, this
+        writes in the caller's transaction (caller controls commit). When conn
+        is None (event-bus subscribers), falls back to the Z1 dedicated
+        _persist_connection with 60s busy_timeout.
+
+        See OPT-BACKLOG-AUTO-CHAIN-CONN-CONTENTION for root cause.
+        """
         if self._recovering:
             return  # Don't write back to DB during replay
 
-        log.info("_persist_event: entry event_type=%s task_id=%s root_task_id=%s payload_keys=%s",
-                 event_type, task_id, root_task_id, list(payload.keys()) if payload else [])
+        log.info("_persist_event: entry event_type=%s task_id=%s root_task_id=%s payload_keys=%s caller_conn=%s",
+                 event_type, task_id, root_task_id,
+                 list(payload.keys()) if payload else [],
+                 conn is not None)
 
+        payload_json = json.dumps(payload, ensure_ascii=False, default=str)[:20000]
+        ts = _utc_iso()
+
+        # --- Fast path: caller-provided conn (MF-2026-04-24-001) ---
+        if conn is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO chain_events "
+                    "(root_task_id, task_id, event_type, payload_json, ts) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (root_task_id, task_id, event_type, payload_json, ts),
+                )
+                # Do NOT commit here — caller owns the transaction.
+            except Exception:
+                log.error("chain_context: persist event (caller-conn) failed (%s/%s)",
+                          task_id, event_type, exc_info=True)
+            return
+
+        # --- Legacy path: dedicated conn (event-bus subscribers) ---
         try:
             from .task_registry import _retry_on_db_lock
 
             def _do_insert():
-                conn = _persist_connection(project_id)
+                own_conn = _persist_connection(project_id)
                 try:
-                    conn.execute(
+                    own_conn.execute(
                         "INSERT INTO chain_events "
                         "(root_task_id, task_id, event_type, payload_json, ts) "
                         "VALUES (?, ?, ?, ?, ?)",
-                        (root_task_id, task_id, event_type,
-                         json.dumps(payload, ensure_ascii=False, default=str)[:20000],
-                         _utc_iso()),
+                        (root_task_id, task_id, event_type, payload_json, ts),
                     )
-                    conn.commit()
+                    own_conn.commit()
                 finally:
-                    conn.close()
+                    own_conn.close()
 
             _retry_on_db_lock(_do_insert, _context=f"persist_{event_type}")
         except Exception:
