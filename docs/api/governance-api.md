@@ -736,6 +736,114 @@ def _do_write():
 _retry_on_busy(_do_write)
 ```
 
+### MF-001 + MF-002: `conn.commit()`-before-publish pattern
+
+**Background:** Manual-fix sessions MF-001 (PM-stage) and MF-002 (dev-stage)
+identified a conn-contention bug where the `on_task_completed` handler in
+`auto_chain.py` published an EventBus event (e.g. `task.completed`) while still
+holding the SQLite write lock from the preceding DB update. Downstream subscribers
+that attempted their own DB writes would immediately hit `SQLITE_BUSY`, causing
+cascade failures in the auto-chain pipeline.
+
+**Root cause:** The shared connection's `conn.commit()` was called *after* the
+EventBus publish call, or in some paths not called at all before the publish.
+This meant the WAL write lock was held across the entire publish→subscribe fan-out.
+
+**Fix pattern — commit before publish:**
+
+Both the PM-stage and dev-stage `on_task_completed` code paths now follow this
+strict ordering:
+
+```python
+# In auto_chain.on_task_completed (PM-stage path, MF-001):
+conn = independent_connection(project_id)
+try:
+    conn.execute("UPDATE tasks SET status=? …", (…,))
+    conn.commit()          # ← Release write lock BEFORE publish
+finally:
+    conn.close()
+
+event_bus.publish("task.completed", payload)  # ← Now safe: no lock held
+```
+
+```python
+# In auto_chain.on_task_completed (dev-stage path, MF-002):
+conn = independent_connection(project_id)
+try:
+    conn.execute("INSERT INTO chain_events …", (…,))
+    conn.commit()          # ← Release write lock BEFORE publish
+finally:
+    conn.close()
+
+event_bus.publish("gate.passed", payload)     # ← Now safe: no lock held
+```
+
+**Key invariant:** Every `on_task_completed` path must call `conn.commit()` and
+`conn.close()` *before* any EventBus publish. This ensures downstream subscribers
+can acquire their own write locks without contention.
+
+---
+
+## Backlog Endpoints
+
+### GET `/api/backlog/{pid}/{bid}`
+
+Retrieve a single backlog item by project ID and backlog ID.
+
+**Response:**
+
+```json
+{
+  "bid": "OPT-BACKLOG-EXAMPLE",
+  "project_id": "aming-claw",
+  "title": "Example backlog item",
+  "priority": "P1",
+  "status": "open",
+  "provenance_paths": ["agent/governance/server.py", "agent/governance/auto_chain.py"],
+  "created_at": "2026-04-20T12:00:00Z"
+}
+```
+
+The `provenance_paths` field is an array of file paths that contributed to the creation of this backlog item — i.e., the code files where the issue was originally discovered or that are implicated in the fix. This field may be `null` if provenance was not recorded.
+
+### PUT `/api/backlog/{pid}/{bid}`
+
+Upsert (create or update) a backlog item. If the item already exists, all provided fields are merged; if it does not exist, a new item is created.
+
+**Request body:**
+
+```json
+{
+  "title": "Fix conn-contention in on_task_completed",
+  "priority": "P0",
+  "status": "open",
+  "provenance_paths": ["agent/governance/auto_chain.py"],
+  "description": "..."
+}
+```
+
+**Strict-gate error codes:**
+
+| Status | Error Code | Condition |
+|--------|-----------|-----------|
+| `400` | `invalid_backlog_id` | `bid` is empty or contains invalid characters |
+| `400` | `missing_title` | No `title` provided on create (required for new items) |
+| `404` | `project_not_found` | Project `pid` is not registered |
+| `409` | `version_conflict` | Concurrent upsert detected (retry with fresh read) |
+
+### Version-Update Whitelist (Lockdown)
+
+The `/api/version-update/{pid}` endpoint enforces a version-update lockdown policy on the `updated_by` field. Only whitelisted values are accepted:
+
+| Allowed `updated_by` value | Description |
+|---------------------------|-------------|
+| `auto-chain` | Standard merge-stage update (requires `task_id`) |
+| `auto-chain:<task_id>` | Merge-stage update with embedded task reference |
+| `merge-service` | Legacy merge service path |
+| `manual-recovery` | Explicit manual recovery (human-authorized) |
+
+Any other `updated_by` value (including `"init"`, `"observer"`, `"test"`) is rejected with `403 permission_denied`. This version-update whitelist prevents unauthorized or accidental chain_version mutations that could desynchronize the governance state.
+
 ---
 
 ## Merge Isolation & Doc Gate Policy
@@ -948,6 +1056,7 @@ indeterminate state.
 ---
 
 ## Changelog
+- 2026-04-24: MF-001/MF-002 conn-contention fixes — conn.commit()-before-publish pattern in PM-stage and dev-stage on_task_completed paths; version-update lockdown (whitelist enforcement on updated_by field); backlog endpoint provenance_paths documentation; strict-gate error codes for backlog upsert
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: P1-P3 optimization — memory injection all task types; index_status tracking + flush-index; conflict_policy enforcement; TTL cleanup endpoint; orphan task recovery; role-split guides (guide-dev-agent.md, guide-tester-qa.md, guide-coordinator.md)
 - 2026-03-28: Add independent_connection() + _retry_on_busy(); use in handle_version_update/handle_version_sync
