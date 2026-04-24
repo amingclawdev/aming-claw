@@ -9,7 +9,7 @@ import sys
 import uuid
 import traceback
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
@@ -3295,7 +3295,11 @@ def handle_docs_section(ctx: RequestContext):
 
 def create_server(port: int = None) -> HTTPServer:
     p = port or PORT
-    server = HTTPServer(("0.0.0.0", p), GovernanceHandler)
+    # Z0-sequel observer-hotfix 2026-04-24: ThreadingHTTPServer so a slow
+    # handler (e.g. on_task_completed waiting on Z1's 60s busy_timeout DB lock)
+    # doesn't starve every other HTTP request — the "post-completion wedge"
+    # symptom that blocked the Z0+Z2 verification chain 3× in 30min.
+    server = ThreadingHTTPServer(("0.0.0.0", p), GovernanceHandler)
     return server
 
 
