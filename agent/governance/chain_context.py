@@ -18,8 +18,10 @@ Consistency boundary: single governance process.
 
 import json
 import logging
+import sqlite3
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +77,21 @@ def _extract_core(result: dict) -> dict:
         if val is not None:
             core[field] = val
     return core
+
+
+def _persist_connection(project_id: str) -> sqlite3.Connection:
+    """Dedicated connection for _persist_event with extended busy_timeout.
+
+    Uses the same DB path resolution as db.get_connection (governance.db),
+    but with timeout=60s and PRAGMA busy_timeout=60000ms to survive heavy
+    WAL contention during auto-chain pipeline surges.
+    """
+    from .db import _project_db_path
+    db_path = _project_db_path(project_id)
+    conn = sqlite3.connect(str(db_path), timeout=60)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=60000")
+    return conn
 
 
 class StageSnapshot:
@@ -621,8 +638,7 @@ class ChainContextStore:
             from .task_registry import _retry_on_db_lock
 
             def _do_insert():
-                from .db import get_connection
-                conn = get_connection(project_id)
+                conn = _persist_connection(project_id)
                 try:
                     conn.execute(
                         "INSERT INTO chain_events "
