@@ -1,7 +1,8 @@
 param(
     [switch]$Takeover,
     [string]$Project = "aming-claw",
-    [int]$HealthWaitSeconds = 20
+    # Windows cold-start (sidecar + aiohttp + executor Python init) takes 21-25s; 45s gives safe margin
+    [int]$HealthWaitSeconds = 45
 )
 
 $ErrorActionPreference = "Stop"
