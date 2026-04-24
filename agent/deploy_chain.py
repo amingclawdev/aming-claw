@@ -741,14 +741,26 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
                 except Exception as exc:
                     log.warning("[redeploy] executor: pre-SUCCESS write failed: %s", exc)
 
-            # [legacy] existing restart path
-            ok = restart_executor()
-            log.info("[legacy] executor: success=%s", ok)
+            # B48-sequel FIX (observer-hotfix 2026-04-24): Skip legacy
+            # restart_executor signal write to avoid SELFKILL loop.
+            #
+            # Problem: legacy restart_executor() writes manager_signal.json.
+            # On next SM monitor tick (~10s), SM reads signal and taskkills
+            # the worker — but that worker IS the one executing this deploy
+            # task. Worker dies mid-deploy → _recover_stuck_tasks on new
+            # worker marks the task failed → auto-chain retries → same SELFKILL
+            # loops 3× → deploy task terminally failed.
+            #
+            # The [redeploy] path (_post_manager_redeploy_executor) is the
+            # modern replacement; it handles executor reload without the
+            # self-kill race. Rely on its result.
+            ok = bool(redeploy_result.get("ok", True))
+            log.info("[legacy] executor: SKIPPED (B48-sequel); using redeploy_result.ok=%s", ok)
 
             steps["executor"] = {
                 "success": ok,
                 "redeploy_result": redeploy_result,
-                "legacy_success": ok,
+                "legacy_skipped": True,
             }
 
         # R7: For governance, POST to /api/manager/redeploy/governance

@@ -2238,11 +2238,22 @@ def handle_version_update(ctx: RequestContext):
             task_row = conn.execute(
                 "SELECT status, type FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
-            if task_row and task_row["status"] != "succeeded":
-                _audit_version_update(conn, pid, body, "rejected", "TASK_NOT_SUCCEEDED")
-                return {"error": "TASK_NOT_SUCCEEDED",
-                        "message": f"Task {task_id} status is {task_row['status']}, expected succeeded"}, 400
-            # Note: task_row could be None if task is in a different DB or not found — allow (backward compat)
+            # B48-sequel FIX (observer-hotfix 2026-04-24): Previously this check
+            # required task.status == "succeeded" which is NEVER true at the
+            # moment auto-chain's executor_worker._execute_merge calls
+            # version-update. The task is still "claimed" (status transitions
+            # to succeeded AFTER _execute_task returns, via _complete_task).
+            # This was a latent bug: observer workaround was updated_by=merge-service
+            # bypass, which my prior lockdown removed. Now allow any non-terminal-failure
+            # status for in-flight version-update calls.
+            _TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "timed_out", "design_mismatch"}
+            if task_row and task_row["status"] in _TERMINAL_FAILURE_STATUSES:
+                _audit_version_update(conn, pid, body, "rejected", "TASK_TERMINALLY_FAILED")
+                return {"error": "TASK_TERMINALLY_FAILED",
+                        "message": f"Task {task_id} is in terminal failure state "
+                                   f"{task_row['status']}; cannot sync version for it"}, 400
+            # Allowed: claimed (in-flight auto-chain), running, succeeded
+            # task_row could be None if task is in a different DB — allow (backward compat)
         finally:
             conn.close()
 
