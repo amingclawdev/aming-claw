@@ -5,6 +5,7 @@ Provides routing, middleware (auth, idempotency, request_id, audit), and JSON ha
 """
 
 import json
+import re
 import sys
 import uuid
 import traceback
@@ -1716,8 +1717,22 @@ def handle_task_create(ctx: RequestContext):
         _force_bypass = metadata.get("force_no_backlog") is True
         _enforce_mode = os.environ.get("OPT_BACKLOG_ENFORCE", "strict")
         if _force_bypass:
+            # R3: tighter force_no_backlog requirements — validate before bypass
+            _bypass_reason = metadata.get("force_reason", "")
+            _mf_id = metadata.get("mf_id", "")
+            if not _bypass_reason or len(_bypass_reason) < 30:
+                _msg = "force_no_backlog requires force_reason of at least 30 chars"
+                log.warning("backlog_gate: %s (mode=%s)", _msg, _enforce_mode)
+                if _enforce_mode == "strict":
+                    raise GovernanceError("force_reason too short", _msg, status=422)
+            if not _mf_id or not re.match(r'^MF-\d{4}-\d{2}-\d{2}-\d{3}$', _mf_id):
+                _msg = "force_no_backlog requires mf_id matching MF-YYYY-MM-DD-NNN"
+                log.warning("backlog_gate: %s (mode=%s)", _msg, _enforce_mode)
+                if _enforce_mode == "strict":
+                    raise GovernanceError("mf_id invalid", _msg, status=422)
             # R4: observer bypass — audit the event
-            _bypass_reason = metadata.get("force_reason", "no reason given")
+            if not _bypass_reason:
+                _bypass_reason = "no reason given"
             try:
                 _publish_event("backlog_gate.observer_bypass", {
                     "project_id": project_id,
@@ -1768,6 +1783,40 @@ def handle_task_create(ctx: RequestContext):
                         f"or set force_no_backlog=true with force_reason to bypass.",
                         status=422,
                     )
+            elif _row[0] not in ("OPEN", "IN_PROGRESS"):
+                # R2: bug_id status must be OPEN or IN_PROGRESS
+                _bug_status = _row[0]
+                _msg = (f"bug_id {_bug_id} is not OPEN (current status={_bug_status}); "
+                        f"cannot attach new work to closed bug")
+                log.warning("backlog_gate: %s (mode=%s)", _msg, _enforce_mode)
+                if _enforce_mode == "strict":
+                    raise GovernanceError("bug_id not open", _msg, status=422)
+
+        # R1: parent_task_id requirement for non-pm code-change types
+        _PARENT_REQUIRED_TYPES = ("dev", "test", "qa", "gatekeeper", "merge", "deploy")
+        if task_type in _PARENT_REQUIRED_TYPES and not _force_bypass:
+            _parent_task_id = metadata.get("parent_task_id") or ""
+            if not _parent_task_id:
+                _msg = "parent_task_id required for code-change type from non-auto-chain creator"
+                log.warning("backlog_gate: %s (type=%s, mode=%s)", _msg, task_type, _enforce_mode)
+                if _enforce_mode == "strict":
+                    raise GovernanceError("parent_task_id missing", _msg, status=422)
+            else:
+                # Verify parent_task_id exists in tasks table
+                try:
+                    with DBContext(project_id) as _ptid_conn:
+                        _ptid_row = _ptid_conn.execute(
+                            "SELECT task_id FROM tasks WHERE task_id = ?",
+                            (_parent_task_id,),
+                        ).fetchone()
+                except Exception:
+                    _ptid_row = None
+                if _ptid_row is None:
+                    _msg = "parent_task_id not found in tasks table"
+                    log.warning("backlog_gate: %s (parent=%r, mode=%s)",
+                                _msg, _parent_task_id, _enforce_mode)
+                    if _enforce_mode == "strict":
+                        raise GovernanceError("parent_task_id invalid", _msg, status=422)
 
     # Run conflict rules for user-facing task types (not auto-chain internal)
     rule_decision = None
