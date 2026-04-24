@@ -519,6 +519,25 @@ def _dispatch_auto_chain_success(
             task_id, project_id, task_type,
             exc_info=True,
         )
+        # Z0-sequel observer-hotfix 2026-04-24: on Windows governance, stdout
+        # goes nowhere (no redirect in scripts/start-governance.ps1). Without
+        # this file-log, silent-drop exceptions are invisible. See
+        # handoff-2026-04-24-post-z0.md §3 + project_auto_chain_silent_dispatch_drop.md.
+        try:
+            import traceback as _tb
+            _log_path = os.path.join(
+                "shared-volume", "codex-tasks", "logs", "auto-chain-errors.log",
+            )
+            os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+            with open(_log_path, "a", encoding="utf-8") as _f:
+                _f.write(
+                    f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                    f"task={task_id} project={project_id} type={task_type} "
+                    f"path=success ===\n"
+                )
+                _tb.print_exc(file=_f)
+        except Exception:
+            pass
         return None
 
 
@@ -562,6 +581,21 @@ def _dispatch_auto_chain_failed(
             task_id, project_id, task_type,
             exc_info=True,
         )
+        try:
+            import traceback as _tb
+            _log_path = os.path.join(
+                "shared-volume", "codex-tasks", "logs", "auto-chain-errors.log",
+            )
+            os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+            with open(_log_path, "a", encoding="utf-8") as _f:
+                _f.write(
+                    f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                    f"task={task_id} project={project_id} type={task_type} "
+                    f"path=failed ===\n"
+                )
+                _tb.print_exc(file=_f)
+        except Exception:
+            pass
         return None
 
 
