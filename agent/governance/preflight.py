@@ -167,14 +167,26 @@ def check_graph(conn, project_id: str) -> dict:
 # 4. Coverage check — CODE_DOC_MAP completeness
 # ---------------------------------------------------------------------------
 
-def check_coverage() -> dict:
-    """Scan governance/*.py and agent/*.py for CODE_DOC_MAP gaps."""
+def check_coverage(project_id: str = None) -> dict:
+    """Scan governance/*.py and agent/*.py for CODE_DOC_MAP gaps.
+
+    Uses project-specific code_doc_map.json when *project_id* is given,
+    falling back to the hardcoded CODE_DOC_MAP otherwise (R3 / AC3).
+    """
     try:
-        from .impact_analyzer import CODE_DOC_MAP
+        from .impact_analyzer import _load_project_code_doc_map
+
+        code_doc_map = _load_project_code_doc_map(project_id)
 
         # Find the agent directory
         agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         gov_dir = os.path.join(agent_dir, "governance")
+
+        # Noise directories to exclude from unmapped scan (R4)
+        _NOISE_DIRS = {
+            "docs/dev/scratch", ".worktrees", ".claude/worktrees",
+            "node_modules", "runtime", ".venv", "shared-volume/codex-tasks",
+        }
 
         # Collect all .py files that should be mapped
         scan_files = []
@@ -191,10 +203,13 @@ def check_coverage() -> dict:
                 rel = f"agent/{f}"
                 scan_files.append(rel)
 
-        # Check which files are covered by CODE_DOC_MAP
-        mapped_patterns = set(CODE_DOC_MAP.keys())
+        # Check which files are covered by code_doc_map
+        mapped_patterns = set(code_doc_map.keys())
         unmapped = []
         for sf in scan_files:
+            # Skip noise directories (R4)
+            if any(sf.startswith(nd) for nd in _NOISE_DIRS):
+                continue
             covered = False
             for pattern in mapped_patterns:
                 if pattern in sf or sf == pattern:
@@ -409,7 +424,7 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
     checks["system"] = check_system(conn)
     checks["version"] = check_version(conn, project_id)
     checks["graph"] = check_graph(conn, project_id)
-    checks["coverage"] = check_coverage()
+    checks["coverage"] = check_coverage(project_id)
     checks["queue"] = check_queue(conn, project_id)
 
     # Collect warnings and blockers
