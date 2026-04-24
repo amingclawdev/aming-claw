@@ -2161,14 +2161,65 @@ def handle_version_update(ctx: RequestContext):
         return {"error": "MISSING_FIELDS", "message": f"Missing: {missing}"}, 400
 
     # Step 3: Lifecycle validation
+    # LOCKDOWN (observer-hotfix 2026-04-24): Tightened updated_by whitelist to
+    # prevent observer from bypassing manual-fix flow by POSTing version-update
+    # directly. Removed "merge-service" (dead field, only used by observer as
+    # escape hatch) and "register" (dead field, no code caller). Added
+    # "manager-redeploy" (legitimate manager_http_server.py caller) and
+    # "redeploy-orchestrator" (legitimate redeploy_handler.py caller).
+    # Non-auto-chain paths now require VERSION_UPDATE_TOKEN to be set — observer
+    # cannot manually invoke without knowing the server-side secret.
     updated_by = body["updated_by"]
-    if updated_by not in ("auto-chain", "init", "register", "merge-service"):
+    _ALLOWED_UPDATED_BY = ("auto-chain", "init", "manager-redeploy", "redeploy-orchestrator")
+    if updated_by not in _ALLOWED_UPDATED_BY:
         conn = _open()
         try:
             _audit_version_update(conn, pid, body, "rejected", "INVALID_UPDATED_BY")
         finally:
             conn.close()
-        return {"error": "INVALID_UPDATED_BY", "message": f"updated_by '{updated_by}' not allowed"}, 403
+        return {"error": "INVALID_UPDATED_BY",
+                "message": f"updated_by '{updated_by}' not allowed. "
+                           f"Allowed: {_ALLOWED_UPDATED_BY}. "
+                           f"Observer manual version-update is no longer supported — "
+                           f"run a verification chain to land version changes."}, 403
+
+    # LOCKDOWN step 3a: Non-auto-chain callers must present VERSION_UPDATE_TOKEN.
+    # auto-chain is itself in-process and uses chain_stage='merge' enforcement;
+    # it doesn't need a separate token. Other callers (manager-redeploy,
+    # redeploy-orchestrator) MUST have the token. "init" is only allowed when
+    # no project version exists yet (first-time bootstrap).
+    if updated_by != "auto-chain":
+        if updated_by == "init":
+            conn = _open()
+            try:
+                existing = conn.execute(
+                    "SELECT chain_version FROM project_version WHERE project_id = ?",
+                    (pid,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if existing and existing["chain_version"]:
+                conn = _open()
+                try:
+                    _audit_version_update(conn, pid, body, "rejected", "INIT_AFTER_BOOTSTRAP")
+                finally:
+                    conn.close()
+                return {"error": "INIT_AFTER_BOOTSTRAP",
+                        "message": f"updated_by='init' only allowed for first-time bootstrap; "
+                                   f"current chain_version='{existing['chain_version']}'"}, 403
+        else:
+            # manager-redeploy / redeploy-orchestrator — require token
+            if not expected_token:
+                conn = _open()
+                try:
+                    _audit_version_update(conn, pid, body, "rejected", "TOKEN_NOT_CONFIGURED")
+                finally:
+                    conn.close()
+                return {"error": "TOKEN_NOT_CONFIGURED",
+                        "message": f"VERSION_UPDATE_TOKEN is not configured on the server; "
+                                   f"updated_by='{updated_by}' cannot be authenticated"}, 503
+            # expected_token equality was already checked in Step 1; reaching here
+            # means provided_token matches. OK.
 
     task_id = body.get("task_id", "")
     chain_stage = body.get("chain_stage", "")
@@ -2180,8 +2231,8 @@ def handle_version_update(ctx: RequestContext):
             conn.close()
         return {"error": "INVALID_CHAIN_STAGE", "message": f"Expected merge, got {chain_stage}"}, 400
 
-    # Step 3b: Chain link validation — verify task_id references a succeeded merge task
-    if updated_by in ("auto-chain", "merge-service") and task_id:
+    # Step 3b: Chain link validation — verify task_id references a succeeded task
+    if updated_by in ("auto-chain", "manager-redeploy", "redeploy-orchestrator") and task_id:
         conn = _open()
         try:
             task_row = conn.execute(
