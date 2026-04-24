@@ -119,6 +119,41 @@ Content-Type: application/json
 }
 ```
 
+## Version-Update Lockdown (commit e57e7ba)
+
+The `version-update` endpoint now enforces a lockdown on the `updated_by` field.
+Prior to this change, any caller could pass arbitrary `updated_by` values (including
+`"init"` or `"observer"`), which created false governance records and could
+desynchronize chain_version with the actual merge state.
+
+**What changed:** Commit `e57e7ba` added a restricted whitelist of allowed
+`updated_by` values:
+
+- `auto-chain` / `auto-chain:<task_id>` — standard merge-stage updates
+- `merge-service` — legacy merge path
+- `manual-recovery` — explicit human-authorized recovery
+
+All other values are rejected with `403 permission_denied`. This lockdown ensures
+that only governed code paths can mutate `chain_version`.
+
+## In-Flight Check Relaxation (commit 4a12c29)
+
+The version gate previously blocked stage transitions if any in-flight task existed
+for the same project, even if that task belonged to a different chain or was a stale
+lease from a crashed executor.
+
+**What changed:** Commit `4a12c29` relaxed the in-flight check behavior:
+
+- The in-flight task check now only considers tasks in the *same chain*
+  (matching `root_task_id`) rather than all tasks for the project.
+- Stale claimed tasks (lease age > 30 minutes) are excluded from the in-flight
+  count, preventing crashed-executor leftovers from blocking new chains.
+- The check emits a warning log instead of blocking when in-flight tasks are
+  detected in a *different* chain, allowing parallel chains to proceed.
+
+This change resolves false blocks that occurred when multiple chains ran
+concurrently or when executor crashes left orphaned task claims.
+
 ## Known Issues and Fixes
 
 ### D3: Version Gate False Blocks
@@ -137,7 +172,9 @@ Content-Type: application/json
 
 **Problem:** `version-update` API call sometimes causes WAL lock on governance DB (~50% of merges).
 
-**Workaround:** Restart governance service to clear WAL locks.
+**Fix (MF-001/MF-002):** Resolved via `independent_connection()` pattern — version-update and version-sync now use dedicated short-lived connections with `conn.commit()` before EventBus publish, preventing WAL lock leaks. See [governance-api.md](../api/governance-api.md#sqlite-independent-connection-pattern) for details.
+
+**Previous workaround (no longer needed):** Restart governance service to clear WAL locks.
 
 ## Manual Version Recovery
 
