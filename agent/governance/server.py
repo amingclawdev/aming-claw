@@ -1701,10 +1701,20 @@ def handle_task_create(ctx: RequestContext):
         metadata["intent_summary"] = prompt[:200]
 
     # --- Backlog gate: check bug_id for code-change task types (R1/R4) ---
+    # Z3 observer-hotfix 2026-04-24 (P0-1 + P0-2):
+    #   - Default enforce mode changed from 'warn' to 'strict' (P0-1).
+    #     Rollback: set env OPT_BACKLOG_ENFORCE=warn to revert.
+    #   - Added bug_id existence check in backlog_bugs (P0-2). Reject if bug_id
+    #     given but not found in backlog_bugs. Prevents typo'd or fabricated IDs
+    #     (observed 2026-04-24: MCP task_create silently dropped metadata and
+    #     3 tasks landed with bug_id=missing in `warn` mode).
+    #   - auto-chain internal creator is exempt (auto_chain already copies
+    #     bug_id from parent's metadata; gate would create chicken-and-egg).
     _CODE_CHANGE_TYPES = ("pm", "dev", "test", "qa", "gatekeeper", "merge", "deploy")
-    if task_type in _CODE_CHANGE_TYPES:
-        _has_bug_id = bool(metadata.get("bug_id"))
+    if task_type in _CODE_CHANGE_TYPES and created_by not in ("auto-chain", "auto-chain-retry"):
+        _bug_id = metadata.get("bug_id") or ""
         _force_bypass = metadata.get("force_no_backlog") is True
+        _enforce_mode = os.environ.get("OPT_BACKLOG_ENFORCE", "strict")
         if _force_bypass:
             # R4: observer bypass — audit the event
             _bypass_reason = metadata.get("force_reason", "no reason given")
@@ -1727,16 +1737,37 @@ def handle_task_create(ctx: RequestContext):
             except Exception:
                 log.debug("backlog_gate: failed to audit observer bypass", exc_info=True)
             log.info("backlog_gate: observer bypass for %s task (reason: %s)", task_type, _bypass_reason)
-        elif not _has_bug_id:
-            _enforce_mode = os.environ.get("OPT_BACKLOG_ENFORCE", "warn")
+        elif not _bug_id:
             log.warning("backlog_gate: missing bug_id for %s task in project %s (mode=%s)",
                         task_type, project_id, _enforce_mode)
             if _enforce_mode == "strict":
                 raise GovernanceError(
                     "bug_id required",
-                    f"Task type '{task_type}' requires metadata.bug_id",
+                    f"Task type '{task_type}' requires metadata.bug_id (OPT_BACKLOG_ENFORCE=strict). "
+                    f"Set metadata.force_no_backlog=true with force_reason to bypass.",
                     status=422,
                 )
+        else:
+            # P0-2: bug_id existence check — must correspond to a real backlog row
+            try:
+                with DBContext(project_id) as _chk_conn:
+                    _row = _chk_conn.execute(
+                        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+                        (_bug_id,),
+                    ).fetchone()
+            except Exception:
+                _row = None
+            if _row is None:
+                log.warning("backlog_gate: bug_id %r not found in backlog_bugs for %s task (mode=%s)",
+                            _bug_id, task_type, _enforce_mode)
+                if _enforce_mode == "strict":
+                    raise GovernanceError(
+                        "bug_id not in backlog",
+                        f"metadata.bug_id '{_bug_id}' does not exist in backlog_bugs. "
+                        f"Create the backlog row first via POST /api/backlog/{project_id}/{_bug_id}, "
+                        f"or set force_no_backlog=true with force_reason to bypass.",
+                        status=422,
+                    )
 
     # Run conflict rules for user-facing task types (not auto-chain internal)
     rule_decision = None
