@@ -351,12 +351,21 @@ def restart_local_governance(port: int = 40000) -> tuple[bool, str]:
         stderr_path = stderr_fd.name
         repo_root = Path(__file__).resolve().parent.parent
         python_exe = sys.executable or "python"
+        # B48/F2 FIX (observer-hotfix 2026-04-24): Explicitly propagate PYTHONPATH
+        # so the spawned `python -m agent.governance.server` can find the `agent`
+        # package. Historically failed 24+ times with
+        #   ModuleNotFoundError: No module named 'agent'
+        # because cwd= alone doesn't put the project root on sys.path for `-m`
+        # when using the embedded python runtime. See
+        # docs/dev/b48-investigation-and-fix-proposal.md §3.
+        _env = {**os.environ, "PYTHONPATH": str(repo_root)}
         proc = subprocess.Popen(
             [python_exe, "-m", "agent.governance.server"],
             cwd=str(repo_root),
             stdout=subprocess.DEVNULL,
             stderr=stderr_fd,
             start_new_session=True,
+            env=_env,
         )
         stderr_fd.close()  # Process owns the fd now via inheritance
         output_lines.append(f"started PID {proc.pid}")

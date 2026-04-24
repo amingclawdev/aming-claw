@@ -173,10 +173,15 @@ def _spawn_target(target: str) -> Optional[int]:
         return None
 
     env = os.environ.copy()
-    # Ensure PYTHONPATH includes the agent directory
-    agent_dir = str(repo_root / "agent")
+    # B48/F2 FIX (observer-hotfix 2026-04-24): PYTHONPATH must include the
+    # PROJECT ROOT (repo_root), not repo_root/agent. Previously the agent dir
+    # was put on PYTHONPATH which allows `import governance.server` but NOT
+    # `import agent.governance.server` — which is what `python -m agent.governance.server`
+    # (the cmd below) requires. This was part of the F2 ModuleNotFoundError
+    # cascade root cause. See docs/dev/b48-investigation-and-fix-proposal.md §3.
+    project_root = str(repo_root)
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{agent_dir}{os.pathsep}{existing}" if existing else agent_dir
+    env["PYTHONPATH"] = f"{project_root}{os.pathsep}{existing}" if existing else project_root
 
     try:
         proc = subprocess.Popen(
