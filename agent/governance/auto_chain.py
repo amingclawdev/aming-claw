@@ -1919,6 +1919,17 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                            {"type": "dev_complete", "producer": "auto-chain",
                             "task_id": task_id})
 
+    # MF-2026-04-24-002: release caller write-lock before _emit_or_infer_graph_delta.
+    # That helper + its 4 internal _persist_event legacy-path callsites open NEW
+    # connections; if main conn has open transaction here (audit pm.completed at
+    # ~1760 + optional _try_verify_update above), they wait 60s busy_timeout each
+    # and compound into multi-minute dev-stage stalls. See OPT-BACKLOG-AUTO-CHAIN-
+    # CONN-CONTENTION-DEV-PATH for the follow-on to MF-001.
+    try:
+        conn.commit()
+    except Exception:
+        log.debug("auto_chain: commit before graph_delta emit failed (non-critical)", exc_info=True)
+
     # R2: Emit graph.delta.proposed event (auto-infer if dev omitted graph_delta)
     if task_type == "dev":
         _emit_or_infer_graph_delta(project_id, task_id, result, metadata)
@@ -1933,6 +1944,12 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         )
         log.info("auto_chain: gate blocked %s→%s for task %s: %s",
                  task_type, next_type or "deploy", task_id, reason)
+        # MF-2026-04-24-002: release write-lock before publish (subscriber
+        # chain_context.on_gate_blocked opens separate conn via legacy path)
+        try:
+            conn.commit()
+        except Exception:
+            log.debug("auto_chain: commit before stage gate.blocked publish failed (non-critical)", exc_info=True)
         _publish_event("gate.blocked", {
             "project_id": project_id, "task_id": task_id,
             "stage": task_type, "next_stage": next_type or "deploy",
@@ -2410,6 +2427,15 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     log.info("auto_chain: %s→%s | %s → %s",
              task_type, next_type, task_id, new_task.get("task_id"))
+    # MF-2026-04-24-002: release write-lock before next-stage task.created
+    # publish. create_task above opened an implicit write transaction on main
+    # conn; without this commit, chain_context.on_task_created subscriber's
+    # legacy-path _persist_event waits 60s busy_timeout, stalling the chain
+    # at every dispatch boundary.
+    try:
+        conn.commit()
+    except Exception:
+        log.debug("auto_chain: commit before next-stage task.created publish failed (non-critical)", exc_info=True)
     # OPT-BACKLOG-CH2: forward metadata.bug_id in task.created payload so
     # chain_context.on_task_created can populate chain.bug_id (first-write-wins).
     # Retry paths then fallback-fill from chain store when metadata is lost.
