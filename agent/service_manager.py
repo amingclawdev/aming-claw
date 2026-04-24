@@ -34,6 +34,17 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+# B48 FIX B (observer-hotfix 2026-04-23): Ensure the project root is on
+# sys.path so `from agent.manager_http_server import run_server` works when
+# this file is invoked as `python agent/service_manager.py`. Without this,
+# the sidecar thread raises ImportError: No module named 'agent', sets
+# _sidecar_crashed=True and _running=False, which silently kills the monitor
+# loop. Workers then die with no respawn (root cause of B48). See
+# docs/dev/b48-investigation-and-fix-proposal.md §1.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 try:
     import requests  # noqa: F401 — imported here so tests can patch service_manager.requests.get
 except ImportError:  # pragma: no cover — requests may be absent in minimal test envs
@@ -392,16 +403,31 @@ class ServiceManager:
         self._sidecar_crashed = False
 
         def _sidecar_runner():
-            """Thread target: run the manager_http_server; on crash, signal main loop."""
+            """Thread target: run the manager_http_server; on crash, log and degrade.
+
+            B48 FIX B (observer-hotfix 2026-04-23): Previously a sidecar crash
+            set ``self._running = False`` which killed the monitor loop and
+            caused workers to never be respawned. Now a sidecar crash is
+            treated as a non-fatal degradation: executor supervision
+            continues uninterrupted. The ``_sidecar_crashed`` flag is still
+            set for external inspection (e.g. health endpoints), but the
+            monitor loop no longer self-terminates.
+            """
             try:
                 from agent.manager_http_server import run_server
                 log.info("ServiceManager: sidecar thread starting manager_http_server")
                 run_server()
             except Exception as exc:
-                log.error("ServiceManager: sidecar crashed: %s", exc)
+                log.error(
+                    "ServiceManager: sidecar crashed (non-fatal, monitor loop continues): %s",
+                    exc,
+                    exc_info=True,
+                )
                 self._sidecar_crashed = True
-                # Crash-together: signal the main loop to stop
-                self._running = False
+                # B48 FIX B: do NOT set self._running = False here. Keep monitor
+                # alive so workers continue to be supervised / respawned.
+                # Sidecar is best-effort HTTP control-plane; executor lifecycle
+                # is the primary responsibility.
 
         self._sidecar_thread = threading.Thread(
             target=_sidecar_runner,
@@ -442,14 +468,17 @@ class ServiceManager:
             if not self._running:
                 break
 
-            # R4: Check sidecar health — crash-together semantics
-            if self._sidecar_crashed:
-                log.error(
-                    "ServiceManager._monitor_loop: sidecar crashed; stopping main loop "
-                    "(crash-together semantics)"
+            # B48 FIX B (observer-hotfix 2026-04-23): Previously crash-together
+            # semantics — any sidecar exception would stop monitor loop, leaving
+            # workers un-supervised. Now sidecar crash is non-fatal; log once
+            # then continue supervising the executor. Sidecar is best-effort
+            # HTTP control-plane; executor lifecycle is the primary job.
+            if self._sidecar_crashed and not getattr(self, "_sidecar_warning_logged", False):
+                log.warning(
+                    "ServiceManager._monitor_loop: sidecar is down (non-fatal); "
+                    "continuing executor supervision"
                 )
-                self._running = False
-                break
+                self._sidecar_warning_logged = True
 
             # R1: Check for restart signal on each cycle
             self._check_restart_signal()
