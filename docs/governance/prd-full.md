@@ -231,6 +231,10 @@ CREATE TABLE IF NOT EXISTS memory_events (
     created_at TEXT NOT NULL
 );
 
+-- Schema v18: provenance_paths column on backlog_bugs
+-- Stores file-path provenance of bug discoveries (TEXT, comma-separated paths)
+ALTER TABLE backlog_bugs ADD COLUMN provenance_paths TEXT DEFAULT '';
+
 -- FTS5 full-text search (local backend)
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content, module_id, kind,
@@ -1334,6 +1338,15 @@ chain.archived → memory.write(kind="task_result", ref_id=root_task_id, content
 
 This would allow Coordinator to recall historical chain outcomes via `/api/mem/search`
 when creating new tasks.
+
+## 11. Documentation Location
+
+> **Note (cd3a0ed):** `docs/dev/` is now gitignored. All governance documentation
+> lives in `docs/governance/`. References to `docs/dev/` in older sections of this
+> PRD are historical; new documentation must be placed in `docs/governance/` per
+> Rule R10 of the Manual Fix SOP.
+
+---
 
 ## Changelog
 - 2026-03-28: Phase P1-P3 optimization — conflict_policy enforcement, TTL auto-archive, DockerBackend index_status + retry queue, memory injection all task types, orphan lease recovery, role-split guides

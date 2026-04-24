@@ -15,6 +15,7 @@ Manual fixes are **only** permitted in chicken-and-egg deadlock scenarios where 
 |----------|------------------------|------------------|
 | Dirty workspace blocks all chains | auto_chain gate rejects every dispatch | Commit accumulated code |
 | Fixing auto_chain itself | The chain engine is the thing being repaired | Modify auto_chain.py |
+| Fixing auto_chain itself — conn contention | conn.commit() not called before synchronous _publish_event in auto_chain.py; legacy subscribers hit 60s busy_timeout stall | Scope C / High — modify auto_chain.py commit-before-publish pattern |
 | Fixing executor CLI | Dev stage requires executor to run | Modify executor code |
 | Governance service won't start | No service = no API = no tasks | Fix server.py startup |
 
@@ -509,6 +510,28 @@ Prevent:  Rule R9 — if any unmapped file in the coverage warning list is part 
           unmapped.
 ```
 
+### Pitfall 12: conn-contention — synchronous _publish_event while write-tx open (commit-before-publish)
+
+```
+Symptom:  auto_chain.py on_task_completed triggers _publish_event (e.g.
+          pm.prd.published) while the main SQLite connection still has an
+          open write transaction. Legacy EventBus subscribers that open
+          their own write connections hit the 60s busy_timeout and stall
+          the entire chain.
+Cause:    _publish_event is called synchronously BEFORE conn.commit().
+          SQLite WAL allows concurrent readers but only one writer; the
+          subscriber's write attempt blocks until busy_timeout expires.
+Pattern:  commit-before-publish — always call conn.commit() BEFORE any
+          synchronous _publish_event call in auto_chain.py to release the
+          write lock before subscribers attempt their own writes.
+Fix:      MF-2026-04-24-001 (PM path, commits e745691+c6f05be+f740cbb)
+          MF-2026-04-24-002 (dev path, commit bf3b497)
+          Both applied the same commit-before-publish reordering in
+          auto_chain.py on_task_completed.
+Prevent:  Any new _publish_event call site in auto_chain.py must ensure
+          conn.commit() is called first. Code review checklist item.
+```
+
 ### Pitfall 11: Documentation placed in wrong directory (Rule R10)
 
 ```
@@ -737,3 +760,14 @@ Executing MF-2026-04-05-001 using SOP v2 revealed 5 gaps. Each gap is now covere
 | No doc location verification | SOP initially placed in docs/dev/ instead of docs/governance/. Node path was wrong | R10 |
 
 These findings validate the dogfooding approach: using the SOP to update the SOP exposed real procedural gaps that would have remained hidden in a workflow-driven update.
+
+---
+
+## 15. Registered Manual Fixes
+
+Precedent manual fixes registered for audit trail and pattern reference.
+
+| MF ID | Date | Scenario | Classification | Pattern | Commits | Description |
+|-------|------|----------|----------------|---------|---------|-------------|
+| MF-2026-04-24-001 | 2026-04-24 | fixing_auto_chain_itself — conn contention | Scope C / High | commit-before-publish | e745691+c6f05be+f740cbb | PM-path conn-contention fix in auto_chain.py: reordered conn.commit() before synchronous _publish_event calls to prevent legacy subscriber 60s busy_timeout stall |
+| MF-2026-04-24-002 | 2026-04-24 | fixing_auto_chain_itself — conn contention | Scope C / High | commit-before-publish | bf3b497 | Dev-path conn-contention fix in auto_chain.py: same commit-before-publish reordering applied to the dev task completion path |
