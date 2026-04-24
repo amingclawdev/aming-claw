@@ -1779,6 +1779,57 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                    project_id=project_id, task_id=task_id,
                    trace_id=_trace_id, chain_id=_chain_id)
 
+    # M1: PM completes → persist full PRD to memory for future dev/qa recall
+    # Moved BEFORE version gate so PRD publication fires regardless of gate outcome
+    if task_type == "pm":
+        prd = result.get("prd", result)
+        prd_data = {
+            "requirements": prd.get("requirements", result.get("requirements", [])),
+            "acceptance_criteria": result.get("acceptance_criteria", prd.get("acceptance_criteria", [])),
+            "target_files": result.get("target_files", []),
+            "test_files": result.get("test_files", []),
+            "proposed_nodes": result.get("proposed_nodes", []),
+            "doc_impact": result.get("doc_impact", {}),
+            "verification": result.get("verification", {}),
+            "skip_reasons": result.get("skip_reasons", {}),
+        }
+        if any(prd_data.values()):
+            _write_chain_memory(
+                conn, project_id, "prd_scope",
+                json.dumps(prd_data, ensure_ascii=False),
+                metadata,
+                extra_structured={"task_id": task_id, "chain_stage": "pm"},
+            )
+
+        # R3: Emit pm.prd.published event when PM result has non-empty proposed_nodes
+        proposed_nodes = result.get("proposed_nodes", [])
+        log.info("auto_chain: on_task_completed PM path proposed_nodes count=%d task=%s",
+                 len(proposed_nodes), task_id)
+        if proposed_nodes:
+            try:
+                from .chain_context import get_store
+                store = get_store()
+                root_task_id = store._task_to_root.get(task_id, task_id)
+                store._persist_event(
+                    root_task_id=root_task_id,
+                    task_id=task_id,
+                    event_type="pm.prd.published",
+                    payload={
+                        "proposed_nodes": proposed_nodes,
+                        "test_files": result.get("test_files", []),
+                        "target_files": result.get("target_files", []),
+                        "requirements": prd.get("requirements", result.get("requirements", [])),
+                        "acceptance_criteria": result.get("acceptance_criteria",
+                                                          prd.get("acceptance_criteria", [])),
+                    },
+                    project_id=project_id,
+                    conn=conn,  # MF-2026-04-24-001: share caller transaction
+                )
+                log.info("auto_chain: emitted pm.prd.published for task %s (%d proposed_nodes)",
+                         task_id, len(proposed_nodes))
+            except Exception:
+                log.error("auto_chain: pm.prd.published emission failed", exc_info=True)
+
     # B30: merge produces a new commit advancing HEAD past chain_version; deploy updates
     # chain_version itself.  Both are version-advancing operations that must not be blocked
     # by the version gate (which anchors to chain_version per B29 fix). Gate remains active
@@ -1846,56 +1897,6 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         return {"gate_blocked": True, "dispatched": False, "stage": "version_check", "reason": ver_reason}
     else:
         log.debug("auto_chain: version check passed for task %s: %s", task_id, ver_reason)
-
-    # M1: PM completes → persist full PRD to memory for future dev/qa recall
-    if task_type == "pm":
-        prd = result.get("prd", result)
-        prd_data = {
-            "requirements": prd.get("requirements", result.get("requirements", [])),
-            "acceptance_criteria": result.get("acceptance_criteria", prd.get("acceptance_criteria", [])),
-            "target_files": result.get("target_files", []),
-            "test_files": result.get("test_files", []),
-            "proposed_nodes": result.get("proposed_nodes", []),
-            "doc_impact": result.get("doc_impact", {}),
-            "verification": result.get("verification", {}),
-            "skip_reasons": result.get("skip_reasons", {}),
-        }
-        if any(prd_data.values()):
-            _write_chain_memory(
-                conn, project_id, "prd_scope",
-                json.dumps(prd_data, ensure_ascii=False),
-                metadata,
-                extra_structured={"task_id": task_id, "chain_stage": "pm"},
-            )
-
-        # R3: Emit pm.prd.published event when PM result has non-empty proposed_nodes
-        proposed_nodes = result.get("proposed_nodes", [])
-        log.info("auto_chain: on_task_completed PM path proposed_nodes count=%d task=%s",
-                 len(proposed_nodes), task_id)
-        if proposed_nodes:
-            try:
-                from .chain_context import get_store
-                store = get_store()
-                root_task_id = store._task_to_root.get(task_id, task_id)
-                store._persist_event(
-                    root_task_id=root_task_id,
-                    task_id=task_id,
-                    event_type="pm.prd.published",
-                    payload={
-                        "proposed_nodes": proposed_nodes,
-                        "test_files": result.get("test_files", []),
-                        "target_files": result.get("target_files", []),
-                        "requirements": prd.get("requirements", result.get("requirements", [])),
-                        "acceptance_criteria": result.get("acceptance_criteria",
-                                                          prd.get("acceptance_criteria", [])),
-                    },
-                    project_id=project_id,
-                    conn=conn,  # MF-2026-04-24-001: share caller transaction
-                )
-                log.info("auto_chain: emitted pm.prd.published for task %s (%d proposed_nodes)",
-                         task_id, len(proposed_nodes))
-            except Exception:
-                log.error("auto_chain: pm.prd.published emission failed", exc_info=True)
 
     # M4: Test completes → write validation_result memory (marks dev decision as tested)
     if task_type == "test":
