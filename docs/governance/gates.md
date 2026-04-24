@@ -1,7 +1,7 @@
 # Governance Gates
 
 > **Canonical governance topic document** — Gate checks that control stage transitions in the auto-chain.
-> Last updated: 2026-04-05 | Phase 2 Documentation Consolidation
+> Last updated: 2026-04-24 | Phase 2 Documentation Consolidation + Backlog Gate (Z3 enforcement)
 
 ## Overview
 
@@ -135,6 +135,23 @@ The coordinator has its own gate that validates all coordinator actions before e
 | G5 | Context updates validated for expected keys |
 | G6 | Actions referencing non-existent tasks rejected |
 | G7 | Rate limits apply to PM task creation |
+
+### 6. Backlog Gate
+
+**Purpose:** Enforces that every auto-chain task originates from a valid backlog entry, providing traceability from feature request to deployment (Z3 enforcement).
+
+**Checks:**
+- **Backlog row existence:** A matching row must exist in the `backlog` table for the task's `ref_id`. If no row is found, the gate rejects the task.
+- **`parent_task_id` requirement:** The task metadata must include a valid `parent_task_id` linking it to its originating backlog entry or parent task. This is enforced by Z3 to ensure every task in the chain has a clear lineage.
+- **Strict default:** The backlog_gate defaults to strict mode — tasks without a backlog row are rejected rather than warned. This is the opposite of the version gate philosophy (which was downgraded to warning-only).
+
+**Bypass:**
+- The `force_no_backlog` metadata flag can be set on a task to bypass the backlog existence check. This is intended for infrastructure tasks (e.g., doc-only updates, hotfixes) that do not originate from a backlog entry.
+- When `force_no_backlog` is set, the gate logs a warning to audit but allows the task to proceed.
+
+**Triggers:** Runs at PM → Dev transition (and optionally at other transitions when strict chain traceability is required).
+
+**On failure:** Task is marked `gate_blocked` with the reason indicating which check failed (missing backlog row or missing `parent_task_id`).
 
 ## Gate Failure Flow
 
