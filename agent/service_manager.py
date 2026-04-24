@@ -735,11 +735,35 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
+    # B48 FIX A (observer-hotfix 2026-04-23): Add RotatingFileHandler so SM logs
+    # are captured to disk. Previously -WindowStyle Hidden + basicConfig with no
+    # FileHandler silently discarded every SM log message. See
+    # docs/dev/b48-investigation-and-fix-proposal.md §2.
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = _shared_log_dir()
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _sm_log_path = _log_dir / f"service-manager-{args.project}.log"
+
+    _formatter = logging.Formatter(
+        "[%(asctime)s] %(name)s %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    _file_handler = RotatingFileHandler(
+        str(_sm_log_path),
+        maxBytes=50_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(_formatter)
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(_formatter)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[_file_handler, _stream_handler],
+    )
+    log.info("ServiceManager logging initialized: file=%s (B48 Fix A)", _sm_log_path)
 
     manager = ServiceManager(
         project_id=args.project,
