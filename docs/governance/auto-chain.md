@@ -1,7 +1,7 @@
 # Auto-Chain — Automated Stage Progression
 
 > **Canonical governance topic document** — How the auto-chain pipeline orchestrates task stages.
-> Last updated: 2026-04-11 | Phase 2 Documentation Consolidation + B/G-series updates + B24 chain integrity
+> Last updated: 2026-04-24 | Phase 2 Documentation Consolidation + B/G-series updates + B24 chain integrity + MF-2026-04-24 connection-contention fixes
 
 > **2026-04-11 (B24):** Chain integrity verification — retry dev prompts now include `SCOPE CONSTRAINT` populated by `get_retry_scope()` which accumulates changed_files from prior dev attempts. Version gate remains warning-only for merge/deploy stages (D3/B29/B30 fixes preserved).
 
@@ -222,3 +222,41 @@ Extends the D5 dirty workspace filter with additional exclusion patterns and sma
 - **Configurable patterns:** Exclusion patterns are read from `DIRTY_FILTER_PATTERNS` env var (comma-separated globs), defaulting to the built-in list
 - **Remaining dirty handling:** After filtering, if dirty files remain, they are logged as warnings with file paths but do not block dispatch (consistent with G5 downgrade philosophy)
 - **Audit trail:** Filtered files are recorded in the chain context so post-mortem analysis can distinguish "genuinely dirty" from "filtered noise"
+
+## Connection-Contention Fix: conn.commit()-before-publish (MF-2026-04-24)
+
+Manual fixes MF-001 and MF-002 (applied 2026-04-24) resolved a critical connection-contention bug in `on_task_completed` that caused 60-second stalls due to SQLite's `busy_timeout` setting.
+
+### Problem
+
+When `on_task_completed` fired, the handler would:
+1. Open a SQLite connection and perform writes (task status update, chain context update)
+2. Publish an event (e.g., `pm.prd.published`) while the connection was still held open
+3. Event subscribers would attempt their own DB writes, hitting the held write-lock
+4. SQLite's `busy_timeout` (default 60s) would cause subscribers to wait up to 60 seconds before failing
+
+This affected both the PM-stage path (line ~1700 in auto_chain.py) and the dev-stage path (lines ~1760/1924/2433).
+
+### Fix Pattern
+
+The `conn.commit()` call is now issued **before** any event publication, releasing the write-lock so that downstream subscribers can acquire it immediately:
+
+```python
+# BEFORE (stalls):
+conn.execute("UPDATE tasks SET status=? ...", ...)
+event_bus.publish("task.completed", ...)  # subscribers blocked on write-lock
+conn.commit()
+
+# AFTER (MF-001/MF-002 fix):
+conn.execute("UPDATE tasks SET status=? ...", ...)
+conn.commit()  # release write-lock FIRST
+event_bus.publish("task.completed", ...)  # subscribers can now write freely
+```
+
+This pattern must be followed in all paths where DB writes precede event publication.
+
+## Event Emission Timing: pm.prd.published
+
+The `pm.prd.published` event fires **after** the PM gate check passes, not before. This means downstream consumers (e.g., backlog chain-trigger) only receive the event once the PRD has been validated and the Dev task dispatch is already underway.
+
+**Design consideration (OPT-BACKLOG-PM-PRD-PUBLISH-PRE-GATE):** Moving `pm.prd.published` to fire *before* the gate would allow subscribers to react to the raw PRD output even if the gate rejects it. This is noted as a potential optimization but has not been implemented, as the current post-gate ordering ensures subscribers only see valid PRDs.
