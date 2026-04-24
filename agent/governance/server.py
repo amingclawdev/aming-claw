@@ -3162,6 +3162,11 @@ def handle_backlog_list(ctx: RequestContext):
                 bug["required_docs"] = json.loads(bug.get("required_docs", "[]"))
             except (json.JSONDecodeError, TypeError):
                 bug["required_docs"] = []
+            # Parse provenance_paths from JSON string to list
+            try:
+                bug["provenance_paths"] = json.loads(bug.get("provenance_paths", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                bug["provenance_paths"] = []
             bugs.append(bug)
         return {"bugs": bugs, "count": len(bugs)}
     finally:
@@ -3186,6 +3191,11 @@ def handle_backlog_get(ctx: RequestContext):
             result["required_docs"] = json.loads(result.get("required_docs", "[]"))
         except (json.JSONDecodeError, TypeError):
             result["required_docs"] = []
+        # Parse provenance_paths from JSON string to list
+        try:
+            result["provenance_paths"] = json.loads(result.get("provenance_paths", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            result["provenance_paths"] = []
         return result
     finally:
         conn.close()
@@ -3205,8 +3215,8 @@ def handle_backlog_upsert(ctx: RequestContext):
                (bug_id, title, status, priority, target_files, test_files,
                 acceptance_criteria, chain_task_id, "commit", discovered_at,
                 fixed_at, details_md, chain_trigger_json, required_docs,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provenance_paths, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(bug_id) DO UPDATE SET
                  title = excluded.title,
                  status = excluded.status,
@@ -3221,6 +3231,7 @@ def handle_backlog_upsert(ctx: RequestContext):
                  details_md = excluded.details_md,
                  chain_trigger_json = excluded.chain_trigger_json,
                  required_docs = excluded.required_docs,
+                 provenance_paths = excluded.provenance_paths,
                  updated_at = excluded.updated_at
             """,
             (
@@ -3238,6 +3249,7 @@ def handle_backlog_upsert(ctx: RequestContext):
                 body.get("details_md", ""),
                 json.dumps(body.get("chain_trigger_json", {})),
                 json.dumps(body.get("required_docs", [])),
+                json.dumps(body.get("provenance_paths", [])),
                 now,
                 now,
             ),

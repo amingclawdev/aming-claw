@@ -154,3 +154,6 @@ agent/governance/governance.db
 .recent-tasks.json
 .governance-cache/
 .observer-cache/
+
+# Generated dev docs (provenance tracked in backlog_bugs.provenance_paths)
+docs/dev/
