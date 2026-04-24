@@ -68,7 +68,7 @@ For each Zn:
 |---|---|---|---|---|
 | Z1 | pending | | | |
 | Z2 | | | | |
-| Z3 | | | | |
+| Z3 | 2026-04-24 | | fedaf27 | Z3-partial landed: P0-1 strict backlog gate + P0-2 bug_id existence check verified by smoke chain |
 | Z4 | | | | |
 | Z5 | | | | |
 | Z6 | | | | |
