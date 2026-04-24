@@ -1694,6 +1694,12 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 "UPDATE tasks SET trace_id=?, chain_id=? WHERE task_id=?",
                 (_trace_id, _chain_id, task_id),
             )
+            # MF-2026-04-24-001 extension: release write lock immediately so
+            # subsequent _publish_event subscribers (chain_context.on_task_completed
+            # → _persist_event legacy path, opens separate conn) do not wait 60s
+            # busy_timeout for this transaction to finish. Lock-hold time here
+            # dominates the ~10min stall pattern in OPT-BACKLOG-AUTO-CHAIN-CONN-CONTENTION.
+            conn.commit()
         except Exception:
             log.warning("auto_chain: failed to backfill trace_id on PM task %s", task_id)
     elif not _trace_id:
