@@ -1831,6 +1831,13 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             )
         except Exception:
             log.debug("auto_chain: failed to insert audit_log for gate block (non-critical)", exc_info=True)
+        # MF-2026-04-24-001 extension: release write lock before sync event
+        # dispatch so chain_context subscriber's legacy _persist_event does not
+        # wait 60s busy_timeout on this audit_log INSERT.
+        try:
+            conn.commit()
+        except Exception:
+            log.debug("auto_chain: commit before gate.blocked publish failed (non-critical)", exc_info=True)
         _publish_event("gate.blocked", {
             "project_id": project_id, "task_id": task_id,
             "stage": "version_check", "next_stage": task_type,
