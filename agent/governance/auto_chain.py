@@ -307,8 +307,9 @@ def _is_dev_doc(path):
 def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
     """Infer graph_delta from PM proposed_nodes + dev changed_files.
 
-    Five deterministic rules:
+    Six deterministic rules:
       Rule A: PM proposed_nodes whose primary appears in changed_files (excl .md)
+      Rule H: When dev_delta is None, bridge ALL PM proposed_nodes into creates[]
       Rule B: @route decorator grep on changed agent/**/*.py files
       Rule D: Updates to existing graph nodes whose primary is in changed_files
       Rule E: Dev override — dev entries replace inferred with same title/primary
@@ -350,6 +351,31 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
                 covered_primaries.update(p.replace("\\", "/") for p in primaries)
                 rule_hits.append({"rule": "A", "entry_title": entry["title"],
                                   "matched_files": matched})
+
+    # ---- Rule H: Bridge ALL PM proposed_nodes when dev emitted no graph_delta ----
+    if dev_delta is None and pm_nodes:
+        # Collect node_ids already added by Rule A to avoid duplicates (R5)
+        existing_node_ids = {c.get("node_id") for c in creates}
+        for node in pm_nodes:
+            nid = node.get("node_id", "")
+            if nid in existing_node_ids:
+                continue  # already matched by Rule A
+            primaries = node.get("primary", [])
+            if isinstance(primaries, str):
+                primaries = [primaries]
+            entry = {
+                "node_id": nid,
+                "title": node.get("title", ""),
+                "parent_layer": node.get("parent_layer", ""),
+                "primary": primaries,
+                "deps": node.get("deps", []),
+                "description": node.get("description", ""),
+            }
+            creates.append(entry)
+            rule_hits.append({"rule": "H", "entry_title": entry["title"],
+                              "node_id": nid})
+        if "pm_proposed_bridge" not in inferred_from:
+            inferred_from.append("pm_proposed_bridge")
 
     # ---- Rule B: @route decorator grep on changed agent/**/*.py ----
     py_agent_files = [f for f in non_md_changed
