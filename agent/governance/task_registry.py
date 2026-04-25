@@ -727,7 +727,10 @@ def _is_pid_alive(pid: int) -> bool:
     except PermissionError:
         # Process exists but we don't have permission to signal it
         return True
-    except OSError:
+    except (OSError, SystemError):
+        # observer-hotfix 2026-04-25: Windows os.kill on a stale PID can raise
+        # SystemError ("returned a result with an exception set") instead of OSError.
+        # Treat both as "process dead" rather than crashing the request handler.
         return False
 
 
