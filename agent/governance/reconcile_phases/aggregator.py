@@ -26,6 +26,9 @@ _HUMAN_REVIEW_TYPES = frozenset({
     "doc_stale",
     "doc_missing_known_keyword",
     "pm_proposed_not_in_node_state",
+    "orphan_in_db",
+    "stuck_testing",
+    "chain_not_closed",
 })
 
 CONF_ORDER = {"high": 3, "medium": 2, "low": 1}
@@ -109,6 +112,8 @@ def aggregate(
     all_findings.extend(phase_results.get("B", []))
     all_findings.extend(phase_results.get("C", []))
     all_findings.extend(phase_d)
+    all_findings.extend(phase_results.get("F", []))
+    all_findings.extend(phase_results.get("G", []))
 
     # --- Bucket into 3 tiers ------------------------------------------------
     auto_fixable: list = []

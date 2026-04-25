@@ -323,6 +323,12 @@ class ExecutorWorker:
             return self._execute_deploy(task_id, metadata)
         if task_type == "test":
             return self._execute_test(task_id, metadata)
+        # observer-hotfix-3 2026-04-25: reconcile is also a script operation,
+        # delegated to agent.governance.reconcile_task.run_reconcile_pipeline.
+        # Phase J added the task type but missed wiring it into executor; without
+        # this handler, executor falls back to AI 'dev' role and times out.
+        if task_type == "reconcile" or task_type.startswith("reconcile_"):
+            return self._execute_reconcile(task_id, metadata)
 
         worktree_path = None
         branch_name = None
@@ -1040,6 +1046,31 @@ class ExecutorWorker:
             return proc.returncode == 0
         except Exception:
             return False
+
+    def _execute_reconcile(self, task_id: str, metadata: dict) -> dict:
+        """observer-hotfix-3 2026-04-25: Run reconcile pipeline via Phase J task type.
+
+        Delegates to agent.governance.reconcile_task.run_reconcile_pipeline,
+        which walks the 6 stages (scan/diff/propose/approve/apply/verify),
+        produces mutation_plan.json, and either auto-applies high-conf items
+        or queues medium/low for manual review.
+        """
+        self._report_progress(task_id, {"step": "reconciling"})
+        try:
+            from agent.governance.reconcile_task import run_full_reconcile
+            from agent.governance.db import get_connection
+            conn = get_connection(self.project_id)
+            try:
+                result = run_full_reconcile(
+                    conn, self.project_id, task_id, metadata,
+                )
+                conn.commit()
+                return {"status": "succeeded", "result": result}
+            finally:
+                conn.close()
+        except Exception as e:
+            log.error("reconcile pipeline failed for %s: %s", task_id, e, exc_info=True)
+            return {"status": "failed", "error": f"reconcile pipeline error: {e}"}
 
     def _execute_deploy(self, task_id: str, metadata: dict) -> dict:
         """Run deploy orchestration on the host executor, not in governance."""

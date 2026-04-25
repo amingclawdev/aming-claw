@@ -49,6 +49,7 @@ def _write_report(
     workspace_path: str,
     aggregated: Dict[str, Any],
     phase_details: Dict[str, Any],
+    graph_db_delta: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Write markdown report and return the relative report path."""
     today = date.today().isoformat()
@@ -67,6 +68,22 @@ def _write_report(
         f"- Genuinely unresolvable: {len(aggregated.get('genuinely_unresolvable', []))}",
         f"- Dedup removed: {aggregated.get('dedup_removed', 0)}",
         "",
+    ]
+
+    # Graph-vs-DB delta section
+    if graph_db_delta:
+        lines += [
+            "## Graph vs DB Node Delta",
+            "",
+            f"- Graph nodes: {graph_db_delta.get('graph_count', '?')}",
+            f"- DB node_state rows: {graph_db_delta.get('db_count', '?')}",
+            f"- Orphan DB records (in DB, not in graph): {graph_db_delta.get('orphan_db_count', 0)}",
+            f"- Missing DB records (in graph, not in DB): {graph_db_delta.get('missing_db_count', 0)}",
+            f"- Stuck in testing: {graph_db_delta.get('stuck_testing_count', 0)}",
+            "",
+        ]
+
+    lines += [
         "## Auto-fixable",
         "",
     ]
@@ -149,10 +166,28 @@ def run_orchestrated(
     )
 
     # Write report
-    report_path = _write_report(workspace_path, aggregated, phase_details)
+    try:
+        delta_for_report = ctx.graph_db_delta
+    except Exception:
+        delta_for_report = None
+    report_path = _write_report(workspace_path, aggregated, phase_details, delta_for_report)
 
     auto_fixed_count = len(aggregated["auto_fixable"]) if not dry_run else 0
     human_review_count = len(aggregated["human_review"])
+
+    # Compute graph-vs-DB delta summary
+    try:
+        delta = ctx.graph_db_delta
+        graph_db_summary = {
+            "graph_count": delta["graph_count"],
+            "db_count": delta["db_count"],
+            "orphan_db_count": delta["orphan_db_count"],
+            "missing_db_count": delta["missing_db_count"],
+            "stuck_testing_count": delta["stuck_testing_count"],
+        }
+    except Exception as exc:
+        log.warning("Failed to compute graph_db_delta: %s", exc)
+        graph_db_summary = {}
 
     return {
         "report_path": report_path,
@@ -162,6 +197,7 @@ def run_orchestrated(
             "genuinely_unresolvable": len(aggregated["genuinely_unresolvable"]),
             "dedup_removed": aggregated["dedup_removed"],
         },
+        "graph_db_delta": graph_db_summary,
         "auto_fixed_count": auto_fixed_count,
         "human_review_count": human_review_count,
         "phases": {k: {"count": v["count"]} for k, v in phase_details.items()},

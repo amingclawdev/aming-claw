@@ -130,8 +130,8 @@ def _load_pm_tasks(ctx: "ReconcileContext") -> List[Dict[str, Any]]:
     Filters to last 30 days in-memory for safety.
     """
     try:
-        from ..state_service import _get_conn
-        conn = _get_conn(ctx.project_id)
+        from ..db import get_connection
+        conn = get_connection(ctx.project_id)
         cursor = conn.execute(
             "SELECT * FROM tasks WHERE type='pm' AND project_id=?",
             (ctx.project_id,),
@@ -164,8 +164,8 @@ def _load_chain_events(
     ORDER BY created_at
     """
     try:
-        from ..state_service import _get_conn
-        conn = _get_conn(ctx.project_id)
+        from ..db import get_connection
+        conn = get_connection(ctx.project_id)
         cursor = conn.execute(
             "SELECT * FROM chain_events "
             "WHERE root_task_id=? OR task_id=? "
