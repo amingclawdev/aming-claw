@@ -951,30 +951,55 @@ def handle_reconcile(ctx: RequestContext):
 
 @route("POST", "/api/wf/{project_id}/reconcile-v2")
 def handle_reconcile_v2(ctx: RequestContext):
-    """Reconcile V2: 5-phase comprehensive reconcile pipeline.
+    """Reconcile V2: creates a reconcile task and returns task_id + status_url (R9).
 
-    Body: {workspace_path, dry_run?, phases?, auto_fix_threshold?, since?, scan_depth?}
+    Body: {metadata?, _meta_circular?, scenario?, reason?, observer_acknowledged_by?}
+
+    Returns: {task_id, status_url, status}
     """
-    from .reconcile_phases.orchestrator import run_orchestrated
+    from . import task_registry
 
     project_id = ctx.get_project_id()
     body = ctx.body
 
-    workspace_path = body.get("workspace_path", "")
-    if not workspace_path:
-        from .errors import ValidationError
-        raise ValidationError("workspace_path is required")
+    metadata = body.get("metadata") or {}
+    if isinstance(metadata, str):
+        import json as _json
+        try:
+            metadata = _json.loads(metadata)
+        except Exception:
+            metadata = {}
 
-    result = run_orchestrated(
-        project_id=project_id,
-        workspace_path=workspace_path,
-        phases=body.get("phases"),
-        dry_run=body.get("dry_run", True),
-        auto_fix_threshold=body.get("auto_fix_threshold", "high"),
-        scan_depth=body.get("scan_depth", 3),
-        since=body.get("since"),
-    )
-    return result
+    # Forward meta-circular fields
+    for key in ("_meta_circular", "scenario", "reason", "observer_acknowledged_by"):
+        if key in body and key not in metadata:
+            metadata[key] = body[key]
+
+    # Forward legacy fields for compat
+    for key in ("workspace_path", "dry_run", "phases", "auto_fix_threshold",
+                "scan_depth", "since"):
+        if key in body:
+            metadata[key] = body[key]
+
+    prompt = body.get("prompt", "Reconcile project graph and node state")
+
+    with DBContext(project_id) as conn:
+        result = task_registry.create_task(
+            conn,
+            project_id,
+            prompt=prompt,
+            task_type="reconcile",
+            metadata=metadata,
+            created_by=body.get("operator_id", "reconcile-v2-api"),
+        )
+        conn.commit()
+
+    task_id = result["task_id"]
+    return {
+        "task_id": task_id,
+        "status_url": f"/api/task/{project_id}/{task_id}",
+        "status": result.get("status", "queued"),
+    }
 
 
 @route("POST", "/api/wf/{project_id}/node-create")
