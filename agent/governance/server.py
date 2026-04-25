@@ -3210,6 +3210,124 @@ _DOCS = {
 
 
 # ---------------------------------------------------------------------------
+# Baseline Endpoints (Phase I)
+# ---------------------------------------------------------------------------
+
+@route("GET", "/api/baseline/{project_id}/list")
+def handle_baseline_list(ctx: RequestContext):
+    """List all baselines for a project."""
+    pid = ctx.path_params["project_id"]
+    conn = get_connection(pid)
+    try:
+        from . import baseline_service
+        baselines = baseline_service.list_baselines(conn, pid)
+        return {"ok": True, "baselines": baselines}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/baseline/{project_id}/latest")
+def handle_baseline_latest(ctx: RequestContext):
+    """Get the latest baseline for a project."""
+    pid = ctx.path_params["project_id"]
+    conn = get_connection(pid)
+    try:
+        from . import baseline_service
+        baselines = baseline_service.list_baselines(conn, pid)
+        if not baselines:
+            return ctx.handler._respond(404, {"error": "baseline_missing", "message": "No baselines found"})
+        return {"ok": True, "baseline": baselines[0]}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/baseline/{project_id}/{baseline_id}")
+def handle_baseline_get(ctx: RequestContext):
+    """Get a single baseline by ID."""
+    pid = ctx.path_params["project_id"]
+    baseline_id = int(ctx.path_params["baseline_id"])
+    conn = get_connection(pid)
+    try:
+        from . import baseline_service
+        bl = baseline_service.get_baseline(conn, pid, baseline_id)
+        return {"ok": True, "baseline": bl}
+    except baseline_service.BaselineMissingError as e:
+        return ctx.handler._respond(404, e.to_dict())
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/baseline/{project_id}/by-commit/{sha}")
+def handle_baseline_by_commit(ctx: RequestContext):
+    """Get baseline by commit SHA."""
+    pid = ctx.path_params["project_id"]
+    sha = ctx.path_params["sha"]
+    conn = get_connection(pid)
+    try:
+        from . import baseline_service
+        bl = baseline_service.get_by_commit(conn, pid, sha)
+        return {"ok": True, "baseline": bl}
+    except baseline_service.BaselineMissingError as e:
+        return ctx.handler._respond(404, e.to_dict())
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/baseline/{project_id}/diff")
+def handle_baseline_diff(ctx: RequestContext):
+    """Diff two baselines. Body: {from, to, scope}."""
+    pid = ctx.path_params["project_id"]
+    body = ctx.body
+    from_id = body.get("from")
+    to_id = body.get("to")
+    scope = body.get("scope", "full")
+    if from_id is None or to_id is None:
+        return ctx.handler._respond(400, {"error": "invalid_request", "message": "'from' and 'to' are required"})
+    conn = get_connection(pid)
+    try:
+        from . import baseline_service
+        delta = baseline_service.diff(conn, pid, int(from_id), int(to_id), scope)
+        return {"ok": True, "delta": delta}
+    except baseline_service.BaselineMissingError as e:
+        return ctx.handler._respond(404, e.to_dict())
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/baseline/{project_id}/create")
+def handle_baseline_create(ctx: RequestContext):
+    """Create a new baseline. R7: trigger allowlist enforcement."""
+    pid = ctx.path_params["project_id"]
+    body = ctx.body
+    triggered_by = body.get("triggered_by", "")
+    from . import baseline_service
+    if triggered_by not in baseline_service.TRIGGER_ALLOWLIST:
+        return ctx.handler._respond(400, {
+            "error": "invalid_request",
+            "message": f"triggered_by must be one of {sorted(baseline_service.TRIGGER_ALLOWLIST)}, got {triggered_by!r}"
+        })
+    conn = get_connection(pid)
+    try:
+        bl = baseline_service.create_baseline(
+            conn, pid,
+            chain_version=body.get("chain_version", ""),
+            trigger=body.get("trigger", triggered_by),
+            triggered_by=triggered_by,
+            graph_json=body.get("graph_json", {}),
+            code_doc_map_json=body.get("code_doc_map_json", {}),
+            node_state_snap=body.get("node_state_snap", "{}"),
+            chain_event_max=body.get("chain_event_max", 0),
+            notes=body.get("notes", ""),
+            reconstructed=body.get("reconstructed", 0),
+        )
+        return {"ok": True, "baseline": bl}
+    except ValueError as e:
+        return ctx.handler._respond(400, {"error": "invalid_request", "message": str(e)})
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Backlog Endpoints (OPT-DB-BACKLOG)
 # ---------------------------------------------------------------------------
 
