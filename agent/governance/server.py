@@ -3360,6 +3360,34 @@ def handle_baseline_create(ctx: RequestContext):
 
 
 # ---------------------------------------------------------------------------
+# Baseline GC Endpoint
+# ---------------------------------------------------------------------------
+
+@route("POST", "/api/baseline/{project_id}/gc")
+def handle_baseline_gc(ctx: RequestContext):
+    """Run baseline garbage collection (coordinator-only). R8."""
+    pid = ctx.path_params["project_id"]
+    conn = get_connection(pid)
+    try:
+        session = ctx.require_auth(conn)
+        if session.get("role") != "coordinator":
+            from .errors import PermissionDeniedError
+            raise PermissionDeniedError(
+                session.get("role", ""), "baseline.gc",
+                {"detail": "Only coordinator can run baseline GC"})
+    finally:
+        conn.close()
+
+    body = ctx.body
+    dry_run = body.get("dry_run", True)
+    keep_last_n = body.get("keep_last_n", 100)
+
+    from . import baseline_gc
+    result = baseline_gc.gc_baselines(pid, dry_run=dry_run, keep_last_n=keep_last_n)
+    return {"ok": True, **result}
+
+
+# ---------------------------------------------------------------------------
 # Backlog Endpoints (OPT-DB-BACKLOG)
 # ---------------------------------------------------------------------------
 
