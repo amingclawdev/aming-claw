@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from . import phase_a
+from . import phase_b
 from . import phase_e
 from .context import ReconcileContext
 
@@ -32,4 +33,4 @@ class PhaseBase(ABC):
         ...
 
 
-__all__ = ["Discrepancy", "PhaseBase", "ReconcileContext", "phase_a", "phase_e"]
+__all__ = ["Discrepancy", "PhaseBase", "ReconcileContext", "phase_a", "phase_b", "phase_e"]
