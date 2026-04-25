@@ -191,14 +191,21 @@ class GovernanceHandler(BaseHTTPRequestHandler):
 
     def _respond(self, code: int, body: dict, extra_headers: dict | None = None):
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        if extra_headers:
-            for k, v in extra_headers.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(payload)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
+            # observer-hotfix 2026-04-25: Windows clients drop connections
+            # mid-write (gateway timeouts, executor restarts). Don't let
+            # the connection death propagate up the request thread and
+            # crash the gov server. Just log and move on.
+            log.debug("client connection dropped during _respond: %s", e)
 
     def _handle(self, method: str):
         request_id = f"req-{uuid.uuid4().hex[:12]}"
