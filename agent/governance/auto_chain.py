@@ -3865,6 +3865,64 @@ def _try_backlog_close_via_db(project_id, bug_id, commit_hash):
         return False
 
 
+def _post_manager_redeploy_governance_from_chain(chain_version: str) -> dict:
+    """POST to localhost:40101/api/manager/redeploy/governance (PR1-R4).
+
+    Uses urllib.request (already used elsewhere in auto_chain.py) — no new
+    dependency.  On ConnectionRefusedError (service_manager HTTP not running),
+    falls back to legacy restart_local_governance and logs a warning (PR1-R5).
+
+    Returns dict with at least {"ok": bool}.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = "http://localhost:40101/api/manager/redeploy/governance"
+    data = json.dumps({"chain_version": chain_version}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        # PR1-R5: ConnectionRefusedError → fallback to legacy
+        if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            log.warning(
+                "auto_chain: manager HTTP not reachable (ConnectionRefused); "
+                "fallback to legacy restart_local_governance"
+            )
+            return _legacy_restart_local_governance_fallback()
+        log.warning("auto_chain: manager redeploy URLError: %s", exc)
+        return {"ok": False, "detail": str(exc), "fallback": False}
+    except ConnectionRefusedError:
+        log.warning(
+            "auto_chain: manager HTTP not reachable (ConnectionRefused); "
+            "fallback to legacy restart_local_governance"
+        )
+        return _legacy_restart_local_governance_fallback()
+    except Exception as exc:
+        log.warning("auto_chain: manager redeploy error: %s", exc)
+        return {"ok": False, "detail": str(exc), "fallback": False}
+
+
+def _legacy_restart_local_governance_fallback() -> dict:
+    """PR1-R5: Legacy fallback — restart governance via deploy_chain.restart_local_governance.
+
+    Only called when the POST to localhost:40101 gets ConnectionRefusedError.
+    """
+    try:
+        from agent.deploy_chain import restart_local_governance
+        ok, summary = restart_local_governance(port=40000)
+        return {"ok": ok, "detail": summary, "fallback": True}
+    except Exception as exc:
+        log.warning("auto_chain: legacy restart_local_governance fallback failed: %s", exc)
+        return {"ok": False, "detail": str(exc), "fallback": True}
+
+
 def _finalize_chain(conn, project_id, task_id, result, metadata):
     """Terminal stage after deploy succeeds.
 
@@ -3876,6 +3934,26 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
 
     report = result.get("report", result)
     finalize_result = {"deploy": "completed", "report": report}
+
+    # --- PR1-R4: If changed_files include governance code, POST to manager
+    # endpoint to trigger a governance redeploy via service_manager sidecar.
+    changed_files = metadata.get("changed_files") or result.get("changed_files", [])
+    _governance_files_changed = any(
+        f.startswith("agent/governance/") or f.startswith("agent\\governance\\")
+        for f in changed_files
+    )
+    if _governance_files_changed:
+        redeploy_via_manager = _post_manager_redeploy_governance_from_chain(
+            metadata.get("chain_version", "")
+            or result.get("chain_version", "")
+            or metadata.get("merge_commit", "")
+        )
+        finalize_result["governance_redeploy"] = redeploy_via_manager
+        if redeploy_via_manager.get("ok"):
+            log.info("_finalize_chain: governance redeploy via manager succeeded")
+        else:
+            log.warning("_finalize_chain: governance redeploy via manager failed: %s",
+                        redeploy_via_manager.get("detail", "unknown"))
 
     # --- R4: version-sync then version-update ---
     # PR-2 (R11): chain_version DB write now owned by redeploy_handler.
