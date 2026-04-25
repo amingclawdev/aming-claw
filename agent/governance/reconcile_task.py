@@ -363,11 +363,35 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
     except Exception as e:
         log.warning("reconcile diff: graph load failed: %s", e)
 
+    # --- Phase H integration (R5): run content delta detection if available ---
+    phase_h_result = None
+    if metadata.get("enable_phase_h", True):
+        try:
+            from .reconcile_phases.phase_h import run_phase_h
+            baseline = scan_result.get("baseline", {})
+            baseline_sha = baseline.get("chain_version", "")
+            if baseline_sha:
+                import os
+                repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                phase_h_result = run_phase_h(
+                    conn, project_id, baseline_sha, repo_root,
+                )
+                log.info("reconcile diff: Phase H completed — spawned=%d, throttled=%d",
+                         len(phase_h_result.spawned_tasks), phase_h_result.skipped_throttled)
+        except ImportError:
+            log.debug("reconcile diff: Phase H not available (Track B Phase J dependency)")
+        except Exception as e:
+            log.warning("reconcile diff: Phase H failed (non-blocking): %s", e)
+
     return {
         "stage": "diff",
         "diffs": diffs,
         "diff_count": len(diffs),
         "baseline": scan_result.get("baseline", {}),
+        "phase_h": {
+            "spawned_tasks": phase_h_result.spawned_tasks if phase_h_result else [],
+            "skipped_throttled": phase_h_result.skipped_throttled if phase_h_result else 0,
+        } if phase_h_result else None,
     }
 
 

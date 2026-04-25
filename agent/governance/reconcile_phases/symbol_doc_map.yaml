@@ -1,0 +1,40 @@
+# symbol_doc_map.yaml — Symbol-kind → expected-doc mappings for Phase H
+# Ref: §15.4 — Confidence levels: high, medium, low
+#
+# Each entry maps a symbol_kind to an expected documentation path
+# and a default confidence level.
+#
+# Confidence overrides:
+#   - Classes referenced by @route/registry/public-API/CLI/schema → high
+#   - Unreferenced classes → medium
+#
+# Fields:
+#   expected_doc: relative path from repo root to expected doc file
+#   confidence: default confidence level (may be overridden by Phase H logic)
+#   suggested_format: hint for PM prompt (e.g. "api-endpoint", "schema-table")
+
+mappings:
+  route:
+    expected_doc: "docs/api/governance-api.md"
+    confidence: "high"
+    suggested_format: "api-endpoint"
+
+  create_table:
+    expected_doc: "docs/governance/db-schema.md"
+    confidence: "high"
+    suggested_format: "schema-table"
+
+  alter_table:
+    expected_doc: "docs/governance/db-schema.md"
+    confidence: "high"
+    suggested_format: "schema-alter"
+
+  class_governance:
+    expected_doc: "docs/governance/architecture.md"
+    confidence: "conditional"
+    suggested_format: "class-reference"
+
+  public_def:
+    expected_doc: "module_docstring"
+    confidence: "low"
+    suggested_format: "function-docstring"

@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -781,7 +781,26 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
         c.execute("CREATE INDEX IF NOT EXISTS idx_baselines_chain_version ON version_baselines(project_id, chain_version)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_baselines_created_at ON version_baselines(project_id, created_at)")
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19}
+    def _migrate_v19_to_v20(c):
+        """Add phase_h_processed_symbols table for Phase H content delta detection."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS phase_h_processed_symbols (
+                fingerprint       TEXT PRIMARY KEY,
+                project_id        TEXT NOT NULL,
+                commit_sha        TEXT NOT NULL,
+                symbol_kind       TEXT NOT NULL,
+                symbol_qname      TEXT NOT NULL,
+                expected_doc      TEXT NOT NULL,
+                spawned_task_id   TEXT NOT NULL DEFAULT '',
+                spawn_status      TEXT NOT NULL DEFAULT 'pending',
+                last_chain_event  TEXT NOT NULL DEFAULT '',
+                updated_at        TEXT NOT NULL,
+                processed_at      TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_phase_h_processed_status ON phase_h_processed_symbols(project_id, spawn_status)")
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)

@@ -4298,6 +4298,21 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
     except Exception as e:
         log.debug("_finalize_chain: version verify failed: %s", e)
 
+    # --- Phase H (R4): advance phase_h_processed_symbols running → merged ---
+    spawned_task_id = metadata.get("spawned_task_id", "") or metadata.get("task_id", task_id)
+    if spawned_task_id:
+        try:
+            now_ph = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "UPDATE phase_h_processed_symbols "
+                "SET spawn_status = 'merged', updated_at = ? "
+                "WHERE spawned_task_id = ? AND spawn_status = 'running'",
+                (now_ph, spawned_task_id),
+            )
+        except Exception as exc_ph:
+            # Table may not exist yet (pre-migration); swallow gracefully
+            log.debug("_finalize_chain: phase_h status update skipped: %s", exc_ph)
+
     # --- R6 (OPT-DB-BACKLOG): close backlog bug if metadata.bug_id set ---
     bug_id = metadata.get("bug_id", "")
     if bug_id:
