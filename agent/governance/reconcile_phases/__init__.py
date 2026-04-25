@@ -13,6 +13,7 @@ from . import phase_b
 from . import phase_c
 from . import phase_d
 from . import phase_e
+from . import phase_z
 from . import aggregator
 from . import orchestrator
 from .context import ReconcileContext
@@ -39,6 +40,6 @@ class PhaseBase(ABC):
 
 __all__ = [
     "Discrepancy", "PhaseBase", "ReconcileContext",
-    "phase_a", "phase_b", "phase_c", "phase_d", "phase_e",
+    "phase_a", "phase_b", "phase_c", "phase_d", "phase_e", "phase_z",
     "aggregator", "orchestrator",
 ]

@@ -383,6 +383,44 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
         except Exception as e:
             log.warning("reconcile diff: Phase H failed (non-blocking): %s", e)
 
+    # --- Phase Z integration (R5): optional baseline discovery ---
+    phase_z_result = None
+    if metadata.get("enable_phase_z", False):
+        try:
+            from .reconcile_phases.phase_z import phase_z_run
+
+            class _PhaseZCtx:
+                """Minimal context adapter for Phase Z."""
+                def __init__(self, workspace, scratch, pid, graph, api_base):
+                    self.workspace_path = workspace
+                    self.scratch_dir = scratch
+                    self.project_id = pid
+                    self.graph = graph
+                    self.api_base = api_base
+
+            import os as _os
+            repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__)))
+            scratch = _os.path.join(repo_root, "docs", "dev", "scratch")
+            z_ctx = _PhaseZCtx(
+                workspace=repo_root,
+                scratch=scratch,
+                pid=project_id,
+                graph=scan_result.get("graph", {}),
+                api_base=metadata.get("api_base", "http://localhost:40000"),
+            )
+            phase_z_result = phase_z_run(
+                z_ctx,
+                enable_llm_enrichment=metadata.get("enable_llm_enrichment", False),
+                apply_backlog=metadata.get("apply_backlog", False),
+            )
+            log.info("reconcile diff: Phase Z completed — deltas=%d, backlog=%d",
+                     len(phase_z_result.get("deltas", [])),
+                     len(phase_z_result.get("backlog_rows", [])))
+        except ImportError:
+            log.debug("reconcile diff: Phase Z not available")
+        except Exception as e:
+            log.warning("reconcile diff: Phase Z failed (non-blocking): %s", e)
+
     return {
         "stage": "diff",
         "diffs": diffs,
@@ -392,6 +430,7 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
             "spawned_tasks": phase_h_result.spawned_tasks if phase_h_result else [],
             "skipped_throttled": phase_h_result.skipped_throttled if phase_h_result else 0,
         } if phase_h_result else None,
+        "phase_z": phase_z_result,
     }
 
 
