@@ -3897,6 +3897,21 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
             log.warning("_finalize_chain: version-sync/update failed: %s", e)
             finalize_result["version_sync_error"] = str(e)
 
+    # --- MF-2026-04-24-001/002: commit-before-slow-IO pattern ---
+    # During the 2026-04-24 autonomous sequence, _finalize_chain held a SQLite
+    # write-lock for 5-30s spanning version-sync DB writes (R4), subprocess calls
+    # (git rev-parse in R5), HTTP calls (server version check in R5), and backlog
+    # close HTTP POST (R6). Observer-side /api/backlog/.../close requests hit
+    # 'database is locked' ~50% of the time.  Fix: commit conn here so that all
+    # subsequent IO (R5 subprocess + HTTP, R6 HTTP) runs without holding the
+    # caller's write-lock.  _try_backlog_close_via_db (R6) already uses its own
+    # HTTP connection (urllib), so no additional conn isolation is needed — just
+    # ensuring conn is committed before R6 starts.
+    try:
+        conn.commit()
+    except Exception:
+        pass  # conn may already be committed by _finalize_version_sync
+
     # --- R5: verify server version == new HEAD ---
     try:
         from .server import get_server_version
@@ -3977,6 +3992,10 @@ def _finalize_version_sync(conn, project_id, task_id):
         "WHERE project_id=?",
         (new_head, f"auto-chain:{task_id}", project_id),
     )
+    # MF-2026-04-24-001/002: commit immediately after version write to release
+    # the SQLite write-lock before returning to _finalize_chain, which performs
+    # slow subprocess + HTTP IO in R5/R6.
+    conn.commit()
     log.info(
         "_finalize_version_sync: version-update project=%s chain_version=%s updated_by=auto-chain:%s",
         project_id, new_head, task_id,
