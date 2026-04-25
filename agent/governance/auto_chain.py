@@ -781,7 +781,10 @@ def _commit_graph_delta(conn, project_id, metadata):
                 prior_payload = json.loads(prior["payload_json"]) if isinstance(prior["payload_json"], str) else prior["payload_json"]
                 if prior_payload.get("source_event_id") == source_event_id:
                     log.info("_commit_graph_delta: idempotent skip — already committed for source %s", source_event_id)
-                    return prior_payload.get("committed_node_ids", [])
+                    return {
+                        "attempted_node_ids": prior_payload.get("attempted_node_ids", prior_payload.get("committed_node_ids", [])),
+                        "committed_node_ids": prior_payload.get("committed_node_ids", []),
+                    }
         except Exception:
             log.debug("_commit_graph_delta: idempotency check failed", exc_info=True)
 
@@ -791,6 +794,7 @@ def _commit_graph_delta(conn, project_id, metadata):
 
     now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     committed_node_ids = []
+    attempted_node_ids = []  # R1: all creates[] node_ids regardless of dedup outcome
 
     try:
         # Begin transaction — conn should already be in autocommit=off mode
@@ -818,14 +822,7 @@ def _commit_graph_delta(conn, project_id, metadata):
             explicit_node_id = item.get("node_id")
 
             if explicit_node_id:
-                # R2: Check collision
-                existing = conn.execute(
-                    "SELECT node_id FROM node_state WHERE project_id = ? AND node_id = ?",
-                    (project_id, explicit_node_id),
-                ).fetchone()
-                if existing:
-                    # AC5: Collision — reject entire batch
-                    raise ValueError(f"node_id collision: {explicit_node_id} already exists")
+                # Use explicit node_id — INSERT OR IGNORE handles dedup (AC3)
                 display_id = explicit_node_id
             else:
                 # R2: Auto-generate node_id using existing pattern
@@ -843,31 +840,35 @@ def _commit_graph_delta(conn, project_id, metadata):
                         pass
                 display_id = f"L{parent_layer}.{max_index + 1}"
 
-            # Insert node_state
-            conn.execute(
+            # R1: Record intent before INSERT
+            attempted_node_ids.append(display_id)
+
+            # Insert node_state — R2: check rowcount to detect dedup-skip
+            cursor = conn.execute(
                 """INSERT OR IGNORE INTO node_state
                    (project_id, node_id, verify_status, build_status, updated_at, version)
                    VALUES (?, ?, 'pending', 'unknown', ?, 1)""",
                 (project_id, display_id, now),
             )
 
-            # Record in node_history
-            try:
-                title = item.get("title", display_id)
-                conn.execute(
-                    """INSERT INTO node_history
-                       (project_id, node_id, from_status, to_status, role, evidence_json, session_id, ts, version)
-                       VALUES (?, ?, 'none', 'pending', 'auto-chain', ?, 'graph-delta-commit', ?, 1)""",
-                    (project_id, display_id,
-                     json.dumps({"title": title, "deps": item.get("deps", []),
-                                 "primary": item.get("primary", []),
-                                 "source": "graph.delta.committed"}),
-                     now),
-                )
-            except Exception:
-                pass  # History is nice-to-have
+            if cursor.rowcount > 0:
+                # Record in node_history
+                try:
+                    title = item.get("title", display_id)
+                    conn.execute(
+                        """INSERT INTO node_history
+                           (project_id, node_id, from_status, to_status, role, evidence_json, session_id, ts, version)
+                           VALUES (?, ?, 'none', 'pending', 'auto-chain', ?, 'graph-delta-commit', ?, 1)""",
+                        (project_id, display_id,
+                         json.dumps({"title": title, "deps": item.get("deps", []),
+                                     "primary": item.get("primary", []),
+                                     "source": "graph.delta.committed"}),
+                         now),
+                    )
+                except Exception:
+                    pass  # History is nice-to-have
 
-            committed_node_ids.append(display_id)
+                committed_node_ids.append(display_id)
 
         # Process updates[]
         for item in updates:
@@ -902,18 +903,20 @@ def _commit_graph_delta(conn, project_id, metadata):
                 update_parts.append("updated_by = ?")
                 update_vals.append("graph-delta-commit")
                 update_vals.extend([project_id, node_id])
-                conn.execute(
+                cursor = conn.execute(
                     f"UPDATE node_state SET {', '.join(update_parts)} WHERE project_id = ? AND node_id = ?",
                     update_vals,
                 )
 
-            if node_id not in committed_node_ids:
-                committed_node_ids.append(node_id)
+                # R3: Only count as committed if UPDATE actually modified a row
+                if cursor.rowcount > 0 and node_id not in committed_node_ids:
+                    committed_node_ids.append(node_id)
 
         # AC3: Write graph.delta.committed event — write to same conn (transactional)
         committed_payload = {
             "event_id": event_id,
             "source_event_id": source_event_id,
+            "attempted_node_ids": attempted_node_ids,
             "committed_node_ids": committed_node_ids,
             "creates_count": len(creates),
             "updates_count": len(updates),
@@ -949,9 +952,12 @@ def _commit_graph_delta(conn, project_id, metadata):
             except Exception:
                 log.debug("_commit_graph_delta: related_nodes carryforward failed", exc_info=True)
 
-        log.info("_commit_graph_delta: committed %d nodes for chain %s: %s",
-                 len(committed_node_ids), root_task_id, committed_node_ids)
-        return committed_node_ids
+        log.info("_commit_graph_delta: attempted %d, committed %d nodes for chain %s: %s",
+                 len(attempted_node_ids), len(committed_node_ids), root_task_id, committed_node_ids)
+        return {
+            "attempted_node_ids": attempted_node_ids,
+            "committed_node_ids": committed_node_ids,
+        }
 
     except ValueError as ve:
         # AC2/AC5: Collision or validation error — rollback
