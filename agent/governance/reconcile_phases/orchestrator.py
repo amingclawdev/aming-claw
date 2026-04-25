@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-PHASE_ORDER = ["A", "E", "B", "C", "D", "F"]
+PHASE_ORDER = ["A", "E", "B", "C", "D", "F", "G"]
 
 
 def _run_phase(phase_key: str, ctx: Any, phase_results: Dict[str, list]) -> list:
@@ -37,6 +37,9 @@ def _run_phase(phase_key: str, ctx: Any, phase_results: Dict[str, list]) -> list
     elif phase_key == "F":
         from . import phase_f
         return phase_f.run(ctx, phase_a_discrepancies=phase_results.get("A"))
+    elif phase_key == "G":
+        from . import phase_g
+        return phase_g.run(ctx)
     else:
         log.warning("Unknown phase key: %s", phase_key)
         return []
