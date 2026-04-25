@@ -160,6 +160,29 @@ CHAIN = {
     "deploy": ("_gate_deploy_pass", None, "_finalize_chain"),
 }
 
+# ---------------------------------------------------------------------------
+# Reconcile Task Stages (Phase J, R2)
+# ---------------------------------------------------------------------------
+# Separate from CHAIN — reconcile tasks bypass all governance gates.
+from .reconcile_task import (
+    _RECONCILE_STAGES,
+    handle_scan as _reconcile_scan,
+    handle_diff as _reconcile_diff,
+    handle_propose as _reconcile_propose,
+    handle_approve as _reconcile_approve,
+    handle_apply as _reconcile_apply,
+    handle_verify as _reconcile_verify,
+    run_full_reconcile as _run_full_reconcile,
+    acquire_reconcile_lock,
+    release_reconcile_lock,
+    ReconcileCancelled,
+)
+
+# Re-export for AC-J1: _RECONCILE_STAGES dict with keys
+# ['scan','diff','propose','approve','apply','verify']
+assert set(_RECONCILE_STAGES.keys()) == {"scan", "diff", "propose", "approve", "apply", "verify"}, \
+    f"_RECONCILE_STAGES keys mismatch: {set(_RECONCILE_STAGES.keys())}"
+
 # Maximum chain depth to prevent infinite loops
 MAX_CHAIN_DEPTH = 10
 
@@ -1894,6 +1917,42 @@ def _render_dev_contract_prompt(source_task_id, metadata):
     return "\n".join(parts)
 
 
+def _dispatch_reconcile(conn, project_id, task_id, task_type, result, metadata):
+    """Dispatch reconcile task through 6-stage pipeline (R2).
+
+    Bypasses version_check, PM-completeness, dev-contract, test, and QA gates.
+    Routes through _RECONCILE_STAGES instead of CHAIN.
+    """
+    from .db import get_connection
+    try:
+        rconn = get_connection(project_id)
+    except Exception:
+        log.error("auto_chain: failed to get connection for reconcile dispatch %s", project_id)
+        return None
+    try:
+        result_val = _run_full_reconcile(rconn, project_id, task_id, metadata)
+        rconn.commit()
+        return result_val
+    except ReconcileCancelled:
+        try:
+            rconn.rollback()
+        except Exception:
+            pass
+        return {"cancelled": True, "task_id": task_id}
+    except Exception:
+        try:
+            rconn.rollback()
+        except Exception:
+            pass
+        log.error("auto_chain: reconcile dispatch failed for %s", task_id, exc_info=True)
+        raise
+    finally:
+        try:
+            rconn.close()
+        except Exception:
+            pass
+
+
 def on_task_completed(conn, project_id, task_id, task_type, status, result, metadata):
     """Called by complete_task(). Dispatches next stage if gate passes.
 
@@ -1904,6 +1963,9 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
     """
     if status != "succeeded":
         return None
+    # R2: Reconcile tasks use separate stage map, bypass all governance gates
+    if task_type == "reconcile" or (isinstance(task_type, str) and task_type.startswith("reconcile_")):
+        return _dispatch_reconcile(conn, project_id, task_id, task_type, result, metadata)
     if task_type not in CHAIN:
         return None
 

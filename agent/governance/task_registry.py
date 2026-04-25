@@ -61,6 +61,13 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "timed_out", "design_mi
 
 NOTIFICATION_STATUSES = {"none", "pending", "sent", "read"}
 
+# R10: Accepted task types for create_task validation.
+# 'reconcile' added in Phase J. Types starting with 'reconcile_' also accepted.
+VALID_TASK_TYPES = {
+    "task", "pm", "dev", "test", "qa", "gatekeeper", "merge", "deploy",
+    "coordinator", "reconcile",
+}
+
 # Backward compat
 VALID_STATUSES = EXECUTION_STATUSES
 
@@ -137,7 +144,15 @@ def create_task(
     trace_id: str = None,
     chain_id: str = None,
 ) -> dict:
-    """Create a new task. If observer_mode is on, task starts as observer_hold."""
+    """Create a new task. If observer_mode is on, task starts as observer_hold.
+
+    R10: task_type must be in VALID_TASK_TYPES or start with 'reconcile_'.
+    """
+    # R10: validate task type
+    if task_type not in VALID_TASK_TYPES and not task_type.startswith("reconcile_"):
+        log.warning("create_task: unknown task_type '%s' (accepted: %s + reconcile_*)",
+                     task_type, sorted(VALID_TASK_TYPES))
+
     task_id = _new_task_id()
     now = _utc_iso()
 
