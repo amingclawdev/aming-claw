@@ -641,7 +641,7 @@ def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = ""
     import urllib.request
     import urllib.error
 
-    url = "http://localhost:40200/api/manager/redeploy/governance"
+    url = "http://localhost:40101/api/manager/redeploy/governance"
     payload = json.dumps({
         "task_id": task_id,
         "expected_head": expected_head,
@@ -724,6 +724,37 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         # 2. Restart each service (double-write: redeploy + legacy)
         steps: dict[str, Any] = {}
 
+        # R4/PR2: When BOTH governance AND executor are affected, governance
+        # MUST be redeployed FIRST (via manager_http_server on port 40101),
+        # then executor. This ensures governance is healthy before executor
+        # tries to register with it.
+
+        # R7: For governance, POST to /api/manager/redeploy/governance
+        if "governance" in affected:
+            # [redeploy] POST to manager endpoint (PR-1)
+            redeploy_result = _post_manager_redeploy_governance(
+                task_id=task_id,
+                expected_head=expected_head,
+            )
+            log.info("[redeploy] governance: %s", redeploy_result)
+
+            # [legacy] existing restart path
+            ok, summary = rebuild_governance()
+            if not ok:
+                ok2, summary2 = restart_local_governance()
+                if ok2:
+                    ok, summary = ok2, f"docker failed ({summary}), local restart OK: {summary2}"
+                else:
+                    summary = f"docker: {summary} | local: {summary2}"
+            log.info("[legacy] governance: success=%s summary=%s", ok, summary[:200])
+
+            steps["governance"] = {
+                "success": ok,
+                "summary": summary,
+                "redeploy_result": redeploy_result,
+                "legacy_success": ok,
+            }
+
         # R6: For executor, mark task SUCCEEDED with redeploy_pending BEFORE kill
         if "executor" in affected:
             # [redeploy] POST to redeploy endpoint
@@ -761,32 +792,6 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
                 "success": ok,
                 "redeploy_result": redeploy_result,
                 "legacy_skipped": True,
-            }
-
-        # R7: For governance, POST to /api/manager/redeploy/governance
-        if "governance" in affected:
-            # [redeploy] POST to manager endpoint (PR-1)
-            redeploy_result = _post_manager_redeploy_governance(
-                task_id=task_id,
-                expected_head=expected_head,
-            )
-            log.info("[redeploy] governance: %s", redeploy_result)
-
-            # [legacy] existing restart path
-            ok, summary = rebuild_governance()
-            if not ok:
-                ok2, summary2 = restart_local_governance()
-                if ok2:
-                    ok, summary = ok2, f"docker failed ({summary}), local restart OK: {summary2}"
-                else:
-                    summary = f"docker: {summary} | local: {summary2}"
-            log.info("[legacy] governance: success=%s summary=%s", ok, summary[:200])
-
-            steps["governance"] = {
-                "success": ok,
-                "summary": summary,
-                "redeploy_result": redeploy_result,
-                "legacy_success": ok,
             }
 
         if "gateway" in affected:

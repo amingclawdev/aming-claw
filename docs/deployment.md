@@ -32,6 +32,7 @@ export REDIS_URL="redis://localhost:40079"
 ```
 Host Machine (primary runtime)
 ├── Governance Service     :40000   ← Rule engine, API, auto-chain
+├── Manager HTTP Server    :40101   ← Redeploy orchestration (PR1)
 ├── Service Manager                 ← Executor supervisor
 └── Executor Worker                 ← Task execution
 
@@ -114,7 +115,7 @@ Verify with `tasklist /v /fi "imagename eq python.exe" | findstr service_manager
 3. **Auto-restart** — If executor crashes, ServiceManager restarts it
 4. **Circuit breaker** — 5 restarts within 300s triggers OPEN state (stops restart attempts)
 5. **Crash recovery** — On startup, executor requeues orphaned claimed tasks
-6. **Deploy signal** — ServiceManager consumes `manager_signal.json` written by the Merge stage, which is how auto-chain restarts the executor after a deploy
+6. **Deploy signal** — ServiceManager consumes `manager_signal.json` written by the Merge stage (and by the redeploy handler for executor targets), which is how auto-chain restarts the executor after a deploy. The manager_http_server on port 40101 handles governance redeploy requests from `deploy_chain.py`
 
 ### Manual Executor Control
 
@@ -198,6 +199,7 @@ docker compose -f docker-compose.governance.yml logs -f telegram-gateway
 | Service | Port | Depends On | Required? |
 |---------|------|------------|-----------|
 | Governance | 40000 | — | **Yes** (host) |
+| Manager HTTP | 40101 | Governance | **Yes** (host, PR1) |
 | Executor | — | Governance | **Yes** (host) |
 | Redis | 40079 | — | Recommended |
 | Telegram GW | 40010 | Governance, Redis | Optional |
