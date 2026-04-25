@@ -262,13 +262,30 @@ def handle_redeploy(target: str, body: dict) -> tuple[dict, int]:
     Returns:
         (response_dict, http_status_code)
     """
-    # --- Mutual-exclusion guard (R2) ---
+    # --- Mutual-exclusion guard: governance cannot restart itself ---
     if target == "governance":
         return {
             "ok": False,
             "error": "Governance cannot restart itself (mutual-exclusion guard)",
             "step": "guard",
         }, 400
+
+    # --- R2: Mutual-exclusion guard: service_manager cannot be redeployed ---
+    if target == "service_manager":
+        return {
+            "ok": False,
+            "error": "cannot redeploy supervisor — start manually",
+            "step": "guard",
+        }, 400
+
+    # --- R3: gateway and coordinator are stubs (services don't exist yet) ---
+    if target in ("gateway", "coordinator"):
+        return {
+            "ok": True,
+            "stub": True,
+            "todo": "wire when service deployed",
+            "target": target,
+        }, 200
 
     if target not in VALID_TARGETS:
         return {
@@ -292,6 +309,54 @@ def handle_redeploy(target: str, body: dict) -> tuple[dict, int]:
         "handle_redeploy: target=%s task_id=%s expected_head=%s drain_grace=%d",
         target, task_id, expected_head, drain_grace_seconds,
     )
+
+    # --- R1: executor target writes shutdown signal to manager_signal.json ---
+    # Instead of directly killing/spawning the process, we write a signal file
+    # that ServiceManager consumes on its next monitor tick. This is the same
+    # mechanism used by deploy_chain.py:restart_executor (line ~138) via
+    # state/manager_signal.json with action='restart'.
+    if target == "executor":
+        try:
+            _agent_dir = Path(__file__).resolve().parent.parent
+            _tasks_root = _agent_dir / "tasks"
+            state_dir = _tasks_root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            signal_path = state_dir / "manager_signal.json"
+            payload = {
+                "action": "restart",
+                "requested_at": _utc_now(),
+                "task_id": task_id,
+                "expected_head": expected_head,
+            }
+            signal_path.write_text(json.dumps(payload), encoding="utf-8")
+            log.info(
+                "handle_redeploy[executor]: wrote manager_signal.json → %s",
+                signal_path,
+            )
+        except Exception as exc:
+            log.error("handle_redeploy[executor]: failed to write manager_signal.json: %s", exc)
+            return {
+                "ok": False,
+                "error": f"Failed to write manager_signal.json: {exc}",
+                "step": "signal_write",
+                "target": target,
+            }, 500
+
+        # Write chain_version to DB on success
+        db_ok = _db_write_chain_version(expected_head, task_id, target)
+        if not db_ok:
+            log.warning("handle_redeploy[executor]: db_write failed but signal was written")
+
+        return {
+            "ok": True,
+            "target": target,
+            "mechanism": "manager_signal.json",
+            "new_chain_version": expected_head,
+            "updated_at": _utc_now(),
+            "db_write": db_ok,
+        }, 200
+
+    # --- Full 5-step pipeline for remaining targets ---
 
     # --- Step 1: precheck (drain grace + health probe) ---
     old_pid = _find_pid_for_target(target)
