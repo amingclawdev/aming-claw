@@ -771,3 +771,76 @@ Precedent manual fixes registered for audit trail and pattern reference.
 |-------|------|----------|----------------|---------|---------|-------------|
 | MF-2026-04-24-001 | 2026-04-24 | fixing_auto_chain_itself — conn contention | Scope C / High | commit-before-publish | e745691+c6f05be+f740cbb | PM-path conn-contention fix in auto_chain.py: reordered conn.commit() before synchronous _publish_event calls to prevent legacy subscriber 60s busy_timeout stall |
 | MF-2026-04-24-002 | 2026-04-24 | fixing_auto_chain_itself — conn contention | Scope C / High | commit-before-publish | bf3b497 | Dev-path conn-contention fix in auto_chain.py: same commit-before-publish reordering applied to the dev task completion path |
+
+---
+
+# Manual-Fix vs Chain-Spawn Decision Matrix
+
+Per proposal §15.5b, manual-fix is reserved for B48-class meta-circular deadlocks (chain pipeline broken, governance wedge, deploy-selfkill, graph corrupted). Routine reconcile-detected gaps must go through Phase H chain-spawn. This section documents the boundary.
+
+## Decision matrix
+
+| # | Trigger Scenario | Route | Rationale |
+|---|-----------------|-------|-----------|
+| 1 | Missing API doc | **Chain-spawn** | Documentation gap does not block the chain pipeline; PM can generate a PRD and dev can write the doc through normal workflow |
+| 2 | Missing unit test | **Chain-spawn** | Test gaps are routine work items; the chain is fully operational and can handle test creation |
+| 3 | Phase Z found candidate node missing | **Chain-spawn** | Node gaps are detected by reconcile and can be addressed through a standard PM→Dev→Test→QA→Merge chain |
+| 4 | Stale ref / wrong path | **Chain-spawn** | Reference corrections are routine maintenance; reconcile detects them and chain-spawn fixes them |
+| 5 | Chain pipeline itself broken | **Manual-fix** | Meta-circular deadlock: the tool used to fix things is itself broken. Cannot chain-spawn a fix for the chain engine |
+| 6 | Security/sensitive doc | **Manual-fix** | Security-sensitive changes may require immediate intervention outside normal chain timing; observer discretion applies |
+| 7 | Hotfix during incident | **Manual-fix** | Active incident with pipeline down or governance wedged; waiting for full chain would extend the outage |
+
+**Rule of thumb:** If the chain pipeline is operational, use chain-spawn. Manual-fix is only for when the pipeline itself cannot execute.
+
+## Why manual-fix is narrow
+
+A manual-fix bypasses the following governance mechanisms that a normal chain enforces:
+
+1. **PM PRD review** — no structured requirements document is produced
+2. **dev contract** — no target_files / acceptance_criteria scope constraint
+3. **test/qa** — no automated test stage or QA verification pass
+4. **gatekeeper** — no gatekeeper review of changed files against allowed scope
+5. **audit trail** — reduced audit trail (only git commit prefix + optional MF execution record, vs. full chain event history)
+
+Each bypass increases the risk of undetected regressions, scope creep, and governance drift. This is why manual-fix must remain narrow: reserved for scenarios where the chain cannot run at all.
+
+## Manual-fix has only
+
+Unlike a full chain (which produces PM PRD, dev contract, test results, QA pass, gatekeeper approval, and merge audit), a manual-fix provides only:
+
+1. **Git commit prefix**: either `manual fix:` or `[observer-hotfix]` — this is the primary audit signal that identifies a commit as bypassing the normal chain
+2. **Optional MF execution record file**: `docs/dev/manual-fix-current-YYYY-MM-DD[-NNN].md` — a freeform record of the manual fix steps, decisions, and outcomes (per Rule R7)
+
+These two mechanisms are the entire governance surface for a manual-fix. Everything else (scope verification, test coverage, regression detection) depends on the operator's diligence.
+
+## Examples (today's session — 2026-04-25)
+
+### Example A: Chain A fix at 7cf3ca1
+
+- **Scenario:** Chain pipeline broken (auto_chain dispatch silently dropping tasks)
+- **Route:** Manual-fix (correct — pipeline itself was non-functional)
+- **Commit:** 7cf3ca1 with `manual fix:` prefix
+- **Justification:** The chain engine's dispatch mechanism was the component being repaired; spawning a chain to fix the chain would deadlock
+
+### Example B: Observer-hotfixes bf564b5 + cac32c3
+
+- **Scenario:** Observer-detected issues requiring immediate intervention
+- **Route:** Manual-fix via `[observer-hotfix]` prefix
+- **Commits:** bf564b5 and cac32c3
+- **Justification:** Issues discovered during active incident where waiting for full chain execution would have extended the outage window
+
+## Concrete manual-fix authorship steps
+
+When a manual-fix is warranted (per the decision matrix above), follow these 5 steps:
+
+1. **Verify chain-broken** — Confirm the chain pipeline cannot execute. Check: `GET /api/version-check/{pid}` returns errors, `task_create` fails, or auto_chain dispatch is non-functional. Document the evidence
+2. **Make minimal change** — Apply the smallest possible code or documentation change that restores pipeline operation. Do not bundle unrelated improvements
+3. **Commit with prefix** — Use `git commit -m "manual fix: <reason>"` or `git commit -m "[observer-hotfix] <reason>"`. Include affected node list and bypass reason in the commit body
+4. **Write MF execution record** — Create `docs/dev/manual-fix-current-YYYY-MM-DD[-NNN].md` documenting: what broke, what was changed, why chain-spawn was not viable, and post-fix verification results
+5. **Verify state** — Restart governance, run `version_check` (expect `ok=true, dirty=false`), run `preflight_check`, and confirm workflow restore per Phase 5 of this SOP
+
+## Cross-references
+
+- **Proposal §15.5b**: The decision matrix above is derived from `proposal-reconcile-comprehensive-2026-04-25.md` section 15.5b, which defines the manual-fix vs chain-spawn boundary
+- **B48 precedent**: The meta-circular deadlock pattern was first documented in `project_b48_sm_sidecar_import.md` — executor silent-death caused by SM sidecar ImportError, where the fix tooling (executor) was itself the broken component. This B48 precedent established that manual-fix is appropriate when the repair target is the repair tool itself
+- **Phase H chain-spawn**: Routine gaps (missing docs, missing tests, stale refs, missing nodes) detected by reconcile are routed through Phase H chain-spawn, which creates a full PM→Dev→Test→QA→Merge chain for each gap. See reconcile flow documentation for Phase H details
