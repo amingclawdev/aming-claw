@@ -1057,8 +1057,14 @@ class ExecutorWorker:
         """
         self._report_progress(task_id, {"step": "reconciling"})
         try:
-            from agent.governance.reconcile_task import run_full_reconcile
-            from agent.governance.db import get_connection
+            try:
+                from agent.governance.reconcile_task import run_full_reconcile
+                from agent.governance.db import get_connection
+            except ImportError:
+                # When _agent_dir is on sys.path (this module's import setup),
+                # the 'agent.X' import fails; fall back to 'governance.X'.
+                from governance.reconcile_task import run_full_reconcile
+                from governance.db import get_connection
             conn = get_connection(self.project_id)
             try:
                 result = run_full_reconcile(
