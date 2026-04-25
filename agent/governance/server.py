@@ -949,6 +949,34 @@ def handle_reconcile(ctx: RequestContext):
     return result
 
 
+@route("POST", "/api/wf/{project_id}/reconcile-v2")
+def handle_reconcile_v2(ctx: RequestContext):
+    """Reconcile V2: 5-phase comprehensive reconcile pipeline.
+
+    Body: {workspace_path, dry_run?, phases?, auto_fix_threshold?, since?, scan_depth?}
+    """
+    from .reconcile_phases.orchestrator import run_orchestrated
+
+    project_id = ctx.get_project_id()
+    body = ctx.body
+
+    workspace_path = body.get("workspace_path", "")
+    if not workspace_path:
+        from .errors import ValidationError
+        raise ValidationError("workspace_path is required")
+
+    result = run_orchestrated(
+        project_id=project_id,
+        workspace_path=workspace_path,
+        phases=body.get("phases"),
+        dry_run=body.get("dry_run", True),
+        auto_fix_threshold=body.get("auto_fix_threshold", "high"),
+        scan_depth=body.get("scan_depth", 3),
+        since=body.get("since"),
+    )
+    return result
+
+
 @route("POST", "/api/wf/{project_id}/node-create")
 def handle_node_create(ctx: RequestContext):
     """Create a single node. System allocates display_id.
