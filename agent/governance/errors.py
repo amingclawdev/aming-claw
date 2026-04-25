@@ -189,6 +189,33 @@ class RoleUnavailableError(GovernanceError):
         )
 
 
+# --- Baseline errors (Phase I) ---
+
+class BaselineMissingError(GovernanceError):
+    """Required baseline does not exist."""
+
+    def __init__(self, project_id: str, baseline_id: int = None):
+        bid_str = str(baseline_id) if baseline_id is not None else "any"
+        super().__init__(
+            "baseline_missing",
+            f"Baseline {bid_str} not found for project {project_id!r}",
+            404,
+            {"project_id": project_id, "baseline_id": baseline_id},
+        )
+
+
+class BaselineCorruptedError(GovernanceError):
+    """Baseline companion file failed sha256 verification."""
+
+    def __init__(self, project_id: str, baseline_id: int, detail: str = ""):
+        super().__init__(
+            "baseline_corrupted",
+            detail or f"Baseline {baseline_id} for project {project_id!r} is corrupted",
+            500,
+            {"project_id": project_id, "baseline_id": baseline_id},
+        )
+
+
 # --- 500 Internal ---
 
 class InternalError(GovernanceError):

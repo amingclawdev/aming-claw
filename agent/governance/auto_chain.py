@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import traceback
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 from .observability import new_trace_id, structured_log
@@ -4244,7 +4245,70 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
         if closed:
             finalize_result["backlog_bug_id"] = bug_id
 
+    # --- Phase I (R4): async best-effort baseline creation ---
+    import threading
+    def _create_baseline_async():
+        try:
+            from .db import get_connection as _get_conn
+            from . import baseline_service
+            bl_conn = _get_conn(project_id)
+            try:
+                chain_ver = (
+                    metadata.get("chain_version", "")
+                    or result.get("chain_version", "")
+                    or metadata.get("merge_commit", "")
+                )
+                baseline_service.create_baseline(
+                    bl_conn, project_id,
+                    chain_version=chain_ver,
+                    trigger="auto-chain",
+                    triggered_by="auto-chain",
+                    graph_json={},
+                    code_doc_map_json={},
+                    notes=f"Auto-created after deploy task {task_id}",
+                )
+                log.info("_finalize_chain: baseline created for %s", project_id)
+            finally:
+                bl_conn.close()
+        except Exception as exc:
+            log.warning("_finalize_chain: async baseline creation failed: %s", exc)
+            _file_baseline_missing_backlog(project_id, task_id, exc)
+
+    t = threading.Thread(target=_create_baseline_async, daemon=True)
+    t.start()
+    finalize_result["baseline_thread_started"] = True
+
     return finalize_result
+
+
+def _file_baseline_missing_backlog(project_id, task_id, exc):
+    """File OPT-BACKLOG-BASELINE-MISSING-B{n} as P1 backlog row on async failure."""
+    try:
+        from .db import get_connection as _get_conn
+        conn = _get_conn(project_id)
+        try:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Determine next baseline_id that would have been created
+            row = conn.execute(
+                "SELECT COALESCE(MAX(baseline_id), 0) AS max_id FROM version_baselines WHERE project_id = ?",
+                (project_id,)
+            ).fetchone()
+            next_id = (row["max_id"] if row else 0) + 1
+            bug_id = f"OPT-BACKLOG-BASELINE-MISSING-B{next_id}"
+            conn.execute(
+                """INSERT OR IGNORE INTO backlog_bugs
+                   (bug_id, title, status, priority, created_at, updated_at)
+                   VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+                (bug_id,
+                 f"Baseline creation failed after deploy {task_id}: {exc}",
+                 now, now),
+            )
+            conn.commit()
+            log.info("_file_baseline_missing_backlog: filed %s", bug_id)
+        finally:
+            conn.close()
+    except Exception as inner:
+        log.warning("_file_baseline_missing_backlog: could not file backlog: %s", inner)
 
 
 def _finalize_version_sync(conn, project_id, task_id):
