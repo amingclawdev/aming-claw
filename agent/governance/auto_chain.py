@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import traceback
+from pathlib import PurePosixPath
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 from .observability import new_trace_id, structured_log
 from .doc_policy import (
@@ -512,6 +513,224 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
             continue
         final_creates.append(entry)
     creates = final_creates
+
+    # ---- Rule I: Bind unbound test files to best-matching graph node ----
+    # ---- Rule J: Bind unbound src modules or propose new L7 nodes ----
+    # Both rules run after A-H and operate only on files not yet covered.
+    _rule_ij_covered = set(covered_primaries)
+    for c in creates:
+        cprim = c.get("primary", [])
+        if isinstance(cprim, str):
+            cprim = [cprim]
+        _rule_ij_covered.update(p.replace("\\", "/") for p in cprim)
+    # Also mark files touched by Rule D updates
+    _rule_d_updated_nodes = {u.get("node_id") for u in updates}
+
+    # Load graph once for both rules (reuse Rule D's pattern)
+    _ij_graph = None
+    _ij_graph_loaded = False
+    project_id_for_graph = (
+        dev_result.get("project_id", "aming-claw")
+        if isinstance(dev_result, dict) else "aming-claw"
+    )
+
+    def _load_ij_graph():
+        nonlocal _ij_graph, _ij_graph_loaded
+        if _ij_graph_loaded:
+            return _ij_graph
+        _ij_graph_loaded = True
+        try:
+            from . import project_service
+            _ij_graph = project_service.load_project_graph(project_id_for_graph)
+        except Exception:
+            log.debug("Rule I/J: graph load failed", exc_info=True)
+        return _ij_graph
+
+    def _derive_title_from_path(f):
+        """R5: derive title from file path stem."""
+        return PurePosixPath(f).stem.replace("_", " ").title()
+
+    def _fuzzy_score(file_path, node_id, node_data):
+        """R5: fuzzy scoring — same_dir +0.4, stem-match +0.5, title keyword +0.2."""
+        score = 0.0
+        f_norm = file_path.replace("\\", "/")
+        f_dir = str(PurePosixPath(f_norm).parent)
+        f_stem = PurePosixPath(f_norm).stem.lower()
+        # Remove test_ prefix for test files
+        if f_stem.startswith("test_"):
+            f_stem = f_stem[5:]
+
+        node_primaries = node_data.get("primary", [])
+        if isinstance(node_primaries, str):
+            node_primaries = [node_primaries]
+
+        # Title keyword match (applies to every candidate)
+        node_title = (node_data.get("title") or "").lower()
+        title_bonus = 0.2 if (f_stem and f_stem in node_title) else 0.0
+
+        for np in node_primaries:
+            np_norm = np.replace("\\", "/")
+            np_dir = str(PurePosixPath(np_norm).parent)
+            np_stem = PurePosixPath(np_norm).stem.lower()
+
+            candidate = 0.0
+            # same_dir: exact match or parent-child relationship
+            if f_dir == np_dir or f_dir.startswith(np_dir + "/") or np_dir.startswith(f_dir + "/"):
+                candidate += 0.4
+            if f_stem == np_stem:
+                candidate += 0.5
+            candidate += title_bonus
+            score = max(score, candidate)
+
+        # If no primaries matched but title matched, still give title bonus
+        if not node_primaries and title_bonus:
+            score = max(score, title_bonus)
+
+        return score
+
+    def _allocate_next_id(graph):
+        """R5: scan graph for max L7.N + 1."""
+        max_n = 0
+        for nid in graph.list_nodes():
+            m = re.match(r"^L7\.(\d+)$", nid)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return "L7.%d" % (max_n + 1)
+
+    # -- Rule I: test files --
+    _test_file_re = re.compile(r"^agent/tests/test_.*\.py$")
+    unbound_tests = [
+        f for f in changed_set
+        if _test_file_re.match(f) and f not in _rule_ij_covered
+    ]
+    if unbound_tests:
+        graph = _load_ij_graph()
+        if graph:
+            for tf in unbound_tests:
+                best_node = None
+                best_score = 0.0
+                for nid in graph.list_nodes():
+                    if nid in _rule_d_updated_nodes:
+                        # Already handled — but we still want to bind test
+                        pass
+                    try:
+                        nd = graph.get_node(nid)
+                    except Exception:
+                        continue
+                    sc = _fuzzy_score(tf, nid, nd)
+                    if sc > best_score:
+                        best_score = sc
+                        best_node = nid
+                if best_score >= 0.85 and best_node is not None:
+                    # Check if this node already has an update entry
+                    existing_update = None
+                    for u in updates:
+                        if u.get("node_id") == best_node:
+                            existing_update = u
+                            break
+                    if existing_update:
+                        existing_test = existing_update["fields"].get("test", [])
+                        if isinstance(existing_test, str):
+                            existing_test = [existing_test]
+                        if tf not in existing_test:
+                            existing_test.append(tf)
+                        existing_update["fields"]["test"] = existing_test
+                    else:
+                        updates.append({
+                            "node_id": best_node,
+                            "fields": {"test": [tf]},
+                        })
+                    rule_hits.append({"rule": "I", "test_file": tf,
+                                      "bound_to": best_node,
+                                      "score": best_score})
+                else:
+                    log.warning("Rule I: no fuzzy match (score=%.2f) for test file %s",
+                                best_score, tf)
+        if "test_file_binding" not in inferred_from:
+            inferred_from.append("test_file_binding")
+
+    # -- Rule J: src modules --
+    _src_module_re = re.compile(r"^agent/.*\.py$")
+    unbound_src = [
+        f for f in changed_set
+        if _src_module_re.match(f)
+        and not f.startswith("agent/tests/")
+        and f not in _rule_ij_covered
+        # Also skip files already touched by Rule D
+    ]
+    # Filter out files already in Rule D updates' primary
+    if unbound_src:
+        graph = _load_ij_graph()
+        if graph:
+            # Build set of primaries already handled by Rule D
+            rule_d_primaries = set()
+            for nid in _rule_d_updated_nodes:
+                try:
+                    nd = graph.get_node(nid)
+                    np = nd.get("primary", [])
+                    if isinstance(np, str):
+                        np = [np]
+                    rule_d_primaries.update(p.replace("\\", "/") for p in np)
+                except Exception:
+                    pass
+            unbound_src = [f for f in unbound_src if f not in rule_d_primaries]
+
+    if unbound_src:
+        graph = _load_ij_graph()
+        if graph:
+            for sf in unbound_src:
+                best_node = None
+                best_score = 0.0
+                for nid in graph.list_nodes():
+                    try:
+                        nd = graph.get_node(nid)
+                    except Exception:
+                        continue
+                    sc = _fuzzy_score(sf, nid, nd)
+                    if sc > best_score:
+                        best_score = sc
+                        best_node = nid
+                if best_score >= 0.9 and best_node is not None:
+                    # Bind to existing node's secondary
+                    existing_update = None
+                    for u in updates:
+                        if u.get("node_id") == best_node:
+                            existing_update = u
+                            break
+                    if existing_update:
+                        existing_sec = existing_update["fields"].get("secondary", [])
+                        if isinstance(existing_sec, str):
+                            existing_sec = [existing_sec]
+                        if sf not in existing_sec:
+                            existing_sec.append(sf)
+                        existing_update["fields"]["secondary"] = existing_sec
+                    else:
+                        updates.append({
+                            "node_id": best_node,
+                            "fields": {"secondary": [sf]},
+                        })
+                    rule_hits.append({"rule": "J", "src_file": sf,
+                                      "bound_to": best_node,
+                                      "score": best_score,
+                                      "action": "secondary_bind"})
+                else:
+                    # Propose new L7 node
+                    new_id = _allocate_next_id(graph)
+                    title = _derive_title_from_path(sf)
+                    creates.append({
+                        "node_id": new_id,
+                        "title": title,
+                        "parent_layer": "L7",
+                        "primary": [sf],
+                        "deps": [],
+                        "description": "Auto-inferred new module",
+                        "created_by": "autochain-new-file-binding",
+                    })
+                    rule_hits.append({"rule": "J", "src_file": sf,
+                                      "new_node_id": new_id,
+                                      "action": "new_l7_node"})
+            if "src_module_binding" not in inferred_from:
+                inferred_from.append("src_module_binding")
 
     delta = {"creates": creates, "updates": updates, "links": links}
     return delta, rule_hits, inferred_from, source
