@@ -743,21 +743,34 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
             )
             log.info("[redeploy] governance: %s", redeploy_result)
 
-            # [legacy] existing restart path
-            ok, summary = rebuild_governance()
-            if not ok:
-                ok2, summary2 = restart_local_governance()
-                if ok2:
-                    ok, summary = ok2, f"docker failed ({summary}), local restart OK: {summary2}"
-                else:
-                    summary = f"docker: {summary} | local: {summary2}"
-            log.info("[legacy] governance: success=%s summary=%s", ok, summary[:200])
+            # observer-hotfix 2: SKIP legacy when [redeploy] succeeds.
+            # PR1+PR2 designed [redeploy] to REPLACE the legacy path, but the
+            # original code unconditionally called rebuild_governance() →
+            # restart_local_governance() which has the ModuleNotFoundError bug
+            # ('No module named agent') and kills gov regardless. This mirrors
+            # the executor branch's B48-sequel pattern (line 794) where legacy
+            # is skipped when redeploy succeeds.
+            if redeploy_result.get("ok"):
+                ok = True
+                summary = "redeploy via manager_http_server succeeded; legacy skipped"
+                log.info("[legacy] governance: SKIPPED (observer-hotfix-2); manager redeploy ok=true")
+            else:
+                # [legacy] only fall back when [redeploy] failed
+                ok, summary = rebuild_governance()
+                if not ok:
+                    ok2, summary2 = restart_local_governance()
+                    if ok2:
+                        ok, summary = ok2, f"docker failed ({summary}), local restart OK: {summary2}"
+                    else:
+                        summary = f"docker: {summary} | local: {summary2}"
+                log.info("[legacy] governance: success=%s summary=%s", ok, summary[:200])
 
             steps["governance"] = {
                 "success": ok,
                 "summary": summary,
                 "redeploy_result": redeploy_result,
                 "legacy_success": ok,
+                "legacy_skipped": redeploy_result.get("ok", False),
             }
 
         # R6: For executor, mark task SUCCEEDED with redeploy_pending BEFORE kill
