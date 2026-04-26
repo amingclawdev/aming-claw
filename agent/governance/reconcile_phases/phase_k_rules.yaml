@@ -11,3 +11,6 @@ service_name_aliases: {}
 # Endpoint path normalization rules
 # e.g. /api/v1/: /api/
 endpoint_path_normalize: {}
+
+# Ports to skip in doc localhost:PORT scanning — frontend examples, third-party services
+excluded_doc_ports: [3000]
