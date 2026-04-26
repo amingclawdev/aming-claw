@@ -1,18 +1,24 @@
-"""Phase K — Contract-Test-Coverage Invariant (DRY-RUN).
+"""Phase K — Contract-Test-Coverage Invariant.
 
 AST-extracts 4 contract types from scoped .py files, then emits:
   - contract_no_test: endpoint/service-port with no test coverage
   - doc_value_drift: doc value (port, path) mismatches code value
 
-DRY-RUN only in this PR — suggested_action is set but no spawn.
+Autospawn: spawn_phase_k_discrepancies() groups discrepancies and spawns
+PM tasks via /api/task/{pid}/create, deduplicating via fingerprint in
+phase_k_processed_contracts table.
 """
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import os
 import re
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
@@ -531,6 +537,308 @@ def find_endpoint_occurrence(content: str, method: str, path: str):
         port_match = re.search(r"localhost:(\d+)", nearby)
         port = int(port_match.group(1)) if port_match else None
         yield type("Occurrence", (), {"line_no": line_no, "port_in_curl_example": port})()
+
+
+# ---------------------------------------------------------------------------
+# Autospawn constants
+# ---------------------------------------------------------------------------
+MAX_SPAWN_PER_RUN_DEFAULT = 3
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint (R5)
+# ---------------------------------------------------------------------------
+
+def _compute_contract_fingerprint(
+    project_id: str,
+    contract_kind: str,
+    contract_id: str,
+    discrepancy_type: str,
+    target: str,
+) -> str:
+    """sha256(project_id, contract_kind, contract_id, discrepancy_type, target_doc_or_test)."""
+    payload = "|".join([project_id, contract_kind, contract_id, discrepancy_type, target])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# DB helpers for phase_k_processed_contracts
+# ---------------------------------------------------------------------------
+
+def _get_existing_k_status(conn, fingerprint: str) -> Optional[str]:
+    """Get spawn_status for existing fingerprint, or None if not found."""
+    row = conn.execute(
+        "SELECT spawn_status FROM phase_k_processed_contracts WHERE fingerprint = ?",
+        (fingerprint,),
+    ).fetchone()
+    return row["spawn_status"] if row else None
+
+
+def _upsert_k_fingerprint(
+    conn,
+    fingerprint: str,
+    contract_kind: str,
+    contract_id: str,
+    discrepancy_type: str,
+    target_doc: str,
+    target_test: str,
+    status: str,
+    spawned_task_id: str = "",
+) -> None:
+    """Insert or update a processed contract fingerprint."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        """INSERT INTO phase_k_processed_contracts
+           (fingerprint, contract_kind, contract_id, discrepancy_type,
+            target_doc, target_test, spawned_task_id, spawn_status,
+            last_chain_event, updated_at, processed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+           ON CONFLICT(fingerprint) DO UPDATE SET
+             spawn_status = excluded.spawn_status,
+             spawned_task_id = excluded.spawned_task_id,
+             updated_at = excluded.updated_at""",
+        (fingerprint, contract_kind, contract_id, discrepancy_type,
+         target_doc, target_test, spawned_task_id, status, now, now),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PM task spawning (R7)
+# ---------------------------------------------------------------------------
+
+def _spawn_pm_task_k(
+    project_id: str,
+    discrepancy_type: str,
+    target: str,
+    fingerprints: List[str],
+    discrepancies: List["PhaseKDiscrepancy"],
+    scope_origin: str,
+    bug_id: str,
+    api_base: str = "",
+) -> str:
+    """POST to /api/task/{pid}/create to spawn a PM task for Phase K discrepancies.
+
+    Returns the task_id of the spawned task, or raises on failure.
+    """
+    import urllib.request
+
+    base = api_base or os.environ.get("GOVERNANCE_API_BASE", "http://localhost:40000")
+    url = "{base}/api/task/{pid}/create".format(base=base, pid=project_id)
+
+    detail_lines = "\n".join(
+        "- {detail}".format(detail=d.detail or str(d)) for d in discrepancies
+    )
+
+    if discrepancy_type == "doc_value_drift":
+        prompt = (
+            "Fix doc value drift in {target}:\n{detail_lines}\n\n"
+            "Detected by Phase K contract-test-coverage invariant."
+        ).format(target=target, detail_lines=detail_lines)
+    else:
+        prompt = (
+            "Write tests for uncovered contracts (expected at {target}):\n{detail_lines}\n\n"
+            "Detected by Phase K contract-test-coverage invariant."
+        ).format(target=target, detail_lines=detail_lines)
+
+    payload = {
+        "type": "pm",
+        "prompt": prompt,
+        "metadata": {
+            "bug_id": bug_id,
+            "operator_id": "phase-k-autospawn",
+            "source_phase": "K",
+            "fingerprints": fingerprints,
+            "scope_origin": scope_origin,
+            "discrepancy_type": discrepancy_type,
+            "target": target,
+        },
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                headers={"Content-Type": "application/json"})
+    resp = urllib.request.urlopen(req, timeout=15)
+    body = json.loads(resp.read().decode("utf-8"))
+    return body.get("task_id", "")
+
+
+# ---------------------------------------------------------------------------
+# Autospawn entry point (R1, R4, R6, R8)
+# ---------------------------------------------------------------------------
+
+def spawn_phase_k_discrepancies(
+    ctx,
+    scope,
+    discrepancies: List["PhaseKDiscrepancy"],
+    dry_run: bool = False,
+    max_spawn_per_run: int = MAX_SPAWN_PER_RUN_DEFAULT,
+) -> dict:
+    """Group discrepancies, deduplicate, and spawn PM tasks.
+
+    R4: dry_run=True returns immediately with spawned=0, no DB writes.
+    R6: max_spawn_per_run applies per discrepancy_type.
+    R8: contract_no_test and doc_value_drift processed independently.
+    """
+    if dry_run:
+        return {
+            "dry_run": True,
+            "spawned": 0,
+            "spawned_doc_fix": [],
+            "spawned_test_write": [],
+            "skipped_throttled": [],
+        }
+
+    project_id = getattr(ctx, "project_id", "")
+    conn = getattr(ctx, "conn", None)
+    api_base = getattr(ctx, "api_base", "")
+    scope_origin = ""
+    if scope is not None:
+        scope_origin = getattr(scope, "bug_id", "") or getattr(scope, "origin", "") or ""
+
+    result = {
+        "dry_run": False,
+        "spawned": 0,
+        "spawned_doc_fix": [],
+        "spawned_test_write": [],
+        "skipped_throttled": [],
+    }
+
+    if not discrepancies or conn is None:
+        return result
+
+    # Separate by type
+    doc_drift = [d for d in discrepancies if d.type == "doc_value_drift"]
+    no_test = [d for d in discrepancies if d.type == "contract_no_test"]
+
+    # --- Process doc_value_drift (group by target_doc) ---
+    _process_group(
+        conn=conn,
+        project_id=project_id,
+        discrepancy_type="doc_value_drift",
+        items=doc_drift,
+        group_key_fn=lambda d: d.doc or "",
+        target_doc_fn=lambda d: d.doc or "",
+        target_test_fn=lambda d: "",
+        max_spawn=max_spawn_per_run,
+        result=result,
+        result_key="spawned_doc_fix",
+        api_base=api_base,
+        scope_origin=scope_origin,
+    )
+
+    # --- Process contract_no_test (group by target_test) ---
+    _process_group(
+        conn=conn,
+        project_id=project_id,
+        discrepancy_type="contract_no_test",
+        items=no_test,
+        group_key_fn=lambda d: d.expected_test_location or "",
+        target_doc_fn=lambda d: "",
+        target_test_fn=lambda d: d.expected_test_location or "",
+        max_spawn=max_spawn_per_run,
+        result=result,
+        result_key="spawned_test_write",
+        api_base=api_base,
+        scope_origin=scope_origin,
+    )
+
+    conn.commit()
+    return result
+
+
+def _process_group(
+    conn,
+    project_id: str,
+    discrepancy_type: str,
+    items: List["PhaseKDiscrepancy"],
+    group_key_fn,
+    target_doc_fn,
+    target_test_fn,
+    max_spawn: int,
+    result: dict,
+    result_key: str,
+    api_base: str,
+    scope_origin: str,
+):
+    """Process one discrepancy type: group, dedup, spawn, rate-limit."""
+    if not items:
+        return
+
+    # Group by key
+    groups = defaultdict(list)
+    for d in items:
+        groups[group_key_fn(d)].append(d)
+
+    spawned_count = 0
+
+    for target, discs in groups.items():
+        # Compute fingerprints for each discrepancy
+        fps = []
+        new_discs = []
+        for d in discs:
+            fp = _compute_contract_fingerprint(
+                project_id,
+                d.contract_kind,
+                d.contract_id,
+                discrepancy_type,
+                target,
+            )
+            existing = _get_existing_k_status(conn, fp)
+            if existing in ("running", "merged", "waived"):
+                continue  # already processed
+            fps.append(fp)
+            new_discs.append((d, fp))
+
+        if not new_discs:
+            continue  # all already processed
+
+        # Rate limit
+        if spawned_count >= max_spawn:
+            for d, fp in new_discs:
+                _upsert_k_fingerprint(
+                    conn, fp, d.contract_kind, d.contract_id,
+                    discrepancy_type, target_doc_fn(d), target_test_fn(d),
+                    "skipped_throttled",
+                )
+            result["skipped_throttled"].extend([fp for _, fp in new_discs])
+            continue
+
+        # Spawn PM task
+        bug_id = "OPT-BACKLOG-PHASE-K-{dtype}-{target}".format(
+            dtype=discrepancy_type.upper().replace("_", "-"),
+            target=target.replace("/", "-").replace(".", "-"),
+        )
+        try:
+            task_id = _spawn_pm_task_k(
+                project_id,
+                discrepancy_type,
+                target,
+                [fp for _, fp in new_discs],
+                [d for d, _ in new_discs],
+                scope_origin,
+                bug_id,
+                api_base,
+            )
+            for d, fp in new_discs:
+                _upsert_k_fingerprint(
+                    conn, fp, d.contract_kind, d.contract_id,
+                    discrepancy_type, target_doc_fn(d), target_test_fn(d),
+                    "running", task_id,
+                )
+            result[result_key].append(task_id)
+            result["spawned"] += 1
+            spawned_count += 1
+            log.info("phase_k autospawn: spawned PM task %s for %s target=%s (%d items)",
+                     task_id, discrepancy_type, target, len(new_discs))
+        except Exception as exc:
+            log.warning("phase_k autospawn: spawn failed for %s target=%s: %s",
+                        discrepancy_type, target, exc)
+            for d, fp in new_discs:
+                _upsert_k_fingerprint(
+                    conn, fp, d.contract_kind, d.contract_id,
+                    discrepancy_type, target_doc_fn(d), target_test_fn(d),
+                    "failed",
+                )
 
 
 # ---------------------------------------------------------------------------

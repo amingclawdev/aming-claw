@@ -698,11 +698,39 @@ def handle_apply(conn, project_id, task_id, metadata, prev_result):
         # R7: Trigger Phase I baseline write on success
         _trigger_baseline_write(conn, project_id, task_id)
 
+        # --- Phase K autospawn integration (PR4) ---
+        phase_k_result = None
+        if metadata.get("enable_phase_k_autospawn", True):
+            try:
+                from .reconcile_phases.phase_k import spawn_phase_k_discrepancies
+                k_discrepancies = metadata.get("phase_k_discrepancies")
+                if k_discrepancies:
+                    class _PhaseKCtx:
+                        """Minimal context for Phase K autospawn."""
+                        pass
+                    k_ctx = _PhaseKCtx()
+                    k_ctx.project_id = project_id
+                    k_ctx.conn = conn
+                    k_ctx.api_base = metadata.get("api_base", "")
+                    k_scope = metadata.get("scope")
+                    phase_k_result = spawn_phase_k_discrepancies(
+                        k_ctx, k_scope, k_discrepancies,
+                        dry_run=metadata.get("phase_k_dry_run", False),
+                        max_spawn_per_run=metadata.get("phase_k_max_spawn", 3),
+                    )
+                    log.info("reconcile apply: Phase K autospawn — spawned=%d",
+                             phase_k_result.get("spawned", 0))
+            except ImportError:
+                log.debug("reconcile apply: Phase K autospawn not available")
+            except Exception as e:
+                log.warning("reconcile apply: Phase K autospawn failed (non-blocking): %s", e)
+
         return {
             "stage": "apply",
             "applied_count": applied,
             "txn_id": txn_id,
             "txn_status": "committed",
+            "phase_k_autospawn": phase_k_result,
         }
 
     except ReconcileCancelled:
