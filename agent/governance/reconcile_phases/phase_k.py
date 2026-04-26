@@ -16,6 +16,7 @@ import json
 import os
 import re
 import logging
+import yaml
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,6 +28,34 @@ if TYPE_CHECKING:
     from .scope import ResolvedScope
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Phase K rules loader (excluded_doc_ports etc.)
+# ---------------------------------------------------------------------------
+
+_PHASE_K_RULES: Optional[Dict[str, Any]] = None
+
+
+def _load_phase_k_rules() -> Dict[str, Any]:
+    """Load phase_k_rules.yaml and cache in module global."""
+    global _PHASE_K_RULES
+    if _PHASE_K_RULES is not None:
+        return _PHASE_K_RULES
+    rules_path = os.path.join(os.path.dirname(__file__), "phase_k_rules.yaml")
+    try:
+        with open(rules_path, "r", encoding="utf-8") as fh:
+            _PHASE_K_RULES = yaml.safe_load(fh) or {}
+    except Exception:
+        log.warning("Failed to load phase_k_rules.yaml, using defaults")
+        _PHASE_K_RULES = {}
+    return _PHASE_K_RULES
+
+
+def _excluded_doc_ports() -> List[int]:
+    """Return the list of ports to skip in doc localhost:PORT scanning."""
+    rules = _load_phase_k_rules()
+    return rules.get("excluded_doc_ports", [])
+
 
 # ---------------------------------------------------------------------------
 # Contract dataclasses (§6.0 verbatim)
@@ -979,6 +1008,9 @@ def run(ctx: "ReconcileContext", *, scope: Optional["ResolvedScope"] = None) -> 
             continue
         for m in re.finditer(r"localhost:(\d+)", doc_content):
             doc_port = int(m.group(1))
+            # Skip excluded doc ports (frontend examples, third-party services)
+            if doc_port in _excluded_doc_ports():
+                continue
             # Skip if port matches any known contract exactly
             if any(sp.port == doc_port for sp in service_ports):
                 continue
