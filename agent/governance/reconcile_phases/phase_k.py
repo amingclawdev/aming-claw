@@ -177,7 +177,12 @@ def _const_value(node: ast.expr):
 
 
 def extract_service_ports(source_file: str, workspace: str = "") -> List[ServicePortContract]:
-    """Find *PORT or *HOST module-level assigns; infer service_name from filename."""
+    """Find *PORT or *HOST via module-level Assign OR os.environ.setdefault calls.
+
+    R1: Detects os.environ.setdefault('NAME', 'VALUE') where NAME matches
+        ^[A-Z_]*(PORT|HOST)$ and VALUE is a numeric string or int.
+    R4: Existing top-level Assign extraction (PORT = 40101) continues unchanged.
+    """
     src = _read_file(source_file, workspace)
     if not src:
         return []
@@ -187,6 +192,9 @@ def extract_service_ports(source_file: str, workspace: str = "") -> List[Service
         return []
     service_name = _infer_service_name(source_file)
     results: List[ServicePortContract] = []
+    seen_names: Set[str] = set()
+
+    # Path 1: top-level Assign (existing, R4 regression safety)
     for node in ast.iter_child_nodes(tree):
         if not isinstance(node, ast.Assign):
             continue
@@ -198,6 +206,7 @@ def extract_service_ports(source_file: str, workspace: str = "") -> List[Service
                 continue
             val = _const_value(node.value)
             if isinstance(val, int):
+                seen_names.add(name)
                 results.append(ServicePortContract(
                     service_name=service_name,
                     port=val,
@@ -205,7 +214,53 @@ def extract_service_ports(source_file: str, workspace: str = "") -> List[Service
                     source_file=source_file,
                     source_line=node.lineno,
                 ))
+
+    # Path 2: os.environ.setdefault('NAME', 'VALUE') calls (R1)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not _is_environ_setdefault(node):
+            continue
+        if len(node.args) < 2:
+            continue
+        env_name = _const_value(node.args[0])
+        env_val = _const_value(node.args[1])
+        if not isinstance(env_name, str):
+            continue
+        if not re.match(r"^[A-Z_]*(PORT|HOST)$", env_name):
+            continue
+        # Already found via Assign — skip duplicate
+        if env_name in seen_names:
+            continue
+        # Value can be int directly or numeric string
+        port = None
+        if isinstance(env_val, int):
+            port = env_val
+        elif isinstance(env_val, str) and env_val.isdigit():
+            port = int(env_val)
+        if port is not None:
+            seen_names.add(env_name)
+            results.append(ServicePortContract(
+                service_name=service_name,
+                port=port,
+                constant_name=env_name,
+                source_file=source_file,
+                source_line=node.lineno,
+            ))
+
     return results
+
+
+def _is_environ_setdefault(node: ast.Call) -> bool:
+    """Check if node is os.environ.setdefault(...)."""
+    func = node.func
+    # os.environ.setdefault(...)
+    if isinstance(func, ast.Attribute) and func.attr == "setdefault":
+        val = func.value
+        if isinstance(val, ast.Attribute) and val.attr == "environ":
+            if isinstance(val.value, ast.Name) and val.value.id == "os":
+                return True
+    return False
 
 
 def _infer_service_name(source_file: str) -> str:
@@ -324,6 +379,77 @@ def context_mentions_service(
     return False
 
 
+def score_service_port_match(
+    sp: ServicePortContract,
+    doc_content: str,
+    port_offset: int,
+    endpoints: Optional[List[EndpointContract]] = None,
+) -> float:
+    """Score how well a ServicePortContract matches a localhost:NNNN occurrence.
+
+    R3 scoring factors:
+      +3.0  constant_name within ±10 lines
+      +2.0  handler_qname (from endpoints sharing source_file) within ±5 lines
+      +1.0  service_name within ±5 lines
+      +0.5  source_file path-fragment in same paragraph
+    R6: Factored out for attribution scoring.
+    """
+    lines = doc_content.splitlines()
+    line_no = doc_content[:port_offset].count("\n")
+    score = 0.0
+
+    # +3 constant_name within ±10 lines
+    start10 = max(0, line_no - 10)
+    end10 = min(len(lines), line_no + 11)
+    snippet10 = "\n".join(lines[start10:end10]).lower()
+    if sp.constant_name.lower() in snippet10:
+        score += 3.0
+
+    # +2 handler_qname within ±5 lines
+    start5 = max(0, line_no - 5)
+    end5 = min(len(lines), line_no + 6)
+    snippet5 = "\n".join(lines[start5:end5]).lower()
+    if endpoints:
+        for ep in endpoints:
+            if ep.source_file == sp.source_file:
+                if ep.handler_qname.lower() in snippet5:
+                    score += 2.0
+                    break
+
+    # +1 service_name within ±5 lines (exact match gets full score,
+    # partial word-fragment match gets half to avoid false positives
+    # like "server" matching for both "governance" and "manager_http_server")
+    sn = sp.service_name.lower()
+    if sn in snippet5:
+        score += 1.0
+    else:
+        # Check underscore parts, but only unique long parts (>4 chars)
+        parts = sn.split("_")
+        long_parts = [p for p in parts if len(p) > 4]
+        if long_parts and any(p in snippet5 for p in long_parts):
+            score += 0.5
+
+    # +0.5 source_file path-fragment in same paragraph
+    # Find paragraph boundaries (blank lines)
+    para_start = line_no
+    while para_start > 0 and lines[para_start - 1].strip():
+        para_start -= 1
+    para_end = line_no
+    while para_end < len(lines) - 1 and lines[para_end + 1].strip():
+        para_end += 1
+    paragraph = "\n".join(lines[para_start:para_end + 1]).lower()
+    # Check source_file stem (exact stem match: +0.5, partial: +0.25)
+    sf_stem = PurePosixPath(sp.source_file).stem.lower()
+    if sf_stem in paragraph:
+        score += 0.5
+    else:
+        sf_parts = [p for p in sf_stem.split("_") if len(p) > 4]
+        if sf_parts and any(p in paragraph for p in sf_parts):
+            score += 0.25
+
+    return score
+
+
 def find_endpoint_occurrence(content: str, method: str, path: str):
     """Find method+path mentions in doc content. Yield (line_no, port_in_curl)."""
     # Escape path for regex, allow placeholder params like {target}
@@ -425,30 +551,47 @@ def run(ctx: "ReconcileContext", *, scope: Optional["ResolvedScope"] = None) -> 
                         ))
 
     # 3b: ServicePort drift (localhost:PORT near service context in docs)
-    for sp in service_ports:
-        for doc in doc_files:
-            doc_content = _read_file(doc, workspace)
-            if not doc_content:
+    # R2: Score ALL known ServicePortContracts for each localhost:NNNN,
+    # select the best-scoring candidate rather than greedily matching first.
+    for doc in doc_files:
+        doc_content = _read_file(doc, workspace)
+        if not doc_content:
+            continue
+        for m in re.finditer(r"localhost:(\d+)", doc_content):
+            doc_port = int(m.group(1))
+            # Skip if port matches any known contract exactly
+            if any(sp.port == doc_port for sp in service_ports):
                 continue
-            for m in re.finditer(r"localhost:(\d+)", doc_content):
-                doc_port = int(m.group(1))
-                if doc_port == sp.port:
-                    continue
-                mentions = context_mentions_service(doc_content, m.start(), sp.service_name)
-                if mentions:
-                    results.append(PhaseKDiscrepancy(
-                        type="doc_value_drift",
-                        contract_kind="ServicePortContract",
-                        contract_id=sp.constant_name,
-                        doc=doc,
-                        doc_line=_line_of(doc_content, m.start()),
-                        doc_value=doc_port,
-                        code_value=sp.port,
-                        drift_role="service_port",
-                        confidence="high",
-                        priority="P1",
-                        suggested_action="spawn_pm_fix_doc",
-                        detail=f"Doc {doc}: localhost:{doc_port} near '{sp.service_name}' but code has {sp.port}",
-                    ))
+            # Score each service port candidate
+            candidates = []  # type: List[tuple]
+            for sp in service_ports:
+                sc = score_service_port_match(sp, doc_content, m.start(), endpoints)
+                if sc > 0:
+                    candidates.append((sc, sp))
+            if not candidates:
+                continue
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_sp = candidates[0]
+            # R3: ties → medium confidence; score<1 with multiple → ambiguous
+            if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+                confidence = "medium"
+            elif best_score < 1 and len(candidates) > 1:
+                confidence = "ambiguous attribution"
+            else:
+                confidence = "high"
+            results.append(PhaseKDiscrepancy(
+                type="doc_value_drift",
+                contract_kind="ServicePortContract",
+                contract_id=best_sp.constant_name,
+                doc=doc,
+                doc_line=_line_of(doc_content, m.start()),
+                doc_value=doc_port,
+                code_value=best_sp.port,
+                drift_role="service_port",
+                confidence=confidence,
+                priority="P1",
+                suggested_action="spawn_pm_fix_doc",
+                detail=f"Doc {doc}: localhost:{doc_port} attributed to '{best_sp.constant_name}' (score={best_score:.1f}) but code has {best_sp.port}",
+            ))
 
     return results
