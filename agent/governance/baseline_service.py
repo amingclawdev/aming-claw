@@ -118,11 +118,14 @@ def create_baseline(conn: sqlite3.Connection, project_id: str,
                     chain_version: str, trigger: str, triggered_by: str,
                     graph_json: dict = None, code_doc_map_json: dict = None,
                     node_state_snap: str = "", chain_event_max: int = 0,
-                    notes: str = "", reconstructed: int = 0) -> dict:
+                    notes: str = "", reconstructed: int = 0,
+                    scope_kind: str = None, scope_value: str = None,
+                    parent_baseline_id: int = None) -> dict:
     """Create a new baseline row + companion files.
 
     R7: trigger allowlist enforcement.
     R8: append-only — only INSERT, never UPDATE/DELETE.
+    R3: Optional scope_kind, scope_value, parent_baseline_id for slice baselines.
     """
     if triggered_by not in TRIGGER_ALLOWLIST:
         raise ValueError(
@@ -147,15 +150,22 @@ def create_baseline(conn: sqlite3.Connection, project_id: str,
     graph_sha = shas["graph_sha"]
     code_doc_map_sha = shas["code_doc_map_sha"]
 
+    # Build scope_id from kind+value if provided
+    scope_id = f"{scope_kind}:{scope_value}" if scope_kind and scope_value else None
+
     conn.execute(
         """INSERT INTO version_baselines
            (project_id, baseline_id, chain_version, graph_sha, code_doc_map_sha,
             node_state_snap, chain_event_max, trigger, triggered_by,
-            reconstructed, created_at, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            reconstructed, created_at, notes,
+            scope_id, parent_baseline_id, scope_kind, scope_value,
+            merged_into, merge_status, merge_evidence_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (project_id, next_id, chain_version, graph_sha, code_doc_map_sha,
          node_state_snap, chain_event_max, trigger, triggered_by,
-         reconstructed, now, notes),
+         reconstructed, now, notes,
+         scope_id, parent_baseline_id, scope_kind, scope_value,
+         None, None, None),
     )
     conn.commit()
 
@@ -169,6 +179,9 @@ def create_baseline(conn: sqlite3.Connection, project_id: str,
         "triggered_by": triggered_by,
         "reconstructed": reconstructed,
         "created_at": now,
+        "scope_kind": scope_kind,
+        "scope_value": scope_value,
+        "parent_baseline_id": parent_baseline_id,
     }
 
 
@@ -373,3 +386,276 @@ def _file_baseline_missing_alert(conn: sqlite3.Connection, project_id: str,
         conn.commit()
     except Exception as exc:
         log.warning("baseline_service: failed to file backlog alert %s: %s", bug_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# R4: Batch-insert mutation rows
+# ---------------------------------------------------------------------------
+
+def record_baseline_mutations(conn: sqlite3.Connection, project_id: str,
+                              baseline_id: int, mutations: list) -> int:
+    """Batch-insert mutation rows for a slice baseline.
+
+    Each mutation dict should contain: mutation_id, mutation_type,
+    affected_file, affected_node, before_sha256, after_sha256.
+    Returns the number of rows inserted.
+    """
+    inserted = 0
+    for m in mutations:
+        conn.execute(
+            """INSERT INTO baseline_mutations
+               (project_id, baseline_id, mutation_id, mutation_type,
+                affected_file, affected_node, before_sha256, after_sha256)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (project_id, baseline_id,
+             m["mutation_id"], m.get("mutation_type", ""),
+             m.get("affected_file", ""), m.get("affected_node", ""),
+             m.get("before_sha256", ""), m.get("after_sha256", "")),
+        )
+        inserted += 1
+    conn.commit()
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# R6: Compute post-state for a baseline
+# ---------------------------------------------------------------------------
+
+def compute_post_state(conn: sqlite3.Connection, project_id: str,
+                       baseline_id: int) -> dict:
+    """Return {key -> sha256} from companion files + node_state_snap at baseline.
+
+    Keys are file paths from companion graph nodes and node IDs from state snap.
+    """
+    post_state = {}
+
+    # Include node_state_snap hashes
+    bl = get_baseline(conn, project_id, baseline_id)
+    snap_raw = bl.get("node_state_snap", "{}")
+    try:
+        snap = json.loads(snap_raw) if snap_raw else {}
+    except (json.JSONDecodeError, TypeError):
+        snap = {}
+    for node_id, state_val in snap.items():
+        # Hash the state value to get a sha256
+        if isinstance(state_val, str):
+            post_state[node_id] = _sha256(state_val.encode("utf-8"))
+        else:
+            post_state[node_id] = _sha256(json.dumps(state_val, sort_keys=True).encode("utf-8"))
+
+    # Include companion file hashes
+    post_state["graph.json"] = bl.get("graph_sha", "")
+    post_state["code_doc_map.json"] = bl.get("code_doc_map_sha", "")
+
+    # Include mutation after_sha256 values (from baseline_mutations table)
+    try:
+        rows = conn.execute(
+            """SELECT affected_file, after_sha256 FROM baseline_mutations
+               WHERE project_id = ? AND baseline_id = ?""",
+            (project_id, baseline_id),
+        ).fetchall()
+        for row in rows:
+            key = row["affected_file"] or row[0]
+            val = row["after_sha256"] or row[1]
+            if key and val:
+                post_state[key] = val
+    except Exception:
+        pass  # baseline_mutations table may not exist yet
+
+    return post_state
+
+
+# ---------------------------------------------------------------------------
+# R5: Merge slice baselines into a full baseline
+# ---------------------------------------------------------------------------
+
+def attempt_merge_slice_baselines_into(conn: sqlite3.Connection,
+                                       project_id: str,
+                                       full_baseline_id: int) -> dict:
+    """Merge unmerged slice baselines into a full baseline using content fingerprints.
+
+    For each unmerged slice baseline:
+    - If every mutation's after_sha256 matches the full baseline's post_state,
+      set merge_status='merged' and merged_into=full_baseline_id.
+    - If any mutation diverges, set merge_status='conflict' and file a backlog row.
+    - If no mutations exist, set merge_status='unknown'.
+
+    Returns dict with counts: merged, conflict, unknown.
+    """
+    full_post_state = compute_post_state(conn, project_id, full_baseline_id)
+
+    # Find all unmerged slice baselines (scope_kind IS NOT NULL, merge_status IS NULL)
+    rows = conn.execute(
+        """SELECT baseline_id, scope_kind, scope_value
+           FROM version_baselines
+           WHERE project_id = ? AND scope_kind IS NOT NULL
+             AND (merge_status IS NULL OR merge_status = '')""",
+        (project_id,),
+    ).fetchall()
+
+    result = {"merged": 0, "conflict": 0, "unknown": 0}
+    now = _utc_now()
+
+    for row in rows:
+        slice_bid = row["baseline_id"]
+
+        # Get mutations for this slice baseline
+        mutations = conn.execute(
+            """SELECT mutation_id, affected_file, after_sha256
+               FROM baseline_mutations
+               WHERE project_id = ? AND baseline_id = ?""",
+            (project_id, slice_bid),
+        ).fetchall()
+
+        if not mutations:
+            # No mutations → unknown
+            conn.execute(
+                """UPDATE version_baselines
+                   SET merge_status = 'unknown', merged_into = ?, merge_evidence_json = ?
+                   WHERE project_id = ? AND baseline_id = ?""",
+                (full_baseline_id,
+                 json.dumps({"reason": "no_mutations", "checked_at": now}),
+                 project_id, slice_bid),
+            )
+            result["unknown"] += 1
+            continue
+
+        # Check each mutation's after_sha256 against full_post_state
+        diverged = []
+        for mut in mutations:
+            key = mut["affected_file"]
+            after_sha = mut["after_sha256"]
+            full_sha = full_post_state.get(key)
+            if after_sha and full_sha and after_sha != full_sha:
+                diverged.append({
+                    "mutation_id": mut["mutation_id"],
+                    "affected_file": key,
+                    "slice_sha256": after_sha,
+                    "full_sha256": full_sha,
+                })
+
+        if not diverged:
+            # All mutations match → merged
+            conn.execute(
+                """UPDATE version_baselines
+                   SET merge_status = 'merged', merged_into = ?, merge_evidence_json = ?
+                   WHERE project_id = ? AND baseline_id = ?""",
+                (full_baseline_id,
+                 json.dumps({"merged_at": now, "mutation_count": len(mutations)}),
+                 project_id, slice_bid),
+            )
+            result["merged"] += 1
+        else:
+            # Divergence → conflict
+            evidence = {"diverged_mutations": diverged, "checked_at": now}
+            conn.execute(
+                """UPDATE version_baselines
+                   SET merge_status = 'conflict', merged_into = ?, merge_evidence_json = ?
+                   WHERE project_id = ? AND baseline_id = ?""",
+                (full_baseline_id,
+                 json.dumps(evidence),
+                 project_id, slice_bid),
+            )
+            result["conflict"] += 1
+
+            # File backlog row for conflict
+            bug_id = f"OPT-BACKLOG-SLICE-MERGE-CONFLICT-B{slice_bid}"
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO backlog_bugs
+                       (bug_id, title, status, priority, created_at, updated_at)
+                       VALUES (?, ?, 'OPEN', 'P1', ?, ?)""",
+                    (bug_id,
+                     f"Slice baseline B{slice_bid} merge conflict with full B{full_baseline_id}",
+                     now, now),
+                )
+            except Exception as exc:
+                log.warning("baseline_service: failed to file conflict backlog %s: %s",
+                            bug_id, exc)
+
+    conn.commit()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# R7: Get last relevant baseline (§8.4)
+# ---------------------------------------------------------------------------
+
+def get_last_relevant_baseline(conn: sqlite3.Connection, project_id: str,
+                               scope_kind: str = None,
+                               scope_value: str = None) -> dict:
+    """Return the newest relevant baseline for the given scope.
+
+    Per §8.4: returns the newest of:
+    - The last full baseline (scope_kind IS NULL)
+    - The last matching unmerged/merged slice baseline (if scope provided)
+
+    If no scope is provided, returns the last full baseline.
+    Raises BaselineMissingError if nothing found.
+    """
+    # Get last full baseline
+    full_row = conn.execute(
+        """SELECT * FROM version_baselines
+           WHERE project_id = ? AND scope_kind IS NULL
+           ORDER BY baseline_id DESC LIMIT 1""",
+        (project_id,),
+    ).fetchone()
+
+    if not scope_kind or not scope_value:
+        if not full_row:
+            raise BaselineMissingError(project_id, None)
+        return dict(full_row)
+
+    # Get last matching slice baseline (unmerged or merged)
+    slice_row = conn.execute(
+        """SELECT * FROM version_baselines
+           WHERE project_id = ? AND scope_kind = ? AND scope_value = ?
+             AND (merge_status IS NULL OR merge_status IN ('', 'merged', 'unknown'))
+           ORDER BY baseline_id DESC LIMIT 1""",
+        (project_id, scope_kind, scope_value),
+    ).fetchone()
+
+    if not full_row and not slice_row:
+        raise BaselineMissingError(project_id, None)
+
+    if not full_row:
+        return dict(slice_row)
+    if not slice_row:
+        return dict(full_row)
+
+    # Return whichever is newer (higher baseline_id)
+    if slice_row["baseline_id"] > full_row["baseline_id"]:
+        return dict(slice_row)
+    return dict(full_row)
+
+
+# ---------------------------------------------------------------------------
+# R11: GC safety — slice baselines with unresolved status must not be deleted
+# ---------------------------------------------------------------------------
+
+def is_slice_baseline_gc_safe(conn: sqlite3.Connection, project_id: str,
+                              baseline_id: int) -> bool:
+    """Return True if the baseline is safe to GC-delete.
+
+    Slice baselines with merge_status IN (NULL, 'unknown', 'conflict')
+    must NEVER be deleted by GC.
+    """
+    row = conn.execute(
+        """SELECT scope_kind, merge_status FROM version_baselines
+           WHERE project_id = ? AND baseline_id = ?""",
+        (project_id, baseline_id),
+    ).fetchone()
+    if not row:
+        return True  # Non-existent rows are safe to "delete"
+
+    # Full baselines (no scope_kind) follow normal GC rules
+    if row["scope_kind"] is None:
+        return True
+
+    # Slice baselines: only 'merged' status is safe to GC
+    merge_status = row["merge_status"]
+    if merge_status == "merged":
+        return True
+
+    # NULL, 'unknown', 'conflict' → NOT safe to delete
+    return False
