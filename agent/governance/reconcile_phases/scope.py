@@ -121,7 +121,7 @@ def _resolve_bug_id(
 ) -> None:
     """Resolve bug_id → target_files from backlog_bugs table."""
     try:
-        from ..dbservice import DBContext
+        from ..db import DBContext
         with DBContext(ctx.project_id) as conn:
             row = conn.execute(
                 "SELECT target_files FROM backlog_bugs WHERE bug_id = ?",
