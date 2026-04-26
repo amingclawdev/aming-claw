@@ -177,3 +177,83 @@ def test_file_origin_creation():
     fo = FileOrigin(source="bug_id", detail="BUG-123")
     assert fo.source == "bug_id"
     assert fo.detail == "BUG-123"
+
+
+# ---------------------------------------------------------------------------
+# AC2: bug_id resolver — backlog_bugs row → resolved file_set
+# ---------------------------------------------------------------------------
+
+def test_bug_id_resolver_returns_target_files():
+    """bug_id resolver reads backlog_bugs row and populates file_set with both paths."""
+    import json
+    import sqlite3
+    from contextlib import contextmanager
+    from agent.governance.reconcile_phases.scope import _resolve_bug_id
+
+    bug_id = "TEST-BUG-SCOPE-001"
+    target_files = ["a.py", "b.py"]
+
+    # In-memory DB with backlog_bugs table and a test row
+    mem_conn = sqlite3.connect(":memory:")
+    mem_conn.execute(
+        "CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, target_files TEXT)"
+    )
+    mem_conn.execute(
+        "INSERT INTO backlog_bugs (bug_id, target_files) VALUES (?, ?)",
+        (bug_id, json.dumps(target_files)),
+    )
+    mem_conn.commit()
+
+    @contextmanager
+    def fake_db_context(project_id):
+        yield mem_conn
+
+    ctx = FakeCtx()
+    file_set = {}
+
+    # Patch DBContext in the db module so the lazy import inside _resolve_bug_id picks it up
+    with patch("agent.governance.db.DBContext", fake_db_context):
+        _resolve_bug_id(bug_id, ctx, file_set)
+
+    assert "a.py" in file_set, f"a.py missing from file_set: {file_set}"
+    assert "b.py" in file_set, f"b.py missing from file_set: {file_set}"
+    assert file_set["a.py"].source == "bug_id"
+    assert file_set["b.py"].source == "bug_id"
+    assert file_set["a.py"].detail == bug_id
+
+    mem_conn.close()
+
+
+def test_bug_id_resolve_integration():
+    """ReconcileScope(bug_id=...).resolve() returns file_set with both target paths."""
+    import json
+    import sqlite3
+    from contextlib import contextmanager
+
+    bug_id = "TEST-BUG-SCOPE-002"
+    target_files = ["a.py", "b.py"]
+
+    mem_conn = sqlite3.connect(":memory:")
+    mem_conn.execute(
+        "CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, target_files TEXT)"
+    )
+    mem_conn.execute(
+        "INSERT INTO backlog_bugs (bug_id, target_files) VALUES (?, ?)",
+        (bug_id, json.dumps(target_files)),
+    )
+    mem_conn.commit()
+
+    @contextmanager
+    def fake_db_context(project_id):
+        yield mem_conn
+
+    scope = ReconcileScope(bug_id=bug_id, include_tests=False, include_docs=False)
+    ctx = FakeCtx()
+
+    with patch("agent.governance.db.DBContext", fake_db_context):
+        resolved = scope.resolve(ctx)
+
+    assert "a.py" in resolved.files(), f"a.py missing: {resolved.files()}"
+    assert "b.py" in resolved.files(), f"b.py missing: {resolved.files()}"
+
+    mem_conn.close()
