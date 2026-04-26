@@ -17,6 +17,8 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from .errors import ReconcileScopeViolationError
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -300,6 +302,47 @@ def _read_mutation_plan(project_id: str, task_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Scope Guard Helper (R7)
+# ---------------------------------------------------------------------------
+
+def _mutation_in_scope(mutation: dict, scope_declared: dict) -> bool:
+    """Check whether a single mutation falls within the declared scope.
+
+    Returns True if in-scope, False otherwise.
+
+    Rules (R7):
+    - node_id in scope_declared['node_set'] → in-scope
+    - affected_file in scope_declared['file_set'] → in-scope
+    - For node-create with system-allocated id: check m['after']['primary']
+      intersection with file_set
+    """
+    node_set = set(scope_declared.get("node_set") or [])
+    file_set = set(scope_declared.get("file_set") or [])
+
+    node_id = mutation.get("node_id", "")
+    if node_id and node_id in node_set:
+        return True
+
+    affected_file = mutation.get("affected_file", "")
+    if affected_file and affected_file in file_set:
+        return True
+
+    # For node-create with system-allocated id, check after.primary
+    action = mutation.get("action", "")
+    if action == "node-create":
+        after = mutation.get("after", {})
+        if isinstance(after, dict):
+            primary = after.get("primary", "")
+            if isinstance(primary, list):
+                if file_set.intersection(primary):
+                    return True
+            elif isinstance(primary, str) and primary and primary in file_set:
+                return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Stage Handlers (R1)
 # ---------------------------------------------------------------------------
 
@@ -470,6 +513,20 @@ def handle_propose(conn, project_id, task_id, metadata, prev_result):
         "applied_count": 0,
     }
 
+    # R1: persist scope_declared and scope_overflow_policy when scope provided
+    scope_meta = metadata.get("scope")
+    if scope_meta and isinstance(scope_meta, dict):
+        scope_declared = {
+            "bug_id": scope_meta.get("bug_id", ""),
+            "file_set": sorted(scope_meta.get("file_set") or []),
+            "node_set": sorted(scope_meta.get("node_set") or []),
+            "commit_set": list(scope_meta.get("commit_set") or []),
+        }
+        plan["scope_declared"] = scope_declared
+        plan["scope_overflow_policy"] = metadata.get(
+            "scope_overflow_policy", "reject"
+        )
+
     _write_mutation_plan(project_id, task_id, plan)
 
     return {
@@ -547,6 +604,14 @@ def handle_apply(conn, project_id, task_id, metadata, prev_result):
     plan = _read_mutation_plan(project_id, task_id)
     mutations = [m for m in plan.get("mutations", []) if m.get("approved")]
 
+    # --- Scope guard (R2-R5) ---
+    scope_declared = plan.get("scope_declared") or {}
+    scope_policy = plan.get("scope_overflow_policy", "reject")
+    _scope_active = bool(
+        scope_declared
+        and (scope_declared.get("node_set") or scope_declared.get("file_set"))
+    )
+
     # R12: Begin two-phase commit
     _ensure_mutation_wal_table(conn)
     txn_id = _begin_two_phase(conn, task_id, mutations)
@@ -559,6 +624,47 @@ def handle_apply(conn, project_id, task_id, metadata, prev_result):
     try:
         for m in mutations:
             _check_cancellation(conn, task_id)
+
+            # --- Scope enforcement (R2-R4) ---
+            if _scope_active and not _mutation_in_scope(m, scope_declared):
+                mutation_id = m.get("node_id") or m.get("action", "unknown")
+                detail = (
+                    f"node_id={m.get('node_id')!r}, "
+                    f"affected_file={m.get('affected_file')!r} "
+                    f"not in scope node_set/file_set"
+                )
+                if scope_policy == "log_and_skip":
+                    # R4: skip and audit
+                    m["skip_reason"] = "scope_violation"
+                    try:
+                        from . import audit_service
+                        audit_service.record(
+                            conn, project_id,
+                            "reconcile.scope.violation.skipped",
+                            actor="reconcile-task",
+                            details={
+                                "task_id": task_id,
+                                "mutation_id": mutation_id,
+                                "detail": detail,
+                            },
+                        )
+                    except Exception:
+                        log.warning("Failed to audit scope violation skip", exc_info=True)
+                    continue
+                else:
+                    # R3: reject (default)
+                    plan["status"] = "rejected_scope_violation"
+                    plan["rejection_detail"] = (
+                        f"Mutation {mutation_id!r} out of scope: {detail}"
+                    )
+                    plan["phases_run"].append("apply")
+                    _write_mutation_plan(project_id, task_id, plan)
+                    _rollback_two_phase(conn, txn_id)
+                    conn.commit()
+                    raise ReconcileScopeViolationError(
+                        mutation_id, detail, scope_declared,
+                    )
+
             action = m.get("action", "")
             node_id = m.get("node_id", "")
 

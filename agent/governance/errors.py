@@ -218,6 +218,19 @@ class BaselineCorruptedError(GovernanceError):
 
 # --- 500 Internal ---
 
+class ReconcileScopeViolationError(GovernanceError):
+    """Mutation targets nodes/files outside the reconcile scope boundary."""
+
+    def __init__(self, mutation_id: str, detail: str, scope_declared: dict = None):
+        super().__init__(
+            "reconcile_scope_violation",
+            f"Mutation {mutation_id!r} is out of scope: {detail}",
+            400,
+            {"mutation_id": mutation_id, "detail": detail,
+             "scope_declared": scope_declared or {}},
+        )
+
+
 class InternalError(GovernanceError):
     """Unexpected server-side error."""
 
