@@ -612,14 +612,20 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
 
         return score
 
-    def _allocate_next_id(graph):
-        """R5: scan graph for max L7.N + 1."""
+    def _allocate_next_id(graph, layer_prefix="L7"):
+        """R4/R5: scan graph for max <layer_prefix>.N + 1.
+
+        Produces monotonically increasing IDs with no gaps or collisions
+        against existing node_state entries.  Accepts any layer prefix
+        (e.g. "L7", "L3").
+        """
+        _pfx_pat = re.compile(r"^" + re.escape(layer_prefix) + r"\.(\d+)$")
         max_n = 0
         for nid in graph.list_nodes():
-            m = re.match(r"^L7\.(\d+)$", nid)
+            m = _pfx_pat.match(nid)
             if m:
                 max_n = max(max_n, int(m.group(1)))
-        return "L7.%d" % (max_n + 1)
+        return "%s.%d" % (layer_prefix, max_n + 1)
 
     # -- Rule I: test files --
     _test_file_re = re.compile(r"^agent/tests/test_.*\.py$")
@@ -1049,18 +1055,23 @@ def _commit_graph_delta(conn, project_id, metadata):
                 log.warning("_commit_graph_delta: skipping non-dict creates item")
                 continue
 
-            parent_layer = item.get("parent_layer")
+            parent_layer_raw = item.get("parent_layer")
             # R7: skip malformed items missing parent_layer
-            if parent_layer is None:
+            if parent_layer_raw is None:
                 log.warning("_commit_graph_delta: skipping creates[] item with missing parent_layer: %s",
                             item.get("title", "<untitled>"))
                 continue
 
-            try:
-                parent_layer = int(parent_layer)
-            except (ValueError, TypeError):
-                log.warning("_commit_graph_delta: skipping creates[] item with non-int parent_layer: %s", parent_layer)
+            # R2: Normalize parent_layer — accept both int (7), string-int ("7"),
+            # and prefixed ("L7") formats.  Extract the numeric layer number and
+            # build the canonical "L<N>" prefix for node-id allocation.
+            parent_layer_str = str(parent_layer_raw).strip()
+            _pl_match = re.match(r"^[Ll]?(\d+)$", parent_layer_str)
+            if _pl_match is None:
+                log.warning("_commit_graph_delta: skipping creates[] item with non-parseable parent_layer: %s", parent_layer_raw)
                 continue
+            parent_layer_num = int(_pl_match.group(1))
+            layer_prefix = f"L{parent_layer_num}"
 
             explicit_node_id = item.get("node_id")
 
@@ -1068,8 +1079,8 @@ def _commit_graph_delta(conn, project_id, metadata):
                 # Use explicit node_id — INSERT OR IGNORE handles dedup (AC3)
                 display_id = explicit_node_id
             else:
-                # R2: Auto-generate node_id using existing pattern
-                prefix = f"L{parent_layer}."
+                # R2/R4: Auto-generate node_id using monotonically increasing IDs
+                prefix = f"{layer_prefix}."
                 existing_rows = conn.execute(
                     "SELECT node_id FROM node_state WHERE project_id = ? AND node_id LIKE ?",
                     (project_id, f"{prefix}%"),
@@ -1081,7 +1092,7 @@ def _commit_graph_delta(conn, project_id, metadata):
                         max_index = max(max_index, idx)
                     except (ValueError, IndexError):
                         pass
-                display_id = f"L{parent_layer}.{max_index + 1}"
+                display_id = f"{layer_prefix}.{max_index + 1}"
 
             # R1: Record intent before INSERT
             attempted_node_ids.append(display_id)

@@ -289,5 +289,183 @@ class TestGraphDeltaDefaults(unittest.TestCase):
         self.assertEqual(len(gd["creates"]), 1)
 
 
+class TestCommitGraphDeltaL7Nodes(unittest.TestCase):
+    """AC2: _commit_graph_delta inserts L7 node rows into node_state for creates[] with parent_layer 7."""
+
+    def _make_db_with_validated_event(self, creates, root_task_id="pm-root"):
+        """Create an in-memory DB with node_state table and a graph.delta.validated event."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE chain_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_task_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                ts TEXT NOT NULL
+            );
+            CREATE TABLE node_state (
+                project_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                verify_status TEXT NOT NULL DEFAULT 'pending',
+                build_status TEXT NOT NULL DEFAULT 'unknown',
+                updated_at TEXT,
+                version INTEGER DEFAULT 1,
+                updated_by TEXT,
+                PRIMARY KEY (project_id, node_id)
+            );
+            CREATE TABLE node_history (
+                project_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT,
+                evidence_json TEXT,
+                session_id TEXT,
+                ts TEXT,
+                version INTEGER DEFAULT 1
+            );
+        """)
+        validated_payload = {
+            "proposed_payload": {
+                "source_task_id": "dev-001",
+                "graph_delta": {
+                    "creates": creates,
+                    "updates": [],
+                    "links": [],
+                },
+            },
+        }
+        conn.execute(
+            "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) VALUES (?,?,?,?,?)",
+            (root_task_id, "dev-001", "graph.delta.validated",
+             json.dumps(validated_payload), "2026-04-25T00:00:00Z"),
+        )
+        conn.commit()
+        return conn
+
+    def test_l7_string_parent_layer_inserted(self):
+        """AC2: parent_layer='L7' (string prefixed) is accepted and creates L7 node."""
+        from governance.auto_chain import _commit_graph_delta
+
+        creates = [
+            {"parent_layer": "L7", "title": "New L7 node", "node_id": "L7.1",
+             "deps": [], "primary": ["agent/foo.py"], "description": "test"},
+        ]
+        conn = self._make_db_with_validated_event(creates)
+        metadata = {"chain_id": "pm-root"}
+
+        # Patch chain_context.get_store
+        import unittest.mock as mock
+        mock_store = mock.MagicMock()
+        mock_store._task_to_root = {"pm-root": "pm-root"}
+        with mock.patch("governance.chain_context.get_store", return_value=mock_store):
+            _commit_graph_delta(conn, "test-proj", metadata)
+
+        row = conn.execute(
+            "SELECT node_id, verify_status FROM node_state WHERE project_id='test-proj' AND node_id='L7.1'"
+        ).fetchone()
+        self.assertIsNotNone(row, "L7.1 should be inserted into node_state")
+        self.assertEqual(row["verify_status"], "pending")
+
+    def test_l7_int_parent_layer_inserted(self):
+        """AC2: parent_layer=7 (integer) is accepted and auto-generates L7.N node_id."""
+        from governance.auto_chain import _commit_graph_delta
+
+        creates = [
+            {"parent_layer": 7, "title": "Auto-ID L7 node",
+             "deps": [], "primary": ["agent/bar.py"], "description": "test"},
+        ]
+        conn = self._make_db_with_validated_event(creates)
+        metadata = {"chain_id": "pm-root"}
+
+        import unittest.mock as mock
+        mock_store = mock.MagicMock()
+        mock_store._task_to_root = {"pm-root": "pm-root"}
+        with mock.patch("governance.chain_context.get_store", return_value=mock_store):
+            _commit_graph_delta(conn, "test-proj", metadata)
+
+        row = conn.execute(
+            "SELECT node_id FROM node_state WHERE project_id='test-proj' AND node_id LIKE 'L7.%'"
+        ).fetchone()
+        self.assertIsNotNone(row, "L7.N should be auto-generated in node_state")
+        self.assertEqual(row["node_id"], "L7.1")
+
+    def test_l7_string_int_parent_layer_inserted(self):
+        """AC2: parent_layer='7' (string numeric) is accepted."""
+        from governance.auto_chain import _commit_graph_delta
+
+        creates = [
+            {"parent_layer": "7", "title": "String-int L7 node", "node_id": "L7.5",
+             "deps": [], "primary": [], "description": "test"},
+        ]
+        conn = self._make_db_with_validated_event(creates)
+        metadata = {"chain_id": "pm-root"}
+
+        import unittest.mock as mock
+        mock_store = mock.MagicMock()
+        mock_store._task_to_root = {"pm-root": "pm-root"}
+        with mock.patch("governance.chain_context.get_store", return_value=mock_store):
+            _commit_graph_delta(conn, "test-proj", metadata)
+
+        row = conn.execute(
+            "SELECT node_id FROM node_state WHERE project_id='test-proj' AND node_id='L7.5'"
+        ).fetchone()
+        self.assertIsNotNone(row, "L7.5 should be inserted with parent_layer='7'")
+
+
+class TestAllocateNextIdAC5(unittest.TestCase):
+    """AC5: _allocate_next_id('L7') returns L7.(max+1) when existing nodes L7.1..L7.N exist."""
+
+    def test_allocate_next_l7_id(self):
+        """AC5: L7.1..L7.3 exist → next is L7.4."""
+        from governance.reconcile_phases.phase_b import allocate_next_id
+        result = allocate_next_id("L7", ["L7.1", "L7.2", "L7.3", "L3.1", "L3.2"])
+        self.assertEqual(result, "L7.4")
+
+    def test_allocate_with_gaps(self):
+        """AC5: L7.1, L7.5 exist → next is L7.6 (max+1, no gap filling)."""
+        from governance.reconcile_phases.phase_b import allocate_next_id
+        result = allocate_next_id("L7", ["L7.1", "L7.5"])
+        self.assertEqual(result, "L7.6")
+
+    def test_allocate_empty_graph(self):
+        """AC5: No L7 nodes → L7.1."""
+        from governance.reconcile_phases.phase_b import allocate_next_id
+        result = allocate_next_id("L7", ["L3.1", "L3.2"])
+        self.assertEqual(result, "L7.1")
+
+    def test_allocate_no_collision(self):
+        """AC5: Monotonically increasing, no collision with existing."""
+        from governance.reconcile_phases.phase_b import allocate_next_id
+        existing = ["L7.1", "L7.2", "L7.3"]
+        id1 = allocate_next_id("L7", existing)
+        self.assertEqual(id1, "L7.4")
+        existing.append(id1)
+        id2 = allocate_next_id("L7", existing)
+        self.assertEqual(id2, "L7.5")
+
+
+class TestGatekeeperBlocksOnCommitFailure(unittest.TestCase):
+    """AC3: _gate_gatekeeper_pass returns (False, ...) when _commit_graph_delta raises."""
+
+    def test_gate_returns_false_on_commit_exception(self):
+        """AC3: Graph delta commit failure → gate blocked."""
+        from governance.auto_chain import _gate_gatekeeper_pass
+        import unittest.mock as mock
+
+        result = {"recommendation": "merge_pass"}
+        metadata = {"chain_id": "pm-root"}
+        conn = mock.MagicMock()
+
+        with mock.patch("governance.auto_chain._commit_graph_delta", side_effect=RuntimeError("L7 write failed")):
+            passed, reason = _gate_gatekeeper_pass(conn, "test-proj", result, metadata)
+
+        self.assertFalse(passed)
+        self.assertIn("graph delta commit failed", reason)
+        self.assertIn("L7 write failed", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

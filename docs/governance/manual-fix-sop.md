@@ -839,6 +839,40 @@ When a manual-fix is warranted (per the decision matrix above), follow these 5 s
 4. **Write MF execution record** — Create `docs/dev/manual-fix-current-YYYY-MM-DD[-NNN].md` documenting: what broke, what was changed, why chain-spawn was not viable, and post-fix verification results
 5. **Verify state** — Restart governance, run `version_check` (expect `ok=true, dirty=false`), run `preflight_check`, and confirm workflow restore per Phase 5 of this SOP
 
+## Troubleshooting: L7 Node Drop During Merge Gate
+
+### Symptoms
+- PM proposed_nodes with `parent_layer=7` or `parent_layer="L7"` are present in `pm.prd.published` chain_event but absent from `node_state` after merge completes
+- Phase B reconcile reports `pm_proposed_not_in_node_state` discrepancies for L7 nodes
+- `_commit_graph_delta` log shows `skipping creates[] item with non-int parent_layer: L7`
+
+### Root Cause
+Prior to the fix, `_commit_graph_delta` attempted `int(parent_layer)` which rejected string-prefixed values like `"L7"`. PM stages typically emit `parent_layer="L7"` (string with prefix) while `_commit_graph_delta` only accepted bare integers.
+
+### Verification Query
+```sql
+-- Check for L7 nodes in chain_events but missing from node_state
+SELECT ce.root_task_id, ce.payload_json
+FROM chain_events ce
+WHERE ce.event_type = 'graph.delta.validated'
+  AND ce.payload_json LIKE '%parent_layer%L7%'
+  AND NOT EXISTS (
+    SELECT 1 FROM node_state ns
+    WHERE ns.project_id = 'aming-claw'
+      AND ns.node_id LIKE 'L7.%'
+  );
+```
+
+### Manual Backfill Steps
+1. Identify dropped L7 nodes from the validated payload above
+2. For each dropped node, insert into node_state:
+   ```sql
+   INSERT OR IGNORE INTO node_state (project_id, node_id, verify_status, build_status, updated_at, version)
+   VALUES ('aming-claw', 'L7.<N>', 'pending', 'unknown', datetime('now'), 1);
+   ```
+3. Run reconcile Phase B to confirm no remaining `pm_proposed_not_in_node_state` discrepancies
+4. Restart governance to clear any cached state
+
 ## Cross-references
 
 - **Proposal §15.5b**: The decision matrix above is derived from `proposal-reconcile-comprehensive-2026-04-25.md` section 15.5b, which defines the manual-fix vs chain-spawn boundary

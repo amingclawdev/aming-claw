@@ -433,5 +433,65 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
         self.assertEqual(proposed[0]["payload"]["source"], "dev-emitted+inferred-gaps")
 
 
+class TestInferGraphDeltaRuleH_L7(unittest.TestCase):
+    """AC1: _infer_graph_delta returns creates[] containing every PM proposed_node
+    with parent_layer=7 when dev result has no graph_delta (Rule H)."""
+
+    def test_all_l7_pm_nodes_bridged_when_no_dev_delta(self):
+        """AC1: dev_delta=None → all L7 PM nodes appear in creates[]."""
+        pm_nodes = [
+            {"node_id": "L7.1", "title": "L7 Node A", "primary": ["agent/a.py"],
+             "parent_layer": "L7", "deps": [], "description": "First L7 node"},
+            {"node_id": "L7.2", "title": "L7 Node B", "primary": ["agent/b.py"],
+             "parent_layer": "L7", "deps": ["L7.1"], "description": "Second L7 node"},
+            {"node_id": "L3.5", "title": "L3 Node", "primary": ["agent/c.py"],
+             "parent_layer": "L3", "deps": [], "description": "Non-L7 node"},
+        ]
+        changed = []
+        delta, hits, sources, source = _infer_graph_delta(pm_nodes, changed, None, {})
+
+        # All 3 PM nodes should appear via Rule H (dev_delta is None)
+        create_ids = [c["node_id"] for c in delta["creates"]]
+        self.assertIn("L7.1", create_ids)
+        self.assertIn("L7.2", create_ids)
+        self.assertIn("L3.5", create_ids)
+
+        rule_h_hits = [h for h in hits if h["rule"] == "H"]
+        self.assertEqual(len(rule_h_hits), 3)  # All 3 bridged via H
+        self.assertIn("pm_proposed_bridge", sources)
+
+    def test_l7_node_with_matching_primary_uses_rule_a_then_h(self):
+        """AC1: L7 nodes with matching primary → Rule A; remainder → Rule H."""
+        pm_nodes = [
+            {"node_id": "L7.1", "title": "Matched L7", "primary": ["agent/match.py"],
+             "parent_layer": "L7", "deps": [], "description": ""},
+            {"node_id": "L7.2", "title": "Unmatched L7", "primary": ["agent/other.py"],
+             "parent_layer": "L7", "deps": [], "description": ""},
+        ]
+        changed = ["agent/match.py"]
+        delta, hits, _, _ = _infer_graph_delta(pm_nodes, changed, None, {})
+
+        create_ids = [c["node_id"] for c in delta["creates"]]
+        self.assertIn("L7.1", create_ids)
+        self.assertIn("L7.2", create_ids)
+
+        # L7.1 matched by Rule A, L7.2 bridged by Rule H
+        rule_a_hits = [h for h in hits if h["rule"] == "A"]
+        rule_h_hits = [h for h in hits if h["rule"] == "H"]
+        self.assertEqual(len(rule_a_hits), 1)
+        self.assertEqual(len(rule_h_hits), 1)
+
+    def test_l7_nodes_preserved_parent_layer(self):
+        """AC1: creates[] entries preserve parent_layer field from PM nodes."""
+        pm_nodes = [
+            {"node_id": "L7.10", "title": "Deep L7", "primary": [],
+             "parent_layer": "L7", "deps": [], "description": "Deep node"},
+        ]
+        delta, _, _, _ = _infer_graph_delta(pm_nodes, [], None, {})
+        self.assertEqual(len(delta["creates"]), 1)
+        self.assertEqual(delta["creates"][0]["parent_layer"], "L7")
+        self.assertEqual(delta["creates"][0]["node_id"], "L7.10")
+
+
 if __name__ == "__main__":
     unittest.main()
