@@ -47,6 +47,9 @@ _DIRTY_IGNORE = (
 # When True, graph doc checks log warnings instead of blocking.
 _GRAPH_DOC_OBSERVATION_MODE = True
 
+# QA Sweep Phase 5: structural drift gate during QA (opt-in via env var)
+_QA_SWEEP_ENABLED = os.environ.get("QA_SWEEP_ENABLED", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Corrective PM State Machine Constants (R5)
 # ---------------------------------------------------------------------------
@@ -3641,6 +3644,100 @@ def _gate_t2_pass(conn, project_id, result, metadata):
     return True, "ok"
 
 
+# ---------------------------------------------------------------------------
+# QA Sweep Phase 5 — structural drift gate helpers
+# ---------------------------------------------------------------------------
+
+def _qa_sweep_skip_rule(changed_files):
+    """Classify changed files to decide sweep scope.
+
+    Returns one of: 'tests_only', 'docs_only', 'docs_plus_code', 'code_only', 'unknown'.
+    """
+    if not changed_files:
+        return "unknown"
+
+    docs = []
+    tests = []
+    code = []
+    for f in changed_files:
+        if f.endswith(".md") or f.startswith("docs/"):
+            docs.append(f)
+        elif "/tests/" in f or f.startswith("test_"):
+            tests.append(f)
+        else:
+            code.append(f)
+
+    total = len(changed_files)
+    if tests and not docs and not code:
+        return "tests_only"
+    if docs and not code and not tests:
+        return "docs_only"
+    if docs and (code or tests):
+        return "docs_plus_code"
+    if code and not docs:
+        return "code_only"
+    return "unknown"
+
+
+def _qa_sweep_gate(conn, project_id, qa_task_id, qa_metadata, qa_result):
+    """Structural drift gate invoked after AI QA passes.
+
+    Returns (ok: bool, message: str, sweep_result_or_none).
+    """
+    # R3: Feature-flag check
+    if not _QA_SWEEP_ENABLED:
+        return True, "qa_sweep disabled — QA_SWEEP_ENABLED is not 'true'", None
+
+    changed_files = qa_metadata.get("changed_files", [])
+    skip_rule = _qa_sweep_skip_rule(changed_files)
+
+    # R5: tests-only → skip
+    if skip_rule == "tests_only":
+        return True, "qa_sweep skipped — tests-only change", None
+
+    # R4: docs-only → run doc-related phases only
+    phases = None
+    if skip_rule == "docs_only":
+        phases = ["K", "D"]
+
+    # Derive workspace_path (R10)
+    workspace_path = str(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+    # Get commit from metadata
+    commit = qa_metadata.get("commit") or qa_metadata.get("commit_sha") or "HEAD"
+
+    # R6: Orchestrator exceptions are non-blocking
+    try:
+        from .reconcile_phases.orchestrator import run_commit_slice_orchestrated
+        sweep_result = run_commit_slice_orchestrated(
+            project_id,
+            workspace_path,
+            commit,
+            phases=phases,
+            dry_run=True,
+        )
+    except Exception as exc:
+        log.warning("qa_sweep error (non-blocking): %s", exc)
+        return True, f"qa_sweep error (non-blocking): {exc}", None
+
+    # R7: Count high-severity findings
+    findings = sweep_result.get("findings", [])
+    high_count = sum(
+        1 for f in findings
+        if f.get("confidence") == "high" and f.get("priority") in ("P0", "P1")
+    )
+
+    if high_count > 0:
+        # R8: Gate failure → spawn corrective PM
+        failure_msg = f"qa_sweep found {high_count} high-severity drift findings"
+        spawn_corrective_pm(
+            conn, project_id, qa_task_id, failure_msg, bug_id="qa_sweep_drift"
+        )
+        return False, failure_msg, sweep_result
+
+    return True, "qa_sweep passed — no high-severity drift", sweep_result
+
+
 def _gate_qa_pass(conn, project_id, result, metadata):
     """Verify QA recommendation before merge.
 
@@ -3765,6 +3862,13 @@ def _gate_qa_pass(conn, project_id, result, metadata):
         extra_structured={"recommendation": rec, "chain_stage": "qa",
                           "changed_files": metadata.get("changed_files", [])},
     )
+
+    # Phase 5: QA Sweep structural drift gate (R9 — after AI QA passes)
+    qa_task_id = metadata.get("task_id", "")
+    sweep_ok, sweep_msg, sweep_result = _qa_sweep_gate(conn, project_id, qa_task_id, metadata, result)
+    if not sweep_ok:
+        return False, sweep_msg
+
     return True, "ok"
 
 
