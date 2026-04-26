@@ -405,11 +405,18 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
     # ---- Rule B: @route decorator grep on changed agent/**/*.py ----
     py_agent_files = [f for f in non_md_changed
                       if f.startswith("agent/") and f.endswith(".py")
+                      and not f.startswith("agent/tests/")
+                      and "/tests/" not in f.replace("\\", "/")
                       and f.replace("\\", "/") not in covered_primaries]
     if py_agent_files:
         inferred_from.append("route_decorator_grep")
-        route_re = re.compile(
-            r'@(?:\w+\.)?(?:route|get|post|put|delete|patch)\(\s*["\']([^"\']+)["\']',
+        # Positional: @route('POST', '/api/foo') or @app.route('GET', '/path')
+        route_re_positional = re.compile(
+            r"@(?:\w+\.)?route\(\s*[\"'](\w+)[\"']\s*,\s*[\"']([^\"']+)[\"']",
+        )
+        # Dotted: @app.get('/path'), @bp.post('/path'), etc. — requires dotted prefix
+        route_re_dotted = re.compile(
+            r"@\w+\.(get|post|put|delete|patch)\(\s*[\"']([^\"']+)[\"']",
             re.IGNORECASE,
         )
         for fpath in py_agent_files:
@@ -421,13 +428,23 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
                     continue
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
-                for m in route_re.finditer(content):
-                    path_str = m.group(1)
-                    # Determine method from decorator name
-                    dec_match = re.search(r'@(?:\w+\.)?(\w+)\(', m.group(0))
-                    method = dec_match.group(1).upper() if dec_match else "ROUTE"
-                    if method == "ROUTE":
-                        method = "ANY"
+                for m in route_re_positional.finditer(content):
+                    method = m.group(1).upper()
+                    path_str = m.group(2)
+                    title = "HTTP endpoint: %s %s" % (method, path_str)
+                    creates.append({
+                        "node_id": "",
+                        "title": title,
+                        "parent_layer": "",
+                        "primary": [fpath],
+                        "deps": [],
+                        "description": "Auto-inferred from @route decorator",
+                    })
+                    rule_hits.append({"rule": "B", "entry_title": title,
+                                      "file": fpath})
+                for m in route_re_dotted.finditer(content):
+                    method = m.group(1).upper()
+                    path_str = m.group(2)
                     title = "HTTP endpoint: %s %s" % (method, path_str)
                     creates.append({
                         "node_id": "",
