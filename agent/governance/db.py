@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -230,6 +230,9 @@ CREATE TABLE IF NOT EXISTS backlog_bugs (
     chain_trigger_json  TEXT NOT NULL DEFAULT '{}',
     required_docs       TEXT NOT NULL DEFAULT '[]',
     provenance_paths    TEXT NOT NULL DEFAULT '[]',
+    chain_stage         TEXT NOT NULL DEFAULT '',
+    last_failure_reason TEXT NOT NULL DEFAULT '',
+    stage_updated_at    TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -727,6 +730,11 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
                 fixed_at            TEXT NOT NULL DEFAULT '',
                 details_md          TEXT NOT NULL DEFAULT '',
                 chain_trigger_json  TEXT NOT NULL DEFAULT '{}',
+                required_docs       TEXT NOT NULL DEFAULT '[]',
+                provenance_paths    TEXT NOT NULL DEFAULT '[]',
+                chain_stage         TEXT NOT NULL DEFAULT '',
+                last_failure_reason TEXT NOT NULL DEFAULT '',
+                stage_updated_at    TEXT NOT NULL DEFAULT '',
                 created_at          TEXT NOT NULL,
                 updated_at          TEXT NOT NULL
             )
@@ -856,7 +864,19 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
         c.execute("CREATE INDEX IF NOT EXISTS idx_bm_file ON baseline_mutations(affected_file)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bm_node ON baseline_mutations(affected_node)")
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22}
+    def _migrate_v22_to_v23(c):
+        """Add chain_stage, last_failure_reason, stage_updated_at columns to backlog_bugs."""
+        for col, typedef in [
+            ("chain_stage", "TEXT NOT NULL DEFAULT ''"),
+            ("last_failure_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("stage_updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE backlog_bugs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)
