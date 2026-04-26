@@ -1807,9 +1807,10 @@ def handle_task_create(ctx: RequestContext):
                 })
                 with DBContext(project_id) as _evt_conn:
                     _evt_conn.execute(
-                        "INSERT INTO chain_events (chain_id, event_type, payload, created_at) "
-                        "VALUES (?, ?, ?, datetime('now'))",
-                        ("backlog_gate", "backlog_gate.observer_bypass",
+                        "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+                        "VALUES (?, ?, ?, ?, datetime('now'))",
+                        ("backlog_gate", "backlog_gate",
+                         "backlog_gate.observer_bypass",
                          json.dumps({"project_id": project_id, "task_type": task_type,
                                      "force_reason": _bypass_reason, "created_by": created_by})),
                     )

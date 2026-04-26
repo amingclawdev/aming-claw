@@ -340,8 +340,63 @@ class TestOrchestratorRegistration:
             return_value=[],
         ) as mock_run:
             result = _run_phase("G", mock_ctx, {})
-            mock_run.assert_called_once_with(mock_ctx)
+            mock_run.assert_called_once_with(mock_ctx, scope=None)
             assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Multiple PM tasks
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# AC6: test_load_chain_events_uses_ts_column
+# ---------------------------------------------------------------------------
+
+class TestLoadChainEventsTsColumn:
+
+    def test_load_chain_events_uses_ts_column(self):
+        """Insert 2 rows with different ts values, call load_chain_events,
+        assert 2 rows returned in ascending ts order."""
+        import sqlite3
+        from agent.governance.reconcile_phases.phase_g import _load_chain_events
+
+        # Create in-memory DB with chain_events table matching real schema
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.execute(
+            "CREATE TABLE chain_events ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  root_task_id TEXT,"
+            "  task_id TEXT,"
+            "  event_type TEXT,"
+            "  payload_json TEXT,"
+            "  ts TEXT"
+            ")"
+        )
+        # Insert rows with ts out of order to prove ORDER BY ts works
+        mem_conn.execute(
+            "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("task-abc", "task-abc", "dev.started", "{}", "2026-01-02T00:00:00Z"),
+        )
+        mem_conn.execute(
+            "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("task-abc", "task-abc", "pm.created", "{}", "2026-01-01T00:00:00Z"),
+        )
+        mem_conn.commit()
+
+        ctx = _StubCtx(project_id="test-proj")
+
+        with patch("agent.governance.db.get_connection", return_value=mem_conn):
+            results = _load_chain_events(ctx, "task-abc")
+
+        assert len(results) == 2
+        # First row should be the earlier ts (pm.created at Jan 1)
+        assert results[0]["event_type"] == "pm.created"
+        assert results[0]["ts"] == "2026-01-01T00:00:00Z"
+        # Second row should be the later ts (dev.started at Jan 2)
+        assert results[1]["event_type"] == "dev.started"
+        assert results[1]["ts"] == "2026-01-02T00:00:00Z"
 
 
 # ---------------------------------------------------------------------------
