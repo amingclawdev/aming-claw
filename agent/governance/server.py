@@ -3557,6 +3557,153 @@ def handle_backlog_upsert(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/backlog/{project_id}/{bug_id}/predeclare-mf")
+def handle_backlog_predeclare_mf(ctx: RequestContext):
+    """Predeclare a manual fix: transition OPEN -> MF_PLANNED with mf_id validation."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    body = ctx.body
+    now = _utc_now()
+
+    # Validate mf_id format
+    mf_id = body.get("mf_id", "")
+    if not re.match(r"^MF-\d{4}-\d{2}-\d{2}-\d{3}$", mf_id):
+        raise GovernanceError(
+            "invalid_mf_id",
+            f"mf_id must match MF-YYYY-MM-DD-NNN, got: {mf_id}",
+            422,
+        )
+
+    # Validate reason length
+    reason = body.get("reason", "")
+    if len(reason) < 20:
+        raise GovernanceError(
+            "reason_too_short",
+            f"reason must be >= 20 chars, got {len(reason)}",
+            422,
+        )
+
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT bug_id, status, details_md FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+
+        current_status = row["status"]
+        if current_status != "OPEN":
+            raise GovernanceError(
+                "invalid_status",
+                f"Bug must be OPEN to predeclare MF, currently: {current_status}",
+                422,
+            )
+
+        # Store mf_id and reason in details_md for start-mf ownership check
+        existing_md = row["details_md"] or ""
+        marker = f"\n\n<!-- MF-PREDECLARE mf_id={mf_id} reason={reason} -->"
+        new_details = existing_md + marker
+
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status = 'MF_PLANNED',
+                   details_md = ?,
+                   updated_at = ?
+               WHERE bug_id = ?""",
+            (new_details, now, bug_id),
+        )
+        conn.commit()
+
+        # Audit: best-effort
+        try:
+            audit_service.record(
+                conn, pid, "backlog_predeclare_mf",
+                actor=body.get("actor", "api"),
+                bug_id=bug_id,
+                mf_id=mf_id,
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "bug_id": bug_id,
+            "status": "MF_PLANNED",
+            "mf_id": mf_id,
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/backlog/{project_id}/{bug_id}/start-mf")
+def handle_backlog_start_mf(ctx: RequestContext):
+    """Start a manual fix: transition MF_PLANNED -> MF_IN_PROGRESS with mf_id ownership check."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    body = ctx.body
+    now = _utc_now()
+
+    mf_id = body.get("mf_id", "")
+
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT bug_id, status, details_md FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+
+        current_status = row["status"]
+        if current_status != "MF_PLANNED":
+            raise GovernanceError(
+                "invalid_status",
+                f"Bug must be MF_PLANNED to start MF, currently: {current_status}",
+                422,
+            )
+
+        # Verify mf_id ownership via substring check on details_md
+        details_md = row["details_md"] or ""
+        if mf_id not in details_md:
+            raise GovernanceError(
+                "mf_id_mismatch",
+                f"mf_id {mf_id} not found in bug details; ownership check failed",
+                422,
+            )
+
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status = 'MF_IN_PROGRESS',
+                   updated_at = ?
+               WHERE bug_id = ?""",
+            (now, bug_id),
+        )
+        conn.commit()
+
+        # Audit: best-effort
+        try:
+            audit_service.record(
+                conn, pid, "backlog_start_mf",
+                actor=body.get("actor", "api"),
+                bug_id=bug_id,
+                mf_id=mf_id,
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "bug_id": bug_id,
+            "status": "MF_IN_PROGRESS",
+            "mf_id": mf_id,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/backlog/{project_id}/{bug_id}/close")
 def handle_backlog_close(ctx: RequestContext):
     """Close a backlog bug: set status=FIXED, commit, fixed_at."""
@@ -3567,10 +3714,21 @@ def handle_backlog_close(ctx: RequestContext):
     conn = get_connection(pid)
     try:
         row = conn.execute(
-            "SELECT bug_id FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
+            "SELECT bug_id, status FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
         ).fetchone()
         if not row:
             raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+
+        prior_status = row["status"]
+
+        # Allow closing from OPEN or MF_IN_PROGRESS
+        if prior_status not in ("OPEN", "MF_IN_PROGRESS"):
+            raise GovernanceError(
+                "invalid_status",
+                f"Bug must be OPEN or MF_IN_PROGRESS to close, currently: {prior_status}",
+                422,
+            )
+
         # Verify commit SHA exists in git log (best-effort)
         commit_sha = body.get("commit", "")
         if commit_sha:
@@ -3589,15 +3747,27 @@ def handle_backlog_close(ctx: RequestContext):
                 log.warning("git rev-parse timed out for commit %s; allowing close", commit_sha)
             except FileNotFoundError:
                 log.warning("git not found; skipping commit verification for %s", commit_sha)
-        conn.execute(
-            """UPDATE backlog_bugs
+
+        # Determine chain_stage based on prior status
+        chain_stage = "manual-fix" if prior_status == "MF_IN_PROGRESS" else None
+
+        update_sql = """UPDATE backlog_bugs
                SET status = 'FIXED',
                    "commit" = ?,
                    fixed_at = ?,
-                   updated_at = ?
-               WHERE bug_id = ?""",
-            (body.get("commit", ""), now, now, bug_id),
-        )
+                   updated_at = ?"""
+        params = [body.get("commit", ""), now, now]
+
+        if chain_stage:
+            update_sql += """,
+                   chain_stage = ?"""
+            params.append(chain_stage)
+
+        update_sql += """
+               WHERE bug_id = ?"""
+        params.append(bug_id)
+
+        conn.execute(update_sql, params)
         conn.commit()
         # Audit: backlog_close event
         try:
@@ -3609,7 +3779,10 @@ def handle_backlog_close(ctx: RequestContext):
             conn.commit()
         except Exception:
             pass  # best-effort audit
-        return {"ok": True, "bug_id": bug_id, "status": "FIXED", "fixed_at": now}
+        result = {"ok": True, "bug_id": bug_id, "status": "FIXED", "fixed_at": now}
+        if chain_stage:
+            result["chain_stage"] = chain_stage
+        return result
     finally:
         conn.close()
 

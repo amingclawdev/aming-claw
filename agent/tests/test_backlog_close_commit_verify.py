@@ -23,8 +23,8 @@ def _mock_db():
     """Patch get_connection so SELECT returns a row and UPDATE/commit succeed."""
     with patch("agent.governance.server.get_connection") as mock_gc:
         conn = MagicMock()
-        # SELECT returns a row (bug exists)
-        conn.execute.return_value.fetchone.return_value = {"bug_id": "BUG-001"}
+        # SELECT returns a row (bug exists) with OPEN status for close eligibility
+        conn.execute.return_value.fetchone.return_value = {"bug_id": "BUG-001", "status": "OPEN"}
         mock_gc.return_value = conn
         yield conn
 
