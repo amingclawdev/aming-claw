@@ -68,7 +68,7 @@ Returns: `{project_id, config_hash, registered: true, test_command, deploy_strat
 
 ```bash
 # Via governance API (task create) — no X-Gov-Token required
-curl -X POST http://localhost:40006/api/task/create \
+curl -X POST http://localhost:40000/api/task/create \
   -H "Content-Type: application/json" \
   -d '{"message":"Fix the login bug","project_id":"my-project"}'
 
@@ -100,7 +100,7 @@ Every task follows this pipeline automatically. `auto_chain.py` (`agent/governan
 Message → Governance API → PM → Dev → Checkpoint Gate → Tester → QA → Merge → Deploy
 ```
 
-> Note: The old coordinator.py / backends.py and other modules have been fully removed. Task routing is now handled through the governance server (port 40006) task_registry.
+> Note: The old coordinator.py / backends.py and other modules have been fully removed. Task routing is now handled through the governance server (port 40000) task_registry.
 
 ### Auto-Chain Trigger
 
@@ -188,7 +188,7 @@ The Token already contains your role information. You **must not and cannot** in
 Send a heartbeat every 60 seconds, otherwise your session will become stale (180s) then expired (600s).
 
 ```
-POST http://localhost:30006/api/role/heartbeat
+POST http://localhost:40000/api/role/heartbeat
 Header: X-Gov-Token: gov-<your-token>
 Body: {"project_id": "<pid>", "status": "idle"}
 ```
@@ -990,7 +990,7 @@ that each service can restart the other without restarting itself.
 
 ### POST `/api/governance/redeploy/{target}`
 
-**Governance-side endpoint** (port 40006). Triggers a redeploy of a named target service.
+**Governance-side endpoint** (port 40000). Triggers a redeploy of a named target service.
 
 | Parameter | Location | Type | Description |
 |-----------|----------|------|-------------|
@@ -1015,7 +1015,7 @@ that each service can restart the other without restarting itself.
 **Example:**
 
 ```bash
-curl -X POST http://localhost:40006/api/governance/redeploy/executor
+curl -X POST http://localhost:40000/api/governance/redeploy/executor
 ```
 
 ### POST `/api/manager/redeploy/governance`
@@ -1040,7 +1040,7 @@ service manager provides this complementary endpoint.
 **Example:**
 
 ```bash
-curl -X POST http://localhost:40007/api/manager/redeploy/governance
+curl -X POST http://localhost:40101/api/manager/redeploy/governance
 ```
 
 ### Mutual-Exclusion Guards
