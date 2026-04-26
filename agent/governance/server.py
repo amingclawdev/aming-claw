@@ -2317,7 +2317,8 @@ def handle_version_update(ctx: RequestContext):
     # cannot manually invoke without knowing the server-side secret.
     updated_by = body["updated_by"]
     _ALLOWED_UPDATED_BY = ("auto-chain", "init", "manager-redeploy", "redeploy-orchestrator")
-    if updated_by not in _ALLOWED_UPDATED_BY:
+    _is_manual_fix = isinstance(updated_by, str) and updated_by.startswith("manual-fix-") and len(updated_by) > len("manual-fix-")
+    if updated_by not in _ALLOWED_UPDATED_BY and not _is_manual_fix:
         conn = _open()
         try:
             _audit_version_update(conn, pid, body, "rejected", "INVALID_UPDATED_BY")
@@ -2328,6 +2329,18 @@ def handle_version_update(ctx: RequestContext):
                            f"Allowed: {_ALLOWED_UPDATED_BY}. "
                            f"Observer manual version-update is no longer supported — "
                            f"run a verification chain to land version changes."}, 403
+
+    # Step 3 manual-fix guard: require non-empty manual_fix_reason
+    if _is_manual_fix:
+        manual_fix_reason = (body.get("manual_fix_reason") or "").strip()
+        if not manual_fix_reason:
+            conn = _open()
+            try:
+                _audit_version_update(conn, pid, body, "rejected", "MANUAL_FIX_REASON_MISSING")
+            finally:
+                conn.close()
+            return {"error": "MANUAL_FIX_REASON_MISSING",
+                    "message": "manual_fix_reason is required when updated_by is a manual-fix-* value"}, 400
 
     # LOCKDOWN step 3a: Non-auto-chain callers must present VERSION_UPDATE_TOKEN.
     # auto-chain is itself in-process and uses chain_stage='merge' enforcement;
@@ -2457,6 +2470,7 @@ def _audit_version_update(conn, pid, body, result, reason):
                 "new_version": body.get("chain_version", ""),
                 "chain_stage": body.get("chain_stage", ""),
                 "updated_by": body.get("updated_by", ""),
+                "manual_fix_reason": body.get("manual_fix_reason", ""),
                 "result": result,
                 "reject_reason": reason,
             },
