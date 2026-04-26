@@ -17,6 +17,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from . import baseline_service
 from .errors import ReconcileScopeViolationError
 
 log = logging.getLogger(__name__)
@@ -916,13 +917,21 @@ def _api_backlog_upsert(conn, project_id, mutation):
 def _trigger_baseline_write(conn, project_id, task_id):
     """R7: Trigger Phase I baseline write on successful apply."""
     try:
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """INSERT OR REPLACE INTO baselines
-               (project_id, baseline_id, created_at, created_by, baseline_type, details_json)
-               VALUES (?, ?, ?, 'reconcile-task', 'phase_i',
-                       json_object('source', 'reconcile-apply', 'task_id', ?))""",
-            (project_id, f"baseline-reconcile-{task_id}", now, task_id),
+        # Retrieve chain_version from project_version table
+        vrow = conn.execute(
+            "SELECT chain_version FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        chain_version = vrow["chain_version"] if vrow else "unknown"
+
+        baseline_service.create_baseline(
+            conn,
+            project_id=project_id,
+            chain_version=chain_version,
+            trigger="reconcile-apply",
+            triggered_by="reconcile-task",
+            scope_kind="phase_i_reconcile",
+            scope_value=task_id,
         )
         log.info("Phase I baseline written for reconcile task %s", task_id)
     except Exception:
