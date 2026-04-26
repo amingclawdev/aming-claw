@@ -2316,7 +2316,7 @@ def handle_version_update(ctx: RequestContext):
     # Non-auto-chain paths now require VERSION_UPDATE_TOKEN to be set — observer
     # cannot manually invoke without knowing the server-side secret.
     updated_by = body["updated_by"]
-    _ALLOWED_UPDATED_BY = ("auto-chain", "init", "manager-redeploy", "redeploy-orchestrator")
+    _ALLOWED_UPDATED_BY = ("auto-chain", "init", "manager-redeploy", "redeploy-orchestrator", "cron-writeback")
     _is_manual_fix = isinstance(updated_by, str) and updated_by.startswith("manual-fix-") and len(updated_by) > len("manual-fix-")
     if updated_by not in _ALLOWED_UPDATED_BY and not _is_manual_fix:
         conn = _open()
@@ -2391,7 +2391,11 @@ def handle_version_update(ctx: RequestContext):
         return {"error": "INVALID_CHAIN_STAGE", "message": f"Expected merge, got {chain_stage}"}, 400
 
     # Step 3b: Chain link validation — verify task_id references a succeeded task
-    if updated_by in ("auto-chain", "manager-redeploy", "redeploy-orchestrator") and task_id:
+    # B40: cron-writeback skips task_id lookup and task.type enforcement entirely.
+    # It only writes chain_version and has no associated task.
+    if updated_by == "cron-writeback":
+        pass  # short-circuit: no task_id or task.type checks for cron-writeback
+    elif updated_by in ("auto-chain", "manager-redeploy", "redeploy-orchestrator") and task_id:
         conn = _open()
         try:
             task_row = conn.execute(
@@ -2411,6 +2415,14 @@ def handle_version_update(ctx: RequestContext):
                 return {"error": "TASK_TERMINALLY_FAILED",
                         "message": f"Task {task_id} is in terminal failure state "
                                    f"{task_row['status']}; cannot sync version for it"}, 400
+            # B40: Reject if task.type is not 'merge' for chain-enforcement callers.
+            # manual-fix-* is excluded from this block (only auto-chain/manager-redeploy/
+            # redeploy-orchestrator reach here). cron-writeback short-circuits above.
+            if task_row and task_row["type"] != "merge":
+                _audit_version_update(conn, pid, body, "rejected", "TASK_TYPE_NOT_MERGE")
+                return {"error": "TASK_TYPE_NOT_MERGE",
+                        "message": f"Task {task_id} has type '{task_row['type']}', "
+                                   f"expected 'merge' for updated_by='{updated_by}'"}, 400
             # Allowed: claimed (in-flight auto-chain), running, succeeded
             # task_row could be None if task is in a different DB — allow (backward compat)
         finally:
