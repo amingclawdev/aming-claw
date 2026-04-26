@@ -82,7 +82,7 @@ def run(ctx: "ReconcileContext", *, scope=None) -> list:
         last_event_type = None
         last_event_at = None
         if chain_events:
-            last = chain_events[-1]  # already ordered by created_at
+            last = chain_events[-1]
             last_event_type = last.get("event_type")
             last_event_at = last.get("created_at")
 
@@ -172,7 +172,7 @@ def _load_chain_events(
 
     SELECT * FROM chain_events
     WHERE root_task_id=? OR task_id=?
-    ORDER BY created_at
+    ORDER BY ts
     """
     try:
         from ..db import get_connection
@@ -180,7 +180,7 @@ def _load_chain_events(
         cursor = conn.execute(
             "SELECT * FROM chain_events "
             "WHERE root_task_id=? OR task_id=? "
-            "ORDER BY created_at",
+            "ORDER BY ts",
             (task_id, task_id),
         )
         columns = [desc[0] for desc in cursor.description] if cursor.description else []
