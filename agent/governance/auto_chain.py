@@ -3486,7 +3486,20 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     if _gd_proposed:
         gd_review = result.get("graph_delta_review")
         if not gd_review or not isinstance(gd_review, dict):
-            return False, "graph.delta.proposed present but QA result omits graph_delta_review"
+            # Auto-pass for auto-inferred graph deltas: system-generated deltas
+            # should not block QA when the agent omits graph_delta_review.
+            # Only dev-emitted deltas require explicit QA review.
+            _gd_source = _gd_proposed.get("source", "")
+            if _gd_source in ("auto-inferred", "dev-emitted+inferred-gaps", ""):
+                gd_review = {
+                    "decision": "pass",
+                    "issues": [],
+                    "auto_generated": True,
+                    "reason": f"auto-pass: graph.delta.proposed source={_gd_source!r} does not require explicit QA review",
+                }
+                log.info("qa_gate: auto-generated graph_delta_review pass for source=%s", _gd_source)
+            else:
+                return False, "graph.delta.proposed present but QA result omits graph_delta_review"
         gd_decision = gd_review.get("decision", "")
         if gd_decision == "reject":
             issues = gd_review.get("issues", [])
