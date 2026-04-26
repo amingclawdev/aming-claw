@@ -313,3 +313,101 @@ class TestArgparse:
     def test_workspace_default(self):
         args = reconcile.parse_args([])
         assert args.workspace == "."
+
+
+class TestPhaseBDetectsL7Missing:
+    """AC4: phase_b detect() reports discrepancy type 'pm_proposed_not_in_node_state'
+    for L7 nodes missing from node_state."""
+
+    def _make_mock_graph(self, existing_node_ids):
+        """Create a mock graph with given node_ids."""
+        import unittest.mock as mock
+        graph = mock.MagicMock()
+        graph.list_nodes.return_value = list(existing_node_ids.keys())
+        graph.get_node.side_effect = lambda nid: existing_node_ids.get(nid, {})
+        return graph
+
+    def _make_mock_ctx(self, graph, pm_events):
+        """Create a mock ReconcileContext."""
+        import unittest.mock as mock
+        ctx = mock.MagicMock()
+        ctx.graph = graph
+        ctx.pm_events = pm_events
+        ctx.project_id = "test-proj"
+        return ctx
+
+    def test_l7_node_missing_detected(self):
+        """AC4: L7 node in PM proposed_nodes but NOT in node_state → discrepancy."""
+        from governance.reconcile_phases.phase_b import run as phase_b_run
+
+        existing_nodes = {
+            "L7.1": {"title": "Existing L7 node", "primary": ["agent/existing.py"]},
+            "L3.1": {"title": "Some L3 node", "primary": ["agent/l3.py"]},
+        }
+        graph = self._make_mock_graph(existing_nodes)
+
+        pm_events = [{
+            "task_id": "pm-task-001",
+            "proposed_nodes": [
+                {"node_id": "L7.1", "title": "Existing L7 node", "parent_layer": "L7",
+                 "primary": ["agent/existing.py"], "deps": [], "description": ""},
+                {"node_id": "L7.99", "title": "Missing L7 node", "parent_layer": "L7",
+                 "primary": ["agent/missing.py"], "deps": [], "description": ""},
+            ],
+        }]
+
+        ctx = self._make_mock_ctx(graph, pm_events)
+        results = phase_b_run(ctx)
+
+        # Only L7.99 should be reported as missing
+        assert len(results) == 1
+        d = results[0]
+        assert d.type == "pm_proposed_not_in_node_state"
+        assert d.node_id == "L7.99"
+        assert d.confidence in ("high", "medium")  # confidence >= medium
+
+    def test_multiple_l7_nodes_missing(self):
+        """AC4: Multiple L7 nodes missing → multiple discrepancies."""
+        from governance.reconcile_phases.phase_b import run as phase_b_run
+
+        existing_nodes = {"L3.1": {"title": "L3 node", "primary": []}}
+        graph = self._make_mock_graph(existing_nodes)
+
+        pm_events = [{
+            "task_id": "pm-task-002",
+            "proposed_nodes": [
+                {"node_id": "L7.1", "title": "First L7", "parent_layer": "L7",
+                 "primary": [], "deps": [], "description": ""},
+                {"node_id": "L7.2", "title": "Second L7", "parent_layer": "L7",
+                 "primary": [], "deps": [], "description": ""},
+            ],
+        }]
+
+        ctx = self._make_mock_ctx(graph, pm_events)
+        results = phase_b_run(ctx)
+
+        assert len(results) == 2
+        for d in results:
+            assert d.type == "pm_proposed_not_in_node_state"
+            assert d.confidence in ("high", "medium")
+
+    def test_l7_node_present_not_reported(self):
+        """AC4: L7 node present in node_state → no discrepancy."""
+        from governance.reconcile_phases.phase_b import run as phase_b_run
+
+        existing_nodes = {
+            "L7.1": {"title": "Present L7 node", "primary": ["agent/present.py"]},
+        }
+        graph = self._make_mock_graph(existing_nodes)
+
+        pm_events = [{
+            "task_id": "pm-task-003",
+            "proposed_nodes": [
+                {"node_id": "L7.1", "title": "Present L7 node", "parent_layer": "L7",
+                 "primary": ["agent/present.py"], "deps": [], "description": ""},
+            ],
+        }]
+
+        ctx = self._make_mock_ctx(graph, pm_events)
+        results = phase_b_run(ctx)
+        assert len(results) == 0
