@@ -431,7 +431,9 @@ def run_phase_h(conn, project_id: str, baseline_sha: str,
                 repo_root: str,
                 max_spawn: int = MAX_SPAWN_PER_RUN_DEFAULT,
                 api_base: str = "",
-                yaml_path: Optional[Path] = None) -> PhaseHResult:
+                yaml_path: Optional[Path] = None,
+                scope_kind: str = None,
+                scope_value: str = None) -> PhaseHResult:
     """Execute Phase H: detect content deltas and spawn PM tasks.
 
     Args:
@@ -442,12 +444,23 @@ def run_phase_h(conn, project_id: str, baseline_sha: str,
         max_spawn: Max PM tasks to spawn per run (R7).
         api_base: Override for governance API base URL.
         yaml_path: Override path to symbol_doc_map.yaml.
+        scope_kind: Optional scope kind for slice-aware baseline lookup (R8).
+        scope_value: Optional scope value for slice-aware baseline lookup (R8).
 
     Returns:
         PhaseHResult with spawn stats.
     """
     max_spawn = min(max_spawn, MAX_SPAWN_HARD_LIMIT)
     result = PhaseHResult()
+
+    # R8: Use slice-aware baseline lookup when scope is provided
+    if scope_kind and scope_value and not baseline_sha:
+        try:
+            from ..baseline_service import get_last_relevant_baseline
+            bl = get_last_relevant_baseline(conn, project_id, scope_kind, scope_value)
+            baseline_sha = bl.get("chain_version", baseline_sha)
+        except Exception as exc:
+            log.warning("phase_h: slice-aware baseline lookup failed: %s", exc)
 
     # 1. Detect discrepancies
     all_discs = detect_discrepancies(project_id, baseline_sha, repo_root, yaml_path)

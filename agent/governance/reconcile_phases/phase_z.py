@@ -361,6 +361,8 @@ def phase_z_run(
     *,
     enable_llm_enrichment: bool = False,
     apply_backlog: bool = False,
+    scope_kind: str = None,
+    scope_value: str = None,
 ) -> Dict[str, Any]:
     """Run Phase Z baseline discovery (read-only).
 
@@ -373,12 +375,29 @@ def phase_z_run(
         When True, run cheap-first LLM enrichment via ``phase_z_llm``.
     apply_backlog : bool
         When True, POST backlog rows to governance API.  Default False (AC-Z1).
+    scope_kind : str, optional
+        When provided with scope_value, uses slice-aware baseline lookup (R9).
+    scope_value : str, optional
+        When provided with scope_kind, uses slice-aware baseline lookup (R9).
 
     Returns
     -------
     dict with keys: deltas, epic_groups, artifacts, backlog_rows
     """
     from ..graph_generator import generate_graph  # R1: read-only call
+
+    # R9: Slice-aware baseline lookup for dedup
+    if scope_kind and scope_value:
+        try:
+            from ..baseline_service import get_last_relevant_baseline
+            conn = getattr(ctx, "conn", None)
+            pid = getattr(ctx, "project_id", "aming-claw")
+            if conn:
+                _bl = get_last_relevant_baseline(conn, pid, scope_kind, scope_value)
+                log.info("phase_z: using slice-aware baseline B%s for scope %s=%s",
+                         _bl.get("baseline_id"), scope_kind, scope_value)
+        except Exception as exc:
+            log.warning("phase_z: slice-aware baseline lookup failed: %s", exc)
 
     workspace = getattr(ctx, "workspace_path", getattr(ctx, "workspace", "."))
     scratch = getattr(ctx, "scratch_dir", os.path.join(workspace, "docs", "dev", "scratch"))

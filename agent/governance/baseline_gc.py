@@ -81,6 +81,16 @@ def _classify(
             seen_months.add(ym)
             month_rep_ids.add(b["baseline_id"])
 
+    # --- Rule 4 (R11): slice baselines with unresolved merge_status ----
+    # Slice baselines where merge_status IN (NULL, 'unknown', 'conflict')
+    # must NEVER be deleted by GC.
+    unresolved_slice_ids = set()
+    for b in baselines:
+        scope_kind = b.get("scope_kind")
+        merge_status = b.get("merge_status")
+        if scope_kind is not None and merge_status != "merged":
+            unresolved_slice_ids.add(b["baseline_id"])
+
     # Build annotated lists
     keep: List[dict] = []
     delete: List[dict] = []
@@ -93,6 +103,8 @@ def _classify(
             reasons.append("manual_fix")
         if bid in month_rep_ids:
             reasons.append("month_representative")
+        if bid in unresolved_slice_ids:
+            reasons.append("unresolved_slice")
         if reasons:
             b["reason_kept"] = ",".join(reasons)
             keep.append(b)
