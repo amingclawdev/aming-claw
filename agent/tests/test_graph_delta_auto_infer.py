@@ -110,6 +110,100 @@ class TestInferGraphDeltaRuleB(unittest.TestCase):
         rule_b_hits = [h for h in hits if h["rule"] == "B"]
         self.assertEqual(len(rule_b_hits), 0)
 
+    def test_skips_test_files(self):
+        """AC6: changed_files=['agent/tests/test_foo.py'] with @patch content → zero Rule B hits."""
+        tmpdir = tempfile.mkdtemp()
+        agent_tests_dir = os.path.join(tmpdir, "agent", "tests")
+        os.makedirs(agent_tests_dir)
+        test_file = os.path.join(agent_tests_dir, "test_foo.py")
+        with open(test_file, "w") as f:
+            f.write("from unittest.mock import patch\n"
+                    "@patch('urllib.request.urlopen')\n"
+                    "def test_something(mock_urlopen): pass\n")
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            delta, hits, _, _ = _infer_graph_delta(
+                [], ["agent/tests/test_foo.py"], None, {})
+            rule_b_hits = [h for h in hits if h["rule"] == "B"]
+            self.assertEqual(len(rule_b_hits), 0)
+        finally:
+            os.chdir(old_cwd)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_route_positional_extracts_method_and_path(self):
+        """AC7: @route('POST', '/api/foo') → 'HTTP endpoint: POST /api/foo'."""
+        tmpdir = tempfile.mkdtemp()
+        agent_dir = os.path.join(tmpdir, "agent")
+        os.makedirs(agent_dir)
+        route_file = os.path.join(agent_dir, "api.py")
+        with open(route_file, "w") as f:
+            f.write("@route('POST', '/api/foo')\ndef create_foo(): pass\n")
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            delta, hits, _, _ = _infer_graph_delta(
+                [], ["agent/api.py"], None, {})
+            rule_b_hits = [h for h in hits if h["rule"] == "B"]
+            self.assertEqual(len(rule_b_hits), 1)
+            self.assertEqual(
+                delta["creates"][0]["title"],
+                "HTTP endpoint: POST /api/foo")
+        finally:
+            os.chdir(old_cwd)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_dotted_decorator_extracts_method(self):
+        """AC8: @app.patch('/items/{id}') → 'HTTP endpoint: PATCH /items/{id}'."""
+        tmpdir = tempfile.mkdtemp()
+        agent_dir = os.path.join(tmpdir, "agent")
+        os.makedirs(agent_dir)
+        route_file = os.path.join(agent_dir, "items.py")
+        with open(route_file, "w") as f:
+            f.write("@app.patch('/items/{id}')\ndef update_item(): pass\n")
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            delta, hits, _, _ = _infer_graph_delta(
+                [], ["agent/items.py"], None, {})
+            rule_b_hits = [h for h in hits if h["rule"] == "B"]
+            self.assertEqual(len(rule_b_hits), 1)
+            self.assertEqual(
+                delta["creates"][0]["title"],
+                "HTTP endpoint: PATCH /items/{id}")
+        finally:
+            os.chdir(old_cwd)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_bare_patch_not_matched(self):
+        """AC9: non-test file with @patch('urllib.request.urlopen') → zero Rule B hits."""
+        tmpdir = tempfile.mkdtemp()
+        agent_dir = os.path.join(tmpdir, "agent")
+        os.makedirs(agent_dir)
+        src_file = os.path.join(agent_dir, "client.py")
+        with open(src_file, "w") as f:
+            f.write("from unittest.mock import patch\n"
+                    "@patch('urllib.request.urlopen')\n"
+                    "def patched_func(): pass\n")
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            delta, hits, _, _ = _infer_graph_delta(
+                [], ["agent/client.py"], None, {})
+            rule_b_hits = [h for h in hits if h["rule"] == "B"]
+            self.assertEqual(len(rule_b_hits), 0)
+        finally:
+            os.chdir(old_cwd)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestInferGraphDeltaRuleD(unittest.TestCase):
     """A6: Rule D — existing graph nodes with primary in changed_files get updates[]."""
