@@ -14,13 +14,18 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-PHASE_ORDER = ["A", "E", "B", "C", "D", "F", "G"]
+PHASE_ORDER = ["K", "A", "E", "B", "C", "D", "F", "G"]
 
 
 def _run_phase(phase_key: str, ctx: Any, phase_results: Dict[str, list],
                scope: Optional[Any] = None) -> list:
     """Run a single phase by key, returning its discrepancy list."""
-    if phase_key == "A":
+    if phase_key == "K":
+        if scope is None:
+            return []
+        from . import phase_k
+        return phase_k.run(ctx, scope=scope)
+    elif phase_key == "A":
         from . import phase_a
         return phase_a.run(ctx, scope=scope)
     elif phase_key == "E":

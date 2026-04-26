@@ -1,0 +1,13 @@
+# Phase K — Contract-Test-Coverage rules
+# Filters and aliases for contract extraction.
+
+# Constants to exclude from PublicConstantContract extraction
+excluded_constants: []
+
+# Service name aliases for context_mentions_service matching
+# e.g. governance: [gov, governance-api]
+service_name_aliases: {}
+
+# Endpoint path normalization rules
+# e.g. /api/v1/: /api/
+endpoint_path_normalize: {}
