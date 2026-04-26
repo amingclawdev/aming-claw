@@ -48,6 +48,13 @@ _DIRTY_IGNORE = (
 _GRAPH_DOC_OBSERVATION_MODE = True
 
 # ---------------------------------------------------------------------------
+# Corrective PM State Machine Constants (R5)
+# ---------------------------------------------------------------------------
+TASK_STATUS_BLOCKED_BY_CORRECTIVE = "blocked_by_corrective"
+TASK_STATUS_HUMAN_REVIEW_REQUIRED = "human_review_required"
+MAX_QA_CORRECTIVE_ROUNDS = 1
+
+# ---------------------------------------------------------------------------
 # Reconciliation Bypass Policy (R1)
 # ---------------------------------------------------------------------------
 RECONCILIATION_BYPASS_POLICY = {
@@ -113,6 +120,118 @@ def _audit_reconciliation_bypass(conn, project_id, task_id, observer_task_id, la
         )
     except Exception:
         log.debug("audit reconciliation_bypass failed (non-critical)", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Corrective PM State Machine Helpers (R6-R8)
+# ---------------------------------------------------------------------------
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def spawn_corrective_pm(conn, project_id, parent_qa_task_id, qa_failure_reason, bug_id):
+    """Spawn a corrective PM task when QA fails, enforcing round limits and dedup.
+
+    Returns the new child task_id, or None if:
+      - qa_corrective_round >= MAX_QA_CORRECTIVE_ROUNDS (marks parent human_review_required)
+      - an OPEN child PM task with same bug_id + parent_task_id already exists (dedup)
+    """
+    # Read parent task to get current round
+    parent_row = conn.execute(
+        "SELECT task_id, status, retry_round, metadata_json FROM tasks WHERE task_id = ? AND project_id = ?",
+        (parent_qa_task_id, project_id),
+    ).fetchone()
+    if not parent_row:
+        log.warning("spawn_corrective_pm: parent task %s not found", parent_qa_task_id)
+        return None
+
+    parent_meta = {}
+    try:
+        parent_meta = json.loads(parent_row["metadata_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    qa_corrective_round = int(parent_meta.get("qa_corrective_round", 0))
+
+    # R6: enforce MAX_QA_CORRECTIVE_ROUNDS limit
+    if qa_corrective_round >= MAX_QA_CORRECTIVE_ROUNDS:
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE task_id = ? AND project_id = ?",
+            (TASK_STATUS_HUMAN_REVIEW_REQUIRED, parent_qa_task_id, project_id),
+        )
+        conn.commit()
+        log.info("spawn_corrective_pm: parent %s marked human_review_required (round %d >= max %d)",
+                 parent_qa_task_id, qa_corrective_round, MAX_QA_CORRECTIVE_ROUNDS)
+        return None
+
+    # R7: dedup guard — check for existing OPEN child PM with same bug_id + parent_task_id
+    existing = conn.execute(
+        """SELECT task_id FROM tasks
+           WHERE project_id = ? AND type = 'pm'
+             AND parent_task_id = ?
+             AND status NOT IN ('succeeded', 'failed', 'cancelled')
+             AND metadata_json LIKE ?""",
+        (project_id, parent_qa_task_id, f'%"bug_id": "{bug_id}"%'),
+    ).fetchone()
+    if existing:
+        log.info("spawn_corrective_pm: dedup — existing OPEN PM task %s for bug_id=%s",
+                 existing["task_id"], bug_id)
+        return None
+
+    # Mark parent as blocked
+    conn.execute(
+        "UPDATE tasks SET status = ? WHERE task_id = ? AND project_id = ?",
+        (TASK_STATUS_BLOCKED_BY_CORRECTIVE, parent_qa_task_id, project_id),
+    )
+
+    # Spawn child PM task
+    import uuid
+    now = _utc_now()
+    child_task_id = f"task-corrective-{uuid.uuid4().hex[:12]}"
+    child_meta = json.dumps({
+        "bug_id": bug_id,
+        "parent_task_id": parent_qa_task_id,
+        "qa_corrective_round": qa_corrective_round + 1,
+        "qa_failure_reason": qa_failure_reason,
+    }, sort_keys=True)
+
+    conn.execute(
+        """INSERT INTO tasks
+           (task_id, project_id, status, type, prompt, created_by, created_at,
+            updated_at, parent_task_id, metadata_json)
+           VALUES (?, ?, 'queued', 'pm', ?, 'auto-chain', ?, ?, ?, ?)""",
+        (child_task_id, project_id,
+         f"Corrective PM for QA failure: {qa_failure_reason[:200]}",
+         now, now, parent_qa_task_id, child_meta),
+    )
+    conn.commit()
+    log.info("spawn_corrective_pm: spawned child PM %s for parent %s (round %d)",
+             child_task_id, parent_qa_task_id, qa_corrective_round + 1)
+    return child_task_id
+
+
+def on_corrective_chain_complete(conn, project_id, parent_task_id):
+    """Clear blocked_by_corrective on the parent QA task and re-enqueue it.
+
+    Sets status='queued' and increments retry_round.
+    """
+    parent_row = conn.execute(
+        "SELECT task_id, status, retry_round FROM tasks WHERE task_id = ? AND project_id = ?",
+        (parent_task_id, project_id),
+    ).fetchone()
+    if not parent_row:
+        log.warning("on_corrective_chain_complete: parent task %s not found", parent_task_id)
+        return
+
+    new_retry_round = (parent_row["retry_round"] or 0) + 1
+    conn.execute(
+        "UPDATE tasks SET status = 'queued', retry_round = ? WHERE task_id = ? AND project_id = ?",
+        (new_retry_round, parent_task_id, project_id),
+    )
+    conn.commit()
+    log.info("on_corrective_chain_complete: re-enqueued parent %s as queued (retry_round=%d)",
+             parent_task_id, new_retry_round)
 
 
 def _audit_version_gate_bypass(conn, project_id, task_id, operator_id, bypass_reason, task_type):

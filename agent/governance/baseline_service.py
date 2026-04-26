@@ -21,6 +21,21 @@ log = logging.getLogger(__name__)
 
 TRIGGER_ALLOWLIST = frozenset({"auto-chain", "reconcile-task", "manual-fix", "init"})
 
+# ---------------------------------------------------------------------------
+# Merge status enum (R1)
+# ---------------------------------------------------------------------------
+MERGE_STATUS_QA_VERIFIED = "qa_verified"
+MERGE_STATUS_MERGED = "merged"
+MERGE_STATUS_ABANDONED = "abandoned"
+MERGE_STATUS_SUPERSEDED = "superseded"
+
+ALLOWED_MERGE_STATUSES = frozenset({
+    MERGE_STATUS_QA_VERIFIED,
+    MERGE_STATUS_MERGED,
+    MERGE_STATUS_ABANDONED,
+    MERGE_STATUS_SUPERSEDED,
+})
+
 _COMPANION_DIR_ENV = "SHARED_VOLUME_PATH"
 
 
@@ -114,13 +129,32 @@ def read_companion_file(project_id: str, baseline_id: int, filename: str) -> dic
 # Core CRUD (R1)
 # ---------------------------------------------------------------------------
 
+def set_baseline_merge_status(conn: sqlite3.Connection, project_id: str,
+                              baseline_id: int, status: str) -> None:
+    """Set the merge_status of a baseline, validating against ALLOWED_MERGE_STATUSES.
+
+    Raises ValueError if *status* is not in ALLOWED_MERGE_STATUSES.
+    """
+    if status not in ALLOWED_MERGE_STATUSES:
+        raise ValueError(
+            f"status must be one of {sorted(ALLOWED_MERGE_STATUSES)}, got {status!r}"
+        )
+    conn.execute(
+        """UPDATE version_baselines SET merge_status = ?
+           WHERE project_id = ? AND baseline_id = ?""",
+        (status, project_id, baseline_id),
+    )
+    conn.commit()
+
+
 def create_baseline(conn: sqlite3.Connection, project_id: str,
                     chain_version: str, trigger: str, triggered_by: str,
                     graph_json: dict = None, code_doc_map_json: dict = None,
                     node_state_snap: str = "", chain_event_max: int = 0,
                     notes: str = "", reconstructed: int = 0,
                     scope_kind: str = None, scope_value: str = None,
-                    parent_baseline_id: int = None) -> dict:
+                    parent_baseline_id: int = None,
+                    mutations_sha256: dict = None) -> dict:
     """Create a new baseline row + companion files.
 
     R7: trigger allowlist enforcement.
@@ -153,19 +187,23 @@ def create_baseline(conn: sqlite3.Connection, project_id: str,
     # Build scope_id from kind+value if provided
     scope_id = f"{scope_kind}:{scope_value}" if scope_kind and scope_value else None
 
+    mutations_sha256_json = json.dumps(mutations_sha256 or {}, sort_keys=True)
+
     conn.execute(
         """INSERT INTO version_baselines
            (project_id, baseline_id, chain_version, graph_sha, code_doc_map_sha,
             node_state_snap, chain_event_max, trigger, triggered_by,
             reconstructed, created_at, notes,
             scope_id, parent_baseline_id, scope_kind, scope_value,
-            merged_into, merge_status, merge_evidence_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            merged_into, merge_status, merge_evidence_json,
+            mutations_sha256)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (project_id, next_id, chain_version, graph_sha, code_doc_map_sha,
          node_state_snap, chain_event_max, trigger, triggered_by,
          reconstructed, now, notes,
          scope_id, parent_baseline_id, scope_kind, scope_value,
-         None, None, None),
+         None, None, None,
+         mutations_sha256_json),
     )
     conn.commit()
 
