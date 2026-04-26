@@ -526,5 +526,69 @@ class TestTriggerBaselineWrite(unittest.TestCase):
         self.assertEqual(row["chain_version"], "abc1234")
 
 
+class TestHandleProposeMutationSchema(unittest.TestCase):
+    """AC7/AC8: Verify handle_propose emits spec-compliant mutation entries."""
+
+    @mock.patch("governance.reconcile_task._write_mutation_plan")
+    @mock.patch("governance.reconcile_task._check_cancellation")
+    def test_handle_propose_mutation_schema(self, mock_cancel, mock_write_plan):
+        from governance.reconcile_task import handle_propose
+
+        conn = _make_in_memory_db()
+        project_id = "test-proj"
+        task_id = "task-propose-schema"
+
+        # Build prev_result with both missing_in_db and orphan_in_db diffs
+        prev_result = {
+            "diffs": [
+                {"type": "missing_in_db", "node_id": "L1.new", "severity": "high"},
+                {"type": "orphan_in_db", "node_id": "L2.old", "severity": "medium"},
+            ],
+            "baseline": {"chain_version": "abc123"},
+        }
+
+        handle_propose(conn, project_id, task_id, {}, prev_result)
+        # Extract the plan passed to _write_mutation_plan
+        mock_write_plan.assert_called_once()
+        plan = mock_write_plan.call_args[0][2]  # (project_id, task_id, plan)
+        mutations = plan["mutations"]
+        self.assertEqual(len(mutations), 2)
+
+        required_keys = {
+            "mutation_id", "type", "before", "after",
+            "reason", "confidence", "governance_api", "rollback_hint",
+        }
+
+        # Check all required keys present in each mutation
+        for m in mutations:
+            for key in required_keys:
+                self.assertIn(key, m, f"Missing key '{key}' in mutation {m.get('mutation_id', '?')}")
+
+        # AC3: sequential mutation_id
+        self.assertEqual(mutations[0]["mutation_id"], "M1")
+        self.assertEqual(mutations[1]["mutation_id"], "M2")
+
+        # AC4: missing_in_db specifics
+        m_create = mutations[0]
+        self.assertEqual(m_create["type"], "node_create")
+        self.assertIsNone(m_create["before"])
+        self.assertIn("node-create", m_create["governance_api"])
+        self.assertIn("node_id_proposed", m_create)
+        self.assertEqual(m_create["node_id_proposed"], "L1.new")
+
+        # AC5: orphan_in_db specifics
+        m_delete = mutations[1]
+        self.assertEqual(m_delete["type"], "node_soft_delete")
+        self.assertEqual(m_delete["confidence"], "low")
+        self.assertIn("node-soft-delete", m_delete["governance_api"])
+        self.assertIn("node_id", m_delete)
+        self.assertEqual(m_delete["before"]["verify_status"], "active")
+        self.assertEqual(m_delete["after"]["verify_status"], "soft_deleted")
+
+        # AC6: backward-compatible action field
+        self.assertEqual(m_create["action"], "node-create")
+        self.assertEqual(m_delete["action"], "node-soft-delete")
+
+
 if __name__ == "__main__":
     unittest.main()

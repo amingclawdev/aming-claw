@@ -516,21 +516,35 @@ def handle_propose(conn, project_id, task_id, metadata, prev_result):
     baseline = diff_result.get("baseline", {})
 
     mutations = []
-    for d in diffs:
+    all_diffs = diffs
+    for idx, d in enumerate(all_diffs, start=1):
+        mutation_id = f"M{idx}"
         confidence = "high" if d.get("severity") == "high" else "medium"
         if d["type"] == "missing_in_db":
             mutations.append({
-                "action": "node-create",
-                "node_id": d["node_id"],
+                "mutation_id": mutation_id,
+                "type": "node_create",
+                "node_id_proposed": d["node_id"],
+                "before": None,
+                "after": {"node_id": d["node_id"], "verify_status": "pending"},
+                "reason": f"Create missing node_state for {d['node_id']}",
                 "confidence": confidence,
-                "description": f"Create missing node_state for {d['node_id']}",
+                "governance_api": f"POST /api/wf/{project_id}/node-create",
+                "rollback_hint": f"DELETE node {d['node_id']} if created",
+                "action": "node-create",
             })
         elif d["type"] == "orphan_in_db":
             mutations.append({
-                "action": "node-soft-delete",
+                "mutation_id": mutation_id,
+                "type": "node_soft_delete",
                 "node_id": d["node_id"],
+                "before": {"node_id": d["node_id"], "verify_status": "active"},
+                "after": {"node_id": d["node_id"], "verify_status": "soft_deleted"},
+                "reason": f"Soft-delete orphan node {d['node_id']}",
                 "confidence": "low",
-                "description": f"Soft-delete orphan node {d['node_id']}",
+                "governance_api": f"POST /api/wf/{project_id}/node-soft-delete",
+                "rollback_hint": f"Restore node {d['node_id']} to active",
+                "action": "node-soft-delete",
             })
 
     plan = {
