@@ -91,6 +91,7 @@ def run(
     *,
     grace_period_days: int = DEFAULT_GRACE_PERIOD_DAYS,
     required_keywords: Optional[frozenset] = None,
+    scope=None,
 ) -> list:
     """Run Phase D doc drift scan. REPORT ONLY — never auto-fixes."""
     from . import Discrepancy
@@ -119,5 +120,25 @@ def run(
                 detail=f"doc={f['doc']} missing={f['missing']}",
                 confidence="low",
             ))
+
+    # --- scope filtering: keep only docs in scope.files() or referencing scope files ---
+    if scope is not None:
+        scope_files = scope.files()
+        filtered = []
+        for d in results:
+            import re as _re
+            m = _re.search(r"doc=(\S+)", d.detail)
+            if m:
+                doc_path = m.group(1)
+                if doc_path in scope_files:
+                    filtered.append(d)
+                    continue
+                # Check if the doc references any scope source file
+                ref_m = _re.search(r"ref=(\S+)", d.detail)
+                if ref_m and ref_m.group(1) in scope_files:
+                    filtered.append(d)
+            else:
+                filtered.append(d)
+        results = filtered
 
     return results

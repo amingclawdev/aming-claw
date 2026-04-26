@@ -982,6 +982,11 @@ def handle_reconcile_v2(ctx: RequestContext):
         if key in body and key not in metadata:
             metadata[key] = body[key]
 
+    # Forward scope fields if present
+    scope_data = body.get("scope")
+    if scope_data and isinstance(scope_data, dict):
+        metadata["scope"] = scope_data
+
     # Forward legacy fields for compat
     for key in ("workspace_path", "dry_run", "phases", "auto_fix_threshold",
                 "scan_depth", "since"):

@@ -94,6 +94,7 @@ def run(
     git_log: Optional[List[Dict[str, Any]]] = None,
     backlog_bugs: Optional[List[Dict[str, Any]]] = None,
     mf_files: Optional[List[Dict[str, str]]] = None,
+    scope=None,
 ) -> list:
     """Run Phase C completeness check.
 
@@ -146,6 +147,18 @@ def run(
                     detail=f"sha={sha} subject={subject!r}",
                     confidence="medium",
                 ))
+
+    # --- scope filtering: keep only commits in scope.commit_set ---
+    if scope is not None and hasattr(scope, 'commit_set') and scope.commit_set:
+        filtered = []
+        for d in results:
+            import re as _re
+            m = _re.search(r"sha=(\S+)", d.detail)
+            if m and m.group(1) in scope.commit_set:
+                filtered.append(d)
+            elif not m:
+                filtered.append(d)
+        results = filtered
 
     return results
 

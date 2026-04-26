@@ -17,29 +17,30 @@ log = logging.getLogger(__name__)
 PHASE_ORDER = ["A", "E", "B", "C", "D", "F", "G"]
 
 
-def _run_phase(phase_key: str, ctx: Any, phase_results: Dict[str, list]) -> list:
+def _run_phase(phase_key: str, ctx: Any, phase_results: Dict[str, list],
+               scope: Optional[Any] = None) -> list:
     """Run a single phase by key, returning its discrepancy list."""
     if phase_key == "A":
         from . import phase_a
-        return phase_a.run(ctx)
+        return phase_a.run(ctx, scope=scope)
     elif phase_key == "E":
         from . import phase_e
-        return phase_e.run(ctx)
+        return phase_e.run(ctx, scope=scope)
     elif phase_key == "B":
         from . import phase_b
-        return phase_b.run(ctx, phase_e_discrepancies=phase_results.get("E"))
+        return phase_b.run(ctx, phase_e_discrepancies=phase_results.get("E"), scope=scope)
     elif phase_key == "C":
         from . import phase_c
-        return phase_c.run(ctx)
+        return phase_c.run(ctx, scope=scope)
     elif phase_key == "D":
         from . import phase_d
-        return phase_d.run(ctx)
+        return phase_d.run(ctx, scope=scope)
     elif phase_key == "F":
         from . import phase_f
-        return phase_f.run(ctx, phase_a_discrepancies=phase_results.get("A"))
+        return phase_f.run(ctx, phase_a_discrepancies=phase_results.get("A"), scope=scope)
     elif phase_key == "G":
         from . import phase_g
-        return phase_g.run(ctx)
+        return phase_g.run(ctx, scope=scope)
     else:
         log.warning("Unknown phase key: %s", phase_key)
         return []
@@ -120,6 +121,7 @@ def run_orchestrated(
     auto_fix_threshold: str = "high",
     scan_depth: int = 3,
     since: Optional[str] = None,
+    scope: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run the full reconcile v2 pipeline.
 
@@ -144,6 +146,11 @@ def run_orchestrated(
         scan_depth=scan_depth,
     )
 
+    # Resolve scope if provided
+    resolved_scope = None
+    if scope is not None:
+        resolved_scope = scope.resolve(ctx)
+
     requested = phases if phases else list(PHASE_ORDER)
     # Enforce canonical order
     ordered = [p for p in PHASE_ORDER if p in requested]
@@ -153,7 +160,7 @@ def run_orchestrated(
 
     for key in ordered:
         try:
-            result = _run_phase(key, ctx, phase_results)
+            result = _run_phase(key, ctx, phase_results, scope=resolved_scope)
         except Exception as exc:
             log.error("Phase %s failed: %s", key, exc)
             result = []

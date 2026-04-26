@@ -28,12 +28,15 @@ def _get_discrepancy():
     return _Discrepancy
 
 
-def run(ctx: "ReconcileContext") -> list:
+def run(ctx: "ReconcileContext", *, scope=None) -> list:
     """Run phase_diff via context and convert DiffReport → list[Discrepancy].
 
     Additionally checks DB-vs-graph consistency:
     - orphan_in_db: nodes in node_state table but not in graph definition
     - stuck_testing: nodes stuck in 'testing' verify_status
+
+    When scope is provided (ResolvedScope), filters results to nodes whose
+    files intersect scope.files() or whose node_id is in scope.node_set.
     """
     Discrepancy = _get_discrepancy()
     graph = ctx.graph
@@ -92,7 +95,41 @@ def run(ctx: "ReconcileContext") -> list:
     _check_orphan_db_records(ctx, graph, results, Discrepancy)
     _check_stuck_testing_nodes(ctx, graph, results, Discrepancy)
 
+    # --- scope filtering ---
+    if scope is not None:
+        results = _filter_by_scope(results, scope, graph)
+
     return results
+
+
+def _filter_by_scope(results, scope, graph):
+    """Keep only discrepancies whose node/file intersects scope."""
+    scope_files = scope.files()
+    scope_nodes = scope.node_set
+    filtered = []
+    for d in results:
+        # File-level discrepancies (unmapped_file, unmapped_doc, stale_doc_ref)
+        if d.node_id is None:
+            # detail holds the file path for unmapped_file/unmapped_doc
+            if d.detail in scope_files:
+                filtered.append(d)
+            continue
+        # Node-level: check node_id in scope or node files intersect scope
+        if d.node_id in scope_nodes:
+            filtered.append(d)
+            continue
+        if graph is not None:
+            try:
+                node = graph.get_node(d.node_id)
+                if node is not None:
+                    from .scope import _node_files
+                    nf = set(_node_files(node))
+                    if nf & scope_files:
+                        filtered.append(d)
+                        continue
+            except Exception:
+                pass
+    return filtered
 
 
 def _check_orphan_db_records(ctx, graph, results, Discrepancy):

@@ -61,6 +61,7 @@ def run(
     ctx: "ReconcileContext",
     *,
     phase_a_discrepancies: Optional[List[Any]] = None,
+    scope=None,
 ) -> list:
     """Run Phase F verify_status freshness check.
 
@@ -150,6 +151,12 @@ def run(
                 ),
                 confidence=confidence,
             ))
+
+    # --- scope filtering: keep only nodes in scope.node_set ---
+    if scope is not None:
+        scope_nodes = scope.node_set
+        if scope_nodes:
+            results = [d for d in results if d.node_id in scope_nodes]
 
     return results
 

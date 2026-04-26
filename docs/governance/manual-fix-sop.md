@@ -1,6 +1,6 @@
 # Manual Fix SOP (Standard Operating Procedure)
 
-> Status: DRAFT v3 — v2 + 5 new rules (R6-R10) from dogfooding MF-2026-04-05-001
+> Status: DRAFT v4 — v3 + scoped reconcile support (reconcile-v2 scope parameter)
 > Author: Observer
 > Date: 2026-04-05
 > Scope: Enforceable operating procedure for AI agents performing manual fixes

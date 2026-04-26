@@ -214,6 +214,7 @@ def run(
     ctx: "ReconcileContext",
     *,
     phase_e_discrepancies: Optional[List[Any]] = None,
+    scope=None,
 ) -> list:
     """Run Phase B: detect PM proposed_nodes absent from node_state.
 
@@ -282,6 +283,22 @@ def run(
                 ),
                 confidence=confidence,
             ))
+
+    # --- scope filtering: keep only PM tasks intersecting scope.files() ---
+    if scope is not None:
+        scope_files = scope.files()
+        filtered = []
+        for d in results:
+            # Extract primary files from detail
+            import re as _re
+            m = _re.search(r"primary=\[([^\]]*)\]", d.detail)
+            if m:
+                primaries = [p.strip().strip("'\"") for p in m.group(1).split(",") if p.strip()]
+                if set(primaries) & scope_files:
+                    filtered.append(d)
+            else:
+                filtered.append(d)
+        results = filtered
 
     # Attach breakdown as a property on the results list
     # (callers access via phase_b_result.confidence_breakdown)
