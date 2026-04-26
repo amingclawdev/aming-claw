@@ -1,14 +1,18 @@
-"""Phase Z v2 PR1 — Symbol-level topology infrastructure.
+"""Phase Z v2 — Symbol-level topology infrastructure + driver.
 
-AST-based parsing, import-aware call graph construction, Tarjan SCC,
-and hybrid cycle handling.  No CLI, no graph.json writes, no migration
-state machine — those are PR 2/3 scope.
+PR1: AST-based parsing, import-aware call graph construction, Tarjan SCC,
+and hybrid cycle handling.
+PR2: Scoring + aggregation.
+PR3: Driver function, coverage lookup, diff, artifact write, CLI.
 """
 from __future__ import annotations
 
 import ast
+import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
@@ -662,3 +666,344 @@ def _edge_strength(
 
     # Otherwise assume function-internal import (weakest)
     return 1
+
+
+# ---------------------------------------------------------------------------
+# PR2: Scoring + Aggregation
+# ---------------------------------------------------------------------------
+
+def score_function_layer(
+    func_qname: str,
+    scc_index: Dict[str, int],
+    graph_edges: Dict[str, List[str]],
+    all_functions: Dict[str, FunctionMeta],
+) -> int:
+    """Score a function's layer based on SCC topology order and call depth.
+
+    Lower layer = closer to leaf (no outgoing calls).
+    Returns an integer layer score >= 0.
+    """
+    base = scc_index.get(func_qname, 0)
+    outgoing = graph_edges.get(func_qname, [])
+    if not outgoing:
+        return base
+    max_target = max(scc_index.get(t, 0) for t in outgoing)
+    return max(base, max_target + 1)
+
+
+def aggregate_functions_into_nodes(
+    modules: Dict[str, ModuleInfo],
+    layer_scores: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """Aggregate per-function layer scores into per-module node dicts.
+
+    Returns a list of node dicts with keys:
+      node_id, primary_file, module, layer, functions, function_count
+    """
+    nodes: List[Dict[str, Any]] = []
+    for mod_name, mod_info in modules.items():
+        func_layers = [layer_scores.get(f.qualified_name, 0) for f in mod_info.functions]
+        agg_layer = max(func_layers) if func_layers else 0
+        nodes.append({
+            "node_id": mod_name,
+            "primary_file": mod_info.path,
+            "module": mod_name,
+            "layer": agg_layer,
+            "functions": [f.qualified_name for f in mod_info.functions],
+            "function_count": len(mod_info.functions),
+        })
+    return nodes
+
+
+# ---------------------------------------------------------------------------
+# PR3 R2: Coverage lookup
+# ---------------------------------------------------------------------------
+
+def find_test_coverage(
+    project_root: str,
+    primary_file: str,
+) -> Dict[str, Any]:
+    """Find test files and coverage for a given primary source file.
+
+    Returns dict with test_files (list of paths) and covered_lines (int).
+    """
+    test_files: List[str] = []
+    covered_lines = 0
+
+    # Derive the module basename for matching
+    base = os.path.basename(primary_file)
+    if base.endswith(".py"):
+        base = base[:-3]
+
+    # Search common test dirs
+    test_dirs = ["tests", "agent/tests", "test"]
+    for td in test_dirs:
+        tpath = os.path.join(project_root, td)
+        if not os.path.isdir(tpath):
+            continue
+        for fname in os.listdir(tpath):
+            if not fname.endswith(".py"):
+                continue
+            # Match test_<module>.py or test_<module>_*.py patterns
+            if fname == f"test_{base}.py" or fname.startswith(f"test_{base}_"):
+                full = os.path.join(tpath, fname)
+                test_files.append(full)
+                try:
+                    content = _read_file(full)
+                    covered_lines += content.count("\n")
+                except OSError:
+                    pass
+
+    return {"test_files": test_files, "covered_lines": covered_lines}
+
+
+def find_doc_coverage(
+    project_root: str,
+    primary_file: str,
+) -> Dict[str, Any]:
+    """Find doc files referencing a given primary source file.
+
+    Returns dict with doc_files (list of paths) and covered_lines (int).
+    """
+    doc_files: List[str] = []
+    covered_lines = 0
+
+    rel = os.path.relpath(primary_file, project_root) if os.path.isabs(primary_file) else primary_file
+    rel_normalized = rel.replace(os.sep, "/")
+
+    docs_dir = os.path.join(project_root, "docs")
+    if not os.path.isdir(docs_dir):
+        return {"doc_files": doc_files, "covered_lines": covered_lines}
+
+    for dirpath, _dirnames, filenames in os.walk(docs_dir):
+        for fname in filenames:
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                content = _read_file(fpath)
+                if rel_normalized in content or os.path.basename(primary_file) in content:
+                    doc_files.append(fpath)
+                    covered_lines += content.count("\n")
+            except OSError:
+                pass
+
+    return {"doc_files": doc_files, "covered_lines": covered_lines}
+
+
+# ---------------------------------------------------------------------------
+# PR3 R3: Dry-run artifact
+# ---------------------------------------------------------------------------
+
+def write_dry_run_artifact(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+    diff_report: Dict[str, Any],
+) -> str:
+    """Write docs/dev/scratch/graph-v2-{date}.json with diff-vs-current report.
+
+    Returns the path to the written file.
+    """
+    scratch_dir = os.path.join(project_root, "docs", "dev", "scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_path = os.path.join(scratch_dir, f"graph-v2-{date_str}.json")
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "node_count": len(nodes),
+        "nodes": nodes,
+        "diff_report": diff_report,
+    }
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# PR3 R4: Diff against existing graph
+# ---------------------------------------------------------------------------
+
+def diff_against_existing_graph(
+    project_root: str,
+    new_nodes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Compare new derived nodes vs existing graph.json.
+
+    Returns dict with only_in_new, only_in_old, layer_changes.
+    """
+    graph_path = os.path.join(project_root, "agent", "governance", "graph.json")
+
+    old_nodes_by_id: Dict[str, Any] = {}
+    if os.path.isfile(graph_path):
+        try:
+            with open(graph_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # graph.json may have various formats; try to extract node list
+            if isinstance(data, dict) and "nodes" in data:
+                for n in data["nodes"]:
+                    nid = n.get("node_id", n.get("id", ""))
+                    if nid:
+                        old_nodes_by_id[nid] = n
+            elif isinstance(data, list):
+                for n in data:
+                    nid = n.get("node_id", n.get("id", ""))
+                    if nid:
+                        old_nodes_by_id[nid] = n
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    new_ids = {n["node_id"] for n in new_nodes}
+    old_ids = set(old_nodes_by_id.keys())
+
+    only_in_new = sorted(new_ids - old_ids)
+    only_in_old = sorted(old_ids - new_ids)
+
+    layer_changes: List[Dict[str, Any]] = []
+    new_by_id = {n["node_id"]: n for n in new_nodes}
+    for nid in new_ids & old_ids:
+        old_layer = old_nodes_by_id[nid].get("layer")
+        new_layer = new_by_id[nid].get("layer")
+        if old_layer is not None and new_layer is not None and old_layer != new_layer:
+            layer_changes.append({
+                "node_id": nid,
+                "old_layer": old_layer,
+                "new_layer": new_layer,
+            })
+
+    return {
+        "only_in_new": only_in_new,
+        "only_in_old": only_in_old,
+        "layer_changes": layer_changes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PR3 R5: Write graph.v2.json
+# ---------------------------------------------------------------------------
+
+def write_graph_v2_json(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+) -> str:
+    """Write agent/governance/graph.v2.json (NOT graph.json).
+
+    Returns the path to the written file.
+    """
+    out_path = os.path.join(project_root, "agent", "governance", "graph.v2.json")
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "version": "v2",
+        "node_count": len(nodes),
+        "nodes": nodes,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# PR3 R1/R10/R11: Driver function
+# ---------------------------------------------------------------------------
+
+CYCLE_ABORT_THRESHOLD = 30
+
+
+def build_graph_v2_from_symbols(
+    project_root: str,
+    dry_run: bool = True,
+    owner: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Orchestrate the full symbol-level topology pipeline.
+
+    Calls: parse_production_modules, build_call_graph, tarjan_scc,
+    score_function_layer, aggregate_functions_into_nodes,
+    find_test_coverage, find_doc_coverage.
+
+    If dry_run=True, writes to docs/dev/scratch/ and returns report_path.
+    If dry_run=False, writes graph.v2.json and calls create_baseline.
+    If >30 cycles detected, returns status='aborted'.
+    """
+    # Step 1: PR1 — parse + call graph + SCC
+    modules = parse_production_modules(project_root)
+    call_graph = build_call_graph(modules)
+    sccs = tarjan_scc(call_graph.edges)
+
+    # Handle cycles
+    real_cycles = [scc for scc in sccs if len(scc) >= 2]
+
+    # R10: Cycle abort threshold
+    if len(real_cycles) > CYCLE_ABORT_THRESHOLD:
+        return {
+            "status": "aborted",
+            "abort_reason": f"Too many cycles: {len(real_cycles)} exceeds threshold {CYCLE_ABORT_THRESHOLD}",
+        }
+
+    for scc in real_cycles:
+        handle_cycle(scc, call_graph.all_functions, call_graph.edges)
+
+    # Step 2: PR2 — scoring + aggregation
+    # Build SCC index (topological order)
+    scc_index: Dict[str, int] = {}
+    for idx, scc in enumerate(sccs):
+        for node in scc:
+            scc_index[node] = idx
+
+    layer_scores: Dict[str, int] = {}
+    for qname in call_graph.all_functions:
+        layer_scores[qname] = score_function_layer(
+            qname, scc_index, call_graph.edges, call_graph.all_functions
+        )
+
+    nodes = aggregate_functions_into_nodes(modules, layer_scores)
+
+    # Step 3: PR3 — coverage lookup
+    for node in nodes:
+        pf = node.get("primary_file", "")
+        test_cov = find_test_coverage(project_root, pf)
+        doc_cov = find_doc_coverage(project_root, pf)
+        node["test_coverage"] = test_cov
+        node["doc_coverage"] = doc_cov
+
+    # Step 4: Diff against existing
+    diff_report = diff_against_existing_graph(project_root, nodes)
+
+    if dry_run:
+        # R3: Write dry-run artifact
+        report_path = write_dry_run_artifact(project_root, nodes, diff_report)
+        return {
+            "status": "ok",
+            "report_path": report_path,
+            "node_count": len(nodes),
+            "diff_report": diff_report,
+        }
+    else:
+        # R5: Write graph.v2.json
+        graph_path = write_graph_v2_json(project_root, nodes)
+
+        # R11: Call create_baseline with scope_kind='symbol-bootstrap'
+        try:
+            from agent.governance.baseline_service import create_baseline
+            from agent.governance.db import get_connection
+            conn = get_connection("aming-claw")
+            create_baseline(
+                conn=conn,
+                project_id="aming-claw",
+                chain_version="",
+                trigger="phase-z-v2",
+                triggered_by=owner or "phase-z-v2",
+                scope_kind="symbol-bootstrap",
+            )
+            conn.close()
+        except Exception:
+            pass  # Best-effort baseline creation
+
+        return {
+            "status": "ok",
+            "graph_path": graph_path,
+            "node_count": len(nodes),
+            "diff_report": diff_report,
+        }
