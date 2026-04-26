@@ -49,6 +49,7 @@ _DEFAULT_EXCLUDE = {
     "__pycache__", ".git", "node_modules", ".venv", "venv",
     "dist", "build", ".mypy_cache", ".pytest_cache", ".tox",
     "target", ".next", ".nuxt", "coverage", ".eggs", "*.egg-info",
+    ".claude", ".worktrees", "shared-volume", "runtime",
 }
 
 
