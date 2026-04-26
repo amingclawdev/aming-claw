@@ -2259,7 +2259,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     if task_type == "dev" and metadata.get("related_nodes"):
         _try_verify_update(conn, project_id, metadata, "testing", "dev",
                            {"type": "dev_complete", "producer": "auto-chain",
-                            "task_id": task_id})
+                            "task_id": task_id},
+                           task_id=task_id)
 
     # MF-2026-04-24-002: release caller write-lock before _emit_or_infer_graph_delta.
     # That helper + its 4 internal _persist_event legacy-path callsites open NEW
@@ -3469,10 +3470,12 @@ def _gate_t2_pass(conn, project_id, result, metadata):
     # Evidence validator checks summary.passed > 0, so ensure it's there
     passed_count = report.get("passed", 1)  # Default 1 if not reported (tests passed gate)
     summary = {**report, "passed": passed_count, "failed": failed}
+    task_id = metadata.get("task_id", "")
     vu_ok, vu_err = _try_verify_update(conn, project_id, metadata, "t2_pass", "tester",
                        {"type": "test_report", "producer": "auto-chain",
                         "tool": report.get("tool", "pytest"),
-                        "summary": summary})
+                        "summary": summary},
+                       task_id=task_id)
     # Then verify nodes reached t2_pass — defer enforcement when promotion failed or
     # impact-enriched related_nodes include over-broad graph neighbors
     related_nodes = metadata.get("related_nodes", [])
@@ -3573,10 +3576,12 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 return False, f"QA approved overall but {len(failed_criteria)} criteria failed: {names}"
     # Update nodes FIRST (QA passed → promote to qa_pass)
     # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
+    task_id = metadata.get("task_id", "")
     vu_ok, vu_err = _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
                        {"type": "e2e_report", "producer": "auto-chain",
                         "summary": {"passed": 1, "failed": 0,
-                                    "review": result.get("review_summary", "auto-chain QA pass")}})
+                                    "review": result.get("review_summary", "auto-chain QA pass")}},
+                       task_id=task_id)
     if not vu_ok:
         return False, f"qa_pass gate blocked — {vu_err}"
     # Then verify nodes reached qa_pass
@@ -3681,8 +3686,10 @@ def _gate_release(conn, project_id, result, metadata):
     # For auto-chain deploys, we trust the merge task result
     # After successful merge, promote related_nodes to qa_pass
     if related_nodes:
+        task_id = metadata.get("task_id", "")
         _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
-                           {"type": "merge_complete", "producer": "auto-chain"})
+                           {"type": "merge_complete", "producer": "auto-chain"},
+                           task_id=task_id)
 
     # TODO-DEPRECATED: _store_proposed_nodes callsite removed per OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT PR-A.
     # Graph delta is now emitted as chain_event in dev completion path via _emit_graph_delta_event().
@@ -4598,7 +4605,7 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
     return True, "ok"
 
 
-def _try_verify_update(conn, project_id, metadata, target_status, role, evidence_dict):
+def _try_verify_update(conn, project_id, metadata, target_status, role, evidence_dict, task_id=""):
     """Best-effort node status update. Returns (True, "") on success, (False, error_msg) on failure."""
     related = _normalize_related_nodes(metadata.get("related_nodes", []))
     if not related:
@@ -4616,7 +4623,12 @@ def _try_verify_update(conn, project_id, metadata, target_status, role, evidence
         graph = AcceptanceGraph()
         if os.path.exists(graph_path):
             graph.load(graph_path)
-        session = {"principal_id": "auto-chain", "role": role, "scope_json": "[]"}
+        session_id = (task_id
+                      or metadata.get("parent_task_id")
+                      or metadata.get("task_id")
+                      or "auto-chain")
+        session = {"principal_id": "auto-chain", "role": role, "scope_json": "[]",
+                   "session_id": session_id}
         state_service.verify_update(
             conn, project_id, graph,
             node_ids=related if isinstance(related, list) else [related],
