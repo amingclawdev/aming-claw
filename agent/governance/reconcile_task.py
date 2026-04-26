@@ -414,7 +414,6 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
             baseline = scan_result.get("baseline", {})
             baseline_sha = baseline.get("chain_version", "")
             if baseline_sha:
-                import os
                 repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
                 phase_h_result = run_phase_h(
                     conn, project_id, baseline_sha, repo_root,
@@ -441,9 +440,8 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
                     self.graph = graph
                     self.api_base = api_base
 
-            import os as _os
-            repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__)))
-            scratch = _os.path.join(repo_root, "docs", "dev", "scratch")
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            scratch = os.path.join(repo_root, "docs", "dev", "scratch")
             z_ctx = _PhaseZCtx(
                 workspace=repo_root,
                 scratch=scratch,
@@ -464,6 +462,36 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
         except Exception as e:
             log.warning("reconcile diff: Phase Z failed (non-blocking): %s", e)
 
+    # --- Orchestrator integration (G1): run orchestrated phases if scope/phases present ---
+    orchestrator_result = None
+    if metadata.get("scope") or metadata.get("phases"):
+        try:
+            from .reconcile_phases.orchestrator import run_orchestrated
+            from .reconcile_phases.scope import ReconcileScope
+
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+            scope_arg = None
+            scope_meta = metadata.get("scope")
+            if scope_meta and isinstance(scope_meta, dict):
+                scope_arg = ReconcileScope(
+                    bug_id=scope_meta.get("bug_id"),
+                    nodes=scope_meta.get("node_set"),
+                    paths=scope_meta.get("file_set"),
+                )
+
+            orchestrator_result = run_orchestrated(
+                project_id,
+                repo_root,
+                phases=metadata.get("phases"),
+                dry_run=metadata.get("dry_run", True),
+                scope=scope_arg,
+            )
+            log.info("reconcile diff: orchestrator completed — phases=%s",
+                     list((orchestrator_result or {}).get("phases", {}).keys()))
+        except Exception as e:
+            log.warning("reconcile diff: orchestrator failed (non-blocking): %s", e)
+
     return {
         "stage": "diff",
         "diffs": diffs,
@@ -474,6 +502,7 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
             "skipped_throttled": phase_h_result.skipped_throttled if phase_h_result else 0,
         } if phase_h_result else None,
         "phase_z": phase_z_result,
+        "orchestrator": orchestrator_result,
     }
 
 
