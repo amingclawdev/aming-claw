@@ -573,6 +573,30 @@ def find_endpoint_occurrence(content: str, method: str, path: str):
 # ---------------------------------------------------------------------------
 MAX_SPAWN_PER_RUN_DEFAULT = 3
 
+# ---------------------------------------------------------------------------
+# High-confidence thresholds (OPT-BACKLOG-PHASE-K-HIGH-CONFIDENCE-THRESHOLD)
+# ---------------------------------------------------------------------------
+_HIGH_CONFIDENCE_MIN_SCORE = 5.0
+_HIGH_CONFIDENCE_MIN_GAP = 1.5
+
+
+def _contract_no_test_confidence(handler_qname: str, fingerprints: List[str]) -> str:
+    """Determine confidence for contract_no_test discrepancies.
+
+    High: handler_qname is qualified (contains >=1 dot, e.g. module.func
+          or module.class.method) AND at least one fingerprint has len>=10.
+    Medium: handler_qname is qualified but fingerprints are all short,
+            OR handler_qname is unqualified but has long fingerprint evidence.
+    Low: handler_qname is unqualified (no dots) and fingerprints are short.
+    """
+    dot_count = handler_qname.count(".") if handler_qname else 0
+    has_long_fp = any(len(fp) >= 10 for fp in fingerprints if fp)
+    if dot_count >= 1 and has_long_fp:
+        return "high"
+    if dot_count >= 1 or has_long_fp:
+        return "medium"
+    return "low"
+
 
 # ---------------------------------------------------------------------------
 # Fingerprint (R5)
@@ -959,13 +983,17 @@ def run(ctx: "ReconcileContext", *, scope: Optional["ResolvedScope"] = None) -> 
                     break
         if not test_hits:
             cid = getattr(c, "handler_qname", None) or getattr(c, "constant_name", "")
+            cnt_confidence = _contract_no_test_confidence(
+                getattr(c, "handler_qname", ""),
+                c.doc_fingerprints(),
+            )
             results.append(PhaseKDiscrepancy(
                 type="contract_no_test",
                 contract_kind=type(c).__name__,
                 contract_id=cid,
                 contract_summary=str(c),
                 expected_test_location=derive_test_path_for(c),
-                confidence="high",
+                confidence=cnt_confidence,
                 priority="P0",
                 suggested_action="spawn_pm_write_test",
                 detail=f"No test coverage for {type(c).__name__}: {cid}",
@@ -1024,13 +1052,18 @@ def run(ctx: "ReconcileContext", *, scope: Optional["ResolvedScope"] = None) -> 
                 continue
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_score, best_sp = candidates[0]
-            # R3: ties → medium confidence; score<1 with multiple → ambiguous
-            if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-                confidence = "medium"
-            elif best_score < 1 and len(candidates) > 1:
-                confidence = "ambiguous attribution"
-            else:
+            # Confidence ladder: single candidate → high (no ambiguity);
+            # multiple candidates → score-floor + gap
+            if len(candidates) == 1:
                 confidence = "high"
+            elif best_score < _HIGH_CONFIDENCE_MIN_SCORE:
+                confidence = "low"
+            else:
+                gap = candidates[0][0] - candidates[1][0]
+                if gap >= _HIGH_CONFIDENCE_MIN_GAP:
+                    confidence = "high"
+                else:
+                    confidence = "medium"
             results.append(PhaseKDiscrepancy(
                 type="doc_value_drift",
                 contract_kind="ServicePortContract",
