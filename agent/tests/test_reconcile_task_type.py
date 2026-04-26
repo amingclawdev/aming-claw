@@ -429,5 +429,83 @@ class TestReconcileV2Endpoint(unittest.TestCase):
         self.assertIn("task_id", result)
 
 
+class TestHandleDiffCallsOrchestrator(unittest.TestCase):
+    """AC6: handle_diff invokes orchestrator when metadata has scope/phases."""
+
+    def setUp(self):
+        self.conn = _make_in_memory_db()
+        self.project_id = "test-proj"
+        self.task_id = "task-orch-001"
+        self.conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head) "
+            "VALUES (?, ?, ?)",
+            (self.project_id, "abc1234", "abc1234"),
+        )
+        self.conn.execute(
+            "INSERT INTO tasks (task_id, project_id, status, execution_status, type) "
+            "VALUES (?, ?, 'running', 'running', 'reconcile')",
+            (self.task_id, self.project_id),
+        )
+        self.conn.commit()
+
+    def test_handle_diff_calls_orchestrator(self):
+        """Mocks run_orchestrated, asserts called_once, asserts 'orchestrator' key."""
+        fake_result = {"phases": {"A": {}}, "summary": "ok"}
+        with mock.patch(
+            "governance.reconcile_phases.orchestrator.run_orchestrated",
+            return_value=fake_result,
+        ) as mock_run:
+            from governance.reconcile_task import handle_diff
+
+            scan_prev = {
+                "node_states": {},
+                "baseline": {"chain_version": "abc1234"},
+            }
+            metadata = {
+                "scope": {"bug_id": "TEST-1", "file_set": ["a.py"], "node_set": ["L1.1"]},
+                "enable_phase_h": False,
+                "enable_phase_z": False,
+            }
+            result = handle_diff(self.conn, self.project_id, self.task_id, metadata, scan_prev)
+
+            mock_run.assert_called_once()
+            self.assertIn("orchestrator", result)
+            self.assertEqual(result["orchestrator"], fake_result)
+
+    def test_handle_diff_orchestrator_skipped_no_scope(self):
+        """Without scope/phases metadata, orchestrator key is None."""
+        from governance.reconcile_task import handle_diff
+
+        scan_prev = {
+            "node_states": {},
+            "baseline": {"chain_version": "abc1234"},
+        }
+        metadata = {"enable_phase_h": False, "enable_phase_z": False}
+        result = handle_diff(self.conn, self.project_id, self.task_id, metadata, scan_prev)
+        self.assertIn("orchestrator", result)
+        self.assertIsNone(result["orchestrator"])
+
+    def test_handle_diff_orchestrator_failure_nonblocking(self):
+        """Orchestrator failure is non-blocking — result['orchestrator'] is None."""
+        with mock.patch(
+            "governance.reconcile_phases.orchestrator.run_orchestrated",
+            side_effect=RuntimeError("boom"),
+        ):
+            from governance.reconcile_task import handle_diff
+
+            scan_prev = {
+                "node_states": {},
+                "baseline": {"chain_version": "abc1234"},
+            }
+            metadata = {
+                "phases": ["A", "B"],
+                "enable_phase_h": False,
+                "enable_phase_z": False,
+            }
+            result = handle_diff(self.conn, self.project_id, self.task_id, metadata, scan_prev)
+            self.assertIn("orchestrator", result)
+            self.assertIsNone(result["orchestrator"])
+
+
 if __name__ == "__main__":
     unittest.main()
