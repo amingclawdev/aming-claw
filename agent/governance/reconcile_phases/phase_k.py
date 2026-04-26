@@ -447,7 +447,73 @@ def score_service_port_match(
         if sf_parts and any(p in paragraph for p in sf_parts):
             score += 0.25
 
+    # Path-prefix additive axis (R2: dominant weight, purely additive over R5 keyword_score)
+    score += score_path_prefix_match(sp, doc_content, port_offset)
+
     return score
+
+
+# ---------------------------------------------------------------------------
+# Path-prefix scoring (R1-R4)
+# ---------------------------------------------------------------------------
+
+# R4: normalisation aliases — short name → list of full service_names it matches
+_PATH_PREFIX_ALIASES: Dict[str, List[str]] = {
+    "manager": ["manager_http_server"],
+    "governance": ["governance"],
+}
+
+
+def score_path_prefix_match(
+    sp: ServicePortContract,
+    doc_content: str,
+    port_offset: int,
+    window: int = 5,
+) -> float:
+    """Score path-prefix match for a ServicePortContract near a localhost:NNNN.
+
+    R1: Extracts /api/<svc>/ prefixes from HTTP URLs within ±window lines.
+    R3: Only considers paths inside HTTP context (curl/http://).
+    R4: Normalises via _PATH_PREFIX_ALIASES.
+    R2: Returns +5.0 exact, +3.0 alias, 0.0 no match.
+    """
+    lines = doc_content.splitlines()
+    line_no = doc_content[:port_offset].count("\n")
+    start = max(0, line_no - window)
+    end = min(len(lines), line_no + window + 1)
+    snippet = "\n".join(lines[start:end])
+
+    # R3: only extract /api/<svc>/ from http:// or curl contexts
+    prefixes: List[str] = []
+    for m in re.finditer(r'(?:curl\s+|https?://)[^\s]*?/api/([a-z_]+)/', snippet, re.IGNORECASE):
+        prefixes.append(m.group(1).lower())
+
+    if not prefixes:
+        return 0.0
+
+    sn_lower = sp.service_name.lower()
+    # Build set of names that match this service port
+    match_names = {sn_lower}
+    # Add the short alias keys that map TO this service_name
+    for alias_key, targets in _PATH_PREFIX_ALIASES.items():
+        if sn_lower in (t.lower() for t in targets):
+            match_names.add(alias_key)
+        if alias_key == sn_lower:
+            match_names.update(t.lower() for t in targets)
+
+    best = 0.0
+    for prefix in prefixes:
+        if prefix == sn_lower or prefix in match_names:
+            best = max(best, 5.0)  # exact or direct alias
+        else:
+            # Check reverse: prefix is an alias key that maps to sn_lower
+            alias_targets = _PATH_PREFIX_ALIASES.get(prefix, [])
+            if sn_lower in (t.lower() for t in alias_targets):
+                best = max(best, 5.0)
+            # Check if sn_lower starts with prefix (partial alias → +3.0)
+            elif sn_lower.startswith(prefix + "_") or prefix.startswith(sn_lower + "_"):
+                best = max(best, 3.0)
+    return best
 
 
 def find_endpoint_occurrence(content: str, method: str, path: str):
