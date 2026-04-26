@@ -658,6 +658,15 @@ class ExecutorWorker:
 
         log.info("test_script: running command in %s: %s (shell=%s)", execution_workspace, cmd, use_shell)
 
+        # B50: Propagate PYTHONPATH so legacy governance.X imports resolve
+        from pathlib import Path as _Path
+        _repo_root = _Path(execution_workspace).resolve()
+        _new_pp = str(_repo_root) + os.pathsep + str(_repo_root / "agent")
+        _existing_pp = os.environ.get("PYTHONPATH", "")
+        if _existing_pp:
+            _new_pp = _new_pp + os.pathsep + _existing_pp
+        test_env = {**os.environ, "PYTHONPATH": _new_pp}
+
         try:
             proc = _sp.run(
                 cmd,
@@ -666,6 +675,7 @@ class ExecutorWorker:
                 text=True,
                 timeout=300,
                 shell=use_shell,
+                env=test_env,
             )
             report = _parse_pytest_output(proc.stdout, proc.stderr, proc.returncode)
             result = {
