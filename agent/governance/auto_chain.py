@@ -1683,6 +1683,25 @@ def _record_gate_event(conn, project_id, task_id, gate_name, passed, reason, tra
         log.debug("auto_chain: failed to record gate_event for %s/%s (non-critical)", gate_name, task_id, exc_info=True)
 
 
+def _update_backlog_stage(conn, project_id, bug_id, stage, failure_reason=""):
+    """Update backlog_bugs chain_stage, stage_updated_at, last_failure_reason for a given bug_id.
+
+    Non-critical path — silently catches all exceptions at debug level.
+    No-op when bug_id is empty/falsy.
+    """
+    if not bug_id:
+        return
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE backlog_bugs SET chain_stage=?, stage_updated_at=?, last_failure_reason=? WHERE bug_id=?",
+            (stage, now, failure_reason, bug_id),
+        )
+    except Exception:
+        log.debug("auto_chain: failed to update backlog_stage for bug_id=%s (non-critical)", bug_id, exc_info=True)
+
+
 def _load_task_metadata(conn, project_id, task_id):
     if not task_id or not hasattr(conn, "execute"):
         return {}
@@ -2121,6 +2140,11 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                    project_id=project_id, task_id=task_id,
                    trace_id=_trace_id, chain_id=_chain_id)
 
+    # CH4: Update backlog_bugs chain_stage on task completion
+    _bug_id = metadata.get("bug_id", "")
+    if _bug_id:
+        _update_backlog_stage(conn, project_id, _bug_id, f"{task_type}_complete")
+
     # M1: PM completes → persist full PRD to memory for future dev/qa recall
     # Moved BEFORE version gate so PRD publication fires regardless of gate outcome
     if task_type == "pm":
@@ -2236,6 +2260,9 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             "stage": "version_check", "next_stage": task_type,
             "reason": ver_reason,
         })
+        # CH4: Update backlog_bugs chain_stage on version gate block
+        if _bug_id:
+            _update_backlog_stage(conn, project_id, _bug_id, f"{task_type}_complete_blocked", failure_reason=ver_reason)
         return {"gate_blocked": True, "dispatched": False, "stage": "version_check", "reason": ver_reason}
     else:
         log.debug("auto_chain: version check passed for task %s: %s", task_id, ver_reason)
