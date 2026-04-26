@@ -603,6 +603,48 @@ def _upsert_k_fingerprint(
 
 
 # ---------------------------------------------------------------------------
+# Backlog upsert helper (best-effort, for backlog_gate strict mode)
+# ---------------------------------------------------------------------------
+
+def _ensure_backlog_row(
+    project_id: str,
+    bug_id: str,
+    discrepancy_type: str,
+    target: str,
+    api_base: str = "",
+) -> None:
+    """POST to /api/backlog/{pid}/{bug_id} to upsert the backlog row.
+
+    Best-effort: logs a warning on failure but never raises.
+    This prevents 422 from backlog_gate strict mode when bug_ids are
+    dynamically derived by Phase K.
+    """
+    import urllib.request
+
+    base = api_base or os.environ.get("GOVERNANCE_API_BASE", "http://localhost:40000")
+    url = "{base}/api/backlog/{pid}/{bid}".format(base=base, pid=project_id, bid=bug_id)
+
+    body = {
+        "title": "Phase K auto-detected {dtype} for {target}".format(
+            dtype=discrepancy_type, target=target,
+        ),
+        "status": "OPEN",
+        "priority": "P2",
+        "target_files": [target],
+        "actor": "phase-k-autospawn",
+        "details_md": "Auto-filed by Phase K",
+    }
+
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                    headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as exc:
+        log.warning("_ensure_backlog_row failed for %s/%s: %s", project_id, bug_id, exc)
+
+
+# ---------------------------------------------------------------------------
 # PM task spawning (R7)
 # ---------------------------------------------------------------------------
 
@@ -653,6 +695,10 @@ def _spawn_pm_task_k(
             "target": target,
         },
     }
+
+    # Best-effort: upsert backlog row before creating the task so that
+    # backlog_gate strict mode does not reject the dynamically derived bug_id.
+    _ensure_backlog_row(project_id, bug_id, discrepancy_type, target, api_base=base)
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST",

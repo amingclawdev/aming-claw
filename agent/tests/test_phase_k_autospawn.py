@@ -340,6 +340,57 @@ class TestPhaseKFingerprint(unittest.TestCase):
         int(fp, 16)
 
 
+class TestSpawnCallsBacklogFirst(unittest.TestCase):
+    """AC5: _spawn_pm_task_k POSTs to /api/backlog/ before /api/task/."""
+
+    def test_spawn_calls_backlog_first(self):
+        from governance.reconcile_phases.phase_k import _spawn_pm_task_k, PhaseKDiscrepancy
+
+        recorded_urls = []
+
+        class FakeResponse:
+            def read(self):
+                return json.dumps({"task_id": "pm-task-99"}).encode("utf-8")
+
+        def fake_urlopen(req, **kwargs):
+            recorded_urls.append(req.full_url)
+            return FakeResponse()
+
+        discs = [PhaseKDiscrepancy(
+            type="doc_value_drift",
+            contract_kind="ServicePortContract",
+            contract_id="PORT_1",
+            doc="docs/api.md",
+            detail="drift detail",
+        )]
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = _spawn_pm_task_k(
+                project_id="test-proj",
+                discrepancy_type="doc_value_drift",
+                target="docs/api.md",
+                fingerprints=["fp1"],
+                discrepancies=discs,
+                scope_origin="test",
+                bug_id="OPT-BACKLOG-PHASE-K-DOC-VALUE-DRIFT-docs-api-md",
+                api_base="http://localhost:40000",
+            )
+
+        # Two POSTs should have been made
+        self.assertEqual(len(recorded_urls), 2,
+                         "Expected 2 HTTP calls, got %d: %s" % (len(recorded_urls), recorded_urls))
+
+        # First URL must be backlog upsert
+        self.assertIn("/api/backlog/", recorded_urls[0],
+                       "First call should be to /api/backlog/, got: %s" % recorded_urls[0])
+
+        # Second URL must be task create
+        self.assertIn("/api/task/", recorded_urls[1],
+                       "Second call should be to /api/task/, got: %s" % recorded_urls[1])
+
+        self.assertEqual(result, "pm-task-99")
+
+
 class TestReconcileTaskPhaseKIntegration(unittest.TestCase):
     """R3: handle_apply calls spawn_phase_k_discrepancies when Phase K outputs present."""
 
