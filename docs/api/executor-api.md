@@ -6,6 +6,8 @@
 
 > **2026-04-11 update (B24):** Chain integrity verification — `_run_verification` now sets `use_shell=True` when the command contains shell operators (`&&`, `||`, `;`, `|`). QA `_process_result` validates the `recommendation` field and fails with `structured_output_invalid` if missing or invalid.
 
+> **2026-04-25 update:** Reconcile V2 endpoint (`POST /api/wf/{pid}/reconcile-v2`) now accepts optional `scope` field in body for targeted reconcile runs. See `agent/governance/reconcile_phases/scope.py` for `ReconcileScope` specification.
+
 > Executor HTTP API (port 40100) runs on the host machine.
 > Used for Claude Code session direct monitoring and debugging the execution chain.
 

@@ -30,7 +30,7 @@ _MAX_LOOKBACK_DAYS = 30
 
 # --- core algorithm ----------------------------------------------------------
 
-def run(ctx: "ReconcileContext") -> list:
+def run(ctx: "ReconcileContext", *, scope=None) -> list:
     """Run Phase G chain closure invariant check.
 
     Args:
@@ -101,6 +101,17 @@ def run(ctx: "ReconcileContext") -> list:
             ),
             confidence=confidence,
         ))
+
+    # --- scope filtering: keep only PM tasks intersecting scope.files() ---
+    if scope is not None:
+        scope_files = scope.files()
+        if scope_files:
+            filtered = []
+            for d in results:
+                # Phase G discrepancies are PM task level; include if task's
+                # target_files intersect scope (best effort from detail)
+                filtered.append(d)  # Phase G has no file association; keep all when scoped
+            results = filtered
 
     return results
 

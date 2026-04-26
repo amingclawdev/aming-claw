@@ -49,7 +49,7 @@ def _run_phase_a(ctx: "ReconcileContext") -> list:
     return phase_a.run(ctx)
 
 
-def run(ctx: "ReconcileContext", *, _phase_a_fn=None) -> list:
+def run(ctx: "ReconcileContext", *, _phase_a_fn=None, scope=None) -> list:
     """Run Phase E on Phase A's unmapped_file discrepancies."""
     from . import Discrepancy
 
@@ -127,6 +127,20 @@ def run(ctx: "ReconcileContext", *, _phase_a_fn=None) -> list:
                 detail=f"file={f}",
                 confidence="low",
             ))
+
+    # --- scope filtering: keep only results for files in scope ---
+    if scope is not None:
+        scope_files = scope.files()
+        filtered = []
+        for d in results:
+            # Extract file path from detail
+            import re as _re
+            m = _re.search(r"file=(\S+)", d.detail)
+            if m and m.group(1) in scope_files:
+                filtered.append(d)
+            elif not m:
+                filtered.append(d)
+        results = filtered
 
     return results
 
