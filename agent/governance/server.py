@@ -3545,6 +3545,24 @@ def handle_backlog_close(ctx: RequestContext):
         ).fetchone()
         if not row:
             raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+        # Verify commit SHA exists in git log (best-effort)
+        commit_sha = body.get("commit", "")
+        if commit_sha:
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "--verify", commit_sha],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    raise GovernanceError(
+                        "commit_not_found",
+                        f"Commit {commit_sha} does not resolve to a real commit",
+                        422,
+                    )
+            except subprocess.TimeoutExpired:
+                log.warning("git rev-parse timed out for commit %s; allowing close", commit_sha)
+            except FileNotFoundError:
+                log.warning("git not found; skipping commit verification for %s", commit_sha)
         conn.execute(
             """UPDATE backlog_bugs
                SET status = 'FIXED',
