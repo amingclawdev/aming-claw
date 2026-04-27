@@ -2205,9 +2205,29 @@ def handle_version_check(ctx: RequestContext):
         "FROM project_version WHERE project_id=?", (pid,)
     ).fetchone()
 
+    # Runtime version baking — detect stale-process-after-deploy
+    gov_runtime = ""
+    sm_runtime = ""
+    runtime_match = False
+    try:
+        from .chain_trailer import get_runtime_version
+        gov_runtime = get_runtime_version()
+    except Exception as e:
+        log.debug("version-check: gov runtime_version unavailable: %s", e)
+    try:
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:40101/api/manager/health", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            sm_data = json.loads(resp.read().decode())
+            sm_runtime = sm_data.get("runtime_version", "")
+    except Exception as e:
+        log.debug("version-check: sm runtime_version unavailable: %s", e)
+
     if not row:
         source = trailer_state["source"] if trailer_state else "none"
         version = trailer_state["version"] if trailer_state else "unknown"
+        runtime_match = bool(gov_runtime and gov_runtime == version
+                             and sm_runtime and sm_runtime == version)
         return {
             "ok": True, "project_id": pid,
             "head": version if trailer_state else "unknown",
@@ -2217,6 +2237,9 @@ def handle_version_check(ctx: RequestContext):
             "source": source,
             "message": "Project not initialized" + (f" (trailer source: {source})" if trailer_state else ""),
             "generated_at": _utc_now(), "project_version": version if trailer_state else "unknown",
+            "gov_runtime_version": gov_runtime,
+            "sm_runtime_version": sm_runtime,
+            "runtime_match": runtime_match,
         }
 
     chain_ver = row["chain_version"]
@@ -2251,6 +2274,8 @@ def handle_version_check(ctx: RequestContext):
         ok = False
         parts.append(f"{len(dirty_files)} uncommitted files")
 
+    runtime_match = bool(gov_runtime and gov_runtime == chain_ver
+                         and sm_runtime and sm_runtime == chain_ver)
     return {
         "ok": ok,
         "project_id": pid,
@@ -2264,6 +2289,9 @@ def handle_version_check(ctx: RequestContext):
         "message": "; ".join(parts),
         "generated_at": _utc_now(),
         "project_version": chain_ver,
+        "gov_runtime_version": gov_runtime,
+        "sm_runtime_version": sm_runtime,
+        "runtime_match": runtime_match,
     }
 
 
