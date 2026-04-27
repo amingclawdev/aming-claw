@@ -340,3 +340,40 @@ The env-strip fix (R1) and auth classifier (R3) are stateless — they operate o
 ### Coordinator Impact
 
 The coordinator itself is unaffected — it does not manage env vars or authenticate. The fix operates at the executor/lifecycle level. However, coordinator-dispatched tasks (dev, test, QA) benefit because their child CLI processes no longer inherit stale OAuth tokens.
+
+---
+
+## OPT-BACKLOG-EXECUTOR-TEST-USE-SYS-EXECUTABLE: Use sys.executable in _execute_test
+
+**Added:** 2026-04-27 | **Source:** `_execute_test` in `agent/executor_worker.py` (default cmd construction, line ~650) | **Bug:** OPT-BACKLOG-EXECUTOR-TEST-USE-SYS-EXECUTABLE
+
+### Background
+
+When `service_manager` spawns executor as a detached process on Windows, `PATH` inheritance is unreliable. ~50% of test-stage chains on 2026-04-26 failed with `WinError 2` because the bare `"python"` string in the default test command could not be resolved by the OS. `sys.executable` is the correct way to reference the running interpreter — it returns an absolute path to the exact Python binary that is executing the current process.
+
+### Change
+
+The default test command construction in `_execute_test` was:
+
+```python
+cmd = ["python", "-m", "pytest"] + test_files + ["-v", "--tb=short"]
+```
+
+Changed to:
+
+```python
+cmd = [sys.executable, "-m", "pytest"] + test_files + ["-v", "--tb=short"]
+```
+
+`sys` was already imported at module level. No other code paths are affected — when `verification.command` is provided in task metadata, the custom command is used as-is (unchanged).
+
+### Test Coverage
+
+| Test file | Tests | Covers |
+|-----------|-------|--------|
+| `agent/tests/test_executor_test_pythonpath.py` | `TestExecuteTestUsesSysExecutable` | Default cmd uses `sys.executable` as cmd[0] |
+| `agent/tests/test_executor_test_pythonpath.py` | `TestExecuteTestResolvesToRuntimePythonOnWindows` | `sys.executable` is absolute and exists (Windows-only) |
+
+### Coordinator Impact
+
+The coordinator is unaffected. The fix operates at the executor level when running test-stage tasks with no explicit `verification.command`. Coordinator-dispatched test tasks benefit because the subprocess now always resolves the correct Python binary regardless of PATH inheritance.
