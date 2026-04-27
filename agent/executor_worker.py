@@ -647,7 +647,7 @@ class ExecutorWorker:
                     use_shell = True
         else:
             # Default: run all test files with pytest
-            cmd = ["python", "-m", "pytest"] + test_files + ["-v", "--tb=short"]
+            cmd = [sys.executable, "-m", "pytest"] + test_files + ["-v", "--tb=short"]
 
         # B41 AC2: fail-fast guard for non-portable commands
         cmd_for_guard = cmd if isinstance(cmd, str) else " ".join(cmd)
