@@ -3,6 +3,7 @@
 Uses stdlib http.server (Starlette upgrade deferred to when dependencies are added).
 Provides routing, middleware (auth, idempotency, request_id, audit), and JSON handling.
 """
+from __future__ import annotations
 
 import json
 import re
@@ -2226,8 +2227,8 @@ def handle_version_check(ctx: RequestContext):
     if not row:
         source = trailer_state["source"] if trailer_state else "none"
         version = trailer_state["version"] if trailer_state else "unknown"
-        runtime_match = bool(gov_runtime and gov_runtime == version
-                             and sm_runtime and sm_runtime == version)
+        runtime_match = bool(gov_runtime and (gov_runtime.startswith(version) or version.startswith(gov_runtime))
+                             and sm_runtime and (sm_runtime.startswith(version) or version.startswith(sm_runtime)))
         return {
             "ok": True, "project_id": pid,
             "head": version if trailer_state else "unknown",
@@ -2274,8 +2275,8 @@ def handle_version_check(ctx: RequestContext):
         ok = False
         parts.append(f"{len(dirty_files)} uncommitted files")
 
-    runtime_match = bool(gov_runtime and gov_runtime == chain_ver
-                         and sm_runtime and sm_runtime == chain_ver)
+    runtime_match = bool(gov_runtime and (gov_runtime.startswith(chain_ver) or chain_ver.startswith(gov_runtime))
+                         and sm_runtime and (sm_runtime.startswith(chain_ver) or chain_ver.startswith(sm_runtime)))
     return {
         "ok": ok,
         "project_id": pid,
