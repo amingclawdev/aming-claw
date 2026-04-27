@@ -58,3 +58,17 @@ def test_endpoint_schedules_deferred_restart():
     handler_src = src[start:next_def_idx] if next_def_idx > 0 else src[start:]
     assert "threading.Thread" in handler_src
     assert "restart_local_governance" in handler_src
+
+
+def test_audit_rows_persist_to_audit_index(tmp_path):
+    """DBContext auto-commits so audit rows survive connection close."""
+    db = tmp_path / "g.db"
+    sqlite3.connect(str(db)).executescript("CREATE TABLE audit_index(event_id TEXT,project_id TEXT,event TEXT,actor TEXT,ok INT DEFAULT 1,ts TEXT,node_ids TEXT)")
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from governance import audit_service; from governance.db import DBContext
+    _g = lambda pid: (lambda c: (setattr(c, 'row_factory', sqlite3.Row) or c))(sqlite3.connect(str(db)))
+    with mock.patch("governance.db.get_connection", _g), mock.patch("governance.db.close_connection", lambda c: c.close()), \
+         mock.patch.object(audit_service, "_audit_file", return_value=tmp_path / "a.jsonl"), DBContext("t") as c:
+        audit_service.record(c, "t", "redeploy_after_merge.requested", actor="x")
+        audit_service.record(c, "t", "redeploy_after_merge.sm_notified", actor="x")
+    assert len(sqlite3.connect(str(db)).execute("SELECT * FROM audit_index WHERE event LIKE 'redeploy_after_merge.%'").fetchall()) >= 2
