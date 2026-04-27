@@ -298,7 +298,14 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Health endpoint for the manager HTTP server itself."""
         if self.path.rstrip("/") == "/api/manager/health":
-            self._send_json({"ok": True, "service": "manager_http_server"})
+            runtime_version = ""
+            try:
+                from agent.governance.chain_trailer import get_runtime_version
+                runtime_version = get_runtime_version()
+            except Exception:
+                pass
+            self._send_json({"ok": True, "service": "manager_http_server",
+                             "runtime_version": runtime_version})
             return
         self._send_json({"ok": False, "detail": "Not found"}, 404)
 

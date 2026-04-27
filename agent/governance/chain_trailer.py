@@ -110,6 +110,27 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
     }
 
 
+def _read_runtime_version() -> str:
+    """Read git short HEAD once at module import. Used to freeze RUNTIME_VERSION."""
+    try:
+        p = _git(["rev-parse", "--short", "HEAD"])
+        return p.stdout.strip() if p.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+RUNTIME_VERSION = _read_runtime_version()  # frozen at process startup
+
+
+def get_runtime_version() -> str:
+    """Return chain version baked into this process at import time.
+
+    Differs from get_chain_version() which reads live git on every call.
+    Use to detect 'process running stale code' after a deploy.
+    """
+    return RUNTIME_VERSION
+
+
 def get_chain_version(cwd: str | None = None) -> str:
     """Compat shim — returns short-hash string for existing auto_chain callers.
 
