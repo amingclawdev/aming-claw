@@ -89,12 +89,18 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
     # Check dirty status
     status_proc = _git(["status", "--porcelain"], cwd=root)
     raw_dirty = []
-    if status_proc.returncode == 0 and status_proc.stdout.strip():
-        for line in status_proc.stdout.strip().splitlines():
-            # porcelain format: XY filename
-            filepath = line[3:].strip() if len(line) > 3 else line.strip()
-            if filepath:
-                raw_dirty.append(filepath)
+    if status_proc.returncode == 0:
+        # NOTE: Do NOT strip() the whole stdout before splitlines() — the global
+        # strip removes leading whitespace from ONLY the first line, then line[3:]
+        # over-slices that first line by 1 char and drops its leading dot.
+        # See OPT-BACKLOG-CHAIN-TRAILER-STRIP-SLICE-DROPS-DOT for full details.
+        for line in status_proc.stdout.splitlines():
+            # porcelain v1 format: 2-char status + 1 space + filename. line[3:] is
+            # the path. Use rstrip only — never lstrip (would re-introduce the bug).
+            if len(line) >= 4:
+                filepath = line[3:].rstrip()
+                if filepath:
+                    raw_dirty.append(filepath)
 
     # Filter ignored paths
     dirty_files = [

@@ -157,3 +157,8 @@ agent/governance/governance.db
 
 # Generated dev docs (provenance tracked in backlog_bugs.provenance_paths)
 docs/dev/
+
+# Claude Code runtime artifacts (untracked via git rm --cached in this commit)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+.claude/worktrees/
