@@ -2561,6 +2561,53 @@ def _audit_version_update(conn, pid, body, result, reason):
         pass  # audit failure should not block
 
 
+# --- Redeploy-after-merge endpoint ---
+
+@route("POST", "/api/governance/redeploy-after-merge/{project_id}")
+def handle_redeploy_after_merge(ctx: RequestContext):
+    """Orchestrate executor respawn + governance self-restart after merge."""
+    pid = ctx.get_project_id()
+    conn = get_connection(pid)
+    body = ctx.body
+    task_id = body.get("task_id", "")
+    chain_version = body.get("chain_version", "")
+    # Audit row 1: requested
+    try:
+        audit_service.record(conn, pid, "redeploy_after_merge.requested",
+                             actor="deploy_chain", details={"task_id": task_id, "chain_version": chain_version})
+    except Exception:
+        pass
+    # Notify SM sidecar to respawn executor
+    import urllib.request, urllib.error
+    sm_ok = False
+    try:
+        req = urllib.request.Request(
+            "http://localhost:40101/api/manager/respawn-executor",
+            data=json.dumps({"chain_version": chain_version}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            sm_ok = json.loads(r.read()).get("ok", False)
+    except Exception:
+        pass
+    # Audit row 2: sm_notified
+    try:
+        audit_service.record(conn, pid, "redeploy_after_merge.sm_notified",
+                             actor="deploy_chain", details={"task_id": task_id, "sm_ok": sm_ok})
+    except Exception:
+        pass
+    # Schedule deferred self-restart
+    import threading
+    def _deferred_restart():
+        import time as _t; _t.sleep(2)
+        try:
+            from agent.deploy_chain import restart_local_governance
+            restart_local_governance()
+        except Exception:
+            pass
+    threading.Thread(target=_deferred_restart, daemon=True).start()
+    return {"ok": True, "sm_ok": sm_ok, "self_restart": "scheduled"}
+
+
 # --- Redeploy Endpoints (PR-2) ---
 
 @route("POST", "/api/governance/redeploy/executor")

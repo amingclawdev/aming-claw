@@ -286,6 +286,11 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         """Route POST requests."""
         path = self.path.rstrip("/")
 
+        # Match /api/manager/respawn-executor
+        if path == "/api/manager/respawn-executor":
+            self._handle_respawn_executor()
+            return
+
         # Match /api/manager/redeploy/{target}
         prefix = "/api/manager/redeploy/"
         if path.startswith(prefix):
@@ -308,6 +313,19 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
                              "runtime_version": runtime_version})
             return
         self._send_json({"ok": False, "detail": "Not found"}, 404)
+
+    def _handle_respawn_executor(self) -> None:
+        """POST /api/manager/respawn-executor — write manager_signal.json."""
+        body = self._read_json_body()
+        try:
+            state_dir = _project_root() / "shared-volume" / "codex-tasks" / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            sig = {"action": "respawn_executor", "chain_version": body.get("chain_version", ""),
+                   "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            (state_dir / "manager_signal.json").write_text(json.dumps(sig), encoding="utf-8")
+            self._send_json({"ok": True, "detail": "signal written"})
+        except Exception as exc:
+            self._send_json({"ok": False, "detail": str(exc)}, 500)
 
     def _handle_redeploy(self, target: str) -> None:
         """POST /api/manager/redeploy/{target}
