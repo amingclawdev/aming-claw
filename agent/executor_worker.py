@@ -843,17 +843,27 @@ class ExecutorWorker:
                     if not integration_worktree:
                         return {"status": "failed", "error": f"Integration worktree setup failed: {create_error[:300]}"}
 
-                    proc = subprocess.run(
-                        ["git", "merge", branch, "--no-ff", "-m", f"Auto-merge: {task_id}"],
-                        cwd=integration_worktree, capture_output=True, text=True, timeout=30)
-                    if proc.returncode != 0:
-                        subprocess.run(["git", "merge", "--abort"],
-                                       cwd=integration_worktree, capture_output=True, timeout=10)
-                        return {"status": "failed", "error": f"Merge conflict: {proc.stderr[:300]}"}
-
-                    rev = subprocess.run(["git", "rev-parse", "HEAD"],
-                                         cwd=integration_worktree, capture_output=True, text=True, timeout=5)
-                    merge_commit = rev.stdout.strip()
+                    # Use chain_trailer for merge with Chain-Version trailer
+                    try:
+                        from agent.governance.chain_trailer import write_merge_with_trailer
+                        success, merge_commit, err = write_merge_with_trailer(
+                            message=f"Auto-merge: {task_id}",
+                            branch=branch,
+                            cwd=integration_worktree)
+                        if not success:
+                            return {"status": "failed", "error": f"Merge conflict: {err[:300]}"}
+                    except ImportError:
+                        log.warning("chain_trailer not available, falling back to raw git merge")
+                        proc = subprocess.run(
+                            ["git", "merge", branch, "--no-ff", "-m", f"Auto-merge: {task_id}"],
+                            cwd=integration_worktree, capture_output=True, text=True, timeout=30)
+                        if proc.returncode != 0:
+                            subprocess.run(["git", "merge", "--abort"],
+                                           cwd=integration_worktree, capture_output=True, timeout=10)
+                            return {"status": "failed", "error": f"Merge conflict: {proc.stderr[:300]}"}
+                        rev = subprocess.run(["git", "rev-parse", "HEAD"],
+                                             cwd=integration_worktree, capture_output=True, text=True, timeout=5)
+                        merge_commit = rev.stdout.strip()
 
                     # B20: Clean leaked staged/untracked files before ff-only merge
                     try:
@@ -935,19 +945,24 @@ class ExecutorWorker:
                     "files_changed": 0, "note": "nothing to commit"
                 }}
 
-            # Commit
+            # Commit with Chain-Version trailer
             msg = f"Auto-merge: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
-            proc = subprocess.run(
-                ["git", "commit", "-m", msg],
-                cwd=self.workspace, capture_output=True, text=True, timeout=30)
-
-            if proc.returncode != 0:
-                return {"status": "failed", "error": f"git commit failed: {proc.stderr[:300]}"}
-
-            # Get commit hash
-            rev = subprocess.run(["git", "rev-parse", "HEAD"],
-                                 cwd=self.workspace, capture_output=True, text=True, timeout=5)
-            commit_hash = rev.stdout.strip()
+            try:
+                from agent.governance.chain_trailer import write_merge_with_trailer
+                success, commit_hash, err = write_merge_with_trailer(
+                    message=msg, cwd=self.workspace)
+                if not success:
+                    return {"status": "failed", "error": f"git commit failed: {err[:300]}"}
+            except ImportError:
+                log.warning("chain_trailer not available, falling back to raw git commit")
+                proc = subprocess.run(
+                    ["git", "commit", "-m", msg],
+                    cwd=self.workspace, capture_output=True, text=True, timeout=30)
+                if proc.returncode != 0:
+                    return {"status": "failed", "error": f"git commit failed: {proc.stderr[:300]}"}
+                rev = subprocess.run(["git", "rev-parse", "HEAD"],
+                                     cwd=self.workspace, capture_output=True, text=True, timeout=5)
+                commit_hash = rev.stdout.strip()
 
             log.info("Merge complete: %s (%d files)", commit_hash, len(staged))
 

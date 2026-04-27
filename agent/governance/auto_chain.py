@@ -3214,17 +3214,27 @@ def _gate_version_check(conn, project_id, result, metadata):
         return True, "governed dirty-workspace reconciliation"
 
     try:
-        row = conn.execute(
-            "SELECT chain_version, git_head, dirty_files FROM project_version WHERE project_id=?",
-            (project_id,),
-        ).fetchone()
-        dirty_files = json.loads(row["dirty_files"] or "[]") if row and row["dirty_files"] else []
-        # B15/B23/B31: filter tool-local / non-governed paths (module-level _DIRTY_IGNORE)
-        dirty_files = [f for f in dirty_files if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
+        # Phase A: read chain state from git trailer (single source of truth)
+        from .chain_trailer import get_chain_state
+        chain_state = get_chain_state()
+
+        dirty_files = chain_state.get("dirty_files", [])
         if dirty_files:
             log.warning("version_check: dirty workspace (%d files: %s) — blocking chain",
                         len(dirty_files), dirty_files[:5])
             return False, f"dirty workspace ({len(dirty_files)} files: {dirty_files[:3]})"
+
+        chain_ver = chain_state.get("version", "")
+        source = chain_state.get("source", "head")
+        if not chain_ver or chain_ver == "unknown":
+            return True, "chain_version unavailable, skipping"
+
+        # Also read DB chain_version for cross-check (backward compat, B29)
+        row = conn.execute(
+            "SELECT chain_version FROM project_version WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+        db_chain_ver = (row["chain_version"] or "").strip() if row else ""
 
         import subprocess
         head = subprocess.run(
@@ -3234,23 +3244,17 @@ def _gate_version_check(conn, project_id, result, metadata):
         ).stdout.strip()
         if not head or head == "unknown":
             return True, "git HEAD unavailable, skipping"
-        # B29: anchor version gate to DB chain_version (set only by successful Deploy),
-        # not to get_server_version() which dynamically reads git HEAD (B19 side-effect).
-        # This prevents manual Observer commits from silently advancing the gate baseline.
-        chain_ver = (row["chain_version"] or "").strip() if row else ""
-        if not chain_ver or chain_ver == "unknown":
-            return True, "chain_version unavailable in DB, skipping"
-        # B35: `head` is short (7 chars) from `git rev-parse --short`, but chain_version
-        # may be full (40 chars) if a manual-fix SOP wrote via /api/version-update with
-        # the full hash. Short git hashes are unique prefixes of full hashes, so compare
-        # via prefix match in either direction.
-        if not (chain_ver.startswith(head) or head.startswith(chain_ver)):
-            log.warning("version_check: chain_version (%s) != git HEAD (%s) — blocking chain. "
+
+        # B35: prefix match for short/full hash comparison
+        # Use DB chain_version if available (B29 anchor), else git trailer version
+        effective_ver = db_chain_ver if db_chain_ver and db_chain_ver != "unknown" else chain_ver
+        if not (effective_ver.startswith(head) or head.startswith(effective_ver)):
+            log.warning("version_check: chain_version (%s, source=%s) != git HEAD (%s) — blocking chain. "
                         "Complete a full workflow Deploy to update chain_version.",
-                        chain_ver, head)
-            return False, (f"chain_version ({chain_ver}) != git HEAD ({head}). "
+                        effective_ver, source, head)
+            return False, (f"chain_version ({effective_ver}) != git HEAD ({head}). "
                            f"Complete workflow Deploy to update chain_version.")
-        return True, f"version match: {chain_ver}"
+        return True, f"version match: {effective_ver} (source={source})"
     except Exception as e:
         log.warning("version_check failed (non-fatal): %s", e)
         return True, f"version check skipped: {e}"
