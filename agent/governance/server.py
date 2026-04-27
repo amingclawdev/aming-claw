@@ -2567,16 +2567,9 @@ def _audit_version_update(conn, pid, body, result, reason):
 def handle_redeploy_after_merge(ctx: RequestContext):
     """Orchestrate executor respawn + governance self-restart after merge."""
     pid = ctx.get_project_id()
-    conn = get_connection(pid)
     body = ctx.body
     task_id = body.get("task_id", "")
     chain_version = body.get("chain_version", "")
-    # Audit row 1: requested
-    try:
-        audit_service.record(conn, pid, "redeploy_after_merge.requested",
-                             actor="deploy_chain", details={"task_id": task_id, "chain_version": chain_version})
-    except Exception:
-        pass
     # Notify SM sidecar to respawn executor
     import urllib.request, urllib.error
     sm_ok = False
@@ -2589,12 +2582,18 @@ def handle_redeploy_after_merge(ctx: RequestContext):
             sm_ok = json.loads(r.read()).get("ok", False)
     except Exception:
         pass
-    # Audit row 2: sm_notified
-    try:
-        audit_service.record(conn, pid, "redeploy_after_merge.sm_notified",
-                             actor="deploy_chain", details={"task_id": task_id, "sm_ok": sm_ok})
-    except Exception:
-        pass
+    # Audit rows inside DBContext so they auto-commit
+    with DBContext(pid) as conn:
+        try:
+            audit_service.record(conn, pid, "redeploy_after_merge.requested",
+                                 actor="deploy_chain", details={"task_id": task_id, "chain_version": chain_version})
+        except Exception:
+            pass
+        try:
+            audit_service.record(conn, pid, "redeploy_after_merge.sm_notified",
+                                 actor="deploy_chain", details={"task_id": task_id, "sm_ok": sm_ok})
+        except Exception:
+            pass
     # Schedule deferred self-restart
     import threading
     def _deferred_restart():
