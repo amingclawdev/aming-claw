@@ -37,21 +37,6 @@ from utils import save_json, tasks_root, utc_iso  # noqa: E402
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _ensure_pending_reload_table(conn):
-    """Create pending_executor_reloads table if it does not exist."""
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS pending_executor_reloads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chain_version TEXT NOT NULL,
-            requested_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending'
-                CHECK(status IN ('pending', 'processed')),
-            processed_at TEXT
-        )
-    ''')
-    conn.commit()
-
-
 def _state_dir() -> Path:
     """Return the state directory (tasks_root / 'state'), creating it if needed."""
     d = tasks_root() / "state"
@@ -749,10 +734,10 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         # then executor. This ensures governance is healthy before executor
         # tries to register with it.
 
-        # R7: Event-driven governance restart (replaces inline SELFKILL pattern)
+        # R7: Event-driven governance restart via HTTP (no direct sqlite3)
         if "governance" in affected:
-            import sqlite3 as _sqlite3
-            from datetime import datetime, timezone
+            import urllib.request as _ur
+            import urllib.error as _ue
             chain_version_short = expected_head or ""
             if not chain_version_short:
                 try:
@@ -760,44 +745,22 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
                     chain_version_short = get_chain_version()
                 except Exception:
                     chain_version_short = "unknown"
-            gov_db_path = Path(__file__).resolve().parent.parent / "governance.db"
             ok = False
             summary = ""
-            reload_row_id = None
             try:
-                gov_conn = _sqlite3.connect(str(gov_db_path), timeout=5)
-                _ensure_pending_reload_table(gov_conn)
-                now = datetime.now(timezone.utc).isoformat()
-                cur = gov_conn.execute(
-                    "INSERT INTO pending_executor_reloads (chain_version, requested_at, status) "
-                    "VALUES (?, ?, 'pending')", (chain_version_short, now)
-                )
-                gov_conn.commit()
-                reload_row_id = cur.lastrowid
-                # Durability: fsync so the row survives gov restart
-                try:
-                    db_fd = os.open(str(gov_db_path), os.O_RDONLY)
-                    os.fsync(db_fd)
-                    os.close(db_fd)
-                except Exception as e:
-                    log.warning("deploy: fsync failed (non-fatal): %s", e)
-                # Mark processed BEFORE triggering gov restart for idempotency
-                gov_conn.execute(
-                    "UPDATE pending_executor_reloads SET status='processed', processed_at=? WHERE id=?",
-                    (datetime.now(timezone.utc).isoformat(), reload_row_id))
-                gov_conn.commit()
-                gov_conn.close()
-                # Trigger gov restart only — NO inline executor self-kill
-                ok, summary = restart_local_governance()
+                _pid = project_id or "aming-claw"
+                _payload = json.dumps({"task_id": task_id, "chain_version": chain_version_short}).encode()
+                _req = _ur.Request(
+                    f"http://localhost:40000/api/governance/redeploy-after-merge/{_pid}",
+                    data=_payload, headers={"Content-Type": "application/json"}, method="POST")
+                with _ur.urlopen(_req, timeout=30) as _resp:
+                    _body = json.loads(_resp.read())
+                ok = _body.get("ok", False)
+                summary = f"redeploy-after-merge ok={ok}"
             except Exception as exc:
-                summary = f"event-driven restart failed: {exc}"
-                log.warning("deploy: governance event-driven restart failed: %s", exc)
-
-            steps["governance"] = {
-                "success": ok,
-                "summary": summary,
-                "reload_row_id": reload_row_id,
-            }
+                summary = f"redeploy-after-merge failed: {exc}"
+                log.warning("deploy: governance HTTP restart failed: %s", exc)
+            steps["governance"] = {"success": ok, "summary": summary}
 
         # R6: For executor, mark task SUCCEEDED with redeploy_pending BEFORE kill
         if "executor" in affected:
