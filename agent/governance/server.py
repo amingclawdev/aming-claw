@@ -2184,13 +2184,21 @@ def handle_health(ctx: RequestContext):
 
 @route("GET", "/api/version-check/{project_id}")
 def handle_version_check(ctx: RequestContext):
-    """Check chain version vs git HEAD. All data from DB (synced by executor).
+    """Check chain version vs git HEAD.
 
-    executor_worker polls git on host and writes to DB via /api/version-sync.
-    This endpoint just reads DB — no git, no MCP, no external HTTP calls.
+    Phase A hybrid: reads DB state (synced by executor) AND derives trailer
+    state from git. Returns 'source' field indicating where version came from.
     """
     pid = ctx.get_project_id()
     conn = get_connection(pid)
+
+    # Derive trailer state (best-effort, non-blocking)
+    trailer_state = None
+    try:
+        from .chain_trailer import get_chain_state
+        trailer_state = get_chain_state()
+    except Exception as e:
+        log.debug("version-check: chain_trailer unavailable: %s", e)
 
     row = conn.execute(
         "SELECT chain_version, updated_at, git_head, dirty_files, git_synced_at "
@@ -2198,12 +2206,17 @@ def handle_version_check(ctx: RequestContext):
     ).fetchone()
 
     if not row:
+        source = trailer_state["source"] if trailer_state else "none"
+        version = trailer_state["version"] if trailer_state else "unknown"
         return {
             "ok": True, "project_id": pid,
-            "head": "unknown", "chain_version": "(not set)",
-            "dirty": False, "dirty_files": [],
-            "message": "Project not initialized",
-            "generated_at": _utc_now(), "project_version": "unknown",
+            "head": version if trailer_state else "unknown",
+            "chain_version": version if trailer_state else "(not set)",
+            "dirty": trailer_state["dirty"] if trailer_state else False,
+            "dirty_files": trailer_state["dirty_files"] if trailer_state else [],
+            "source": source,
+            "message": "Project not initialized" + (f" (trailer source: {source})" if trailer_state else ""),
+            "generated_at": _utc_now(), "project_version": version if trailer_state else "unknown",
         }
 
     chain_ver = row["chain_version"]
@@ -2212,6 +2225,18 @@ def handle_version_check(ctx: RequestContext):
     # B31: apply _DIRTY_IGNORE filter (same as auto_chain._gate_version_check)
     dirty_files = [f for f in dirty_files_raw if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
     git_synced = row["git_synced_at"] or ""
+
+    # Determine source: prefer trailer if available
+    source = "db"
+    if trailer_state:
+        source = trailer_state["source"]  # 'trailer' or 'head'
+        # Merge trailer dirty_files with DB dirty_files (union, filtered)
+        if trailer_state.get("dirty_files"):
+            trailer_dirty = [f for f in trailer_state["dirty_files"]
+                             if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
+            for f in trailer_dirty:
+                if f not in dirty_files:
+                    dirty_files.append(f)
 
     # Compare
     ok = True
@@ -2229,12 +2254,13 @@ def handle_version_check(ctx: RequestContext):
     return {
         "ok": ok,
         "project_id": pid,
-        "head": git_head or "unknown",
+        "head": git_head or (trailer_state["version"] if trailer_state else "unknown"),
         "chain_version": chain_ver,
         "chain_updated_at": row["updated_at"],
         "dirty": bool(dirty_files),
         "dirty_files": dirty_files,
         "git_synced_at": git_synced,
+        "source": source,
         "message": "; ".join(parts),
         "generated_at": _utc_now(),
         "project_version": chain_ver,
@@ -2467,7 +2493,22 @@ def handle_version_update(ctx: RequestContext):
             conn.close()
 
     _retry_on_busy(_do_update)
-    return {"ok": True, "chain_version": new_version, "updated_at": now}
+
+    # Phase A: also log IGNORED audit entry for trailer transition awareness
+    # and return derived trailer state alongside DB state
+    derived_state = None
+    try:
+        from .chain_trailer import get_chain_state
+        derived_state = get_chain_state()
+        log.info("version-update: DB write succeeded; trailer-derived state: %s", derived_state)
+    except Exception as e:
+        log.debug("version-update: chain_trailer unavailable for derived state: %s", e)
+
+    result = {"ok": True, "chain_version": new_version, "updated_at": now}
+    if derived_state:
+        result["derived_state"] = derived_state
+        result["source"] = derived_state.get("source", "db")
+    return result
 
 
 def _audit_version_update(conn, pid, body, result, reason):

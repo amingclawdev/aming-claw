@@ -47,6 +47,16 @@ def main() -> None:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     configure_host_env(root)
+
+    # Phase A: backfill legacy commits lacking Chain-Version trailer at boot
+    try:
+        from agent.governance.chain_trailer import backfill_legacy_chain_history
+        legacy = backfill_legacy_chain_history(limit=50)
+        if legacy:
+            print(f"[boot] Backfilled {len(legacy)} legacy commits lacking Chain-Version trailer")
+    except Exception as e:
+        print(f"[boot] chain_trailer backfill skipped: {e}")
+
     from agent.governance.server import main as governance_main
     governance_main()
 
