@@ -104,3 +104,63 @@ def test_cross_references(spec_content):
     assert "auto-chain.md" in spec_content, "Missing cross-ref to auto-chain.md"
     assert "version-control.md" in spec_content, "Missing cross-ref to version-control.md"
     assert "manual-fix-sop.md" in spec_content, "Missing cross-ref to manual-fix-sop.md"
+
+
+# --- v2 structural assertions (7 new tests) ---
+
+
+def test_v2_plan_approval_section(spec_content):
+    """v2-AC1: §5.5 Plan Approval subsection exists with required fields."""
+    assert "### 5.5 Plan Approval" in spec_content, "Missing §5.5 Plan Approval subsection"
+    assert "auto-approval-bot" in spec_content, "§5.5 missing auto-approval-bot"
+    assert "approver_id" in spec_content, "§5.5 missing approver_id"
+    assert "plan_hash" in spec_content, "§5.5 missing plan_hash"
+    assert "expires_at" in spec_content, "§5.5 missing expires_at"
+
+
+def test_v2_rollback_subsections(spec_content):
+    """v2-AC4: §10 has subsections §10.1 through §10.6."""
+    for i in range(1, 7):
+        assert f"### 10.{i}" in spec_content, f"Missing §10.{i} rollback subsection"
+
+
+def test_v2_three_tier_rate_limit(spec_content):
+    """v2-AC5: §2.3 defines 3-tier rate limit."""
+    assert "Tier 1" in spec_content, "§2.3 missing Tier 1"
+    assert "Tier 2" in spec_content, "§2.3 missing Tier 2"
+    assert "Tier 3" in spec_content, "§2.3 missing Tier 3"
+    assert "N=3" in spec_content, "§2.3 missing default N=3"
+    assert "M=10" in spec_content, "§2.3 missing default M=10"
+
+
+def test_v2_verify_before_close_state_machine(spec_content):
+    """v2-AC6: §8 documents verify-before-close state machine."""
+    assert "queued" in spec_content, "§8 missing state 'queued'"
+    assert "claimed" in spec_content, "§8 missing state 'claimed'"
+    assert "executing" in spec_content, "§8 missing state 'executing'"
+    assert "executed" in spec_content, "§8 missing state 'executed'"
+    assert "verifying" in spec_content, "§8 missing state 'verifying'"
+    assert "succeeded" in spec_content, "§8 missing state 'succeeded'"
+    assert "failed" in spec_content, "§8 missing state 'failed'"
+    assert "written exactly once" in spec_content, "§8 missing 'written exactly once'"
+
+
+def test_v2_suspected_drift_findings(spec_content):
+    """v2-AC2a: §3 output uses suspected_drift_findings."""
+    assert "suspected_drift_findings" in spec_content, "§3 missing suspected_drift_findings"
+
+
+def test_v2_confirmed_field(spec_content):
+    """v2-AC2b: §4 output has confirmed boolean field."""
+    assert "confirmed: bool" in spec_content, "§4 missing 'confirmed: bool' field"
+    assert "0.7" in spec_content, "§4 missing confidence threshold 0.7"
+    assert "observer_review_required" in spec_content, "§4 missing observer_review_required"
+
+
+def test_v2_lock_token(spec_content):
+    """v2-AC3: §7 input contract requires lock_token."""
+    assert "lock_token" in spec_content, "§7 missing lock_token"
+    assert "expected_before_state" in spec_content, "§7 missing expected_before_state"
+    assert "expected_node_version" in spec_content, "§7 missing expected_node_version"
+    assert "chain_version" in spec_content, "§7 missing chain_version in input contract"
+    assert "stale_plan" in spec_content, "§7 missing stale_plan error semantics"

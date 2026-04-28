@@ -58,14 +58,15 @@ Audit records are immutable and queryable via `/api/audit/{pid}/log`.
 
 ### 2.3 Rate Limit
 
-Reconcile tasks are rate-limited to prevent runaway repair loops:
+Reconcile operations enforce a 3-tier rate limit to prevent runaway repair loops:
 
-- **Default rate limit**: Maximum 5 reconcile tasks per hour per project
-- **Burst allowance**: Up to 3 concurrent reconcile tasks
-- **Cooldown**: 60 seconds minimum between consecutive reconcile task creations
-- **Override**: Project-level `reconcile_config.rate_limit` metadata can adjust thresholds
+- **Tier 1 (run-level)**: Maximum 1 active `reconcile_run_id` per project at any time. A new run cannot start until the previous run reaches terminal state (`completed` or `rolled_back`). Counter: `audit_index.run_level_active`. Alert threshold: attempt to start second run logs `F2.1a`.
 
-Rate limit violations are logged as `F2.1` failure events and require observer intervention.
+- **Tier 2 (task-level)**: Maximum N=3 concurrent `reconcile_task` instances within a single run (configurable via `reconcile_config.task_concurrency`, default N=3). Counter: `audit_index.task_level_active`. Alert threshold: N-1 active tasks logs `F2.1b` warning.
+
+- **Tier 3 (action-level)**: Maximum M=10 discrete actions per task (configurable via `reconcile_config.max_actions_per_task`, default M=10). Prevents a single task from runaway changes. Counter: `audit_index.action_level_count`. Alert threshold: M-2 actions logs `F2.1c` warning.
+
+Each tier has a separate counter in `audit_index` and a separate alert threshold. Rate limit violations at any tier are logged as `F2.1` failure events and require observer intervention.
 
 ---
 
@@ -85,7 +86,7 @@ Rate limit violations are logged as `F2.1` failure events and require observer i
 
 ### Output contract
 
-- Drift report: list of `{node_id, drift_type, evidence, severity}`
+- `suspected_drift_findings`: list of `{node_id, drift_type, evidence, severity, confidence}` where `confidence` is a float 0.0–1.0 representing detection-phase certainty
 - No state mutations during detection phase
 - Report persisted to `reconcile_runs` table with unique `run_id`
 
@@ -117,7 +118,11 @@ Detection is read-only; no rollback needed. Failed scans are logged and retried.
 
 ### Output contract
 
-- Classified drift items with proposed remediation action
+- Classified drift items with proposed remediation action, each including:
+  - `confirmed: bool` — set to `true` only when classification raises confidence above 0.7 AND assigns a severity tier (low/medium/high)
+  - `severity`: one of `low`, `medium`, `high`
+  - `confidence`: float 0.0–1.0 (carried from §3, potentially adjusted by classification)
+- Unconfirmed findings (confidence < 0.7) receive `observer_review_required` status and do NOT auto-flow to §5
 - Priority ordering (P0 > P1 > P2)
 - Deduplication against in-progress reconcile tasks
 
@@ -170,6 +175,33 @@ if classification logic is updated. No DB mutations to reverse.
 
 Plans are proposals; delete the plan record from `reconcile_plans`. No node state changed yet.
 
+### 5.5 Plan Approval
+
+Before a remediation plan flows to §6 Task Creation, it must pass an approval gate.
+
+**Approver allowlist**: `observer-*`, `coordinator`, or `auto-approval-bot` (under conditions below).
+
+**Auto-approval conditions** (all must hold for `auto-approval-bot` to approve):
+- Single-node remediation (exactly one target node)
+- Severity = `low`
+- Confidence ≥ 0.85
+- No gate bypass involved in the remediation plan
+
+**Mandatory observer approval** (any triggers human review):
+- Multi-node remediation (>1 target node)
+- Severity = `medium` or `high`
+- Gate bypass involved in the plan
+- Dead code deletion > 20 LOC
+- Edge rewrite touching foundation layers L0–L1
+
+**Rejection path**: Plan marked `rejected` with reason; `reconcile_run` aborted; remediation logged for re-planning in next cycle.
+
+**Approval output**: Signed approval token containing:
+- `approver_id`: identity of the approving actor
+- `approved_at`: ISO-8601 timestamp
+- `plan_hash`: SHA-256 of the approved plan
+- `expires_at`: token expiry (default 1 hour from `approved_at`)
+
 ---
 
 ## §6 Phase 4: Task Creation
@@ -212,6 +244,13 @@ Tasks already `claimed` require observer intervention to cancel.
 - Reconcile task in `claimed` state
 - Executor worker available with reconcile capability
 - Target node(s) accessible and not locked by another operation
+- Optimistic locking fields (MUST validate before any mutation):
+  - `expected_before_state`: SHA-256 of relevant state snapshot taken at §5 plan time
+  - `expected_node_version`: per-node version counter (incremented on each mutation)
+  - `chain_version`: governance HEAD at §5 plan time
+  - `lock_token`: signed token from §5.5 Plan Approval
+
+If any optimistic lock check fails, abort execution with `stale_plan` error. No mutation has occurred so no state change to undo, but the plan must be invalidated and re-planning triggered via §5.
 
 ### Output contract
 
@@ -238,36 +277,47 @@ observer with full evidence per [manual-fix-sop.md](manual-fix-sop.md) §2 proce
 
 ---
 
-## §8 Phase 6: Verification
+## §8 Phase 6: Verification (verify-before-close)
+
+Verification uses a verify-before-close pattern: terminal status is written exactly once, only after all checks complete.
+
+**State machine**: `queued` → `claimed` → `executing` → `executed` → `verifying` → `succeeded | failed`
+
+- §7 Execution completes → status = `executed` (NOT terminal)
+- §8 Verification runs ALL checks while status = `verifying`
+- If all pass → status = `succeeded` (terminal, written exactly once)
+- If any fail → trigger §10 action-specific rollback → status = `failed` (terminal, written exactly once)
+- NEVER allow `succeeded` to revert to `failed` after the fact
 
 ### Input contract
 
-- Completed reconcile execution (§7)
+- Completed reconcile execution (§7) in `executed` state
 - Expected end-state from remediation plan
 - Access to governance DB for state verification
 
 ### Output contract
 
 - Verification result: `pass` or `fail` with evidence
-- If pass: task transitions to QA stage
-- If fail: task marked for retry or escalation
+- If pass: status transitions to `succeeded` (terminal, written exactly once)
+- If fail: trigger §10 rollback, then status transitions to `failed` (terminal, written exactly once)
 
 ### Acceptance criteria
 
 - AC8.1: Verification checks actual DB state (not cached/stale)
 - AC8.2: Verification runs within 60s of execution completion
-- AC8.3: Failed verification triggers automatic retry (max 2 retries)
+- AC8.3: Failed verification triggers §10 action-specific rollback before writing terminal status
+- AC8.4: Terminal status (`succeeded` or `failed`) is written exactly once — no double-write
 
 ### Failure modes
 
-- F8.1: DB state inconsistent with expected — retry execution from Phase 5
-- F8.2: Verification timeout — treat as failure, retry
+- F8.1: DB state inconsistent with expected — trigger §10 rollback, write `failed`
+- F8.2: Verification timeout — treat as failure, trigger rollback
 - F8.3: Max retries exceeded — escalate to observer, mark task `failed`
 
 ### Rollback path
 
-Verification is read-only check. On failure, rollback is handled by re-entering Phase 5 (§7)
-with rollback flag, which reverses the state change.
+Verification is read-only check. On failure, rollback is handled by §10 action-specific
+rollback subsections before terminal status is written.
 
 ---
 
@@ -312,36 +362,69 @@ Per [manual-fix-sop.md](manual-fix-sop.md) rollback procedures if automated roll
 
 ---
 
-## §10 Phase 8: Closure
+## §10 Phase 8: Rollback and Closure
 
 ### Input contract
 
-- Approved review from Phase 7 (§9) OR rollback completion
-- All affected nodes in expected final state
-- Audit trail complete for the reconcile run
+- Failed verification from §8 OR rejected review from §9
+- Before-state snapshots from §7 execution evidence
+- Action type from remediation plan (determines which rollback subsection applies)
 
 ### Output contract
+
+- Rollback completed: affected nodes restored to pre-execution state
+- Reconcile run marked `completed` or `rolled_back` in `reconcile_runs`
+- Summary report with rollback details and root cause
+
+### Acceptance criteria
+
+- AC10.1: Rollback restores node state to match before-state snapshot
+- AC10.2: All rollback actions audited with action-specific event type
+- AC10.3: Observer notified if any rollback sub-step fails
+
+Action-specific rollback strategies replace the generic .bak swap. Each subsection defines its own acceptance criteria, audit requirements, and observer escalation path.
+
+### 10.1 State-only Repair Rollback
+
+Restore node state from `.bak` snapshot (existing pattern). AC: before-state matches `.bak` content after restore. Audit: log `rollback_state_repair` with node_id and before/after hashes. Observer alert if `.bak` file missing or corrupted.
+
+### 10.2 Missing-node Creation Rollback
+
+Delete the created node from the graph. Restore `proposed_nodes` to `pending` status. AC: node no longer exists in graph export; proposed_nodes entry reverted. Audit: log `rollback_node_creation` with node_id. Observer alert if deletion fails (foreign key constraints).
+
+### 10.3 Orphan-node Deletion Rollback
+
+Restore deleted node from `.bak` with full metadata. Verify all metadata fields preserved (title, deps, primary, description, layer). AC: restored node matches pre-deletion snapshot. Audit: log `rollback_orphan_deletion` with node_id and metadata hash. Observer alert if metadata fields missing after restore.
+
+### 10.4 Edge Rewrite Rollback
+
+Revert call-graph edges to pre-rewrite state. Recompute affected `in_degree` and `color_count` for all touched nodes. AC: edge set matches pre-rewrite snapshot; derived metrics recalculated. Audit: log `rollback_edge_rewrite` with affected edge list. Observer alert if recomputation produces inconsistent metrics.
+
+### 10.5 Gate-bypass Action Rollback
+
+Revoke the bypass token. Re-enable the original gate check. AC: gate function returns to enforcing state; bypass token invalidated. Audit: log `rollback_gate_bypass` with token_id and revoke reason. Observer alert if gate re-enable fails.
+
+### 10.6 Multi-node Action Rollback
+
+Execute compensating reverse-order undo per node (last-modified-first). If any sub-undo fails, escalate immediately to observer for manual recovery per [manual-fix-sop.md](manual-fix-sop.md). AC: all nodes restored OR observer notified with partial-undo report. Audit: log `rollback_multi_node` with per-node undo status. Observer alert on any sub-undo failure.
+
+### Closure
+
+After rollback (or after successful verification in §8):
 
 - Reconcile run marked `completed` or `rolled_back` in `reconcile_runs`
 - Summary report generated with: nodes_fixed, duration, drift_types_resolved
 - Metrics emitted for monitoring dashboards
 
-### Acceptance criteria
-
-- AC10.1: Run status is terminal (`completed` or `rolled_back`)
-- AC10.2: All intermediate artifacts (plans, evidence) linked to run record
-- AC10.3: Summary includes actionable insights for preventing recurrence
-
 ### Failure modes
 
-- F10.1: Final state verification fails at closure — re-open run, return to Phase 6 (§8)
+- F10.1: Rollback itself fails — escalate to observer manual recovery
 - F10.2: Audit trail incomplete — block closure until gaps filled
 - F10.3: Metrics emission fails — log warning but allow closure (non-blocking)
 
 ### Rollback path
 
-Closure is terminal. If reopened due to F10.1, the run returns to verification phase.
-No "undo close" — the run simply transitions back to active state.
+If rollback fails at any subsection, escalate to observer. No automated retry of failed rollbacks — manual intervention required per [manual-fix-sop.md](manual-fix-sop.md).
 
 ---
 
@@ -394,6 +477,7 @@ This specification is versioned alongside the governance codebase.
 
 | Version | Date | Change |
 |---------|------|--------|
+| v2 | 2026-04-28 | GPT round 5 review hardening — Plan Approval gate, optimistic locking, action-specific rollback, 3-tier rate-limit, verify-before-close. See OPT-BACKLOG-RECONCILE-WORKFLOW-SPEC-V2-HARDENING. |
 | 1.0.0 | 2026-04-28 | Initial formalization from scratch draft |
 
 ### 12.2 Modification Process
@@ -464,8 +548,8 @@ gate path (`_should_defer_doc_gate_to_lane_c`) already handles this pattern.
 ## Appendix A: Reconcile Run Lifecycle Diagram
 
 ```
-Detection (§3) → Classification (§4) → Planning (§5) → Task Creation (§6)
-    → Execution (§7) → Verification (§8) → Review (§9) → Closure (§10)
+Detection (§3) → Classification (§4) → Planning (§5) → Plan Approval (§5.5)
+    → Task Creation (§6) → Execution (§7) → Verification (§8) → Review (§9) → Closure (§10)
 ```
 
 Each phase has defined input/output contracts and failure modes documented above.
