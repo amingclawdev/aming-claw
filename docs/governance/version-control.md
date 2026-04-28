@@ -7,6 +7,9 @@
 
 The version control system ensures governance state stays synchronized with the git repository. The `chain_version` field in the governance DB tracks which git commit the current auto-chain is based on, and the version gate validates this synchronization at each stage transition.
 
+> **See also:** [reconcile-workflow.md](reconcile-workflow.md) §12 for how reconcile operations
+> interact with chain_version lifecycle and version gate during spec updates.
+
 ## Core Concepts
 
 ### chain_version

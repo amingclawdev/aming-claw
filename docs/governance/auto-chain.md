@@ -9,6 +9,9 @@
 
 The auto-chain is the core workflow automation in Aming Claw. It automatically progresses tasks through a fixed sequence of governance stages, with gate checks at each transition to ensure quality.
 
+> **See also:** [reconcile-workflow.md](reconcile-workflow.md) §11 for gate exemption patterns
+> used during reconcile operations (references `_gate_release`, `_gate_qa_pass`, `_gate_t2_pass`).
+
 ## Stage Sequence
 
 ```

@@ -23,6 +23,9 @@ Manual fixes are **only** permitted in chicken-and-egg deadlock scenarios where 
 
 **Principle: Manual fixes must be minimal in scope. The sole goal is to restore Workflow operation. All subsequent fixes must return to the normal Workflow chain.**
 
+> **See also:** [reconcile-workflow.md](reconcile-workflow.md) — Reconcile replaces ad-hoc manual
+> fixes with a structured, auditable process. Rollback paths in §7 and §9 reference this SOP.
+
 ---
 
 ## 2. Manual Fix Flow (6 Phases)
