@@ -1,4 +1,4 @@
-"""Tests for POST /api/governance/redeploy-after-merge/{project_id}."""
+"""Tests: handle_redeploy_after_merge is audit-only (v4 design)."""
 from pathlib import Path
 
 
@@ -9,41 +9,26 @@ def _handler_src():
     return src[s:e]
 
 
-def test_endpoint_writes_two_audit_rows():
+def test_ack_response_shape():
     h = _handler_src()
-    assert h.count("audit_service.record(") == 2
-    assert h.count("with DBContext(") == 2
-    assert h.index("redeploy_after_merge.requested") < h.index("respawn-executor")
+    assert '"audit recorded; executor must orchestrate sm calls"' in h
 
 
-def test_endpoint_calls_respawn_executor_first():
+def test_single_audit_row():
     h = _handler_src()
-    assert "/api/manager/respawn-executor" in h
-    assert h.index("respawn-executor") < h.index("redeploy/governance")
+    assert h.count("audit_service.record(") == 1
+    assert "redeploy_after_merge.requested" in h
+    assert "sm_notified" not in h
 
 
-def test_endpoint_calls_redeploy_governance_second():
+def test_no_sm_calls():
     h = _handler_src()
-    assert "/api/manager/redeploy/governance" in h
+    assert "urllib.request" not in h
+    assert "40101" not in h
 
 
-def test_endpoint_returns_ok_when_both_sm_succeed():
+def test_no_self_kill_mechanisms():
     h = _handler_src()
-    assert "sm_respawn_ok and sm_redeploy_ok" in h
-
-
-def test_endpoint_returns_partial_ok_when_one_fails():
-    h = _handler_src()
-    assert '"sm_respawn_ok": sm_respawn_ok' in h
-    assert '"sm_redeploy_ok": sm_redeploy_ok' in h
-
-
-def test_endpoint_does_NOT_create_thread():
-    h = _handler_src()
-    assert "threading" not in h
-    assert "Thread" not in h
-
-
-def test_endpoint_does_NOT_call_restart_local_governance():
-    h = _handler_src()
+    assert "threading.Thread" not in h
     assert "restart_local_governance" not in h
+    assert "os.kill" not in h

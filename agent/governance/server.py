@@ -2565,46 +2565,18 @@ def _audit_version_update(conn, pid, body, result, reason):
 
 @route("POST", "/api/governance/redeploy-after-merge/{project_id}")
 def handle_redeploy_after_merge(ctx: RequestContext):
-    """Orchestrate executor respawn + governance redeploy via SM after merge."""
+    """Audit-only ack; executor (deploy_chain) orchestrates SM calls."""
     pid = ctx.get_project_id()
     body = ctx.body
     task_id = body.get("task_id", "")
     chain_version = body.get("chain_version", "")
-    # Audit row 1: requested (committed before HTTP calls)
     with DBContext(pid) as conn:
         try:
             audit_service.record(conn, pid, "redeploy_after_merge.requested",
                                  actor="deploy_chain", details={"task_id": task_id, "chain_version": chain_version})
         except Exception:
             pass
-    import urllib.request, urllib.error
-    sm_respawn_ok = sm_redeploy_ok = False
-    try:
-        req = urllib.request.Request(
-            "http://localhost:40101/api/manager/respawn-executor",
-            data=json.dumps({"chain_version": chain_version}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            sm_respawn_ok = json.loads(r.read()).get("ok", False)
-    except Exception:
-        pass
-    try:
-        req = urllib.request.Request(
-            "http://localhost:40101/api/manager/redeploy/governance",
-            data=json.dumps({"chain_version": chain_version}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            sm_redeploy_ok = json.loads(r.read()).get("ok", False)
-    except Exception:
-        pass
-    # Audit row 2: sm_notified (after both SM calls)
-    with DBContext(pid) as conn:
-        try:
-            audit_service.record(conn, pid, "redeploy_after_merge.sm_notified",
-                                 actor="deploy_chain", details={"task_id": task_id, "sm_respawn_ok": sm_respawn_ok, "sm_redeploy_ok": sm_redeploy_ok})
-        except Exception:
-            pass
-    return {"ok": sm_respawn_ok and sm_redeploy_ok, "sm_respawn_ok": sm_respawn_ok, "sm_redeploy_ok": sm_redeploy_ok}
+    return {"ok": True, "message": "audit recorded; executor must orchestrate sm calls"}
 
 
 # --- Redeploy Endpoints (PR-2) ---
