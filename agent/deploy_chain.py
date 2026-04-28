@@ -19,6 +19,8 @@ import logging
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -734,33 +736,29 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
         # then executor. This ensures governance is healthy before executor
         # tries to register with it.
 
-        # R7: Event-driven governance restart via HTTP (no direct sqlite3)
+        # R7: Event-driven governance restart — executor orchestrates 3 POSTs
         if "governance" in affected:
-            import urllib.request as _ur
-            import urllib.error as _ue
-            chain_version_short = expected_head or ""
-            if not chain_version_short:
+            _pid = project_id or "aming-claw"
+            _cv = expected_head or ""
+            _hdr = {"Content-Type": "application/json"}
+            _payload = json.dumps({"task_id": task_id, "chain_version": _cv}).encode()
+            gov_url = f"http://localhost:40000/api/governance/redeploy-after-merge/{_pid}"
+            sm_url = "http://localhost:40101"
+            ok = True
+            summary_parts: list[str] = []
+            for label, url in [("gov-ack", gov_url),
+                                ("sm-redeploy", f"{sm_url}/api/manager/redeploy/governance"),
+                                ("sm-respawn", f"{sm_url}/api/manager/respawn-executor")]:
                 try:
-                    from agent.governance.chain_trailer import get_chain_version
-                    chain_version_short = get_chain_version()
-                except Exception:
-                    chain_version_short = "unknown"
-            ok = False
-            summary = ""
-            try:
-                _pid = project_id or "aming-claw"
-                _payload = json.dumps({"task_id": task_id, "chain_version": chain_version_short}).encode()
-                _req = _ur.Request(
-                    f"http://localhost:40000/api/governance/redeploy-after-merge/{_pid}",
-                    data=_payload, headers={"Content-Type": "application/json"}, method="POST")
-                with _ur.urlopen(_req, timeout=30) as _resp:
-                    _body = json.loads(_resp.read())
-                ok = _body.get("ok", False)
-                summary = f"redeploy-after-merge ok={ok}"
-            except Exception as exc:
-                summary = f"redeploy-after-merge failed: {exc}"
-                log.warning("deploy: governance HTTP restart failed: %s", exc)
-            steps["governance"] = {"success": ok, "summary": summary}
+                    req = urllib.request.Request(url, data=_payload, headers=_hdr, method="POST")
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        body = json.loads(resp.read())
+                    summary_parts.append(f"{label}=ok")
+                except Exception as exc:
+                    ok = False
+                    summary_parts.append(f"{label}=FAIL({exc})")
+                    log.warning("deploy: %s failed: %s", label, exc)
+            steps["governance"] = {"success": ok, "summary": ", ".join(summary_parts)}
 
         # R6: For executor, mark task SUCCEEDED with redeploy_pending BEFORE kill
         if "executor" in affected:
