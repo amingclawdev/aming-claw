@@ -2565,7 +2565,12 @@ def _audit_version_update(conn, pid, body, result, reason):
 
 @route("POST", "/api/governance/redeploy-after-merge/{project_id}")
 def handle_redeploy_after_merge(ctx: RequestContext):
-    """Orchestrate executor respawn + governance self-restart after merge."""
+    """Orchestrate executor respawn + governance self-restart after merge.
+
+    Triggered by deploy_chain.run_deploy via HTTP POST. Sends SM respawn
+    signal, schedules threaded self-restart, audit rows auto-committed
+    via DBContext.
+    """
     pid = ctx.get_project_id()
     body = ctx.body
     task_id = body.get("task_id", "")
