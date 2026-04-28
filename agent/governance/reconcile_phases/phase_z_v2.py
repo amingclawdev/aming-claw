@@ -906,6 +906,90 @@ def write_graph_v2_json(
 
 
 # ---------------------------------------------------------------------------
+# PR2a: DFS coloring from entry points
+# ---------------------------------------------------------------------------
+
+_ENTRY_DECORATORS_SET = frozenset(
+    {"route", "app", "get", "post", "put", "delete", "patch", "cli"}
+)
+_MCP_HANDLER_PATTERNS = frozenset(
+    {"mcp_tool", "server.tool", "server.resource", "server.prompt"}
+)
+
+
+def identify_entries(modules: Dict[str, ModuleInfo]) -> List[str]:
+    """Detect entry-point functions from module metadata.
+
+    Entry criteria:
+    - Decorated with @route/@app/@get/@post/@put/@delete/@patch/@cli
+    - MCP handler patterns (mcp_tool, server.tool, etc.)
+    - __main__ guard or scripts/ path with __main__ block
+    """
+    entries: List[str] = []
+    for _mod_name, mod_info in modules.items():
+        is_script = "scripts/" in mod_info.path.replace("\\", "/")
+        for func in mod_info.functions:
+            if _is_entry_func(func, is_script):
+                entries.append(func.qualified_name)
+    return entries
+
+
+def _is_entry_func(func: FunctionMeta, is_script: bool) -> bool:
+    for dec in func.decorators:
+        dec_lower = dec.lower()
+        for pat in _ENTRY_DECORATORS_SET:
+            if pat in dec_lower:
+                return True
+        for pat in _MCP_HANDLER_PATTERNS:
+            if pat in dec_lower:
+                return True
+    if "__main__" in func.name or "__main__" in func.qualified_name:
+        return True
+    if is_script and func.is_entry:
+        return True
+    return False
+
+
+def dfs_color_from_entries(
+    edges: Dict[str, List[str]],
+    entries: List[str],
+    track_distance: bool = False,
+) -> Tuple[Dict[str, Set[str]], Dict[str, int]]:
+    """Perform DFS from each entry through strong call-graph edges.
+
+    Args:
+        edges: Strong call-graph edges (caller -> [targets]).
+        entries: List of entry-point qualified names.
+        track_distance: Reserved for future re-add of min_distance computation
+            via in-DFS hashmap. Currently unused.
+
+    Returns:
+        (color_sets, color_count_map) where:
+        - color_sets[entry_qname] = set of all reachable function qnames
+        - color_count_map[fn_qname] = count of distinct entries reaching fn
+    """
+    color_sets: Dict[str, Set[str]] = {}
+    color_count_map: Dict[str, int] = {}
+
+    for entry in entries:
+        visited: Set[str] = set()
+        stack = [entry]
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            for target in edges.get(node, []):
+                if target not in visited:
+                    stack.append(target)
+        color_sets[entry] = visited
+        for fn in visited:
+            color_count_map[fn] = color_count_map.get(fn, 0) + 1
+
+    return color_sets, color_count_map
+
+
+# ---------------------------------------------------------------------------
 # PR3 R1/R10/R11: Driver function
 # ---------------------------------------------------------------------------
 
@@ -944,6 +1028,13 @@ def build_graph_v2_from_symbols(
 
     for scc in real_cycles:
         handle_cycle(scc, call_graph.all_functions, call_graph.edges)
+
+    # Step 2a: DFS coloring from entries
+    entry_qnames = identify_entries(modules)
+    _color_sets, color_count_map = dfs_color_from_entries(
+        call_graph.edges, entry_qnames
+    )
+    max_color_count = max(color_count_map.values()) if color_count_map else 0
 
     # Step 2: PR2 — scoring + aggregation
     # Build SCC index (topological order)
