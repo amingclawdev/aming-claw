@@ -383,6 +383,10 @@ Output format (strict JSON):
 }
 ```""",
 
+    "backlog_triage": """You are the Backlog Triage AI gate.
+Classify new backlog filings against existing OPEN rows.
+Return JSON: {"action":"admit|reject_dup|supersede|merge_into","reason":"...","related_bug_ids":[],"confidence":0.0-1.0}""",
+
     "gatekeeper": """You are the Gatekeeper role in this project.
 
 Your responsibilities:
@@ -463,6 +467,9 @@ def _initialize():
         perms = _build_permissions_from_yaml(yaml_configs)
         prompts = _build_prompts_from_yaml(yaml_configs)
         verify = _build_verify_limits_from_yaml(yaml_configs)
+        # Merge non-YAML roles from defaults (e.g. backlog_triage)
+        for k, v in _DEFAULT_ROLE_PROMPTS.items():
+            prompts.setdefault(k, v)
         return perms, prompts, verify
     return dict(_DEFAULT_ROLE_PERMISSIONS), dict(_DEFAULT_ROLE_PROMPTS), dict(_DEFAULT_ROLE_VERIFY_LIMITS)
 

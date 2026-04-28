@@ -3613,6 +3613,43 @@ def handle_backlog_upsert(ctx: RequestContext):
     now = _utc_now()
     conn = get_connection(pid)
     try:
+        # --- AI triage gate (R2: before INSERT, skip if force_admit) ---
+        decision = None
+        if not body.get("force_admit"):
+            try:
+                from .backlog_triage import triage_backlog_insert
+                open_rows = conn.execute(
+                    "SELECT bug_id, title, target_files FROM backlog_bugs WHERE status='OPEN'"
+                ).fetchall()
+                open_rows = [dict(r) for r in open_rows]
+                decision = triage_backlog_insert(body | {"bug_id": bug_id}, open_rows)
+                action = decision.get("action", "admit")
+                try:
+                    audit_service.record(conn, pid, "backlog_triage", actor="ai_triage",
+                                         bug_id=bug_id, details=json.dumps(decision))
+                    conn.commit()
+                except Exception:
+                    pass
+                if action == "reject_dup":
+                    return 409, {"ok": False, "error": "duplicate", "duplicate_of": decision["related_bug_ids"],
+                                 "reason": decision["reason"]}
+                if action == "supersede":
+                    # Insert new row first (fall through), then close old rows
+                    pass  # insert happens below; old rows closed after
+                if action == "merge_into" and decision["related_bug_ids"]:
+                    target_id = decision["related_bug_ids"][0]
+                    conn.execute(
+                        "UPDATE backlog_bugs SET details_md = details_md || ? , updated_at = ? WHERE bug_id = ?",
+                        ("\n\n---\nMerged from %s: %s" % (bug_id, body.get("details_md", "")), now, target_id))
+                    conn.commit()
+                    return {"ok": True, "bug_id": target_id, "action": "merge_into", "merged_from": bug_id}
+            except Exception:
+                try:
+                    audit_service.record(conn, pid, "backlog_triage_failed", actor="ai_triage", bug_id=bug_id)
+                    conn.commit()
+                except Exception:
+                    pass
+                decision = {"action": "admit", "reason": "agent failure", "related_bug_ids": [], "confidence": 0.0}
         conn.execute(
             """INSERT INTO backlog_bugs
                (bug_id, title, status, priority, target_files, test_files,
@@ -3668,6 +3705,12 @@ def handle_backlog_upsert(ctx: RequestContext):
             conn.commit()
         except Exception:
             pass  # best-effort audit
+        # Supersede: close old rows after inserting new one
+        if decision and decision.get("action") == "supersede":
+            for old_id in decision.get("related_bug_ids", []):
+                conn.execute("UPDATE backlog_bugs SET status='FIXED', updated_at=? WHERE bug_id=?", (now, old_id))
+            conn.commit()
+            return {"ok": True, "bug_id": bug_id, "action": "superseded", "closed_bugs": decision["related_bug_ids"]}
         return {"ok": True, "bug_id": bug_id, "action": "upserted"}
     finally:
         conn.close()
