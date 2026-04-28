@@ -1,7 +1,7 @@
-"""Phase Z v2 PR2 — 5-signal composite layer scorer.
+"""Phase Z v2 PR2 — 6-signal composite layer scorer.
 
 Assigns each function a layer (L0..L6) based on composite scoring of
-in-degree, fan-out, import depth, path hint, and entry-point signal.
+in-degree, color_count, fan-out, import depth, path hint, and entry-point signal.
 """
 from __future__ import annotations
 
@@ -16,13 +16,14 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
 )
 
 # ---------------------------------------------------------------------------
-# R1: Configurable weights for the 5-signal composite scorer
+# R1: Configurable weights for the 6-signal composite scorer
 # ---------------------------------------------------------------------------
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "in_degree": 0.40,
-    "fan_out": 0.20,
-    "import_depth": 0.15,
-    "path_hint": 0.15,
+    "in_degree": 0.35,
+    "color_count": 0.30,
+    "fan_out": 0.15,
+    "import_depth": 0.10,
+    "path_hint": 0.10,
     "entry_signal": 0.10,
 }
 
@@ -78,8 +79,19 @@ def path_to_layer_hint(file_path: str) -> float:
 def compute_calibration(
     call_graph: CallGraph,
     modules: List[ModuleInfo],
+    color_count_map: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
-    """Compute normalization thresholds from the call graph."""
+    """Compute normalization thresholds from the call graph.
+
+    Args:
+        call_graph: The resolved call graph.
+        modules: List of parsed module infos.
+        color_count_map: Optional map of fn_qname -> count of distinct entries
+            reaching that fn (from dfs_color_from_entries). Defaults to empty.
+    """
+    if color_count_map is None:
+        color_count_map = {}
+
     # In-degree counts
     in_deg: Counter[str] = Counter()
     max_fan_out = 0
@@ -103,12 +115,16 @@ def compute_calibration(
         if depth > max_import_depth:
             max_import_depth = depth
 
+    max_color_count = max(color_count_map.values()) if color_count_map else 0
+
     return {
         "top_5pct_in_deg": top_5pct_in_deg,
         "max_in_deg": max_in_deg,
         "max_fan_out": max_fan_out,
         "max_import_depth": max_import_depth,
         "in_degree_counts": dict(in_deg),
+        "color_count_map": color_count_map,
+        "max_color_count": max_color_count,
     }
 
 
@@ -155,20 +171,28 @@ def score_function_layer(
     s_path_hint = path_to_layer_hint(file_path)
     s_entry = 1.0 if is_entrypoint(qname, info) else 0.0
 
+    # Color count signal (backward-compat: defaults to 0 when absent)
+    ccm: Dict[str, int] = calibration.get("color_count_map", {})
+    max_cc = calibration.get("max_color_count", 0)
+    s_color_count = normalize(ccm.get(qname, 0), max_cc) if max_cc > 0 else 0.0
+
     signals = {
         "in_degree": s_in_degree,
+        "color_count": s_color_count,
         "fan_out": s_fan_out,
         "import_depth": s_import_depth,
         "path_hint": s_path_hint,
         "entry_signal": s_entry,
     }
 
-    composite = sum(w[k] * signals[k] for k in w)
+    composite = sum(w.get(k, 0.0) * signals[k] for k in signals)
 
     # Foundation candidate: top 5% in-degree AND >= min threshold
+    # High color_count (reached by many entries) disqualifies from L0
     is_foundation = (
         in_deg >= calibration.get("top_5pct_in_deg", 0)
         and in_deg >= FOUNDATION_MIN_IN_DEG
+        and s_color_count < 0.5
     )
 
     # Layer assignment
