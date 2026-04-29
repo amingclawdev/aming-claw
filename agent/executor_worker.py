@@ -34,9 +34,11 @@ import shutil
 from pathlib import Path
 from typing import Dict, Optional
 
-_agent_dir = str(Path(__file__).resolve().parent)
-if _agent_dir not in sys.path:
-    sys.path.insert(0, _agent_dir)
+_proj_root = str(Path(__file__).resolve().parent.parent)
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
+# Ensures `from agent.governance.X import Y` works regardless of launch form
+# (script-path / -m module / embedded Python with restrictive _pth file).
 
 log = logging.getLogger("executor_worker")
 
