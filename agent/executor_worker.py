@@ -35,10 +35,15 @@ from pathlib import Path
 from typing import Dict, Optional
 
 _proj_root = str(Path(__file__).resolve().parent.parent)
+_agent_dir = str(Path(__file__).resolve().parent)
+# Both paths needed:
+#   _proj_root → makes `from agent.governance.X import Y` work (used by merge stage)
+#   _agent_dir → makes `from ai_lifecycle import ...` (sibling) work (used by PM/Dev stages)
+# Embedded Python's restrictive python312._pth doesn't include either by default.
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
-# Ensures `from agent.governance.X import Y` works regardless of launch form
-# (script-path / -m module / embedded Python with restrictive _pth file).
+if _agent_dir not in sys.path:
+    sys.path.insert(0, _agent_dir)
 
 log = logging.getLogger("executor_worker")
 
