@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import PurePosixPath
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 from .observability import new_trace_id, structured_log
@@ -382,6 +382,29 @@ def _audit_doc_gap(conn, project_id, task_id, stage, missing_docs, changed_files
         )
     except Exception:
         log.debug("_audit_doc_gap failed (non-critical)", exc_info=True)
+
+
+def _audit_reconcile_bypass(conn, project_id, gate_name, run_id, task_id):
+    """Audit gate bypass for reconcile tasks (§11.3). Writes 'gate.reconcile_bypass' to audit_index."""
+    try:
+        from .audit_service import record
+        record(conn, project_id, event="gate.reconcile_bypass", actor="auto-chain",
+               ok=True, node_ids=None, request_id="",
+               gate_name=gate_name, reconcile_run_id=run_id, task_id=task_id)
+        # §11.4: rolling 1-hour high-frequency check per operator_id
+        one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_index WHERE event='gate.reconcile_bypass' AND ts >= ?",
+            (one_hour_ago,),
+        ).fetchone()
+        count = row[0] if row else 0
+        if count > 3:
+            log.warning("reconcile_bypass high frequency: %d bypasses in last hour (run_id=%s)", count, run_id)
+            record(conn, project_id, event="gate.reconcile_bypass.high_frequency", actor="auto-chain",
+                   ok=True, node_ids=None, request_id="",
+                   bypass_count=count, reconcile_run_id=run_id, task_id=task_id)
+    except Exception:
+        log.debug("_audit_reconcile_bypass failed (non-critical)", exc_info=True)
 
 
 # TODO-DEPRECATED: _store_proposed_nodes removed per OPT-BACKLOG-GRAPH-DELTA-CHAIN-COMMIT PR-A.
@@ -3548,6 +3571,11 @@ def _gate_checkpoint(conn, project_id, result, metadata):
                 related_nodes,
             )
         return True, "ok"
+    # §11.1: reconcile_run_id bypass for doc-check gate (R5/R9)
+    _reconcile_run_id = metadata.get("reconcile_run_id")
+    if _reconcile_run_id:
+        _audit_reconcile_bypass(conn, project_id, "checkpoint_doc", _reconcile_run_id, metadata.get("task_id", ""))
+        return True, "reconcile bypass — doc check skipped (§11.1)"
     from .impact_analyzer import get_related_docs
     code_files = [f for f in changed if not f.startswith("docs/") and not f.endswith(".md")]
     doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
@@ -3603,6 +3631,11 @@ def _gate_checkpoint(conn, project_id, result, metadata):
 
 def _gate_t2_pass(conn, project_id, result, metadata):
     """Verify tests passed before advancing to QA."""
+    # §11.1: reconcile_run_id bypass (R5/R9)
+    _reconcile_run_id = metadata.get("reconcile_run_id")
+    if _reconcile_run_id:
+        _audit_reconcile_bypass(conn, project_id, "t2_pass", _reconcile_run_id, metadata.get("task_id", ""))
+        return True, "reconcile bypass — t2_pass skipped (§11.1)"
     report = result.get("test_report", {})
     if not isinstance(report, dict) or not report:
         return False, "Test stage missing required test_report"
@@ -3742,6 +3775,11 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     Requires explicit qa_pass recommendation.
     Missing or ambiguous recommendation is a hard block (not auto-pass).
     """
+    # §11.1: reconcile_run_id bypass (R5/R9)
+    _reconcile_run_id = metadata.get("reconcile_run_id")
+    if _reconcile_run_id:
+        _audit_reconcile_bypass(conn, project_id, "qa_pass", _reconcile_run_id, metadata.get("task_id", ""))
+        return True, "reconcile bypass — qa_pass skipped (§11.1)"
     rec = result.get("recommendation", "")
     if rec == "qa_pass":
         pass  # Explicit pass
@@ -3916,6 +3954,11 @@ def _gate_gatekeeper_pass(conn, project_id, result, metadata):
 
 def _gate_release(conn, project_id, result, metadata):
     """Verify merge succeeded before deploy."""
+    # §11.2: reconcile_run_id bypass (R5/R9)
+    _reconcile_run_id = metadata.get("reconcile_run_id")
+    if _reconcile_run_id:
+        _audit_reconcile_bypass(conn, project_id, "release", _reconcile_run_id, metadata.get("task_id", ""))
+        return True, "reconcile bypass — release skipped (§11.2)"
     # Node status check: all related_nodes must be "qa_pass" before merge is allowed
     related_nodes = metadata.get("related_nodes", [])
     if related_nodes:

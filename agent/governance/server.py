@@ -1767,6 +1767,42 @@ def handle_task_create(ctx: RequestContext):
     if "intent_summary" not in metadata:
         metadata["intent_summary"] = prompt[:200]
 
+    # §2.1-§2.3: Reconcile task creator allowlist + audit + rate limit (R2/R3/R4)
+    _is_reconcile = task_type == "reconcile" or task_type.startswith("reconcile_")
+    if _is_reconcile:
+        # §2.1: Soft enforcement — warn for non-allowed creators (R2)
+        _allowed_prefixes = ("observer-", "coordinator", "auto-chain-reconcile")
+        if not any(created_by.startswith(p) for p in _allowed_prefixes):
+            log.warning("reconcile_task: creator %r not in allowlist (soft enforce §2.1)", created_by)
+        # §2.3: 3-tier rate limiting (R4)
+        with DBContext(project_id) as _rl_conn:
+            # Tier-1: max 1 active reconcile_run
+            _active_runs = _rl_conn.execute(
+                "SELECT COUNT(DISTINCT json_extract(metadata_json, '$.reconcile_run_id')) "
+                "FROM tasks WHERE project_id=? AND type LIKE 'reconcile%' AND status IN ('pending','claimed','running')",
+                (project_id,),
+            ).fetchone()[0]
+            if _active_runs > 1:
+                raise GovernanceError("rate_limit", "Tier-1: max 1 active reconcile_run exceeded", status=429)
+            # Tier-2: max 3 concurrent tasks per run
+            _run_id = metadata.get("reconcile_run_id", "")
+            if _run_id:
+                _concurrent = _rl_conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE project_id=? AND type LIKE 'reconcile%' "
+                    "AND status IN ('pending','claimed','running') AND json_extract(metadata_json, '$.reconcile_run_id')=?",
+                    (project_id, _run_id),
+                ).fetchone()[0]
+                if _concurrent >= 3:
+                    raise GovernanceError("rate_limit", "Tier-2: max 3 concurrent tasks per reconcile_run exceeded", status=429)
+                # Tier-3: max 10 actions per task
+                _actions = _rl_conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE project_id=? AND type LIKE 'reconcile%' "
+                    "AND json_extract(metadata_json, '$.reconcile_run_id')=?",
+                    (project_id, _run_id),
+                ).fetchone()[0]
+                if _actions >= 10:
+                    raise GovernanceError("rate_limit", "Tier-3: max 10 actions per reconcile_run exceeded", status=429)
+
     # --- Backlog gate: check bug_id for code-change task types (R1/R4) ---
     # Z3 observer-hotfix 2026-04-24 (P0-1 + P0-2):
     #   - Default enforce mode changed from 'warn' to 'strict' (P0-1).
@@ -1913,6 +1949,15 @@ def handle_task_create(ctx: RequestContext):
             max_attempts=int(ctx.body.get("max_attempts", 3)),
             metadata=metadata,
         )
+    # §2.2: Audit reconcile task creation (R3)
+    if _is_reconcile:
+        try:
+            with DBContext(project_id) as _ac:
+                audit_service.record(_ac, project_id, event="reconcile_task.created",
+                                     actor=created_by, ok=True, node_ids=None, request_id="",
+                                     task_id=result.get("task_id", ""), task_type=task_type)
+        except Exception:
+            log.debug("reconcile_task.created audit failed (non-critical)", exc_info=True)
     # Best-effort publish task.created event to event bus
     try:
         _publish_event("task.created", {
