@@ -6,6 +6,7 @@ ModuleNotFoundError before executor_worker.py can run. Script-path form lets
 executor_worker.py's own _proj_root sys.path bootstrap handle the agent.*
 imports it needs internally.
 """
+import subprocess
 import sys
 from pathlib import Path
 
@@ -49,3 +50,33 @@ def test_spawn_command_workspace_param_present():
     assert "--workspace" in cmd
     idx = cmd.index("--workspace")
     assert cmd[idx + 1] == "/some/workspace"
+
+
+def test_default_spawn_command_actually_boots():
+    """The spawn command from _default_executor_cmd must actually run without ModuleNotFoundError."""
+    cmd = _default_executor_cmd("test-proj", "http://localhost:40000", "/tmp")
+    result = subprocess.run(cmd + ["--help"], capture_output=True, text=True, timeout=15)
+    assert "ModuleNotFoundError" not in result.stderr, f"ModuleNotFoundError in stderr:\n{result.stderr}"
+    combined = (result.stdout + result.stderr).lower()
+    assert "usage:" in combined, f"Expected 'usage:' in output, got:\n{result.stdout}\n{result.stderr}"
+
+
+def test_executor_can_import_chain_trailer_in_subprocess():
+    """A subprocess mirroring executor_worker.py's sys.path bootstrap can import chain_trailer."""
+    probe_path = _repo_root() / "agent" / "_probe_chain_trailer.py"
+    probe_code = (
+        "import sys, os\n"
+        "_proj_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+        "if _proj_root not in sys.path:\n"
+        "    sys.path.insert(0, _proj_root)\n"
+        "from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state\n"
+        "print('IMPORTS_OK')\n"
+    )
+    try:
+        probe_path.write_text(probe_code, encoding="utf-8")
+        result = subprocess.run([sys.executable, str(probe_path)], capture_output=True, text=True, timeout=15)
+        assert "IMPORTS_OK" in result.stdout, f"Expected IMPORTS_OK in stdout, got:\n{result.stdout}"
+        assert "ModuleNotFoundError" not in result.stderr, f"ModuleNotFoundError in stderr:\n{result.stderr}"
+    finally:
+        if probe_path.exists():
+            probe_path.unlink()
