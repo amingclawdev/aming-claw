@@ -1,6 +1,6 @@
 # Manual Fix SOP (Standard Operating Procedure)
 
-> Status: DRAFT v4 — v3 + scoped reconcile support (reconcile-v2 scope parameter)
+> Status: DRAFT v5 — v4 + Phase A version gate trailer changes (version-update deprecated)
 > Author: Observer
 > Date: 2026-04-05
 > Scope: Enforceable operating procedure for AI agents performing manual fixes

@@ -843,27 +843,20 @@ class ExecutorWorker:
                     if not integration_worktree:
                         return {"status": "failed", "error": f"Integration worktree setup failed: {create_error[:300]}"}
 
-                    # Use chain_trailer for merge with Chain-Version trailer
-                    try:
-                        from agent.governance.chain_trailer import write_merge_with_trailer
-                        success, merge_commit, err = write_merge_with_trailer(
-                            message=f"Auto-merge: {task_id}",
-                            branch=branch,
-                            cwd=integration_worktree)
-                        if not success:
-                            return {"status": "failed", "error": f"Merge conflict: {err[:300]}"}
-                    except ImportError:
-                        log.warning("chain_trailer not available, falling back to raw git merge")
-                        proc = subprocess.run(
-                            ["git", "merge", branch, "--no-ff", "-m", f"Auto-merge: {task_id}"],
-                            cwd=integration_worktree, capture_output=True, text=True, timeout=30)
-                        if proc.returncode != 0:
-                            subprocess.run(["git", "merge", "--abort"],
-                                           cwd=integration_worktree, capture_output=True, timeout=10)
-                            return {"status": "failed", "error": f"Merge conflict: {proc.stderr[:300]}"}
-                        rev = subprocess.run(["git", "rev-parse", "HEAD"],
-                                             cwd=integration_worktree, capture_output=True, text=True, timeout=5)
-                        merge_commit = rev.stdout.strip()
+                    # Use chain_trailer for merge with 4-field trailer (Phase A §4.4)
+                    from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state
+                    chain_state = get_chain_state(cwd=integration_worktree)
+                    parent_chain_sha = chain_state.get("chain_sha", "")
+                    bug_id = metadata.get("bug_id", "") or metadata.get("chain_bug_id", "")
+                    success, merge_commit, err = write_merge_with_trailer(
+                        message=f"Auto-merge: {task_id}",
+                        branch=branch,
+                        cwd=integration_worktree,
+                        task_id=task_id,
+                        parent_chain_sha=parent_chain_sha,
+                        bug_id=bug_id)
+                    if not success:
+                        return {"status": "failed", "error": f"Merge conflict: {err[:300]}"}
 
                     # B20: Clean leaked staged/untracked files before ff-only merge
                     try:
@@ -945,24 +938,19 @@ class ExecutorWorker:
                     "files_changed": 0, "note": "nothing to commit"
                 }}
 
-            # Commit with Chain-Version trailer
+            # Commit with 4-field Chain trailer (Phase A §4.4)
             msg = f"Auto-merge: {task_id}\n\nChanged files: {', '.join(staged[:10])}"
-            try:
-                from agent.governance.chain_trailer import write_merge_with_trailer
-                success, commit_hash, err = write_merge_with_trailer(
-                    message=msg, cwd=self.workspace)
-                if not success:
-                    return {"status": "failed", "error": f"git commit failed: {err[:300]}"}
-            except ImportError:
-                log.warning("chain_trailer not available, falling back to raw git commit")
-                proc = subprocess.run(
-                    ["git", "commit", "-m", msg],
-                    cwd=self.workspace, capture_output=True, text=True, timeout=30)
-                if proc.returncode != 0:
-                    return {"status": "failed", "error": f"git commit failed: {proc.stderr[:300]}"}
-                rev = subprocess.run(["git", "rev-parse", "HEAD"],
-                                     cwd=self.workspace, capture_output=True, text=True, timeout=5)
-                commit_hash = rev.stdout.strip()
+            from agent.governance.chain_trailer import write_merge_with_trailer, get_chain_state
+            chain_state = get_chain_state(cwd=self.workspace)
+            parent_chain_sha = chain_state.get("chain_sha", "")
+            bug_id = metadata.get("bug_id", "") or metadata.get("chain_bug_id", "")
+            success, commit_hash, err = write_merge_with_trailer(
+                message=msg, cwd=self.workspace,
+                task_id=task_id,
+                parent_chain_sha=parent_chain_sha,
+                bug_id=bug_id)
+            if not success:
+                return {"status": "failed", "error": f"git commit failed: {err[:300]}"}
 
             log.info("Merge complete: %s (%d files)", commit_hash, len(staged))
 

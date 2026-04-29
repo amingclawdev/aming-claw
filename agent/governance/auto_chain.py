@@ -3224,17 +3224,11 @@ def _gate_version_check(conn, project_id, result, metadata):
                         len(dirty_files), dirty_files[:5])
             return False, f"dirty workspace ({len(dirty_files)} files: {dirty_files[:3]})"
 
-        chain_ver = chain_state.get("version", "")
+        # Phase A (R6): use git-derived chain_sha as source of truth, not DB
+        chain_sha = chain_state.get("chain_sha", chain_state.get("version", ""))
         source = chain_state.get("source", "head")
-        if not chain_ver or chain_ver == "unknown":
+        if not chain_sha or chain_sha == "unknown":
             return True, "chain_version unavailable, skipping"
-
-        # Also read DB chain_version for cross-check (backward compat, B29)
-        row = conn.execute(
-            "SELECT chain_version FROM project_version WHERE project_id=?",
-            (project_id,),
-        ).fetchone()
-        db_chain_ver = (row["chain_version"] or "").strip() if row else ""
 
         import subprocess
         head = subprocess.run(
@@ -3246,14 +3240,14 @@ def _gate_version_check(conn, project_id, result, metadata):
             return True, "git HEAD unavailable, skipping"
 
         # B35: prefix match for short/full hash comparison
-        # Use DB chain_version if available (B29 anchor), else git trailer version
-        effective_ver = db_chain_ver if db_chain_ver and db_chain_ver != "unknown" else chain_ver
+        # R6: chain_sha from git trailer is the sole effective version
+        effective_ver = chain_sha
         if not (effective_ver.startswith(head) or head.startswith(effective_ver)):
-            log.warning("version_check: chain_version (%s, source=%s) != git HEAD (%s) — blocking chain. "
-                        "Complete a full workflow Deploy to update chain_version.",
+            log.warning("version_check: chain_sha (%s, source=%s) != git HEAD (%s) — blocking chain. "
+                        "Complete a full workflow Deploy to update chain state.",
                         effective_ver, source, head)
-            return False, (f"chain_version ({effective_ver}) != git HEAD ({head}). "
-                           f"Complete workflow Deploy to update chain_version.")
+            return False, (f"chain_sha ({effective_ver}) != git HEAD ({head}). "
+                           f"Complete workflow Deploy to update chain state.")
         return True, f"version match: {effective_ver} (source={source})"
     except Exception as e:
         log.warning("version_check failed (non-fatal): %s", e)
