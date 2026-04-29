@@ -150,6 +150,9 @@ shared-volume/
 governance.db
 agent/governance/governance.db
 
+# Per-project chain history cache (generated at runtime)
+agent/governance/chain_history/
+
 # Observer / auto-chain runtime-state files (must not be staged)
 .recent-tasks.json
 .governance-cache/

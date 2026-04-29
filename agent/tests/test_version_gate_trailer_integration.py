@@ -101,12 +101,19 @@ class TestGitResetRollbackAutoHealsChainState:
 class TestManualChainSourceStageDetectable:
     """AC9: manual commit with Chain-Source-Stage is detectable as non-native."""
 
-    def test_manual_trailer_detected_as_legacy_inferred_by_backfill(self, git_repo):
+    def test_manual_trailer_detected_as_legacy_inferred_by_backfill(self, git_repo, tmp_path, monkeypatch):
         """A manually-crafted commit with Chain-Source-Stage but written by hand
         (not via write_merge_with_trailer) is detectable. backfill will skip it
         since it has the trailer, but validate_chain_lineage will see it as valid
         — the key distinction is the task_id will be whatever the manual user typed."""
         from agent.governance.chain_trailer import get_chain_state, backfill_legacy_chain_history
+        import json as _json
+
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
+        )
 
         # Manual commit with Chain-Source-Stage trailer (not via write_merge_with_trailer)
         with open(os.path.join(git_repo, "manual.txt"), "w") as f:
@@ -131,12 +138,14 @@ class TestManualChainSourceStageDetectable:
         assert state["stage"] == "manual-fix"  # Non-standard stage value = detectable as non-native
 
         # backfill should skip this commit (it has Chain-Source-Stage)
-        results = backfill_legacy_chain_history(cwd=git_repo)
+        backfill_legacy_chain_history(cwd=git_repo, incremental=False)
+        with open(os.path.join(cache_dir, "aming-claw.json")) as f:
+            data = _json.load(f)
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=git_repo, capture_output=True, text=True,
         ).stdout.strip()
-        backfill_commits = [r["commit"] for r in results]
+        backfill_commits = [r["commit"] for r in data["backfill_results"]]
         assert head not in backfill_commits  # Has trailer, excluded from backfill
 
     def test_non_merge_stage_distinguishable(self, git_repo):

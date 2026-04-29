@@ -395,7 +395,20 @@ The `backlog_bugs` table now includes a `required_docs` field (TEXT, DEFAULT `'[
 
 `get_backlog_required_docs(conn, project_id, bug_id) -> list[str]` in `agent/governance/backlog_db.py` provides direct DB access outside the HTTP server context. Handles missing column (pre-v17) gracefully by returning `[]`.
 
+## Per-Project Chain History Cache
+
+**Added:** 2026-04-29 | **Source:** `agent/governance/chain_trailer.py`
+
+At server startup, the governance service iterates all known `project_id` values from the `project_version` table and runs an incremental chain history backfill for each. Cache files are written to `agent/governance/chain_history/{project_id}.json` (gitignored). The `bootstrap_project()` flow also triggers a full backfill for the bootstrapped project.
+
+Key design points:
+- **Per-project namespacing**: each project gets its own cache file under `agent/governance/chain_history/`
+- **Incremental scan**: when a cache exists, only `git log <last_scanned_sha>..HEAD` is scanned
+- **Single subprocess**: uses `git log --format=%H%n%h%n%B` to extract both full and short hashes in one call
+- **Legacy migration**: existing root `chain_history.json` is migrated to `agent/governance/chain_history/aming-claw.json` on first run
+
 ## Changelog
+- 2026-04-29: Added per-project chain history cache documentation
 - 2026-04-23: Added backlog required_docs field documentation (schema v17)
 - 2026-04-22: Added merge-stage backlog auto-close (OPT-BACKLOG) documentation
 - 2026-04-10: Added worktree isolation (L4), session timeout (B11), task pause/resume (B12), spin loop enhancement (B14) documentation
