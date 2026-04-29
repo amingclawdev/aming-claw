@@ -97,7 +97,7 @@ def _default_workspace() -> str:
 def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) -> list[str]:
     return [
         sys.executable,
-        str(Path(__file__).resolve().parent / "executor_worker.py"),
+        "-m", "agent.executor_worker",
         "--project",
         project_id,
         "--url",
@@ -661,6 +661,7 @@ class ServiceManager:
                 self._executor_cmd,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
+                cwd=str(_repo_root()),
             )
         finally:
             stdout_handle.close()
