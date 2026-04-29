@@ -289,63 +289,120 @@ def validate_chain_lineage(start: str, end: str, cwd: str | None = None) -> dict
     }
 
 
+def _chain_history_dir() -> str:
+    """Return the per-project chain_history cache directory."""
+    return os.path.join(os.path.dirname(__file__), "chain_history")
+
+
+def _migrate_legacy_cache(project_id: str, cache_dir: str) -> None:
+    """R7: Migrate root chain_history.json to per-project cache on first run."""
+    legacy_path = os.path.join(_repo_root(), "chain_history.json")
+    dest = os.path.join(cache_dir, f"{project_id}.json")
+    if os.path.exists(legacy_path) and not os.path.exists(dest):
+        try:
+            import shutil
+            shutil.copy2(legacy_path, dest)
+            log.info("backfill: migrated legacy chain_history.json → %s", dest)
+        except Exception as e:
+            log.warning("backfill: migration failed: %s", e)
+
+
 def backfill_legacy_chain_history(
+    project_id: str = "aming-claw",
+    *,
     limit: int = 50,
     cwd: str | None = None,
     output_path: str | None = None,
-) -> list[dict[str, Any]]:
-    """Tag commits lacking Chain-Source-Stage trailer with legacy metadata.
+    incremental: bool = True,
+) -> dict[str, Any]:
+    """Per-project chain history backfill with incremental scan support.
 
-    Scans up to `limit` recent commits and returns metadata dicts for those
-    missing a 4-field trailer. Each dict contains:
-        commit          — full hash
-        short           — short hash
-        legacy_inferred — True
-        needs_audit     — True
-        audit_note      — descriptive string
-        has_legacy_trailer — True if commit has old Chain-Version trailer
+    Scans git log for commits lacking a 4-field Chain-Source-Stage trailer
+    and writes results to agent/governance/chain_history/{project_id}.json.
 
-    If output_path is provided, writes chain_history.json to that path.
+    Uses a single ``git log --format=%H%n%h%n%B`` call (R3) to extract both
+    full and short hashes, eliminating per-commit ``git rev-parse --short``.
 
-    NOTE: This does NOT modify git history (no rebase/amend). The metadata
-    is returned for the caller to store in governance DB or audit log.
+    When *incremental* is True and a cache exists with ``last_scanned_sha``,
+    only scans ``<last_scanned_sha>..HEAD`` (R2).
+
+    Returns dict with keys: project_id, new_entries, total_entries,
+    last_scanned_sha, scanned_at, scan_mode.
     """
-    root = cwd or _repo_root()
+    import datetime as _dt
 
+    root = cwd or _repo_root()
+    cache_dir = _chain_history_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # R7: migrate legacy root cache
+    _migrate_legacy_cache(project_id, cache_dir)
+
+    cache_path = output_path or os.path.join(cache_dir, f"{project_id}.json")
+
+    # Load existing cache
+    existing: dict[str, Any] = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+
+    # R2: incremental scan
+    scan_mode = "full"
+    git_range_args: list[str] = [f"--max-count={limit}"]
+    if incremental and existing.get("last_scanned_sha"):
+        last_sha = existing["last_scanned_sha"]
+        # Verify the sha still exists
+        verify = _git(["rev-parse", "--verify", last_sha], cwd=root)
+        if verify.returncode == 0:
+            git_range_args = [f"{last_sha}..HEAD"]
+            scan_mode = "incremental"
+
+    # R3: single git log call with %H and %h — no per-commit rev-parse --short
     log_proc = _git(
-        ["log", f"--max-count={limit}", "--format=%H%n%B%n---END-COMMIT---"],
+        ["log"] + git_range_args + ["--format=%H%n%h%n%B%n---END-COMMIT---"],
         cwd=root,
     )
     if log_proc.returncode != 0:
         log.warning("backfill: git log failed: %s", log_proc.stderr.strip())
-        return []
+        return {
+            "project_id": project_id, "new_entries": 0,
+            "total_entries": len(existing.get("backfill_results", [])),
+            "last_scanned_sha": existing.get("last_scanned_sha", ""),
+            "scanned_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "scan_mode": scan_mode,
+        }
 
-    results: list[dict[str, Any]] = []
+    new_results: list[dict[str, Any]] = []
+    first_hash: str | None = None
     chunks = log_proc.stdout.split("---END-COMMIT---")
 
     for chunk in chunks:
         chunk = chunk.strip()
         if not chunk:
             continue
-        lines = chunk.split("\n", 1)
-        if not lines:
+        lines = chunk.split("\n", 2)
+        if len(lines) < 2:
             continue
         commit_hash = lines[0].strip()
+        short_hash = lines[1].strip()
+        message = lines[2] if len(lines) > 2 else ""
         if not commit_hash or len(commit_hash) < 7:
             continue
-        message = lines[1] if len(lines) > 1 else ""
+
+        if first_hash is None:
+            first_hash = commit_hash
 
         # Check for 4-field trailer
         fields = _parse_4field_trailer(message)
         if fields["stage"]:
             continue  # Already has new-style trailer
 
-        short_proc = _git(["rev-parse", "--short", commit_hash], cwd=root)
-        short_hash = short_proc.stdout.strip() if short_proc.returncode == 0 else commit_hash[:7]
-
         has_legacy = bool(_LEGACY_TRAILER_RE.search(message))
 
-        results.append({
+        new_results.append({
             "commit": commit_hash,
             "short": short_hash,
             "legacy_inferred": True,
@@ -355,19 +412,68 @@ def backfill_legacy_chain_history(
                           f"marked legacy_inferred during backfill scan",
         })
 
-    log.info("backfill: scanned %d commits, %d lack Chain-Source-Stage trailer",
-             min(limit, len(chunks)), len(results))
+    # Merge with existing results (deduplicate by commit hash)
+    prev_results = existing.get("backfill_results", [])
+    seen = {r["commit"] for r in prev_results}
+    for r in new_results:
+        if r["commit"] not in seen:
+            prev_results.append(r)
+            seen.add(r["commit"])
 
-    # Write chain_history.json if output_path specified
-    if output_path and results:
-        try:
-            with open(output_path, "w") as f:
-                json.dump({"backfill_results": results, "total_scanned": min(limit, len(chunks))}, f, indent=2)
-            log.info("backfill: wrote chain_history.json to %s", output_path)
-        except Exception as e:
-            log.warning("backfill: failed to write chain_history.json: %s", e)
+    # Determine last_scanned_sha (newest commit seen = first in log output)
+    head_proc = _git(["rev-parse", "HEAD"], cwd=root)
+    last_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else (first_hash or existing.get("last_scanned_sha", ""))
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
 
-    return results
+    cache_data = {
+        "project_id": project_id,
+        "backfill_results": prev_results,
+        "total_scanned": len(prev_results),
+        "last_scanned_sha": last_sha,
+        "scanned_at": now_iso,
+    }
+
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception as e:
+        log.warning("backfill: failed to write cache: %s", e)
+
+    log.info("backfill[%s]: %s scan, %d new entries, %d total",
+             project_id, scan_mode, len(new_results), len(prev_results))
+
+    return {
+        "project_id": project_id,
+        "new_entries": len(new_results),
+        "total_entries": len(prev_results),
+        "last_scanned_sha": last_sha,
+        "scanned_at": now_iso,
+        "scan_mode": scan_mode,
+    }
+
+
+def _backfill_legacy_compat(
+    limit: int = 50,
+    cwd: str | None = None,
+    output_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """R6: Backwards-compat wrapper for old 3-arg signature.
+
+    Callers using the old ``backfill_legacy_chain_history(limit, cwd, output_path)``
+    signature are redirected here with a deprecation warning.
+    """
+    import warnings
+    warnings.warn(
+        "backfill_legacy_chain_history(limit, cwd, output_path) is deprecated; "
+        "use backfill_legacy_chain_history(project_id=...) instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    result = backfill_legacy_chain_history(
+        project_id="aming-claw", limit=limit, cwd=cwd,
+        output_path=output_path, incremental=False,
+    )
+    return result.get("backfill_results", []) if isinstance(result, dict) else []
 
 
 def write_merge_with_trailer(

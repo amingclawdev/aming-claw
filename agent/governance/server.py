@@ -3850,13 +3850,26 @@ def main():
     except Exception as e:
         print(f"OutboxWorker: failed to start ({e})")
 
-    # Phase A (R9): backfill chain_history.json for legacy commits at startup
+    # Per-project chain history backfill at startup (R5)
     try:
         from .chain_trailer import backfill_legacy_chain_history
-        import os as _os
-        _history_path = _os.path.join(_os.path.dirname(__file__), "..", "..", "chain_history.json")
-        backfill_legacy_chain_history(output_path=_history_path)
-        print("ChainTrailer: backfill_legacy_chain_history completed")
+        _conn = get_connection("aming-claw")
+        try:
+            _rows = _conn.execute(
+                "SELECT DISTINCT project_id FROM project_version"
+            ).fetchall()
+            _pids = [r["project_id"] if isinstance(r, dict) else r[0] for r in _rows]
+        except Exception:
+            _pids = ["aming-claw"]
+        finally:
+            _conn.close()
+        for _pid in _pids:
+            try:
+                _res = backfill_legacy_chain_history(project_id=_pid, incremental=True)
+                print(f"ChainTrailer: backfill[{_pid}] {_res.get('scan_mode','?')} — "
+                      f"{_res.get('new_entries',0)} new, {_res.get('total_entries',0)} total")
+            except Exception as _e:
+                print(f"ChainTrailer: backfill[{_pid}] failed ({_e})")
     except Exception as e:
         print(f"ChainTrailer: backfill failed ({e})")
 

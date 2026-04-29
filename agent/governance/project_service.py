@@ -477,6 +477,13 @@ def bootstrap_project(
             if pid in projects["projects"]:
                 projects["projects"][pid]["node_count"] = gen_result["node_count"]
                 _save_projects(projects)
+
+            # R4: Backfill chain history for this project at bootstrap
+            try:
+                from .chain_trailer import backfill_legacy_chain_history
+                backfill_legacy_chain_history(project_id=pid, incremental=False)
+            except Exception:
+                pass  # Non-fatal — git may not be available in all contexts
         finally:
             conn.close()
 

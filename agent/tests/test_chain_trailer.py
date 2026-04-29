@@ -352,69 +352,121 @@ class TestValidateChainLineage:
 # ---------------------------------------------------------------------------
 
 class TestBackfillLegacyChainHistory:
-    def test_returns_list(self, git_repo):
-        from agent.governance.chain_trailer import backfill_legacy_chain_history
-        results = backfill_legacy_chain_history(cwd=git_repo)
-        assert isinstance(results, list)
+    def _get_results(self, res):
+        """Helper: extract backfill_results list from new dict return value."""
+        if isinstance(res, dict):
+            # Read from cache file or return empty
+            return []  # results are in cache, use total_entries
+        return res
 
-    def test_tags_commits_without_trailer(self, git_repo):
+    def test_returns_dict_with_keys(self, git_repo, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
-        results = backfill_legacy_chain_history(cwd=git_repo)
-        assert len(results) >= 1
-        for r in results:
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: str(tmp_path / "ch"),
+        )
+        result = backfill_legacy_chain_history(cwd=git_repo, incremental=False)
+        assert isinstance(result, dict)
+        for key in ("project_id", "new_entries", "total_entries",
+                     "last_scanned_sha", "scanned_at", "scan_mode"):
+            assert key in result
+
+    def test_tags_commits_without_trailer(self, git_repo, tmp_path, monkeypatch):
+        from agent.governance.chain_trailer import backfill_legacy_chain_history
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
+        )
+        result = backfill_legacy_chain_history(cwd=git_repo, incremental=False)
+        assert result["total_entries"] >= 1
+        # Verify cache file contents
+        with open(os.path.join(cache_dir, "aming-claw.json")) as f:
+            data = json.load(f)
+        for r in data["backfill_results"]:
             assert r["legacy_inferred"] is True
             assert r["needs_audit"] is True
             assert "audit_note" in r
             assert "commit" in r
             assert "short" in r
 
-    def test_skips_commits_with_4field_trailer(self, git_repo_with_4field_trailer):
+    def test_skips_commits_with_4field_trailer(self, git_repo_with_4field_trailer, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
-        results = backfill_legacy_chain_history(cwd=git_repo_with_4field_trailer)
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
+        )
+        result = backfill_legacy_chain_history(cwd=git_repo_with_4field_trailer, incremental=False)
         # Only the initial commit (without trailer) should appear
-        assert len(results) == 1
-        assert results[0]["legacy_inferred"] is True
+        assert result["total_entries"] == 1
 
-    def test_detects_legacy_trailer(self, git_repo_with_legacy_trailer):
+    def test_detects_legacy_trailer(self, git_repo_with_legacy_trailer, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
-        results = backfill_legacy_chain_history(cwd=git_repo_with_legacy_trailer)
-        # Initial commit has no trailer at all, legacy commit has Chain-Version
-        legacy_entries = [r for r in results if r.get("has_legacy_trailer")]
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
+        )
+        result = backfill_legacy_chain_history(cwd=git_repo_with_legacy_trailer, incremental=False)
+        with open(os.path.join(cache_dir, "aming-claw.json")) as f:
+            data = json.load(f)
         # Legacy Chain-Version commit is NOT skipped - it lacks Chain-Source-Stage
-        assert any(r["has_legacy_trailer"] for r in results)
+        assert any(r["has_legacy_trailer"] for r in data["backfill_results"])
 
-    def test_limit_parameter(self, git_repo):
+    def test_limit_parameter(self, git_repo, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: str(tmp_path / "ch"),
+        )
         for i in range(5):
             with open(os.path.join(git_repo, f"f{i}.txt"), "w") as f:
                 f.write(f"{i}\n")
             subprocess.run(["git", "add", "."], cwd=git_repo, capture_output=True)
             subprocess.run(["git", "commit", "-m", f"Commit {i}"], cwd=git_repo, capture_output=True)
-        results = backfill_legacy_chain_history(limit=3, cwd=git_repo)
-        assert len(results) <= 3
+        result = backfill_legacy_chain_history(limit=3, cwd=git_repo, incremental=False)
+        assert result["total_entries"] <= 3
 
-    def test_audit_note_contains_short_hash(self, git_repo):
+    def test_audit_note_contains_short_hash(self, git_repo, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
-        results = backfill_legacy_chain_history(cwd=git_repo)
-        for r in results:
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
+        )
+        backfill_legacy_chain_history(cwd=git_repo, incremental=False)
+        with open(os.path.join(cache_dir, "aming-claw.json")) as f:
+            data = json.load(f)
+        for r in data["backfill_results"]:
             assert r["short"] in r["audit_note"]
 
-    def test_writes_chain_history_json(self, git_repo, tmp_path):
+    def test_writes_chain_history_json(self, git_repo, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
+        )
         out = str(tmp_path / "chain_history.json")
-        results = backfill_legacy_chain_history(cwd=git_repo, output_path=out)
+        backfill_legacy_chain_history(cwd=git_repo, output_path=out, incremental=False)
         assert os.path.exists(out)
         with open(out) as f:
             data = json.load(f)
         assert "backfill_results" in data
 
-    def test_empty_repo_returns_empty(self, tmp_path):
+    def test_empty_repo_returns_zero_entries(self, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import backfill_legacy_chain_history
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: str(tmp_path / "ch"),
+        )
         repo = str(tmp_path / "empty-repo")
         os.makedirs(repo)
         subprocess.run(["git", "init"], cwd=repo, capture_output=True)
-        results = backfill_legacy_chain_history(cwd=repo)
-        assert results == []
+        result = backfill_legacy_chain_history(cwd=repo, incremental=False)
+        assert isinstance(result, dict)
+        assert result["total_entries"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -526,17 +578,24 @@ class TestIntegration:
         assert state["stage"] == "merge"
         assert state["parent_sha"] == "pint"
 
-    def test_backfill_excludes_4field_trailer_commits(self, git_repo):
+    def test_backfill_excludes_4field_trailer_commits(self, git_repo, tmp_path, monkeypatch):
         from agent.governance.chain_trailer import (
             write_merge_with_trailer, backfill_legacy_chain_history
+        )
+        cache_dir = str(tmp_path / "ch")
+        monkeypatch.setattr(
+            "agent.governance.chain_trailer._chain_history_dir",
+            lambda: cache_dir,
         )
         with open(os.path.join(git_repo, "bf.txt"), "w") as f:
             f.write("backfill test\n")
         subprocess.run(["git", "add", "."], cwd=git_repo, capture_output=True)
         write_merge_with_trailer(message="With trailer", cwd=git_repo, task_id="t1")
 
-        results = backfill_legacy_chain_history(cwd=git_repo)
-        hashes = [r["commit"] for r in results]
+        backfill_legacy_chain_history(cwd=git_repo, incremental=False)
+        with open(os.path.join(cache_dir, "aming-claw.json")) as f:
+            data = json.load(f)
+        hashes = [r["commit"] for r in data["backfill_results"]]
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=git_repo, capture_output=True, text=True,

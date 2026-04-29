@@ -194,6 +194,7 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R9 | Coverage warnings actionable | preflight_check reports unmapped files that are in the current commit | MUST either create nodes for unmapped committed files or document why they are intentionally unmapped |
 | R10 | Doc location check | Any new documentation file | MUST verify file is placed in the correct directory per project convention (e.g., governance docs in docs/governance/, dev docs in docs/dev/). Misplaced docs must be moved before commit |
 | R11 | chain_version sync after commit | Every manual fix commit | MUST call `POST /api/version-sync/{project_id}` (updates git_head) then `POST /api/version-update/{project_id}` with `{"chain_version":"<full HEAD hash>","updated_by":"manual-fix-..."}` to advance chain_version. Verify with `GET /api/version-check/{project_id}` returns `ok: true` and `chain_version == HEAD`. If governance is offline, update `project_version` table directly. Omitting this step causes version gate to block all subsequent workflow tasks. |
+| R12 | Per-project chain history cache | Every manual fix commit | After commit, the per-project chain history cache at `agent/governance/chain_history/{project_id}.json` will be updated on next governance startup or bootstrap. Manual fixes that add commits without trailers will be detected as `legacy_inferred` entries in the cache. No manual action needed — the cache updates incrementally. |
 
 ---
 
