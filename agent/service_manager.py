@@ -95,9 +95,15 @@ def _default_workspace() -> str:
 
 
 def _default_executor_cmd(project_id: str, governance_url: str, workspace: str) -> list[str]:
+    # NOTE: Uses script-path form (NOT -m module form) because embedded Python
+    # runtime has restrictive python312._pth that doesn't include project root.
+    # Module form fails with "No module named 'agent'" before executor_worker.py
+    # has a chance to bootstrap its sys.path. Script-path works because
+    # executor_worker.py's top-level _proj_root sys.path.insert handles the
+    # `from agent.governance.X import Y` imports it needs internally.
     return [
         sys.executable,
-        "-m", "agent.executor_worker",
+        str(Path(__file__).resolve().parent / "executor_worker.py"),
         "--project",
         project_id,
         "--url",
