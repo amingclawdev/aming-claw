@@ -2327,216 +2327,58 @@ def handle_version_sync(ctx: RequestContext):
 
 @route("POST", "/api/version-update/{project_id}")
 def handle_version_update(ctx: RequestContext):
-    """Update chain_version. 5-step validation: token + fields + lifecycle + version + audit."""
-    log.warning("DEPRECATED — handle_version_update will be locked to bootstrap-only in PR-3")
+    """DEPRECATED (Phase A §4.4): All writes are ignored. Returns git-derived chain_version.
+
+    R7: This endpoint no longer writes to project_version. It logs a deprecation
+    warning, audits the ignored call, and returns the current chain state derived
+    from git trailers. The endpoint is preserved (R10) but neutered.
+    """
     pid = ctx.get_project_id()
     body = ctx.body or {}
-
-    # Validation uses a short-lived independent connection to avoid WAL lock
-    # contention with the shared server connection.  The final write is wrapped
-    # with _retry_on_busy for resilience against concurrent merges.
-
-    def _open():
-        return independent_connection(pid)
-
-    # Step 1: Internal token check (validation — no DB needed yet)
-    expected_token = os.environ.get("VERSION_UPDATE_TOKEN", "")
-    provided_token = (ctx.handler.headers.get("X-Internal-Token", "") if ctx.handler else "") or body.get("internal_token", "")
-    if expected_token and provided_token != expected_token:
-        conn = _open()
-        try:
-            _audit_version_update(conn, pid, body, "rejected", "INVALID_TOKEN")
-        finally:
-            conn.close()
-        return {"error": "INVALID_TOKEN", "message": "Internal token mismatch"}, 403
-
-    # Step 2: Field completeness
-    required = ("chain_version", "updated_by")
-    missing = [f for f in required if not body.get(f)]
-    if missing:
-        conn = _open()
-        try:
-            _audit_version_update(conn, pid, body, "rejected", "MISSING_FIELDS")
-        finally:
-            conn.close()
-        return {"error": "MISSING_FIELDS", "message": f"Missing: {missing}"}, 400
-
-    # Step 3: Lifecycle validation
-    # LOCKDOWN (observer-hotfix 2026-04-24): Tightened updated_by whitelist to
-    # prevent observer from bypassing manual-fix flow by POSTing version-update
-    # directly. Removed "merge-service" (dead field, only used by observer as
-    # escape hatch) and "register" (dead field, no code caller). Added
-    # "manager-redeploy" (legitimate manager_http_server.py caller) and
-    # "redeploy-orchestrator" (legitimate redeploy_handler.py caller).
-    # Non-auto-chain paths now require VERSION_UPDATE_TOKEN to be set — observer
-    # cannot manually invoke without knowing the server-side secret.
-    updated_by = body["updated_by"]
-    _ALLOWED_UPDATED_BY = ("auto-chain", "init", "manager-redeploy", "redeploy-orchestrator", "cron-writeback")
-    _is_manual_fix = isinstance(updated_by, str) and updated_by.startswith("manual-fix-") and len(updated_by) > len("manual-fix-")
-    if updated_by not in _ALLOWED_UPDATED_BY and not _is_manual_fix:
-        conn = _open()
-        try:
-            _audit_version_update(conn, pid, body, "rejected", "INVALID_UPDATED_BY")
-        finally:
-            conn.close()
-        return {"error": "INVALID_UPDATED_BY",
-                "message": f"updated_by '{updated_by}' not allowed. "
-                           f"Allowed: {_ALLOWED_UPDATED_BY}. "
-                           f"Observer manual version-update is no longer supported — "
-                           f"run a verification chain to land version changes."}, 403
-
-    # Step 3 manual-fix guard: require non-empty manual_fix_reason
-    if _is_manual_fix:
-        manual_fix_reason = (body.get("manual_fix_reason") or "").strip()
-        if not manual_fix_reason:
-            conn = _open()
-            try:
-                _audit_version_update(conn, pid, body, "rejected", "MANUAL_FIX_REASON_MISSING")
-            finally:
-                conn.close()
-            return {"error": "MANUAL_FIX_REASON_MISSING",
-                    "message": "manual_fix_reason is required when updated_by is a manual-fix-* value"}, 400
-
-    # LOCKDOWN step 3a: Non-auto-chain callers must present VERSION_UPDATE_TOKEN.
-    # auto-chain is itself in-process and uses chain_stage='merge' enforcement;
-    # it doesn't need a separate token. Other callers (manager-redeploy,
-    # redeploy-orchestrator) MUST have the token. "init" is only allowed when
-    # no project version exists yet (first-time bootstrap).
-    if updated_by != "auto-chain":
-        if updated_by == "init":
-            conn = _open()
-            try:
-                existing = conn.execute(
-                    "SELECT chain_version FROM project_version WHERE project_id = ?",
-                    (pid,),
-                ).fetchone()
-            finally:
-                conn.close()
-            if existing and existing["chain_version"]:
-                conn = _open()
-                try:
-                    _audit_version_update(conn, pid, body, "rejected", "INIT_AFTER_BOOTSTRAP")
-                finally:
-                    conn.close()
-                return {"error": "INIT_AFTER_BOOTSTRAP",
-                        "message": f"updated_by='init' only allowed for first-time bootstrap; "
-                                   f"current chain_version='{existing['chain_version']}'"}, 403
-        else:
-            # manager-redeploy / redeploy-orchestrator — require token
-            if not expected_token:
-                conn = _open()
-                try:
-                    _audit_version_update(conn, pid, body, "rejected", "TOKEN_NOT_CONFIGURED")
-                finally:
-                    conn.close()
-                return {"error": "TOKEN_NOT_CONFIGURED",
-                        "message": f"VERSION_UPDATE_TOKEN is not configured on the server; "
-                                   f"updated_by='{updated_by}' cannot be authenticated"}, 503
-            # expected_token equality was already checked in Step 1; reaching here
-            # means provided_token matches. OK.
-
-    task_id = body.get("task_id", "")
-    chain_stage = body.get("chain_stage", "")
-    if updated_by == "auto-chain" and chain_stage and chain_stage != "merge":
-        conn = _open()
-        try:
-            _audit_version_update(conn, pid, body, "rejected", "INVALID_CHAIN_STAGE")
-        finally:
-            conn.close()
-        return {"error": "INVALID_CHAIN_STAGE", "message": f"Expected merge, got {chain_stage}"}, 400
-
-    # Step 3b: Chain link validation — verify task_id references a succeeded task
-    # B40: cron-writeback skips task_id lookup and task.type enforcement entirely.
-    # It only writes chain_version and has no associated task.
-    if updated_by == "cron-writeback":
-        pass  # short-circuit: no task_id or task.type checks for cron-writeback
-    elif updated_by in ("auto-chain", "manager-redeploy", "redeploy-orchestrator") and task_id:
-        conn = _open()
-        try:
-            task_row = conn.execute(
-                "SELECT status, type FROM tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            # B48-sequel FIX (observer-hotfix 2026-04-24): Previously this check
-            # required task.status == "succeeded" which is NEVER true at the
-            # moment auto-chain's executor_worker._execute_merge calls
-            # version-update. The task is still "claimed" (status transitions
-            # to succeeded AFTER _execute_task returns, via _complete_task).
-            # This was a latent bug: observer workaround was updated_by=merge-service
-            # bypass, which my prior lockdown removed. Now allow any non-terminal-failure
-            # status for in-flight version-update calls.
-            _TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "timed_out", "design_mismatch"}
-            if task_row and task_row["status"] in _TERMINAL_FAILURE_STATUSES:
-                _audit_version_update(conn, pid, body, "rejected", "TASK_TERMINALLY_FAILED")
-                return {"error": "TASK_TERMINALLY_FAILED",
-                        "message": f"Task {task_id} is in terminal failure state "
-                                   f"{task_row['status']}; cannot sync version for it"}, 400
-            # B40: Reject if task.type is not 'merge' for chain-enforcement callers.
-            # manual-fix-* is excluded from this block (only auto-chain/manager-redeploy/
-            # redeploy-orchestrator reach here). cron-writeback short-circuits above.
-            if task_row and task_row["type"] != "merge":
-                _audit_version_update(conn, pid, body, "rejected", "TASK_TYPE_NOT_MERGE")
-                return {"error": "TASK_TYPE_NOT_MERGE",
-                        "message": f"Task {task_id} has type '{task_row['type']}', "
-                                   f"expected 'merge' for updated_by='{updated_by}'"}, 400
-            # Allowed: claimed (in-flight auto-chain), running, succeeded
-            # task_row could be None if task is in a different DB — allow (backward compat)
-        finally:
-            conn.close()
-
-    # Step 4: Version consistency (optional — old_version check)
-    old_version = body.get("old_version")
-    if old_version:
-        conn = _open()
-        try:
-            row = conn.execute("SELECT chain_version FROM project_version WHERE project_id=?", (pid,)).fetchone()
-            current = row["chain_version"] if row else None
-        finally:
-            conn.close()
-        if current and old_version != current:
-            conn2 = _open()
-            try:
-                _audit_version_update(conn2, pid, body, "rejected", "OLD_VERSION_MISMATCH")
-            finally:
-                conn2.close()
-            return {"error": "OLD_VERSION_MISMATCH",
-                    "message": f"Expected {old_version}, DB has {current}"}, 409
-
-    # Step 5: Update + audit — wrapped with retry for SQLITE_BUSY resilience
-    new_version = body["chain_version"]
     now = _utc_now()
 
-    def _do_update():
-        conn = independent_connection(pid)
-        try:
-            conn.execute("""
-                INSERT INTO project_version (project_id, chain_version, updated_at, updated_by)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(project_id) DO UPDATE SET
-                    chain_version=excluded.chain_version,
-                    updated_at=excluded.updated_at,
-                    updated_by=excluded.updated_by
-            """, (pid, new_version, now, updated_by))
-            conn.commit()
-            _audit_version_update(conn, pid, body, "success", "")
-        finally:
-            conn.close()
+    log.warning("deprecated_write_ignored: handle_version_update called for %s by %s — "
+                "writes are no longer accepted (Phase A §4.4, R7)",
+                pid, body.get("updated_by", "unknown"))
 
-    _retry_on_busy(_do_update)
+    # Audit the ignored call
+    conn = independent_connection(pid)
+    try:
+        audit_service.record(
+            conn, pid, "version.update_attempt",
+            actor=body.get("updated_by", "unknown"),
+            details={
+                "task_id": body.get("task_id", ""),
+                "new_version": body.get("chain_version", ""),
+                "updated_by": body.get("updated_by", ""),
+                "result": "deprecated_write_ignored",
+                "reason": "Phase A: version-update writes are ignored; git trailers are source of truth",
+            },
+        )
+        conn.commit()
+    except Exception as e:
+        log.debug("version-update audit failed (non-fatal): %s", e)
+    finally:
+        conn.close()
 
-    # Phase A: also log IGNORED audit entry for trailer transition awareness
-    # and return derived trailer state alongside DB state
+    # Return git-derived chain state
     derived_state = None
     try:
         from .chain_trailer import get_chain_state
         derived_state = get_chain_state()
-        log.info("version-update: DB write succeeded; trailer-derived state: %s", derived_state)
     except Exception as e:
-        log.debug("version-update: chain_trailer unavailable for derived state: %s", e)
+        log.debug("version-update: chain_trailer unavailable: %s", e)
 
-    result = {"ok": True, "chain_version": new_version, "updated_at": now}
+    chain_version = derived_state["chain_sha"] if derived_state else "unknown"
+    result = {
+        "ok": True,
+        "chain_version": chain_version,
+        "updated_at": now,
+        "deprecated_write_ignored": True,
+        "source": "git_trailer",
+    }
     if derived_state:
         result["derived_state"] = derived_state
-        result["source"] = derived_state.get("source", "db")
     return result
 
 
@@ -4007,6 +3849,16 @@ def main():
         print("OutboxWorker: started")
     except Exception as e:
         print(f"OutboxWorker: failed to start ({e})")
+
+    # Phase A (R9): backfill chain_history.json for legacy commits at startup
+    try:
+        from .chain_trailer import backfill_legacy_chain_history
+        import os as _os
+        _history_path = _os.path.join(_os.path.dirname(__file__), "..", "..", "chain_history.json")
+        backfill_legacy_chain_history(output_path=_history_path)
+        print("ChainTrailer: backfill_legacy_chain_history completed")
+    except Exception as e:
+        print(f"ChainTrailer: backfill failed ({e})")
 
     server = create_server()
     print(f"Governance service listening on port {PORT}")

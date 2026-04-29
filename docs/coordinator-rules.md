@@ -3,6 +3,8 @@
 > Migrated from original `docs/coordinator-rules.md`. Primary coordinator role specification now lives in [`docs/roles/coordinator.md`](roles/coordinator.md).
 > This document covers supplementary rules enforced by the executor on behalf of the coordinator pipeline.
 
+> **2026-04-28 update (Phase A):** Version gate now uses git-derived `chain_sha` as source of truth (not DB `chain_version`). `_gate_version_check` reads `get_chain_state()` which walks `git log --first-parent` for the latest `Chain-Source-Stage` trailer. The `effective_ver = db_chain_ver if db_chain_ver` pattern is removed — git trailers are authoritative.
+
 ## B41: Cross-Platform Verification Command Guard
 
 **Added:** 2026-04-21 | **Source:** `_assert_portable_verification_command` in `agent/executor_worker.py`

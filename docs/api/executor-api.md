@@ -8,6 +8,8 @@
 
 > **2026-04-25 update:** Reconcile V2 endpoint (`POST /api/wf/{pid}/reconcile-v2`) now accepts optional `scope` field in body for targeted reconcile runs. See `agent/governance/reconcile_phases/scope.py` for `ReconcileScope` specification.
 
+> **2026-04-28 update (Phase A — Version Gate as Commit Trailer):** Merge commits now use 4-field trailer schema (`Chain-Source-Task`, `Chain-Source-Stage`, `Chain-Parent`, `Chain-Bug-Id`) instead of single `Chain-Version`. `_execute_merge` calls `write_merge_with_trailer()` with `task_id` and `parent_chain_sha` from `get_chain_state()` — no bare git merge fallback. The `/api/version-update` endpoint is neutered (writes ignored, returns git-derived state). See `docs/dev/proposal-version-gate-as-commit-trailer.md` §4.
+
 > Executor HTTP API (port 40100) runs on the host machine.
 > Used for Claude Code session direct monitoring and debugging the execution chain.
 
