@@ -66,6 +66,64 @@ RECONCILIATION_BYPASS_POLICY = {
     "audit_action": "reconciliation_bypass",
 }
 
+# ---------------------------------------------------------------------------
+# PRD Graph-Declaration Fields (R1/R6)
+# ---------------------------------------------------------------------------
+_PRD_GRAPH_DECLARATION_FIELDS = ("removed_nodes", "unmapped_files", "renamed_nodes", "remapped_files")
+
+
+def _extract_prd_declarations(prd):
+    """Extract the 4 PRD graph-declaration fields with empty-list defaults (R6)."""
+    return {f: prd.get(f, []) for f in _PRD_GRAPH_DECLARATION_FIELDS}
+
+
+def validate_prd_graph_declarations(prd, dev_changed_files, current_graph):
+    """Validate PRD graph declarations against dev changed_files and graph (R2/R5).
+
+    Returns a list of error strings. Empty list means valid / backward-compat.
+    """
+    decl = _extract_prd_declarations(prd) if prd else {}
+    removed = decl.get("removed_nodes", [])
+    unmapped = decl.get("unmapped_files", [])
+    # R6: If no declaration fields present, skip validation (backward compat)
+    if not any(decl.get(f) for f in _PRD_GRAPH_DECLARATION_FIELDS):
+        return []
+    errors = []
+    # Build set of graph-bound files from current_graph
+    graph_file_to_node = {}
+    if current_graph and isinstance(current_graph, dict):
+        for nid, ndata in current_graph.items():
+            if not isinstance(ndata, dict):
+                continue
+            primaries = ndata.get("primary", [])
+            if isinstance(primaries, str):
+                primaries = [primaries]
+            for p in primaries:
+                graph_file_to_node[p.replace("\\", "/")] = nid
+    # Normalise dev_changed_files
+    changed_set = {f.replace("\\", "/") for f in (dev_changed_files or [])}
+    # Detect deleted graph-bound files not declared
+    declared_node_ids = {n if isinstance(n, str) else n.get("node_id", "") for n in removed}
+    unmapped_set = {f.replace("\\", "/") for f in unmapped}
+    for f in changed_set:
+        bound_node = graph_file_to_node.get(f)
+        if bound_node and bound_node not in declared_node_ids and f not in unmapped_set:
+            errors.append(
+                f"File '{f}' is bound to node '{bound_node}' but not declared in "
+                "removed_nodes or unmapped_files"
+            )
+    # R5: Validate removed_nodes correspond to actually-deleted files
+    for node_ref in removed:
+        nid = node_ref if isinstance(node_ref, str) else node_ref.get("node_id", "")
+        # Find primary files for this node
+        node_files = [fp for fp, n in graph_file_to_node.items() if n == nid]
+        if node_files and not any(nf in changed_set for nf in node_files):
+            errors.append(
+                f"removed_nodes declares '{nid}' but none of its primary files "
+                f"{node_files} appear in dev changed_files"
+            )
+    return errors
+
 
 def _check_reconciliation_bypass(conn, project_id, metadata):
     """Validate metadata against RECONCILIATION_BYPASS_POLICY.
@@ -474,7 +532,7 @@ def _is_dev_doc(path):
     return _is_dev_note(normalized)
 
 
-def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
+def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_declarations=None):
     """Infer graph_delta from PM proposed_nodes + dev changed_files.
 
     Six deterministic rules:
@@ -487,7 +545,11 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
 
     Rules C (warn-only) and G (fuzzy title similarity) are explicitly SKIPPED.
 
-    Returns (graph_delta_dict, rule_hits_list, inferred_from_list).
+    When prd_declarations is provided (R3), PM declarations take priority:
+      - removed_nodes → {op: 'remove_node', source: 'pm_declaration'}
+      - Files covered by declarations skip auto-inferrer heuristics
+
+    Returns (graph_delta_dict, rule_hits_list, inferred_from_list, source_str).
     """
     creates = []
     updates = []
@@ -499,18 +561,50 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
     changed_set = {f.replace("\\", "/") for f in (changed_files or [])}
     non_md_changed = {f for f in changed_set if not f.endswith(".md")}
 
+    # ---- PRD declarations priority (R3) ----
+    decl = prd_declarations or {}
+    declared_removed = decl.get("removed_nodes", [])
+    declared_removed_ids = set()
+    declared_files = set()  # files covered by declarations — skip auto-inferrer
+    for nr in declared_removed:
+        nid = nr if isinstance(nr, str) else nr.get("node_id", "")
+        if nid:
+            declared_removed_ids.add(nid)
+            creates.append({"op": "remove_node", "node_id": nid, "source": "pm_declaration"})
+            rule_hits.append({"rule": "PM_DECL", "op": "remove_node", "node_id": nid})
+    for rf in decl.get("remapped_files", []):
+        f = rf if isinstance(rf, str) else rf.get("file", "")
+        if f:
+            declared_files.add(f.replace("\\", "/"))
+    for uf in decl.get("unmapped_files", []):
+        f = uf if isinstance(uf, str) else uf.get("file", uf)
+        if isinstance(f, str) and f:
+            declared_files.add(f.replace("\\", "/"))
+    if declared_removed_ids or declared_files:
+        inferred_from.append("pm_declarations")
+    # Filter non_md_changed to skip declared files
+    non_md_changed_undeclared = non_md_changed - declared_files
+
     # ---- Rule A: PM proposed_nodes with matching primary in changed_files ----
     covered_primaries = set()
     if pm_nodes:
         inferred_from.append("pm_proposed_nodes")
         for node in pm_nodes:
+            nid_a = node.get("node_id", "")
+            # R3: skip nodes declared as removed
+            if nid_a in declared_removed_ids:
+                # R4: emit conflict audit — inferrer would create but PM declared remove
+                structured_log("info", "graph_delta.declaration_overrides_inference",
+                               node_id=nid_a, declared_op="remove_node",
+                               inferred_op="creates", source="pm_declaration")
+                continue
             primaries = node.get("primary", [])
             if isinstance(primaries, str):
                 primaries = [primaries]
-            matched = [p for p in primaries if p.replace("\\", "/") in non_md_changed]
+            matched = [p for p in primaries if p.replace("\\", "/") in non_md_changed_undeclared]
             if matched:
                 entry = {
-                    "node_id": node.get("node_id", ""),
+                    "node_id": nid_a,
                     "title": node.get("title", ""),
                     "parent_layer": node.get("parent_layer", ""),
                     "primary": primaries,
@@ -530,6 +624,8 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
             nid = node.get("node_id", "")
             if nid in existing_node_ids:
                 continue  # already matched by Rule A
+            if nid in declared_removed_ids:
+                continue  # R3: skip declared-removed nodes
             primaries = node.get("primary", [])
             if isinstance(primaries, str):
                 primaries = [primaries]
@@ -548,7 +644,7 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result):
             inferred_from.append("pm_proposed_bridge")
 
     # ---- Rule B: @route decorator grep on changed agent/**/*.py ----
-    py_agent_files = [f for f in non_md_changed
+    py_agent_files = [f for f in non_md_changed_undeclared
                       if f.startswith("agent/") and f.endswith(".py")
                       and not f.startswith("agent/tests/")
                       and "/tests/" not in f.replace("\\", "/")
@@ -2321,18 +2417,24 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 from .chain_context import get_store
                 store = get_store()
                 root_task_id = store._task_to_root.get(task_id, task_id)
-                store._persist_event(
-                    root_task_id=root_task_id,
-                    task_id=task_id,
-                    event_type="pm.prd.published",
-                    payload={
+                _prd_payload = {
                         "proposed_nodes": proposed_nodes,
                         "test_files": result.get("test_files", []),
                         "target_files": result.get("target_files", []),
                         "requirements": prd.get("requirements", result.get("requirements", [])),
                         "acceptance_criteria": result.get("acceptance_criteria",
                                                           prd.get("acceptance_criteria", [])),
-                    },
+                    }
+                # R1/AC1: Persist 4 PRD graph-declaration fields
+                for _gdf in _PRD_GRAPH_DECLARATION_FIELDS:
+                    _gdf_val = result.get(_gdf, prd.get(_gdf, []))
+                    if _gdf_val:
+                        _prd_payload[_gdf] = _gdf_val
+                store._persist_event(
+                    root_task_id=root_task_id,
+                    task_id=task_id,
+                    event_type="pm.prd.published",
+                    payload=_prd_payload,
                     project_id=project_id,
                     conn=conn,  # MF-2026-04-24-001: share caller transaction
                 )
@@ -3790,6 +3892,20 @@ def _gate_qa_pass(conn, project_id, result, metadata):
         return False, (
             f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
             f"Got: {rec!r}. QA agent must set result.recommendation."
+        )
+    # AC5: validate PRD graph declarations against dev changed_files
+    _prd_decl_raw = metadata.get("prd", metadata)
+    _dev_changed = metadata.get("changed_files", result.get("changed_files", []))
+    _current_graph = None
+    try:
+        from . import project_service
+        _current_graph = project_service.load_project_graph(project_id)
+    except Exception:
+        log.debug("qa_gate: graph load for prd declaration validation failed", exc_info=True)
+    _decl_errors = validate_prd_graph_declarations(_prd_decl_raw, _dev_changed, _current_graph)
+    if _decl_errors:
+        return False, (
+            "PRD graph-declaration validation failed: " + "; ".join(_decl_errors)
         )
     # PR-B: graph.delta.proposed enforcement — check BEFORE criteria evaluation
     _gd_proposed = _query_graph_delta_proposed(metadata)
