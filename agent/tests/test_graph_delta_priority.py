@@ -196,5 +196,38 @@ class TestRemappedFilesSkipInferrer(unittest.TestCase):
         self.assertEqual(len(rule_a), 0)
 
 
+class TestMF20260429001RuleBExcludesAutoChain(unittest.TestCase):
+    """MF-2026-04-29-001: Rule B's @route grep must skip auto_chain.py self-mod."""
+
+    def test_rule_b_skips_auto_chain_self(self):
+        delta, hits, _, _ = _infer_graph_delta(
+            None,
+            ["agent/governance/auto_chain.py"],
+            None,
+            {},
+            prd_declarations=None,
+        )
+        rule_b_hits = [h for h in hits if h.get("rule") == "B"]
+        self.assertEqual(rule_b_hits, [],
+                         f"Rule B must skip auto_chain.py self-modification; got hits: {rule_b_hits}")
+
+
+class TestMF20260429001RuleJRespectsDeclarations(unittest.TestCase):
+    """MF-2026-04-29-001: Rule J's unbound_src filter must respect declared_files."""
+
+    def test_rule_j_skips_unmapped_file(self):
+        decl = {"unmapped_files": ["agent/governance/migration_state_machine.py"]}
+        delta, hits, _, _ = _infer_graph_delta(
+            None,
+            ["agent/governance/migration_state_machine.py"],
+            None,
+            {},
+            prd_declarations=decl,
+        )
+        rule_j_hits = [h for h in hits if h.get("rule") == "J"]
+        self.assertEqual(rule_j_hits, [],
+                         f"Rule J must skip files in unmapped_files; got hits: {rule_j_hits}")
+
+
 if __name__ == "__main__":
     unittest.main()

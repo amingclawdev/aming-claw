@@ -644,11 +644,19 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
             inferred_from.append("pm_proposed_bridge")
 
     # ---- Rule B: @route decorator grep on changed agent/**/*.py ----
+    # MF-2026-04-29-001: exclude self-referential governance modules whose source
+    # CONTAINS @route regex patterns (used to scan OTHER files) but are NOT routers.
+    # Rule B's own regex matches the regex pattern strings inside auto_chain.py →
+    # phantom 4× endpoint creates with empty node_id/parent_layer → QA rejects.
+    _ROUTE_GREP_EXCLUDE = frozenset({
+        "agent/governance/auto_chain.py",  # contains @route regex strings, scans others
+    })
     py_agent_files = [f for f in non_md_changed_undeclared
                       if f.startswith("agent/") and f.endswith(".py")
                       and not f.startswith("agent/tests/")
                       and "/tests/" not in f.replace("\\", "/")
-                      and f.replace("\\", "/") not in covered_primaries]
+                      and f.replace("\\", "/") not in covered_primaries
+                      and f.replace("\\", "/") not in _ROUTE_GREP_EXCLUDE]
     if py_agent_files:
         inferred_from.append("route_decorator_grep")
         # Positional: @route('POST', '/api/foo') or @app.route('GET', '/path')
@@ -938,12 +946,16 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
             inferred_from.append("test_file_binding")
 
     # -- Rule J: src modules --
+    # MF-2026-04-29-001: filter declared_files (completes 13a2060's PRD-declarations
+    # framework which missed Rule J). Without this, deleting a graph-bound file
+    # triggers phantom new-L7-node create from Rule J's fuzzy match fallback.
     _src_module_re = re.compile(r"^agent/.*\.py$")
     unbound_src = [
         f for f in changed_set
         if _src_module_re.match(f)
         and not f.startswith("agent/tests/")
         and f not in _rule_ij_covered
+        and f.replace("\\", "/") not in declared_files  # MF-2026-04-29-001: respect PM declarations
         # Also skip files already touched by Rule D
     ]
     # Filter out files already in Rule D updates' primary
