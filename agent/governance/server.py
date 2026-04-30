@@ -2288,7 +2288,14 @@ def handle_version_check(ctx: RequestContext):
             "runtime_match": runtime_match,
         }
 
-    chain_ver = row["chain_version"]
+    # R1/R2: Trailer-priority chain_ver. When trailer source='trailer', the git
+    # log--first-parent trailer is authoritative (auto_chain._gate_version_check
+    # uses chain_state.chain_sha for the same reason). Fall back to DB row
+    # otherwise (preserves prior behavior, including post-deploy DB sync state).
+    if trailer_state and trailer_state.get("source") == "trailer":
+        chain_ver = trailer_state.get("version", "") or trailer_state.get("chain_sha", "")
+    else:
+        chain_ver = row["chain_version"]
     git_head = row["git_head"] or ""
     dirty_files_raw = json.loads(row["dirty_files"] or "[]")
     # B31: apply _DIRTY_IGNORE filter (same as auto_chain._gate_version_check)
