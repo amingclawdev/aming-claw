@@ -85,6 +85,7 @@ def test_runtime_match_with_full_chain_short_runtime():
     fake_resp.__exit__ = mock.Mock(return_value=False)
     with mock.patch("agent.governance.server.get_connection", return_value=mc), \
          mock.patch("agent.governance.server._utc_now", return_value="2026-01-01T00:00:00Z"), \
+         mock.patch("agent.governance.chain_trailer.get_chain_state", side_effect=Exception("no trailer")), \
          mock.patch("agent.governance.chain_trailer.get_runtime_version", return_value=short), \
          mock.patch("urllib.request.urlopen", return_value=fake_resp):
         result = handle_version_check(_Ctx())
