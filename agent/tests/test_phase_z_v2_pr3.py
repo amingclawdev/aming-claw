@@ -1,6 +1,9 @@
-"""Tests for Phase Z v2 PR3 — driver + migration state machine.
+"""Tests for Phase Z v2 PR3 — driver + atomic swap module.
 
-13 tests: 6 driver tests + 7 migration state machine tests.
+The legacy migration_state_machine has been replaced by
+``agent.governance.symbol_swap.atomic_swap`` (spec §4.4 v6 / GPT R4).
+This file retains the driver tests and adds smoke coverage for the new
+atomic-swap module so the PR3 surface stays exercised.
 """
 from __future__ import annotations
 
@@ -36,14 +39,14 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     FunctionMeta,
 )
 
-from agent.governance.migration_state_machine import (
-    check_swap_gate,
-    trigger_migration_window,
-    check_deadline_expired,
-    extend_deadline,
-    abort_migration,
-    MIGRATION_DEADLINE_DAYS,
-    MIGRATION_DEADLINE_EXTEND_MAX,
+# NOTE: migration_state_machine has been removed — replaced by
+# agent.governance.symbol_swap. We only re-import the atomic-swap surface
+# here as a smoke check that the replacement module loads.
+from agent.governance.symbol_swap import (
+    BAK_RETENTION_DAYS,
+    atomic_swap,
+    smoke_validate,
+    rollback,
 )
 
 
@@ -157,88 +160,24 @@ class TestCoverageLookup:
 
 
 # ===========================================================================
-# Migration state machine tests (7)
+# Atomic swap smoke tests (replacement for migration_state_machine tests)
+# Full coverage lives in test_symbol_atomic_swap.py.
 # ===========================================================================
 
-class TestCheckSwapGate:
-    """AC6: check_swap_gate 4-condition gate."""
+class TestAtomicSwapSurface:
+    """Smoke checks: atomic_swap module loads and exposes its public API."""
 
-    def test_ac6_all_conditions_met(self):
-        """AC6: can_swap=True when all 4 conditions met."""
-        result = check_swap_gate(
-            chain_count=3,
-            signoff_ok=True,
-            p0_p1_blockers=0,
-            owner_approved=True,
-        )
-        assert result.can_swap is True
+    def test_bak_retention_days_is_30(self):
+        assert BAK_RETENTION_DAYS == 30
 
-    def test_ac6_insufficient_chains(self):
-        """AC6: can_swap=False when chain_count < 3."""
-        result = check_swap_gate(
-            chain_count=2,
-            signoff_ok=True,
-            p0_p1_blockers=0,
-            owner_approved=True,
-        )
-        assert result.can_swap is False
+    def test_atomic_swap_callable(self):
+        assert callable(atomic_swap)
 
-    def test_ac6_blockers_present(self):
-        """AC6: can_swap=False when p0_p1_blockers > 0."""
-        result = check_swap_gate(
-            chain_count=5,
-            signoff_ok=True,
-            p0_p1_blockers=1,
-            owner_approved=True,
-        )
-        assert result.can_swap is False
+    def test_smoke_validate_callable(self):
+        assert callable(smoke_validate)
 
-    def test_ac6_no_signoff(self):
-        """AC6: can_swap=False when signoff_ok=False."""
-        result = check_swap_gate(
-            chain_count=5,
-            signoff_ok=False,
-            p0_p1_blockers=0,
-            owner_approved=True,
-        )
-        assert result.can_swap is False
-
-
-class TestMigrationWindow:
-    """AC7: Migration deadline and extension."""
-
-    def test_ac7_trigger_sets_14_day_deadline(self):
-        """AC7: trigger_migration_window sets deadline = start + 14 days."""
-        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        window = trigger_migration_window("test-owner", start=start)
-        expected_deadline = start + timedelta(days=14)
-        assert window.deadline_at == expected_deadline
-        assert window.owner == "test-owner"
-
-    def test_ac7_check_deadline_expired(self):
-        """AC7: check_deadline_expired returns True after 14 days."""
-        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        window = trigger_migration_window("owner", start=start)
-
-        # Not expired at day 13
-        assert check_deadline_expired(window, now=start + timedelta(days=13)) is False
-
-        # Expired at day 15
-        assert check_deadline_expired(window, now=start + timedelta(days=15)) is True
-
-    def test_ac7_extend_max(self):
-        """AC7: MIGRATION_DEADLINE_EXTEND_MAX = 7."""
-        assert MIGRATION_DEADLINE_EXTEND_MAX == 7
-        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        window = trigger_migration_window("owner", start=start)
-
-        # Extend by 7 should work
-        extend_deadline(window, 7)
-        assert window.current_extension == 7
-
-        # Extending further should fail
-        with pytest.raises(ValueError):
-            extend_deadline(window, 1)
+    def test_rollback_callable(self):
+        assert callable(rollback)
 
 
 # ===========================================================================
