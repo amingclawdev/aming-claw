@@ -189,3 +189,80 @@ def test_valid_prd_fallback_passes():
     }
     res = validate_pm_output(payload, None, mode="warn")
     assert res.valid is True, f"expected valid via prd fallback; got {res.errors}"
+
+
+# --------------------------------------------------------------------------- #
+# S5 list[str] primary acceptance (PR1g)                                      #
+# --------------------------------------------------------------------------- #
+
+def test_proposed_node_primary_as_list_passes():
+    """S5: proposed_nodes element with primary=['agent/foo.py'] is accepted."""
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "target_files": ["agent/foo.py"],
+        "proposed_nodes": [
+            {"primary": ["agent/foo.py"], "title": "X"},
+        ],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is True, f"expected valid for list[str] primary; got {res.errors}"
+    bad = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "proposed_nodes[0].primary" in e.field_path]
+    assert not bad, f"unexpected primary errors: {bad}"
+
+
+def test_proposed_node_primary_as_list_with_multiple_paths_passes():
+    """S5: proposed_nodes element with multi-element list[str] primary is accepted."""
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "target_files": ["agent/foo.py"],
+        "proposed_nodes": [
+            {
+                "primary": [
+                    "agent/foo.py",
+                    "agent/bar.py",
+                    "agent/governance/baz.py",
+                ],
+                "title": "Multi-path node",
+            },
+        ],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is True, f"expected valid for multi-path list primary; got {res.errors}"
+    bad = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "proposed_nodes[0].primary" in e.field_path]
+    assert not bad, f"unexpected primary errors: {bad}"
+
+
+def test_proposed_node_primary_as_empty_list_fails():
+    """S5: proposed_nodes element with primary=[] still fails."""
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "proposed_nodes": [
+            {"primary": [], "title": "X"},
+        ],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False, "empty list primary must fail"
+    bad = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "proposed_nodes[0].primary" in e.field_path]
+    assert bad, f"expected MISSING_REQUIRED_FIELD on primary; got {res.errors}"
+
+
+def test_proposed_node_primary_as_list_with_empty_string_fails():
+    """S5: proposed_nodes element with primary=[''] (or whitespace-only) fails."""
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "proposed_nodes": [
+            {"primary": ["agent/foo.py", ""], "title": "X"},
+        ],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False, "list with empty string element must fail"
+    bad = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "proposed_nodes[0].primary" in e.field_path]
+    assert bad, f"expected MISSING_REQUIRED_FIELD on primary; got {res.errors}"
