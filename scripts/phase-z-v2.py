@@ -39,6 +39,9 @@ from agent.governance.ai_cluster_processor import (  # noqa: E402
     process_cluster_with_ai,
 )
 from agent.governance.llm_cache import LLMCache  # noqa: E402
+from agent.governance.auto_backlog_bridge import (  # noqa: E402
+    file_remediation_plan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +274,44 @@ def cmd_enrich(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+def cmd_file_backlog(args: argparse.Namespace) -> int:
+    """Phase Z v2 PR4 — file an approved remediation plan as reconcile tasks.
+
+    Reads the plan JSON at ``--plan``, calls
+    :func:`agent.governance.auto_backlog_bridge.file_remediation_plan`, and
+    prints a JSON summary. Exit codes: 0 on success, 1 if filed=0 with
+    errors, 2 on partial errors (filed>0 but errors non-empty).
+    """
+    plan_path = pathlib.Path(args.plan)
+    try:
+        with plan_path.open("r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        _print_json({"ok": False, "reason": f"plan unreadable: {exc}"})
+        return 1
+    if not isinstance(plan, dict):
+        _print_json({"ok": False, "reason": "plan JSON must be an object"})
+        return 1
+
+    project_id = args.project_id or os.environ.get("PROJECT_ID", "aming-claw")
+    summary = file_remediation_plan(
+        plan,
+        run_id=args.run_id,
+        project_id=project_id,
+        creator=args.creator,
+        dry_run=bool(args.dry_run),
+    )
+    _print_json(summary)
+
+    filed = int(summary.get("filed", 0) or 0)
+    errors = summary.get("errors") or []
+    if filed == 0 and errors:
+        return 1
+    if filed > 0 and errors:
+        return 2
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # argparse wiring
 # ---------------------------------------------------------------------------
@@ -393,6 +434,44 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # file-backlog (Phase Z v2 PR4 — auto-backlog filing bridge)
+    file_p = sub.add_parser(
+        "file-backlog",
+        help=(
+            "File an approved remediation plan as reconcile-type tasks via "
+            "the governance HTTP API."
+        ),
+    )
+    file_p.add_argument(
+        "--plan",
+        required=True,
+        help="Path to the approved remediation plan JSON.",
+    )
+    file_p.add_argument(
+        "--run-id",
+        required=True,
+        help="Reconcile run id (correlates this filing with a ClusterReport run).",
+    )
+    file_p.add_argument(
+        "--project-id",
+        default=None,
+        help="Governance project id (defaults to $PROJECT_ID or 'aming-claw').",
+    )
+    file_p.add_argument(
+        "--creator",
+        default="reconcile-bridge",
+        help=(
+            "Creator name; must be in {reconcile-bridge, coordinator, "
+            "auto-approval-bot} or start with 'observer-'."
+        ),
+    )
+    file_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Compose plan + bug_ids; do not POST any task creates.",
+    )
+
     return parser
 
 
@@ -407,6 +486,7 @@ def main(argv: list | None = None) -> int:
         "rollback": cmd_rollback,
         "status": cmd_status,
         "enrich": cmd_enrich,
+        "file-backlog": cmd_file_backlog,
     }
 
     handler = handlers.get(args.command)

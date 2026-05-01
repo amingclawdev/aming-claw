@@ -1,0 +1,196 @@
+"""Phase Z v2 PR4 — Auto-backlog filing bridge (§6 Phase-4).
+
+Converts an approved remediation plan into ``type='reconcile'`` tasks via
+the governance HTTP API. Reconcile-type tasks are 4-gate exempt per
+MF-2026-04-21-005. Public surface: :func:`compose_bug_id`,
+:func:`file_remediation_plan`.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import urllib.parse
+import urllib.request
+from typing import Any, Iterable
+
+log = logging.getLogger(__name__)
+
+__all__ = [
+    "compose_bug_id", "file_remediation_plan",
+    "DEFAULT_CREATOR_ALLOWLIST", "MAX_DUP_SUFFIX",
+]
+
+DEFAULT_CREATOR_ALLOWLIST: frozenset[str] = frozenset(
+    {"reconcile-bridge", "coordinator", "auto-approval-bot"}
+)
+MAX_DUP_SUFFIX: int = 10
+_DEFAULT_BASE_URL = "http://localhost:40000"
+_ACTIVE_STATUSES = ("claimed", "queued", "pending", "running")
+
+
+def _slug(target_node: str) -> str:
+    s = (target_node or "").lower().replace(".", "-")
+    s = re.sub(r"[^a-z0-9_-]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "unknown"
+
+
+def compose_bug_id(run_id: str, action_type: str, target_node: str) -> str:
+    """``OPT-BACKLOG-RECONCILE-{run_id[:8]}-{action_type}-{slug}``."""
+    return (
+        f"OPT-BACKLOG-RECONCILE-{(run_id or '')[:8]}-"
+        f"{action_type or 'unknown'}-{_slug(target_node)}"
+    )
+
+
+def _is_allowed_creator(creator: str) -> bool:
+    if not isinstance(creator, str) or not creator:
+        return False
+    return creator in DEFAULT_CREATOR_ALLOWLIST or creator.startswith("observer-")
+
+
+class _DefaultHttpClient:
+    """urllib-backed JSON HTTP client used when caller passes none."""
+
+    def __init__(self, base_url: str = _DEFAULT_BASE_URL, timeout: float = 10.0):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def _full(self, path: str) -> str:
+        if path.startswith(("http://", "https://")):
+            return path
+        return f"{self.base_url}{path}"
+
+    def get(self, url: str) -> dict:
+        req = urllib.request.Request(self._full(url), method="GET")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
+            return json.loads(resp.read().decode("utf-8") or "{}")
+
+    def post(self, url: str, payload: dict) -> dict:
+        req = urllib.request.Request(
+            self._full(url), data=json.dumps(payload).encode("utf-8"),
+            method="POST", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
+            return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _count_active_tasks(http_client: Any, project_id: str) -> int:
+    try:
+        resp = http_client.get(f"/api/task/{project_id}/list?limit=200")
+    except Exception:
+        log.warning("auto_backlog_bridge: queue-size probe failed", exc_info=True)
+        return 0
+    tasks = resp.get("tasks") if isinstance(resp, dict) else None
+    if not isinstance(tasks, list):
+        return 0
+    return sum(
+        1 for t in tasks
+        if isinstance(t, dict) and str(t.get("status", "")).lower() in _ACTIVE_STATUSES
+    )
+
+
+def _bug_exists(http_client: Any, project_id: str, bug_id: str) -> bool:
+    if not bug_id:
+        return False
+    try:
+        resp = http_client.get(
+            f"/api/backlog/{project_id}/exists?bug_id={urllib.parse.quote(bug_id)}"
+        )
+    except Exception:
+        return False
+    return isinstance(resp, dict) and bool(resp.get("exists", False))
+
+
+def file_remediation_plan(
+    plan: dict, run_id: str, project_id: str,
+    creator: str = "reconcile-bridge", dry_run: bool = False,
+    queue_threshold: int = 50, http_client: Any = None,
+) -> dict:
+    """File each plan action as a reconcile task; see module docstring."""
+    result: dict[str, Any] = {
+        "filed": 0, "skipped": 0, "errors": [], "task_ids": [],
+        "planned": [] if dry_run else None,
+    }
+    if not _is_allowed_creator(creator):
+        result["errors"].append({"reason": "unauthorized_creator", "creator": creator})
+        log.warning("auto_backlog_bridge: unauthorized_creator=%r — no tasks filed", creator)
+        return result
+
+    actions: Iterable[dict] = (plan or {}).get("actions") or []
+    if not isinstance(actions, list):
+        actions = []
+    plan_id = (plan or {}).get("plan_id") or ""
+    if http_client is None and not dry_run:
+        http_client = _DefaultHttpClient()
+
+    for idx, action in enumerate(actions):
+        if not isinstance(action, dict):
+            result["errors"].append({"action_index": idx, "reason": "invalid_action"})
+            continue
+        action_type = action.get("action") or action.get("action_type") or "unknown"
+        target_node = action.get("target_node") or action.get("node") or ""
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        target_files = params.get("files") or []
+        if not isinstance(target_files, list):
+            target_files = [str(target_files)]
+        drift_type = params.get("drift_type") or "unknown"
+        base_bug_id = compose_bug_id(run_id, action_type, target_node)
+
+        # R7 — queue capacity check (applies even in dry-run when http_client supplied).
+        if http_client is not None:
+            try:
+                active = _count_active_tasks(http_client, project_id)
+            except Exception:
+                active = 0
+            if active >= queue_threshold:
+                result["skipped"] += 1
+                log.warning("auto_backlog_bridge: queue_full active=%d threshold=%d action_index=%d",
+                            active, queue_threshold, idx)
+                continue
+
+        # R5 — duplicate-suffix walk -2..-10; beyond cap, record error.
+        chosen_bug_id: str | None = base_bug_id
+        if http_client is not None:
+            suffix = 1
+            while _bug_exists(http_client, project_id, chosen_bug_id):
+                suffix += 1
+                if suffix > MAX_DUP_SUFFIX:
+                    chosen_bug_id = None
+                    break
+                chosen_bug_id = f"{base_bug_id}-{suffix}"
+        if chosen_bug_id is None:
+            result["errors"].append({"action_index": idx, "bug_id": base_bug_id,
+                                     "reason": "duplicate_collision_exhausted"})
+            continue
+
+        metadata = {"bug_id": chosen_bug_id, "reconcile_run_id": run_id,
+                    "drift_type": drift_type, "plan_id": plan_id, "action_index": idx}
+        payload = {"type": "reconcile",
+                   "prompt": action.get("prompt") or f"reconcile {action_type} {target_node}",
+                   "target_files": target_files, "metadata": metadata, "created_by": creator}
+
+        if dry_run:
+            result["planned"].append({"bug_id": chosen_bug_id, "action_index": idx,
+                                      "target_node": target_node,
+                                      "target_files": list(target_files),
+                                      "action_type": action_type, "drift_type": drift_type})
+            continue
+
+        try:
+            resp = http_client.post(f"/api/task/{project_id}/create", payload)
+        except Exception as exc:
+            result["errors"].append({"action_index": idx, "bug_id": chosen_bug_id,
+                                     "reason": f"create_failed: {exc!s}"})
+            continue
+
+        task_id = str(resp.get("task_id") or "") if isinstance(resp, dict) else ""
+        if task_id:
+            result["task_ids"].append(task_id)
+            result["filed"] += 1
+        else:
+            result["errors"].append({"action_index": idx, "bug_id": chosen_bug_id,
+                                     "reason": "create_no_task_id"})
+
+    return result
