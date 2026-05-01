@@ -217,38 +217,39 @@ class TestQAGateVerifyUpdateFailure:
         assert passed is True
 
     def test_try_verify_update_returns_true_on_success(self, isolated_gov_db):
-        """AC1: _try_verify_update returns (True, '') on success."""
+        """AC1: _try_verify_update returns (True, '') on success.
+
+        Patches governance.state_service.verify_update directly, since
+        auto_chain._try_verify_update does ``from . import state_service``
+        inside the function body — patch.dict('sys.modules', ...) is
+        ineffective once governance.state_service has already been imported.
+        """
         from governance.auto_chain import _try_verify_update
 
         conn = isolated_gov_db
         metadata = {"related_nodes": ["L1.3"]}
 
-        mock_state_service = MagicMock()
-        mock_state_service.verify_update.return_value = None  # success
-
-        with patch.dict("sys.modules", {
-            "governance.state_service": mock_state_service,
-            "governance.graph": MagicMock(AcceptanceGraph=MagicMock()),
-        }), patch("governance.auto_chain.os.path.exists", return_value=False):
+        with patch("governance.state_service.verify_update", return_value=None) as mock_vu, \
+                patch("governance.auto_chain.os.path.exists", return_value=False):
             ok, err = _try_verify_update(conn, "test-proj", metadata, "qa_pass", "qa", {"type": "e2e_report"})
 
         assert ok is True
         assert err == ""
+        assert mock_vu.called
 
     def test_try_verify_update_returns_false_on_exception(self, isolated_gov_db):
-        """AC1/AC4: _try_verify_update returns (False, error_msg) on exception and logs warning."""
+        """AC1/AC4: _try_verify_update returns (False, error_msg) on exception and logs warning.
+
+        Patches governance.state_service.verify_update directly to raise; see
+        the success-case docstring for why patch.dict(sys.modules) is unreliable.
+        """
         from governance.auto_chain import _try_verify_update
 
         conn = isolated_gov_db
         metadata = {"related_nodes": ["L1.3"]}
 
-        mock_state_service = MagicMock()
-        mock_state_service.verify_update.side_effect = ValueError("RBAC denied")
-
-        with patch.dict("sys.modules", {
-            "governance.state_service": mock_state_service,
-            "governance.graph": MagicMock(AcceptanceGraph=MagicMock()),
-        }), patch("governance.auto_chain.os.path.exists", return_value=False):
+        with patch("governance.state_service.verify_update", side_effect=ValueError("RBAC denied")), \
+                patch("governance.auto_chain.os.path.exists", return_value=False):
             ok, err = _try_verify_update(conn, "test-proj", metadata, "qa_pass", "qa", {"type": "e2e_report"})
 
         assert ok is False
