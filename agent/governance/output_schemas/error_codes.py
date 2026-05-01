@@ -12,11 +12,15 @@ EMPTY_NODE_ID = "EMPTY_NODE_ID"
 INVALID_PARENT_LAYER_TYPE = "INVALID_PARENT_LAYER_TYPE"
 UNSUPPORTED_SCHEMA_VERSION = "UNSUPPORTED_SCHEMA_VERSION"
 UNAUTHORIZED_SELF_WAIVER = "UNAUTHORIZED_SELF_WAIVER"
-
-# Warning codes — these are demoted to warnings under mode='warn' (default).
-CREATE_NOT_IN_PROPOSED_NODES = "CREATE_NOT_IN_PROPOSED_NODES"
 PHANTOM_CREATE_FOR_DECLARED_REMOVED = "PHANTOM_CREATE_FOR_DECLARED_REMOVED"
 PHANTOM_CREATE_FOR_UNMAPPED_FILE = "PHANTOM_CREATE_FOR_UNMAPPED_FILE"
+
+# Warning codes — only CREATE_NOT_IN_PROPOSED_NODES is demoted to a warning
+# under mode='warn' (default). Intentional drift from PM proposed_nodes is
+# acceptable in some flows. The two phantom-create codes above were promoted
+# to FATAL (PR1b) because they signal real graph-delta inconsistency against
+# explicit PM declarations (removed_nodes / unmapped_files).
+CREATE_NOT_IN_PROPOSED_NODES = "CREATE_NOT_IN_PROPOSED_NODES"
 
 FATAL_CODES = frozenset({
     MALFORMED_JSON,
@@ -25,4 +29,6 @@ FATAL_CODES = frozenset({
     INVALID_PARENT_LAYER_TYPE,
     UNSUPPORTED_SCHEMA_VERSION,
     UNAUTHORIZED_SELF_WAIVER,
+    PHANTOM_CREATE_FOR_DECLARED_REMOVED,
+    PHANTOM_CREATE_FOR_UNMAPPED_FILE,
 })

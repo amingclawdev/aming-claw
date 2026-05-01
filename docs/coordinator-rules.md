@@ -379,3 +379,42 @@ cmd = [sys.executable, "-m", "pytest"] + test_files + ["-v", "--tb=short"]
 ### Coordinator Impact
 
 The coordinator is unaffected. The fix operates at the executor level when running test-stage tasks with no explicit `verification.command`. Coordinator-dispatched test tasks benefit because the subprocess now always resolves the correct Python binary regardless of PATH inheritance.
+
+---
+
+## OPT-BACKLOG-PREFLIGHT-VALIDATOR-PR1B-PHANTOM-FATAL-DEV-ADVISORY: Phantom-Create FATAL Promotion + Dev Validator Advisory
+
+**Added:** 2026-04-30 | **Source:** `agent/governance/output_schemas/error_codes.py` (FATAL_CODES expansion); `agent/role_permissions.py` (`_DEFAULT_ROLE_PROMPTS['dev']` advisory section); `docs/roles/dev.md` (workflow step 3.5) | **Bug:** OPT-BACKLOG-PREFLIGHT-VALIDATOR-PR1B-PHANTOM-FATAL-DEV-ADVISORY
+
+### Background
+
+PR1 (commit `f7bc3c4`) shipped the dev-stage preflight validator framework but
+left two gaps that PR1b closes:
+
+1. The two phantom-create error codes that motivated the validator —
+   `PHANTOM_CREATE_FOR_DECLARED_REMOVED` and `PHANTOM_CREATE_FOR_UNMAPPED_FILE` —
+   were classified as warnings, so default `mode='warn'` demoted them to
+   non-fatal. The exact failure mode the validator was built to catch sailed
+   through with `valid=True`.
+2. The dev role prompt and `docs/roles/dev.md` were never updated to point dev
+   at `scripts/validate_stage_output.py`. Dev had no in-prompt awareness of
+   the validator at all.
+
+### Changes
+
+| Area | File | Change |
+|------|------|--------|
+| FATAL split | `agent/governance/output_schemas/error_codes.py` | `PHANTOM_CREATE_FOR_DECLARED_REMOVED` and `PHANTOM_CREATE_FOR_UNMAPPED_FILE` added to `FATAL_CODES`. `CREATE_NOT_IN_PROPOSED_NODES` remains the only "demoted under warn" code. |
+| Dev advisory | `agent/role_permissions.py` | New "Output preflight (recommended)" section in `_DEFAULT_ROLE_PROMPTS['dev']` that mentions `scripts/validate_stage_output.py`, the `--stage=dev --input=<output.json>` flag form, the server-validates-regardless note, and the phantom-FATAL note. `_initialize()` falls back to the Python default when a stale YAML config lacks the validator marker. |
+| Dev workflow doc | `docs/roles/dev.md` | New `### 3.5 Self-validate dev output (recommended)` subsection between steps 3 and 4 of the Task Workflow, mirroring the role-prompt advisory and back-linking to `docs/dev/proposal-stage-output-preflight-validator.md`. |
+| Test coverage | `agent/tests/test_dev_result_validator.py` | Three new tests (`test_phantom_for_declared_removed_is_fatal_in_warn_mode`, `test_phantom_for_unmapped_file_is_fatal_in_warn_mode`, `test_dev_role_prompt_mentions_validator`) plus a rewrite of `test_phantom_create_for_unmapped_file`'s warn-mode assertions (now expects `valid=False` and the code in `errors`, not `warnings`). |
+
+### Coordinator Impact
+
+The coordinator itself is unaffected — it does not produce `graph_delta` and does
+not run the preflight validator. The change reaches dev only. However, dev tasks
+dispatched by the coordinator now receive a role prompt that explicitly tells them
+how (and why) to self-validate before submitting, and any phantom-create errors
+against PM-declared `removed_nodes` / `unmapped_files` will fail the checkpoint
+gate — preventing the late-chain reject loops that previously stalled OPT-BACKLOG
+chains for several stages before QA caught the drift.
