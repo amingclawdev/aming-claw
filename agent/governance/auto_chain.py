@@ -950,6 +950,9 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
     # MF-2026-04-29-001: filter declared_files (completes 13a2060's PRD-declarations
     # framework which missed Rule J). Without this, deleting a graph-bound file
     # triggers phantom new-L7-node create from Rule J's fuzzy match fallback.
+    # PR1c: the prd_declarations parameter must be supplied by the caller
+    # _emit_or_infer_graph_delta for this filter to be effective; otherwise
+    # declared_files/declared_removed_ids degenerate to empty sets (no-op).
     _src_module_re = re.compile(r"^agent/.*\.py$")
     unbound_src = [
         f for f in changed_set
@@ -1046,6 +1049,11 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
     Case A: Dev provided non-empty graph_delta → passthrough with source='dev-emitted'
     Case B: Dev omitted graph_delta → auto-infer from PM proposed_nodes + changed_files
     Case A+B: Dev provided partial + inference fills gaps → source='dev-emitted+inferred-gaps'
+
+    PR1c (MF b6e874a / MF-2026-04-29-001): prd_declarations are extracted from the
+    pm.prd.published chain_event payload and threaded into _infer_graph_delta to
+    enable the declared_files / declared_removed_ids filters that prevent phantom
+    creates for files PM declared as unmapped/removed (see Rule J in _infer_graph_delta).
     """
     graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
 
@@ -1061,6 +1069,10 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
 
     # Load PM proposed_nodes from pm.prd.published chain_event
     pm_nodes = []
+    # PR1c (MF b6e874a / MF-2026-04-29-001): default declarations to empty lists
+    # so the keyword arg is always supplied to _infer_graph_delta, even when the
+    # pm.prd.published lookup fails or returns no payload.
+    prd_declarations = {f: [] for f in _PRD_GRAPH_DECLARATION_FIELDS}
     try:
         from .chain_context import get_store
         store = get_store()
@@ -1082,6 +1094,10 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
             if row:
                 payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
                 pm_nodes = payload.get("proposed_nodes", [])
+                # PR1c: extract the 4 PRD graph-declaration fields so that
+                # _infer_graph_delta's declared_files / declared_removed_ids
+                # filters become effective (Rule J phantom-create prevention).
+                prd_declarations = {f: payload.get(f, []) for f in _PRD_GRAPH_DECLARATION_FIELDS}
         finally:
             conn.close()
     except Exception:
@@ -1103,7 +1119,8 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
     dev_result_ctx["task_id"] = task_id
 
     inferred_delta, rule_hits, inferred_from, source = _infer_graph_delta(
-        pm_nodes, changed_files, graph_delta if dev_has_delta else None, dev_result_ctx
+        pm_nodes, changed_files, graph_delta if dev_has_delta else None, dev_result_ctx,
+        prd_declarations=prd_declarations,
     )
 
     log.info("_emit_or_infer_graph_delta: inference produced source=%s creates=%d updates=%d links=%d",
