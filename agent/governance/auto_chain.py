@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import PurePosixPath
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 from .observability import new_trace_id, structured_log
+from .output_schemas import validate_dev_output
 from .doc_policy import (
     is_dev_artifact as _is_dev_note,
     is_governance_internal_repair as _is_governance_internal_repair,
@@ -2253,6 +2254,51 @@ def _dispatch_reconcile(conn, project_id, task_id, task_type, result, metadata):
             pass
 
 
+def _validate_dev_at_transition(conn, project_id, task_id, result, metadata):
+    """PR1 primary preflight validator hook for dev→test transition.
+
+    Returns True when the chain may proceed to next-stage dispatch, False when
+    the validator detected blocking errors and the dispatch must be aborted.
+
+    Reads OPT_PREFLIGHT_VALIDATOR_MODE (default 'warn'). Mode 'disabled' or
+    a metadata observer_emergency_bypass with a non-empty bypass_reason
+    short-circuit to True without running validation.
+    """
+    mode = (os.environ.get("OPT_PREFLIGHT_VALIDATOR_MODE") or "warn").strip().lower()
+    if mode == "disabled":
+        log.info("preflight: dev validator disabled by OPT_PREFLIGHT_VALIDATOR_MODE")
+        return True
+    if metadata and metadata.get("observer_emergency_bypass") and metadata.get("bypass_reason"):
+        log.warning(
+            "preflight: observer_emergency_bypass active for task %s reason=%s",
+            task_id, metadata.get("bypass_reason"),
+        )
+        return True
+    chain_context = None
+    try:
+        from .chain_context import get_store
+        chain_context = get_store().get_chain(task_id)
+    except Exception:
+        log.debug("preflight: chain_context unavailable for %s", task_id, exc_info=True)
+    try:
+        vr = validate_dev_output(result or {}, chain_context, mode=mode)
+    except Exception:
+        log.error("preflight: validator crashed for task %s", task_id, exc_info=True)
+        return True  # never block chain on validator bug
+    if not vr.valid:
+        log.warning(
+            "preflight: dev result validation FAILED for task %s mode=%s errors=%d warnings=%d",
+            task_id, mode, len(vr.errors), len(vr.warnings),
+        )
+        return False
+    if vr.warnings:
+        log.info(
+            "preflight: dev result validation passed with %d warning(s) for %s",
+            len(vr.warnings), task_id,
+        )
+    return True
+
+
 def on_task_completed(conn, project_id, task_id, task_type, status, result, metadata):
     """Called by complete_task(). Dispatches next stage if gate passes.
 
@@ -2268,6 +2314,15 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
         return _dispatch_reconcile(conn, project_id, task_id, task_type, result, metadata)
     if task_type not in CHAIN:
         return None
+
+    # PR1 PRIMARY: dev result preflight validator — runs right after dev
+    # succeeds and BEFORE next-stage dispatch (_do_chain). Returns False to
+    # block dispatch when validator declares the payload invalid; logs only
+    # when mode='disabled' or observer_emergency_bypass is in effect.
+    if task_type == "dev":
+        if not _validate_dev_at_transition(conn, project_id, task_id, result, metadata):
+            return {"preflight_blocked": True, "stage": "dev",
+                    "reason": "dev result preflight validation failed"}
 
     # Use independent connection — don't hold caller's lock during chain ops
     from .db import get_connection
@@ -3889,6 +3944,15 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     Requires explicit qa_pass recommendation.
     Missing or ambiguous recommendation is a hard block (not auto-pass).
     """
+    # PR1 SECONDARY defense-in-depth: re-run dev preflight at QA gate to
+    # surface any dev-stage violation that slipped past the primary check.
+    # Always logs only — never blocks here.
+    try:
+        if not _validate_dev_at_transition(conn, project_id,
+                                           metadata.get("task_id", ""), result, metadata):
+            log.warning("qa_gate: dev preflight validator caught violations past stage-transition")
+    except Exception:
+        log.debug("qa_gate: secondary preflight call failed (non-critical)", exc_info=True)
     # §11.1: reconcile_run_id bypass (R5/R9)
     _reconcile_run_id = metadata.get("reconcile_run_id")
     if _reconcile_run_id:
