@@ -318,6 +318,11 @@ System knowledge:
 - If this is a retry after a checkpoint gate rejection, the rejection reason is included in the prompt. Fix ONLY the specific issue described; do not make unrelated changes.
 - After making changes, run tests to verify: use `python -m pytest` or at minimum `python -m py_compile <file>` for each changed file.
 
+Output preflight (recommended):
+- Before reporting your result, you MAY self-validate the JSON output against the dev-stage preflight schema by piping it through `scripts/validate_stage_output.py --stage=dev --input=<output.json>`. The script exits non-zero on FATAL violations and prints a human-readable diff.
+- The server validates your output regardless of whether you run the script — running it locally is purely an early-warning aid, not a bypass.
+- Phantom-create errors against PM-declared removed_nodes (PHANTOM_CREATE_FOR_DECLARED_REMOVED) and PM-declared unmapped_files (PHANTOM_CREATE_FOR_UNMAPPED_FILE) are now FATAL: a graph_delta.creates entry that targets a node_id PM marked as removed, or a primary file PM marked as unmapped, will fail the gate even under mode='warn'.
+
 Output format (strict JSON):
 ```json
 {
@@ -470,6 +475,14 @@ def _initialize():
         # Merge non-YAML roles from defaults (e.g. backlog_triage)
         for k, v in _DEFAULT_ROLE_PROMPTS.items():
             prompts.setdefault(k, v)
+        # PR1b: ensure the dev prompt always carries the preflight-validator
+        # advisory and the phantom-FATAL note. If a stale YAML config lacks
+        # the validator marker, fall back to the Python default which has it.
+        # This keeps governance behavior aligned with code regardless of
+        # whether config/roles/default/dev.yaml has been re-synced.
+        dev_prompt = prompts.get("dev")
+        if dev_prompt and "validate_stage_output" not in dev_prompt:
+            prompts["dev"] = _DEFAULT_ROLE_PROMPTS["dev"]
         return perms, prompts, verify
     return dict(_DEFAULT_ROLE_PERMISSIONS), dict(_DEFAULT_ROLE_PROMPTS), dict(_DEFAULT_ROLE_VERIFY_LIMITS)
 

@@ -50,6 +50,29 @@ Response fields:
 
 ### 3. Write code, commit
 
+### 3.5 Self-validate dev output (recommended)
+
+Before posting your dev result, you MAY pipe the JSON through the preflight validator:
+
+```
+python scripts/validate_stage_output.py --stage=dev --input=<output.json>
+```
+
+This catches phantom-create errors, missing required fields, mixed `parent_layer` types,
+and unauthorized self-waivers locally before the server-side gate runs. The script exits
+non-zero on FATAL violations and prints a human-readable diff.
+
+Notes:
+- The server validates your output regardless of whether you run the script — running it
+  locally is purely an early-warning aid, not a bypass for any gate.
+- Phantom-create errors against PM-declared `removed_nodes`
+  (`PHANTOM_CREATE_FOR_DECLARED_REMOVED`) and PM-declared `unmapped_files`
+  (`PHANTOM_CREATE_FOR_UNMAPPED_FILE`) are now FATAL: a `graph_delta.creates` entry that
+  targets a node PM marked as removed, or a `primary` file PM marked as unmapped, will
+  fail the gate even under `mode='warn'`.
+- Background and design rationale: see
+  [`docs/dev/proposal-stage-output-preflight-validator.md`](../dev/proposal-stage-output-preflight-validator.md).
+
 ### 4. Mark node status after fix
 
 ```json

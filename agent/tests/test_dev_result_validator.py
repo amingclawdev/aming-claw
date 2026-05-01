@@ -41,18 +41,55 @@ def test_phantom_create_for_unmapped_file():
             {"node_id": "L7.1", "primary": "legacy/old.py", "parent_layer": "L7"}
         ]
     })
-    # strict mode keeps the warning code as an error so we can assert detection
+    # strict mode keeps the code as an error so we can assert detection
     res = validate_dev_output(payload, ctx, mode="strict")
     assert isinstance(res, ValidationResult)
     codes = [e.code for e in res.errors]
     assert error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE in codes
     assert res.valid is False
 
-    # default warn-mode demotes the non-fatal code to a warning
+    # PR1b: PHANTOM_CREATE_FOR_UNMAPPED_FILE is FATAL — warn mode no longer
+    # demotes it. It must surface as an error and force valid=False.
     res_warn = validate_dev_output(payload, ctx, mode="warn")
-    warn_codes = [w.code for w in res_warn.warnings]
-    assert error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE in warn_codes
-    assert res_warn.valid is True
+    assert res_warn.valid is False
+    err_codes = [e.code for e in res_warn.errors]
+    assert error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE in err_codes
+
+
+def test_phantom_for_declared_removed_is_fatal_in_warn_mode():
+    """PR1b: PHANTOM_CREATE_FOR_DECLARED_REMOVED is FATAL even under warn."""
+    ctx = _pm_context(removed_nodes=["L7.21"])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {"node_id": "L7.21", "primary": "agent/governance/foo.py",
+             "parent_layer": "L7"}
+        ]
+    })
+    res = validate_dev_output(payload, ctx, mode="warn")
+    assert res.valid is False
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.PHANTOM_CREATE_FOR_DECLARED_REMOVED in err_codes
+
+
+def test_phantom_for_unmapped_file_is_fatal_in_warn_mode():
+    """PR1b: PHANTOM_CREATE_FOR_UNMAPPED_FILE is FATAL even under warn."""
+    ctx = _pm_context(unmapped_files=["legacy/old.py"])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {"node_id": "L7.5", "primary": "legacy/old.py",
+             "parent_layer": "L7"}
+        ]
+    })
+    res = validate_dev_output(payload, ctx, mode="warn")
+    assert res.valid is False
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE in err_codes
+
+
+def test_dev_role_prompt_mentions_validator():
+    """PR1b R2/AC3: dev role prompt must point dev at the preflight validator."""
+    from agent.role_permissions import ROLE_PROMPTS
+    assert "validate_stage_output" in ROLE_PROMPTS["dev"]
 
 
 def test_empty_node_id_fatal():
