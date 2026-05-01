@@ -2,7 +2,7 @@
 
 > **Meta-governed document** — Modifications to this spec require a governance chain (modify via chain).
 > Canonical governance spec for the reconcile workflow.
-> Last updated: 2026-04-28 | Initial formalization from scratch draft
+> Last updated: 2026-05-01 | PR2 atomic swap + disappearance review additions (§6 disappearance review, §8 atomic swap, §10 rollback)
 
 ---
 
@@ -204,6 +204,53 @@ Before a remediation plan flows to §6 Task Creation, it must pass an approval g
 
 ---
 
+### 6.0 Disappearance Review (Pre-Swap)
+
+Before §8 atomic swap can run, every node that disappears between the
+existing `graph.json` and the candidate `graph.v2.json` MUST receive an
+explicit observer decision. The review is implemented in
+[`agent/governance/symbol_disappearance_review.py`](../../agent/governance/symbol_disappearance_review.py)
+and is invoked via:
+
+```
+python scripts/phase-z-v2.py review \
+    --graph-path agent/governance/graph.json \
+    --candidate-path agent/governance/graph.v2.json \
+    --decisions <decisions.json>
+```
+
+The module exposes two canonical constant tables:
+
+* `REMOVAL_REASONS` — exactly 5 strings, in order:
+  `files_relocated`, `files_deleted`, `merged_into_other_node`,
+  `low_confidence_inference`, `no_matching_call_topology`. Each
+  disappearing node is classified into exactly one reason by
+  `classify_removal()`.
+* `OBSERVER_DECISIONS` — exactly 4 strings, in order:
+  `approve_removal`, `map_to_new_node`, `preserve_as_supplement`,
+  `block_swap`. The observer must record one decision per disappearing
+  node; `block_swap` halts the swap regardless of other decisions.
+
+`require_observer_decision()` returns `{ok, missing, blocked}` and is the
+gate-equivalent for §8: `ok=False` means the swap MUST NOT be invoked.
+`detect_governance_markers()` flags B36 dangling-L7 nodes, legacy
+waivers, and manual carve-outs so the observer can decide based on full
+governance context.
+
+### 6.1 Acceptance Criteria
+
+- AC6.0.1: Every node missing from the candidate graph receives a
+  classification from `REMOVAL_REASONS`.
+- AC6.0.2: Every removed node has a recorded decision from
+  `OBSERVER_DECISIONS`; absent or unknown values are reported in
+  `missing`.
+- AC6.0.3: Any `block_swap` decision aborts the swap and is logged in
+  the audit trail.
+- AC6.0.4: The review report is JSON-serialisable and is the input to
+  the §8 atomic swap.
+
+---
+
 ## §6 Phase 4: Task Creation
 
 ### Input contract
@@ -274,6 +321,36 @@ If any optimistic lock check fails, abort execution with `stale_plan` error. No 
 
 Reverse the node state change using before-state snapshot. If reversal fails, escalate to
 observer with full evidence per [manual-fix-sop.md](manual-fix-sop.md) §2 procedures.
+
+---
+
+### 7.5 Atomic Graph Swap
+
+For graph-replacement reconcile actions (e.g. Phase Z v2 swap of
+`graph.json` ⇄ `graph.v2.json`), execution uses the atomic-swap module
+[`agent/governance/symbol_swap.py`](../../agent/governance/symbol_swap.py).
+The legacy `agent/governance/migration_state_machine.py` (V5-era
+14-day staged migration with 4-condition swap gate) has been
+**REMOVED**; per spec §4.4 v6 / GPT R4 it is replaced by the
+deterministic atomic swap below.
+
+**Sequence** (`atomic_swap(graph_path, candidate_path, *, observer_alert=None)`):
+
+1. `shutil.move(graph_path → graph_path.with_suffix('.json.bak'))` —
+   the existing graph is backed up.
+2. `shutil.move(candidate_path → graph_path)` — the candidate becomes
+   the canonical graph.
+3. `smoke_validate(graph_path)` runs — purely deterministic, NO AI / NO
+   network. It checks: parses as JSON, unique `node_id`s, every layer
+   in L0–L6 inclusive, and every primary path resolvable on disk.
+4. On smoke failure the function auto-rolls-back: it restores the
+   `.bak` to `graph_path`, returns the candidate file to its original
+   path, and invokes `observer_alert({"ok": False, "reason": str})`
+   exactly once.
+
+`smoke_validate` is required to be deterministic — calling it twice on
+the same input MUST return the same result. There are no environment-
+or time-dependent branches.
 
 ---
 
@@ -403,6 +480,39 @@ Revert call-graph edges to pre-rewrite state. Recompute affected `in_degree` and
 ### 10.5 Gate-bypass Action Rollback
 
 Revoke the bypass token. Re-enable the original gate check. AC: gate function returns to enforcing state; bypass token invalidated. Audit: log `rollback_gate_bypass` with token_id and revoke reason. Observer alert if gate re-enable fails.
+
+### 10.5b Atomic Graph Swap Rollback (`.bak` Restore)
+
+When a `.json.bak` exists alongside a swapped `graph.json`,
+[`symbol_swap.rollback(graph_path, max_age_days=BAK_RETENTION_DAYS)`](../../agent/governance/symbol_swap.py)
+restores the previous graph from the backup. Operationally, this is
+exposed via the [`scripts/phase-z-v2.py`](../../scripts/phase-z-v2.py)
+`rollback` subcommand:
+
+```
+python scripts/phase-z-v2.py rollback \
+    --graph-path agent/governance/graph.json \
+    --max-age-days 30
+```
+
+**Retention policy**: `BAK_RETENTION_DAYS = 30` (module-level constant
+in `symbol_swap.py`). `rollback()` REFUSES to restore a `.bak` whose
+age exceeds `max_age_days` (default 30); this prevents a stale backup
+from overwriting weeks of subsequent intentional changes. AC: when
+`age_days > max_age_days`, returns `{ok: False, reason: "backup too old: ..."}`
+and leaves both `graph.json` and `graph.json.bak` untouched.
+
+The `status` subcommand is the operator-facing inspection point:
+
+```
+python scripts/phase-z-v2.py status --graph-path agent/governance/graph.json
+```
+
+It returns `{bak_exists, age_days, expired, graph_path, bak_path}` and
+is the canonical way to check whether a recent swap is still rollable.
+
+Audit: log `rollback_atomic_swap` with `graph_path`, `age_days`, and
+`max_age_days`. Observer alert if rollback returns `ok=False`.
 
 ### 10.6 Multi-node Action Rollback
 
