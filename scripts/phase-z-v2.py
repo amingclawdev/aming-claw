@@ -34,6 +34,61 @@ from agent.governance.reconcile_phases.phase_z_v2 import (  # noqa: E402
 )
 from agent.governance import symbol_disappearance_review  # noqa: E402
 from agent.governance import symbol_swap  # noqa: E402
+from agent.governance.ai_cluster_processor import (  # noqa: E402
+    ClusterReport,
+    process_cluster_with_ai,
+)
+from agent.governance.llm_cache import LLMCache  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# enrich helpers
+# ---------------------------------------------------------------------------
+
+class _ClusterMember:
+    """Lightweight stand-in exposing ``qname`` + ``lines`` for cache keying."""
+
+    __slots__ = ("qname", "lines")
+
+    def __init__(self, qname: str, lines):
+        self.qname = qname
+        self.lines = lines
+
+
+def _load_cluster_payload(path: pathlib.Path) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _payload_to_members(payload: dict):
+    members = payload.get("members") or payload.get("functions") or []
+    out = []
+    for m in members:
+        if isinstance(m, dict):
+            qn = m.get("qname") or m.get("qualified_name") or ""
+            lines = m.get("lines")
+            if lines is None:
+                lo = m.get("lineno")
+                hi = m.get("end_lineno")
+                if lo is not None:
+                    lines = [lo, hi]
+            out.append(_ClusterMember(qn, lines))
+    return out
+
+
+def _payload_to_entry(payload: dict, members):
+    entry_qname = payload.get("entry") or payload.get("entry_qname")
+    if entry_qname:
+        return _ClusterMember(entry_qname, None)
+    if members:
+        return members[0]
+    return _ClusterMember("", None)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +187,90 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enrich(args: argparse.Namespace) -> int:
+    """Pass-5 AI enrichment of cluster JSON files in *workspace*.
+
+    Iterates every ``cluster_*.json`` (and ``*.cluster.json``) under
+    ``--workspace``, calls
+    :func:`agent.governance.ai_cluster_processor.process_cluster_with_ai`
+    for each, and writes a sibling ``<name>.enriched.json`` containing
+    the :class:`ClusterReport`.  When ``--resume`` is set, clusters
+    whose existing report already has ``enrichment_status ==
+    'ai_complete'`` are skipped.
+    """
+    workspace = pathlib.Path(args.workspace).resolve()
+    if not workspace.exists():
+        _print_json({"ok": False, "reason": f"workspace not found: {workspace}"})
+        return 1
+
+    cache = LLMCache(workspace)
+
+    candidates: list[pathlib.Path] = []
+    for pattern in ("cluster_*.json", "*.cluster.json", "clusters/*.json"):
+        candidates.extend(sorted(workspace.rglob(pattern)))
+    # De-dup while preserving order
+    seen: set[str] = set()
+    cluster_files: list[pathlib.Path] = []
+    for p in candidates:
+        if p.name.endswith(".enriched.json"):
+            continue
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        cluster_files.append(p)
+
+    processed = 0
+    skipped = 0
+    failed = 0
+    for cluster_path in cluster_files:
+        enriched_path = cluster_path.with_suffix(".enriched.json")
+        if args.resume and enriched_path.exists():
+            existing = _load_graph(enriched_path)
+            if existing.get("enrichment_status") == "ai_complete":
+                skipped += 1
+                continue
+
+        payload = _load_cluster_payload(cluster_path)
+        if payload is None:
+            failed += 1
+            continue
+
+        members = _payload_to_members(payload)
+        entry = _payload_to_entry(payload, members)
+
+        try:
+            report = process_cluster_with_ai(
+                members,
+                entry,
+                str(workspace),
+                use_ai=args.use_ai,
+                cache=cache,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            failed += 1
+            _print_json({"ok": False, "cluster": str(cluster_path), "error": str(exc)})
+            continue
+
+        try:
+            with enriched_path.open("w", encoding="utf-8") as f:
+                json.dump(report.to_dict(), f, indent=2, sort_keys=True)
+            processed += 1
+        except OSError as exc:
+            failed += 1
+            _print_json({"ok": False, "cluster": str(cluster_path), "error": str(exc)})
+            continue
+
+    _print_json({
+        "ok": failed == 0,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "total": len(cluster_files),
+    })
+    return 0 if failed == 0 else 1
+
+
 # ---------------------------------------------------------------------------
 # argparse wiring
 # ---------------------------------------------------------------------------
@@ -218,6 +357,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to the canonical graph.json",
     )
 
+    # enrich (Phase Z v2 PR3 — AI cluster processor)
+    enrich_p = sub.add_parser(
+        "enrich",
+        help=(
+            "Pass-5 AI enrichment: iterate cluster JSON files under "
+            "--workspace and write sibling <name>.enriched.json reports."
+        ),
+    )
+    enrich_p.add_argument(
+        "--workspace",
+        required=True,
+        help="Workspace root containing cluster_*.json output from prior passes.",
+    )
+    enrich_p.add_argument(
+        "--use-ai",
+        dest="use_ai",
+        action="store_true",
+        default=True,
+        help="Enable AI enrichment (default).",
+    )
+    enrich_p.add_argument(
+        "--no-ai",
+        dest="use_ai",
+        action="store_false",
+        help="Disable AI calls; emit ai_unavailable placeholders.",
+    )
+    enrich_p.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip clusters whose existing enriched report already has "
+            "enrichment_status == 'ai_complete'."
+        ),
+    )
+
     return parser
 
 
@@ -231,6 +406,7 @@ def main(argv: list | None = None) -> int:
         "apply": cmd_apply,
         "rollback": cmd_rollback,
         "status": cmd_status,
+        "enrich": cmd_enrich,
     }
 
     handler = handlers.get(args.command)
