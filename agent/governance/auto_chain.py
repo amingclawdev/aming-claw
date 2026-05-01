@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import PurePosixPath
 from .failure_classifier import classify_gate_failure, build_workflow_improvement_prompt
 from .observability import new_trace_id, structured_log
-from .output_schemas import validate_dev_output
+from .output_schemas import validate_dev_output, validate_pm_output
 from .doc_policy import (
     is_dev_artifact as _is_dev_note,
     is_governance_internal_repair as _is_governance_internal_repair,
@@ -2316,6 +2316,53 @@ def _validate_dev_at_transition(conn, project_id, task_id, result, metadata):
     return True
 
 
+def _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
+    """PR1d primary preflight validator hook for pm→dev transition.
+
+    Returns True when the chain may proceed to next-stage dispatch, False when
+    the validator detected blocking errors and the dispatch must be aborted.
+
+    Mirrors _validate_dev_at_transition: respects OPT_PREFLIGHT_VALIDATOR_MODE
+    (default 'warn'); a metadata observer_emergency_bypass with a non-empty
+    bypass_reason short-circuits to True without running validation; chain
+    context is fetched best-effort and never blocks; validator crashes
+    fall back to True so a buggy validator never wedges the chain.
+    """
+    mode = (os.environ.get("OPT_PREFLIGHT_VALIDATOR_MODE") or "warn").strip().lower()
+    if mode == "disabled":
+        log.info("preflight: pm validator disabled by OPT_PREFLIGHT_VALIDATOR_MODE")
+        return True
+    if metadata and metadata.get("observer_emergency_bypass") and metadata.get("bypass_reason"):
+        log.warning(
+            "preflight: observer_emergency_bypass active for task %s reason=%s",
+            task_id, metadata.get("bypass_reason"),
+        )
+        return True
+    chain_context = None
+    try:
+        from .chain_context import get_store
+        chain_context = get_store().get_chain(task_id)
+    except Exception:
+        log.debug("preflight: chain_context unavailable for %s", task_id, exc_info=True)
+    try:
+        vr = validate_pm_output(result or {}, chain_context, mode=mode)
+    except Exception:
+        log.error("preflight: validator crashed for task %s", task_id, exc_info=True)
+        return True  # never block chain on validator bug
+    if not vr.valid:
+        log.warning(
+            "preflight: pm result validation FAILED for task %s mode=%s errors=%d warnings=%d",
+            task_id, mode, len(vr.errors), len(vr.warnings),
+        )
+        return False
+    if vr.warnings:
+        log.info(
+            "preflight: pm result validation passed with %d warning(s) for %s",
+            len(vr.warnings), task_id,
+        )
+    return True
+
+
 def on_task_completed(conn, project_id, task_id, task_type, status, result, metadata):
     """Called by complete_task(). Dispatches next stage if gate passes.
 
@@ -2331,6 +2378,15 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
         return _dispatch_reconcile(conn, project_id, task_id, task_type, result, metadata)
     if task_type not in CHAIN:
         return None
+
+    # PR1d PRIMARY: pm result preflight validator — runs right after pm
+    # succeeds and BEFORE next-stage dispatch. Returns False to block dispatch
+    # when validator declares the PM payload invalid (e.g. missing
+    # removed_nodes / unmapped_files declarations on a delete-flavored PR).
+    if task_type == "pm":
+        if not _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
+            return {"preflight_blocked": True, "stage": "pm",
+                    "reason": "pm result preflight validation failed"}
 
     # PR1 PRIMARY: dev result preflight validator — runs right after dev
     # succeeds and BEFORE next-stage dispatch (_do_chain). Returns False to

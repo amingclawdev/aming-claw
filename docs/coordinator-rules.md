@@ -418,3 +418,76 @@ how (and why) to self-validate before submitting, and any phantom-create errors
 against PM-declared `removed_nodes` / `unmapped_files` will fail the checkpoint
 gate — preventing the late-chain reject loops that previously stalled OPT-BACKLOG
 chains for several stages before QA caught the drift.
+
+---
+
+## OPT-BACKLOG-PM-PRD-GRAPH-DECLARATIONS-MANDATORY: PM-Side Stage-Output Preflight Compliance (PR1d)
+
+**Added:** 2026-05-01 | **Source:** `agent/governance/output_schemas/pm_result_schema.py` (new validator); `agent/governance/auto_chain.py` (`_validate_pm_at_transition` + `on_task_completed` wiring); `agent/role_permissions.py` (PM role-prompt advisory); `docs/roles/pm.md` (`## Graph-delta declarations` section) | **Bug:** OPT-BACKLOG-PM-PRD-GRAPH-DECLARATIONS-MANDATORY
+
+### Background
+
+PR1c (commit `6003ee8`) wired PRD declarations through to the graph-delta
+auto-inferrer, but PR2 atomic-swap chains continued to phantom-reject because
+PM result payloads consistently came back with `removed_nodes=None` and
+`unmapped_files=None` across 6 verified attempts. The root cause: the PM role
+prompt in `agent/role_permissions.py` never mentioned these fields, so per-task
+prompt directives were unreliable. PR1d is the PM analogue of the PR1b dev fix:
+role-prompt advisory + role-spec doc update + a server-side FATAL validator
+wired into the post-PM transition.
+
+### Changes
+
+| Area | File | Change |
+|------|------|--------|
+| FATAL code | `agent/governance/output_schemas/error_codes.py` | New `MISSING_DECLARATION_FOR_DELETED_FILE` constant added to `FATAL_CODES`. |
+| PM validator | `agent/governance/output_schemas/pm_result_schema.py` | New module exposing `validate_pm_output(payload, chain_context, mode='warn')`. Detects `MISSING_DECLARATION_FOR_DELETED_FILE` via case-insensitive substring scan over `acceptance_criteria` for `delete`/`remove`/`replaces`/`replaced_by`. Reuses the dev-side `ValidationError` / `ValidationResult` dataclasses + `_apply_mode` so behavior matches the dev validator across `strict` / `warn` / `disabled` modes. |
+| Public API | `agent/governance/output_schemas/__init__.py` | `validate_pm_output` added alongside `validate_dev_output` in imports and `__all__`. |
+| Auto-chain wiring | `agent/governance/auto_chain.py` | New `_validate_pm_at_transition(conn, project_id, task_id, result, metadata)` mirrors `_validate_dev_at_transition` (env-var mode, `observer_emergency_bypass` short-circuit, best-effort chain_context fetch, validator-crash safety returning `True`). `on_task_completed` invokes it for `task_type == 'pm'` BEFORE the dev branch and emits `{"preflight_blocked": True, "stage": "pm", "reason": "pm result preflight validation failed"}` on failure. |
+| PM role prompt | `agent/role_permissions.py` | New "Output graph-delta declarations" advisory section in `_DEFAULT_ROLE_PROMPTS['pm']` placed between the existing "Important rules" bullets and the closing instruction line. Mentions `removed_nodes`, `unmapped_files`, `renamed_nodes`/`remapped_files`, and the delete-keyword trigger semantics. |
+| PM role doc | `docs/roles/pm.md` | New `## Graph-delta declarations (required when AC implies file changes)` section with a worked single-file-deletion example showing `{removed_nodes: ["L7.X"], unmapped_files: ["path/to/file.py"]}`. |
+| Test coverage | `agent/tests/test_pm_declarations_compliance.py` | Four tests: `test_pm_with_delete_ac_missing_declarations_fatal`, `test_pm_with_delete_ac_proper_declarations_pass`, `test_pm_with_no_delete_ac_declarations_optional`, `test_pm_validator_wired_into_auto_chain`. |
+
+### Trigger Semantics
+
+The keyword scan is **case-insensitive simple substring matching ONLY**:
+
+```python
+_DELETE_KEYWORDS = ("delete", "remove", "replaces", "replaced_by")
+# applied via str.lower() on each acceptance_criteria entry — no LLM, no
+# regex backreferences, no external service.
+```
+
+A PM payload trips `MISSING_DECLARATION_FOR_DELETED_FILE` when **all** of the
+following hold:
+
+1. `target_files` is a non-empty list, AND
+2. At least one `acceptance_criteria` entry contains a delete-keyword
+   (case-insensitive substring), AND
+3. Both `removed_nodes` and `unmapped_files` are empty/None.
+
+When the trigger fires under `mode='warn'` the validator emits a FATAL error
+(severity `error`), driving `valid=False` and `_validate_pm_at_transition`
+returning `False`, which causes `on_task_completed` to emit
+`preflight_blocked` instead of dispatching the dev stage.
+
+### Mode + Bypass Semantics
+
+Identical to the dev-side path:
+
+- `OPT_PREFLIGHT_VALIDATOR_MODE=warn` (default) — FATAL stays as error.
+- `OPT_PREFLIGHT_VALIDATOR_MODE=strict` — all errors stay as errors.
+- `OPT_PREFLIGHT_VALIDATOR_MODE=disabled` — short-circuit to `True` with a log line.
+- `metadata.observer_emergency_bypass=true` + `metadata.bypass_reason="<reason>"` —
+  short-circuit to `True` with a warning log line.
+- Validator internal exception → return `True` (never block chain on validator bug).
+
+### Coordinator Impact
+
+The coordinator itself is unaffected — it does not produce PRDs and does not
+run the preflight validator. The change reaches PM only. However, coordinator-
+dispatched PM tasks now receive a role prompt that explicitly instructs PM to
+declare `removed_nodes` / `unmapped_files` whenever AC implies file changes,
+and any PM payload that fails the new check will be blocked at the post-PM
+transition, preventing the downstream phantom-create reject loops that
+previously stalled PR2-style atomic-swap chains.
