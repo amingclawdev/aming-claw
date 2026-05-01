@@ -2379,22 +2379,17 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
     if task_type not in CHAIN:
         return None
 
-    # PR1d PM validator wiring DISABLED by MF-2026-05-01-001 (this commit).
-    # The MISSING_DECLARATION_FOR_DELETED_FILE check over-fires on ACs that
-    # mention 'remove'/'delete' as feature description (not file-deletion intent).
-    # PR1e (Rule J defense-in-depth: dev removes + filesystem fallback) was
-    # blocked by this validator on its own ACs.
-    # PM is a proposer not an executor — graph deletes happen at QA/merge/swap,
-    # not at PM. PM declarations are advisory, not mandatory. Auto-inferrer
-    # filtering should rely on dev's graph_delta.removes + filesystem truth
-    # (PR1e) + optional PM declaration hint (PR1c).
-    # _validate_pm_at_transition function retained for potential future use
-    # (e.g., narrower validator that uses filesystem-confirmed deletion intent).
-    # See OPT-BACKLOG-PM-VALIDATOR-OVERFIRES-ON-FEATURE-DESCRIPTION-KEYWORDS.
-    # if task_type == "pm":
-    #     if not _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
-    #         return {"preflight_blocked": True, "stage": "pm",
-    #                 "reason": "pm result preflight validation failed"}
+    # PR1f: PM validator wiring RESTORED. The PR1d delete-keyword substring
+    # scan that over-fired on feature-description ACs has been replaced with
+    # a structural-only validator (payload shape, AC list-of-strings,
+    # work-scope non-empty, proposed_nodes element shape, removed_nodes /
+    # unmapped_files type, no self-waiver). The new validator does not
+    # inspect natural-language AC content, so it is safe to wire — it cannot
+    # over-fire on PR1e-style "Rule J respects dev removes" ACs.
+    if task_type == "pm":
+        if not _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
+            return {"preflight_blocked": True, "stage": "pm",
+                    "reason": "pm result preflight validation failed"}
 
     # PR1 PRIMARY: dev result preflight validator — runs right after dev
     # succeeds and BEFORE next-stage dispatch (_do_chain). Returns False to

@@ -1,17 +1,33 @@
-"""PM-stage result preflight validator (PR1d).
+"""PM-stage result preflight validator (PR1f — structural-only).
 
 Validates a PM task's result payload BEFORE auto-chain advances to dev.
-Catches the missing-declaration case where the acceptance_criteria imply a
-file deletion (DELETE / remove / replaces / replaced_by keywords, case-
-insensitive substring scan) AND target_files is non-empty, but the PM
-result payload omits both removed_nodes and unmapped_files. This is the
-PM-side analogue of the dev-side phantom-create check: without the PM
-declarations, the dev-stage auto-inferrer cannot avoid emitting phantom
-creates against deleted nodes/files, which leads to chain bouncing.
+This validator is STRUCTURAL ONLY: it checks shape and types of the payload
+and never inspects the natural-language content of acceptance criteria. The
+prior PR1d substring scan for delete-keywords (DELETE / remove / replaces /
+replaced_by) was removed because it over-fired on ACs that mention those
+words as feature description rather than file-deletion intent (e.g.
+"Rule J respects dev removes", "_file_deleted_in_worktree"). PM is a
+proposer not an executor — graph deletes are enforced at QA/merge/swap,
+not at PM. PM declarations remain advisory hints for the auto-inferrer.
 
-Reuses the ValidationError / ValidationResult dataclasses from the dev
-result validator so call-sites (auto_chain._validate_pm_at_transition,
-__init__.py public API) consume a single shape.
+Structural checks (S1–S7):
+    S1  payload-not-dict                         → MALFORMED_JSON
+    S2  acceptance_criteria absent / not list /   → MISSING_REQUIRED_FIELD
+        empty
+    S3  any AC element is not a string            → MISSING_REQUIRED_FIELD
+    S4  empty work scope (target_files empty AND  → MISSING_REQUIRED_FIELD
+        proposed_nodes empty)
+    S5  any proposed_nodes element missing a      → MISSING_REQUIRED_FIELD
+        non-empty 'primary'
+    S6  removed_nodes / unmapped_files present    → MALFORMED_JSON
+        but not a list
+    S7  bypass_validations key present in payload → UNAUTHORIZED_SELF_WAIVER
+
+The validator still reads the optional 'prd' sub-dict as a fallback when
+top-level fields are absent or empty (legacy PM result shape).
+
+Reuses ValidationError / ValidationResult / _apply_mode from
+dev_result_schema so all call-sites consume a single shape.
 """
 from __future__ import annotations
 
@@ -26,30 +42,6 @@ from .dev_result_schema import (
     _apply_mode,
 )
 
-# Case-insensitive simple substring scan only — no LLM, no regex
-# backreferences, no external service. Each acceptance_criteria entry is
-# lowered and checked against this tuple of keywords. Verifiable by
-# inspection.
-_DELETE_KEYWORDS = ("delete", "remove", "replaces", "replaced_by")
-
-
-def _has_delete_keyword(acceptance_criteria: Any) -> bool:
-    """Return True iff any AC string contains a delete-keyword (case-insensitive)."""
-    if not acceptance_criteria:
-        return False
-    if isinstance(acceptance_criteria, str):
-        items: list[str] = [acceptance_criteria]
-    elif isinstance(acceptance_criteria, list):
-        items = [str(x) for x in acceptance_criteria if x is not None]
-    else:
-        return False
-    for ac in items:
-        lowered = ac.lower()
-        for kw in _DELETE_KEYWORDS:
-            if kw in lowered:
-                return True
-    return False
-
 
 def _is_empty_list(value: Any) -> bool:
     """True for None, [], or non-list values that should be treated as empty."""
@@ -63,74 +55,135 @@ def _is_empty_list(value: Any) -> bool:
 
 def validate_pm_output(payload: dict, chain_context: Any = None,
                        mode: str = "warn") -> ValidationResult:
-    """Validate a PM-stage result payload.
+    """Validate a PM-stage result payload (structural-only).
 
     Modes: 'strict' (errors stay as errors), 'warn' (FATAL stay, non-FATAL
     demoted to warnings), 'disabled' (everything demoted; valid=True).
 
-    Currently the only check is MISSING_DECLARATION_FOR_DELETED_FILE — this
-    is PM-side enforcement of the declarations contract described in
-    docs/roles/pm.md. Other structural checks (required fields, JSON shape)
-    are intentionally NOT duplicated here; they are enforced by the existing
-    _gate_post_pm. This validator focuses on the declarations gap that has
-    historically caused chain bouncing.
+    See module docstring for the S1–S7 structural checks. The validator
+    never inspects natural-language AC content; delete/remove/replaces
+    intent is now handled downstream by dev's graph_delta.removes plus
+    filesystem truth (PR1e) and the auto-inferrer's PRD-declaration hint
+    (PR1c).
     """
     errors: list[ValidationError] = []
+
+    # S1: payload must be a dict.
     if not isinstance(payload, dict):
         errors.append(ValidationError(
             error_codes.MALFORMED_JSON, "$",
             "payload is not a JSON object", "error"))
         return _apply_mode(errors, mode)
 
+    # S7: bypass_validations is a self-waiver attempt — block immediately.
+    if "bypass_validations" in payload:
+        errors.append(ValidationError(
+            error_codes.UNAUTHORIZED_SELF_WAIVER, "$.bypass_validations",
+            "pm role cannot self-waive validation; use observer_emergency_bypass",
+            "error",
+            suggested_fix=(
+                "remove bypass_validations; ask observer for emergency bypass"
+            ),
+        ))
+
     # PRD-shape support: PM result payloads sometimes wrap the declarations
     # under a 'prd' sub-dict (legacy shape). Read both top-level and
     # prd-nested forms; the first non-empty wins.
     prd = payload.get("prd") if isinstance(payload.get("prd"), dict) else {}
 
-    target_files = payload.get("target_files")
-    if _is_empty_list(target_files) and isinstance(prd, dict):
-        target_files = prd.get("target_files")
-
+    # S2: acceptance_criteria must be present, a list, and non-empty.
     acceptance_criteria = payload.get("acceptance_criteria")
     if _is_empty_list(acceptance_criteria) and isinstance(prd, dict):
-        acceptance_criteria = prd.get("acceptance_criteria")
+        prd_ac = prd.get("acceptance_criteria")
+        if not _is_empty_list(prd_ac):
+            acceptance_criteria = prd_ac
 
-    removed_nodes = payload.get("removed_nodes")
-    if _is_empty_list(removed_nodes) and isinstance(prd, dict):
-        removed_nodes = prd.get("removed_nodes")
+    if acceptance_criteria is None:
+        errors.append(ValidationError(
+            error_codes.MISSING_REQUIRED_FIELD, "$.acceptance_criteria",
+            "missing required field 'acceptance_criteria'", "error"))
+    elif not isinstance(acceptance_criteria, list):
+        errors.append(ValidationError(
+            error_codes.MISSING_REQUIRED_FIELD, "$.acceptance_criteria",
+            "acceptance_criteria must be a list of strings", "error"))
+    elif len(acceptance_criteria) == 0:
+        errors.append(ValidationError(
+            error_codes.MISSING_REQUIRED_FIELD, "$.acceptance_criteria",
+            "acceptance_criteria must be non-empty", "error"))
+    else:
+        # S3: every AC element must be a string.
+        for i, ac in enumerate(acceptance_criteria):
+            if not isinstance(ac, str):
+                errors.append(ValidationError(
+                    error_codes.MISSING_REQUIRED_FIELD,
+                    f"$.acceptance_criteria[{i}]",
+                    "acceptance_criteria element is not a string",
+                    "error"))
 
-    unmapped_files = payload.get("unmapped_files")
-    if _is_empty_list(unmapped_files) and isinstance(prd, dict):
-        unmapped_files = prd.get("unmapped_files")
+    # S4: work scope — at least one of target_files / proposed_nodes is
+    # non-empty (read from prd as fallback).
+    target_files = payload.get("target_files")
+    if _is_empty_list(target_files) and isinstance(prd, dict):
+        prd_tf = prd.get("target_files")
+        if not _is_empty_list(prd_tf):
+            target_files = prd_tf
+
+    proposed_nodes = payload.get("proposed_nodes")
+    if _is_empty_list(proposed_nodes) and isinstance(prd, dict):
+        prd_pn = prd.get("proposed_nodes")
+        if not _is_empty_list(prd_pn):
+            proposed_nodes = prd_pn
 
     has_target_files = (
         isinstance(target_files, list) and len(target_files) > 0
     )
-    has_delete_kw = _has_delete_keyword(acceptance_criteria)
-    declarations_empty = (
-        _is_empty_list(removed_nodes) and _is_empty_list(unmapped_files)
+    has_proposed_nodes = (
+        isinstance(proposed_nodes, list) and len(proposed_nodes) > 0
     )
-
-    if has_target_files and has_delete_kw and declarations_empty:
+    if not has_target_files and not has_proposed_nodes:
         errors.append(ValidationError(
-            error_codes.MISSING_DECLARATION_FOR_DELETED_FILE,
-            "$.removed_nodes",
+            error_codes.MISSING_REQUIRED_FIELD, "$.target_files",
             (
-                "acceptance_criteria imply file deletion "
-                "(DELETE/remove/replaces/replaced_by) and target_files is "
-                "non-empty, but both removed_nodes and unmapped_files are "
-                "empty. PM must declare which graph nodes will be removed "
-                "and which files will be unmapped so the dev-stage auto-"
-                "inferrer does not emit phantom creates."
+                "PM work scope is empty: both target_files and "
+                "proposed_nodes are absent or empty. PM must declare at "
+                "least one target_file or proposed_node so the dev stage "
+                "has a concrete scope."
             ),
             "error",
             suggested_fix=(
-                "Populate removed_nodes (list of node_ids being deleted) "
-                "and/or unmapped_files (list of file paths whose owning "
-                "nodes should be unmapped). See "
-                "docs/roles/pm.md '## Graph-delta declarations'."
+                "populate target_files (list of file paths the dev stage "
+                "will modify) and/or proposed_nodes (list of new graph "
+                "nodes) in the PM result payload."
             ),
         ))
+
+    # S5: every proposed_nodes element must have a non-empty 'primary'.
+    if isinstance(proposed_nodes, list):
+        for i, n in enumerate(proposed_nodes):
+            if not isinstance(n, dict):
+                errors.append(ValidationError(
+                    error_codes.MISSING_REQUIRED_FIELD,
+                    f"$.proposed_nodes[{i}]",
+                    "proposed_nodes element is not an object",
+                    "error"))
+                continue
+            primary = n.get("primary")
+            if not (isinstance(primary, str) and primary.strip()):
+                errors.append(ValidationError(
+                    error_codes.MISSING_REQUIRED_FIELD,
+                    f"$.proposed_nodes[{i}].primary",
+                    "proposed_nodes element missing non-empty 'primary'",
+                    "error"))
+
+    # S6: removed_nodes / unmapped_files MUST be lists when present.
+    for fld in ("removed_nodes", "unmapped_files"):
+        val = payload.get(fld)
+        if val is None and isinstance(prd, dict):
+            val = prd.get(fld)
+        if val is not None and not isinstance(val, list):
+            errors.append(ValidationError(
+                error_codes.MALFORMED_JSON, f"$.{fld}",
+                f"'{fld}' must be a list when present", "error"))
 
     return _apply_mode(errors, mode)
 

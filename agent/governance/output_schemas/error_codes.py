@@ -14,10 +14,12 @@ UNSUPPORTED_SCHEMA_VERSION = "UNSUPPORTED_SCHEMA_VERSION"
 UNAUTHORIZED_SELF_WAIVER = "UNAUTHORIZED_SELF_WAIVER"
 PHANTOM_CREATE_FOR_DECLARED_REMOVED = "PHANTOM_CREATE_FOR_DECLARED_REMOVED"
 PHANTOM_CREATE_FOR_UNMAPPED_FILE = "PHANTOM_CREATE_FOR_UNMAPPED_FILE"
-# PR1d: PM-side declaration enforcement. PM tasks whose acceptance_criteria
-# contain delete-keywords (DELETE/remove/replaces/replaced_by) AND target_files
-# is non-empty AND both removed_nodes and unmapped_files are empty/None are
-# blocked at the post-PM transition.
+# PR1d / PR1f: PM-side declaration enforcement. The constant is retained for
+# backward compatibility (existing tests / docs reference the name and any
+# legacy emitter paths can still raise it), but PR1f demoted the code OUT of
+# FATAL_CODES — PM is a proposer, not an executor; declarations are advisory.
+# Filtering of phantom creates relies on dev's graph_delta.removes plus
+# filesystem truth (PR1e) and the auto-inferrer's PRD-declaration hint (PR1c).
 MISSING_DECLARATION_FOR_DELETED_FILE = "MISSING_DECLARATION_FOR_DELETED_FILE"
 
 # Warning codes — only CREATE_NOT_IN_PROPOSED_NODES is demoted to a warning
@@ -36,5 +38,4 @@ FATAL_CODES = frozenset({
     UNAUTHORIZED_SELF_WAIVER,
     PHANTOM_CREATE_FOR_DECLARED_REMOVED,
     PHANTOM_CREATE_FOR_UNMAPPED_FILE,
-    MISSING_DECLARATION_FOR_DELETED_FILE,
 })

@@ -1,11 +1,13 @@
-"""Tests for the PR1d PM-stage preflight validator (output_schemas).
+"""Tests for the PR1f PM-stage preflight validator (output_schemas).
 
-Covers the MISSING_DECLARATION_FOR_DELETED_FILE check + the
-_validate_pm_at_transition wiring inside auto_chain.
+PR1f rewrote the validator to be STRUCTURAL ONLY. The prior PR1d
+delete-keyword substring scan was deleted because it over-fired on
+feature-description ACs (e.g. "Rule J respects dev removes"). These tests
+cover the new S1–S7 structural checks. All tests use mode='warn' to match
+production wiring (FATAL codes still drive valid=False, non-FATAL demote
+to warnings).
 """
 from __future__ import annotations
-
-import os
 
 from agent.governance.output_schemas import (
     error_codes,
@@ -14,145 +16,176 @@ from agent.governance.output_schemas import (
 
 
 # --------------------------------------------------------------------------- #
-# Validator unit tests                                                        #
+# Structural FATAL checks (S1 – S7)                                           #
 # --------------------------------------------------------------------------- #
 
-def test_pm_with_delete_ac_missing_declarations_fatal():
-    """target_files non-empty + delete-keyword AC + empty declarations → FATAL.
+def test_payload_not_dict_fatal():
+    """S1: payload is not a JSON object → MALFORMED_JSON FATAL."""
+    res = validate_pm_output("not a dict", None, mode="warn")  # type: ignore[arg-type]
+    assert res.valid is False
+    assert any(e.code == error_codes.MALFORMED_JSON for e in res.errors)
 
-    Under mode='warn' the new code MUST stay as an error (FATAL_CODES) and
-    drive valid=False, mirroring the dev-side phantom-create FATAL behavior.
-    """
+
+def test_missing_acceptance_criteria_fatal():
+    """S2: acceptance_criteria absent → MISSING_REQUIRED_FIELD FATAL."""
     payload = {
         "target_files": ["x.py"],
-        "acceptance_criteria": ["DELETE the legacy module"],
-        "removed_nodes": [],
-        "unmapped_files": [],
+        # acceptance_criteria intentionally absent
     }
     res = validate_pm_output(payload, None, mode="warn")
     assert res.valid is False
-    err_codes = [e.code for e in res.errors]
-    assert error_codes.MISSING_DECLARATION_FOR_DELETED_FILE in err_codes
-    # Severity must be 'error' (FATAL stays an error in warn mode).
-    matching = [e for e in res.errors
-                if e.code == error_codes.MISSING_DECLARATION_FOR_DELETED_FILE]
-    assert matching, "expected at least one MISSING_DECLARATION_FOR_DELETED_FILE error"
-    assert all(e.severity == "error" for e in matching)
-    # suggested_fix should be set so PM gets a useful retry hint.
-    assert all(e.suggested_fix for e in matching)
+    err = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "acceptance_criteria" in e.field_path]
+    assert err, f"expected MISSING_REQUIRED_FIELD on acceptance_criteria; got {res.errors}"
 
 
-def test_pm_with_delete_ac_proper_declarations_pass():
-    """delete-keyword AC + populated declarations → valid=True."""
-    # Case A: removed_nodes populated.
-    payload_a = {
-        "target_files": ["agent/legacy/old.py"],
-        "acceptance_criteria": ["DELETE agent/legacy/old.py"],
-        "removed_nodes": ["L7.21"],
-        "unmapped_files": [],
-    }
-    res_a = validate_pm_output(payload_a, None, mode="warn")
-    assert res_a.valid is True
-    assert all(
-        e.code != error_codes.MISSING_DECLARATION_FOR_DELETED_FILE
-        for e in res_a.errors
-    )
-
-    # Case B: only unmapped_files populated.
-    payload_b = {
-        "target_files": ["agent/legacy/old.py"],
-        "acceptance_criteria": ["remove agent/legacy/old.py"],
-        "removed_nodes": [],
-        "unmapped_files": ["agent/legacy/old.py"],
-    }
-    res_b = validate_pm_output(payload_b, None, mode="warn")
-    assert res_b.valid is True
-    assert all(
-        e.code != error_codes.MISSING_DECLARATION_FOR_DELETED_FILE
-        for e in res_b.errors
-    )
-
-    # Case C: replaced_by keyword.
-    payload_c = {
-        "target_files": ["agent/legacy/old.py"],
-        "acceptance_criteria": [
-            "module replaced_by agent/new/replacement.py"
-        ],
-        "removed_nodes": ["L7.99"],
-        "unmapped_files": [],
-    }
-    res_c = validate_pm_output(payload_c, None, mode="warn")
-    assert res_c.valid is True
-
-
-def test_pm_with_no_delete_ac_declarations_optional():
-    """No delete keywords in AC → declarations not required, valid=True."""
+def test_empty_acceptance_criteria_fatal():
+    """S2: acceptance_criteria=[] → MISSING_REQUIRED_FIELD FATAL."""
     payload = {
-        "target_files": ["agent/governance/new_feature.py"],
-        "acceptance_criteria": [
-            "add new feature",
-            "all existing tests still pass",
-            "verification command exits zero",
-        ],
-        "removed_nodes": [],
-        "unmapped_files": [],
+        "target_files": ["x.py"],
+        "acceptance_criteria": [],
     }
     res = validate_pm_output(payload, None, mode="warn")
-    assert res.valid is True
-    assert all(
-        e.code != error_codes.MISSING_DECLARATION_FOR_DELETED_FILE
-        for e in res.errors
-    )
+    assert res.valid is False
+    err = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "acceptance_criteria" in e.field_path]
+    assert err
 
-    # Also verify case-insensitivity: substrings 'DELETE'/'delete' both trip
-    # the keyword scan, but a plain word like 'add' / 'enhance' / 'wire' must
-    # NOT trip it (negative case for the case-insensitive scan logic).
-    payload_neg = {
+
+def test_acceptance_criteria_non_string_element_fatal():
+    """S3: any AC element is not a string → MISSING_REQUIRED_FIELD FATAL."""
+    payload = {
         "target_files": ["x.py"],
-        "acceptance_criteria": ["enhance the parser", "wire new flag"],
-        "removed_nodes": [],
-        "unmapped_files": [],
+        "acceptance_criteria": ["valid AC", 42, {"oops": True}],
     }
-    res_neg = validate_pm_output(payload_neg, None, mode="warn")
-    assert res_neg.valid is True
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False
+    bad_paths = [e.field_path for e in res.errors
+                 if e.code == error_codes.MISSING_REQUIRED_FIELD
+                 and "acceptance_criteria[" in e.field_path]
+    assert bad_paths, f"expected per-element MISSING_REQUIRED_FIELD errors; got {res.errors}"
+
+
+def test_empty_work_scope_fatal():
+    """S4: target_files empty AND proposed_nodes empty → MISSING_REQUIRED_FIELD FATAL."""
+    payload = {
+        "target_files": [],
+        "proposed_nodes": [],
+        "acceptance_criteria": ["do something"],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False
+    err = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "target_files" in e.field_path]
+    assert err
+
+
+def test_proposed_node_missing_primary_fatal():
+    """S5: proposed_nodes element missing non-empty primary → MISSING_REQUIRED_FIELD FATAL."""
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "proposed_nodes": [
+            {"node_id": "L7.1", "primary": "agent/foo.py"},
+            {"node_id": "L7.2"},  # missing primary
+            {"node_id": "L7.3", "primary": ""},  # empty primary
+        ],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False
+    bad = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "proposed_nodes[" in e.field_path
+           and "primary" in e.field_path]
+    assert len(bad) >= 2, f"expected >=2 missing-primary errors; got {res.errors}"
+
+
+def test_removed_nodes_wrong_type_fatal():
+    """S6: removed_nodes present but not a list → MALFORMED_JSON FATAL."""
+    payload = {
+        "target_files": ["x.py"],
+        "acceptance_criteria": ["AC1"],
+        "removed_nodes": "L7.1",  # string instead of list
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False
+    err = [e for e in res.errors
+           if e.code == error_codes.MALFORMED_JSON
+           and "removed_nodes" in e.field_path]
+    assert err
+
+
+def test_unmapped_files_wrong_type_fatal():
+    """S6: unmapped_files present but not a list → MALFORMED_JSON FATAL."""
+    payload = {
+        "target_files": ["x.py"],
+        "acceptance_criteria": ["AC1"],
+        "unmapped_files": {"oops": True},  # dict instead of list
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False
+    err = [e for e in res.errors
+           if e.code == error_codes.MALFORMED_JSON
+           and "unmapped_files" in e.field_path]
+    assert err
+
+
+def test_bypass_validations_self_waiver_fatal():
+    """S7: bypass_validations key present → UNAUTHORIZED_SELF_WAIVER FATAL."""
+    payload = {
+        "target_files": ["x.py"],
+        "acceptance_criteria": ["AC1"],
+        "bypass_validations": True,
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is False
+    assert any(e.code == error_codes.UNAUTHORIZED_SELF_WAIVER for e in res.errors)
 
 
 # --------------------------------------------------------------------------- #
-# Auto-chain wiring                                                           #
+# Happy paths                                                                 #
 # --------------------------------------------------------------------------- #
 
-def test_pm_validator_wired_into_auto_chain():
-    """_validate_pm_at_transition is importable and blocks bad PM output.
-
-    Calls the function with a stub conn=None and a payload that should fail
-    the validator (delete-keyword AC + empty declarations). Asserts the
-    function returns False so that on_task_completed will emit the
-    preflight_blocked dict instead of dispatching the dev stage.
-    """
-    # Force warn mode so the FATAL code surfaces (matches default).
-    os.environ["OPT_PREFLIGHT_VALIDATOR_MODE"] = "warn"
-    try:
-        from agent.governance.auto_chain import _validate_pm_at_transition
-    finally:
-        # Don't pollute later tests' env if import side-effected anything.
-        pass
-
-    bad_payload = {
-        "target_files": ["agent/legacy/old.py"],
-        "acceptance_criteria": ["DELETE agent/legacy/old.py"],
-        "removed_nodes": [],
-        "unmapped_files": [],
+def test_valid_minimal_pm_output_passes():
+    """Smallest legal payload — single AC + single target_file — passes."""
+    payload = {
+        "target_files": ["agent/foo.py"],
+        "acceptance_criteria": ["AC1: implement foo"],
     }
-    # observer_emergency_bypass off — must NOT short-circuit to True.
-    metadata = {}
-    result = _validate_pm_at_transition(
-        conn=None,
-        project_id="aming-claw",
-        task_id="task-test-pm-validator",
-        result=bad_payload,
-        metadata=metadata,
-    )
-    assert result is False, (
-        "expected _validate_pm_at_transition to return False for a payload "
-        "missing declarations; got True instead"
-    )
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is True, f"expected valid; got errors={res.errors}"
+
+
+def test_valid_full_pm_output_passes():
+    """Realistic payload with all optional fields populated structurally."""
+    payload = {
+        "target_files": ["agent/governance/foo.py"],
+        "acceptance_criteria": [
+            "AC1: feature works",
+            "AC2: tests pass",
+            "AC3: docs updated",
+        ],
+        "proposed_nodes": [
+            {"node_id": "L7.1", "primary": "agent/governance/foo.py"},
+            {"primary": "agent/governance/bar.py"},  # PM-as-proposer (no id)
+        ],
+        "removed_nodes": ["L7.21"],
+        "unmapped_files": ["agent/legacy/old.py"],
+        "verification": {"method": "pytest", "command": "pytest -v"},
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is True, f"expected valid; got errors={res.errors}"
+
+
+def test_valid_prd_fallback_passes():
+    """PRD sub-dict supplies acceptance_criteria + target_files — must pass."""
+    payload = {
+        "prd": {
+            "target_files": ["agent/foo.py"],
+            "acceptance_criteria": ["AC1: implement foo"],
+        },
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is True, f"expected valid via prd fallback; got {res.errors}"
