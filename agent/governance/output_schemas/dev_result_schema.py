@@ -107,6 +107,55 @@ def _proposed_node_ids(proposed_nodes: list) -> set:
     return ids
 
 
+def _pm_has_concrete_id_for_primary(proposed_nodes: list, primary: str) -> bool:
+    """Return True iff PM proposed_nodes contains an entry whose 'primary'
+    matches `primary` AND its id field is a non-empty string.
+
+    PM is a proposer not an ID allocator — it routinely emits proposed_nodes
+    with id=None or id='' for new files. When PM has no concrete id for a
+    given primary, dev's empty node_id is acceptable (auto-inferrer Rule H
+    handles allocation downstream); EMPTY_NODE_ID is then demoted to
+    CREATE_NOT_IN_PROPOSED_NODES (warning).
+
+    Accepts dict-shaped proposed_nodes only (string entries don't carry a
+    primary). The id field is checked under both 'node_id' and 'id' keys.
+    """
+    if not primary or not isinstance(proposed_nodes, list):
+        return False
+    for n in proposed_nodes:
+        if not isinstance(n, dict):
+            continue
+        if n.get("primary") != primary:
+            continue
+        nid = n.get("node_id")
+        if nid is None:
+            nid = n.get("id")
+        if isinstance(nid, str) and nid.strip():
+            return True
+    return False
+
+
+def _pm_stage_present(chain_context: Any) -> bool:
+    """True iff chain_context contains an identifiable PM stage entry."""
+    if chain_context is None:
+        return False
+    if isinstance(chain_context, dict):
+        stages = chain_context.get("stages")
+        if isinstance(stages, list):
+            for s in stages:
+                if isinstance(s, dict) and s.get("type") == "pm":
+                    return True
+        elif isinstance(stages, dict):
+            return isinstance(stages.get("pm"), dict)
+        return False
+    stages = getattr(chain_context, "stages", None)
+    if isinstance(stages, dict):
+        for s in stages.values():
+            if getattr(s, "task_type", None) == "pm":
+                return True
+    return False
+
+
 def validate_dev_output(payload: dict, chain_context: Any = None,
                         mode: str = "warn") -> ValidationResult:
     """Validate a dev-stage result payload.
@@ -145,16 +194,47 @@ def validate_dev_output(payload: dict, chain_context: Any = None,
     if not isinstance(creates, list):
         creates = []
 
+    pm_decl = _pm_decl_from_context(chain_context)
+    pm_proposed_nodes = pm_decl.get("proposed_nodes", [])
+    pm_present = _pm_stage_present(chain_context)
+
     parent_layer_types = set()
     for i, c in enumerate(creates):
         if not isinstance(c, dict):
             continue
         nid = c.get("node_id", "")
         if not (isinstance(nid, str) and nid.strip()):
-            errors.append(ValidationError(
-                error_codes.EMPTY_NODE_ID,
-                f"$.graph_delta.creates[{i}].node_id",
-                "creates[].node_id is empty", "error"))
+            # PR1f chain-context-aware demotion: when PM stage exists in the
+            # chain_context but it has no concrete id for this create's
+            # primary path, PM was acting as a proposer (id=None/'' or
+            # missing entry). The dev passing through with node_id='' is
+            # then acceptable — auto-inferrer Rule H allocates the id
+            # downstream. Demote to non-FATAL CREATE_NOT_IN_PROPOSED_NODES.
+            # Keep EMPTY_NODE_ID FATAL when chain_context is None, the PM
+            # stage is absent, OR PM had a concrete id for this primary
+            # (anti-regression: protects against silently dropping a
+            # PM-allocated id).
+            primary = c.get("primary", "") if isinstance(c.get("primary", ""), str) else ""
+            pm_has_concrete = _pm_has_concrete_id_for_primary(
+                pm_proposed_nodes, primary
+            )
+            if pm_present and not pm_has_concrete:
+                errors.append(ValidationError(
+                    error_codes.CREATE_NOT_IN_PROPOSED_NODES,
+                    f"$.graph_delta.creates[{i}].node_id",
+                    (
+                        "creates[].node_id is empty and PM did not allocate "
+                        "a concrete id for primary "
+                        f"'{primary}' (PM acted as proposer); "
+                        "auto-inferrer Rule H will assign downstream"
+                    ),
+                    "error",
+                ))
+            else:
+                errors.append(ValidationError(
+                    error_codes.EMPTY_NODE_ID,
+                    f"$.graph_delta.creates[{i}].node_id",
+                    "creates[].node_id is empty", "error"))
         pl = c.get("parent_layer")
         if pl is not None:
             parent_layer_types.add(type(pl).__name__)
@@ -167,8 +247,7 @@ def validate_dev_output(payload: dict, chain_context: Any = None,
             "error",
             suggested_fix="use a single consistent type for parent_layer across all creates"))
 
-    pm_decl = _pm_decl_from_context(chain_context)
-    proposed_ids = _proposed_node_ids(pm_decl.get("proposed_nodes", []))
+    proposed_ids = _proposed_node_ids(pm_proposed_nodes)
     removed = set(pm_decl.get("removed_nodes", []) or [])
     unmapped = set(pm_decl.get("unmapped_files", []) or [])
     if proposed_ids or removed or unmapped:

@@ -169,6 +169,72 @@ def test_happy_path_valid():
     assert isinstance(res.to_human_readable(), str)
 
 
+def test_empty_node_id_demoted_when_pm_also_empty():
+    """PR1f: dev node_id='' demoted to CREATE_NOT_IN_PROPOSED_NODES warning
+    when PM proposed_nodes also has no concrete id for the same primary.
+
+    PM is a proposer, not an ID allocator — when PM emits proposed_nodes
+    with id=None for a primary, dev passing through with node_id='' is
+    acceptable; auto-inferrer Rule H assigns the id downstream.
+    """
+    ctx = _pm_context(proposed_nodes=[
+        {"node_id": None, "primary": "agent/governance/new_feature.py"},
+    ])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {"node_id": "", "primary": "agent/governance/new_feature.py",
+             "parent_layer": "L7"}
+        ]
+    })
+    res = validate_dev_output(payload, ctx, mode="warn")
+    assert res.valid is True, (
+        f"expected valid=True with EMPTY_NODE_ID demoted; got errors={res.errors}"
+    )
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.EMPTY_NODE_ID not in err_codes
+    warn_codes = [w.code for w in res.warnings]
+    assert error_codes.CREATE_NOT_IN_PROPOSED_NODES in warn_codes, (
+        f"expected CREATE_NOT_IN_PROPOSED_NODES warning; got warnings={res.warnings}"
+    )
+
+
+def test_empty_node_id_fatal_when_pm_has_concrete_id():
+    """PR1f anti-regression: dev node_id='' STAYS FATAL when PM had a
+    concrete id for the same primary — protects against dev silently
+    dropping a PM-allocated id."""
+    ctx = _pm_context(proposed_nodes=[
+        {"node_id": "L7.99", "primary": "agent/governance/new_feature.py"},
+    ])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {"node_id": "", "primary": "agent/governance/new_feature.py",
+             "parent_layer": "L7"}
+        ]
+    })
+    res = validate_dev_output(payload, ctx, mode="warn")
+    assert res.valid is False
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.EMPTY_NODE_ID in err_codes
+
+
+def test_empty_node_id_fatal_when_no_pm_context():
+    """PR1f anti-regression: chain_context=None → EMPTY_NODE_ID stays FATAL.
+
+    Without a PM stage in chain_context, the validator cannot tell whether
+    PM acted as a proposer; safest behaviour is to keep EMPTY_NODE_ID FATAL.
+    """
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {"node_id": "", "primary": "agent/governance/new_feature.py",
+             "parent_layer": "L7"}
+        ]
+    })
+    res = validate_dev_output(payload, None, mode="warn")
+    assert res.valid is False
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.EMPTY_NODE_ID in err_codes
+
+
 def test_observer_emergency_bypass_demotes():
     """mode='disabled' should empty errors and set valid=True."""
     payload = _base_payload(
