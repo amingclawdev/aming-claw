@@ -17,8 +17,7 @@ Structural checks (S1–S7):
     S3  any AC element is not a string            → MISSING_REQUIRED_FIELD
     S4  empty work scope (target_files empty AND  → MISSING_REQUIRED_FIELD
         proposed_nodes empty)
-    S5  any proposed_nodes element missing a      → MISSING_REQUIRED_FIELD
-        non-empty 'primary'
+    S5  any proposed_nodes element missing a non-empty 'primary' (list[str] or non-empty str)
     S6  removed_nodes / unmapped_files present    → MALFORMED_JSON
         but not a list
     S7  bypass_validations key present in payload → UNAUTHORIZED_SELF_WAIVER
@@ -168,12 +167,23 @@ def validate_pm_output(payload: dict, chain_context: Any = None,
                     "error"))
                 continue
             primary = n.get("primary")
-            if not (isinstance(primary, str) and primary.strip()):
+            primary_valid = False
+            if isinstance(primary, list):
+                if primary and all(isinstance(p, str) and p.strip() for p in primary):
+                    primary_valid = True
+            elif isinstance(primary, str) and primary.strip():
+                primary_valid = True
+            if not primary_valid:
                 errors.append(ValidationError(
                     error_codes.MISSING_REQUIRED_FIELD,
                     f"$.proposed_nodes[{i}].primary",
-                    "proposed_nodes element missing non-empty 'primary'",
-                    "error"))
+                    "proposed_nodes element missing non-empty 'primary' (list[str] or non-empty str)",
+                    "error",
+                    suggested_fix=(
+                        "set 'primary' to a list of file paths "
+                        "(e.g. ['agent/foo.py']) or a non-empty string"
+                    ),
+                ))
 
     # S6: removed_nodes / unmapped_files MUST be lists when present.
     for fld in ("removed_nodes", "unmapped_files"):
