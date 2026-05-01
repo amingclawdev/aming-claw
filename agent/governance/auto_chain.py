@@ -533,6 +533,22 @@ def _is_dev_doc(path):
     return _is_dev_note(normalized)
 
 
+def _file_deleted_in_worktree(file_path, dev_result_ctx):
+    """PR1e: Return True iff the given file_path no longer exists on the filesystem.
+
+    Defensive: returns False on any exception so unknown-state files default to
+    current Rule J behavior (i.e. keep firing). The dev_result_ctx parameter is
+    accepted (and currently unused) so callers can later thread workspace info
+    without changing the signature.
+    """
+    try:
+        if not file_path:
+            return False
+        return not os.path.exists(file_path)
+    except Exception:
+        return False
+
+
 def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_declarations=None):
     """Infer graph_delta from PM proposed_nodes + dev changed_files.
 
@@ -947,19 +963,57 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
             inferred_from.append("test_file_binding")
 
     # -- Rule J: src modules --
-    # MF-2026-04-29-001: filter declared_files (completes 13a2060's PRD-declarations
-    # framework which missed Rule J). Without this, deleting a graph-bound file
-    # triggers phantom new-L7-node create from Rule J's fuzzy match fallback.
-    # PR1c: the prd_declarations parameter must be supplied by the caller
-    # _emit_or_infer_graph_delta for this filter to be effective; otherwise
-    # declared_files/declared_removed_ids degenerate to empty sets (no-op).
+    # Rule J fuzzy-matches changed source files to existing graph nodes (via
+    # secondary_bind) or proposes new L7 nodes. Defense-in-depth: skip files
+    # that any of THREE truth sources say should not produce phantom creates:
+    #   1. PM declarations (PR1c / MF-2026-04-29-001) — declared_files set,
+    #      derived from prd_declarations.unmapped_files / .remapped_files. If the
+    #      prd_declarations kwarg is missing, declared_files degenerates to empty.
+    #   2. dev_delta.removes (PR1e) — dev_removes_primaries set, computed by
+    #      resolving each removed node_id via _load_ij_graph().get_node().primary.
+    #      Authoritative even when PM forgot to declare the deletion.
+    #   3. Filesystem truth (PR1e) — _file_deleted_in_worktree() checks
+    #      os.path.exists; if the file is gone from the worktree, no real module
+    #      exists to bind, so Rule J must skip it.
+    # All three filter clauses are AND-conjuncted to the existing predicate —
+    # they strictly NARROW the set, never widen it.
     _src_module_re = re.compile(r"^agent/.*\.py$")
+
+    # PR1e: build dev_removes_primaries set from dev_delta.removes (if any).
+    # Each entry may be a string node_id or a {'node_id': '...'} dict; look the
+    # node up in the graph and extract its `primary` field (str or list).
+    dev_removes_primaries = set()
+    if dev_delta and isinstance(dev_delta, dict):
+        graph_for_lookup = _load_ij_graph()
+        for entry in dev_delta.get("removes", []) or []:
+            if isinstance(entry, str):
+                nid = entry
+            elif isinstance(entry, dict):
+                nid = entry.get("node_id", "")
+            else:
+                nid = ""
+            if not nid or graph_for_lookup is None:
+                continue
+            try:
+                nd = graph_for_lookup.get_node(nid)
+                np = nd.get("primary", []) if isinstance(nd, dict) else []
+                if isinstance(np, str):
+                    np = [np]
+                for p in np:
+                    if isinstance(p, str) and p:
+                        dev_removes_primaries.add(p.replace("\\", "/"))
+            except Exception:
+                # Missing-node tolerance: silently continue (AC8)
+                continue
+
     unbound_src = [
         f for f in changed_set
         if _src_module_re.match(f)
         and not f.startswith("agent/tests/")
         and f not in _rule_ij_covered
         and f.replace("\\", "/") not in declared_files  # MF-2026-04-29-001: respect PM declarations
+        and f.replace("\\", "/") not in dev_removes_primaries  # PR1e: respect dev_delta.removes
+        and not _file_deleted_in_worktree(f, dev_result)  # PR1e: respect filesystem truth
         # Also skip files already touched by Rule D
     ]
     # Filter out files already in Rule D updates' primary
