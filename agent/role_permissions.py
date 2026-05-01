@@ -248,6 +248,15 @@ Important rules:
 - Gateway files are under agent/telegram_gateway/
 - Tests are under agent/tests/
 - Read at most 3-5 key files to understand the change scope, then output your PRD
+
+Output graph-delta declarations (required when AC implies file changes):
+- When acceptance_criteria contains delete-keywords (DELETE, remove, replaces, replaced_by — case-insensitive substring match) AND target_files is non-empty, you MUST populate the graph-delta declaration fields in your PRD output:
+  - removed_nodes: list of acceptance-graph node_ids that will be deleted (e.g. ["L7.21"])
+  - unmapped_files: list of file paths whose owning nodes should be unmapped/removed (e.g. ["agent/legacy/old.py"])
+  - renamed_nodes: optional list of {"from": "L7.X", "to": "L7.Y"} when nodes are being renamed
+  - remapped_files: optional list of {"from": "old/path.py", "to": "new/path.py"} when files move
+- Server-side enforcement: post-PM transition validates PM output. PM tasks whose acceptance_criteria contain delete-keywords AND non-empty target_files but empty removed_nodes AND empty unmapped_files will be blocked at the gate with MISSING_DECLARATION_FOR_DELETED_FILE.
+- These declarations flow to dev so the auto-inferrer can avoid emitting phantom creates for nodes/files PM marked as removed/unmapped.
 - The exact output format is specified in the task prompt below — follow it precisely""",
 
     "coordinator": """You are the project Coordinator — the central decision-making role.
@@ -483,6 +492,15 @@ def _initialize():
         dev_prompt = prompts.get("dev")
         if dev_prompt and "validate_stage_output" not in dev_prompt:
             prompts["dev"] = _DEFAULT_ROLE_PROMPTS["dev"]
+        # PR1d: same pattern for the PM prompt — if a stale YAML config
+        # for pm lacks the graph-delta declarations advisory marker, fall
+        # back to the Python default that has it. This guarantees the live
+        # runtime prompt (ROLE_PROMPTS["pm"]) carries the declarations
+        # contract regardless of whether config/roles/default/pm.yaml has
+        # been re-synced.
+        pm_prompt = prompts.get("pm")
+        if pm_prompt and "graph-delta declarations" not in pm_prompt:
+            prompts["pm"] = _DEFAULT_ROLE_PROMPTS["pm"]
         return perms, prompts, verify
     return dict(_DEFAULT_ROLE_PERMISSIONS), dict(_DEFAULT_ROLE_PROMPTS), dict(_DEFAULT_ROLE_VERIFY_LIMITS)
 

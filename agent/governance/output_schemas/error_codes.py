@@ -14,6 +14,11 @@ UNSUPPORTED_SCHEMA_VERSION = "UNSUPPORTED_SCHEMA_VERSION"
 UNAUTHORIZED_SELF_WAIVER = "UNAUTHORIZED_SELF_WAIVER"
 PHANTOM_CREATE_FOR_DECLARED_REMOVED = "PHANTOM_CREATE_FOR_DECLARED_REMOVED"
 PHANTOM_CREATE_FOR_UNMAPPED_FILE = "PHANTOM_CREATE_FOR_UNMAPPED_FILE"
+# PR1d: PM-side declaration enforcement. PM tasks whose acceptance_criteria
+# contain delete-keywords (DELETE/remove/replaces/replaced_by) AND target_files
+# is non-empty AND both removed_nodes and unmapped_files are empty/None are
+# blocked at the post-PM transition.
+MISSING_DECLARATION_FOR_DELETED_FILE = "MISSING_DECLARATION_FOR_DELETED_FILE"
 
 # Warning codes — only CREATE_NOT_IN_PROPOSED_NODES is demoted to a warning
 # under mode='warn' (default). Intentional drift from PM proposed_nodes is
@@ -31,4 +36,5 @@ FATAL_CODES = frozenset({
     UNAUTHORIZED_SELF_WAIVER,
     PHANTOM_CREATE_FOR_DECLARED_REMOVED,
     PHANTOM_CREATE_FOR_UNMAPPED_FILE,
+    MISSING_DECLARATION_FOR_DELETED_FILE,
 })

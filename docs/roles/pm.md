@@ -48,6 +48,40 @@ The PM result MUST include these fields in the completion result. Missing any fi
 }
 ```
 
+## Graph-delta declarations (required when AC implies file changes)
+
+When the acceptance criteria contain delete-keywords (`DELETE`, `remove`, `replaces`, `replaced_by` — case-insensitive substring match) AND `target_files` is non-empty, the PM PRD MUST populate the graph-delta declaration fields. These declarations let the dev-stage graph-delta auto-inferrer avoid emitting phantom `creates` for nodes/files the PM marked as removed.
+
+### Fields
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `removed_nodes` | List of acceptance-graph node_ids the PR will delete | `["L7.21"]` |
+| `unmapped_files` | List of file paths whose owning nodes should be unmapped/removed | `["agent/legacy/old.py"]` |
+| `renamed_nodes` | Optional list of `{"from": "L7.X", "to": "L7.Y"}` for renamed nodes | `[{"from": "L7.5", "to": "L7.5b"}]` |
+| `remapped_files` | Optional list of `{"from": "old/path.py", "to": "new/path.py"}` for moved files | `[{"from": "agent/old.py", "to": "agent/new.py"}]` |
+
+### Worked example (single-file deletion PR)
+
+```json
+{
+  "target_files": ["agent/legacy/migration_state_machine.py"],
+  "acceptance_criteria": [
+    "DELETE agent/legacy/migration_state_machine.py",
+    "all imports of MigrationStateMachine removed"
+  ],
+  "verification": "python -m pytest agent/tests/test_migration_removal.py -v",
+  "removed_nodes": ["L7.21"],
+  "unmapped_files": ["agent/legacy/migration_state_machine.py"]
+}
+```
+
+### Server-side enforcement
+
+The post-PM transition runs `validate_pm_output` (see `agent/governance/output_schemas/pm_result_schema.py`). PM tasks whose `acceptance_criteria` contain `DELETE`/`remove`/`replaces`/`replaced_by` keywords AND non-empty `target_files` but empty `removed_nodes` AND empty `unmapped_files` are blocked at the gate with `MISSING_DECLARATION_FOR_DELETED_FILE`. The validator runs in `mode='warn'` by default (controlled by `OPT_PREFLIGHT_VALIDATOR_MODE`); observer emergency bypass via `metadata.observer_emergency_bypass` + `bypass_reason` short-circuits the check identically to the dev-side validator.
+
+The keyword scan is case-insensitive simple substring matching only (no LLM, no regex backreferences) — see the keyword tuple literal in `pm_result_schema.py`.
+
 ## Gate: `_gate_post_pm`
 
 After PM completes, auto-chain runs `_gate_post_pm` which checks:
