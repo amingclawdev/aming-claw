@@ -675,3 +675,19 @@ Failed phases retry up to their specified limits before escalating.
 | `reconcile_config.stalled_review_days` | 7 | Days before review auto-escalate |
 | `reconcile_config.scan_interval_minutes` | 30 | Drift detection scan frequency |
 | `reconcile_config.grace_period_minutes` | 10 | Ignore recently-modified nodes |
+
+---
+
+## §12 Symbol Reconcile — Cluster-Driven Graph Rebase Session
+
+_(Stub section — see proposal for full design.)_
+
+**Pointer**: [docs/dev/proposal-reconcile-cluster-driven-standard-chain.md](../dev/proposal-reconcile-cluster-driven-standard-chain.md) — full design, contracts, and rollout plan live in the proposal.
+
+**Pipeline summary** (one line): phase_z → cluster_grouper → cluster_report → task type=pm → reconcile session → gatekeeper → overlay → finalize → graph.json.
+
+**Coexistence**: the cluster-driven pipeline coexists with §3-§11 reconcile-type tasks; nothing in §3 is demoted, and both routes remain first-class — the cluster session is an additional surface, not a replacement.
+
+**Scope at landing**: this section is intentionally minimal at landing time; CR6b will expand via dogfood (or observer manual fallback if dogfood fails) once the implemented pipeline can describe itself.
+
+**Proposal anchors**: §4.2 (cluster definition), §4.6 (deferred queue), §4.8 (reconcile session + overlay), §4.9 (snapshot+rollback).
