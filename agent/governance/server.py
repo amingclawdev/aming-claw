@@ -1363,6 +1363,72 @@ def handle_reconcile_session_rollback(ctx: RequestContext):
 
 
 # ---------------------------------------------------------------------------
+# Reconcile Batch Memory HTTP API
+# ---------------------------------------------------------------------------
+
+@route("POST", "/api/reconcile/{project_id}/batch-memory")
+def handle_reconcile_batch_memory_create(ctx: RequestContext):
+    """Create or fetch durable batch memory for PM semantic merge context."""
+    from . import reconcile_batch_memory as bm
+
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    with DBContext(project_id) as conn:
+        batch = bm.create_or_get_batch(
+            conn,
+            project_id,
+            session_id=str(body.get("session_id") or ""),
+            batch_id=body.get("batch_id"),
+            created_by=str(body.get("created_by") or body.get("actor") or ""),
+            initial_memory=body.get("initial_memory") if isinstance(body.get("initial_memory"), dict) else None,
+        )
+    return 201, {"ok": True, "batch": batch}
+
+
+@route("GET", "/api/reconcile/{project_id}/batch-memory/{batch_id}")
+def handle_reconcile_batch_memory_get(ctx: RequestContext):
+    """Return one reconcile batch memory document."""
+    from . import reconcile_batch_memory as bm
+
+    project_id = ctx.get_project_id()
+    batch_id = ctx.path_params.get("batch_id", "")
+    with DBContext(project_id) as conn:
+        batch = bm.get_batch(conn, project_id, batch_id)
+    if not batch:
+        return 404, {"error": "batch_memory_not_found", "batch_id": batch_id}
+    return {"ok": True, "batch": batch}
+
+
+@route("POST", "/api/reconcile/{project_id}/batch-memory/{batch_id}/pm-decision")
+def handle_reconcile_batch_memory_pm_decision(ctx: RequestContext):
+    """Record one PM semantic decision into batch memory."""
+    from . import reconcile_batch_memory as bm
+
+    project_id = ctx.get_project_id()
+    batch_id = ctx.path_params.get("batch_id", "")
+    body = ctx.body or {}
+    cluster_fp = str(
+        body.get("cluster_fingerprint")
+        or body.get("cluster_id")
+        or ctx.path_params.get("cluster_fingerprint", "")
+    )
+    try:
+        with DBContext(project_id) as conn:
+            batch = bm.record_pm_decision(
+                conn,
+                project_id,
+                batch_id,
+                cluster_fp,
+                body,
+            )
+    except KeyError:
+        return 404, {"error": "batch_memory_not_found", "batch_id": batch_id}
+    except ValueError as exc:
+        return 400, {"error": "invalid_pm_decision", "message": str(exc)}
+    return {"ok": True, "batch": batch}
+
+
+# ---------------------------------------------------------------------------
 # CR3 — Reconcile Deferred-Cluster Queue HTTP API (R7)
 # ---------------------------------------------------------------------------
 

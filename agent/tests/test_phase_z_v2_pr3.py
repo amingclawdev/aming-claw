@@ -185,12 +185,12 @@ class TestAtomicSwapSurface:
 # ===========================================================================
 
 class TestSchemaMigration:
-    """AC8: db.py SCHEMA_VERSION == 25 with migrations table."""
+    """AC8: db.py schema version tracks the current governance schema."""
 
-    def test_ac8_schema_version_is_25(self):
-        """AC8: SCHEMA_VERSION == 25."""
+    def test_ac8_schema_version_is_current(self):
+        """AC8: SCHEMA_VERSION matches the current governance schema."""
         from agent.governance.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 25
+        assert SCHEMA_VERSION == 29
 
     # Note: Testing actual migration requires DB access which is
     # integration-level; the unit test validates the constant.

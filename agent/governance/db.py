@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -269,6 +269,23 @@ CREATE TABLE IF NOT EXISTS reconcile_sessions (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reconcile_sessions_one_active
     ON reconcile_sessions (project_id)
     WHERE status IN ('active','finalizing');
+
+-- Reconcile batch memory (PM semantic merge context for cluster batches)
+CREATE TABLE IF NOT EXISTS reconcile_batch_memory (
+    project_id       TEXT NOT NULL,
+    batch_id         TEXT NOT NULL,
+    session_id       TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'active',
+    memory_json      TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    created_by       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (project_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reconcile_batch_memory_session
+    ON reconcile_batch_memory (project_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_reconcile_batch_memory_status
+    ON reconcile_batch_memory (project_id, status);
 """
 
 
@@ -987,7 +1004,31 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23, 24: _migrate_v23_to_v24, 25: _migrate_v24_to_v25, 26: _migrate_v25_to_v26, 27: _migrate_v26_to_v27, 28: _migrate_v27_to_v28}
+    def _migrate_v28_to_v29(c):
+        """Add reconcile batch memory for PM semantic merge context."""
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS reconcile_batch_memory (
+                project_id       TEXT NOT NULL,
+                batch_id         TEXT NOT NULL,
+                session_id       TEXT NOT NULL DEFAULT '',
+                status           TEXT NOT NULL DEFAULT 'active',
+                memory_json      TEXT NOT NULL DEFAULT '{}',
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                created_by       TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (project_id, batch_id)
+            )
+        """)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reconcile_batch_memory_session "
+            "ON reconcile_batch_memory (project_id, session_id)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reconcile_batch_memory_status "
+            "ON reconcile_batch_memory (project_id, status)"
+        )
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23, 24: _migrate_v23_to_v24, 25: _migrate_v24_to_v25, 26: _migrate_v25_to_v26, 27: _migrate_v26_to_v27, 28: _migrate_v27_to_v28, 29: _migrate_v28_to_v29}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)
