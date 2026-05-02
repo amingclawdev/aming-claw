@@ -221,31 +221,46 @@ def _path_to_module(path: str, root: str) -> str:
 
 def parse_production_modules(
     project_root: str,
-    prod_dirs: Tuple[str, ...] = DEFAULT_PROD_DIRS,
+    prod_dirs: Optional[Tuple[str, ...]] = None,
+    profile: Optional[Any] = None,
 ) -> Dict[str, ModuleInfo]:
     """Walk prod_dirs under project_root, parse each .py file via AST.
 
     Returns dict keyed by dotted module name -> ModuleInfo.
-    Skips directories in EXCLUDE_DIRS.
+    Skips excluded/test/doc directories so DFS operates on production code.
     """
+    if profile is None:
+        from ..project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    if prod_dirs is None:
+        prod_dirs = tuple(getattr(profile, "source_roots", None) or DEFAULT_PROD_DIRS)
+
     modules: Dict[str, ModuleInfo] = {}
 
     for prod_dir in prod_dirs:
-        base = os.path.join(project_root, prod_dir)
+        base = project_root if prod_dir in ("", ".") else os.path.join(project_root, prod_dir)
         if not os.path.isdir(base):
             continue
 
         for dirpath, dirnames, filenames in os.walk(base):
             # Filter excluded dirs IN-PLACE so os.walk skips them
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in EXCLUDE_DIRS
-            ]
+            kept_dirs = []
+            for dirname in dirnames:
+                rel_dir = os.path.relpath(os.path.join(dirpath, dirname), project_root)
+                if dirname in EXCLUDE_DIRS:
+                    continue
+                if profile.is_excluded_path(rel_dir) or profile.is_test_path(rel_dir) or profile.is_doc_path(rel_dir):
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
 
             for fname in filenames:
                 if not fname.endswith(".py"):
                     continue
                 fpath = os.path.join(dirpath, fname)
+                rel_file = os.path.relpath(fpath, project_root)
+                if not profile.is_production_source_path(rel_file):
+                    continue
                 try:
                     source = _read_file(fpath)
                     tree = ast.parse(source, filename=fpath)
