@@ -443,6 +443,50 @@ def _audit_doc_gap(conn, project_id, task_id, stage, missing_docs, changed_files
         log.debug("_audit_doc_gap failed (non-critical)", exc_info=True)
 
 
+def _check_session_bypass(gate_name, project_id, task_id):
+    """CR0b R3: consult reconcile_session.get_active_session(project_id) and
+    short-circuit a gate when ``gate_name`` appears in session.bypass_gates.
+
+    Looked-up sessions in status active or finalizing are eligible. When a bypass
+    fires, an audit_index row is recorded with event
+    ``gate.bypassed.reconcile_session_active`` carrying ``{gate, task_id, session_id}``.
+
+    Returns:
+        (True, "reconcile_session_active_bypass:{gate_name}") when bypass applies.
+        (False, "") otherwise.
+    """
+    if not gate_name:
+        return False, ""
+    try:
+        from . import reconcile_session as _rs
+        from .db import DBContext
+        with DBContext(project_id) as _conn:
+            sess = _rs.get_active_session(_conn, project_id)
+            if sess is None:
+                return False, ""
+            if sess.status not in ("active", "finalizing"):
+                return False, ""
+            if gate_name not in (sess.bypass_gates or []):
+                return False, ""
+            # Bypass applies — audit it.
+            try:
+                from .audit_service import record as _audit_record
+                _audit_record(
+                    _conn, project_id,
+                    event="gate.bypassed.reconcile_session_active",
+                    actor="auto-chain",
+                    ok=True, node_ids=None, request_id="",
+                    gate=gate_name, task_id=task_id or "",
+                    session_id=sess.session_id,
+                )
+            except Exception:
+                log.debug("_check_session_bypass: audit failed (non-critical)", exc_info=True)
+            return True, f"reconcile_session_active_bypass:{gate_name}"
+    except Exception:
+        log.debug("_check_session_bypass: lookup failed (non-critical)", exc_info=True)
+        return False, ""
+
+
 def _audit_reconcile_bypass(conn, project_id, gate_name, run_id, task_id):
     """Audit gate bypass for reconcile tasks (§11.3). Writes 'gate.reconcile_bypass' to audit_index."""
     try:
@@ -3582,6 +3626,13 @@ def _gate_post_pm(conn, project_id, result, metadata):
     Mandatory: target_files, verification, acceptance_criteria (hard block)
     Soft-mandatory: test_files, proposed_nodes, doc_impact (must provide OR skip_reasons)
     """
+    # CR0b R4: reconcile-session bypass for the doc-impact node-ref check
+    # (gate label '_doc_impact.node_ref'). Short-circuits PRD doc/node validation
+    # while a reconcile session declares the bypass.
+    _bypassed, _reason = _check_session_bypass(
+        "_doc_impact.node_ref", project_id, metadata.get("task_id", ""))
+    if _bypassed:
+        return True, _reason
     prd = result.get("prd", {})
 
     # === Hard mandatory fields ===
@@ -4074,6 +4125,12 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     Requires explicit qa_pass recommendation.
     Missing or ambiguous recommendation is a hard block (not auto-pass).
     """
+    # CR0b R4: reconcile-session bypass for the qa-pass related-nodes
+    # existence check.
+    _bypassed, _reason = _check_session_bypass(
+        "_gate_qa_pass.related_nodes", project_id, metadata.get("task_id", ""))
+    if _bypassed:
+        return True, _reason
     # PR1 SECONDARY defense-in-depth: re-run dev preflight at QA gate to
     # surface any dev-stage violation that slipped past the primary check.
     # Always logs only — never blocks here.
@@ -4276,6 +4333,12 @@ def _gate_gatekeeper_pass(conn, project_id, result, metadata):
 
 def _gate_release(conn, project_id, result, metadata):
     """Verify merge succeeded before deploy."""
+    # CR0b R4: reconcile-session bypass for the release-gate
+    # related-nodes-at-qa-pass check.
+    _bypassed, _reason = _check_session_bypass(
+        "_gate_release.related_nodes", project_id, metadata.get("task_id", ""))
+    if _bypassed:
+        return True, _reason
     # §11.2: reconcile_run_id bypass (R5/R9)
     _reconcile_run_id = metadata.get("reconcile_run_id")
     if _reconcile_run_id:
