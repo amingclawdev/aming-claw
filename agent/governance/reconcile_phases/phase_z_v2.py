@@ -8,6 +8,7 @@ PR3: Driver function, coverage lookup, diff, artifact write, CLI.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -230,7 +231,7 @@ def parse_production_modules(
     Skips excluded/test/doc directories so DFS operates on production code.
     """
     if profile is None:
-        from ..project_profile import discover_project_profile
+        from agent.governance.project_profile import discover_project_profile
         profile = discover_project_profile(project_root)
     if prod_dirs is None:
         prod_dirs = tuple(getattr(profile, "source_roots", None) or DEFAULT_PROD_DIRS)
@@ -815,6 +816,7 @@ def write_dry_run_artifact(
     nodes: List[Dict[str, Any]],
     diff_report: Dict[str, Any],
     scratch_dir: Optional[str] = None,
+    feature_clusters: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Write docs/dev/scratch/graph-v2-{date}.json with diff-vs-current report.
 
@@ -832,12 +834,251 @@ def write_dry_run_artifact(
         "node_count": len(nodes),
         "nodes": nodes,
         "diff_report": diff_report,
+        "feature_clusters": feature_clusters or [],
     }
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Reconcile feature-cluster synthesis
+# ---------------------------------------------------------------------------
+
+def _repo_relpath(project_root: str, path: str) -> str:
+    raw = str(path or "")
+    try:
+        if os.path.isabs(raw):
+            raw = os.path.relpath(raw, project_root)
+    except ValueError:
+        pass
+    return raw.replace("\\", "/")
+
+
+def _module_from_qname(qname: str) -> str:
+    return qname.split("::", 1)[0] if "::" in qname else ""
+
+
+def _package_key(path: str) -> str:
+    """Return a generic file-tree bucket key for bounded batch coalescing."""
+    normal = str(path or "").replace("\\", "/").strip("/")
+    if not normal:
+        return ""
+    parent = os.path.dirname(normal)
+    return parent or normal
+
+
+def _cluster_fingerprint(entries: List[str], primary_files: List[str]) -> str:
+    payload = "|".join(sorted(entries)) + "||" + "|".join(sorted(primary_files))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _cluster_file_cap() -> int:
+    try:
+        from agent.governance.reconcile_config import RECONCILE_FEATURE_CLUSTER_FILE_CAP
+        return max(1, int(RECONCILE_FEATURE_CLUSTER_FILE_CAP))
+    except Exception:
+        return 6
+
+
+def synthesize_feature_clusters(
+    *,
+    project_root: str,
+    modules: Dict[str, ModuleInfo],
+    call_graph: CallGraph,
+    sccs: List[List[str]],
+    nodes: Optional[List[Dict[str, Any]]] = None,
+    file_cap: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Build reconcile FeatureCluster candidates from SCC roots.
+
+    The synthesis path is intentionally source-only: tests/docs are attached
+    as secondary coverage after DFS, but they never become traversal roots.
+    """
+    if not modules or not call_graph.all_functions:
+        return []
+
+    cap = max(1, int(file_cap or _cluster_file_cap()))
+    component_nodes: Dict[int, Set[str]] = {
+        idx: {fn for fn in scc if fn in call_graph.all_functions}
+        for idx, scc in enumerate(sccs)
+    }
+    component_nodes = {idx: members for idx, members in component_nodes.items() if members}
+    if not component_nodes:
+        return []
+
+    component_by_function: Dict[str, int] = {
+        fn: idx
+        for idx, members in component_nodes.items()
+        for fn in members
+    }
+    dag: Dict[int, Set[int]] = {idx: set() for idx in component_nodes}
+    indegree: Dict[int, int] = {idx: 0 for idx in component_nodes}
+    for caller, targets in call_graph.edges.items():
+        caller_component = component_by_function.get(caller)
+        if caller_component is None:
+            continue
+        for target in targets:
+            target_component = component_by_function.get(target)
+            if target_component is None or target_component == caller_component:
+                continue
+            if target_component not in dag[caller_component]:
+                dag[caller_component].add(target_component)
+                indegree[target_component] += 1
+
+    root_components = sorted(idx for idx, count in indegree.items() if count == 0)
+    if not root_components:
+        root_components = sorted(component_nodes)
+
+    module_functions: Dict[str, Set[str]] = {}
+    for module_name, module_info in modules.items():
+        module_functions[module_name] = {
+            func.qualified_name for func in module_info.functions
+        }
+
+    node_by_module = {
+        str(node.get("module") or node.get("node_id") or ""): node
+        for node in (nodes or [])
+    }
+
+    reach_cache: Dict[int, Set[int]] = {}
+
+    def reachable_components(start: int) -> Set[int]:
+        if start in reach_cache:
+            return set(reach_cache[start])
+        seen: Set[int] = set()
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(sorted(dag.get(current, set()) - seen, reverse=True))
+        reach_cache[start] = set(seen)
+        return seen
+
+    def files_for_modules(module_names: Set[str]) -> Tuple[List[str], List[str]]:
+        primary_files: Set[str] = set()
+        secondary_files: Set[str] = set()
+        for module_name in sorted(module_names):
+            node = node_by_module.get(module_name)
+            if node:
+                pf = _repo_relpath(project_root, str(node.get("primary_file") or ""))
+                if pf:
+                    primary_files.add(pf)
+                for test_file in (node.get("test_coverage") or {}).get("test_files", []):
+                    rel = _repo_relpath(project_root, str(test_file))
+                    if rel:
+                        secondary_files.add(rel)
+                for doc_file in (node.get("doc_coverage") or {}).get("doc_files", []):
+                    rel = _repo_relpath(project_root, str(doc_file))
+                    if rel:
+                        secondary_files.add(rel)
+                continue
+            module_info = modules.get(module_name)
+            if module_info:
+                rel = _repo_relpath(project_root, module_info.path)
+                if rel:
+                    primary_files.add(rel)
+        return sorted(primary_files), sorted(secondary_files)
+
+    branches: List[Dict[str, Any]] = []
+    for root_component in root_components:
+        root_functions = sorted(component_nodes[root_component])
+        if not root_functions:
+            continue
+        entry_qname = root_functions[0]
+        entry_module = _module_from_qname(entry_qname)
+        reached_components = reachable_components(root_component)
+        reached_functions: Set[str] = set()
+        for component in reached_components:
+            reached_functions.update(component_nodes.get(component, set()))
+
+        # Keep a root module's local helpers with its root branch. This avoids
+        # fragmenting plain, undecorated modules into one cluster per helper.
+        reached_functions.update(module_functions.get(entry_module, set()))
+
+        reached_modules = {
+            module for module in (_module_from_qname(fn) for fn in reached_functions) if module
+        }
+        primary_files, secondary_files = files_for_modules(reached_modules)
+        if not primary_files:
+            continue
+        entry_file = _repo_relpath(project_root, modules.get(entry_module, ModuleInfo("", "")).path)
+        package_key = _package_key(entry_file or primary_files[0])
+        decorators = sorted({
+            dec
+            for fn in reached_functions
+            for dec in (call_graph.all_functions.get(fn).decorators if call_graph.all_functions.get(fn) else [])
+        })
+        branches.append({
+            "entry_qname": entry_qname,
+            "root_functions": root_functions,
+            "root_component_size": len(root_functions),
+            "is_cycle_root": len(root_functions) > 1,
+            "package_key": package_key,
+            "primary_files": primary_files,
+            "secondary_files": secondary_files,
+            "functions": sorted(reached_functions),
+            "modules": sorted(reached_modules),
+            "decorators": decorators,
+        })
+
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for branch in branches:
+        buckets.setdefault(branch["package_key"], []).append(branch)
+
+    clusters: List[Dict[str, Any]] = []
+
+    def flush_chunk(package_key: str, chunk: List[Dict[str, Any]]) -> None:
+        if not chunk:
+            return
+        entries = sorted({branch["entry_qname"] for branch in chunk if branch.get("entry_qname")})
+        primary_files = sorted({pf for branch in chunk for pf in branch.get("primary_files", [])})
+        secondary_files = sorted({sf for branch in chunk for sf in branch.get("secondary_files", [])})
+        functions = sorted({fn for branch in chunk for fn in branch.get("functions", [])})
+        modules_in_cluster = sorted({mod for branch in chunk for mod in branch.get("modules", [])})
+        decorators = sorted({dec for branch in chunk for dec in branch.get("decorators", [])})
+        clusters.append({
+            "cluster_fingerprint": _cluster_fingerprint(entries, primary_files),
+            "entries": entries,
+            "primary_files": primary_files,
+            "secondary_files": secondary_files,
+            "functions": functions,
+            "modules": modules_in_cluster,
+            "decorators": decorators,
+            "synthesis": {
+                "strategy": "scc_indegree_root_dfs_filetree_coalesce",
+                "package_key": package_key,
+                "root_count": len(entries),
+                "cycle_root_count": sum(1 for branch in chunk if branch.get("is_cycle_root")),
+                "function_count": len(functions),
+                "module_count": len(modules_in_cluster),
+                "file_cap": cap,
+            },
+        })
+
+    for package_key, package_branches in sorted(buckets.items()):
+        current: List[Dict[str, Any]] = []
+        current_files: Set[str] = set()
+        for branch in sorted(package_branches, key=lambda b: (
+            b.get("primary_files", [""])[0] if b.get("primary_files") else "",
+            b.get("entry_qname", ""),
+        )):
+            branch_files = set(branch.get("primary_files", []))
+            next_files = current_files | branch_files
+            if current and len(next_files) > cap:
+                flush_chunk(package_key, current)
+                current = []
+                current_files = set()
+            current.append(branch)
+            current_files.update(branch_files)
+        flush_chunk(package_key, current)
+
+    clusters.sort(key=lambda c: c["cluster_fingerprint"])
+    return clusters
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1318,14 @@ def build_graph_v2_from_symbols(
         node["test_coverage"] = test_cov
         node["doc_coverage"] = doc_cov
 
+    feature_clusters = synthesize_feature_clusters(
+        project_root=project_root,
+        modules=modules,
+        call_graph=call_graph,
+        sccs=sccs,
+        nodes=nodes,
+    )
+
     # Step 4: Diff against existing
     diff_report = diff_against_existing_graph(project_root, nodes)
 
@@ -1087,12 +1336,14 @@ def build_graph_v2_from_symbols(
             nodes,
             diff_report,
             scratch_dir=scratch_dir,
+            feature_clusters=feature_clusters,
         )
         return {
             "status": "ok",
             "report_path": report_path,
             "node_count": len(nodes),
             "nodes": nodes,
+            "feature_clusters": feature_clusters,
             "diff_report": diff_report,
         }
     else:
@@ -1121,5 +1372,6 @@ def build_graph_v2_from_symbols(
             "graph_path": graph_path,
             "node_count": len(nodes),
             "nodes": nodes,
+            "feature_clusters": feature_clusters,
             "diff_report": diff_report,
         }

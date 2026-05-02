@@ -29,6 +29,7 @@ from agent.governance.reconcile_config import (  # noqa: E402
     BOOTSTRAP_THRESHOLD,
     CLUSTER_SIGNAL_WEIGHTS,
     CLUSTER_THRESHOLD,
+    RECONCILE_FEATURE_CLUSTER_FILE_CAP,
     RECONCILE_CLUSTER_SIZE_CAP,
 )
 from agent.governance.reconcile_phases.cluster_grouper import (  # noqa: E402
@@ -101,6 +102,7 @@ def test_ac5_reconcile_config_constants():
     assert abs(total - 1.0) < 1e-9, f"weights must sum to 1.0, got {total}"
     assert isinstance(CLUSTER_THRESHOLD, float)
     assert isinstance(RECONCILE_CLUSTER_SIZE_CAP, int)
+    assert isinstance(RECONCILE_FEATURE_CLUSTER_FILE_CAP, int)
     assert isinstance(BOOTSTRAP_THRESHOLD, int)
 
 

@@ -352,6 +352,85 @@ def _feature_nodes_from_phase_z_v2(
     return _feature_nodes_from_symbol_nodes(symbol_nodes, workspace, feature_node_cls)
 
 
+def _cluster_groups_from_synthesized_feature_clusters(
+    feature_clusters: List[Dict[str, Any]],
+    feature_node_cls: Any,
+    cluster_group_cls: Any,
+) -> List[Any]:
+    cluster_groups = []
+    for cluster in feature_clusters or []:
+        primary_files = list(cluster.get("primary_files") or [])
+        secondary_files = list(cluster.get("secondary_files") or [])
+        functions = {str(fn) for fn in (cluster.get("functions") or []) if fn}
+        modules = list(cluster.get("modules") or [])
+        decorators = list(cluster.get("decorators") or [])
+        entries = []
+        for qname in cluster.get("entries") or []:
+            qname = str(qname or "")
+            if not qname:
+                continue
+            module = qname.split("::", 1)[0] if "::" in qname else ""
+            entries.append(feature_node_cls(
+                qname=qname,
+                module=module,
+                primary_files=primary_files,
+                secondary_files=secondary_files,
+                descendants=functions,
+                decorators=decorators,
+                deps=modules,
+            ))
+        if not entries:
+            continue
+        group = cluster_group_cls(
+            entries=entries,
+            primary_files=primary_files,
+            secondary_files=secondary_files,
+            cluster_fingerprint=str(cluster.get("cluster_fingerprint") or ""),
+        )
+        try:
+            setattr(group, "synthesis", cluster.get("synthesis") or {})
+        except Exception:
+            pass
+        cluster_groups.append(group)
+    return cluster_groups
+
+
+def _cluster_groups_from_phase_z_v2(
+    workspace: str,
+    scratch: str,
+    feature_node_cls: Any,
+    cluster_group_cls: Any,
+    group_deltas_by_cluster: Any,
+) -> List[Any]:
+    from .phase_z_v2 import build_graph_v2_from_symbols
+
+    result = build_graph_v2_from_symbols(
+        workspace,
+        dry_run=True,
+        scratch_dir=scratch,
+    )
+    feature_clusters = (
+        list(result.get("feature_clusters") or [])
+        if isinstance(result, dict) and result.get("status") == "ok"
+        else []
+    )
+    cluster_groups = _cluster_groups_from_synthesized_feature_clusters(
+        feature_clusters,
+        feature_node_cls,
+        cluster_group_cls,
+    )
+    if cluster_groups:
+        return cluster_groups
+
+    symbol_nodes = (
+        list(result.get("nodes") or [])
+        if isinstance(result, dict) and result.get("status") == "ok"
+        else []
+    )
+    feature_nodes = _feature_nodes_from_symbol_nodes(symbol_nodes, workspace, feature_node_cls)
+    return group_deltas_by_cluster(feature_nodes)
+
+
 # ---------------------------------------------------------------------------
 # Artifact writers  (R8)
 # ---------------------------------------------------------------------------
@@ -551,6 +630,7 @@ def phase_z_run(
     cluster_groups: list = []
     try:
         from .cluster_grouper import (
+            ClusterGroup as _ClusterGroup,
             FeatureNode as _ClusterFeatureNode,
             group_deltas_by_cluster,
         )
@@ -560,12 +640,18 @@ def phase_z_run(
 
         if prefer_symbol_clusters:
             try:
-                _feature_nodes = _feature_nodes_from_phase_z_v2(
+                cluster_groups = _cluster_groups_from_phase_z_v2(
                     workspace,
                     scratch,
                     _ClusterFeatureNode,
+                    _ClusterGroup,
+                    group_deltas_by_cluster,
                 )
-                cluster_groups = group_deltas_by_cluster(_feature_nodes)
+                _feature_nodes = [
+                    entry
+                    for group in cluster_groups
+                    for entry in (getattr(group, "entries", []) or [])
+                ]
                 _cluster_source = "phase-z-v2-symbols"
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("phase_z: phase_z_v2 cluster source failed (non-blocking): %s", exc)
@@ -577,12 +663,18 @@ def phase_z_run(
 
         if not cluster_groups and not prefer_symbol_clusters:
             try:
-                _feature_nodes = _feature_nodes_from_phase_z_v2(
+                cluster_groups = _cluster_groups_from_phase_z_v2(
                     workspace,
                     scratch,
                     _ClusterFeatureNode,
+                    _ClusterGroup,
+                    group_deltas_by_cluster,
                 )
-                cluster_groups = group_deltas_by_cluster(_feature_nodes)
+                _feature_nodes = [
+                    entry
+                    for group in cluster_groups
+                    for entry in (getattr(group, "entries", []) or [])
+                ]
                 _cluster_source = "phase-z-v2-symbols"
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("phase_z: phase_z_v2 cluster fallback failed (non-blocking): %s", exc)
@@ -653,6 +745,7 @@ def phase_z_run(
             "entries": [getattr(e, "qname", "") for e in _entries],
             "primary_files": list(getattr(_group, "primary_files", []) or []),
             "secondary_files": list(getattr(_group, "secondary_files", []) or []),
+            "synthesis": getattr(_group, "synthesis", {}) or {},
             "report": _report.to_dict(),
         })
 

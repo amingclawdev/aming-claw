@@ -6,6 +6,7 @@ operator can tweak behaviour without a code change:
     CLUSTER_SIGNAL_WEIGHT_S{1..5}   -- per-signal weight (must sum to 1.0)
     CLUSTER_THRESHOLD               -- pair similarity merge threshold
     RECONCILE_CLUSTER_SIZE_CAP      -- maximum nodes per cluster
+    RECONCILE_FEATURE_CLUSTER_FILE_CAP -- max files per synthesized cluster
     BOOTSTRAP_THRESHOLD             -- bootstrap detector cluster floor
 
 The defaults below were chosen to produce non-trivial clusters on the
@@ -54,6 +55,7 @@ CLUSTER_SIGNAL_WEIGHTS: Dict[str, float] = {
 # ---------------------------------------------------------------------------
 CLUSTER_THRESHOLD: float = _env_float("CLUSTER_THRESHOLD", 0.50)
 RECONCILE_CLUSTER_SIZE_CAP: int = _env_int("RECONCILE_CLUSTER_SIZE_CAP", 20)
+RECONCILE_FEATURE_CLUSTER_FILE_CAP: int = _env_int("RECONCILE_FEATURE_CLUSTER_FILE_CAP", 6)
 BOOTSTRAP_THRESHOLD: int = _env_int("BOOTSTRAP_THRESHOLD", 10)
 
 
@@ -61,5 +63,6 @@ __all__ = [
     "CLUSTER_SIGNAL_WEIGHTS",
     "CLUSTER_THRESHOLD",
     "RECONCILE_CLUSTER_SIZE_CAP",
+    "RECONCILE_FEATURE_CLUSTER_FILE_CAP",
     "BOOTSTRAP_THRESHOLD",
 ]
