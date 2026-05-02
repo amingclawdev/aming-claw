@@ -32,6 +32,7 @@ from . import state_service
 from . import project_service
 from . import memory_service
 from . import audit_service
+from . import reconcile_session
 from .idempotency import check_idempotency, store_idempotency
 from .redis_client import get_redis
 from .models import Evidence, MemoryEntry, NodeDef
@@ -1015,6 +1016,235 @@ def handle_reconcile_v2(ctx: RequestContext):
     }
 
 
+# ---------------------------------------------------------------------------
+# CR0b: Reconcile session HTTP API
+# ---------------------------------------------------------------------------
+
+def _session_to_dict(sess) -> dict:
+    """Serialize a ReconcileSession dataclass to a JSON-safe dict."""
+    if sess is None:
+        return None
+    return {
+        "project_id": sess.project_id,
+        "session_id": sess.session_id,
+        "run_id": sess.run_id,
+        "status": sess.status,
+        "started_at": sess.started_at,
+        "finalized_at": sess.finalized_at,
+        "cluster_count_total": sess.cluster_count_total,
+        "cluster_count_resolved": sess.cluster_count_resolved,
+        "cluster_count_failed": sess.cluster_count_failed,
+        "bypass_gates": list(sess.bypass_gates or []),
+        "started_by": sess.started_by,
+        "snapshot_path": sess.snapshot_path,
+        "snapshot_head_sha": sess.snapshot_head_sha,
+    }
+
+
+def _row_to_session_dict(row) -> dict:
+    """Serialize a sqlite3.Row from reconcile_sessions to a JSON-safe dict."""
+    if row is None:
+        return None
+    raw = row["bypass_gates_json"] if row["bypass_gates_json"] is not None else "[]"
+    try:
+        bypass = list(json.loads(raw) or [])
+    except Exception:
+        bypass = []
+    return {
+        "project_id": row["project_id"],
+        "session_id": row["session_id"],
+        "run_id": row["run_id"],
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "finalized_at": row["finalized_at"],
+        "cluster_count_total": int(row["cluster_count_total"] or 0),
+        "cluster_count_resolved": int(row["cluster_count_resolved"] or 0),
+        "cluster_count_failed": int(row["cluster_count_failed"] or 0),
+        "bypass_gates": bypass,
+        "started_by": row["started_by"],
+        "snapshot_path": row["snapshot_path"],
+        "snapshot_head_sha": row["snapshot_head_sha"],
+    }
+
+
+@route("POST", "/api/reconcile/{project_id}/sessions/start")
+def handle_reconcile_session_start(ctx: RequestContext):
+    """Start a new reconcile session. 409 if one already exists."""
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    bypass_gates = body.get("bypass_gates") or []
+    started_by = body.get("started_by") or ""
+    run_id = body.get("run_id")
+    full_rebase = bool(body.get("full_rebase", False))
+    dropped = body.get("dropped_cluster_fingerprints")
+    try:
+        with DBContext(project_id) as conn:
+            # Pre-check: active session already exists?
+            existing = reconcile_session.get_active_session(conn, project_id)
+            if existing is not None:
+                return 409, {
+                    "error": "reconcile_session_active_exists",
+                    "session_id": existing.session_id,
+                    "status": existing.status,
+                }
+            sess = reconcile_session.start_session(
+                conn, project_id,
+                run_id=run_id,
+                started_by=started_by or None,
+                bypass_gates=list(bypass_gates),
+                full_rebase=full_rebase,
+                dropped_cluster_fingerprints=dropped,
+            )
+    except reconcile_session.SessionAlreadyActiveError as exc:
+        return 409, {
+            "error": "reconcile_session_active_exists",
+            "message": str(exc),
+        }
+    except ValueError as exc:
+        return 400, {"error": "invalid_request", "message": str(exc)}
+    return 201, {"session": _session_to_dict(sess)}
+
+
+@route("GET", "/api/reconcile/{project_id}/sessions/active")
+def handle_reconcile_session_active(ctx: RequestContext):
+    """Return the active/finalizing session for a project, else null."""
+    project_id = ctx.get_project_id()
+    with DBContext(project_id) as conn:
+        sess = reconcile_session.get_active_session(conn, project_id)
+    return {"session": _session_to_dict(sess)}
+
+
+@route("GET", "/api/reconcile/{project_id}/sessions/history")
+def handle_reconcile_session_history(ctx: RequestContext):
+    """Return all sessions for a project ordered by started_at DESC."""
+    project_id = ctx.get_project_id()
+    try:
+        limit = int(ctx.query.get("limit", "50"))
+    except (TypeError, ValueError):
+        limit = 50
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM reconcile_sessions WHERE project_id = ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            (project_id, max(1, limit)),
+        ).fetchall()
+    sessions = [_row_to_session_dict(r) for r in rows]
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@route("GET", "/api/reconcile/{project_id}/sessions/{session_id}")
+def handle_reconcile_session_get(ctx: RequestContext):
+    """Return a single session by id, else 404."""
+    project_id = ctx.get_project_id()
+    session_id = ctx.path_params.get("session_id", "")
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+            (project_id, session_id),
+        ).fetchone()
+    if row is None:
+        return 404, {"error": "session_not_found", "session_id": session_id}
+    return {"session": _row_to_session_dict(row)}
+
+
+@route("POST", "/api/reconcile/{project_id}/sessions/{session_id}/finalize")
+def handle_reconcile_session_finalize(ctx: RequestContext):
+    """Transition session to finalizing then finalize it. Idempotent on already-finalized sessions."""
+    project_id = ctx.get_project_id()
+    session_id = ctx.path_params.get("session_id", "")
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+            (project_id, session_id),
+        ).fetchone()
+        if row is None:
+            return 404, {"error": "session_not_found", "session_id": session_id}
+        current_status = row["status"]
+        if current_status == "finalized":
+            # Idempotent: already finalized
+            row2 = conn.execute(
+                "SELECT * FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+                (project_id, session_id),
+            ).fetchone()
+            return {
+                "result": {
+                    "project_id": project_id,
+                    "session_id": session_id,
+                    "status": "finalized",
+                    "finalized_at": row2["finalized_at"] if row2 else None,
+                },
+                "idempotent": True,
+            }
+        if current_status == "rolled_back":
+            return 409, {
+                "error": "session_terminal",
+                "status": current_status,
+                "message": "session is rolled_back; cannot finalize",
+            }
+        try:
+            if current_status == "active":
+                reconcile_session.transition_to_finalizing(conn, project_id, session_id)
+            result = reconcile_session.finalize_session(conn, project_id, session_id)
+        except ValueError as exc:
+            return 400, {"error": "invalid_state", "message": str(exc)}
+    return {
+        "result": {
+            "project_id": result.project_id,
+            "session_id": result.session_id,
+            "status": result.status,
+            "finalized_at": result.finalized_at,
+            "overlay_archived_to": result.overlay_archived_to,
+        },
+        "idempotent": False,
+    }
+
+
+@route("POST", "/api/reconcile/{project_id}/sessions/{session_id}/rollback")
+def handle_reconcile_session_rollback(ctx: RequestContext):
+    """Roll back an active or finalizing session. Writes audit event."""
+    project_id = ctx.get_project_id()
+    session_id = ctx.path_params.get("session_id", "")
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+            (project_id, session_id),
+        ).fetchone()
+        if row is None:
+            return 404, {"error": "session_not_found", "session_id": session_id}
+        try:
+            result = reconcile_session.rollback_session(conn, project_id, session_id)
+        except ValueError as exc:
+            return 409, {"error": "invalid_state", "message": str(exc)}
+        # Audit the rollback event
+        try:
+            audit_service.record(
+                conn, project_id,
+                event="reconcile_session.rolled_back",
+                actor=(ctx.body or {}).get("actor", "anonymous"),
+                ok=True, node_ids=None, request_id=ctx.request_id,
+                session_id=session_id,
+            )
+        except Exception:
+            log.debug("rollback audit failed (non-critical)", exc_info=True)
+    return {
+        "result": {
+            "project_id": result.project_id,
+            "session_id": result.session_id,
+            "status": result.status,
+            "rolled_back_at": result.rolled_back_at,
+            "snapshot_path": result.snapshot_path,
+        },
+    }
+
+
 @route("POST", "/api/wf/{project_id}/node-create")
 def handle_node_create(ctx: RequestContext):
     """Create a single node. System allocates display_id.
@@ -1937,6 +2167,23 @@ def handle_task_create(ctx: RequestContext):
         metadata["rule_reason"] = rule_decision["reason"]
         log.info("API conflict_rules: project=%s decision=%s reason=%s",
                  project_id, rule_decision["decision"], rule_decision["reason"])
+
+    # CR0b R2: scoped-task blocker — when an active reconcile session exists,
+    # block new scoped (reconcile_*) task dispatch BEFORE inserting. Existing
+    # in-flight tasks are NOT cancelled; only NEW dispatch is blocked.
+    if task_type.startswith("reconcile_"):
+        try:
+            with DBContext(project_id) as _sess_conn:
+                _active_sess = reconcile_session.get_active_session(_sess_conn, project_id)
+        except Exception:
+            log.debug("reconcile session lookup failed (non-critical)", exc_info=True)
+            _active_sess = None
+        if _active_sess is not None:
+            return 409, {
+                "error": "reconcile_session_active_blocks_scoped",
+                "session_id": _active_sess.session_id,
+                "task_type": task_type,
+            }
 
     with DBContext(project_id) as conn:
         result = task_registry.create_task(
