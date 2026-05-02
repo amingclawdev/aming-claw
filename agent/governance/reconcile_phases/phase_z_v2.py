@@ -799,12 +799,14 @@ def write_dry_run_artifact(
     project_root: str,
     nodes: List[Dict[str, Any]],
     diff_report: Dict[str, Any],
+    scratch_dir: Optional[str] = None,
 ) -> str:
     """Write docs/dev/scratch/graph-v2-{date}.json with diff-vs-current report.
 
     Returns the path to the written file.
     """
-    scratch_dir = os.path.join(project_root, "docs", "dev", "scratch")
+    if scratch_dir is None:
+        scratch_dir = os.path.join(project_root, "docs", "dev", "scratch")
     os.makedirs(scratch_dir, exist_ok=True)
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1000,6 +1002,7 @@ def build_graph_v2_from_symbols(
     project_root: str,
     dry_run: bool = True,
     owner: Optional[str] = None,
+    scratch_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Orchestrate the full symbol-level topology pipeline.
 
@@ -1064,11 +1067,17 @@ def build_graph_v2_from_symbols(
 
     if dry_run:
         # R3: Write dry-run artifact
-        report_path = write_dry_run_artifact(project_root, nodes, diff_report)
+        report_path = write_dry_run_artifact(
+            project_root,
+            nodes,
+            diff_report,
+            scratch_dir=scratch_dir,
+        )
         return {
             "status": "ok",
             "report_path": report_path,
             "node_count": len(nodes),
+            "nodes": nodes,
             "diff_report": diff_report,
         }
     else:
@@ -1096,5 +1105,6 @@ def build_graph_v2_from_symbols(
             "status": "ok",
             "graph_path": graph_path,
             "node_count": len(nodes),
+            "nodes": nodes,
             "diff_report": diff_report,
         }

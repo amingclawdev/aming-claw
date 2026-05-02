@@ -156,11 +156,12 @@ def three_way_diff(
     for nid in sorted(candidate_ids - existing_ids):
         cdata = candidate_nodes[nid]
         conf = _compute_candidate_confidence(cdata)
-        dtype = "missing_node_high_conf" if conf > CONFIDENCE_HIGH_THRESHOLD else "missing_node_low_conf"
+        is_high_conf = conf >= CONFIDENCE_HIGH_THRESHOLD
+        dtype = "missing_node_high_conf" if is_high_conf else "missing_node_low_conf"
         deltas.append(Delta(
             delta_type=dtype,
             node_id=nid,
-            action="candidate" if conf > CONFIDENCE_HIGH_THRESHOLD else "review",
+            action="candidate" if is_high_conf else "review",
             confidence=conf,
             detail=f"Candidate node {nid} discovered by scan (conf={conf:.2f})",
             files=cdata.get("primary", []) if isinstance(cdata.get("primary"), list) else [cdata.get("primary", "")],
@@ -253,6 +254,102 @@ def group_into_epics(deltas: List[Delta]) -> Dict[str, EpicGroup]:
             groups[epic] = EpicGroup(epic=epic)
         groups[epic].candidates.append(d)
     return groups
+
+
+def _repo_relpath(workspace: str, path: Any) -> str:
+    """Return a stable repo-relative slash path when possible."""
+    if not path:
+        return ""
+    raw = str(path)
+    try:
+        if os.path.isabs(raw):
+            raw = os.path.relpath(raw, workspace)
+    except Exception:
+        pass
+    return raw.replace("\\", "/")
+
+
+def _repo_relpaths(workspace: str, paths: Any) -> List[str]:
+    if not paths:
+        return []
+    if isinstance(paths, str):
+        paths = [paths]
+    try:
+        return sorted({p for p in (_repo_relpath(workspace, item) for item in paths) if p})
+    except TypeError:
+        return []
+
+
+def _feature_nodes_from_deltas(
+    deltas: List[Delta],
+    feature_node_cls: Any,
+) -> List[Any]:
+    feature_nodes = []
+    for d in deltas:
+        if d.delta_type != "missing_node_high_conf":
+            continue
+        files = list(d.files or [])
+        module = ""
+        if files:
+            module = os.path.dirname(files[0].replace("\\", "/"))
+        feature_nodes.append(feature_node_cls(
+            qname=d.node_id or "",
+            module=module,
+            primary_files=files,
+        ))
+    return feature_nodes
+
+
+def _feature_nodes_from_symbol_nodes(
+    symbol_nodes: List[Dict[str, Any]],
+    workspace: str,
+    feature_node_cls: Any,
+) -> List[Any]:
+    feature_nodes = []
+    for node in symbol_nodes or []:
+        qname = str(node.get("node_id") or node.get("module") or "")
+        if not qname:
+            continue
+
+        primary = _repo_relpath(workspace, node.get("primary_file", ""))
+        test_files = _repo_relpaths(
+            workspace,
+            (node.get("test_coverage") or {}).get("test_files", []),
+        )
+        doc_files = _repo_relpaths(
+            workspace,
+            (node.get("doc_coverage") or {}).get("doc_files", []),
+        )
+        functions = {str(fn) for fn in (node.get("functions") or []) if fn}
+
+        feature_nodes.append(feature_node_cls(
+            qname=qname,
+            module=str(node.get("module") or qname.rsplit(".", 1)[0]),
+            primary_files=[primary] if primary else [],
+            secondary_files=sorted(set(test_files + doc_files)),
+            descendants=functions,
+        ))
+    return feature_nodes
+
+
+def _feature_nodes_from_phase_z_v2(
+    workspace: str,
+    scratch: str,
+    feature_node_cls: Any,
+) -> List[Any]:
+    from .phase_z_v2 import build_graph_v2_from_symbols
+
+    result = build_graph_v2_from_symbols(
+        workspace,
+        dry_run=True,
+        scratch_dir=scratch,
+    )
+    symbol_nodes = (
+        list(result.get("nodes") or [])
+        if isinstance(result, dict) and result.get("status") == "ok"
+        else []
+    )
+    return _feature_nodes_from_symbol_nodes(symbol_nodes, workspace, feature_node_cls)
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +503,7 @@ def phase_z_run(
     scratch = getattr(ctx, "scratch_dir", os.path.join(workspace, "docs", "dev", "scratch"))
     project_id = getattr(ctx, "project_id", "aming-claw")
     api_base = getattr(ctx, "api_base", "http://localhost:40000")
+    prefer_symbol_clusters = bool(getattr(ctx, "prefer_symbol_clusters", True))
 
     # --- existing graph as dict ---
     existing_graph = getattr(ctx, "graph", {})
@@ -456,20 +554,45 @@ def phase_z_run(
             FeatureNode as _ClusterFeatureNode,
             group_deltas_by_cluster,
         )
+
         _feature_nodes = []
-        for _d in deltas:
-            if _d.delta_type != "missing_node_high_conf":
-                continue
-            _files = list(_d.files or [])
-            _module = ""
-            if _files:
-                _module = os.path.dirname(_files[0].replace("\\", "/"))
-            _feature_nodes.append(_ClusterFeatureNode(
-                qname=_d.node_id or "",
-                module=_module,
-                primary_files=_files,
-            ))
-        cluster_groups = group_deltas_by_cluster(_feature_nodes)
+        _cluster_source = "none"
+
+        if prefer_symbol_clusters:
+            try:
+                _feature_nodes = _feature_nodes_from_phase_z_v2(
+                    workspace,
+                    scratch,
+                    _ClusterFeatureNode,
+                )
+                cluster_groups = group_deltas_by_cluster(_feature_nodes)
+                _cluster_source = "phase-z-v2-symbols"
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("phase_z: phase_z_v2 cluster source failed (non-blocking): %s", exc)
+
+        if not cluster_groups:
+            _feature_nodes = _feature_nodes_from_deltas(deltas, _ClusterFeatureNode)
+            cluster_groups = group_deltas_by_cluster(_feature_nodes)
+            _cluster_source = "legacy-deltas"
+
+        if not cluster_groups and not prefer_symbol_clusters:
+            try:
+                _feature_nodes = _feature_nodes_from_phase_z_v2(
+                    workspace,
+                    scratch,
+                    _ClusterFeatureNode,
+                )
+                cluster_groups = group_deltas_by_cluster(_feature_nodes)
+                _cluster_source = "phase-z-v2-symbols"
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("phase_z: phase_z_v2 cluster fallback failed (non-blocking): %s", exc)
+
+        log.info(
+            "phase_z: cluster_grouper produced %d clusters from %d feature nodes (source=%s)",
+            len(cluster_groups),
+            len(_feature_nodes),
+            _cluster_source,
+        )
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("phase_z: cluster_grouper failed (non-blocking): %s", exc)
         cluster_groups = []

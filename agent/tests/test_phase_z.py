@@ -68,6 +68,7 @@ def _make_ctx(
         project_id=project_id,
         graph=graph,
         api_base=api_base,
+        prefer_symbol_clusters=False,
     )
 
 

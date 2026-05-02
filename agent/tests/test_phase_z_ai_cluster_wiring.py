@@ -46,6 +46,7 @@ class _Ctx:
         self.scratch_dir = scratch
         self.project_id = "aming-claw-test"
         self.graph = {"nodes": {}}
+        self.prefer_symbol_clusters = False
 
 
 @pytest.fixture

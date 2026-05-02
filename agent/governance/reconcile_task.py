@@ -440,6 +440,7 @@ def handle_diff(conn, project_id, task_id, metadata, prev_result):
                     self.project_id = pid
                     self.graph = graph
                     self.api_base = api_base
+                    self.prefer_symbol_clusters = True
 
             repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
             scratch = os.path.join(repo_root, "docs", "dev", "scratch")
