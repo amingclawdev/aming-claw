@@ -1576,14 +1576,14 @@ def handle_reconcile_deferred_cluster_withdraw(ctx: RequestContext):
             cancelled_task = row[0] or ""
             if cancelled_task:
                 try:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'cancelled' "
-                        "WHERE project_id = ? AND task_id = ? "
-                        "AND status NOT IN ('succeeded','failed','cancelled')",
-                        (project_id, cancelled_task),
+                    from . import task_registry
+                    task_registry.cancel_task(
+                        conn,
+                        cancelled_task,
+                        reason,
+                        project_id=project_id,
                     )
-                    conn.commit()
-                except sqlite3.OperationalError:
+                except Exception:
                     pass
     q.mark_terminal(project_id, fp, "skipped", reason)
     return {"ok": True, "cluster_fingerprint": fp,
@@ -2695,7 +2695,12 @@ def handle_task_cancel(ctx: RequestContext):
     log.info("API task.cancel: project=%s task=%s", project_id, ctx.body.get("task_id", "?"))
     from . import task_registry
     with DBContext(project_id) as conn:
-        return task_registry.cancel_task(conn, ctx.body.get("task_id", ""), ctx.body.get("reason", ""))
+        return task_registry.cancel_task(
+            conn,
+            ctx.body.get("task_id", ""),
+            ctx.body.get("reason", ""),
+            project_id=project_id,
+        )
 
 
 @route("POST", "/api/task/{project_id}/release")

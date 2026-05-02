@@ -2300,6 +2300,24 @@ def on_task_failed(conn, project_id, task_id, task_type, result=None, metadata=N
     """Best-effort workflow-improvement routing for failed task executions."""
     metadata = metadata or {}
     result = result or {}
+    try:
+        row = conn.execute(
+            "SELECT execution_status FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        execution_status = row["execution_status"] if row else ""
+        if execution_status in ("failed", "timed_out", "cancelled"):
+            _reconcile_cluster_terminal_hook(
+                conn,
+                project_id,
+                task_id,
+                task_type,
+                "failed" if execution_status == "timed_out" else execution_status,
+                result,
+                metadata,
+            )
+    except Exception:
+        log.debug("auto_chain: reconcile failure hook failed", exc_info=True)
     effective_reason = (
         reason
         or result.get("error")
@@ -2557,7 +2575,12 @@ def _reconcile_cluster_terminal_hook(
         if status in ("failed", "failed_terminal", "failed_retryable", "stalled"):
             outcome = q.requeue_after_failure(
                 project_id, fp, retry_count_delta=1,
-                reason=(result or {}).get("error_message", str(status)),
+                reason=(
+                    (result or {}).get("error_message")
+                    or (result or {}).get("error")
+                    or (result or {}).get("reason")
+                    or str(status)
+                ),
                 conn=conn,
             )
             return {"hook": "reconcile_cluster_failure", "fingerprint": fp,

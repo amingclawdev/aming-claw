@@ -561,5 +561,127 @@ class TestRecoverStalePidCheck(unittest.TestCase):
         self.assertEqual(row["execution_status"], "claimed")
 
 
+class TestCrashRecoveryStateConsistency(unittest.TestCase):
+    """MF-2026-05-02-009: retry/recover/cancel must keep task rows coherent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _make_conn(self.tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def test_retry_reclaim_clears_previous_terminal_fields(self):
+        from agent.governance.task_registry import create_task, claim_task, complete_task
+
+        task = create_task(self.conn, "proj", "test", task_type="pm")
+        self.conn.commit()
+        claimed, fence = claim_task(self.conn, "proj", "worker-1")
+        self.conn.commit()
+
+        out = complete_task(
+            self.conn,
+            task["task_id"],
+            status="failed",
+            result={"error": "executor_crash_recovery"},
+            error_message="crashed",
+            fence_token=fence,
+        )
+        self.conn.commit()
+        self.assertEqual(out["status"], "queued")
+
+        claimed2, fence2 = claim_task(self.conn, "proj", "worker-2")
+        self.conn.commit()
+        self.assertIsNotNone(claimed2)
+        self.assertTrue(fence2)
+
+        row = self.conn.execute(
+            "SELECT status, execution_status, completed_at, result_json, error_message "
+            "FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(row["status"], "claimed")
+        self.assertEqual(row["execution_status"], "claimed")
+        self.assertIsNone(row["completed_at"])
+        self.assertIsNone(row["result_json"])
+        self.assertEqual(row["error_message"], "")
+        running = self.conn.execute(
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id = ? AND status = 'running'",
+            (task["task_id"],),
+        ).fetchone()[0]
+        self.assertEqual(running, 1)
+
+    def test_cancel_task_updates_execution_status_and_running_attempt(self):
+        from agent.governance.task_registry import create_task, claim_task, cancel_task
+
+        task = create_task(self.conn, "proj", "test", task_type="pm")
+        self.conn.commit()
+        claim_task(self.conn, "proj", "worker-1")
+        self.conn.commit()
+
+        cancel_task(self.conn, task["task_id"], "observer withdraw", project_id="proj")
+        self.conn.commit()
+
+        row = self.conn.execute(
+            "SELECT status, execution_status, completed_at, result_json, error_message "
+            "FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(row["status"], "cancelled")
+        self.assertEqual(row["execution_status"], "cancelled")
+        self.assertIsNotNone(row["completed_at"])
+        self.assertIn("observer withdraw", row["error_message"])
+        running = self.conn.execute(
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id = ? AND status = 'running'",
+            (task["task_id"],),
+        ).fetchone()[0]
+        self.assertEqual(running, 0)
+        attempt = self.conn.execute(
+            "SELECT status, completed_at, error_message FROM task_attempts "
+            "WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(attempt["status"], "cancelled")
+        self.assertIsNotNone(attempt["completed_at"])
+        self.assertIn("observer withdraw", attempt["error_message"])
+
+    def test_dead_pid_recovery_requeues_and_closes_attempt(self):
+        from agent.governance.task_registry import create_task, claim_task, recover_stale_tasks
+
+        task = create_task(self.conn, "proj", "test", task_type="pm")
+        self.conn.commit()
+        claim_task(self.conn, "proj", "worker-1", caller_pid=4999999)
+        self.conn.commit()
+        self.conn.execute(
+            "UPDATE tasks SET metadata_json = json_set(metadata_json, '$.lease_expires_at', "
+            "'2099-01-01T00:00:00Z') WHERE task_id = ?",
+            (task["task_id"],),
+        )
+        self.conn.commit()
+
+        out = recover_stale_tasks(self.conn, "proj")
+        self.conn.commit()
+        self.assertGreaterEqual(out["dead_pid"], 1)
+        row = self.conn.execute(
+            "SELECT status, execution_status, completed_at, result_json, error_message "
+            "FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["execution_status"], "queued")
+        self.assertIsNone(row["completed_at"])
+        self.assertIsNone(row["result_json"])
+        self.assertEqual(row["error_message"], "")
+        attempt = self.conn.execute(
+            "SELECT status, completed_at, result_json FROM task_attempts WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(attempt["status"], "failed")
+        self.assertIsNotNone(attempt["completed_at"])
+        self.assertIn("executor_crash_recovery", attempt["result_json"])
+
+
 if __name__ == "__main__":
     unittest.main()

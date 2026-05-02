@@ -240,10 +240,17 @@ def claim_task(
     # Use caller_pid if provided, otherwise fall back to current process PID
     effective_pid = caller_pid if caller_pid else os.getpid()
 
-    # CAS update: only queued → claimed
+    stale_attempt_result = json.dumps({
+        "error": "attempt_superseded",
+        "reason": "Task was reclaimed after retry or executor recovery",
+    }, ensure_ascii=False)
+
+    # CAS update: only queued -> claimed. Clear terminal fields from a prior
+    # retry/recovery so an active task cannot still look completed.
     result = conn.execute(
         """UPDATE tasks SET status = 'claimed', execution_status = 'claimed',
            assigned_to = ?, started_at = ?, updated_at = ?, attempt_count = ?,
+           completed_at = NULL, result_json = NULL, error_message = '',
            metadata_json = json_set(COALESCE(metadata_json, '{}'),
              '$.fence_token', ?,
              '$.lease_owner', ?,
@@ -258,6 +265,14 @@ def claim_task(
     if result.rowcount == 0:
         return None, ""  # Already claimed by another worker
 
+    conn.execute(
+        """UPDATE task_attempts SET status = 'failed',
+             completed_at = COALESCE(completed_at, ?),
+             result_json = COALESCE(result_json, ?),
+             error_message = COALESCE(error_message, ?)
+           WHERE task_id = ? AND status = 'running'""",
+        (now, stale_attempt_result, "Task reclaimed by a new attempt", task_id),
+    )
     conn.execute(
         """INSERT INTO task_attempts (task_id, attempt_num, status, started_at)
            VALUES (?, ?, 'running', ?)""",
@@ -383,6 +398,14 @@ def complete_task(
                 details={"task_id": task_id, "result_keys": list(result_obj.keys())},
             )
 
+    task_is_terminal = exec_status in TERMINAL_STATUSES
+    task_completed_at = now if task_is_terminal else None
+    task_result_json = (
+        json.dumps(result or {}, ensure_ascii=False) if task_is_terminal else None
+    )
+    task_error_message = error_message if task_is_terminal else ""
+    attempt_result_json = json.dumps(result or {}, ensure_ascii=False)
+
     def _do_complete_updates():
         conn.execute(
             """UPDATE tasks SET status = ?, execution_status = ?,
@@ -391,16 +414,16 @@ def complete_task(
                result_json = ?, error_message = ?
                WHERE task_id = ?""",
             (exec_status, exec_status, notify_status,
-             now, now,
-             json.dumps(result or {}, ensure_ascii=False), error_message,
+             task_completed_at, now,
+             task_result_json, task_error_message,
              task_id),
         )
         conn.execute(
             """UPDATE task_attempts SET status = ?, completed_at = ?,
                result_json = ?, error_message = ?
-               WHERE task_id = ? AND status = 'running'""",
-            (status, now, json.dumps(result or {}, ensure_ascii=False),
-             error_message, task_id),
+               WHERE task_id = ? AND attempt_num = ? AND status = 'running'""",
+            (status, now, attempt_result_json, error_message,
+             task_id, int(row["attempt_count"] or 0)),
         )
 
     _retry_on_db_lock(_do_complete_updates, _context=f"complete_task({task_id})")
@@ -664,20 +687,55 @@ def get_observer_mode(conn: sqlite3.Connection, project_id: str) -> bool:
     return _is_observer_mode(conn, project_id)
 
 
-def cancel_task(conn: sqlite3.Connection, task_id: str, reason: str = "") -> dict:
+def cancel_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str = "",
+    *,
+    project_id: str = "",
+) -> dict:
     """Cancel a task. Terminal state — no auto-chain, no retry."""
     now = _utc_iso()
-    row = conn.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT status, type, metadata_json FROM tasks WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
     if not row:
         from .errors import GovernanceError
         raise GovernanceError(f"Task not found: {task_id}", 404)
+    cancel_reason = reason or "Cancelled by observer"
+    cancel_result = json.dumps({
+        "error": "cancelled",
+        "reason": cancel_reason,
+    }, ensure_ascii=False)
     conn.execute(
         """UPDATE tasks SET status = 'cancelled', execution_status = 'cancelled',
-           completed_at = ?, updated_at = ?, error_message = ?
+           completed_at = ?, updated_at = ?, result_json = COALESCE(result_json, ?),
+           error_message = ?
            WHERE task_id = ?""",
-        (now, now, reason or "Cancelled by observer", task_id),
+        (now, now, cancel_result, cancel_reason, task_id),
     )
-    log.info("task.cancelled: %s reason=%s", task_id, reason or "observer")
+    conn.execute(
+        """UPDATE task_attempts SET status = 'cancelled', completed_at = ?,
+             result_json = COALESCE(result_json, ?),
+             error_message = COALESCE(error_message, ?)
+           WHERE task_id = ? AND status = 'running'""",
+        (now, cancel_result, cancel_reason, task_id),
+    )
+    if project_id:
+        try:
+            from . import auto_chain
+            auto_chain.on_task_completed(
+                conn, project_id, task_id,
+                task_type=row["type"] or "task",
+                status="cancelled",
+                result=json.loads(cancel_result),
+                metadata=json.loads(row["metadata_json"] or "{}"),
+            )
+        except Exception:
+            log.debug("task.cancelled: auto_chain cancel hook failed for %s",
+                      task_id, exc_info=True)
+    log.info("task.cancelled: %s reason=%s", task_id, cancel_reason)
     return {"task_id": task_id, "status": "cancelled"}
 
 
@@ -729,11 +787,38 @@ def update_progress(conn: sqlite3.Connection, task_id: str,
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process with the given PID is still running.
 
-    Uses os.kill(pid, 0) which checks existence without sending a signal.
+    Uses a Windows-safe process handle query on Windows, otherwise
+    os.kill(pid, 0), which checks existence without sending a signal.
     Returns False for pid <= 0.
     """
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            process_query_limited_information = 0x1000
+            still_active = 259
+            handle = kernel32.OpenProcess(
+                process_query_limited_information,
+                False,
+                int(pid),
+            )
+            if not handle:
+                # Access denied means the process exists but is not queryable by
+                # this user; any other error is treated as not alive.
+                return ctypes.get_last_error() == 5
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True
@@ -768,9 +853,25 @@ def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
 
     recovered = 0
     for row in rows:
+        recovery_result = json.dumps({
+            "error": "executor_crash_recovery",
+            "reason": "Lease expired while task was claimed/running",
+        }, ensure_ascii=False)
         conn.execute(
-            "UPDATE tasks SET execution_status = 'queued', status = 'queued' WHERE task_id = ?",
-            (row["task_id"],),
+            """UPDATE task_attempts SET status = 'failed',
+                 completed_at = COALESCE(completed_at, ?),
+                 result_json = COALESCE(result_json, ?),
+                 error_message = COALESCE(error_message, ?)
+               WHERE task_id = ? AND status = 'running'""",
+            (now, recovery_result, "Lease expired during execution",
+             row["task_id"]),
+        )
+        conn.execute(
+            """UPDATE tasks SET execution_status = 'queued', status = 'queued',
+                 completed_at = NULL, result_json = NULL, error_message = '',
+                 updated_at = ?
+               WHERE task_id = ?""",
+            (now, row["task_id"]),
         )
         recovered += 1
         log.info("Recovered stale task (expired lease): %s", row["task_id"])
@@ -797,9 +898,25 @@ def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
         if pid == 0:
             continue  # Unknown PID, skip
         if not _is_pid_alive(pid):
+            recovery_result = json.dumps({
+                "error": "executor_crash_recovery",
+                "reason": f"Worker PID {pid} died while task was claimed/running",
+            }, ensure_ascii=False)
             conn.execute(
-                "UPDATE tasks SET execution_status = 'queued', status = 'queued' WHERE task_id = ?",
-                (row["task_id"],),
+                """UPDATE task_attempts SET status = 'failed',
+                     completed_at = COALESCE(completed_at, ?),
+                     result_json = COALESCE(result_json, ?),
+                     error_message = COALESCE(error_message, ?)
+                   WHERE task_id = ? AND status = 'running'""",
+                (now, recovery_result, f"Worker PID {pid} is not alive",
+                 row["task_id"]),
+            )
+            conn.execute(
+                """UPDATE tasks SET execution_status = 'queued', status = 'queued',
+                     completed_at = NULL, result_json = NULL, error_message = '',
+                     updated_at = ?
+                   WHERE task_id = ?""",
+                (now, row["task_id"]),
             )
             pid_recovered += 1
             log.info("Recovered stale task (dead PID %d): %s", pid, row["task_id"])

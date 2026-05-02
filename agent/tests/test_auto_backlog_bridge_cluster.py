@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -170,6 +171,56 @@ def test_terminal_withdrawn_hook(conn):
     ).fetchone()
     assert row[0] == "skipped"
     assert row[1] == "observer_withdraw"
+
+
+def test_on_task_failed_terminal_updates_deferred_queue(conn):
+    """Terminal root failure must move reconcile deferred row out of in_chain."""
+    from governance import auto_chain
+    from governance.task_registry import create_task
+
+    q.enqueue_or_lookup(PROJECT_ID, "fp-fail1", payload={}, run_id="r", conn=conn)
+    q.mark_filing(PROJECT_ID, "fp-fail1", conn=conn)
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "cluster_fingerprint": "fp-fail1",
+    }
+    task = create_task(
+        conn,
+        PROJECT_ID,
+        "pm failed",
+        task_type="pm",
+        metadata=metadata,
+        max_attempts=1,
+    )
+    conn.execute(
+        "UPDATE tasks SET status = 'failed', execution_status = 'failed' "
+        "WHERE task_id = ?",
+        (task["task_id"],),
+    )
+    q.mark_in_chain(PROJECT_ID, "fp-fail1", task["task_id"], conn=conn)
+
+    with mock.patch(
+        "governance.auto_chain._maybe_create_workflow_improvement_task",
+        return_value=None,
+    ):
+        auto_chain.on_task_failed(
+            conn,
+            PROJECT_ID,
+            task["task_id"],
+            "pm",
+            result={"error": "executor_crash_recovery"},
+            metadata=metadata,
+            reason="executor crashed",
+        )
+
+    row = conn.execute(
+        "SELECT status, retry_count, terminal_reason FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (PROJECT_ID, "fp-fail1"),
+    ).fetchone()
+    assert row[0] == "failed_retryable"
+    assert row[1] == 1
+    assert "executor_crash_recovery" in row[2]
 
 
 def test_compose_cluster_bug_id_format():
