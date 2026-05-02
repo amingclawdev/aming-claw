@@ -543,6 +543,14 @@ def generate_graph(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Public alias for CR1 — language_adapters.python_adapter relies on the same
+# AST-based import parser.  Kept as a one-line re-export to minimise blast
+# radius (CR1 R10).
+# ---------------------------------------------------------------------------
+parse_python_imports = _parse_python_imports
+
+
 def save_graph_atomic(graph, path: str) -> None:
     """Save graph to path atomically via temp-file-then-rename (R7)."""
     import networkx as nx

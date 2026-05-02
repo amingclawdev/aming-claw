@@ -446,6 +446,31 @@ def phase_z_run(
     # --- group into epics (R3) ---
     epic_groups = group_into_epics(deltas)
 
+    # --- CR1 R9: also produce 5-signal cluster_groups (additive, retains epic_groups) ---
+    cluster_groups: list = []
+    try:
+        from .cluster_grouper import (
+            FeatureNode as _ClusterFeatureNode,
+            group_deltas_by_cluster,
+        )
+        _feature_nodes = []
+        for _d in deltas:
+            if _d.delta_type != "missing_node_high_conf":
+                continue
+            _files = list(_d.files or [])
+            _module = ""
+            if _files:
+                _module = os.path.dirname(_files[0].replace("\\", "/"))
+            _feature_nodes.append(_ClusterFeatureNode(
+                qname=_d.node_id or "",
+                module=_module,
+                primary_files=_files,
+            ))
+        cluster_groups = group_deltas_by_cluster(_feature_nodes)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("phase_z: cluster_grouper failed (non-blocking): %s", exc)
+        cluster_groups = []
+
     # --- write artifacts (R8) ---
     candidate_path = write_candidate_artifact(scratch, candidate_graph)
     report_path = write_diff_report(scratch, deltas, epic_groups)
@@ -461,6 +486,7 @@ def phase_z_run(
     return {
         "deltas": deltas,
         "epic_groups": epic_groups,
+        "cluster_groups": cluster_groups,
         "artifacts": {
             "candidate_graph": candidate_path,
             "diff_report": report_path,
