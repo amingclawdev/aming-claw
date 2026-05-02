@@ -22,6 +22,9 @@ from typing import Any, Dict, List, Optional
 
 import urllib.request
 
+from .. import ai_cluster_processor
+from ..llm_cache import LLMCache
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -471,6 +474,65 @@ def phase_z_run(
         log.warning("phase_z: cluster_grouper failed (non-blocking): %s", exc)
         cluster_groups = []
 
+    # --- CR2: feed each cluster through ai_cluster_processor and attach reports ---
+    # R4: build a single LLMCache shared across the whole cluster loop so that
+    # cache hits short-circuit redundant LLM calls. Construction is wrapped in
+    # try/except — failure must not break phase_z (cache=None is supported).
+    _llm_cache = None
+    try:
+        _cache_root = scratch if scratch else workspace
+        if _cache_root:
+            _llm_cache = LLMCache(_cache_root)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("phase_z: LLMCache construction failed (non-blocking): %s", exc)
+        _llm_cache = None
+
+    cluster_payloads: list = []
+    for _group in cluster_groups:
+        _entries = list(getattr(_group, "entries", []) or [])
+        _entry = _entries[0] if _entries else None
+        # R6: graceful degradation around the per-cluster invocation.
+        try:
+            _report = ai_cluster_processor.process_cluster_with_ai(
+                cluster=_entries,
+                entry=_entry,
+                workspace=workspace,
+                use_ai=enable_llm_enrichment,
+                cache=_llm_cache,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(
+                "phase_z: process_cluster_with_ai failed for fingerprint=%s: %s",
+                getattr(_group, "cluster_fingerprint", None),
+                exc,
+            )
+            _qname = getattr(_entry, "qname", "") if _entry is not None else ""
+            _report = ai_cluster_processor.ClusterReport(
+                feature_name=str(_qname or ""),
+                purpose=None,
+                expected_test_files=[],
+                expected_doc_sections=[],
+                dead_code_candidates=[],
+                missing_tests=[],
+                gap_explanation=None,
+                doc_validation=None,
+                enrichment_status="ai_unavailable",
+            )
+
+        # R3: stamp the cluster fingerprint so downstream consumers can join.
+        try:
+            _report.cluster_fingerprint = getattr(_group, "cluster_fingerprint", None)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        cluster_payloads.append({
+            "cluster_fingerprint": getattr(_group, "cluster_fingerprint", None),
+            "entries": [getattr(e, "qname", "") for e in _entries],
+            "primary_files": list(getattr(_group, "primary_files", []) or []),
+            "secondary_files": list(getattr(_group, "secondary_files", []) or []),
+            "report": _report.to_dict(),
+        })
+
     # --- write artifacts (R8) ---
     candidate_path = write_candidate_artifact(scratch, candidate_graph)
     report_path = write_diff_report(scratch, deltas, epic_groups)
@@ -486,7 +548,10 @@ def phase_z_run(
     return {
         "deltas": deltas,
         "epic_groups": epic_groups,
-        "cluster_groups": cluster_groups,
+        # CR2 R5: cluster_groups is now a list of payload dicts (one per cluster)
+        # carrying the AI-enriched ClusterReport (as dict) joined to its source
+        # ClusterGroup via cluster_fingerprint.
+        "cluster_groups": cluster_payloads,
         "artifacts": {
             "candidate_graph": candidate_path,
             "diff_report": report_path,
