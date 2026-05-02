@@ -2461,6 +2461,63 @@ def _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
     return True
 
 
+def _reconcile_cluster_terminal_hook(
+    conn, project_id, task_id, task_type, status, result, metadata,
+):
+    """CR3 R6 hook — bridge merge/cancel/stall events to reconcile_deferred_queue.
+
+    When a chain root carries metadata.operation_type=='reconcile-cluster',
+    transitions the deferred queue row to its terminal state:
+
+        * merge succeeded            -> mark_terminal(... 'resolved', 'merged@<sha>')
+        * any task failed_terminal   -> mark_terminal(... 'failed_terminal' or
+                                                       'failed_retryable' depending
+                                                       on retry_count)
+        * observer cancel            -> mark_terminal(... 'skipped')
+
+    Best-effort: never raises; logs at DEBUG when the hook can't act.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("operation_type") != "reconcile-cluster":
+        return None
+    fp = metadata.get("cluster_fingerprint") or ""
+    if not fp:
+        return None
+    try:
+        from . import reconcile_deferred_queue as q
+    except Exception as exc:  # noqa: BLE001
+        log.debug("reconcile-cluster hook: queue import failed: %s", exc)
+        return None
+
+    try:
+        if task_type == "merge" and status == "succeeded":
+            commit = (result or {}).get("merge_commit") or (result or {}).get("commit") or ""
+            q.mark_terminal(project_id, fp, "resolved", f"merged@{commit}",
+                            conn=conn)
+            return {"hook": "reconcile_cluster_resolved", "fingerprint": fp}
+        if status == "cancelled" or (
+            isinstance(metadata.get("cancel_reason"), str) and metadata.get("cancel_reason")
+        ):
+            q.mark_terminal(
+                project_id, fp, "skipped",
+                metadata.get("cancel_reason") or "observer_cancel",
+                conn=conn,
+            )
+            return {"hook": "reconcile_cluster_skipped", "fingerprint": fp}
+        if status in ("failed", "failed_terminal", "failed_retryable", "stalled"):
+            outcome = q.requeue_after_failure(
+                project_id, fp, retry_count_delta=1,
+                reason=(result or {}).get("error_message", str(status)),
+                conn=conn,
+            )
+            return {"hook": "reconcile_cluster_failure", "fingerprint": fp,
+                    "queue_outcome": outcome}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("reconcile-cluster hook: mark_terminal failed: %s", exc)
+    return None
+
+
 def on_task_completed(conn, project_id, task_id, task_type, status, result, metadata):
     """Called by complete_task(). Dispatches next stage if gate passes.
 
@@ -2469,6 +2526,17 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
 
     Returns dict with chain result, or None if not a chain-eligible task.
     """
+    # CR3 R6 — reconcile-cluster terminal hook fires for ANY status (incl.
+    # failed/cancelled), not only 'succeeded' — and on every event (merge,
+    # observer cancel, stall) for the deferred queue.  Calls mark_terminal()
+    # in the queue module.  Pure side-effect; does not gate dispatch.
+    try:
+        _reconcile_cluster_terminal_hook(
+            conn, project_id, task_id, task_type, status, result, metadata,
+        )
+    except Exception:
+        log.debug("reconcile-cluster hook raised; ignoring", exc_info=True)
+
     if status != "succeeded":
         return None
     # R2: Reconcile tasks use separate stage map, bypass all governance gates

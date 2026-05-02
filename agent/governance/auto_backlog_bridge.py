@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "compose_bug_id", "file_remediation_plan",
+    "compose_cluster_bug_id", "file_cluster_as_backlog",
     "DEFAULT_CREATOR_ALLOWLIST", "MAX_DUP_SUFFIX",
 ]
 
@@ -194,3 +195,133 @@ def file_remediation_plan(
                                      "reason": "create_no_task_id"})
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# CR3 — Reconcile-cluster backlog filing (R4)
+# ---------------------------------------------------------------------------
+
+
+def compose_cluster_bug_id(
+    run_id: str, cluster_fingerprint: str, slug_hint: str = "cluster",
+) -> str:
+    """Compose the canonical cluster bug_id.
+
+    Format: ``OPT-BACKLOG-RECONCILE-{run_id[:8]}-CLUSTER-{cluster_fingerprint[:8]}-{slug}``
+    """
+    rid = (run_id or "")[:8]
+    fp = (cluster_fingerprint or "")[:8]
+    return (
+        f"OPT-BACKLOG-RECONCILE-{rid}-CLUSTER-{fp}-{_slug(slug_hint)}"
+    )
+
+
+def file_cluster_as_backlog(
+    cluster_group: dict,
+    cluster_report: dict,
+    run_id: str,
+    project_id: str,
+    *,
+    creator: str = "reconcile-bridge",
+    http_client: Any = None,
+    operation_type: str = "reconcile-cluster",
+) -> dict:
+    """File one ``type='pm'`` task per cluster group (R4).
+
+    POSTs ``/api/task/{project_id}/create`` with::
+
+        {
+          "type": "pm",                       # 4-gate exempt path
+          "metadata": {
+            "operation_type": "reconcile-cluster",
+            "cluster_fingerprint": "...",
+            "cluster_payload": {...},
+            "cluster_report": {...},
+            "bug_id": "OPT-BACKLOG-RECONCILE-{run_id[:8]}-CLUSTER-{fp[:8]}-{slug}"
+          },
+          ...
+        }
+
+    Returns a dict::
+
+        {"backlog_id": <bug_id>, "task_id": <task_id|"">,
+         "skipped": <bool>, "reason": <str>, "filed": <bool>}
+    """
+    cluster_group = cluster_group or {}
+    cluster_report = cluster_report or {}
+    cluster_fp = (
+        cluster_group.get("cluster_fingerprint")
+        or cluster_report.get("cluster_fingerprint")
+        or ""
+    )
+    slug_hint = (
+        cluster_group.get("slug")
+        or cluster_report.get("title")
+        or cluster_report.get("purpose")
+        or "cluster"
+    )
+    backlog_id = compose_cluster_bug_id(run_id, cluster_fp, slug_hint)
+
+    out: dict[str, Any] = {
+        "backlog_id": backlog_id,
+        "task_id": "",
+        "filed": False,
+        "skipped": False,
+        "reason": "",
+    }
+
+    if not _is_allowed_creator(creator):
+        out["skipped"] = True
+        out["reason"] = "unauthorized_creator"
+        log.warning(
+            "auto_backlog_bridge: cluster_filing rejected unauthorized_creator=%r",
+            creator,
+        )
+        return out
+
+    if http_client is None:
+        http_client = _DefaultHttpClient()
+
+    metadata = {
+        "bug_id": backlog_id,
+        "operation_type": operation_type,
+        "cluster_fingerprint": cluster_fp,
+        "cluster_payload": cluster_group,
+        "cluster_report": cluster_report,
+        "reconcile_run_id": run_id,
+    }
+    primary_files = list(
+        cluster_group.get("primary_files")
+        or cluster_report.get("expected_doc_sections")
+        or []
+    )
+    target_files = [str(f) for f in primary_files]
+
+    payload = {
+        "type": "pm",
+        "prompt": (
+            cluster_group.get("prompt")
+            or f"Reconcile cluster {cluster_fp[:8]} — produce PRD"
+        ),
+        "target_files": target_files,
+        "metadata": metadata,
+        "created_by": creator,
+    }
+
+    try:
+        resp = http_client.post(f"/api/task/{project_id}/create", payload)
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"create_failed: {exc!s}"
+        log.warning(
+            "auto_backlog_bridge: cluster_filing POST failed bug=%s err=%s",
+            backlog_id, exc,
+        )
+        return out
+
+    task_id = str(resp.get("task_id") or "") if isinstance(resp, dict) else ""
+    if task_id:
+        out["task_id"] = task_id
+        out["filed"] = True
+        return out
+    out["reason"] = "create_no_task_id"
+    return out

@@ -1245,6 +1245,202 @@ def handle_reconcile_session_rollback(ctx: RequestContext):
     }
 
 
+# ---------------------------------------------------------------------------
+# CR3 — Reconcile Deferred-Cluster Queue HTTP API (R7)
+# ---------------------------------------------------------------------------
+
+
+def _deferred_cluster_row_to_dict(row) -> dict:
+    if row is None:
+        return {}
+    out = {}
+    for key in row.keys():
+        out[key] = row[key]
+    if isinstance(out.get("payload_json"), str):
+        try:
+            out["payload"] = json.loads(out["payload_json"]) if out["payload_json"] else {}
+        except Exception:
+            out["payload"] = {}
+    return out
+
+
+@route("GET", "/api/reconcile/{project_id}/deferred-clusters")
+def handle_reconcile_deferred_clusters_list(ctx: RequestContext):
+    """List queue rows; supports ?status=&priority= filters."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    status_filter = ctx.query.get("status")
+    priority_filter = ctx.query.get("priority")
+    sql = (
+        "SELECT * FROM reconcile_deferred_clusters WHERE project_id = ?"
+    )
+    args: list = [project_id]
+    if status_filter:
+        sql += " AND status = ?"
+        args.append(status_filter)
+    if priority_filter is not None and priority_filter != "":
+        try:
+            sql += " AND priority = ?"
+            args.append(int(priority_filter))
+        except (TypeError, ValueError):
+            pass
+    sql += " ORDER BY priority ASC, first_seen_at ASC"
+
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        q.ensure_schema(conn)
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    items = [_deferred_cluster_row_to_dict(r) for r in rows]
+    return {"clusters": items, "count": len(items)}
+
+
+@route("GET", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}")
+def handle_reconcile_deferred_cluster_get(ctx: RequestContext):
+    """Get a single deferred-cluster row by fingerprint."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        q.ensure_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM reconcile_deferred_clusters "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (project_id, fp),
+        ).fetchone()
+    if row is None:
+        return 404, {"error": "deferred_cluster_not_found",
+                     "cluster_fingerprint": fp}
+    return {"cluster": _deferred_cluster_row_to_dict(row)}
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/skip")
+def handle_reconcile_deferred_cluster_skip(ctx: RequestContext):
+    """Mark a deferred-cluster as skipped with a reason."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    reason = str(body.get("reason") or "observer_skipped")
+    changed = q.mark_terminal(project_id, fp, "skipped", reason)
+    return {"ok": bool(changed), "cluster_fingerprint": fp, "status": "skipped",
+            "reason": reason}
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/file-now")
+def handle_reconcile_deferred_cluster_file_now(ctx: RequestContext):
+    """Force-file a queued cluster as a backlog/PM task immediately."""
+    from . import reconcile_deferred_queue as q
+    from . import auto_backlog_bridge
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        q.ensure_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM reconcile_deferred_clusters "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (project_id, fp),
+        ).fetchone()
+    if row is None:
+        return 404, {"error": "deferred_cluster_not_found",
+                     "cluster_fingerprint": fp}
+    rec = _deferred_cluster_row_to_dict(row)
+    payload = rec.get("payload") or {}
+    run_id = rec.get("run_id") or ""
+    q.mark_filing(project_id, fp)
+    try:
+        out = auto_backlog_bridge.file_cluster_as_backlog(
+            cluster_group=payload,
+            cluster_report=payload.get("cluster_report") or {},
+            run_id=run_id,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return 500, {"error": "file_cluster_failed", "message": str(exc)}
+    if out.get("filed") and out.get("task_id"):
+        q.mark_in_chain(project_id, fp, out["task_id"], bug_id=out.get("backlog_id"))
+    return {"result": out, "cluster_fingerprint": fp}
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/withdraw")
+def handle_reconcile_deferred_cluster_withdraw(ctx: RequestContext):
+    """Withdraw a filed cluster: cancels filed root_task_id and marks skipped."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    reason = str(body.get("reason") or "observer_withdraw")
+    cancelled_task: str = ""
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        q.ensure_schema(conn)
+        row = conn.execute(
+            "SELECT root_task_id FROM reconcile_deferred_clusters "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (project_id, fp),
+        ).fetchone()
+        if row is not None:
+            cancelled_task = row[0] or ""
+            if cancelled_task:
+                try:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'cancelled' "
+                        "WHERE project_id = ? AND task_id = ? "
+                        "AND status NOT IN ('succeeded','failed','cancelled')",
+                        (project_id, cancelled_task),
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+    q.mark_terminal(project_id, fp, "skipped", reason)
+    return {"ok": True, "cluster_fingerprint": fp,
+            "cancelled_root_task_id": cancelled_task, "reason": reason}
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/retry")
+def handle_reconcile_deferred_cluster_retry(ctx: RequestContext):
+    """Retry a failed_retryable cluster.  When body.force=True resets retry_count to 0."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    force = bool(body.get("force", False))
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        q.ensure_schema(conn)
+        if force:
+            cur = conn.execute(
+                "UPDATE reconcile_deferred_clusters SET status = 'queued', "
+                "  retry_count = 0, next_retry_at = NULL "
+                "WHERE project_id = ? AND cluster_fingerprint = ?",
+                (project_id, fp),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE reconcile_deferred_clusters SET status = 'queued', "
+                "  next_retry_at = NULL "
+                "WHERE project_id = ? AND cluster_fingerprint = ? "
+                "  AND status IN ('failed_retryable','expired')",
+                (project_id, fp),
+            )
+        conn.commit()
+        changed = (cur.rowcount or 0) > 0
+    return {"ok": changed, "cluster_fingerprint": fp,
+            "force": force, "status": "queued" if changed else "unchanged"}
+
+
 @route("POST", "/api/wf/{project_id}/node-create")
 def handle_node_create(ctx: RequestContext):
     """Create a single node. System allocates display_id.
