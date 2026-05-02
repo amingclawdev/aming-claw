@@ -165,6 +165,93 @@ def test_start_planned_to_in_progress(_mock_db_mf_planned, _mock_audit):
     assert result["ok"] is True
     assert result["status"] == "MF_IN_PROGRESS"
     assert result["mf_id"] == "MF-2026-04-26-001"
+    assert result["mf_type"] == "chain_rescue"
+    assert result["bypass_policy"]["graph_governance"] == "enforce"
+    assert result["bypass_policy"]["bypass_graph_governance"] is False
+
+
+def test_start_system_recovery_bypasses_graph(_mock_db_mf_planned, _mock_audit):
+    """System-recovery MF is the explicit graph-bypass profile."""
+    from agent.governance.server import handle_backlog_start_mf
+
+    ctx = _make_ctx(
+        mf_id="MF-2026-04-26-001",
+        actor="test-user",
+        mf_type="system_recovery",
+        observer_authorized=True,
+        reason="Repair governance runtime while graph is unreliable",
+    )
+
+    result = handle_backlog_start_mf(ctx)
+
+    assert result["ok"] is True
+    assert result["mf_type"] == "system_recovery"
+    assert result["bypass_policy"]["graph_governance"] == "bypass"
+    assert result["bypass_policy"]["bypass_graph_governance"] is True
+
+
+def test_start_chain_rescue_rejects_graph_bypass(_mock_db_mf_planned, _mock_audit):
+    """Chain-rescue MF remains graph-governed; bypass requires system_recovery."""
+    from agent.governance.errors import GovernanceError
+    from agent.governance.server import handle_backlog_start_mf
+
+    ctx = _make_ctx(
+        mf_id="MF-2026-04-26-001",
+        actor="test-user",
+        mf_type="chain_rescue",
+        bypass_graph_governance=True,
+    )
+
+    with pytest.raises(GovernanceError) as exc_info:
+        handle_backlog_start_mf(ctx)
+
+    assert exc_info.value.status == 422
+    assert "system_recovery" in exc_info.value.message
+
+
+def test_apply_mf_takeover_holds_current_task():
+    """MF takeover can hold the current unfinished chain task."""
+    import sqlite3
+    from agent.governance.server import _apply_mf_takeover
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE tasks (
+             task_id TEXT PRIMARY KEY,
+             project_id TEXT,
+             status TEXT,
+             execution_status TEXT,
+             metadata_json TEXT,
+             error_message TEXT,
+             completed_at TEXT,
+             updated_at TEXT
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, project_id, status, execution_status, metadata_json) "
+        "VALUES ('task-current', 'test-proj', 'queued', 'queued', '{}')"
+    )
+
+    takeover = _apply_mf_takeover(
+        conn,
+        "test-proj",
+        "BUG-001",
+        {
+            "mf_id": "MF-2026-04-26-001",
+            "actor": "test-user",
+            "takeover_action": "hold_current_chain",
+            "reason": "observer takes over failed chain",
+        },
+        {"current_task_id": "task-current"},
+        {"mf_type": "chain_rescue"},
+    )
+
+    row = conn.execute("SELECT status, execution_status, metadata_json FROM tasks WHERE task_id='task-current'").fetchone()
+    assert takeover["outcome"] == "observer_hold"
+    assert row["status"] == "observer_hold"
+    assert row["execution_status"] == "observer_hold"
+    assert "mf_takeover" in row["metadata_json"]
 
 
 def test_start_wrong_mf_id(_mock_audit):

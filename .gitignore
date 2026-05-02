@@ -152,6 +152,8 @@ agent/governance/governance.db
 
 # Per-project chain history cache (generated at runtime)
 agent/governance/chain_history/
+agent/governance/graph.rebase.overlay.json.bak
+phase_z_llm_cache/
 
 # Observer / auto-chain runtime-state files (must not be staged)
 .recent-tasks.json

@@ -33,6 +33,7 @@ from . import project_service
 from . import memory_service
 from . import audit_service
 from . import reconcile_session
+from . import backlog_runtime
 from .idempotency import check_idempotency, store_idempotency
 from .redis_client import get_redis
 from .models import Evidence, MemoryEntry, NodeDef
@@ -73,6 +74,122 @@ SERVER_PID = os.getpid()
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _row_get(row, key: str, default=""):
+    if row is None:
+        return default
+    try:
+        value = row[key]
+    except Exception:
+        if isinstance(row, dict):
+            value = row.get(key, default)
+        else:
+            value = default
+    return default if value is None else value
+
+
+def _apply_mf_takeover(conn, project_id: str, bug_id: str, body: dict, row, policy: dict) -> dict:
+    """Hold/cancel an unfinished chain task when MF takes ownership."""
+    current_task_id = str(_row_get(row, "current_task_id", "") or "")
+    task_id = (
+        str(body.get("taken_over_task_id") or body.get("takeover_task_id") or current_task_id or "")
+        .strip()
+    )
+    action = str(body.get("takeover_action") or "").strip().lower()
+    if not action and task_id:
+        action = "hold_current_chain"
+    if not action:
+        action = "none"
+
+    allowed = {"none", "hold_current_chain", "cancel_current_chain"}
+    if action not in allowed:
+        raise GovernanceError(
+            "invalid_takeover_action",
+            f"takeover_action must be one of {sorted(allowed)}, got: {action}",
+            422,
+        )
+    takeover = {
+        "action": action,
+        "taken_over_task_id": task_id,
+        "mf_id": body.get("mf_id", ""),
+        "mf_type": policy.get("mf_type", ""),
+        "actor": body.get("actor", "api"),
+        "reason": body.get("takeover_reason") or body.get("reason", ""),
+        "ts": _utc_now(),
+    }
+    if action == "none":
+        takeover["outcome"] = "none"
+        return takeover
+    if not task_id:
+        takeover["outcome"] = "no_task_id"
+        return takeover
+
+    task_row = conn.execute(
+        "SELECT task_id, status, execution_status, metadata_json FROM tasks "
+        "WHERE project_id = ? AND task_id = ?",
+        (project_id, task_id),
+    ).fetchone()
+    if not task_row:
+        takeover["outcome"] = "task_missing"
+        return takeover
+
+    prior_status = str(_row_get(task_row, "status", "") or "")
+    prior_exec = str(_row_get(task_row, "execution_status", prior_status) or prior_status)
+    takeover["prior_status"] = prior_status
+    takeover["prior_execution_status"] = prior_exec
+
+    task_meta = backlog_runtime.parse_json_object(_row_get(task_row, "metadata_json", "{}"))
+    task_meta["mf_takeover"] = takeover
+    task_meta["mf_superseded"] = True
+    task_meta["mf_type"] = policy.get("mf_type", "")
+    task_meta["bug_id"] = task_meta.get("bug_id") or bug_id
+
+    terminal = {"succeeded", "failed", "cancelled", "timed_out", "design_mismatch"}
+    if prior_exec in terminal or prior_status in terminal:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE task_id = ?",
+            (json.dumps(task_meta, ensure_ascii=False), _utc_now(), task_id),
+        )
+        takeover["outcome"] = "already_terminal"
+        return takeover
+
+    if action == "cancel_current_chain":
+        new_status = "cancelled"
+        error_message = takeover["reason"] or "Cancelled by MF takeover"
+        conn.execute(
+            """UPDATE tasks
+               SET status = ?, execution_status = ?, completed_at = ?,
+                   updated_at = ?, error_message = ?, metadata_json = ?
+               WHERE task_id = ?""",
+            (
+                new_status,
+                new_status,
+                _utc_now(),
+                _utc_now(),
+                error_message,
+                json.dumps(task_meta, ensure_ascii=False),
+                task_id,
+            ),
+        )
+    else:
+        new_status = "observer_hold"
+        conn.execute(
+            """UPDATE tasks
+               SET status = ?, execution_status = ?, updated_at = ?,
+                   error_message = ?, metadata_json = ?
+               WHERE task_id = ?""",
+            (
+                new_status,
+                new_status,
+                _utc_now(),
+                takeover["reason"] or "Held by MF takeover",
+                json.dumps(task_meta, ensure_ascii=False),
+                task_id,
+            ),
+        )
+    takeover["outcome"] = new_status
+    return takeover
 
 
 # ---------------------------------------------------------------------------
@@ -2296,7 +2413,7 @@ def handle_task_create(ctx: RequestContext):
             try:
                 with DBContext(project_id) as _chk_conn:
                     _row = _chk_conn.execute(
-                        "SELECT status FROM backlog_bugs WHERE bug_id = ?",
+                        "SELECT status, bypass_policy_json FROM backlog_bugs WHERE bug_id = ?",
                         (_bug_id,),
                     ).fetchone()
             except Exception:
@@ -2312,14 +2429,19 @@ def handle_task_create(ctx: RequestContext):
                         f"or set force_no_backlog=true with force_reason to bypass.",
                         status=422,
                     )
-            elif _row[0] not in ("OPEN", "IN_PROGRESS"):
-                # R2: bug_id status must be OPEN or IN_PROGRESS
-                _bug_status = _row[0]
-                _msg = (f"bug_id {_bug_id} is not OPEN (current status={_bug_status}); "
+            elif _row["status"] not in ("OPEN", "IN_PROGRESS", "MF_IN_PROGRESS"):
+                # R2: bug_id status must be active; MF_IN_PROGRESS is allowed
+                # because manual fixes are now audited through backlog runtime.
+                _bug_status = _row["status"]
+                _msg = (f"bug_id {_bug_id} is not active (current status={_bug_status}); "
                         f"cannot attach new work to closed bug")
                 log.warning("backlog_gate: %s (mode=%s)", _msg, _enforce_mode)
                 if _enforce_mode == "strict":
                     raise GovernanceError("bug_id not open", _msg, status=422)
+            else:
+                _policy = backlog_runtime.parse_json_object(_row["bypass_policy_json"])
+                if _policy:
+                    metadata = backlog_runtime.merge_policy_into_metadata(metadata, _policy)
 
         # R1: parent_task_id requirement for non-pm code-change types
         _PARENT_REQUIRED_TYPES = ("dev", "test", "qa", "gatekeeper", "merge", "deploy")
@@ -2392,6 +2514,18 @@ def handle_task_create(ctx: RequestContext):
             max_attempts=int(ctx.body.get("max_attempts", 3)),
             metadata=metadata,
         )
+        _created_bug_id = metadata.get("bug_id", "")
+        if _created_bug_id:
+            backlog_runtime.update_backlog_runtime(
+                conn,
+                _created_bug_id,
+                f"{task_type}_queued",
+                project_id=project_id,
+                task_id=result.get("task_id", ""),
+                task_type=task_type,
+                metadata=metadata,
+                runtime_state=result.get("status", "queued"),
+            )
     # §2.2: Audit reconcile task creation (R3)
     if _is_reconcile:
         try:
@@ -2433,10 +2567,27 @@ def handle_task_claim(ctx: RequestContext):
             pass
     caller_pid = int(ctx.body.get("caller_pid", 0) or 0)
     with DBContext(project_id) as conn:
-        task = task_registry.claim_task(conn, project_id, worker_id, caller_pid=caller_pid)
+        claimed = task_registry.claim_task(conn, project_id, worker_id, caller_pid=caller_pid)
+        if isinstance(claimed, tuple):
+            task, fence_token = claimed
+        else:
+            task, fence_token = claimed, ""
         if task is None:
             return {"task": None, "message": "No tasks available"}
-        return {"task": task}
+        metadata = task.get("metadata", {}) if isinstance(task, dict) else {}
+        bug_id = metadata.get("bug_id", "")
+        if bug_id:
+            backlog_runtime.update_backlog_runtime(
+                conn,
+                bug_id,
+                f"{task.get('type', 'task')}_claimed",
+                project_id=project_id,
+                task_id=task.get("task_id", ""),
+                task_type=task.get("type", "task"),
+                metadata=metadata,
+                runtime_state="claimed",
+            )
+        return {"task": task, "fence_token": fence_token}
 
 
 @route("POST", "/api/task/{project_id}/complete")
@@ -3879,6 +4030,8 @@ def handle_backlog_list(ctx: RequestContext):
                 bug["provenance_paths"] = json.loads(bug.get("provenance_paths", "[]"))
             except (json.JSONDecodeError, TypeError):
                 bug["provenance_paths"] = []
+            bug["bypass_policy"] = backlog_runtime.parse_json_object(bug.get("bypass_policy_json", "{}"))
+            bug["takeover"] = backlog_runtime.parse_json_object(bug.get("takeover_json", "{}"))
             bugs.append(bug)
         return {"bugs": bugs, "count": len(bugs)}
     finally:
@@ -3908,6 +4061,8 @@ def handle_backlog_get(ctx: RequestContext):
             result["provenance_paths"] = json.loads(result.get("provenance_paths", "[]"))
         except (json.JSONDecodeError, TypeError):
             result["provenance_paths"] = []
+        result["bypass_policy"] = backlog_runtime.parse_json_object(result.get("bypass_policy_json", "{}"))
+        result["takeover"] = backlog_runtime.parse_json_object(result.get("takeover_json", "{}"))
         return result
     finally:
         conn.close()
@@ -3959,13 +4114,19 @@ def handle_backlog_upsert(ctx: RequestContext):
                 except Exception:
                     pass
                 decision = {"action": "admit", "reason": "agent failure", "related_bug_ids": [], "confidence": 0.0}
+        bypass_policy = backlog_runtime.parse_json_object(body.get("bypass_policy_json"))
+        bypass_policy.update(backlog_runtime.parse_json_object(body.get("bypass_policy")))
+        if body.get("mf_type"):
+            bypass_policy["mf_type"] = backlog_runtime.normalize_mf_type(body.get("mf_type"), bypass_policy)
+        bypass_policy_raw = backlog_runtime.policy_json(bypass_policy)
+        takeover_raw = backlog_runtime.policy_json(backlog_runtime.parse_json_object(body.get("takeover_json")))
         conn.execute(
             """INSERT INTO backlog_bugs
                (bug_id, title, status, priority, target_files, test_files,
                 acceptance_criteria, chain_task_id, "commit", discovered_at,
                 fixed_at, details_md, chain_trigger_json, required_docs,
-                provenance_paths, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                provenance_paths, bypass_policy_json, mf_type, takeover_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(bug_id) DO UPDATE SET
                  title = excluded.title,
                  status = excluded.status,
@@ -3981,6 +4142,18 @@ def handle_backlog_upsert(ctx: RequestContext):
                  chain_trigger_json = excluded.chain_trigger_json,
                  required_docs = excluded.required_docs,
                  provenance_paths = excluded.provenance_paths,
+                 bypass_policy_json = CASE
+                   WHEN excluded.bypass_policy_json != '{}' THEN excluded.bypass_policy_json
+                   ELSE backlog_bugs.bypass_policy_json
+                 END,
+                 mf_type = CASE
+                   WHEN excluded.mf_type != '' THEN excluded.mf_type
+                   ELSE backlog_bugs.mf_type
+                 END,
+                 takeover_json = CASE
+                   WHEN excluded.takeover_json != '{}' THEN excluded.takeover_json
+                   ELSE backlog_bugs.takeover_json
+                 END,
                  updated_at = excluded.updated_at
             """,
             (
@@ -3999,6 +4172,9 @@ def handle_backlog_upsert(ctx: RequestContext):
                 json.dumps(body.get("chain_trigger_json", {})),
                 json.dumps(body.get("required_docs", [])),
                 json.dumps(body.get("provenance_paths", [])),
+                bypass_policy_raw,
+                backlog_runtime.normalize_mf_type(body.get("mf_type"), bypass_policy) if body.get("mf_type") else "",
+                takeover_raw,
                 now,
                 now,
             ),
@@ -4054,7 +4230,8 @@ def handle_backlog_predeclare_mf(ctx: RequestContext):
     conn = get_connection(pid)
     try:
         row = conn.execute(
-            "SELECT bug_id, status, details_md FROM backlog_bugs WHERE bug_id = ?",
+            "SELECT bug_id, status, details_md, current_task_id, root_task_id, runtime_state, "
+            "bypass_policy_json, mf_type, takeover_json FROM backlog_bugs WHERE bug_id = ?",
             (bug_id,),
         ).fetchone()
         if not row:
@@ -4081,6 +4258,29 @@ def handle_backlog_predeclare_mf(ctx: RequestContext):
                WHERE bug_id = ?""",
             (new_details, now, bug_id),
         )
+        predeclare_policy = backlog_runtime.parse_json_object(body.get("bypass_policy"))
+        mf_type = backlog_runtime.normalize_mf_type(body.get("mf_type"), predeclare_policy)
+        predeclare_policy = backlog_runtime.build_mf_policy(
+            mf_type,
+            mf_id=mf_id,
+            observer_authorized=bool(body.get("observer_authorized", True)),
+            reason=reason,
+            existing_policy=predeclare_policy,
+        )
+        predeclare_policy.update({
+            "mf_id": mf_id,
+            "observer_authorized": bool(body.get("observer_authorized", True)),
+        })
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            "manual_fix_planned",
+            project_id=pid,
+            metadata=predeclare_policy,
+            runtime_state="manual_fix_planned",
+            bypass_policy=predeclare_policy,
+            mf_type=mf_type,
+        )
         conn.commit()
 
         # Audit: best-effort
@@ -4100,6 +4300,7 @@ def handle_backlog_predeclare_mf(ctx: RequestContext):
             "bug_id": bug_id,
             "status": "MF_PLANNED",
             "mf_id": mf_id,
+            "mf_type": mf_type,
         }
     finally:
         conn.close()
@@ -4141,12 +4342,45 @@ def handle_backlog_start_mf(ctx: RequestContext):
                 422,
             )
 
+        existing_policy = backlog_runtime.parse_json_object(_row_get(row, "bypass_policy_json", "{}"))
+        start_policy = {**existing_policy, **backlog_runtime.parse_json_object(body.get("bypass_policy"))}
+        requested_mf_type = body.get("mf_type") or _row_get(row, "mf_type", "") or start_policy.get("mf_type", "")
+        if body.get("bypass_graph_governance") is True and not requested_mf_type:
+            requested_mf_type = backlog_runtime.MF_TYPE_SYSTEM_RECOVERY
+        mf_type = backlog_runtime.normalize_mf_type(requested_mf_type, start_policy)
+        if mf_type == backlog_runtime.MF_TYPE_CHAIN_RESCUE and body.get("bypass_graph_governance") is True:
+            raise GovernanceError(
+                "invalid_mf_policy",
+                "chain_rescue MF cannot bypass graph governance; use mf_type='system_recovery'",
+                422,
+            )
+        start_policy = backlog_runtime.build_mf_policy(
+            mf_type,
+            mf_id=mf_id,
+            observer_authorized=bool(body.get("observer_authorized", True)),
+            reason=body.get("reason", ""),
+            existing_policy=start_policy,
+        )
+
+        takeover = _apply_mf_takeover(conn, pid, bug_id, body, row, start_policy)
+
         conn.execute(
             """UPDATE backlog_bugs
                SET status = 'MF_IN_PROGRESS',
                    updated_at = ?
                WHERE bug_id = ?""",
             (now, bug_id),
+        )
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            "manual_fix_in_progress",
+            project_id=pid,
+            metadata=start_policy,
+            runtime_state="manual_fix_in_progress",
+            bypass_policy=start_policy,
+            mf_type=mf_type,
+            takeover=takeover,
         )
         conn.commit()
 
@@ -4157,6 +4391,8 @@ def handle_backlog_start_mf(ctx: RequestContext):
                 actor=body.get("actor", "api"),
                 bug_id=bug_id,
                 mf_id=mf_id,
+                mf_type=mf_type,
+                takeover=json.dumps(takeover, ensure_ascii=False),
             )
             conn.commit()
         except Exception:
@@ -4167,6 +4403,9 @@ def handle_backlog_start_mf(ctx: RequestContext):
             "bug_id": bug_id,
             "status": "MF_IN_PROGRESS",
             "mf_id": mf_id,
+            "mf_type": mf_type,
+            "bypass_policy": start_policy,
+            "takeover": takeover,
         }
     finally:
         conn.close()
@@ -4236,6 +4475,14 @@ def handle_backlog_close(ctx: RequestContext):
         params.append(bug_id)
 
         conn.execute(update_sql, params)
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            "manual_fix" if prior_status == "MF_IN_PROGRESS" else "fixed",
+            project_id=pid,
+            result={"commit": body.get("commit", "")},
+            runtime_state="fixed",
+        )
         conn.commit()
         # Audit: backlog_close event
         try:

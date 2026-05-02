@@ -23,6 +23,7 @@ from .doc_policy import (
     is_governance_internal_repair as _is_governance_internal_repair,
     _GOVERNANCE_INTERNAL_PREFIXES,
 )
+from . import backlog_runtime
 
 log = logging.getLogger(__name__)
 
@@ -1153,6 +1154,10 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
     enable the declared_files / declared_removed_ids filters that prevent phantom
     creates for files PM declared as unmapped/removed (see Rule J in _infer_graph_delta).
     """
+    if backlog_runtime.is_graph_governance_bypassed(metadata):
+        log.warning("auto_chain: graph.delta.proposed skipped for task %s by backlog graph bypass", task_id)
+        return
+
     graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
 
     # Normalize dev delta
@@ -2052,23 +2057,60 @@ def _record_gate_event(conn, project_id, task_id, gate_name, passed, reason, tra
         log.debug("auto_chain: failed to record gate_event for %s/%s (non-critical)", gate_name, task_id, exc_info=True)
 
 
-def _update_backlog_stage(conn, project_id, bug_id, stage, failure_reason=""):
-    """Update backlog_bugs chain_stage, stage_updated_at, last_failure_reason for a given bug_id.
-
-    Non-critical path — silently catches all exceptions at debug level.
-    No-op when bug_id is empty/falsy.
-    """
-    if not bug_id:
-        return
+def _update_backlog_stage(
+    conn,
+    project_id,
+    bug_id,
+    stage,
+    failure_reason="",
+    task_id="",
+    task_type="",
+    metadata=None,
+    result=None,
+    runtime_state="",
+    root_task_id="",
+):
+    """Mirror chain progress into backlog_bugs runtime/audit columns."""
     try:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE backlog_bugs SET chain_stage=?, stage_updated_at=?, last_failure_reason=? WHERE bug_id=?",
-            (stage, now, failure_reason, bug_id),
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            stage,
+            project_id=project_id,
+            failure_reason=failure_reason,
+            task_id=task_id,
+            task_type=task_type,
+            metadata=metadata or {},
+            result=result or {},
+            runtime_state=runtime_state,
+            root_task_id=root_task_id,
         )
     except Exception:
         log.debug("auto_chain: failed to update backlog_stage for bug_id=%s (non-critical)", bug_id, exc_info=True)
+
+
+def _is_task_taken_over_by_mf(conn, project_id, task_id, metadata):
+    """Return True when a completed task was superseded by an active MF takeover."""
+    bug_id = (metadata or {}).get("bug_id", "")
+    if not bug_id:
+        return False, ""
+    try:
+        row = conn.execute(
+            "SELECT status, takeover_json FROM backlog_bugs WHERE bug_id=?",
+            (bug_id,),
+        ).fetchone()
+        if not row or row["status"] != "MF_IN_PROGRESS":
+            return False, ""
+        takeover = backlog_runtime.parse_json_object(row["takeover_json"])
+        if takeover.get("taken_over_task_id") != task_id:
+            return False, ""
+        action = takeover.get("action", "")
+        if action not in {"hold_current_chain", "cancel_current_chain"}:
+            return False, ""
+        return True, takeover.get("reason") or f"task superseded by MF {takeover.get('mf_id', '')}".strip()
+    except Exception:
+        log.debug("auto_chain: MF takeover lookup failed for %s", task_id, exc_info=True)
+        return False, ""
 
 
 def _load_task_metadata(conn, project_id, task_id):
@@ -2264,6 +2306,13 @@ def on_task_failed(conn, project_id, task_id, task_type, result=None, metadata=N
         or result.get("summary")
         or "task execution failed"
     )
+    _bug_id = metadata.get("bug_id", "")
+    if _bug_id:
+        _update_backlog_stage(
+            conn, project_id, _bug_id, f"{task_type}_failed",
+            failure_reason=effective_reason, task_id=task_id,
+            task_type=task_type, metadata=metadata, result=result,
+        )
     return _maybe_create_workflow_improvement_task(
         conn,
         project_id,
@@ -2537,6 +2586,15 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
     except Exception:
         log.debug("reconcile-cluster hook raised; ignoring", exc_info=True)
 
+    mf_taken_over, mf_reason = _is_task_taken_over_by_mf(conn, project_id, task_id, metadata)
+    if mf_taken_over:
+        log.warning("auto_chain: task %s completion ignored because MF took over: %s", task_id, mf_reason)
+        return {
+            "dispatched": False,
+            "mf_takeover": True,
+            "reason": mf_reason,
+        }
+
     if status != "succeeded":
         return None
     # R2: Reconcile tasks use separate stage map, bypass all governance gates
@@ -2630,8 +2688,12 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         except Exception:
             pass  # never block chain on preflight failure
 
+    graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
+
     # Auto-enrich: derive related_nodes from changed_files via impact API
-    if not metadata.get("related_nodes"):
+    if graph_governance_bypassed:
+        log.warning("auto_chain: graph governance bypassed for task %s via backlog policy", task_id)
+    elif not metadata.get("related_nodes"):
         changed = result.get("changed_files", metadata.get("changed_files", []))
         if changed:
             try:
@@ -2693,7 +2755,11 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     # CH4: Update backlog_bugs chain_stage on task completion
     _bug_id = metadata.get("bug_id", "")
     if _bug_id:
-        _update_backlog_stage(conn, project_id, _bug_id, f"{task_type}_complete")
+        _update_backlog_stage(
+            conn, project_id, _bug_id, f"{task_type}_complete",
+            task_id=task_id, task_type=task_type, metadata=metadata,
+            result=result, root_task_id=_chain_id,
+        )
 
     # M1: PM completes → persist full PRD to memory for future dev/qa recall
     # Moved BEFORE version gate so PRD publication fires regardless of gate outcome
@@ -2818,7 +2884,12 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         })
         # CH4: Update backlog_bugs chain_stage on version gate block
         if _bug_id:
-            _update_backlog_stage(conn, project_id, _bug_id, f"{task_type}_complete_blocked", failure_reason=ver_reason)
+            _update_backlog_stage(
+                conn, project_id, _bug_id, f"{task_type}_complete_blocked",
+                failure_reason=ver_reason, task_id=task_id,
+                task_type=task_type, metadata=metadata, result=result,
+                root_task_id=_chain_id,
+            )
         return {"gate_blocked": True, "dispatched": False, "stage": "version_check", "reason": ver_reason}
     else:
         log.debug("auto_chain: version check passed for task %s: %s", task_id, ver_reason)
@@ -2839,7 +2910,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             )
 
     # Auto-update nodes based on stage completion
-    if task_type == "dev" and metadata.get("related_nodes"):
+    if task_type == "dev" and metadata.get("related_nodes") and not graph_governance_bypassed:
         _try_verify_update(conn, project_id, metadata, "testing", "dev",
                            {"type": "dev_complete", "producer": "auto-chain",
                             "task_id": task_id},
@@ -2857,7 +2928,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         log.debug("auto_chain: commit before graph_delta emit failed (non-critical)", exc_info=True)
 
     # R2: Emit graph.delta.proposed event (auto-infer if dev omitted graph_delta)
-    if task_type == "dev":
+    if task_type == "dev" and not graph_governance_bypassed:
         _emit_or_infer_graph_delta(project_id, task_id, result, metadata)
 
     # Run gate check
@@ -2881,6 +2952,13 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             "stage": task_type, "next_stage": next_type or "deploy",
             "reason": reason,
         })
+        if _bug_id:
+            _update_backlog_stage(
+                conn, project_id, _bug_id, f"{task_type}_gate_blocked",
+                failure_reason=reason, task_id=task_id,
+                task_type=task_type, metadata=metadata, result=result,
+                root_task_id=_chain_id,
+            )
         # M3: Gate fail → write pitfall with previous output context
         _write_chain_memory(
             conn, project_id, "pitfall",
@@ -2989,6 +3067,12 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 chain_id=_chain_id,
             )
             retry_id = dev_retry.get("task_id", "?")
+            if _dev_retry_meta.get("bug_id"):
+                _update_backlog_stage(
+                    conn, project_id, _dev_retry_meta["bug_id"], "dev_queued",
+                    task_id=retry_id, task_type="dev", metadata=_dev_retry_meta,
+                    runtime_state="queued", root_task_id=_chain_id,
+                )
             log.info("auto_chain: %s failure → dev retry task %s", task_type, retry_id)
             _publish_event("task.retry", {
                 "project_id": project_id, "task_id": retry_id,
@@ -3197,6 +3281,12 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 chain_id=_chain_id,
             )
             retry_id = retry_task.get("task_id", "?")
+            if _retry_meta.get("bug_id"):
+                _update_backlog_stage(
+                    conn, project_id, _retry_meta["bug_id"], f"{task_type}_queued",
+                    task_id=retry_id, task_type=task_type, metadata=_retry_meta,
+                    runtime_state="queued", root_task_id=_chain_id,
+                )
             log.info("auto_chain: retry created %s for blocked %s", retry_id, task_id)
             _publish_event("task.retry", {
                 "project_id": project_id, "task_id": retry_id,
@@ -3283,7 +3373,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
     except Exception:
         _graph = None
 
-    if _graph is not None:
+    if _graph is not None and not graph_governance_bypassed:
         _graph_next, _graph_skipped, _graph_policies = dispatch_next_stage(
             conn, project_id, task_id, task_type, result, metadata, _trace_id, _graph,
         )
@@ -3350,6 +3440,14 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         trace_id=_trace_id,
         chain_id=_chain_id,
     )
+    _next_bug_id = task_meta.get("bug_id", metadata.get("bug_id", ""))
+    if _next_bug_id:
+        _update_backlog_stage(
+            conn, project_id, _next_bug_id, f"{next_type}_queued",
+            task_id=new_task.get("task_id", ""), task_type=next_type,
+            metadata={**task_meta, "parent_task_id": task_id, "chain_depth": depth + 1},
+            runtime_state="queued", root_task_id=_chain_id,
+        )
 
     log.info("auto_chain: %s→%s | %s → %s",
              task_type, next_type, task_id, new_task.get("task_id"))
@@ -4224,68 +4322,72 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
             f"Got: {rec!r}. QA agent must set result.recommendation."
         )
-    # AC5: validate PRD graph declarations against dev changed_files
-    _prd_decl_raw = metadata.get("prd", metadata)
-    _dev_changed = metadata.get("changed_files", result.get("changed_files", []))
-    _current_graph = None
-    try:
-        from . import project_service
-        _current_graph = project_service.load_project_graph(project_id)
-    except Exception:
-        log.debug("qa_gate: graph load for prd declaration validation failed", exc_info=True)
-    _decl_errors = validate_prd_graph_declarations(_prd_decl_raw, _dev_changed, _current_graph)
-    if _decl_errors:
-        return False, (
-            "PRD graph-declaration validation failed: " + "; ".join(_decl_errors)
-        )
-    # PR-B: graph.delta.proposed enforcement — check BEFORE criteria evaluation
-    _gd_proposed = _query_graph_delta_proposed(metadata)
-    if _gd_proposed:
-        gd_review = result.get("graph_delta_review")
-        if not gd_review or not isinstance(gd_review, dict):
-            # Auto-pass for auto-inferred graph deltas: system-generated deltas
-            # should not block QA when the agent omits graph_delta_review.
-            # Only dev-emitted deltas require explicit QA review.
-            _gd_source = _gd_proposed.get("source", "")
-            if _gd_source in ("auto-inferred", "dev-emitted+inferred-gaps", ""):
-                gd_review = {
-                    "decision": "pass",
-                    "issues": [],
-                    "auto_generated": True,
-                    "reason": f"auto-pass: graph.delta.proposed source={_gd_source!r} does not require explicit QA review",
-                }
-                log.info("qa_gate: auto-generated graph_delta_review pass for source=%s", _gd_source)
+    graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
+    if graph_governance_bypassed:
+        log.warning("qa_gate: graph governance checks bypassed by backlog policy")
+    else:
+        # AC5: validate PRD graph declarations against dev changed_files
+        _prd_decl_raw = metadata.get("prd", metadata)
+        _dev_changed = metadata.get("changed_files", result.get("changed_files", []))
+        _current_graph = None
+        try:
+            from . import project_service
+            _current_graph = project_service.load_project_graph(project_id)
+        except Exception:
+            log.debug("qa_gate: graph load for prd declaration validation failed", exc_info=True)
+        _decl_errors = validate_prd_graph_declarations(_prd_decl_raw, _dev_changed, _current_graph)
+        if _decl_errors:
+            return False, (
+                "PRD graph-declaration validation failed: " + "; ".join(_decl_errors)
+            )
+        # PR-B: graph.delta.proposed enforcement — check BEFORE criteria evaluation
+        _gd_proposed = _query_graph_delta_proposed(metadata)
+        if _gd_proposed:
+            gd_review = result.get("graph_delta_review")
+            if not gd_review or not isinstance(gd_review, dict):
+                # Auto-pass for auto-inferred graph deltas: system-generated deltas
+                # should not block QA when the agent omits graph_delta_review.
+                # Only dev-emitted deltas require explicit QA review.
+                _gd_source = _gd_proposed.get("source", "")
+                if _gd_source in ("auto-inferred", "dev-emitted+inferred-gaps", ""):
+                    gd_review = {
+                        "decision": "pass",
+                        "issues": [],
+                        "auto_generated": True,
+                        "reason": f"auto-pass: graph.delta.proposed source={_gd_source!r} does not require explicit QA review",
+                    }
+                    log.info("qa_gate: auto-generated graph_delta_review pass for source=%s", _gd_source)
+                else:
+                    return False, "graph.delta.proposed present but QA result omits graph_delta_review"
+            gd_decision = gd_review.get("decision", "")
+            if gd_decision == "reject":
+                issues = gd_review.get("issues", [])
+                return False, f"graph delta rejected by QA: {issues}"
+            if gd_decision == "pass":
+                # Write graph.delta.validated event to chain_events
+                try:
+                    from .chain_context import get_store as _gd_store
+                    store = _gd_store()
+                    root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
+                    root_task_id = store._task_to_root.get(root_task_id, root_task_id)
+                    task_id_for_event = metadata.get("task_id", "")
+                    store._persist_event(
+                        root_task_id=root_task_id,
+                        task_id=task_id_for_event,
+                        event_type="graph.delta.validated",
+                        payload={
+                            "source_task_id": task_id_for_event,
+                            "graph_delta_review": gd_review,
+                            "proposed_payload": _gd_proposed,
+                        },
+                        project_id=project_id,
+                        conn=conn,  # MF-2026-04-24-001: share caller transaction
+                    )
+                    log.info("auto_chain: wrote graph.delta.validated event for chain %s", root_task_id)
+                except Exception:
+                    log.debug("auto_chain: graph.delta.validated write failed", exc_info=True)
             else:
-                return False, "graph.delta.proposed present but QA result omits graph_delta_review"
-        gd_decision = gd_review.get("decision", "")
-        if gd_decision == "reject":
-            issues = gd_review.get("issues", [])
-            return False, f"graph delta rejected by QA: {issues}"
-        if gd_decision == "pass":
-            # Write graph.delta.validated event to chain_events
-            try:
-                from .chain_context import get_store as _gd_store
-                store = _gd_store()
-                root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
-                root_task_id = store._task_to_root.get(root_task_id, root_task_id)
-                task_id_for_event = metadata.get("task_id", "")
-                store._persist_event(
-                    root_task_id=root_task_id,
-                    task_id=task_id_for_event,
-                    event_type="graph.delta.validated",
-                    payload={
-                        "source_task_id": task_id_for_event,
-                        "graph_delta_review": gd_review,
-                        "proposed_payload": _gd_proposed,
-                    },
-                    project_id=project_id,
-                    conn=conn,  # MF-2026-04-24-001: share caller transaction
-                )
-                log.info("auto_chain: wrote graph.delta.validated event for chain %s", root_task_id)
-            except Exception:
-                log.debug("auto_chain: graph.delta.validated write failed", exc_info=True)
-        else:
-            return False, f"graph_delta_review.decision must be 'pass' or 'reject', got: {gd_decision!r}"
+                return False, f"graph_delta_review.decision must be 'pass' or 'reject', got: {gd_decision!r}"
     # AC7: No graph.delta.proposed → graph_delta_review field not required (back-compat)
 
     # E2E1: Verify criteria_results when acceptance_criteria exist
@@ -4300,42 +4402,43 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             if failed_criteria:
                 names = [cr.get("criterion", "?")[:60] for cr in failed_criteria]
                 return False, f"QA approved overall but {len(failed_criteria)} criteria failed: {names}"
-    # Update nodes FIRST (QA passed → promote to qa_pass)
-    # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
-    task_id = metadata.get("task_id", "")
-    vu_ok, vu_err = _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
-                       {"type": "e2e_report", "producer": "auto-chain",
-                        "summary": {"passed": 1, "failed": 0,
-                                    "review": result.get("review_summary", "auto-chain QA pass")}},
-                       task_id=task_id)
-    if not vu_ok:
-        return False, f"qa_pass gate blocked — {vu_err}"
-    # Then verify nodes reached qa_pass
-    related_nodes = metadata.get("related_nodes", [])
-    if related_nodes:
-        passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
-        if not passed:
-            if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
-                log.warning(
-                    "qa_gate: deferring related_nodes qa_pass enforcement for governed dirty-workspace reconciliation lane: %s",
-                    reason,
-                )
-            else:
-                return False, f"qa_pass gate blocked — {reason}"
-    # 5e: Graph doc verification (observation mode)
-    if _GRAPH_DOC_OBSERVATION_MODE:
-        target_files = metadata.get("target_files", [])
-        graph_docs = _get_graph_doc_associations(project_id, target_files)
-        if graph_docs:
-            changed = metadata.get("changed_files", [])
-            doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
-            graph_docs_missing = set(graph_docs) - doc_files_changed
-            if graph_docs_missing:
-                log.warning(
-                    "qa_gate: graph-linked docs not updated (observation): %s",
-                    sorted(graph_docs_missing)[:5],
-                )
-                _audit_doc_gap(conn, project_id, metadata.get("parent_task_id", ""), "qa_pass", graph_docs_missing, changed)
+    if not graph_governance_bypassed:
+        # Update nodes FIRST (QA passed → promote to qa_pass)
+        # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
+        task_id = metadata.get("task_id", "")
+        vu_ok, vu_err = _try_verify_update(conn, project_id, metadata, "qa_pass", "qa",
+                           {"type": "e2e_report", "producer": "auto-chain",
+                            "summary": {"passed": 1, "failed": 0,
+                                        "review": result.get("review_summary", "auto-chain QA pass")}},
+                           task_id=task_id)
+        if not vu_ok:
+            return False, f"qa_pass gate blocked — {vu_err}"
+        # Then verify nodes reached qa_pass
+        related_nodes = metadata.get("related_nodes", [])
+        if related_nodes:
+            passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
+            if not passed:
+                if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
+                    log.warning(
+                        "qa_gate: deferring related_nodes qa_pass enforcement for governed dirty-workspace reconciliation lane: %s",
+                        reason,
+                    )
+                else:
+                    return False, f"qa_pass gate blocked — {reason}"
+        # 5e: Graph doc verification (observation mode)
+        if _GRAPH_DOC_OBSERVATION_MODE:
+            target_files = metadata.get("target_files", [])
+            graph_docs = _get_graph_doc_associations(project_id, target_files)
+            if graph_docs:
+                changed = metadata.get("changed_files", [])
+                doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
+                graph_docs_missing = set(graph_docs) - doc_files_changed
+                if graph_docs_missing:
+                    log.warning(
+                        "qa_gate: graph-linked docs not updated (observation): %s",
+                        sorted(graph_docs_missing)[:5],
+                    )
+                    _audit_doc_gap(conn, project_id, metadata.get("parent_task_id", ""), "qa_pass", graph_docs_missing, changed)
 
     # M2: QA passed → write success pattern memory
     _write_chain_memory(
@@ -4347,10 +4450,11 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     )
 
     # Phase 5: QA Sweep structural drift gate (R9 — after AI QA passes)
-    qa_task_id = metadata.get("task_id", "")
-    sweep_ok, sweep_msg, sweep_result = _qa_sweep_gate(conn, project_id, qa_task_id, metadata, result)
-    if not sweep_ok:
-        return False, sweep_msg
+    if not graph_governance_bypassed:
+        qa_task_id = metadata.get("task_id", "")
+        sweep_ok, sweep_msg, sweep_result = _qa_sweep_gate(conn, project_id, qa_task_id, metadata, result)
+        if not sweep_ok:
+            return False, sweep_msg
 
     return True, "ok"
 
@@ -4377,7 +4481,9 @@ def _gate_gatekeeper_pass(conn, project_id, result, metadata):
 
         # PR-C: Commit graph delta after gatekeeper passes (AC1)
         # R4: Escape hatch — skip graph delta validation if explicitly requested
-        if metadata.get("skip_graph_delta_validation") is True and metadata.get("skip_reason"):
+        if backlog_runtime.is_graph_governance_bypassed(metadata):
+            log.warning("_gate_gatekeeper_pass: graph delta commit skipped by backlog graph bypass")
+        elif metadata.get("skip_graph_delta_validation") is True and metadata.get("skip_reason"):
             log.warning(
                 "_gate_gatekeeper_pass: skipping graph delta validation — %s",
                 metadata["skip_reason"],
@@ -4412,9 +4518,12 @@ def _gate_release(conn, project_id, result, metadata):
     if _reconcile_run_id:
         _audit_reconcile_bypass(conn, project_id, "release", _reconcile_run_id, metadata.get("task_id", ""))
         return True, "reconcile bypass — release skipped (§11.2)"
+    graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
+    if graph_governance_bypassed:
+        log.warning("release_gate: related_nodes enforcement skipped by backlog graph bypass")
     # Node status check: all related_nodes must be "qa_pass" before merge is allowed
     related_nodes = metadata.get("related_nodes", [])
-    if related_nodes:
+    if related_nodes and not graph_governance_bypassed:
         passed, reason = _check_nodes_min_status(conn, project_id, related_nodes, "qa_pass")
         if not passed:
             if _is_governed_dirty_workspace_chain(conn, project_id, metadata):
@@ -4429,7 +4538,7 @@ def _gate_release(conn, project_id, result, metadata):
                      metadata.get("parent_task_id", "unknown"))
     # For auto-chain deploys, we trust the merge task result
     # After successful merge, promote related_nodes to qa_pass
-    if related_nodes:
+    if related_nodes and not graph_governance_bypassed:
         task_id = metadata.get("task_id", "")
         _try_verify_update(conn, project_id, metadata, "qa_pass", "merge",
                            {"type": "merge_complete", "producer": "auto-chain"},
@@ -5351,6 +5460,12 @@ def _check_nodes_min_status(conn, project_id, related_nodes, min_status):
 
 def _try_verify_update(conn, project_id, metadata, target_status, role, evidence_dict, task_id=""):
     """Best-effort node status update. Returns (True, "") on success, (False, error_msg) on failure."""
+    if backlog_runtime.is_graph_governance_bypassed(metadata):
+        log.warning(
+            "auto_chain: verify_update skipped for task %s because backlog policy bypasses graph governance",
+            task_id or metadata.get("task_id", ""),
+        )
+        return True, ""
     related = _normalize_related_nodes(metadata.get("related_nodes", []))
     if not related:
         return True, ""

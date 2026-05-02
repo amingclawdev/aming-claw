@@ -24,9 +24,20 @@ def _make_conn() -> sqlite3.Connection:
         "CREATE TABLE backlog_bugs ("
         "  bug_id TEXT PRIMARY KEY,"
         "  project_id TEXT,"
+        "  chain_task_id TEXT DEFAULT '',"
         "  chain_stage TEXT DEFAULT '',"
         "  stage_updated_at TEXT DEFAULT '',"
-        "  last_failure_reason TEXT DEFAULT ''"
+        "  last_failure_reason TEXT DEFAULT '',"
+        "  runtime_state TEXT DEFAULT '',"
+        "  current_task_id TEXT DEFAULT '',"
+        "  root_task_id TEXT DEFAULT '',"
+        "  worktree_path TEXT DEFAULT '',"
+        "  worktree_branch TEXT DEFAULT '',"
+        "  bypass_policy_json TEXT DEFAULT '{}',"
+        "  mf_type TEXT DEFAULT '',"
+        "  takeover_json TEXT DEFAULT '{}',"
+        "  runtime_updated_at TEXT DEFAULT '',"
+        "  updated_at TEXT DEFAULT ''"
         ")"
     )
     return conn
@@ -47,7 +58,9 @@ def test_update_backlog_stage_exists_with_correct_signature() -> None:
     """AC1: auto_chain.py contains _update_backlog_stage with expected params."""
     auto_chain_path = Path(__file__).resolve().parents[1] / "governance" / "auto_chain.py"
     content = auto_chain_path.read_text(encoding="utf-8")
-    assert "def _update_backlog_stage(conn, project_id, bug_id, stage, failure_reason" in content
+    assert "def _update_backlog_stage(" in content
+    assert "failure_reason=\"\"" in content
+    assert "task_id=\"\"" in content
 
 
 # ---------------------------------------------------------------------------
@@ -56,9 +69,11 @@ def test_update_backlog_stage_exists_with_correct_signature() -> None:
 
 def test_update_backlog_stage_sql_statement() -> None:
     """AC2: helper executes UPDATE with correct column order."""
-    auto_chain_path = Path(__file__).resolve().parents[1] / "governance" / "auto_chain.py"
+    auto_chain_path = Path(__file__).resolve().parents[1] / "governance" / "backlog_runtime.py"
     content = auto_chain_path.read_text(encoding="utf-8")
-    assert "UPDATE backlog_bugs SET chain_stage=?, stage_updated_at=?, last_failure_reason=? WHERE bug_id=?" in content
+    assert "UPDATE backlog_bugs SET" in content
+    assert "runtime_state = ?" in content
+    assert "current_task_id = CASE WHEN ? != '' THEN ? ELSE current_task_id END" in content
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +84,8 @@ def test_do_chain_calls_update_backlog_stage_on_complete() -> None:
     """AC5: _do_chain calls _update_backlog_stage with task_type_complete."""
     auto_chain_path = Path(__file__).resolve().parents[1] / "governance" / "auto_chain.py"
     content = auto_chain_path.read_text(encoding="utf-8")
-    assert '_update_backlog_stage(conn, project_id, _bug_id, f"{task_type}_complete")' in content
+    assert 'f"{task_type}_complete"' in content
+    assert "root_task_id=_chain_id" in content
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +96,8 @@ def test_do_chain_calls_update_backlog_stage_on_gate_block() -> None:
     """AC6: _do_chain calls _update_backlog_stage with task_type_complete_blocked."""
     auto_chain_path = Path(__file__).resolve().parents[1] / "governance" / "auto_chain.py"
     content = auto_chain_path.read_text(encoding="utf-8")
-    assert '_update_backlog_stage(conn, project_id, _bug_id, f"{task_type}_complete_blocked", failure_reason=ver_reason)' in content
+    assert 'f"{task_type}_complete_blocked"' in content
+    assert "failure_reason=ver_reason" in content
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +112,24 @@ def test_update_backlog_stage_writes_columns() -> None:
         "INSERT INTO backlog_bugs (bug_id, project_id) VALUES (?, ?)",
         ("TEST-1", "aming-claw"),
     )
-    fn(conn, "aming-claw", "TEST-1", "dev_complete")
+    fn(
+        conn, "aming-claw", "TEST-1", "dev_complete",
+        task_id="task-1", task_type="dev",
+        metadata={"chain_id": "task-root"},
+        result={"_worktree": ".worktrees/dev-task-1", "_branch": "dev/task-1"},
+    )
     row = conn.execute(
-        "SELECT chain_stage, stage_updated_at FROM backlog_bugs WHERE bug_id=?",
+        "SELECT chain_stage, stage_updated_at, runtime_state, current_task_id, root_task_id, worktree_path, worktree_branch FROM backlog_bugs WHERE bug_id=?",
         ("TEST-1",),
     ).fetchone()
     assert row is not None
     assert row["chain_stage"] == "dev_complete"
     assert row["stage_updated_at"] != ""
+    assert row["runtime_state"] == "in_chain"
+    assert row["current_task_id"] == "task-1"
+    assert row["root_task_id"] == "task-root"
+    assert row["worktree_path"] == ".worktrees/dev-task-1"
+    assert row["worktree_branch"] == "dev/task-1"
 
 
 # ---------------------------------------------------------------------------
@@ -164,3 +191,38 @@ def test_update_backlog_stage_unknown_bug() -> None:
         ("NOPE",),
     ).fetchone()
     assert row["cnt"] == 0
+
+
+def test_task_taken_over_by_mf_detection() -> None:
+    """A task listed in takeover_json is treated as superseded by active MF."""
+    import json
+    import importlib
+
+    mod = importlib.import_module("agent.governance.auto_chain")
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE backlog_bugs (bug_id TEXT PRIMARY KEY, status TEXT, takeover_json TEXT DEFAULT '{}')"
+    )
+    conn.execute(
+        "INSERT INTO backlog_bugs (bug_id, status, takeover_json) VALUES (?, ?, ?)",
+        (
+            "BUG-1",
+            "MF_IN_PROGRESS",
+            json.dumps({
+                "action": "hold_current_chain",
+                "taken_over_task_id": "task-1",
+                "reason": "observer takeover",
+            }),
+        ),
+    )
+
+    taken, reason = mod._is_task_taken_over_by_mf(
+        conn,
+        "aming-claw",
+        "task-1",
+        {"bug_id": "BUG-1"},
+    )
+
+    assert taken is True
+    assert reason == "observer takeover"
