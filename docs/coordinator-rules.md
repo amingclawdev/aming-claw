@@ -491,3 +491,8 @@ declare `removed_nodes` / `unmapped_files` whenever AC implies file changes,
 and any PM payload that fails the new check will be blocked at the post-PM
 transition, preventing the downstream phantom-create reject loops that
 previously stalled PR2-style atomic-swap chains.
+
+## See also
+
+- [docs/roles/pm.md](roles/pm.md) — Reconcile cluster audit pattern (CR4)
+- [docs/roles/dev.md](roles/dev.md) — Reconcile cluster work scope (CR4)

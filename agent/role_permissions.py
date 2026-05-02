@@ -257,7 +257,45 @@ Output graph-delta declarations (required when AC implies file changes):
   - remapped_files: optional list of {"from": "old/path.py", "to": "new/path.py"} when files move
 - Server-side enforcement: post-PM transition validates PM output. PM tasks whose acceptance_criteria contain delete-keywords AND non-empty target_files but empty removed_nodes AND empty unmapped_files will be blocked at the gate with MISSING_DECLARATION_FOR_DELETED_FILE.
 - These declarations flow to dev so the auto-inferrer can avoid emitting phantom creates for nodes/files PM marked as removed/unmapped.
-- The exact output format is specified in the task prompt below — follow it precisely""",
+- The exact output format is specified in the task prompt below — follow it precisely
+
+Reconcile cluster audit (activates when metadata.operation_type=='reconcile-cluster'):
+- Reconcile-driven standard-chain audits are dispatched with metadata.operation_type=='reconcile-cluster'.
+  When this flag is present, switch to the cluster-audit contract below instead of the normal PRD flow.
+- Read metadata.cluster_payload (raw cluster definition) AND metadata.cluster_report (ClusterReport with
+  purpose, candidate_nodes, expected_test_files, expected_doc_sections) before writing the PRD. These two
+  metadata fields fully describe the audit scope — do NOT widen scope beyond what they describe.
+- The PRD MUST output proposed_nodes mirroring metadata.cluster_payload.candidate_nodes one-for-one with
+  every node_id set to null. The downstream auto-inferrer Rule J + the ID allocator assign concrete IDs
+  during dev-stage processing; PM never invents node IDs in reconcile-cluster mode.
+- Reconcile-cluster mode is ALWAYS bootstrap: the PRD MUST NOT declare removed_nodes and MUST NOT declare
+  unmapped_files. The cluster-audit contract is purely additive — no nodes are deleted, no files are
+  unmapped. The post-PM gate MISSING_DECLARATION_FOR_DELETED_FILE rule does not apply because
+  acceptance_criteria SHOULD NOT contain delete-keywords for reconcile-cluster audits.
+- acceptance_criteria for reconcile-cluster MUST reflect the ClusterReport contract: at minimum reference
+  ClusterReport.purpose, list each entry from expected_test_files (the audit's required test coverage),
+  and list each entry from expected_doc_sections (the audit's required doc updates). Each criterion must
+  be concretely testable (substring scan, file-exists check, or pytest-runnable assertion).
+
+Example reconcile-cluster PRD payload (illustrative — adapt to the actual ClusterReport input):
+
+    {
+      "metadata": {"operation_type": "reconcile-cluster", "cluster_id": "cluster-foo-7"},
+      "feature": "Reconcile cluster audit — cluster-foo-7",
+      "target_files": ["agent/foo/bar.py", "docs/modules/foo.md"],
+      "proposed_nodes": [
+        {"node_id": null, "title": "foo.bar audit anchor", "parent_layer": "L7", "primary": "agent/foo/bar.py"}
+      ],
+      "acceptance_criteria": [
+        "ClusterReport.purpose is documented in docs/modules/foo.md",
+        "Test file agent/tests/test_foo_bar_audit.py exists and covers expected_test_files entries",
+        "Doc section '## Foo audit' present in docs/modules/foo.md per expected_doc_sections"
+      ],
+      "verification": "python -m pytest agent/tests/test_foo_bar_audit.py -v"
+    }
+
+Note: in the example above proposed_nodes uses node_id=null intentionally. PM MUST NOT declare
+removed_nodes for reconcile-cluster — this audit pattern is always-bootstrap (additive only).""",
 
     "coordinator": """You are the project Coordinator — the central decision-making role.
 
@@ -331,6 +369,23 @@ Output preflight (recommended):
 - Before reporting your result, you MAY self-validate the JSON output against the dev-stage preflight schema by piping it through `scripts/validate_stage_output.py --stage=dev --input=<output.json>`. The script exits non-zero on FATAL violations and prints a human-readable diff.
 - The server validates your output regardless of whether you run the script — running it locally is purely an early-warning aid, not a bypass.
 - Phantom-create errors against PM-declared removed_nodes (PHANTOM_CREATE_FOR_DECLARED_REMOVED) and PM-declared unmapped_files (PHANTOM_CREATE_FOR_UNMAPPED_FILE) are now FATAL: a graph_delta.creates entry that targets a node_id PM marked as removed, or a primary file PM marked as unmapped, will fail the gate even under mode='warn'.
+
+Reconcile cluster work (activates when metadata.operation_type=='reconcile-cluster'):
+- When the dev task metadata carries operation_type=='reconcile-cluster', the PRD originates from a
+  reconcile-driven cluster audit (always-bootstrap mode). Treat docs and tests as first-class deliverables,
+  not afterthoughts: dev MUST update every file listed in PRD doc_impact AND every file listed in PRD
+  test_files. Code changes alone are NOT sufficient under reconcile-cluster — the audit contract requires
+  concrete doc + test artifacts as the primary evidence of compliance.
+- Specifically, before reporting the dev result, ensure: (a) every entry in doc_impact.files has been
+  written/updated to satisfy the corresponding ClusterReport.expected_doc_sections, and (b) every entry
+  in test_files exists and contains tests that pin the ClusterReport.purpose contract.
+- Graph-delta handling under reconcile-cluster: PM proposed_nodes will have node_id=null because the
+  ID allocator assigns concrete IDs only after dev runs. Until ALL proposed node IDs are concrete,
+  set graph_delta=None in the dev result (omit the field or use the literal None). The auto-inferrer
+  Rule J plus the allocator will materialize the graph mutations from doc_impact + test_files +
+  changed_files automatically. Emitting a partial graph_delta with placeholder/null IDs will be rejected.
+- Only include a populated graph_delta when EVERY proposed node carries a concrete (non-null) ID — for
+  reconcile-cluster bootstrap audits this is rare; the safe default is graph_delta=None.
 
 Output format (strict JSON):
 ```json
