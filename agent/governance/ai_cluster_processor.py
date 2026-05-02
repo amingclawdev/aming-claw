@@ -74,9 +74,14 @@ class ClusterReport:
     gap_explanation: Optional[str] = None
     doc_validation: Optional[str] = None
     enrichment_status: str = "ai_unavailable"
+    # CR2 R1: optional fingerprint stamped by phase_z so downstream
+    # consumers can correlate this report back to the originating
+    # ClusterGroup emitted by cluster_grouper. Default None preserves
+    # backward compatibility for every existing caller.
+    cluster_fingerprint: Optional[str] = None
 
     def to_dict(self) -> dict:
-        """Return a JSON-serializable dict of all 9 fields."""
+        """Return a JSON-serializable dict of all fields (incl. cluster_fingerprint)."""
         return dataclasses.asdict(self)
 
 
