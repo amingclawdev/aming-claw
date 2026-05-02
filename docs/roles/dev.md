@@ -28,6 +28,8 @@ Body: {"project_id": "<pid>", "status": "idle"}
 
 ## Task Workflow
 
+> **Reconcile-cluster note:** When the dev task carries `metadata.operation_type == "reconcile-cluster"`, the PRD originates from a reconcile-driven cluster audit (always-bootstrap mode). Dev MUST update every file listed in PRD `doc_impact` AND every file listed in PRD `test_files` — code changes alone do not satisfy the audit contract; docs and tests are first-class deliverables that pin the `ClusterReport.purpose`. Additionally, when PM `proposed_nodes` contain null IDs (the default for reconcile-cluster), dev MUST leave `graph_delta=None` in the result (omit the field). The auto-inferrer Rule J + the ID allocator materialise the graph mutations from `doc_impact` + `test_files` + `changed_files` automatically; emitting a partial `graph_delta` with placeholder IDs will be rejected.
+
 ### 1. Query memory before starting
 
 ```
