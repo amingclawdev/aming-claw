@@ -1106,7 +1106,14 @@ class ExecutorWorker:
             from deploy_chain import run_deploy
 
             chat_id = int(metadata.get("chat_id", 0) or 0)
-            report = run_deploy(changed, chat_id=chat_id, project_id=self.project_id)
+            expected_head = self._resolve_deploy_expected_head(metadata)
+            report = run_deploy(
+                changed,
+                chat_id=chat_id,
+                project_id=self.project_id,
+                task_id=task_id,
+                expected_head=expected_head,
+            )
 
             # R4: Pre-return coherence assertion — report.success must agree
             # with smoke_test.all_pass. If incoherent, force status='failed'.
@@ -1143,6 +1150,26 @@ class ExecutorWorker:
             return {"status": "failed", "error": summary, "result": result}
         except Exception as e:
             return {"status": "failed", "error": str(e), "result": {"deploy": "failed", "changed_files": changed}}
+
+    def _resolve_deploy_expected_head(self, metadata: dict) -> str:
+        """Return the commit deploy should make active in runtime/version state."""
+        for key in ("expected_head", "merge_commit", "_merge_commit"):
+            value = metadata.get(key, "")
+            if value:
+                return str(value)
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                return proc.stdout.strip()
+        except Exception:
+            pass
+        return ""
 
     def _fetch_memories(self, query: str, top_k: int = 3) -> list:
         """Search memory backend for relevant past work (best-effort, 3s timeout)."""
