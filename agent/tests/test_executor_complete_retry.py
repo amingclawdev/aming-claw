@@ -69,3 +69,17 @@ def test_complete_task_returns_final_error_after_all_retries():
     assert out == {"error": "governance down"}
     assert worker._api.call_count == 4
     assert [c.args[0] for c in sleep.call_args_list] == [5, 15, 30]
+
+
+def test_complete_task_or_raise_raises_after_all_retries():
+    worker = _worker()
+    worker._api = MagicMock(return_value={"error": "governance down"})
+
+    with patch.object(executor_worker.time, "sleep"):
+        try:
+            worker._complete_task_or_raise("task-4", "succeeded", {"summary": "done"})
+        except RuntimeError as exc:
+            assert "complete_task failed after retries" in str(exc)
+            assert "governance down" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError")

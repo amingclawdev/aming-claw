@@ -237,3 +237,41 @@ def test_ac5_head_eq_chain_version_no_changed_files():
 
     assert result["status"] == "failed"
     assert "no isolated" in result["error"].lower()
+
+
+def test_noop_worktree_branch_already_ancestor_returns_success(tmp_path):
+    """A no-op dev worktree can be reused after observer/runtime recovery.
+
+    If its branch is already an ancestor of HEAD and there are no staged
+    changes, merge should be idempotent instead of trying an isolated merge.
+    """
+    worker = _make_worker(workspace=str(tmp_path))
+    worker._branch_exists = lambda branch: True
+    worker._branch_already_merged = lambda branch: True
+    worker._remove_worktree = mock.Mock()
+    worktree = tmp_path / "dev-task"
+    worktree.mkdir()
+
+    metadata = {
+        "parent_task_id": "task-parent-6",
+        "_branch": "dev/task-parent-6",
+        "_worktree": str(worktree),
+        "changed_files": [],
+    }
+
+    def _run(cmd, **kwargs):
+        cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+        result = subprocess.CompletedProcess(cmd, 0)
+        result.stdout = ""
+        result.stderr = ""
+        if "rev-parse HEAD" in cmd_str:
+            result.stdout = "abc123456789\n"
+        return result
+
+    with mock.patch("subprocess.run", side_effect=_run):
+        result = worker._execute_merge("task-merge-6", metadata)
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["merge_mode"] == "already_merged_replay"
+    assert result["result"]["merge_commit"] == "abc123456789"
+    assert result["result"]["files_changed"] == 0

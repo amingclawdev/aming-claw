@@ -312,6 +312,15 @@ class ExecutorWorker:
             )
         return response
 
+    def _complete_task_or_raise(self, task_id: str, status: str, result: dict) -> dict:
+        """Complete a task and fail the worker if governance never accepted it."""
+        response = self._complete_task(task_id, status, result)
+        if "error" in response:
+            raise RuntimeError(
+                f"complete_task failed after retries for {task_id}: {response.get('error')}"
+            )
+        return response
+
     def _execute_task(self, task: dict) -> dict:
         """Execute a single task via Claude CLI."""
         task_id = task["task_id"]
@@ -852,6 +861,7 @@ class ExecutorWorker:
                                                      cwd=worktree, capture_output=True, text=True, timeout=30)
                         if commit_proc.returncode != 0:
                             return {"status": "failed", "error": f"git commit failed in dev worktree: {commit_proc.stderr[:300]}"}
+                    branch_already_merged = self._branch_already_merged(branch)
                 else:
                     branch_already_merged = self._branch_already_merged(branch)
                     if not branch_already_merged:
@@ -2407,7 +2417,7 @@ class ExecutorWorker:
             # Complete task + auto-chain — write results to file (log.info may block in MCP)
             import time as _ct
             _ct0 = _ct.time()
-            completion = self._complete_task(task_id, status, result)
+            completion = self._complete_task_or_raise(task_id, status, result)
             chain = completion.get("auto_chain", {})
 
             # Write completion result to timing file
