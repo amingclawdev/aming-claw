@@ -41,7 +41,7 @@ function Get-ExecutorWorkerProcesses {
         $cmd  = [string]$_.CommandLine
         $name -match '^python.*(\.exe)?$' -and (
             $cmd -like "*agent.executor_worker*" -or
-            $cmd -like "*agent\\executor_worker.py*" -or
+            $cmd -like "*agent\executor_worker.py*" -or
             $cmd -like "*agent/executor_worker.py*"
         )
     }
@@ -53,10 +53,25 @@ function Get-McpServerProcesses {
         $cmd  = [string]$_.CommandLine
         $name -match '^python.*(\.exe)?$' -and (
             $cmd -like "*agent.mcp.server*" -or
-            $cmd -like "*agent\\mcp\\server.py*" -or
+            $cmd -like "*agent\mcp\server.py*" -or
             $cmd -like "*agent/mcp/server.py*"
         )
     }
+}
+
+function Stop-ManagerProcessTree {
+    param([int]$TargetPid)
+    try {
+        Start-Process -FilePath "taskkill.exe" `
+            -ArgumentList @("/F", "/T", "/PID", "$TargetPid") `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru `
+            -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+    }
+    Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
 }
 
 function Stop-ManagerByLockPort {
@@ -66,8 +81,7 @@ function Stop-ManagerByLockPort {
     $pids = $listeners | Select-Object -ExpandProperty OwningProcess -Unique
     foreach ($pidVal in $pids) {
         Write-Host "Takeover: stopping lock-port owner PID=$pidVal ..."
-        Stop-Process -Id $pidVal -Force -ErrorAction SilentlyContinue
-        taskkill /F /T /PID $pidVal | Out-Null
+        Stop-ManagerProcessTree -TargetPid $pidVal
     }
 }
 
@@ -135,8 +149,7 @@ if ($existing.Count -gt 0 -and $Takeover) {
     $pids = ($existing | Select-Object -ExpandProperty ProcessId)
     foreach ($id in $pids) {
         Write-Host "Takeover: stopping existing manager PID=$id ..."
-        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
-        taskkill /F /T /PID $id | Out-Null
+        Stop-ManagerProcessTree -TargetPid $id
     }
 }
 
@@ -144,15 +157,13 @@ if ($Takeover) {
     $workerPids = @(Get-ExecutorWorkerProcesses | Select-Object -ExpandProperty ProcessId -Unique)
     foreach ($id in $workerPids) {
         Write-Host "Takeover: stopping existing executor worker PID=$id ..."
-        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
-        taskkill /F /T /PID $id | Out-Null
+        Stop-ManagerProcessTree -TargetPid $id
     }
 
     $mcpPids = @(Get-McpServerProcesses | Select-Object -ExpandProperty ProcessId -Unique)
     foreach ($id in $mcpPids) {
         Write-Host "Takeover: stopping existing MCP server PID=$id ..."
-        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
-        taskkill /F /T /PID $id | Out-Null
+        Stop-ManagerProcessTree -TargetPid $id
     }
 }
 
