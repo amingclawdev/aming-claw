@@ -4,6 +4,8 @@ Manages node verify_status transitions with permission/evidence/gate checks.
 All mutations go through SQLite transactions with audit logging.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sqlite3

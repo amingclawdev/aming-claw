@@ -5,6 +5,8 @@ check that the evidence type, content, and summary fields match the
 requirements for each transition.
 """
 
+from __future__ import annotations
+
 from .models import Evidence
 from .enums import VerifyStatus
 from .errors import InvalidEvidenceError

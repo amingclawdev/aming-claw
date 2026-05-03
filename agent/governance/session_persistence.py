@@ -16,6 +16,8 @@ Or generic:
   GOV_TOKEN=gov-xxx  (single-role agent)
 """
 
+from __future__ import annotations
+
 import os
 import logging
 

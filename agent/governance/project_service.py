@@ -7,6 +7,8 @@ Trust chain:
   4. Coordinator uses its token to assign roles to other agents via /api/role/assign
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

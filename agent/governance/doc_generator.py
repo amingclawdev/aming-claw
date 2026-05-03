@@ -5,6 +5,8 @@ Scans the node's primary files for @route decorators.
 Generates a skeleton doc entry in _DOCS.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re
