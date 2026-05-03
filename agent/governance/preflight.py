@@ -58,59 +58,148 @@ def check_system(conn) -> dict:
 # 2. Version check — chain_version == git_head, freshness
 # ---------------------------------------------------------------------------
 
-def check_version(conn, project_id: str) -> dict:
-    """Verify chain_version matches git_head and sync is recent."""
+def _prefix_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    return left.startswith(right) or right.startswith(left)
+
+
+def _git_head_short() -> str:
+    try:
+        import subprocess
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _chain_state_from_git() -> dict | None:
+    try:
+        from .chain_trailer import get_chain_state
+
+        return get_chain_state()
+    except Exception as exc:
+        log.debug("preflight version: chain_trailer unavailable: %s", exc)
+        return None
+
+
+def _check_version_db_legacy(row) -> dict:
+    chain_ver = row["chain_version"] if hasattr(row, "keys") else row[0]
+    git_head = row["git_head"] if hasattr(row, "keys") else row[1]
+    synced_at = row["git_synced_at"] if hasattr(row, "keys") else row[2]
+    dirty = row["dirty_files"] if hasattr(row, "keys") else row[3]
+
+    issues = {}
+    status = "pass"
+
+    if git_head and chain_ver and not _prefix_match(git_head, chain_ver):
+        issues["version_mismatch"] = {
+            "chain_version": chain_ver, "git_head": git_head
+        }
+        status = "fail"
+
+    if dirty:
+        dirty_list = json.loads(dirty) if isinstance(dirty, str) else dirty
+        if dirty_list:
+            issues["dirty_files"] = dirty_list
+            if status != "fail":
+                status = "warn"
+
+    if synced_at:
+        try:
+            synced_dt = datetime.fromisoformat(synced_at.replace("Z", "+00:00"))
+            age = datetime.now(timezone.utc) - synced_dt
+            if age > timedelta(minutes=5):
+                issues["sync_stale_seconds"] = int(age.total_seconds())
+                if status != "fail":
+                    status = "warn"
+        except (ValueError, TypeError):
+            pass
+
+    if status == "pass":
+        return _pass({"chain_version": chain_ver, "source": "db"})
+    if status == "warn":
+        return _warn(issues)
+    return _fail(issues)
+
+
+def check_version(conn, project_id: str, *, prefer_trailer: bool | None = None) -> dict:
+    """Verify chain state against git HEAD.
+
+    The auto-chain version gate treats git trailers as the effective source of
+    truth.  Preflight mirrors that behavior by default and keeps the legacy DB
+    comparison available for focused tests/fallback.
+    """
     try:
         row = conn.execute(
             "SELECT chain_version, git_head, git_synced_at, dirty_files "
             "FROM project_version WHERE project_id=?",
             (project_id,)
         ).fetchone()
+
+        if prefer_trailer is None:
+            prefer_trailer = (
+                os.environ.get("OPT_PREFLIGHT_VERSION_SOURCE", "trailer").strip().lower()
+                != "db"
+            )
+
+        if prefer_trailer:
+            trailer_state = _chain_state_from_git()
+            if trailer_state:
+                chain_ver = (
+                    trailer_state.get("chain_sha")
+                    or trailer_state.get("version")
+                    or ""
+                )
+                git_head = _git_head_short()
+                source = trailer_state.get("source", "trailer")
+                issues = {}
+                if chain_ver and git_head and not _prefix_match(git_head, chain_ver):
+                    issues["version_mismatch"] = {
+                        "chain_version": chain_ver,
+                        "git_head": git_head,
+                        "source": source,
+                    }
+                    return _fail(issues)
+
+                dirty_files = trailer_state.get("dirty_files") or []
+                if dirty_files:
+                    return _warn({
+                        "dirty_files": dirty_files,
+                        "chain_version": chain_ver,
+                        "git_head": git_head,
+                        "source": source,
+                    })
+
+                details = {
+                    "chain_version": chain_ver,
+                    "git_head": git_head,
+                    "source": source,
+                }
+                if row:
+                    legacy_chain = row["chain_version"] if hasattr(row, "keys") else row[0]
+                    legacy_head = row["git_head"] if hasattr(row, "keys") else row[1]
+                    synced_at = row["git_synced_at"] if hasattr(row, "keys") else row[2]
+                    if legacy_chain and chain_ver and not _prefix_match(legacy_chain, chain_ver):
+                        details["legacy_chain_version"] = legacy_chain
+                    if legacy_head and git_head and not _prefix_match(legacy_head, git_head):
+                        details["legacy_git_head"] = legacy_head
+                    if synced_at:
+                        details["legacy_git_synced_at"] = synced_at
+                return _pass(details)
+
         if not row:
             return _fail({"error": "no project_version row"})
 
-        chain_ver = row["chain_version"] if hasattr(row, "keys") else row[0]
-        git_head = row["git_head"] if hasattr(row, "keys") else row[1]
-        synced_at = row["git_synced_at"] if hasattr(row, "keys") else row[2]
-        dirty = row["dirty_files"] if hasattr(row, "keys") else row[3]
-
-        issues = {}
-        status = "pass"
-
-        # Version mismatch (B35: tolerate short/full hash via prefix match)
-        if (git_head and chain_ver
-            and not (git_head.startswith(chain_ver) or chain_ver.startswith(git_head))):
-            issues["version_mismatch"] = {
-                "chain_version": chain_ver, "git_head": git_head
-            }
-            status = "fail"
-
-        # Dirty files
-        if dirty:
-            dirty_list = json.loads(dirty) if isinstance(dirty, str) else dirty
-            if dirty_list:
-                issues["dirty_files"] = dirty_list
-                if status != "fail":
-                    status = "warn"
-
-        # Stale sync (>5 min)
-        if synced_at:
-            try:
-                synced_dt = datetime.fromisoformat(synced_at.replace("Z", "+00:00"))
-                age = datetime.now(timezone.utc) - synced_dt
-                if age > timedelta(minutes=5):
-                    issues["sync_stale_seconds"] = int(age.total_seconds())
-                    if status != "fail":
-                        status = "warn"
-            except (ValueError, TypeError):
-                pass
-
-        if status == "pass":
-            return _pass({"chain_version": chain_ver})
-        elif status == "warn":
-            return _warn(issues)
-        else:
-            return _fail(issues)
+        return _check_version_db_legacy(row)
     except Exception as e:
         return _fail({"error": str(e)})
 

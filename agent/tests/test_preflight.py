@@ -90,7 +90,7 @@ class TestCheckVersion(unittest.TestCase):
             "INSERT INTO project_version VALUES (?, ?, ?, ?, ?, ?, ?)",
             (self.pid, "abc123", now, "test", "abc123", "[]", now))
         self.conn.commit()
-        result = check_version(self.conn, self.pid)
+        result = check_version(self.conn, self.pid, prefer_trailer=False)
         self.assertEqual(result["status"], "pass")
 
     def test_fail_on_version_mismatch(self):
@@ -99,7 +99,7 @@ class TestCheckVersion(unittest.TestCase):
             "INSERT INTO project_version VALUES (?, ?, ?, ?, ?, ?, ?)",
             (self.pid, "abc123", now, "test", "def456", "[]", now))
         self.conn.commit()
-        result = check_version(self.conn, self.pid)
+        result = check_version(self.conn, self.pid, prefer_trailer=False)
         self.assertEqual(result["status"], "fail")
         self.assertIn("version_mismatch", result["details"])
 
@@ -109,13 +109,41 @@ class TestCheckVersion(unittest.TestCase):
             "INSERT INTO project_version VALUES (?, ?, ?, ?, ?, ?, ?)",
             (self.pid, "abc123", old, "test", "abc123", "[]", old))
         self.conn.commit()
-        result = check_version(self.conn, self.pid)
+        result = check_version(self.conn, self.pid, prefer_trailer=False)
         self.assertEqual(result["status"], "warn")
         self.assertIn("sync_stale_seconds", result["details"])
 
     def test_fail_no_row(self):
-        result = check_version(self.conn, self.pid)
+        result = check_version(self.conn, self.pid, prefer_trailer=False)
         self.assertEqual(result["status"], "fail")
+
+    def test_trailer_source_overrides_stale_db_chain_version(self):
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT INTO project_version VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.pid, "old1234", now, "test", "abc1234", "[]", now))
+        self.conn.commit()
+
+        import governance.preflight as preflight
+
+        old_chain_state = preflight._chain_state_from_git
+        old_git_head = preflight._git_head_short
+        try:
+            preflight._chain_state_from_git = lambda: {
+                "chain_sha": "abc1234",
+                "version": "abc1234",
+                "dirty_files": [],
+                "source": "trailer",
+            }
+            preflight._git_head_short = lambda: "abc1234"
+            result = check_version(self.conn, self.pid)
+        finally:
+            preflight._chain_state_from_git = old_chain_state
+            preflight._git_head_short = old_git_head
+
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["details"]["source"], "trailer")
+        self.assertEqual(result["details"]["legacy_chain_version"], "old1234")
 
 
 class TestCheckGraph(unittest.TestCase):

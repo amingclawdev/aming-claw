@@ -157,6 +157,41 @@ def _check_version_drift(conn: sqlite3.Connection, project_id: str) -> str | Non
 
     Advisory only — any exception is caught and returns None.
     """
+    def _head_short() -> str:
+        head_full = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+        return head_full[:7]
+
+    try:
+        from .chain_trailer import get_chain_state
+
+        chain_state = get_chain_state()
+        chain_sha = (
+            chain_state.get("chain_sha")
+            or chain_state.get("version")
+            or ""
+        )
+        if chain_sha and chain_sha != "unknown":
+            chain_short = chain_sha[:7]
+            head_short = _head_short()
+            if head_short != chain_short:
+                log.warning(
+                    "HEAD (%s) != CHAIN_VERSION (%s, source=%s); auto_chain dispatch may be blocked",
+                    head_short,
+                    chain_short,
+                    chain_state.get("source", "trailer"),
+                )
+                return (
+                    f"HEAD ({head_short}) != CHAIN_VERSION ({chain_short}); "
+                    f"auto_chain dispatch may be blocked"
+                )
+            return None
+    except Exception:
+        pass
+
     try:
         row = conn.execute(
             "SELECT chain_version FROM project_version WHERE project_id = ?",
@@ -166,12 +201,7 @@ def _check_version_drift(conn: sqlite3.Connection, project_id: str) -> str | Non
             return None
         chain_short = row["chain_version"][:7]
 
-        head_full = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        ).decode().strip()
-        head_short = head_full[:7]
+        head_short = _head_short()
 
         if head_short != chain_short:
             log.warning("HEAD (%s) != CHAIN_VERSION (%s); auto_chain dispatch may be blocked", head_short, chain_short)

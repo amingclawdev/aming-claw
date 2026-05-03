@@ -273,6 +273,9 @@ class TestVersionDriftWarning(unittest.TestCase):
         with mock.patch(
             "agent.governance.task_registry.subprocess.check_output",
             return_value=fake_hash.encode(),
+        ), mock.patch(
+            "agent.governance.chain_trailer.get_chain_state",
+            side_effect=RuntimeError("trailer unavailable"),
         ):
             result = create_task(self.conn, "proj", "test prompt", task_type="task")
 
@@ -289,6 +292,9 @@ class TestVersionDriftWarning(unittest.TestCase):
         with mock.patch(
             "agent.governance.task_registry.subprocess.check_output",
             return_value=head_hash.encode(),
+        ), mock.patch(
+            "agent.governance.chain_trailer.get_chain_state",
+            side_effect=RuntimeError("trailer unavailable"),
         ):
             result = create_task(self.conn, "proj", "test prompt", task_type="task")
 
