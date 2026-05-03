@@ -61,6 +61,41 @@ def _build_turn_caps():
 _CLAUDE_ROLE_TURN_CAPS = _build_turn_caps()
 
 
+def _kill_process_tree(pid: int) -> bool:
+    """Best-effort process-tree termination for AI CLI sessions."""
+    if not pid or pid <= 0:
+        return False
+
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        return True
+    except (ProcessLookupError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
+
 @dataclass
 class AISession:
     """Represents a running AI CLI process."""
@@ -329,6 +364,8 @@ class AILifecycleManager:
                 # On Windows, create a new process group for clean tree-kill
                 if os.name == "nt":
                     popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    popen_kwargs["start_new_session"] = True
                 proc = subprocess.Popen(cmd, **popen_kwargs)
                 session.pid = proc.pid
                 _al_log(f"Popen started: pid={proc.pid}")
@@ -364,7 +401,7 @@ class AILifecycleManager:
                 _al_log(f"Popen TIMEOUT after {_MAX_TIMEOUT}s")
                 # Kill the process on timeout
                 try:
-                    proc.kill()
+                    _kill_process_tree(proc.pid or session.pid)
                     proc.communicate(timeout=5)
                 except Exception:
                     pass
@@ -434,17 +471,10 @@ class AILifecycleManager:
 
         try:
             pid = session.pid
-            if os.name == "nt":
-                # Windows: taskkill /F /T kills entire process tree
-                subprocess.call(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                os.kill(pid, signal.SIGTERM)
-            session.status = "killed"
-            return True
+            killed = _kill_process_tree(pid)
+            if killed:
+                session.status = "killed"
+            return killed
         except (ProcessLookupError, OSError):
             return False
 
