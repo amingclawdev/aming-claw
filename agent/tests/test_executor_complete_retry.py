@@ -49,6 +49,15 @@ def test_complete_task_stops_without_retry_on_success():
     sleep.assert_not_called()
 
 
+def test_complete_task_uses_long_complete_timeout():
+    worker = _worker()
+    worker._api = MagicMock(return_value={"ok": True})
+
+    worker._complete_task("task-timeout", "succeeded", {"summary": "done"})
+
+    assert worker._api.call_args.kwargs["timeout"] == executor_worker.COMPLETE_REQUEST_TIMEOUT
+
+
 def test_complete_task_returns_final_error_after_all_retries():
     worker = _worker()
     worker._api = MagicMock(return_value={"error": "governance down"})

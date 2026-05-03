@@ -4219,6 +4219,19 @@ def _gate_checkpoint(conn, project_id, result, metadata):
              metadata.get("target_files"))
     changed = result.get("changed_files", [])
     if not changed:
+        test_results = result.get("test_results", {})
+        try:
+            failed_count = int(test_results.get("failed") or 0) if isinstance(test_results, dict) else 1
+        except (TypeError, ValueError):
+            failed_count = 1
+        if (
+            metadata.get("operation_type") == CLUSTER_OPERATION_TYPE
+            and isinstance(test_results, dict)
+            and test_results.get("ran") is True
+            and failed_count == 0
+            and result.get("summary")
+        ):
+            return True, "reconcile-cluster no-op audit accepted"
         return False, "No files changed"
 
     # B36-fix(2): single source of truth shared with retry-prompt scope_line

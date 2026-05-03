@@ -404,7 +404,8 @@ def complete_task(
 
     now = _utc_iso()
     row = conn.execute(
-        "SELECT attempt_count, max_attempts, notification_status, metadata_json, assigned_to, type FROM tasks WHERE task_id = ?",
+        "SELECT attempt_count, max_attempts, notification_status, metadata_json, assigned_to, type, "
+        "status, completed_at, result_json FROM tasks WHERE task_id = ?",
         (task_id,),
     ).fetchone()
 
@@ -454,6 +455,42 @@ def complete_task(
             from .errors import GovernanceError
             raise GovernanceError("Fence token mismatch: task reclaimed by another worker", 409)
 
+    current_status = row["status"] or ""
+    task_type_val = row["type"] if row["type"] else ""
+    if current_status in TERMINAL_STATUSES:
+        response = {
+            "task_id": task_id,
+            "status": current_status,
+            "retrying": False,
+            "completed_at": row["completed_at"] or now,
+            "idempotent": True,
+        }
+        if override_reason == "replay_auto_chain" and project_id:
+            meta = json.loads(row["metadata_json"] or "{}")
+            stored_result = result
+            if stored_result is None:
+                try:
+                    stored_result = json.loads(row["result_json"] or "{}")
+                except Exception:
+                    stored_result = {}
+            if current_status == "succeeded":
+                chain_result = _dispatch_auto_chain_success(
+                    project_id, task_id, task_type_val, current_status, stored_result or {}, meta
+                )
+            else:
+                chain_result = _dispatch_auto_chain_failed(
+                    project_id, task_id, task_type_val, stored_result or {}, meta,
+                    error_message or (stored_result or {}).get("error", ""),
+                )
+            response["auto_chain"] = _build_auto_chain_response(chain_result)
+            response["replayed_auto_chain"] = True
+        else:
+            response["auto_chain"] = {
+                "dispatched": False,
+                "reason": "task already terminal",
+            }
+        return response
+
     # Determine execution status
     exec_status = status
     if status == "failed" and row["attempt_count"] < row["max_attempts"]:
@@ -476,7 +513,6 @@ def complete_task(
                 notify_status = "pending"
 
     # --- Test report gate: reject test-type succeeded without valid test_report ---
-    task_type_val = row["type"] if row["type"] else ""
     if task_type_val == "test" and status == "succeeded":
         result_obj = result or {}
         test_report = result_obj.get("test_report")

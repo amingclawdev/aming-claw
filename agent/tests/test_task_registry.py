@@ -84,6 +84,74 @@ class TestCompleteTaskAutoChain(unittest.TestCase):
         # Failed tasks with retries left get re-queued
         self.assertIn(result["status"], ("queued", "failed", "observer_hold"))
 
+    def test_duplicate_complete_on_terminal_task_is_idempotent(self):
+        """Duplicate executor retries must not re-run auto-chain once terminal."""
+        task_id, fence = self._create_and_claim("dev")
+
+        with mock.patch(
+            "agent.governance.auto_chain.on_task_completed", return_value={"ok": True}
+        ) as first_chain:
+            from agent.governance.task_registry import complete_task
+            first = complete_task(
+                self.conn, task_id, status="succeeded",
+                result={"summary": "done"}, project_id="proj",
+                fence_token=fence,
+            )
+
+        self.assertEqual(first["status"], "succeeded")
+        self.assertEqual(first_chain.call_count, 1)
+
+        with mock.patch(
+            "agent.governance.auto_chain.on_task_completed", return_value={"ok": True}
+        ) as duplicate_chain:
+            second = complete_task(
+                self.conn, task_id, status="succeeded",
+                result={"summary": "done"}, project_id="proj",
+                fence_token=fence,
+            )
+
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(second["auto_chain"]["reason"], "task already terminal")
+        duplicate_chain.assert_not_called()
+
+    def test_terminal_task_can_replay_auto_chain_when_observer_requests_it(self):
+        """Observer recovery can replay auto-chain from stored result after a crash."""
+        task_id, fence = self._create_and_claim("dev")
+        stored = {"summary": "done", "changed_files": ["agent/foo.py"]}
+
+        with mock.patch(
+            "agent.governance.auto_chain.on_task_completed", return_value={"ok": True}
+        ):
+            from agent.governance.task_registry import complete_task
+            complete_task(
+                self.conn, task_id, status="succeeded",
+                result=stored, project_id="proj",
+                fence_token=fence,
+            )
+
+        replay_args = {}
+
+        def capture_replay(*args, **kwargs):
+            replay_args.update(kwargs)
+            replay_args["_positional"] = args
+            return {"task_id": "next-task"}
+
+        with mock.patch(
+            "agent.governance.auto_chain.on_task_completed", side_effect=capture_replay
+        ):
+            replay = complete_task(
+                self.conn, task_id, status="succeeded",
+                result=None, project_id="proj",
+                fence_token=fence,
+                completed_by="observer-runtime-recovery",
+                override_reason="replay_auto_chain",
+            )
+
+        self.assertTrue(replay["idempotent"])
+        self.assertTrue(replay["replayed_auto_chain"])
+        self.assertEqual(replay_args["result"], stored)
+        self.assertEqual(replay_args["task_type"], "dev")
+
 
 class TestCompleteAutoChainCreatesTask(unittest.TestCase):
     """AC2: auto_chain still creates correct next-stage task."""

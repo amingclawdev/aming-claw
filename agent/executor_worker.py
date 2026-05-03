@@ -63,6 +63,7 @@ SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
 # Completion is the one API call where a transient governance outage can lose
 # finished work. Retry only after error-shaped responses from _api().
 COMPLETE_RETRY_DELAYS = (5, 15, 30)
+COMPLETE_REQUEST_TIMEOUT = int(os.getenv("COMPLETE_REQUEST_TIMEOUT", "240"))
 
 # Task type → role.
 # Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
@@ -242,15 +243,15 @@ class ExecutorWorker:
         self._start_time = time.monotonic()
         self.last_claimed_at = time.monotonic()  # R5: tracked by ServiceManager watchdog
 
-    def _api(self, method: str, path: str, data: dict = None) -> dict:
+    def _api(self, method: str, path: str, data: dict = None, timeout: Optional[int] = None) -> dict:
         """Call governance API. Short timeouts to avoid MCP IO deadlock."""
         import requests
         url = f"{self.base_url}{path}"
         try:
             if method == "GET":
-                r = requests.get(url, timeout=5)
+                r = requests.get(url, timeout=timeout or 5)
             else:
-                r = requests.post(url, json=data or {}, timeout=10,
+                r = requests.post(url, json=data or {}, timeout=timeout or 10,
                                   headers={"Content-Type": "application/json"})
             r.raise_for_status()
             return r.json()
@@ -293,7 +294,10 @@ class ExecutorWorker:
     def _complete_task(self, task_id: str, status: str, result: dict) -> dict:
         """Mark task complete (triggers auto-chain)."""
         payload = {"task_id": task_id, "status": status, "result": result}
-        response = self._api("POST", f"/api/task/{self.project_id}/complete", payload)
+        response = self._api(
+            "POST", f"/api/task/{self.project_id}/complete", payload,
+            timeout=COMPLETE_REQUEST_TIMEOUT,
+        )
         for delay in COMPLETE_RETRY_DELAYS:
             if "error" not in response:
                 return response
@@ -302,7 +306,10 @@ class ExecutorWorker:
                 task_id, delay, response.get("error"),
             )
             time.sleep(delay)
-            response = self._api("POST", f"/api/task/{self.project_id}/complete", payload)
+            response = self._api(
+                "POST", f"/api/task/{self.project_id}/complete", payload,
+                timeout=COMPLETE_REQUEST_TIMEOUT,
+            )
         return response
 
     def _execute_task(self, task: dict) -> dict:
