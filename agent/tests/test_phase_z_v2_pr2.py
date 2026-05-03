@@ -44,15 +44,18 @@ class TestDefaultWeightsAndConstants:
 
     def test_default_weights(self):
         assert set(DEFAULT_WEIGHTS.keys()) == {
-            "in_degree", "fan_out", "import_depth", "path_hint", "entry_signal"
+            "in_degree", "color_count", "fan_out", "import_depth",
+            "path_hint", "entry_signal"
         }
-        assert DEFAULT_WEIGHTS["in_degree"] == 0.40
-        assert DEFAULT_WEIGHTS["fan_out"] == 0.20
-        assert DEFAULT_WEIGHTS["import_depth"] == 0.15
-        assert DEFAULT_WEIGHTS["path_hint"] == 0.15
+        assert DEFAULT_WEIGHTS["in_degree"] == 0.35
+        assert DEFAULT_WEIGHTS["color_count"] == 0.30
+        assert DEFAULT_WEIGHTS["fan_out"] == 0.15
+        assert DEFAULT_WEIGHTS["import_depth"] == 0.10
+        assert DEFAULT_WEIGHTS["path_hint"] == 0.10
         assert DEFAULT_WEIGHTS["entry_signal"] == 0.10
-        # Weights sum to 1.0
-        assert abs(sum(DEFAULT_WEIGHTS.values()) - 1.0) < 1e-9
+        # The multi-signal scorer intentionally keeps an entry-point boost
+        # on top of the normalized structural weights.
+        assert abs(sum(DEFAULT_WEIGHTS.values()) - 1.10) < 1e-9
 
     def test_foundation_constants(self):
         assert FOUNDATION_TOP_PCT == 0.05

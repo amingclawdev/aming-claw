@@ -159,6 +159,58 @@ class TestCoverageLookup:
         assert len(result["doc_files"]) >= 1
 
 
+class TestDiffAgainstExistingGraph:
+    """Diff current graph formats against symbol-derived candidates."""
+
+    def test_reads_shared_volume_deps_graph_and_reports_primary_disagreements(self):
+        project = _make_temp_project({
+            "agent/keep.py": "def keep():\n    pass\n",
+            "agent/new.py": "def new():\n    pass\n",
+        })
+        graph_dir = os.path.join(
+            project,
+            "shared-volume",
+            "codex-tasks",
+            "state",
+            "governance",
+            "aming-claw",
+        )
+        os.makedirs(graph_dir, exist_ok=True)
+        graph_path = os.path.join(graph_dir, "graph.json")
+        with open(graph_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": 1,
+                "deps_graph": {
+                    "nodes": [
+                        {"id": "L4.1", "primary": ["agent/keep.py"], "layer": "L4"},
+                        {"id": "L4.2", "primary": ["agent/old.py"], "layer": "L4"},
+                    ],
+                    "edges": [],
+                },
+            }, f)
+
+        diff = diff_against_existing_graph(project, [
+            {
+                "node_id": "agent.keep",
+                "primary_file": ".\\agent\\keep.py",
+                "layer": "L5",
+            },
+            {
+                "node_id": "agent.new",
+                "primary_file": ".\\agent\\new.py",
+                "layer": "L5",
+            },
+        ])
+
+        primary = diff["primary_file_diff"]
+        assert diff["graph_path"] == graph_path
+        assert diff["old_node_count"] == 2
+        assert primary["matched"] == 1
+        assert primary["only_in_new"] == ["agent/new.py"]
+        assert primary["only_in_old"] == ["agent/old.py"]
+        assert primary["layer_changes"][0]["primary_file"] == "agent/keep.py"
+
+
 # ===========================================================================
 # Atomic swap smoke tests (replacement for migration_state_machine tests)
 # Full coverage lives in test_symbol_atomic_swap.py.

@@ -1085,46 +1085,163 @@ def synthesize_feature_clusters(
 # PR3 R4: Diff against existing graph
 # ---------------------------------------------------------------------------
 
+def _default_existing_graph_path(project_root: str) -> Optional[str]:
+    """Return the best-effort current governance graph path for *project_root*."""
+    explicit = os.environ.get("PHASE_Z_EXISTING_GRAPH_PATH")
+    if explicit and os.path.isfile(explicit):
+        return explicit
+
+    project_id = (
+        os.environ.get("AMING_PROJECT_ID")
+        or os.environ.get("PROJECT_ID")
+        or "aming-claw"
+    )
+    candidates = [
+        os.path.join(project_root, "agent", "governance", "graph.json"),
+        os.path.join(
+            project_root,
+            "shared-volume",
+            "codex-tasks",
+            "state",
+            "governance",
+            project_id,
+            "graph.json",
+        ),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    governance_root = os.path.join(
+        project_root, "shared-volume", "codex-tasks", "state", "governance"
+    )
+    if os.path.isdir(governance_root):
+        found = []
+        for name in sorted(os.listdir(governance_root)):
+            candidate = os.path.join(governance_root, name, "graph.json")
+            if os.path.isfile(candidate):
+                found.append(candidate)
+        if len(found) == 1:
+            return found[0]
+    return None
+
+
+def _normalize_graph_path(project_root: str, path: Any) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        if os.path.isabs(raw):
+            raw = os.path.relpath(raw, project_root)
+    except ValueError:
+        pass
+    normalized = raw.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def _extract_graph_nodes(payload: Any) -> List[Dict[str, Any]]:
+    """Extract node dictionaries from supported graph.json shapes."""
+    if not isinstance(payload, dict):
+        if isinstance(payload, list):
+            return [n for n in payload if isinstance(n, dict)]
+        return []
+
+    nodes = payload.get("nodes")
+    if isinstance(nodes, list):
+        return [n for n in nodes if isinstance(n, dict)]
+    if isinstance(nodes, dict):
+        return [n for n in nodes.values() if isinstance(n, dict)]
+
+    deps_graph = payload.get("deps_graph")
+    if isinstance(deps_graph, dict):
+        deps_nodes = deps_graph.get("nodes")
+        if isinstance(deps_nodes, list):
+            return [n for n in deps_nodes if isinstance(n, dict)]
+        if isinstance(deps_nodes, dict):
+            return [n for n in deps_nodes.values() if isinstance(n, dict)]
+    return []
+
+
+def _node_id(node: Dict[str, Any]) -> str:
+    return str(node.get("node_id") or node.get("id") or "")
+
+
+def _node_layer(node: Dict[str, Any]) -> Any:
+    return node.get("layer")
+
+
+def _node_primary_files(project_root: str, node: Dict[str, Any]) -> List[str]:
+    raw = (
+        node.get("primary_file")
+        or node.get("primary")
+        or node.get("primary_files")
+        or []
+    )
+    if isinstance(raw, str):
+        raw_values = [raw]
+    elif isinstance(raw, list):
+        raw_values = raw
+    else:
+        raw_values = []
+    return sorted({
+        normalized
+        for normalized in (_normalize_graph_path(project_root, p) for p in raw_values)
+        if normalized
+    })
+
+
+def _index_primary_files(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[str]]]:
+    by_primary: Dict[str, Dict[str, Any]] = {}
+    owners: Dict[str, List[str]] = {}
+    for node in nodes:
+        nid = _node_id(node)
+        for primary in _node_primary_files(project_root, node):
+            owners.setdefault(primary, []).append(nid)
+            by_primary.setdefault(primary, node)
+    return by_primary, owners
+
+
 def diff_against_existing_graph(
     project_root: str,
     new_nodes: List[Dict[str, Any]],
+    graph_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compare new derived nodes vs existing graph.json.
 
-    Returns dict with only_in_new, only_in_old, layer_changes.
+    Returns ID-based drift plus primary-file drift.  The latter is the useful
+    calibration signal when rebasing an old Lx graph into symbol-derived module
+    nodes whose IDs are intentionally different.
     """
-    graph_path = os.path.join(project_root, "agent", "governance", "graph.json")
+    existing_graph_path = graph_path or _default_existing_graph_path(project_root)
 
     old_nodes_by_id: Dict[str, Any] = {}
-    if os.path.isfile(graph_path):
+    if existing_graph_path and os.path.isfile(existing_graph_path):
         try:
-            with open(graph_path, "r", encoding="utf-8") as f:
+            with open(existing_graph_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # graph.json may have various formats; try to extract node list
-            if isinstance(data, dict) and "nodes" in data:
-                for n in data["nodes"]:
-                    nid = n.get("node_id", n.get("id", ""))
-                    if nid:
-                        old_nodes_by_id[nid] = n
-            elif isinstance(data, list):
-                for n in data:
-                    nid = n.get("node_id", n.get("id", ""))
-                    if nid:
-                        old_nodes_by_id[nid] = n
+            for n in _extract_graph_nodes(data):
+                nid = _node_id(n)
+                if nid:
+                    old_nodes_by_id[nid] = n
         except (json.JSONDecodeError, OSError):
             pass
 
-    new_ids = {n["node_id"] for n in new_nodes}
+    new_ids = {_node_id(n) for n in new_nodes if _node_id(n)}
     old_ids = set(old_nodes_by_id.keys())
 
     only_in_new = sorted(new_ids - old_ids)
     only_in_old = sorted(old_ids - new_ids)
 
     layer_changes: List[Dict[str, Any]] = []
-    new_by_id = {n["node_id"]: n for n in new_nodes}
+    new_by_id = {_node_id(n): n for n in new_nodes if _node_id(n)}
     for nid in new_ids & old_ids:
-        old_layer = old_nodes_by_id[nid].get("layer")
-        new_layer = new_by_id[nid].get("layer")
+        old_layer = _node_layer(old_nodes_by_id[nid])
+        new_layer = _node_layer(new_by_id[nid])
         if old_layer is not None and new_layer is not None and old_layer != new_layer:
             layer_changes.append({
                 "node_id": nid,
@@ -1132,10 +1249,53 @@ def diff_against_existing_graph(
                 "new_layer": new_layer,
             })
 
+    old_nodes = list(old_nodes_by_id.values())
+    old_by_primary, old_primary_owners = _index_primary_files(project_root, old_nodes)
+    new_by_primary, new_primary_owners = _index_primary_files(project_root, new_nodes)
+    old_primaries = set(old_by_primary)
+    new_primaries = set(new_by_primary)
+
+    layer_changes_by_primary: List[Dict[str, Any]] = []
+    for primary in sorted(old_primaries & new_primaries):
+        old_node = old_by_primary[primary]
+        new_node = new_by_primary[primary]
+        old_layer = _node_layer(old_node)
+        new_layer = _node_layer(new_node)
+        if old_layer is not None and new_layer is not None and old_layer != new_layer:
+            layer_changes_by_primary.append({
+                "primary_file": primary,
+                "old_node_id": _node_id(old_node),
+                "new_node_id": _node_id(new_node),
+                "old_layer": old_layer,
+                "new_layer": new_layer,
+            })
+
+    duplicate_old = {
+        primary: sorted([owner for owner in owners if owner])
+        for primary, owners in old_primary_owners.items()
+        if len([owner for owner in owners if owner]) > 1
+    }
+    duplicate_new = {
+        primary: sorted([owner for owner in owners if owner])
+        for primary, owners in new_primary_owners.items()
+        if len([owner for owner in owners if owner]) > 1
+    }
+
     return {
+        "graph_path": existing_graph_path or "",
+        "old_node_count": len(old_nodes_by_id),
+        "new_node_count": len(new_nodes),
         "only_in_new": only_in_new,
         "only_in_old": only_in_old,
         "layer_changes": layer_changes,
+        "primary_file_diff": {
+            "matched": len(old_primaries & new_primaries),
+            "only_in_new": sorted(new_primaries - old_primaries),
+            "only_in_old": sorted(old_primaries - new_primaries),
+            "layer_changes": layer_changes_by_primary,
+            "duplicates_in_old": duplicate_old,
+            "duplicates_in_new": duplicate_new,
+        },
     }
 
 
