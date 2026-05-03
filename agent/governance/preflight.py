@@ -8,6 +8,8 @@ Usage:
     report = run_preflight(conn, "aming-claw")
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

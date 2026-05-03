@@ -5,6 +5,8 @@ is sent twice, the second request returns the cached response without
 re-executing the operation.
 """
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from datetime import datetime, timezone, timedelta

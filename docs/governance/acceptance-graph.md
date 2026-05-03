@@ -149,11 +149,68 @@ Until OPT-DB-GRAPH lands, the discipline is: **every code change that introduces
 
 ---
 
-## 8. Related
+## 8. Audit cluster — agent.governance core (FeatureCluster 03825084)
+
+> **Reconcile-driven cluster audit**, fingerprint `03825084` (full
+> `038250847347245a`), package_key `agent/governance`, strategy
+> `scc_indegree_root_dfs_filetree_coalesce`. Emitted by `cluster_grouper`
+> with root_count=25, function_count=73, module_count=6.
+
+The **agent.governance core cluster** is the bootstrap / preflight / permission /
+profile / outbox / reconcile surface that today rolls up to a single coarse L3.3
+node with no L7 module-level anchors. The reconcile-cluster audit proposes one
+L7 candidate per primary file so each module has a discoverable verification
+contract.
+
+### 8.1 Primary files (L7 module anchors under L3.3)
+
+| File | Role |
+|---|---|
+| `agent/governance/outbox.py` | Outbound delivery queue / projection worker |
+| `agent/governance/permissions.py` | Per-role permission scope and authorization checks |
+| `agent/governance/preflight.py` | Pre-flight self-check (5 checks + auto-fix) before chain dispatch |
+| `agent/governance/project_profile.py` | Project profile discovery (root, settings, metadata) |
+| `agent/governance/project_service.py` | Project bootstrap / lifecycle service (registration, update) |
+| `agent/governance/reconcile.py` | Drift detection and graph/DB two-phase reconcile orchestrator |
+
+These six modules constitute the **governance core** — the agent.governance
+audit anchor referenced by reconcile-cluster runs. ID allocation follows the
+PM→Dev contract: `node_id=null` at PM stage, concrete IDs assigned by Rule J +
+ID allocator at the dev/gatekeeper boundary.
+
+### 8.2 Coverage envelope — 21 secondary test files
+
+Direct-mapped (3 — verify on each PR touching the cluster):
+
+- `agent/tests/test_preflight.py`
+- `agent/tests/test_project_profile.py`
+- `agent/tests/test_reconcile.py`
+
+Reconcile sub-surface (18 — coverage anchor, run on focused reconcile work):
+
+- `test_reconcile_batch_memory.py`, `test_reconcile_batch_memory_api.py`
+- `test_reconcile_commit_sweep.py`, `test_reconcile_context.py`
+- `test_reconcile_deferred_queue.py`, `test_reconcile_dropped_nodes.py`
+- `test_reconcile_meta_circular.py`
+- `test_reconcile_scope_cli.py`, `test_reconcile_scope_guard.py`
+- `test_reconcile_scope_phase_filter.py`, `test_reconcile_scope_resolver.py`
+- `test_reconcile_session.py`, `test_reconcile_session_integration.py`
+- `test_reconcile_task_type.py`, `test_reconcile_type_task.py`
+- `test_reconcile_v2_aggregator.py`, `test_reconcile_v2_endpoint.py`
+- `test_reconcile_workflow_spec_lint.py`
+
+The audit contract is **always-bootstrap and additive**: no node removals, no
+file unmappings. The cluster purpose is to make the agent.governance surface
+individually addressable by the gate (one node per module) so future drift can
+be localized rather than rolled up to L3.3.
+
+---
+
+## 9. Related
 
 - `docs/dev/backlog-governance.md` — parallel DB-first governance pattern for bugs/MF entries
 - `docs/dev/manual-fix-sop.md` — Manual Fix SOP (includes graph repair flow)
 - `docs/roles/observer.md` — observer's recovery powers (includes reconcile use)
 - `agent/governance/reconcile.py` — implementation reference
 - `agent/governance/graph_generator.py` — codebase scan for auto-discovery
-- Backlog IDs: `OPT-DB-GRAPH` (future), `B49` (dangling-ref class), `MF-2026-04-21-003` (Plan Y landing)
+- Backlog IDs: `OPT-DB-GRAPH` (future), `B49` (dangling-ref class), `MF-2026-04-21-003` (Plan Y landing), `OPT-BACKLOG-RECONCILE-phase-z--CLUSTER-03825084-cluster` (this audit)

@@ -495,6 +495,7 @@ class TestTriggerBaselineWrite(unittest.TestCase):
                 merged_into       INTEGER,
                 merge_status      TEXT,
                 merge_evidence_json TEXT,
+                mutations_sha256  TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (project_id, baseline_id)
             );
         """)
