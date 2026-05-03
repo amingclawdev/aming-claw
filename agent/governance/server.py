@@ -1620,6 +1620,12 @@ def handle_reconcile_deferred_cluster_file_now(ctx: RequestContext):
     rec = _deferred_cluster_row_to_dict(row)
     payload = rec.get("payload") or {}
     run_id = rec.get("run_id") or ""
+    if rec.get("status") not in ("queued", "failed_retryable"):
+        return 409, {
+            "error": "deferred_cluster_not_fileable",
+            "cluster_fingerprint": fp,
+            "status": rec.get("status"),
+        }
     q.mark_filing(project_id, fp)
     try:
         out = auto_backlog_bridge.file_cluster_as_backlog(
@@ -1629,9 +1635,16 @@ def handle_reconcile_deferred_cluster_file_now(ctx: RequestContext):
             project_id=project_id,
         )
     except Exception as exc:  # noqa: BLE001
+        q.requeue_after_failure(project_id, fp, reason=f"file_cluster_exception: {exc}")
         return 500, {"error": "file_cluster_failed", "message": str(exc)}
     if out.get("filed") and out.get("task_id"):
         q.mark_in_chain(project_id, fp, out["task_id"], bug_id=out.get("backlog_id"))
+    else:
+        q.requeue_after_failure(
+            project_id,
+            fp,
+            reason=str(out.get("reason") or "file_cluster_failed"),
+        )
     return {"result": out, "cluster_fingerprint": fp}
 
 

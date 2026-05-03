@@ -118,8 +118,12 @@ def test_metadata_operation_type_reconcile_cluster():
         project_id=PROJECT_ID, http_client=mock,
     )
     assert out["filed"] is True
-    assert len(mock.posts) == 1
-    url, body = mock.posts[0]
+    assert len(mock.posts) == 2
+    backlog_url, backlog_body = mock.posts[0]
+    assert backlog_url.startswith(f"/api/backlog/{PROJECT_ID}/")
+    assert backlog_body["status"] == "OPEN"
+    assert backlog_body["force_admit"] is True
+    url, body = mock.posts[1]
     assert url == f"/api/task/{PROJECT_ID}/create"
     assert body["type"] == "pm"
     md = body["metadata"]
@@ -243,3 +247,38 @@ def test_unauthorized_creator_skipped():
     assert out["filed"] is False
     assert out["skipped"] is True
     assert mock.posts == []
+
+
+def test_file_cluster_upserts_backlog_before_task_create():
+    mock = MockHttpClient()
+    cluster_group = {"cluster_fingerprint": "fp-audit1", "slug": "Audit Path",
+                     "primary_files": ["agent/a.py"]}
+    out = bridge.file_cluster_as_backlog(
+        cluster_group, {}, "run-audit1", PROJECT_ID, http_client=mock,
+    )
+    assert out["filed"] is True
+    assert len(mock.posts) == 2
+    assert mock.posts[0][0].startswith(f"/api/backlog/{PROJECT_ID}/")
+    assert mock.posts[1][0] == f"/api/task/{PROJECT_ID}/create"
+    assert mock.posts[0][1]["chain_trigger_json"]["cluster_fingerprint"] == "fp-audit1"
+
+
+def test_file_cluster_stops_when_backlog_upsert_fails():
+    class FailingBacklogClient(MockHttpClient):
+        def post(self, url: str, payload: dict) -> dict:
+            self.posts.append((url, payload))
+            if url.startswith(f"/api/backlog/{PROJECT_ID}/"):
+                raise RuntimeError("backlog gate refused")
+            return {"task_id": "should-not-create"}
+
+    mock = FailingBacklogClient()
+    out = bridge.file_cluster_as_backlog(
+        {"cluster_fingerprint": "fp-fail-backlog", "primary_files": ["a.py"]},
+        {},
+        "run-fail",
+        PROJECT_ID,
+        http_client=mock,
+    )
+    assert out["filed"] is False
+    assert out["reason"].startswith("backlog_upsert_failed:")
+    assert len(mock.posts) == 1

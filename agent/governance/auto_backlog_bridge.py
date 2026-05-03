@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Iterable
@@ -75,6 +76,18 @@ class _DefaultHttpClient:
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _exception_message(exc: Exception) -> str:
+    """Return an exception message with HTTP response bodies when available."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        if body:
+            return f"{exc!s}: {body}"
+    return str(exc)
 
 
 def _count_active_tasks(http_client: Any, project_id: str) -> int:
@@ -296,6 +309,34 @@ def file_cluster_as_backlog(
         or []
     )
     target_files = [str(f) for f in primary_files]
+    backlog_payload = {
+        "title": (
+            f"Reconcile FeatureCluster {cluster_fp[:8]}: "
+            f"{slug_hint or 'cluster'}"
+        ),
+        "status": "OPEN",
+        "priority": "P2",
+        "target_files": target_files,
+        "test_files": list(cluster_group.get("secondary_files") or []),
+        "acceptance_criteria": [
+            "PM produces candidate-only graph proposal for this FeatureCluster",
+            "Dev/Test/QA validate docs/tests/coverage gaps for the cluster",
+            "Gatekeeper applies candidate nodes to overlay only",
+        ],
+        "details_md": (
+            "Auto-filed by reconcile cluster bridge before PM task creation.\n\n"
+            f"run_id: {run_id}\n"
+            f"cluster_fingerprint: {cluster_fp}\n"
+            f"primary_files: {', '.join(target_files)}"
+        ),
+        "chain_trigger_json": {
+            "operation_type": operation_type,
+            "reconcile_run_id": run_id,
+            "cluster_fingerprint": cluster_fp,
+        },
+        "force_admit": True,
+        "actor": creator,
+    }
 
     payload = {
         "type": "pm",
@@ -309,9 +350,22 @@ def file_cluster_as_backlog(
     }
 
     try:
+        http_client.post(
+            f"/api/backlog/{project_id}/{urllib.parse.quote(backlog_id)}",
+            backlog_payload,
+        )
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"backlog_upsert_failed: {_exception_message(exc)}"
+        log.warning(
+            "auto_backlog_bridge: cluster backlog upsert failed bug=%s err=%s",
+            backlog_id, exc,
+        )
+        return out
+
+    try:
         resp = http_client.post(f"/api/task/{project_id}/create", payload)
     except Exception as exc:  # noqa: BLE001
-        out["reason"] = f"create_failed: {exc!s}"
+        out["reason"] = f"create_failed: {_exception_message(exc)}"
         log.warning(
             "auto_backlog_bridge: cluster_filing POST failed bug=%s err=%s",
             backlog_id, exc,
