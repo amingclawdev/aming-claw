@@ -678,7 +678,7 @@ Failed phases retry up to their specified limits before escalating.
 
 ---
 
-## §12 Symbol Reconcile — Cluster-Driven Graph Rebase Session
+## §14 Symbol Reconcile — Cluster-Driven Graph Rebase Session
 
 _(Stub section — see proposal for full design.)_
 
@@ -692,7 +692,7 @@ _(Stub section — see proposal for full design.)_
 
 **Proposal anchors**: §4.2 (cluster definition), §4.6 (deferred queue), §4.8 (reconcile session + overlay), §4.9 (snapshot+rollback).
 
-### §12.1 Language adapters
+### §14.1 Language adapters
 
 The cluster-driven reconcile pipeline delegates per-language analysis to the
 `agent/governance/language_adapters/` package, which publishes a small,
