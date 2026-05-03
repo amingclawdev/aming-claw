@@ -4557,8 +4557,12 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     """
     # CR0b R4: reconcile-session bypass for the qa-pass related-nodes
     # existence check.
-    _session_related_bypassed, _session_bypass_reason = _check_session_bypass(
-        "_gate_qa_pass.related_nodes", project_id, metadata.get("task_id", ""))
+    _task_id_for_session = metadata.get("task_id", "")
+    if _task_id_for_session:
+        _session_related_bypassed, _session_bypass_reason = _check_session_bypass(
+            "_gate_qa_pass.related_nodes", project_id, _task_id_for_session)
+    else:
+        _session_related_bypassed, _session_bypass_reason = False, ""
     if _session_related_bypassed:
         log.warning("qa_gate: related_nodes checks bypassed by active reconcile session: %s",
                     _session_bypass_reason)
@@ -4566,9 +4570,18 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     # surface any dev-stage violation that slipped past the primary check.
     # Always logs only — never blocks here.
     try:
-        if not _validate_dev_at_transition(conn, project_id,
-                                           metadata.get("task_id", ""), result, metadata):
-            log.warning("qa_gate: dev preflight validator caught violations past stage-transition")
+        dev_result_for_preflight = metadata.get("dev_result")
+        if isinstance(dev_result_for_preflight, str):
+            try:
+                dev_result_for_preflight = json.loads(dev_result_for_preflight)
+            except Exception:
+                dev_result_for_preflight = None
+        if isinstance(dev_result_for_preflight, dict):
+            if not _validate_dev_at_transition(
+                conn, project_id, metadata.get("task_id", ""),
+                dev_result_for_preflight, metadata,
+            ):
+                log.warning("qa_gate: dev preflight validator caught violations past stage-transition")
     except Exception:
         log.debug("qa_gate: secondary preflight call failed (non-critical)", exc_info=True)
     graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
@@ -4600,20 +4613,28 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     if graph_governance_bypassed:
         log.warning("qa_gate: graph governance checks bypassed by backlog policy")
     else:
-        # AC5: validate PRD graph declarations against dev changed_files
+        # AC5: validate PRD graph declarations against dev changed_files.
+        # Skip the load entirely when this QA task has no graph declarations;
+        # test fixtures may monkeypatch get_connection to a shared in-memory DB,
+        # and project graph loading owns/closes connections it opens.
         _prd_decl_raw = metadata.get("prd", metadata)
-        _dev_changed = metadata.get("changed_files", result.get("changed_files", []))
-        _current_graph = None
-        try:
-            from . import project_service
-            _current_graph = project_service.load_project_graph(project_id)
-        except Exception:
-            log.debug("qa_gate: graph load for prd declaration validation failed", exc_info=True)
-        _decl_errors = validate_prd_graph_declarations(_prd_decl_raw, _dev_changed, _current_graph)
-        if _decl_errors:
-            return False, (
-                "PRD graph-declaration validation failed: " + "; ".join(_decl_errors)
-            )
+        _has_prd_graph_decl = (
+            isinstance(_prd_decl_raw, dict)
+            and any(_prd_decl_raw.get(k) for k in ("proposed_nodes", "removed_nodes", "unmapped_files"))
+        )
+        if _has_prd_graph_decl:
+            _dev_changed = metadata.get("changed_files", result.get("changed_files", []))
+            _current_graph = None
+            try:
+                from . import project_service
+                _current_graph = project_service.load_project_graph(project_id)
+            except Exception:
+                log.debug("qa_gate: graph load for prd declaration validation failed", exc_info=True)
+            _decl_errors = validate_prd_graph_declarations(_prd_decl_raw, _dev_changed, _current_graph)
+            if _decl_errors:
+                return False, (
+                    "PRD graph-declaration validation failed: " + "; ".join(_decl_errors)
+                )
         # PR-B: graph.delta.proposed enforcement — check BEFORE criteria evaluation
         if _gd_proposed:
             gd_review = result.get("graph_delta_review")

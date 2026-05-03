@@ -644,9 +644,7 @@ def _post_manager_redeploy_governance(task_id: str = "", expected_head: str = ""
     import urllib.error
 
     url = "http://localhost:40101/api/manager/redeploy/governance"
-    # observer-hotfix: manager_http_server reads body.get("chain_version") not "expected_head"
-    # PR2 fixed the URL port (40200→40101) but missed the field-name mismatch; this flips
-    # the deploy through the legacy ModuleNotFoundError path instead of the manager redeploy.
+    # observer-hotfix: manager_http_server reads body.get("chain_version") not "expected_head".
     # Send both names for compat; manager picks chain_version, future PR3 can rename.
     payload = json.dumps({
         "task_id": task_id,
