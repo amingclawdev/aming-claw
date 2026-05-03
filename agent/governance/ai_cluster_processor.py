@@ -47,6 +47,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, List, Optional, Sequence
 
@@ -151,6 +152,33 @@ def _default_ai_call(stage: str, payload: dict) -> dict:
     return {}
 
 
+def _call_ai_with_retries(
+    ai_call: Callable[[str, dict], dict],
+    stage: str,
+    payload: dict,
+    *,
+    retry_delays: Sequence[float] = (1, 4, 16),
+    retry_sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Call the LLM adapter with bounded exponential backoff.
+
+    ``retry_delays=(1, 4, 16)`` means one initial attempt plus three retry
+    attempts. The final exception is re-raised so the caller can fall back to
+    the deterministic placeholder without blocking graph publication.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return ai_call(stage, payload)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= len(retry_delays):
+                break
+            retry_sleep(float(retry_delays[attempt]))
+    assert last_exc is not None
+    raise last_exc
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -162,6 +190,8 @@ def process_cluster_with_ai(
     use_ai: bool = True,
     ai_call: Optional[Callable[[str, dict], dict]] = None,
     cache: Optional[LLMCache] = None,
+    retry_delays: Sequence[float] = (1, 4, 16),
+    retry_sleep: Callable[[float], None] = time.sleep,
 ) -> ClusterReport:
     """Produce a :class:`ClusterReport` for *cluster* (entry point = *entry*).
 
@@ -237,7 +267,13 @@ def process_cluster_with_ai(
 
     try:
         # (1) Mandatory semantic summarization.
-        summary = ai_call("summarize_cluster", cluster_payload) or {}
+        summary = _call_ai_with_retries(
+            ai_call,
+            "summarize_cluster",
+            cluster_payload,
+            retry_delays=retry_delays,
+            retry_sleep=retry_sleep,
+        ) or {}
         if not isinstance(summary, dict):
             raise TypeError("ai_call(summarize_cluster) must return a dict")
 
@@ -259,12 +295,15 @@ def process_cluster_with_ai(
 
         # (2) Conditional gap explanation.
         if report.missing_tests:
-            gap = ai_call(
+            gap = _call_ai_with_retries(
+                ai_call,
                 "explain_gap",
                 {
                     "feature_name": report.feature_name,
                     "missing_tests": list(report.missing_tests),
                 },
+                retry_delays=retry_delays,
+                retry_sleep=retry_sleep,
             ) or {}
             if isinstance(gap, dict):
                 report.gap_explanation = gap.get("explanation") or gap.get(
@@ -283,12 +322,15 @@ def process_cluster_with_ai(
                 if os.path.exists(candidate):
                     existing_docs.append(rel)
             if existing_docs:
-                doc = ai_call(
+                doc = _call_ai_with_retries(
+                    ai_call,
                     "validate_docs",
                     {
                         "feature_name": report.feature_name,
                         "doc_paths": existing_docs,
                     },
+                    retry_delays=retry_delays,
+                    retry_sleep=retry_sleep,
                 ) or {}
                 if isinstance(doc, dict):
                     report.doc_validation = doc.get("validation") or doc.get(

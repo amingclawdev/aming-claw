@@ -150,12 +150,20 @@ def test_cache_hit_skips_llm_call(workspace, cluster, entry):
 
 def test_ai_503_falls_back_to_placeholder(workspace, cluster, entry):
     """When ai_call raises any Exception → ai_unavailable placeholder."""
+    attempts = []
+    sleeps = []
 
     def boom(stage, payload):
+        attempts.append(stage)
         raise RuntimeError("503 Service Unavailable")
 
     report = process_cluster_with_ai(
-        cluster, entry, str(workspace), use_ai=True, ai_call=boom
+        cluster,
+        entry,
+        str(workspace),
+        use_ai=True,
+        ai_call=boom,
+        retry_sleep=sleeps.append,
     )
 
     assert isinstance(report, ClusterReport)
@@ -164,6 +172,41 @@ def test_ai_503_falls_back_to_placeholder(workspace, cluster, entry):
     assert report.purpose is None
     assert report.gap_explanation is None
     assert report.doc_validation is None
+    assert attempts == ["summarize_cluster"] * 4
+    assert sleeps == [1.0, 4.0, 16.0]
+
+
+def test_transient_ai_failure_retries_then_succeeds(workspace, cluster, entry):
+    """The 1s/4s/16s backoff path recovers from transient LLM failures."""
+    attempts = []
+    sleeps = []
+
+    def flaky(stage, payload):
+        attempts.append(stage)
+        if len(attempts) < 3:
+            raise RuntimeError("temporary 503")
+        return {
+            "feature_name": "Recovered Feature",
+            "purpose": "Recovered after retry.",
+            "expected_test_files": [],
+            "expected_doc_sections": [],
+            "dead_code_candidates": [],
+            "missing_tests": [],
+        }
+
+    report = process_cluster_with_ai(
+        cluster,
+        entry,
+        str(workspace),
+        use_ai=True,
+        ai_call=flaky,
+        retry_sleep=sleeps.append,
+    )
+
+    assert report.enrichment_status == "ai_complete"
+    assert report.feature_name == "Recovered Feature"
+    assert attempts == ["summarize_cluster"] * 3
+    assert sleeps == [1.0, 4.0]
 
 
 def test_cluster_report_serializable():
@@ -248,3 +291,15 @@ def test_cache_miss_writes_to_cache(workspace, cluster, entry):
     )
     mock2.assert_not_called()
     assert report.feature_name == "F"
+
+
+def test_compatibility_entrypoints_export_existing_implementation():
+    from agent.governance.llm_cache_local import LLMCache as CompatCache
+    from agent.governance.symbol_cluster_processor import (
+        ClusterReport as CompatClusterReport,
+        process_cluster_with_ai as compat_process,
+    )
+
+    assert CompatCache is LLMCache
+    assert CompatClusterReport is ClusterReport
+    assert compat_process is process_cluster_with_ai
