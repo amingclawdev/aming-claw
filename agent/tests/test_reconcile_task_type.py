@@ -103,6 +103,29 @@ def _make_in_memory_db():
             details_json TEXT,
             PRIMARY KEY (project_id, baseline_id)
         );
+        CREATE TABLE IF NOT EXISTS version_baselines (
+            project_id        TEXT NOT NULL,
+            baseline_id       INTEGER NOT NULL,
+            chain_version     TEXT NOT NULL,
+            graph_sha         TEXT NOT NULL DEFAULT '',
+            code_doc_map_sha  TEXT NOT NULL DEFAULT '',
+            node_state_snap   TEXT NOT NULL DEFAULT '{}',
+            chain_event_max   INTEGER NOT NULL DEFAULT 0,
+            trigger           TEXT NOT NULL DEFAULT '',
+            triggered_by      TEXT NOT NULL DEFAULT '',
+            reconstructed     INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL,
+            notes             TEXT NOT NULL DEFAULT '',
+            scope_id          TEXT,
+            parent_baseline_id INTEGER,
+            scope_kind        TEXT,
+            scope_value       TEXT,
+            merged_into       INTEGER,
+            merge_status      TEXT,
+            merge_evidence_json TEXT,
+            mutations_sha256  TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (project_id, baseline_id)
+        );
     """)
     return conn
 
@@ -397,14 +420,24 @@ class TestBaselineWrite(unittest.TestCase):
     def test_baseline_written(self):
         from governance.reconcile_task import _trigger_baseline_write
         conn = _make_in_memory_db()
+        conn.execute(
+            "INSERT INTO project_version (project_id, chain_version, git_head) "
+            "VALUES (?, ?, ?)",
+            ("proj1", "abc1234", "abc1234"),
+        )
+        conn.commit()
         _trigger_baseline_write(conn, "proj1", "task-bl-1")
         conn.commit()
         row = conn.execute(
-            "SELECT * FROM baselines WHERE project_id = ? AND baseline_id = ?",
-            ("proj1", "baseline-reconcile-task-bl-1"),
+            "SELECT * FROM version_baselines WHERE project_id = ?",
+            ("proj1",),
         ).fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(row["baseline_type"], "phase_i")
+        self.assertEqual(row["chain_version"], "abc1234")
+        self.assertEqual(row["trigger"], "reconcile-apply")
+        self.assertEqual(row["triggered_by"], "reconcile-task")
+        self.assertEqual(row["scope_kind"], "phase_i_reconcile")
+        self.assertEqual(row["scope_value"], "task-bl-1")
 
 
 class TestReconcileV2Endpoint(unittest.TestCase):

@@ -1139,7 +1139,13 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
     return delta, rule_hits, inferred_from, source
 
 
-def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
+def _is_reconcile_task_type(task_type):
+    return task_type == "reconcile" or (
+        isinstance(task_type, str) and task_type.startswith("reconcile_")
+    )
+
+
+def _emit_or_infer_graph_delta(project_id, task_id, result, metadata, task_type=""):
     """Emit graph.delta.proposed, auto-inferring if dev omitted graph_delta.
 
     Replaces direct _emit_graph_delta_event() call to ensure graph.delta.proposed
@@ -1154,11 +1160,30 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
     enable the declared_files / declared_removed_ids filters that prevent phantom
     creates for files PM declared as unmapped/removed (see Rule J in _infer_graph_delta).
     """
+    metadata = metadata if isinstance(metadata, dict) else {}
     if backlog_runtime.is_graph_governance_bypassed(metadata):
         log.warning("auto_chain: graph.delta.proposed skipped for task %s by backlog graph bypass", task_id)
         return
 
     graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
+    effective_task_type = task_type or metadata.get("task_type", "")
+    if _is_reconcile_task_type(effective_task_type):
+        # Reconcile tasks derive authoritative topology deltas. Running the
+        # general auto-inferrer on top can re-classify intended removals as
+        # phantom creates and turn graph.v2 into a second-source conflict.
+        log.info(
+            "_emit_or_infer_graph_delta: reconcile task passthrough task=%s type=%s",
+            task_id,
+            effective_task_type,
+        )
+        _emit_graph_delta_event_with_source(
+            project_id,
+            task_id,
+            result,
+            "reconcile-derived",
+            metadata,
+        )
+        return
 
     # Normalize dev delta
     dev_has_delta = False
@@ -3116,7 +3141,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
 
     # R2: Emit graph.delta.proposed event (auto-infer if dev omitted graph_delta)
     if task_type == "dev" and not graph_governance_bypassed:
-        _emit_or_infer_graph_delta(project_id, task_id, result, metadata)
+        _emit_or_infer_graph_delta(project_id, task_id, result, metadata, task_type=task_type)
 
     # Run gate check
     gate_fn = _GATES[gate_fn_name]
