@@ -166,8 +166,13 @@ def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
             else project_root_str
         )
 
+    # The bundled Windows Python uses python312._pth, where "." resolves to the
+    # runtime directory, not the process cwd.  Running with "-m agent..." can
+    # therefore fail to import the repo package even when PYTHONPATH is set.
+    # start_governance.py inserts the project root into sys.path before importing
+    # the server and is the same host-first entrypoint used by the ops script.
     governance_cmd = [
-        sys.executable, "-m", "agent.governance.server",
+        sys.executable, str(project_root / "start_governance.py"),
     ]
 
     log.info(
