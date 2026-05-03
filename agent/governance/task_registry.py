@@ -473,6 +473,10 @@ def complete_task(
                     stored_result = json.loads(row["result_json"] or "{}")
                 except Exception:
                     stored_result = {}
+            # Observer replay can emit audit rows above. Release this request's
+            # transaction before auto-chain opens its own connection, otherwise
+            # SQLite can self-lock while persisting chain_context events.
+            conn.commit()
             if current_status == "succeeded":
                 chain_result = _dispatch_auto_chain_success(
                     project_id, task_id, task_type_val, current_status, stored_result or {}, meta

@@ -152,6 +152,48 @@ class TestCompleteTaskAutoChain(unittest.TestCase):
         self.assertEqual(replay_args["result"], stored)
         self.assertEqual(replay_args["task_type"], "dev")
 
+    def test_terminal_replay_commits_observer_audit_before_auto_chain(self):
+        """Observer replay must release audit writes before chain event writes."""
+        task_id, fence = self._create_and_claim("dev")
+
+        with mock.patch(
+            "agent.governance.auto_chain.on_task_completed", return_value={"ok": True}
+        ):
+            from agent.governance.task_registry import complete_task
+            complete_task(
+                self.conn, task_id, status="succeeded",
+                result={"summary": "done"}, project_id="proj",
+                fence_token=fence,
+            )
+
+        def write_audit(conn, project_id, event, **kwargs):
+            conn.execute(
+                "INSERT INTO audit_index "
+                "(event_id, project_id, event, actor, ok, ts, node_ids) "
+                "VALUES ('aud-test-replay', ?, ?, 'observer', 1, ?, '[]')",
+                (project_id, event, "2026-05-03T00:00:00Z"),
+            )
+
+        def assert_outer_conn_released(*args, **kwargs):
+            self.assertFalse(self.conn.in_transaction)
+            return {"task_id": "next-task"}
+
+        with mock.patch(
+            "agent.governance.audit_service.record", side_effect=write_audit
+        ), mock.patch(
+            "agent.governance.auto_chain.on_task_completed",
+            side_effect=assert_outer_conn_released,
+        ):
+            replay = complete_task(
+                self.conn, task_id, status="succeeded",
+                result=None, project_id="proj",
+                fence_token=fence,
+                completed_by="observer-runtime-recovery",
+                override_reason="replay_auto_chain",
+            )
+
+        self.assertTrue(replay["replayed_auto_chain"])
+
 
 class TestCompleteAutoChainCreatesTask(unittest.TestCase):
     """AC2: auto_chain still creates correct next-stage task."""
