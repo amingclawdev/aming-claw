@@ -268,10 +268,14 @@ class ExecutorWorker:
                            {"worker_id": self.worker_id, "caller_pid": os.getpid()})
         if "error" in result or "task" not in result:
             return None
-        task_pair = result["task"]
-        if not task_pair or not isinstance(task_pair, list) or len(task_pair) < 2:
-            return None
-        task_data, fence_token = task_pair
+        task_payload = result["task"]
+        fence_token = result.get("fence_token", "")
+        if isinstance(task_payload, (list, tuple)):
+            if len(task_payload) < 2:
+                return None
+            task_data, fence_token = task_payload[0], task_payload[1]
+        else:
+            task_data = task_payload
         if not task_data or not isinstance(task_data, dict):
             return None
         task_data["_fence_token"] = fence_token

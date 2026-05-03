@@ -315,6 +315,106 @@ class TestVersionDriftWarning(unittest.TestCase):
         self.assertEqual(result["status"], "queued")
 
 
+class TestBacklogRuntimeMirrorForRegistryTransitions(unittest.TestCase):
+    """Registry-only transitions must keep backlog runtime state current."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _make_conn(self.tmp.name)
+
+    def tearDown(self):
+        self.conn.close()
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        self.tmp.cleanup()
+
+    def _insert_backlog(self, bug_id):
+        self.conn.execute(
+            "INSERT INTO backlog_bugs (bug_id, created_at, updated_at) VALUES (?, ?, ?)",
+            (bug_id, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        self.conn.commit()
+
+    def test_cancel_task_mirrors_backlog_runtime_cancelled(self):
+        from agent.governance.task_registry import create_task, claim_task, cancel_task
+
+        bug_id = "OPT-BACKLOG-CANCEL-MIRROR"
+        self._insert_backlog(bug_id)
+        task = create_task(
+            self.conn,
+            "proj",
+            "pm task",
+            task_type="pm",
+            metadata={"bug_id": bug_id},
+        )
+        self.conn.commit()
+        claim_task(self.conn, "proj", "worker-1")
+        self.conn.commit()
+
+        with mock.patch("agent.governance.auto_chain.on_task_completed", return_value=None):
+            cancel_task(
+                self.conn,
+                task["task_id"],
+                "observer withdrew reconcile smoke",
+                project_id="proj",
+            )
+
+        row = self.conn.execute(
+            "SELECT runtime_state, chain_stage, current_task_id, root_task_id, last_failure_reason "
+            "FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        self.assertEqual(row["runtime_state"], "cancelled")
+        self.assertEqual(row["chain_stage"], "pm_cancelled")
+        self.assertEqual(row["current_task_id"], task["task_id"])
+        self.assertEqual(row["root_task_id"], task["task_id"])
+        self.assertIn("observer withdrew", row["last_failure_reason"])
+
+    def test_recover_stale_task_mirrors_backlog_runtime_queued(self):
+        from agent.governance.task_registry import (
+            create_task,
+            claim_task,
+            recover_stale_tasks,
+        )
+
+        bug_id = "OPT-BACKLOG-RECOVER-MIRROR"
+        self._insert_backlog(bug_id)
+        task = create_task(
+            self.conn,
+            "proj",
+            "pm task",
+            task_type="pm",
+            metadata={"bug_id": bug_id},
+        )
+        self.conn.commit()
+        claim_task(self.conn, "proj", "worker-1")
+        self.conn.execute(
+            "UPDATE tasks SET metadata_json = json_set(metadata_json, '$.lease_expires_at', ?) "
+            "WHERE task_id = ?",
+            ("2000-01-01T00:00:00Z", task["task_id"]),
+        )
+        self.conn.commit()
+
+        result = recover_stale_tasks(self.conn, "proj")
+
+        self.assertEqual(result["recovered"], 1)
+        task_row = self.conn.execute(
+            "SELECT status, execution_status FROM tasks WHERE task_id = ?",
+            (task["task_id"],),
+        ).fetchone()
+        self.assertEqual(task_row["status"], "queued")
+        self.assertEqual(task_row["execution_status"], "queued")
+        backlog_row = self.conn.execute(
+            "SELECT runtime_state, chain_stage, current_task_id, root_task_id, last_failure_reason "
+            "FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        self.assertEqual(backlog_row["runtime_state"], "queued")
+        self.assertEqual(backlog_row["chain_stage"], "pm_queued")
+        self.assertEqual(backlog_row["current_task_id"], task["task_id"])
+        self.assertEqual(backlog_row["root_task_id"], task["task_id"])
+        self.assertIn("Lease expired", backlog_row["last_failure_reason"])
+
+
 class TestRetryOnDbLock(unittest.TestCase):
     """B5: Retry-with-backoff for sqlite3.OperationalError('database is locked')."""
 

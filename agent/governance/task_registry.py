@@ -86,6 +86,61 @@ def _utc_iso_after(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_metadata(raw: str | dict | None) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mirror_backlog_runtime(
+    conn: sqlite3.Connection,
+    project_id: str,
+    task_id: str,
+    task_type: str,
+    metadata_raw: str | dict | None,
+    stage: str,
+    *,
+    runtime_state: str,
+    failure_reason: str = "",
+    result: dict | None = None,
+) -> None:
+    """Best-effort backlog runtime mirror for task_registry-only transitions."""
+    if not project_id:
+        return
+    metadata = _parse_metadata(metadata_raw)
+    bug_id = metadata.get("bug_id", "")
+    if not bug_id:
+        return
+    try:
+        from . import backlog_runtime
+
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            stage,
+            project_id=project_id,
+            failure_reason=failure_reason,
+            task_id=task_id,
+            task_type=task_type or "task",
+            metadata=metadata,
+            result=result or {},
+            runtime_state=runtime_state,
+        )
+    except Exception:
+        log.debug(
+            "task_registry: backlog runtime mirror failed for task=%s stage=%s",
+            task_id,
+            stage,
+            exc_info=True,
+        )
+
+
 def _is_observer_mode(conn: sqlite3.Connection, project_id: str) -> bool:
     """Return True if observer_mode is enabled for this project."""
     try:
@@ -722,6 +777,19 @@ def cancel_task(
            WHERE task_id = ? AND status = 'running'""",
         (now, cancel_result, cancel_reason, task_id),
     )
+    metadata = _parse_metadata(row["metadata_json"])
+    parsed_cancel_result = json.loads(cancel_result)
+    _mirror_backlog_runtime(
+        conn,
+        project_id,
+        task_id,
+        row["type"] or "task",
+        metadata,
+        f"{row['type'] or 'task'}_cancelled",
+        runtime_state="cancelled",
+        failure_reason=cancel_reason,
+        result=parsed_cancel_result,
+    )
     if project_id:
         try:
             from . import auto_chain
@@ -729,8 +797,8 @@ def cancel_task(
                 conn, project_id, task_id,
                 task_type=row["type"] or "task",
                 status="cancelled",
-                result=json.loads(cancel_result),
-                metadata=json.loads(row["metadata_json"] or "{}"),
+                result=parsed_cancel_result,
+                metadata=metadata,
             )
         except Exception:
             log.debug("task.cancelled: auto_chain cancel hook failed for %s",
@@ -845,7 +913,7 @@ def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
 
     # Phase 1: Expired lease recovery
     rows = conn.execute(
-        """SELECT task_id FROM tasks
+        """SELECT task_id, type, metadata_json FROM tasks
            WHERE project_id = ? AND execution_status IN ('claimed', 'running')
              AND json_extract(metadata_json, '$.lease_expires_at') < ?""",
         (project_id, now),
@@ -873,12 +941,23 @@ def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
                WHERE task_id = ?""",
             (now, row["task_id"]),
         )
+        _mirror_backlog_runtime(
+            conn,
+            project_id,
+            row["task_id"],
+            row["type"] or "task",
+            row["metadata_json"],
+            f"{row['type'] or 'task'}_queued",
+            runtime_state="queued",
+            failure_reason="Lease expired during execution",
+            result=json.loads(recovery_result),
+        )
         recovered += 1
         log.info("Recovered stale task (expired lease): %s", row["task_id"])
 
     # Phase 2: PID liveness check for claimed tasks with valid leases
     live_rows = conn.execute(
-        """SELECT task_id, json_extract(metadata_json, '$.worker_pid') as worker_pid
+        """SELECT task_id, type, metadata_json, json_extract(metadata_json, '$.worker_pid') as worker_pid
            FROM tasks
            WHERE project_id = ? AND execution_status IN ('claimed', 'running')
              AND (json_extract(metadata_json, '$.lease_expires_at') >= ? OR
@@ -917,6 +996,17 @@ def recover_stale_tasks(conn: sqlite3.Connection, project_id: str) -> dict:
                      updated_at = ?
                    WHERE task_id = ?""",
                 (now, row["task_id"]),
+            )
+            _mirror_backlog_runtime(
+                conn,
+                project_id,
+                row["task_id"],
+                row["type"] or "task",
+                row["metadata_json"],
+                f"{row['type'] or 'task'}_queued",
+                runtime_state="queued",
+                failure_reason=f"Worker PID {pid} is not alive",
+                result=json.loads(recovery_result),
             )
             pid_recovered += 1
             log.info("Recovered stale task (dead PID %d): %s", pid, row["task_id"])
