@@ -59,6 +59,20 @@ def _governance_port() -> int:
         return 40000
 
 
+def _governance_log_paths(chain_version: str) -> tuple[Path, Path]:
+    """Return durable stdout/stderr log paths for a spawned governance process."""
+    project_root = _project_root()
+    shared_root = Path(os.getenv("SHARED_VOLUME_PATH", str(project_root / "shared-volume")))
+    log_dir = shared_root / "codex-tasks" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    safe_version = "".join(
+        ch for ch in (chain_version or "unknown") if ch.isalnum() or ch in ("-", "_")
+    )[:32] or "unknown"
+    prefix = f"governance-redeploy-{_governance_port()}-{safe_version}-{stamp}"
+    return log_dir / f"{prefix}.out.log", log_dir / f"{prefix}.err.log"
+
+
 # ---------------------------------------------------------------------------
 # Governance redeploy logic
 # ---------------------------------------------------------------------------
@@ -155,6 +169,7 @@ def _stop_governance_process() -> bool:
 def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
     """Spawn a new governance process with correct CWD and PYTHONPATH."""
     project_root = _project_root()
+    stdout_log, stderr_log = _governance_log_paths(chain_version)
 
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
@@ -165,6 +180,8 @@ def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
             if existing_pythonpath
             else project_root_str
         )
+    env["GOVERNANCE_STDOUT_LOG"] = str(stdout_log)
+    env["GOVERNANCE_STDERR_LOG"] = str(stderr_log)
 
     # The bundled Windows Python uses python312._pth, where "." resolves to the
     # runtime directory, not the process cwd.  Running with "-m agent..." can
@@ -176,18 +193,26 @@ def _spawn_governance_process(chain_version: str) -> subprocess.Popen:
     ]
 
     log.info(
-        "manager_http_server: spawning governance with cwd=%s, PYTHONPATH=%s",
+        "manager_http_server: spawning governance with cwd=%s, PYTHONPATH=%s, stdout=%s, stderr=%s",
         project_root_str,
         env.get("PYTHONPATH", ""),
+        stdout_log,
+        stderr_log,
     )
 
-    proc = subprocess.Popen(
-        governance_cmd,
-        cwd=project_root_str,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    stdout_handle = stdout_log.open("ab", buffering=0)
+    stderr_handle = stderr_log.open("ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            governance_cmd,
+            cwd=project_root_str,
+            env=env,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+        )
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
 
     log.info("manager_http_server: governance spawned (PID %d)", proc.pid)
     return proc
