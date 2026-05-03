@@ -1305,9 +1305,13 @@ def handle_reconcile_session_finalize(ctx: RequestContext):
                 "message": "session is rolled_back; cannot finalize",
             }
         try:
-            if current_status == "active":
-                reconcile_session.transition_to_finalizing(conn, project_id, session_id)
             result = reconcile_session.finalize_session(conn, project_id, session_id)
+        except reconcile_session.SessionClusterGateError as exc:
+            return 409, {
+                "error": "reconcile_clusters_incomplete",
+                "message": str(exc),
+                "summary": exc.summary,
+            }
         except ValueError as exc:
             return 400, {"error": "invalid_state", "message": str(exc)}
     return {
@@ -1449,16 +1453,20 @@ def _deferred_cluster_row_to_dict(row) -> dict:
 
 @route("GET", "/api/reconcile/{project_id}/deferred-clusters")
 def handle_reconcile_deferred_clusters_list(ctx: RequestContext):
-    """List queue rows; supports ?status=&priority= filters."""
+    """List queue rows; supports ?status=&priority=&run_id= filters."""
     from . import reconcile_deferred_queue as q
 
     project_id = ctx.get_project_id()
     status_filter = ctx.query.get("status")
     priority_filter = ctx.query.get("priority")
+    run_id_filter = ctx.query.get("run_id")
     sql = (
         "SELECT * FROM reconcile_deferred_clusters WHERE project_id = ?"
     )
     args: list = [project_id]
+    if run_id_filter:
+        sql += " AND run_id = ?"
+        args.append(run_id_filter)
     if status_filter:
         sql += " AND status = ?"
         args.append(status_filter)
@@ -1477,6 +1485,54 @@ def handle_reconcile_deferred_clusters_list(ctx: RequestContext):
         rows = conn.execute(sql, tuple(args)).fetchall()
     items = [_deferred_cluster_row_to_dict(r) for r in rows]
     return {"clusters": items, "count": len(items)}
+
+
+@route("GET", "/api/reconcile/{project_id}/deferred-clusters/summary")
+def handle_reconcile_deferred_clusters_summary(ctx: RequestContext):
+    """Return completion gate state for a project/run."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    run_id = ctx.query.get("run_id") or ""
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        summary = q.completion_summary(
+            project_id,
+            run_id=run_id or None,
+            conn=conn,
+        )
+    return {"summary": summary}
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/register-run")
+def handle_reconcile_deferred_clusters_register_run(ctx: RequestContext):
+    """Register all FeatureClusters from a Phase Z run into the durable queue."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    body = ctx.body or {}
+    run_id = str(body.get("run_id") or "").strip()
+    clusters = body.get("feature_clusters") or body.get("clusters") or []
+    if not run_id:
+        return 400, {"error": "missing_run_id"}
+    if not isinstance(clusters, list):
+        return 400, {"error": "invalid_feature_clusters"}
+    try:
+        priority = int(body.get("priority", 100))
+    except (TypeError, ValueError):
+        priority = 100
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        result = q.register_feature_clusters(
+            project_id,
+            run_id,
+            clusters,
+            conn=conn,
+            priority=priority,
+        )
+    return {"result": result}
 
 
 @route("GET", "/api/reconcile/{project_id}/file-inventory")

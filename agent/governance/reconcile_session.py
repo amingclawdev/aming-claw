@@ -20,6 +20,14 @@ class SessionAlreadyActiveError(Exception):
     """Raised when an active/finalizing session already exists (CR0b -> HTTP 409)."""
 
 
+class SessionClusterGateError(ValueError):
+    """Raised when queued reconcile clusters are not safe to finalize."""
+
+    def __init__(self, message: str, summary: Optional[dict] = None):
+        super().__init__(message)
+        self.summary = summary or {}
+
+
 @dataclass
 class ReconcileSession:
     project_id: str
@@ -165,8 +173,34 @@ def transition_to_finalizing(conn: sqlite3.Connection, project_id: str,
     return sess
 
 
+def _cluster_gate_summary(
+        conn: sqlite3.Connection, project_id: str, session_id: str) -> dict:
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT run_id FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+        (project_id, session_id)).fetchone()
+    run_id = row["run_id"] if row is not None else None
+    try:
+        from . import reconcile_deferred_queue as q
+
+        summary = q.sync_session_counts(
+            project_id, run_id=run_id, session_id=session_id, conn=conn)
+    except Exception:
+        return {"total": 0, "ready_for_finalize": True}
+    return summary
+
+
 def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str, *,
-        governance_dir: Optional[Path] = None) -> SessionFinalizationResult:
+        governance_dir: Optional[Path] = None,
+        enforce_cluster_completion: bool = True) -> SessionFinalizationResult:
+    if enforce_cluster_completion:
+        summary = _cluster_gate_summary(conn, project_id, session_id)
+        if int(summary.get("total") or 0) > 0 and not summary.get("ready_for_finalize"):
+            raise SessionClusterGateError(
+                "reconcile clusters are not complete; finish cluster chain pass before finalize",
+                summary=summary,
+            )
     now = _utcnow_iso()
     cur = conn.execute(
         "UPDATE reconcile_sessions SET status='finalized', finalized_at=? "
@@ -328,7 +362,7 @@ def restore_snapshot(conn: sqlite3.Connection, project_id: str, session_id: str,
 
 __all__ = [
     "ReconcileSession", "SessionFinalizationResult", "SessionRollbackResult",
-    "RestoreResult", "SessionAlreadyActiveError",
+    "RestoreResult", "SessionAlreadyActiveError", "SessionClusterGateError",
     "get_active_session", "start_session", "transition_to_finalizing",
     "finalize_session", "rollback_session", "is_gate_bypassed",
     "capture_snapshot", "restore_snapshot",

@@ -140,6 +140,26 @@ def test_finalize_clears_overlay_and_archives_bak(conn, gov_dir):
     assert (gov_dir / "graph.rebase.overlay.json.bak").exists()
 
 
+def test_finalize_blocks_until_reconcile_clusters_complete(conn, gov_dir):
+    from governance import reconcile_deferred_queue as q
+
+    sess = rs.start_session(conn, PROJECT_ID, run_id="phase-z-block",
+                            governance_dir=gov_dir)
+    q.enqueue_or_lookup(PROJECT_ID, "fp-block", payload={},
+                        run_id="phase-z-block", conn=conn)
+    with pytest.raises(rs.SessionClusterGateError) as exc:
+        rs.finalize_session(conn, PROJECT_ID, sess.session_id,
+                            governance_dir=gov_dir)
+    assert exc.value.summary["active_count"] == 1
+    assert exc.value.summary["ready_for_finalize"] is False
+
+    q.mark_terminal(PROJECT_ID, "fp-block", "resolved", "merged@abc",
+                    conn=conn)
+    result = rs.finalize_session(conn, PROJECT_ID, sess.session_id,
+                                 governance_dir=gov_dir)
+    assert result.status == "finalized"
+
+
 def test_overlay_file_lifecycle(conn, gov_dir):
     overlay = gov_dir / "graph.rebase.overlay.json"
     # finalize path

@@ -56,6 +56,7 @@ def test_module_api_surface():
     for name in [
         "enqueue_or_lookup", "get_next_batch", "mark_filing", "mark_in_chain",
         "mark_terminal", "requeue_after_failure", "escalate",
+        "register_feature_clusters", "completion_summary", "sync_session_counts",
         "RECONCILE_MAX_RETRIES",
     ]:
         assert hasattr(q, name), name
@@ -112,6 +113,54 @@ def test_deltas_change_requeue(conn):
     assert out["retry_count"] == 0
 
 
+def test_new_run_requeue_clears_stale_chain_linkage(conn):
+    q.enqueue_or_lookup(PROJECT_ID, "fp-rerun", payload={"a": 1},
+                        run_id="run-old", conn=conn)
+    q.mark_filing(PROJECT_ID, "fp-rerun", conn=conn)
+    q.mark_in_chain(PROJECT_ID, "fp-rerun", "task-old",
+                    bug_id="OPT-OLD", conn=conn)
+    q.mark_terminal(PROJECT_ID, "fp-rerun", "resolved", "merged@old",
+                    conn=conn)
+
+    out = q.enqueue_or_lookup(PROJECT_ID, "fp-rerun", payload={"a": 1},
+                              run_id="run-new", conn=conn)
+    assert out["existed"] is True
+    assert out["run_changed"] is True
+    assert out["status"] == "queued"
+    row = conn.execute(
+        "SELECT run_id, bug_id, root_task_id, resolved_at, last_terminal_status "
+        "FROM reconcile_deferred_clusters WHERE project_id=? AND cluster_fingerprint=?",
+        (PROJECT_ID, "fp-rerun"),
+    ).fetchone()
+    assert row[0] == "run-new"
+    assert row[1] is None
+    assert row[2] is None
+    assert row[3] is None
+    assert row[4] is None
+
+
+def test_register_recleans_queued_row_with_stale_linkage(conn):
+    q.enqueue_or_lookup(PROJECT_ID, "fp-stale-queued", payload={"a": 1},
+                        run_id="run-same", conn=conn)
+    conn.execute(
+        "UPDATE reconcile_deferred_clusters SET bug_id=?, root_task_id=?, "
+        "last_terminal_status=?, resolved_at=? "
+        "WHERE project_id=? AND cluster_fingerprint=?",
+        ("OPT-STALE", "task-stale", "resolved", "2026-05-03T00:00:00Z",
+         PROJECT_ID, "fp-stale-queued"),
+    )
+    conn.commit()
+    out = q.enqueue_or_lookup(PROJECT_ID, "fp-stale-queued", payload={"a": 1},
+                              run_id="run-same", conn=conn)
+    assert out["deltas_changed"] is False
+    row = conn.execute(
+        "SELECT bug_id, root_task_id, last_terminal_status, resolved_at "
+        "FROM reconcile_deferred_clusters WHERE project_id=? AND cluster_fingerprint=?",
+        (PROJECT_ID, "fp-stale-queued"),
+    ).fetchone()
+    assert tuple(row) == (None, None, None, None)
+
+
 # ---------------------------------------------------------------------------
 # Batch / priority
 # ---------------------------------------------------------------------------
@@ -125,6 +174,132 @@ def test_batch_limit(conn):
     assert len(rows) == 3
     rows_all = q.get_next_batch(PROJECT_ID, batch_size=100, conn=conn)
     assert len(rows_all) == 7
+
+
+def test_get_next_batch_can_filter_run_id(conn):
+    q.enqueue_or_lookup(PROJECT_ID, "fp-run-a", payload={"a": 1},
+                        run_id="run-a", conn=conn)
+    q.enqueue_or_lookup(PROJECT_ID, "fp-run-b", payload={"b": 1},
+                        run_id="run-b", conn=conn)
+    rows = q.get_next_batch(PROJECT_ID, batch_size=10, run_id="run-a", conn=conn)
+    assert [r["cluster_fingerprint"] for r in rows] == ["fp-run-a"]
+
+
+def test_register_feature_clusters_tracks_run_and_session_counts(conn, tmp_path, monkeypatch):
+    from governance import reconcile_session as rs
+
+    real_start = rs.start_session
+
+    def _start_with_tmp(c, pid, **kw):
+        kw.setdefault("governance_dir", tmp_path)
+        return real_start(c, pid, **kw)
+
+    monkeypatch.setattr(rs, "start_session", _start_with_tmp)
+
+    result = q.register_feature_clusters(
+        PROJECT_ID,
+        "phase-z-run",
+        [
+            {"cluster_fingerprint": "fp-reg-a", "primary_files": ["a.py"]},
+            {"cluster_fingerprint": "fp-reg-b", "primary_files": ["b.py"]},
+        ],
+        conn=conn,
+    )
+    assert result["expected"] == 2
+    assert result["registered"] == 2
+    assert result["created"] == 2
+    assert result["summary"]["total"] == 2
+    assert result["summary"]["ready_for_orphan_pass"] is False
+    row = conn.execute(
+        "SELECT run_id, cluster_count_total, cluster_count_resolved "
+        "FROM reconcile_sessions WHERE project_id = ?",
+        (PROJECT_ID,),
+    ).fetchone()
+    assert row[0] == "phase-z-run"
+    assert row[1] == 2
+    assert row[2] == 0
+
+
+def test_register_existing_clusters_starts_session_when_none_active(conn, tmp_path, monkeypatch):
+    from governance import reconcile_session as rs
+
+    real_start = rs.start_session
+
+    def _start_with_tmp(c, pid, **kw):
+        kw.setdefault("governance_dir", tmp_path)
+        return real_start(c, pid, **kw)
+
+    monkeypatch.setattr(rs, "start_session", _start_with_tmp)
+
+    q.ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO reconcile_deferred_clusters ("
+        "project_id, cluster_fingerprint, payload_json, payload_sha256, "
+        "run_id, status, priority, retry_count, first_seen_at, last_seen_at, expires_at"
+        ") VALUES (?, ?, ?, ?, ?, 'queued', 100, 0, ?, ?, ?)",
+        (
+            PROJECT_ID, "fp-existing-only", "{}", "old-sha", "old-run",
+            "2026-05-03T00:00:00Z", "2026-05-03T00:00:00Z",
+            "2026-05-04T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reconcile_sessions WHERE project_id=?",
+        (PROJECT_ID,),
+    ).fetchone()[0] == 0
+
+    result = q.register_feature_clusters(
+        PROJECT_ID,
+        "phase-z-existing",
+        [{"cluster_fingerprint": "fp-existing-only"}],
+        conn=conn,
+    )
+    assert result["registered"] == 1
+    row = conn.execute(
+        "SELECT run_id, status FROM reconcile_sessions WHERE project_id=?",
+        (PROJECT_ID,),
+    ).fetchone()
+    assert tuple(row) == ("phase-z-existing", "active")
+
+
+def test_completion_summary_ready_only_after_safe_terminal_states(conn):
+    q.register_feature_clusters(
+        PROJECT_ID,
+        "phase-z-safe",
+        [
+            {"cluster_fingerprint": "fp-safe-a"},
+            {"cluster_fingerprint": "fp-safe-b"},
+        ],
+        conn=conn,
+    )
+    summary = q.completion_summary(PROJECT_ID, run_id="phase-z-safe", conn=conn)
+    assert summary["active_count"] == 2
+    assert summary["ready_for_orphan_pass"] is False
+
+    q.mark_terminal(PROJECT_ID, "fp-safe-a", "resolved", "merged@abc",
+                    conn=conn)
+    q.mark_terminal(PROJECT_ID, "fp-safe-b", "skipped", "observer_explicit_skip",
+                    conn=conn)
+    summary = q.completion_summary(PROJECT_ID, run_id="phase-z-safe", conn=conn)
+    assert summary["all_terminal"] is True
+    assert summary["ready_for_orphan_pass"] is True
+    assert summary["ready_for_finalize"] is True
+
+
+def test_completion_summary_failed_terminal_still_blocks_orphan_pass(conn):
+    q.register_feature_clusters(
+        PROJECT_ID,
+        "phase-z-failed",
+        [{"cluster_fingerprint": "fp-failed-a"}],
+        conn=conn,
+    )
+    q.mark_terminal(PROJECT_ID, "fp-failed-a", "failed_terminal",
+                    "retry_exhausted", conn=conn)
+    summary = q.completion_summary(PROJECT_ID, run_id="phase-z-failed", conn=conn)
+    assert summary["all_terminal"] is True
+    assert summary["unresolved_terminal_count"] == 1
+    assert summary["ready_for_orphan_pass"] is False
 
 
 # ---------------------------------------------------------------------------

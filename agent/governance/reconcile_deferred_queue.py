@@ -44,6 +44,9 @@ __all__ = [
     "QUEUE_SCHEMA_SQL",
     "ensure_schema",
     "enqueue_or_lookup",
+    "register_feature_clusters",
+    "completion_summary",
+    "sync_session_counts",
     "get_next_batch",
     "mark_filing",
     "mark_in_chain",
@@ -128,6 +131,15 @@ def _payload_sha(payload: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _cluster_fingerprint(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("cluster_fingerprint", "cluster_id", "fingerprint"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+    return _payload_sha(payload)[:16]
+
+
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     if row is None:
         return {}
@@ -195,21 +207,10 @@ def _maybe_start_session(
 
 
 def _maybe_finalize_session(conn: sqlite3.Connection, project_id: str) -> None:
-    """R5 hook — when no active rows remain, transition session to finalizing."""
-    try:
-        active = conn.execute(
-            "SELECT COUNT(*) FROM reconcile_deferred_clusters "
-            "WHERE project_id = ? AND status IN ('queued','filing','in_chain','failed_retryable')",
-            (project_id,),
-        ).fetchone()[0]
-    except sqlite3.OperationalError:
-        return
-    if int(active or 0) > 0:
-        return
     # Find the active session to transition.
     try:
         row = conn.execute(
-            "SELECT session_id FROM reconcile_sessions "
+            "SELECT session_id, run_id FROM reconcile_sessions "
             "WHERE project_id = ? AND status = 'active' LIMIT 1",
             (project_id,),
         ).fetchone()
@@ -217,10 +218,23 @@ def _maybe_finalize_session(conn: sqlite3.Connection, project_id: str) -> None:
         return
     if not row:
         return
+    run_id = row["run_id"] if isinstance(row, sqlite3.Row) else row[1]
+    summary = sync_session_counts(
+        project_id,
+        run_id=run_id,
+        session_id=row["session_id"] if isinstance(row, sqlite3.Row) else row[0],
+        conn=conn,
+    )
+    if not summary.get("ready_for_finalize"):
+        return
     try:
         from . import reconcile_session  # local import — circular safe
 
-        reconcile_session.transition_to_finalizing(conn, project_id, row[0])
+        reconcile_session.transition_to_finalizing(
+            conn,
+            project_id,
+            row["session_id"] if isinstance(row, sqlite3.Row) else row[0],
+        )
     except Exception as exc:
         log.debug(
             "reconcile_deferred_queue: finalize hook skipped: %s", exc,
@@ -288,22 +302,39 @@ def enqueue_or_lookup(
 
     existed_dict = _row_to_dict(existing)
     deltas_changed = existed_dict.get("payload_sha256") != sha
-    if deltas_changed:
+    run_changed = bool(run_id) and str(existed_dict.get("run_id") or "") != str(run_id)
+    if deltas_changed or run_changed:
         # Per §4.6.3: deltas-change detection re-queues with retry_count = 0.
+        # A new Phase Z run for the same fingerprint is also re-queued so stale
+        # root_task_id/bug_id terminal state from a prior run cannot masquerade
+        # as current-run chain progress.
         c.execute(
             "UPDATE reconcile_deferred_clusters SET "
             "  payload_json = ?, payload_sha256 = ?, run_id = ?, "
             "  status = 'queued', retry_count = 0, last_seen_at = ?, "
-            "  expires_at = ?, next_retry_at = NULL "
+            "  expires_at = ?, bug_id = NULL, root_task_id = NULL, "
+            "  filed_at = NULL, last_terminal_status = NULL, "
+            "  terminal_reason = NULL, resolved_at = NULL, "
+            "  skipped_reason = NULL, next_retry_at = NULL "
             "WHERE project_id = ? AND cluster_fingerprint = ?",
             (blob, sha, run_id, now, expires, project_id, cluster_fingerprint),
         )
     else:
-        c.execute(
-            "UPDATE reconcile_deferred_clusters SET last_seen_at = ? "
-            "WHERE project_id = ? AND cluster_fingerprint = ?",
-            (now, project_id, cluster_fingerprint),
-        )
+        if str(existed_dict.get("status") or "") == "queued":
+            c.execute(
+                "UPDATE reconcile_deferred_clusters SET last_seen_at = ?, "
+                "  bug_id = NULL, root_task_id = NULL, filed_at = NULL, "
+                "  last_terminal_status = NULL, terminal_reason = NULL, "
+                "  resolved_at = NULL, skipped_reason = NULL, next_retry_at = NULL "
+                "WHERE project_id = ? AND cluster_fingerprint = ?",
+                (now, project_id, cluster_fingerprint),
+            )
+        else:
+            c.execute(
+                "UPDATE reconcile_deferred_clusters SET last_seen_at = ? "
+                "WHERE project_id = ? AND cluster_fingerprint = ?",
+                (now, project_id, cluster_fingerprint),
+            )
     c.commit()
     row = c.execute(
         "SELECT * FROM reconcile_deferred_clusters "
@@ -313,7 +344,180 @@ def enqueue_or_lookup(
     out = _row_to_dict(row)
     out["existed"] = True
     out["deltas_changed"] = deltas_changed
+    out["run_changed"] = run_changed
     return out
+
+
+def register_feature_clusters(
+    project_id: str,
+    run_id: str,
+    feature_clusters: List[Dict[str, Any]],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    priority: int = 100,
+    ttl_hours: int = DEFAULT_TTL_HOURS,
+) -> Dict[str, Any]:
+    """Register every FeatureCluster from one Phase Z run in the queue.
+
+    This is the durable handoff between discovery and chain execution: orphan
+    analysis/finalize can later ask whether the run's clusters all reached a
+    safe terminal state instead of inferring progress from ad-hoc backlog rows.
+    """
+    c = _get_conn(conn, project_id)
+    clusters = feature_clusters if isinstance(feature_clusters, list) else []
+    if clusters:
+        _maybe_start_session(c, project_id, run_id)
+    result: Dict[str, Any] = {
+        "project_id": project_id,
+        "run_id": run_id,
+        "expected": len(clusters),
+        "registered": 0,
+        "created": 0,
+        "existing": 0,
+        "changed": 0,
+        "requeued": 0,
+        "errors": [],
+        "fingerprints": [],
+    }
+    for idx, cluster in enumerate(clusters):
+        if not isinstance(cluster, dict):
+            result["errors"].append({"index": idx, "reason": "invalid_cluster"})
+            continue
+        fingerprint = _cluster_fingerprint(cluster)
+        if not fingerprint:
+            result["errors"].append({"index": idx, "reason": "missing_fingerprint"})
+            continue
+        payload = dict(cluster)
+        payload.setdefault("cluster_fingerprint", fingerprint)
+        try:
+            row = enqueue_or_lookup(
+                project_id,
+                fingerprint,
+                payload=payload,
+                run_id=run_id,
+                conn=c,
+                priority=priority,
+                ttl_hours=ttl_hours,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append({
+                "index": idx,
+                "cluster_fingerprint": fingerprint,
+                "reason": str(exc),
+            })
+            continue
+        result["registered"] += 1
+        result["fingerprints"].append(fingerprint)
+        if row.get("existed"):
+            result["existing"] += 1
+            if row.get("deltas_changed"):
+                result["changed"] += 1
+            if row.get("deltas_changed") or row.get("run_changed"):
+                result["requeued"] += 1
+        else:
+            result["created"] += 1
+
+    sync_session_counts(project_id, run_id=run_id, conn=c)
+    result["summary"] = completion_summary(project_id, run_id=run_id, conn=c)
+    return result
+
+
+def completion_summary(
+    project_id: str,
+    *,
+    run_id: Optional[str] = None,
+    expected_fingerprints: Optional[List[str]] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """Return queue completion state for a project/run.
+
+    ``ready_for_orphan_pass`` is intentionally stricter than "all rows are
+    terminal": failed/expired rows must be retried or explicitly skipped before
+    graph finalize or orphan batching can proceed.
+    """
+    c = _get_conn(conn, project_id)
+    sql = "SELECT cluster_fingerprint, status FROM reconcile_deferred_clusters WHERE project_id = ?"
+    args: List[Any] = [project_id]
+    if run_id:
+        sql += " AND run_id = ?"
+        args.append(run_id)
+    rows = c.execute(sql, tuple(args)).fetchall()
+    status_counts: Dict[str, int] = {}
+    seen = set()
+    for row in rows:
+        status = str(row["status"] or "")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        seen.add(str(row["cluster_fingerprint"] or ""))
+
+    expected = {str(fp) for fp in (expected_fingerprints or []) if str(fp)}
+    missing = sorted(expected - seen)
+    active_count = sum(status_counts.get(s, 0) for s in ACTIVE_STATUSES)
+    terminal_count = sum(status_counts.get(s, 0) for s in TERMINAL_STATUSES)
+    unresolved_terminal_count = (
+        status_counts.get("failed_terminal", 0)
+        + status_counts.get("expired", 0)
+    )
+    total = len(rows)
+    blocking_count = active_count + unresolved_terminal_count + len(missing)
+    all_terminal = total > 0 and active_count == 0 and not missing
+    ready = total > 0 and blocking_count == 0
+    return {
+        "project_id": project_id,
+        "run_id": run_id or "",
+        "total": total,
+        "status_counts": status_counts,
+        "terminal_count": terminal_count,
+        "active_count": active_count,
+        "unresolved_terminal_count": unresolved_terminal_count,
+        "missing_count": len(missing),
+        "missing_fingerprints": missing,
+        "all_terminal": all_terminal,
+        "ready_for_orphan_pass": ready,
+        "ready_for_finalize": ready,
+        "blocking_count": blocking_count,
+    }
+
+
+def sync_session_counts(
+    project_id: str,
+    *,
+    run_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """Mirror queue counts into reconcile_sessions.cluster_count_* columns."""
+    c = _get_conn(conn, project_id)
+    summary = completion_summary(project_id, run_id=run_id, conn=c)
+    failed = (
+        summary["status_counts"].get("failed_retryable", 0)
+        + summary["status_counts"].get("failed_terminal", 0)
+        + summary["status_counts"].get("expired", 0)
+    )
+    sql = (
+        "UPDATE reconcile_sessions SET "
+        "cluster_count_total = ?, cluster_count_resolved = ?, cluster_count_failed = ? "
+        "WHERE project_id = ?"
+    )
+    args: List[Any] = [
+        int(summary["total"]),
+        int(summary["status_counts"].get("resolved", 0)),
+        int(failed),
+        project_id,
+    ]
+    if session_id:
+        sql += " AND session_id = ?"
+        args.append(session_id)
+    elif run_id:
+        sql += " AND run_id = ?"
+        args.append(run_id)
+    else:
+        sql += " AND status IN ('active','finalizing')"
+    try:
+        c.execute(sql, tuple(args))
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+    return summary
 
 
 def expire_stale_rows(
@@ -342,6 +546,7 @@ def get_next_batch(
     project_id: str,
     batch_size: int = 10,
     *,
+    run_id: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
 ) -> List[Dict[str, Any]]:
     """Return up to batch_size queued rows ordered by priority+age.
@@ -350,12 +555,17 @@ def get_next_batch(
     """
     c = _get_conn(conn, project_id)
     expire_stale_rows(project_id, conn=c)
-    rows = c.execute(
+    sql = (
         "SELECT * FROM reconcile_deferred_clusters "
         "WHERE project_id = ? AND status = 'queued' "
-        "ORDER BY priority ASC, first_seen_at ASC LIMIT ?",
-        (project_id, max(1, int(batch_size or 1))),
-    ).fetchall()
+    )
+    args: List[Any] = [project_id]
+    if run_id:
+        sql += "AND run_id = ? "
+        args.append(run_id)
+    sql += "ORDER BY priority ASC, first_seen_at ASC LIMIT ?"
+    args.append(max(1, int(batch_size or 1)))
+    rows = c.execute(sql, tuple(args)).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -434,6 +644,14 @@ def mark_terminal(
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
+    if changed:
+        row = c.execute(
+            "SELECT run_id FROM reconcile_deferred_clusters "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (project_id, cluster_fingerprint),
+        ).fetchone()
+        run_id = row["run_id"] if row is not None else None
+        sync_session_counts(project_id, run_id=run_id, conn=c)
     if changed and terminal_status in TERMINAL_STATUSES:
         # R5 — finalize session when no in-flight rows remain.
         _maybe_finalize_session(c, project_id)

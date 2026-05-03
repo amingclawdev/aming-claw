@@ -21,6 +21,7 @@ if str(_AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_DIR))
 
 from governance import reconcile_session as rs
+from governance import reconcile_deferred_queue as q
 from governance import server, auto_chain
 from governance.db import _configure_connection, _ensure_schema
 
@@ -211,6 +212,28 @@ def test_finalize_endpoint_idempotent(gov_db):
     assert status2 == 200
     assert body2["result"]["status"] == "finalized"
     assert body2.get("idempotent") is True
+
+
+def test_finalize_endpoint_cluster_gate_keeps_session_active(gov_db):
+    start_status, start_body = _unwrap(
+        server.handle_reconcile_session_start(_StubCtx(
+            body={"started_by": "tester", "run_id": "phase-z-http"})))
+    assert start_status == 201
+    sid = start_body["session"]["session_id"]
+    q.enqueue_or_lookup(PROJECT_ID, "fp-http-block", payload={},
+                        run_id="phase-z-http", conn=gov_db)
+
+    status, body = _unwrap(server.handle_reconcile_session_finalize(
+        _StubCtx(path_params={"session_id": sid})))
+    assert status == 409
+    assert body["error"] == "reconcile_clusters_incomplete"
+    assert body["summary"]["active_count"] == 1
+
+    row = gov_db.execute(
+        "SELECT status FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+        (PROJECT_ID, sid),
+    ).fetchone()
+    assert row[0] == "active"
 
 
 def test_rollback_endpoint_writes_audit(gov_db):
