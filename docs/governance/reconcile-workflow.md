@@ -691,3 +691,40 @@ _(Stub section — see proposal for full design.)_
 **Scope at landing**: this section is intentionally minimal at landing time; CR6b will expand via dogfood (or observer manual fallback if dogfood fails) once the implemented pipeline can describe itself.
 
 **Proposal anchors**: §4.2 (cluster definition), §4.6 (deferred queue), §4.8 (reconcile session + overlay), §4.9 (snapshot+rollback).
+
+### §12.1 Language adapters
+
+The cluster-driven reconcile pipeline delegates per-language analysis to the
+`agent/governance/language_adapters/` package, which publishes a small,
+stable contract — the **`LanguageAdapter`** Protocol — used by
+`reconcile_phases.cluster_grouper` for similarity scoring and module-root
+attribution.
+
+**Required methods** (Protocol surface from `base.py`):
+
+| Method | Contract |
+|--------|----------|
+| `supports(file_path)` | True if this adapter can analyse the file |
+| `collect_decorators(ast_node)` | Decorator names extracted from an AST node |
+| `find_module_root(file_path)` | Closest non-`__init__` package boundary |
+| `detect_test_pairing(source_file)` | Inferred test file path, or `None` |
+
+**In-tree implementations**:
+
+- **`PythonAdapter`** (`python_adapter.py`) — AST-backed analysis: parses
+  `.py`/`.pyi` source via the standard-library `ast` module, walks
+  `decorator_list` for `@route` / `@app.route` / `@route(...)` shapes, climbs
+  `__init__.py` chains to find the package root, and maps `foo.py` →
+  `tests/test_foo.py` for test pairing.
+- **`FileTreeAdapter`** (`filetree_adapter.py`) — conservative
+  language-agnostic fallback: `supports(...)` returns True for any non-empty
+  path, `collect_decorators(...)` returns `[]`, `find_module_root(...)`
+  degenerates to `os.path.dirname(...)`, and `detect_test_pairing(...)`
+  returns `None` unconditionally. Used when no language-specific adapter
+  claims the file (`.go`, `.rs`, `.unknown`, …).
+
+**Invariant** (from `base.py` docstring): adapters MUST be **import-safe**
+(no I/O at import time) and **stateless** — two independent instances must
+yield identical outputs for identical inputs. The contract is locked down by
+`agent/tests/test_language_adapters.py`; `test_cluster_grouper.py` exercises
+the same surface indirectly via the grouper.
