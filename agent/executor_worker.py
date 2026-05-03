@@ -60,6 +60,10 @@ MAX_CONCURRENT_WORKERS = min(5, max(1, int(os.getenv("MAX_CONCURRENT_WORKERS", "
 # R7: SHUTDOWN_TIMEOUT — configurable via env var, default 120s
 SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
 
+# Completion is the one API call where a transient governance outage can lose
+# finished work. Retry only after error-shaped responses from _api().
+COMPLETE_RETRY_DELAYS = (5, 15, 30)
+
 # Task type → role.
 # Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
 # kills processes that produce no stdout for _HANG_TIMEOUT (120 s), and enforces an
@@ -288,8 +292,18 @@ class ExecutorWorker:
 
     def _complete_task(self, task_id: str, status: str, result: dict) -> dict:
         """Mark task complete (triggers auto-chain)."""
-        return self._api("POST", f"/api/task/{self.project_id}/complete",
-                         {"task_id": task_id, "status": status, "result": result})
+        payload = {"task_id": task_id, "status": status, "result": result}
+        response = self._api("POST", f"/api/task/{self.project_id}/complete", payload)
+        for delay in COMPLETE_RETRY_DELAYS:
+            if "error" not in response:
+                return response
+            log.warning(
+                "complete_task error for %s; retrying in %ss: %s",
+                task_id, delay, response.get("error"),
+            )
+            time.sleep(delay)
+            response = self._api("POST", f"/api/task/{self.project_id}/complete", payload)
+        return response
 
     def _execute_task(self, task: dict) -> dict:
         """Execute a single task via Claude CLI."""
