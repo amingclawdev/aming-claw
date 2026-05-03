@@ -33,6 +33,7 @@ def test_create_or_get_batch_initializes_memory(conn):
     memory = batch["memory"]
     assert memory["accepted_features"] == {}
     assert memory["file_ownership"] == {}
+    assert memory["file_claims"] == {}
     assert memory["processed_clusters"] == {}
     assert memory["merge_decisions"] == []
 
@@ -86,6 +87,7 @@ def test_record_new_feature_updates_feature_map_and_file_ownership(conn):
     assert feature["clusters"] == ["fp-a"]
     assert feature["owned_files"] == ["agent/governance/backlog_runtime.py"]
     assert memory["file_ownership"]["agent/governance/backlog_runtime.py"] == "Backlog Runtime State Management"
+    assert memory["file_claims"]["agent/governance/backlog_runtime.py"][0]["feature_name"] == "Backlog Runtime State Management"
     assert memory["processed_clusters"]["fp-a"]["decision"] == "new_feature"
     assert memory["reserved_names"] == ["Backlog Runtime State Management"]
 
@@ -155,6 +157,55 @@ def test_find_related_features_uses_file_ownership_and_candidate_consumers(conn)
         ],
         "clusters": ["fp-a"],
     }]
+
+
+def test_shared_file_claim_preserves_first_owner_and_surfaces_overlap(conn):
+    bm.create_or_get_batch(conn, "p-test", batch_id="batch-1")
+    bm.record_pm_decision(
+        conn,
+        "p-test",
+        "batch-1",
+        "fp-a",
+        {
+            "decision": "new_feature",
+            "feature_name": "Primary Feature",
+            "owned_files": ["agent/governance/shared.py"],
+        },
+    )
+
+    batch = bm.record_pm_decision(
+        conn,
+        "p-test",
+        "batch-1",
+        "fp-b",
+        {
+            "decision": "new_feature",
+            "feature_name": "Secondary Feature",
+            "owned_files": ["agent/governance/shared.py"],
+        },
+    )
+
+    memory = batch["memory"]
+    assert memory["file_ownership"]["agent/governance/shared.py"] == "Primary Feature"
+    assert [
+        claim["feature_name"]
+        for claim in memory["file_claims"]["agent/governance/shared.py"]
+    ] == ["Primary Feature", "Secondary Feature"]
+    assert memory["accepted_features"]["Secondary Feature"]["shared_files"] == [
+        "agent/governance/shared.py"
+    ]
+    assert any(
+        conflict.get("reason") == "shared_file_claim"
+        and conflict.get("owner_feature") == "Primary Feature"
+        and conflict.get("claimant_feature") == "Secondary Feature"
+        for conflict in memory["open_conflicts"]
+    )
+
+    related = bm.find_related_features(batch, {
+        "primary_files": ["agent/governance/shared.py"],
+    })
+    secondary = next(item for item in related if item["feature_name"] == "Secondary Feature")
+    assert "file_claim" in secondary["reasons"]
 
 
 def test_orphan_and_split_decisions_are_recorded_for_followup(conn):

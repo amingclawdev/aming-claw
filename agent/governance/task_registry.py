@@ -211,8 +211,17 @@ def create_task(
     task_id = _new_task_id()
     now = _utc_iso()
 
-    # Auto-store original prompt for retry context recovery
-    metadata = metadata or {}
+    # Auto-store original prompt and durable chain context for retry/restart
+    # recovery.  Auto-chain historically carried chain_id mostly in dedicated
+    # columns; graph event consumers read metadata_json, so mirror it here.
+    metadata = dict(metadata or {})
+    metadata.setdefault("project_id", project_id)
+    if parent_task_id:
+        metadata.setdefault("parent_task_id", parent_task_id)
+    if trace_id:
+        metadata.setdefault("trace_id", trace_id)
+    if chain_id:
+        metadata.setdefault("chain_id", chain_id)
     if "_original_prompt" not in metadata:
         metadata["_original_prompt"] = prompt
 

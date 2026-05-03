@@ -1177,17 +1177,10 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
     # pm.prd.published lookup fails or returns no payload.
     prd_declarations = {f: [] for f in _PRD_GRAPH_DECLARATION_FIELDS}
     try:
-        from .chain_context import get_store
-        store = get_store()
-        root_task_id = store._task_to_root.get(task_id, task_id)
-        # Also try chain_id from metadata
-        if metadata.get("chain_id"):
-            root_task_id = metadata["chain_id"]
-        root_task_id = store._task_to_root.get(root_task_id, root_task_id)
-
         from .db import get_connection
         conn = get_connection(project_id)
         try:
+            root_task_id = _resolve_chain_root_id(conn, project_id, task_id, metadata)
             row = conn.execute(
                 "SELECT payload_json FROM chain_events "
                 "WHERE root_task_id = ? AND event_type = 'pm.prd.published' "
@@ -1213,7 +1206,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
     if dev_has_delta and not pm_nodes and not changed_files:
         log.info("_emit_or_infer_graph_delta: early-return pure dev-emitted passthrough task=%s", task_id)
         # Pure dev-emitted: passthrough with source field
-        _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted")
+        _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted", metadata)
         return
 
     # Run inference
@@ -1244,16 +1237,14 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
         # Nothing to emit — still emit empty proposed for audit trail
         log.info("_emit_or_infer_graph_delta: early-return empty inference task=%s dev_has_delta=%s", task_id, dev_has_delta)
         if dev_has_delta:
-            _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted")
+            _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted", metadata)
         return
 
     # Emit graph.delta.proposed with source
     try:
         from .chain_context import get_store
         store = get_store()
-        root_task_id = store._task_to_root.get(task_id, task_id)
-        if metadata.get("chain_id"):
-            root_task_id = store._task_to_root.get(metadata["chain_id"], metadata["chain_id"])
+        root_task_id = _store_root_for(metadata.get("chain_id") or task_id)
 
         store._persist_event(
             root_task_id=root_task_id,
@@ -1281,9 +1272,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
         try:
             from .chain_context import get_store
             store = get_store()
-            root_task_id = store._task_to_root.get(task_id, task_id)
-            if metadata.get("chain_id"):
-                root_task_id = store._task_to_root.get(metadata["chain_id"], metadata["chain_id"])
+            root_task_id = _store_root_for(metadata.get("chain_id") or task_id)
 
             store._persist_event(
                 root_task_id=root_task_id,
@@ -1302,7 +1291,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata):
             log.error("auto_chain: graph.delta.inferred emission failed", exc_info=True)
 
 
-def _emit_graph_delta_event_with_source(project_id, task_id, result, source):
+def _emit_graph_delta_event_with_source(project_id, task_id, result, source, metadata=None):
     """Emit graph.delta.proposed with explicit source field (passthrough for dev-emitted)."""
     graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
     if not graph_delta or not isinstance(graph_delta, dict):
@@ -1318,7 +1307,8 @@ def _emit_graph_delta_event_with_source(project_id, task_id, result, source):
     try:
         from .chain_context import get_store
         store = get_store()
-        root_task_id = store._task_to_root.get(task_id, task_id)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        root_task_id = _store_root_for(metadata.get("chain_id") or task_id)
 
         store._persist_event(
             root_task_id=root_task_id,
@@ -1361,13 +1351,9 @@ def _commit_graph_delta(conn, project_id, metadata):
     R6: links[] logged as TODO/skipped (no edges table)
     R7: Malformed creates[] (missing parent_layer) skipped with warning
     """
-    root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
-    try:
-        from .chain_context import get_store
-        store = get_store()
-        root_task_id = store._task_to_root.get(root_task_id, root_task_id)
-    except Exception:
-        pass
+    root_task_id = _resolve_chain_root_id(
+        conn, project_id, metadata.get("task_id", ""), metadata,
+    )
 
     # Query for graph.delta.validated event (use passed-in conn — same DB)
     try:
@@ -1467,7 +1453,8 @@ def _commit_graph_delta(conn, project_id, metadata):
             explicit_node_id = item.get("node_id")
 
             if explicit_node_id:
-                # Use explicit node_id — INSERT OR IGNORE handles dedup (AC3)
+                # Use explicit node_id — INSERT OR IGNORE preserves the
+                # attempted-vs-committed distinction for duplicate intents.
                 display_id = explicit_node_id
             else:
                 # R2/R4: Auto-generate node_id using monotonically increasing IDs
@@ -2040,6 +2027,176 @@ def _load_task_trace(conn, task_id):
         return row["trace_id"], row["chain_id"]
     except Exception:
         return None, None
+
+
+def _row_value(row, key, default=None):
+    """Best-effort row getter for sqlite.Row, dicts, and test doubles."""
+    if row is None:
+        return default
+    try:
+        value = row[key]
+    except Exception:
+        try:
+            value = getattr(row, key)
+        except Exception:
+            return default
+    return default if value is None else value
+
+
+def _parse_metadata_obj(raw):
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _store_root_for(task_id):
+    """Resolve a task id through the in-memory chain store when available."""
+    if not isinstance(task_id, str) or not task_id:
+        return ""
+    try:
+        from .chain_context import get_store
+        store = get_store()
+        return store._task_to_root.get(task_id, task_id)
+    except Exception:
+        return task_id
+
+
+def _resolve_chain_root_id(conn, project_id="", task_id="", metadata=None):
+    """Resolve the durable chain root without relying only on in-memory state.
+
+    Priority:
+      1. metadata.chain_id
+      2. tasks.chain_id for the current task or its parents
+      3. chain_events reverse lookup by task_id
+      4. metadata.parent_task_id / current task fallback
+    """
+    meta = metadata if isinstance(metadata, dict) else {}
+
+    chain_id = meta.get("chain_id")
+    if isinstance(chain_id, str) and chain_id:
+        return _store_root_for(chain_id)
+
+    start_ids = []
+    for candidate in (task_id, meta.get("task_id"), meta.get("parent_task_id")):
+        if isinstance(candidate, str) and candidate and candidate not in start_ids:
+            start_ids.append(candidate)
+
+    if hasattr(conn, "execute"):
+        for start in start_ids:
+            current = start
+            seen = set()
+            while isinstance(current, str) and current and current not in seen:
+                seen.add(current)
+                try:
+                    row = conn.execute(
+                        "SELECT task_id, parent_task_id, chain_id, metadata_json "
+                        "FROM tasks WHERE task_id = ?",
+                        (current,),
+                    ).fetchone()
+                except Exception:
+                    row = None
+                if not row:
+                    break
+
+                row_chain = _row_value(row, "chain_id", "")
+                if isinstance(row_chain, str) and row_chain:
+                    return _store_root_for(row_chain)
+
+                row_meta = _parse_metadata_obj(_row_value(row, "metadata_json", ""))
+                row_meta_chain = row_meta.get("chain_id")
+                if isinstance(row_meta_chain, str) and row_meta_chain:
+                    return _store_root_for(row_meta_chain)
+
+                parent = _row_value(row, "parent_task_id", "") or row_meta.get("parent_task_id", "")
+                if not isinstance(parent, str) or not parent:
+                    return _store_root_for(current)
+                current = parent
+
+        for start in start_ids:
+            try:
+                row = conn.execute(
+                    "SELECT root_task_id FROM chain_events "
+                    "WHERE task_id = ? ORDER BY ts DESC LIMIT 1",
+                    (start,),
+                ).fetchone()
+            except Exception:
+                row = None
+            root = _row_value(row, "root_task_id", "")
+            if isinstance(root, str) and root:
+                return _store_root_for(root)
+
+    parent = meta.get("parent_task_id")
+    if isinstance(parent, str) and parent:
+        return _store_root_for(parent)
+    if start_ids:
+        return _store_root_for(start_ids[0])
+    return ""
+
+
+def _persist_task_metadata_context(conn, project_id, task_id, metadata, trace_id="", chain_id=""):
+    """Mirror chain context into metadata_json for restart-safe downstream gates."""
+    if not isinstance(metadata, dict):
+        return
+    if project_id:
+        metadata["project_id"] = project_id
+    if task_id:
+        metadata["task_id"] = task_id
+    if trace_id:
+        metadata["trace_id"] = trace_id
+    if chain_id:
+        metadata["chain_id"] = chain_id
+    if not task_id or not hasattr(conn, "execute"):
+        return
+    try:
+        row = conn.execute(
+            "SELECT metadata_json, parent_task_id FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return
+        durable_meta = _parse_metadata_obj(_row_value(row, "metadata_json", ""))
+        durable_meta.update(metadata)
+        parent_task_id = durable_meta.get("parent_task_id") or _row_value(row, "parent_task_id", "")
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ?, trace_id = COALESCE(trace_id, ?), "
+            "chain_id = COALESCE(chain_id, ?), parent_task_id = COALESCE(parent_task_id, ?) "
+            "WHERE task_id = ?",
+            (
+                json.dumps(durable_meta, ensure_ascii=False),
+                trace_id or None,
+                chain_id or None,
+                parent_task_id or None,
+                task_id,
+            ),
+        )
+    except Exception:
+        log.debug("auto_chain: failed to persist task metadata context for %s", task_id, exc_info=True)
+
+
+def _query_chain_event_payload(conn, root_task_id, event_type):
+    """Return latest chain event payload for root/event_type, or None."""
+    if not root_task_id or not hasattr(conn, "execute"):
+        return None
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM chain_events "
+            "WHERE root_task_id = ? AND event_type = ? "
+            "ORDER BY ts DESC LIMIT 1",
+            (root_task_id, event_type),
+        ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return _parse_metadata_obj(_row_value(row, "payload_json", ""))
 
 
 def _record_gate_event(conn, project_id, task_id, gate_name, passed, reason, trace_id):
@@ -2699,6 +2856,13 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         _trace_id = new_trace_id()
         _chain_id = _chain_id or metadata.get("parent_task_id") or task_id
 
+    _chain_id = _chain_id or _resolve_chain_root_id(conn, project_id, task_id, metadata) or task_id
+    metadata["project_id"] = project_id
+    metadata["task_id"] = task_id
+    metadata["trace_id"] = _trace_id
+    metadata["chain_id"] = _chain_id
+    _persist_task_metadata_context(conn, project_id, task_id, metadata, _trace_id, _chain_id)
+
     # Non-blocking preflight log (first stage only)
     if task_type == "pm":
         try:
@@ -3086,6 +3250,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 task_type="dev",
                 created_by="auto-chain-stage-retry",
                 metadata=_dev_retry_meta,
+                parent_task_id=task_id,
                 trace_id=_trace_id,
                 chain_id=_chain_id,
             )
@@ -3300,6 +3465,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 task_type=task_type,
                 created_by="auto-chain-retry",
                 metadata=_retry_meta,
+                parent_task_id=task_id,
                 trace_id=_trace_id,
                 chain_id=_chain_id,
             )
@@ -3459,7 +3625,11 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             **task_meta,
             "parent_task_id": task_id,
             "chain_depth": depth + 1,
+            "project_id": project_id,
+            "trace_id": _trace_id,
+            "chain_id": _chain_id,
         },
+        parent_task_id=task_id,
         trace_id=_trace_id,
         chain_id=_chain_id,
     )
@@ -3468,7 +3638,8 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         _update_backlog_stage(
             conn, project_id, _next_bug_id, f"{next_type}_queued",
             task_id=new_task.get("task_id", ""), task_type=next_type,
-            metadata={**task_meta, "parent_task_id": task_id, "chain_depth": depth + 1},
+            metadata={**task_meta, "parent_task_id": task_id, "chain_depth": depth + 1,
+                      "project_id": project_id, "trace_id": _trace_id, "chain_id": _chain_id},
             runtime_state="queued", root_task_id=_chain_id,
         )
 
@@ -3493,7 +3664,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
         "type": next_type,
         "prompt": prompt,
         "source": "auto-chain",
-        "metadata": {"bug_id": task_meta.get("bug_id", "")},
+        "metadata": {"bug_id": task_meta.get("bug_id", ""), "chain_id": _chain_id},
     })
     return new_task
 
@@ -3537,6 +3708,9 @@ def _do_subtask_fanout(conn, project_id, pm_task_id, result, metadata, trace_id,
             **metadata,
             "parent_task_id": pm_task_id,
             "chain_depth": depth + 1,
+            "project_id": project_id,
+            "trace_id": trace_id,
+            "chain_id": chain_id,
             "target_files": st.get("target_files", []),
             "acceptance_criteria": st.get("acceptance_criteria", []),
             "verification": st.get("verification", {}),
@@ -3552,6 +3726,7 @@ def _do_subtask_fanout(conn, project_id, pm_task_id, result, metadata, trace_id,
             task_type="dev",
             created_by="auto-chain-subtask",
             metadata=st_meta,
+            parent_task_id=pm_task_id,
             trace_id=trace_id,
             chain_id=chain_id,
         )
@@ -4316,10 +4491,11 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     """
     # CR0b R4: reconcile-session bypass for the qa-pass related-nodes
     # existence check.
-    _bypassed, _reason = _check_session_bypass(
+    _session_related_bypassed, _session_bypass_reason = _check_session_bypass(
         "_gate_qa_pass.related_nodes", project_id, metadata.get("task_id", ""))
-    if _bypassed:
-        return True, _reason
+    if _session_related_bypassed:
+        log.warning("qa_gate: related_nodes checks bypassed by active reconcile session: %s",
+                    _session_bypass_reason)
     # PR1 SECONDARY defense-in-depth: re-run dev preflight at QA gate to
     # surface any dev-stage violation that slipped past the primary check.
     # Always logs only — never blocks here.
@@ -4329,11 +4505,21 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             log.warning("qa_gate: dev preflight validator caught violations past stage-transition")
     except Exception:
         log.debug("qa_gate: secondary preflight call failed (non-critical)", exc_info=True)
-    # §11.1: reconcile_run_id bypass (R5/R9)
+    graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
+    _gd_proposed = None
+    if not graph_governance_bypassed:
+        _gd_proposed = _query_graph_delta_proposed(
+            metadata, conn=conn, project_id=project_id, task_id=metadata.get("task_id", ""),
+        )
+
+    # §11.1: reconcile_run_id bypass (R5/R9).  This bypass is intentionally
+    # scoped to legacy graph-state/related-node gates; graph.delta validation
+    # remains mandatory when a proposed event exists.
     _reconcile_run_id = metadata.get("reconcile_run_id")
     if _reconcile_run_id:
         _audit_reconcile_bypass(conn, project_id, "qa_pass", _reconcile_run_id, metadata.get("task_id", ""))
-        return True, "reconcile bypass — qa_pass skipped (§11.1)"
+        if not _gd_proposed:
+            return True, "reconcile bypass — qa_pass skipped (§11.1)"
     rec = result.get("recommendation", "")
     if rec == "qa_pass":
         pass  # Explicit pass
@@ -4345,7 +4531,6 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
             f"Got: {rec!r}. QA agent must set result.recommendation."
         )
-    graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
     if graph_governance_bypassed:
         log.warning("qa_gate: graph governance checks bypassed by backlog policy")
     else:
@@ -4364,7 +4549,6 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 "PRD graph-declaration validation failed: " + "; ".join(_decl_errors)
             )
         # PR-B: graph.delta.proposed enforcement — check BEFORE criteria evaluation
-        _gd_proposed = _query_graph_delta_proposed(metadata)
         if _gd_proposed:
             gd_review = result.get("graph_delta_review")
             if not gd_review or not isinstance(gd_review, dict):
@@ -4372,7 +4556,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 # should not block QA when the agent omits graph_delta_review.
                 # Only dev-emitted deltas require explicit QA review.
                 _gd_source = _gd_proposed.get("source", "")
-                if _gd_source in ("auto-inferred", "dev-emitted+inferred-gaps", ""):
+                if _gd_source in ("auto-inferred", "dev-emitted+inferred-gaps"):
                     gd_review = {
                         "decision": "pass",
                         "issues": [],
@@ -4391,9 +4575,10 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 try:
                     from .chain_context import get_store as _gd_store
                     store = _gd_store()
-                    root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id", "")
-                    root_task_id = store._task_to_root.get(root_task_id, root_task_id)
                     task_id_for_event = metadata.get("task_id", "")
+                    root_task_id = _resolve_chain_root_id(
+                        conn, project_id, task_id_for_event, metadata,
+                    )
                     store._persist_event(
                         root_task_id=root_task_id,
                         task_id=task_id_for_event,
@@ -4425,7 +4610,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             if failed_criteria:
                 names = [cr.get("criterion", "?")[:60] for cr in failed_criteria]
                 return False, f"QA approved overall but {len(failed_criteria)} criteria failed: {names}"
-    if not graph_governance_bypassed:
+    if not graph_governance_bypassed and not _reconcile_run_id and not _session_related_bypassed:
         # Update nodes FIRST (QA passed → promote to qa_pass)
         # Evidence rule: t2_pass → qa_pass requires "e2e_report" with summary.passed > 0
         task_id = metadata.get("task_id", "")
@@ -4473,12 +4658,117 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     )
 
     # Phase 5: QA Sweep structural drift gate (R9 — after AI QA passes)
-    if not graph_governance_bypassed:
+    if not graph_governance_bypassed and not _reconcile_run_id and not _session_related_bypassed:
         qa_task_id = metadata.get("task_id", "")
         sweep_ok, sweep_msg, sweep_result = _qa_sweep_gate(conn, project_id, qa_task_id, metadata, result)
         if not sweep_ok:
             return False, sweep_msg
 
+    return True, "ok"
+
+
+def _default_project_graph_path(project_id, metadata=None):
+    metadata = metadata if isinstance(metadata, dict) else {}
+    override = metadata.get("graph_path") or metadata.get("graph_json_path")
+    if override:
+        return Path(override)
+    try:
+        from .db import _resolve_project_dir
+        return _resolve_project_dir(project_id) / GRAPH_JSON_FILENAME
+    except Exception:
+        return Path(__file__).resolve().parent / GRAPH_JSON_FILENAME
+
+
+def _default_reconcile_overlay_path(metadata=None):
+    metadata = metadata if isinstance(metadata, dict) else {}
+    override = metadata.get("overlay_path") or metadata.get("graph_overlay_path")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / GRAPH_OVERLAY_FILENAME
+
+
+def _metadata_with_reconcile_session(conn, project_id, metadata):
+    out = dict(metadata or {})
+    if out.get("session_id"):
+        return out
+    try:
+        from . import reconcile_session as _rs
+        sess = _rs.get_active_session(conn, project_id)
+        if sess and sess.session_id:
+            out["session_id"] = sess.session_id
+            return out
+    except Exception:
+        pass
+    out["session_id"] = (
+        out.get("reconcile_run_id")
+        or out.get("chain_id")
+        or out.get("parent_task_id")
+        or ""
+    )
+    return out
+
+
+def _apply_graph_delta_after_gatekeeper(conn, project_id, metadata):
+    """Close the graph event lifecycle after gatekeeper approves merge.
+
+    Standard chains commit validated graph deltas to node_state.  Reconcile
+    cluster chains write candidate nodes to the rebase overlay instead; graph.json
+    remains immutable until session finalize.
+    """
+    root_task_id = _resolve_chain_root_id(
+        conn, project_id, metadata.get("task_id", ""), metadata,
+    )
+    proposed_payload = _query_chain_event_payload(
+        conn, root_task_id, "graph.delta.proposed",
+    )
+    if not proposed_payload:
+        # Backward compatibility: older graph-delta chains only emitted
+        # graph.delta.validated, and existing tests patch _commit_graph_delta
+        # at this boundary.  Keep that commit hook visible while treating a
+        # no-op result as a legacy pass.
+        _commit_graph_delta(conn, project_id, metadata)
+        return True, "ok"
+
+    validated_payload = _query_chain_event_payload(
+        conn, root_task_id, "graph.delta.validated",
+    )
+    if not validated_payload:
+        return False, "graph delta proposed but not validated by QA"
+
+    if is_reconcile_cluster_task(metadata):
+        proposed_from_validated = validated_payload.get("proposed_payload") or proposed_payload
+        graph_delta = proposed_from_validated.get("graph_delta", {}) if isinstance(proposed_from_validated, dict) else {}
+        creates = graph_delta.get("creates", []) if isinstance(graph_delta, dict) else []
+        apply_meta = _metadata_with_reconcile_session(conn, project_id, metadata)
+        cluster_fp = _cluster_compute_fingerprint(apply_meta, creates)
+        prior_applied = _query_chain_event_payload(
+            conn, root_task_id, CHAIN_EVENT_GRAPH_DELTA_APPLIED,
+        )
+        if isinstance(prior_applied, dict) and prior_applied.get("cluster_fingerprint") == cluster_fp:
+            return True, "ok"
+
+        pm_prd = _query_chain_event_payload(conn, root_task_id, "pm.prd.published") or {}
+        dev_result = {"graph_delta": graph_delta}
+        apply_result = apply_reconcile_cluster_to_overlay(
+            conn,
+            project_id,
+            metadata.get("task_id", ""),
+            pm_prd=pm_prd,
+            dev_result=dev_result,
+            metadata=apply_meta,
+            graph_path=_default_project_graph_path(project_id, metadata),
+            overlay_path=_default_reconcile_overlay_path(metadata),
+        )
+        if not apply_result.get("applied"):
+            return False, (
+                "reconcile cluster graph overlay apply failed: "
+                f"{apply_result.get('stage', 'unknown')} — {apply_result.get('reason', apply_result)}"
+            )
+        return True, "ok"
+
+    commit_result = _commit_graph_delta(conn, project_id, metadata)
+    if commit_result is None:
+        return False, "graph delta validated but commit produced no graph update"
     return True, "ok"
 
 
@@ -4513,7 +4803,9 @@ def _gate_gatekeeper_pass(conn, project_id, result, metadata):
             )
         else:
             try:
-                _commit_graph_delta(conn, project_id, metadata)
+                graph_ok, graph_reason = _apply_graph_delta_after_gatekeeper(conn, project_id, metadata)
+                if not graph_ok:
+                    return False, graph_reason
             except Exception as exc:
                 # R1/R5: Graph delta failure blocks the gate
                 log.error("_gate_gatekeeper_pass: graph delta commit failed — %s", exc, exc_info=True)
@@ -4864,37 +5156,33 @@ def _build_test_prompt(task_id, result, metadata):
     return prompt, meta
 
 
-def _query_graph_delta_proposed(metadata):
+def _query_graph_delta_proposed(metadata, conn=None, project_id=None, task_id=""):
     """Query chain_events for the latest graph.delta.proposed event on this chain's root_task_id.
 
     Returns the event payload dict if found, None otherwise.
     """
+    opened_conn = None
     try:
-        from .chain_context import get_store
-        store = get_store()
-        # Resolve root_task_id: chain_id in metadata is the PM root, or fallback to parent_task_id
-        root_task_id = metadata.get("chain_id") or metadata.get("parent_task_id")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        project_id = project_id or metadata.get("project_id", "aming-claw")
+        if conn is None:
+            from .db import get_connection
+            opened_conn = get_connection(project_id)
+            conn = opened_conn
+        root_task_id = _resolve_chain_root_id(
+            conn, project_id, task_id or metadata.get("task_id", ""), metadata,
+        )
         if not root_task_id:
             return None
-        # Also check store's task_to_root mapping for better resolution
-        root_task_id = store._task_to_root.get(root_task_id, root_task_id)
-
-        from .db import get_connection
-        project_id = metadata.get("project_id", "aming-claw")
-        conn = get_connection(project_id)
-        try:
-            row = conn.execute(
-                "SELECT payload_json FROM chain_events "
-                "WHERE root_task_id = ? AND event_type = 'graph.delta.proposed' "
-                "ORDER BY ts DESC LIMIT 1",
-                (root_task_id,),
-            ).fetchone()
-            if row:
-                return json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
-        finally:
-            conn.close()
+        return _query_chain_event_payload(conn, root_task_id, "graph.delta.proposed")
     except Exception:
         log.debug("_query_graph_delta_proposed: lookup failed", exc_info=True)
+    finally:
+        if opened_conn is not None:
+            try:
+                opened_conn.close()
+            except Exception:
+                pass
     return None
 
 

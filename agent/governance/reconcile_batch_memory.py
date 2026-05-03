@@ -59,6 +59,7 @@ def empty_memory(*, session_id: str = "", batch_id: str = "") -> Dict[str, Any]:
         "batch_id": batch_id or "",
         "accepted_features": {},
         "file_ownership": {},
+        "file_claims": {},
         "reserved_names": [],
         "open_conflicts": [],
         "processed_clusters": {},
@@ -204,6 +205,7 @@ def find_related_features(batch_or_memory: Dict[str, Any], cluster_payload: Dict
         return []
     accepted = memory.get("accepted_features") or {}
     file_ownership = memory.get("file_ownership") or {}
+    file_claims = memory.get("file_claims") or {}
     cluster_files = set(_cluster_files(cluster_payload or {}))
 
     matches: Dict[str, Dict[str, Any]] = {}
@@ -217,6 +219,20 @@ def find_related_features(batch_or_memory: Dict[str, Any], cluster_payload: Dict
                 "clusters": _str_list((accepted.get(owner) or {}).get("clusters")),
             })
             match["reasons"].append("file_ownership")
+            match["matching_files"].append(path)
+        for claim in file_claims.get(path) or []:
+            if not isinstance(claim, dict):
+                continue
+            claimant = str(claim.get("feature_name") or "").strip()
+            if not claimant or claimant == owner:
+                continue
+            match = matches.setdefault(claimant, {
+                "feature_name": claimant,
+                "reasons": [],
+                "matching_files": [],
+                "clusters": _str_list((accepted.get(claimant) or {}).get("clusters")),
+            })
+            match["reasons"].append("file_claim")
             match["matching_files"].append(path)
 
     for feature_name, feature in accepted.items():
@@ -303,6 +319,7 @@ def _apply_feature_acceptance(
             "purpose": decision.get("purpose"),
             "clusters": [],
             "owned_files": [],
+            "shared_files": [],
             "candidate_tests": [],
             "candidate_docs": [],
         },
@@ -314,10 +331,52 @@ def _apply_feature_acceptance(
     if decision.get("purpose") and not feature.get("purpose"):
         feature["purpose"] = decision["purpose"]
     for path in decision.get("owned_files") or []:
-        memory["file_ownership"][path] = feature_name
+        _record_file_claim(memory, path, feature_name, decision)
     memory["reserved_names"].append(feature_name)
     memory["reserved_names"].extend(decision.get("reserved_names") or [])
     _append_conflicts(memory, decision)
+
+
+def _record_file_claim(memory: Dict[str, Any], path: str, feature_name: str, decision: Dict[str, Any]) -> None:
+    path = str(path or "").replace("\\", "/")
+    if not path:
+        return
+    memory.setdefault("file_ownership", {})
+    memory.setdefault("file_claims", {})
+    memory.setdefault("open_conflicts", [])
+
+    claims = memory["file_claims"].setdefault(path, [])
+    claim = {
+        "feature_name": feature_name,
+        "cluster_fingerprint": decision.get("cluster_fingerprint", ""),
+        "decision": decision.get("decision", ""),
+        "decided_at": decision.get("decided_at", ""),
+    }
+    if not any(
+        isinstance(existing, dict)
+        and existing.get("feature_name") == claim["feature_name"]
+        and existing.get("cluster_fingerprint") == claim["cluster_fingerprint"]
+        for existing in claims
+    ):
+        claims.append(claim)
+
+    owner = memory["file_ownership"].get(path)
+    if not owner:
+        memory["file_ownership"][path] = feature_name
+        return
+    if owner == feature_name:
+        return
+
+    feature = memory.get("accepted_features", {}).get(feature_name)
+    if isinstance(feature, dict):
+        feature["shared_files"] = sorted(set(_str_list(feature.get("shared_files")) + [path]))
+    memory["open_conflicts"].append({
+        "cluster_fingerprint": decision.get("cluster_fingerprint", ""),
+        "reason": "shared_file_claim",
+        "file": path,
+        "owner_feature": owner,
+        "claimant_feature": feature_name,
+    })
 
 
 def _append_conflicts(memory: Dict[str, Any], decision: Dict[str, Any]) -> None:
@@ -341,8 +400,25 @@ def _append_conflict(memory: Dict[str, Any], decision: Dict[str, Any], reason: s
 def _dedupe_memory(memory: Dict[str, Any]) -> None:
     memory["reserved_names"] = sorted(set(_str_list(memory.get("reserved_names"))))
     for feature in memory.get("accepted_features", {}).values():
-        for key in ("clusters", "owned_files", "candidate_tests", "candidate_docs"):
+        for key in ("clusters", "owned_files", "shared_files", "candidate_tests", "candidate_docs"):
             feature[key] = sorted(set(_str_list(feature.get(key))))
+    deduped_claims = {}
+    for path, claims in (memory.get("file_claims") or {}).items():
+        claim_seen = set()
+        claim_out = []
+        for claim in claims or []:
+            if not isinstance(claim, dict):
+                continue
+            marker = _json(claim)
+            if marker in claim_seen:
+                continue
+            claim_seen.add(marker)
+            claim_out.append(claim)
+        deduped_claims[path] = sorted(
+            claim_out,
+            key=lambda item: (item.get("feature_name", ""), item.get("cluster_fingerprint", "")),
+        )
+    memory["file_claims"] = dict(sorted(deduped_claims.items()))
     seen_conflicts = set()
     deduped = []
     for conflict in memory.get("open_conflicts", []):
