@@ -622,6 +622,38 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
     # Normalize changed_files to forward-slash set
     changed_set = {f.replace("\\", "/") for f in (changed_files or [])}
     non_md_changed = {f for f in changed_set if not f.endswith(".md")}
+    pm_proposed_only = (
+        isinstance(dev_result, dict)
+        and bool(dev_result.get("_pm_proposed_only"))
+        and dev_delta is None
+    )
+
+    def _pm_create_entry(node):
+        primaries = node.get("primary", [])
+        if isinstance(primaries, str):
+            primaries = [primaries]
+        return {
+            "node_id": node.get("node_id") or "",
+            "title": node.get("title", ""),
+            "parent_layer": node.get("parent_layer", ""),
+            "primary": primaries,
+            "deps": node.get("deps", []),
+            "description": node.get("description", ""),
+        }
+
+    def _pm_candidate_dedupe_key(node):
+        nid = node.get("node_id")
+        if isinstance(nid, str) and nid.strip():
+            return ("node_id", nid.strip())
+        primaries = node.get("primary", [])
+        if isinstance(primaries, str):
+            primaries = [primaries]
+        return (
+            "candidate",
+            tuple(sorted(p.replace("\\", "/") for p in primaries if isinstance(p, str) and p)),
+            node.get("title", ""),
+            str(node.get("parent_layer", "")),
+        )
 
     # ---- PRD declarations priority (R3) ----
     decl = prd_declarations or {}
@@ -665,14 +697,7 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
                 primaries = [primaries]
             matched = [p for p in primaries if p.replace("\\", "/") in non_md_changed_undeclared]
             if matched:
-                entry = {
-                    "node_id": nid_a,
-                    "title": node.get("title", ""),
-                    "parent_layer": node.get("parent_layer", ""),
-                    "primary": primaries,
-                    "deps": node.get("deps", []),
-                    "description": node.get("description", ""),
-                }
+                entry = _pm_create_entry(node)
                 creates.append(entry)
                 covered_primaries.update(p.replace("\\", "/") for p in primaries)
                 rule_hits.append({"rule": "A", "entry_title": entry["title"],
@@ -680,30 +705,31 @@ def _infer_graph_delta(pm_nodes, changed_files, dev_delta, dev_result, prd_decla
 
     # ---- Rule H: Bridge ALL PM proposed_nodes when dev emitted no graph_delta ----
     if dev_delta is None and pm_nodes:
-        # Collect node_ids already added by Rule A to avoid duplicates (R5)
-        existing_node_ids = {c.get("node_id") for c in creates}
+        # Collect stable identities already added by Rule A to avoid duplicates.
+        # Candidate-only reconcile nodes legitimately have blank node_id until
+        # the overlay allocator runs, so blank node_id cannot be the dedupe key.
+        existing_keys = {_pm_candidate_dedupe_key(c) for c in creates}
         for node in pm_nodes:
-            nid = node.get("node_id", "")
-            if nid in existing_node_ids:
+            node_key = _pm_candidate_dedupe_key(node)
+            if node_key in existing_keys:
                 continue  # already matched by Rule A
+            nid = node.get("node_id", "")
             if nid in declared_removed_ids:
                 continue  # R3: skip declared-removed nodes
-            primaries = node.get("primary", [])
-            if isinstance(primaries, str):
-                primaries = [primaries]
-            entry = {
-                "node_id": nid,
-                "title": node.get("title", ""),
-                "parent_layer": node.get("parent_layer", ""),
-                "primary": primaries,
-                "deps": node.get("deps", []),
-                "description": node.get("description", ""),
-            }
+            entry = _pm_create_entry(node)
             creates.append(entry)
+            existing_keys.add(node_key)
             rule_hits.append({"rule": "H", "entry_title": entry["title"],
                               "node_id": nid})
         if "pm_proposed_bridge" not in inferred_from:
             inferred_from.append("pm_proposed_bridge")
+        if pm_proposed_only:
+            return (
+                {"creates": creates, "updates": updates, "links": links},
+                rule_hits,
+                inferred_from,
+                "pm-proposed-only",
+            )
 
     # ---- Rule B: @route decorator grep on changed agent/**/*.py ----
     # MF-2026-04-29-001: exclude self-referential governance modules whose source
@@ -1238,6 +1264,8 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata, task_type=
     dev_result_ctx = dict(result) if isinstance(result, dict) else {}
     dev_result_ctx["project_id"] = project_id
     dev_result_ctx["task_id"] = task_id
+    if is_reconcile_cluster_task(metadata) and not dev_has_delta:
+        dev_result_ctx["_pm_proposed_only"] = True
 
     inferred_delta, rule_hits, inferred_from, source = _infer_graph_delta(
         pm_nodes, changed_files, graph_delta if dev_has_delta else None, dev_result_ctx,

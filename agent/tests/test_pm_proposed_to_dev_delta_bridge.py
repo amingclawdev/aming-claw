@@ -4,7 +4,7 @@ Covers:
   AC1: Rule H block exists in _infer_graph_delta with comment '# ---- Rule H:'
   AC2: When dev_delta is None, all pm_nodes appear in creates[]
   AC3: When dev_delta is not None, Rule H does NOT fire
-  AC4: Rule H deduplicates against Rule A by node_id
+  AC4: Rule H deduplicates against Rule A by stable candidate identity
   AC5: rule_hits contains entry with rule='H'
   AC6: inferred_from contains 'pm_proposed_bridge'
   AC7: End-to-end via _emit_or_infer_graph_delta
@@ -148,7 +148,7 @@ class TestRuleHNotFiringWithDevDelta(unittest.TestCase):
 
 
 class TestRuleHDeduplication(unittest.TestCase):
-    """AC4: Rule H deduplicates against Rule A by node_id."""
+    """AC4: Rule H deduplicates against Rule A by stable candidate identity."""
 
     def test_no_duplicate_when_rule_a_matches(self):
         pm_nodes = [
@@ -182,6 +182,58 @@ class TestRuleHDeduplication(unittest.TestCase):
         self.assertIn("L99.1", node_ids)
         self.assertIn("L99.2", node_ids)
         self.assertEqual(len(node_ids), len(set(node_ids)))
+
+    def test_empty_node_id_candidates_do_not_collapse(self):
+        """Candidate-only nodes use primary/title identity, not blank node_id."""
+        pm_nodes = [
+            {"title": "Candidate A", "parent_layer": 7,
+             "primary": ["agent/governance/preflight.py"],
+             "deps": [], "description": "matched by Rule A"},
+            {"title": "Candidate B", "parent_layer": 7,
+             "primary": ["agent/governance/project_service.py"],
+             "deps": [], "description": "bridged by Rule H"},
+            {"title": "Candidate C", "parent_layer": 7,
+             "primary": ["agent/governance/reconcile.py"],
+             "deps": [], "description": "bridged by Rule H"},
+        ]
+        delta, hits, sources, source = _infer_graph_delta(
+            pm_nodes, ["agent/governance/preflight.py"], None, {}
+        )
+        titles = [c["title"] for c in delta["creates"]]
+        self.assertIn("Candidate A", titles)
+        self.assertIn("Candidate B", titles)
+        self.assertIn("Candidate C", titles)
+        self.assertEqual(len([t for t in titles if t.startswith("Candidate ")]), 3)
+
+    def test_pm_proposed_only_suppresses_extra_route_inference(self):
+        """Reconcile-cluster bridge emits exactly PM candidates for overlay preflight."""
+        pm_nodes = [
+            {"title": "agent.governance.preflight", "parent_layer": 7,
+             "primary": ["agent/governance/preflight.py"],
+             "deps": [], "description": "candidate"},
+            {"title": "agent.governance.project_service", "parent_layer": 7,
+             "primary": ["agent/governance/project_service.py"],
+             "deps": [], "description": "candidate"},
+        ]
+        delta, hits, sources, source = _infer_graph_delta(
+            pm_nodes,
+            [
+                "agent/governance/preflight.py",
+                "agent/governance/project_service.py",
+                "agent/governance/doc_generator.py",
+            ],
+            None,
+            {"_pm_proposed_only": True},
+        )
+        self.assertEqual(source, "pm-proposed-only")
+        self.assertEqual(len(delta["creates"]), 2)
+        self.assertEqual(
+            sorted(c["primary"][0] for c in delta["creates"]),
+            [
+                "agent/governance/preflight.py",
+                "agent/governance/project_service.py",
+            ],
+        )
 
 
 class TestRuleHWithRuleF(unittest.TestCase):
