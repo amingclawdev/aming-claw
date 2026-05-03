@@ -612,6 +612,14 @@ class ServiceManager:
             )
             return
 
+        active_tasks = self._get_active_task_count()
+        if active_tasks > 0:
+            log.info(
+                "ServiceManager._check_restart_signal: deferring restart; %d active task(s)",
+                active_tasks,
+            )
+            return
+
         # R2: Perform intentional restart (R5: do NOT count toward circuit breaker)
         log.info("ServiceManager._check_restart_signal: restart signal received; restarting executor")
         with self._lock:

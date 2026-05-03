@@ -459,9 +459,10 @@ class TestCheckRestartSignal(unittest.TestCase):
         """AC4: valid restart signal triggers stop+start and deletes file."""
         fake1 = _make_fake_process(pid=1000)
         fake2 = _make_fake_process(pid=2000)
-        mock_popen.side_effect = [fake1, fake2]
+        mock_popen.return_value = fake2
 
-        self.mgr.start()
+        self.mgr._process = fake1
+        self.mgr._get_active_task_count = MagicMock(return_value=0)
         # Write a valid restart signal
         self.signal_file.write_text('{"action": "restart"}', encoding="utf-8")
 
@@ -472,6 +473,22 @@ class TestCheckRestartSignal(unittest.TestCase):
         self.assertEqual(self.mgr._process.pid, 2000)
         # Signal file should be deleted (R3)
         self.assertFalse(self.signal_file.exists())
+
+    @patch("service_manager.subprocess.Popen")
+    def test_restart_signal_defers_while_active_tasks_running(self, mock_popen):
+        """A restart signal is left in place until active executor tasks drain."""
+        fake = _make_fake_process(pid=1100)
+        mock_popen.return_value = fake
+        self.mgr.start()
+        self.mgr._get_active_task_count = MagicMock(return_value=1)
+
+        self.signal_file.write_text('{"action": "restart"}', encoding="utf-8")
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        self.assertEqual(self.mgr._process.pid, 1100)
+        self.assertTrue(self.signal_file.exists())
+        self.assertEqual(mock_popen.call_count, 1)
 
     def test_missing_signal_file_noop(self):
         """AC5: missing file causes no error."""

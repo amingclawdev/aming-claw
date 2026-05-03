@@ -760,7 +760,10 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
                     log.warning("deploy: %s failed: %s", label, exc)
             steps["governance"] = {"success": ok, "summary": ", ".join(summary_parts)}
 
-        # R6: For executor, mark task SUCCEEDED with redeploy_pending BEFORE kill
+        # R6: Executor restart is requested through service_manager's watched
+        # signal file. ServiceManager drains active tasks before consuming the
+        # signal, so this deploy task can finish with its full report instead
+        # of pre-completing itself with a redeploy_pending placeholder.
         if "executor" in affected:
             # [redeploy] POST to redeploy endpoint
             redeploy_result = _post_redeploy(
@@ -768,14 +771,6 @@ def run_deploy(changed_files: list[str], chat_id: int = 0, project_id: str = "",
                 expected_head=expected_head,
             )
             log.info("[redeploy] executor: %s", redeploy_result)
-
-            # R6: pre-SUCCESS write before executor kill
-            if task_id:
-                try:
-                    _mark_task_succeeded_pre_kill(task_id, project_id)
-                    log.info("[redeploy] executor: marked task %s SUCCEEDED with redeploy_pending", task_id)
-                except Exception as exc:
-                    log.warning("[redeploy] executor: pre-SUCCESS write failed: %s", exc)
 
             # B48-sequel FIX (observer-hotfix 2026-04-24): Skip legacy
             # restart_executor signal write to avoid SELFKILL loop.
