@@ -8,48 +8,20 @@ from __future__ import annotations
 
 import inspect
 import json
-import os
-import tempfile
 from pathlib import Path
+
 from unittest.mock import patch
 
-import pytest
 
-
-def test_executor_writes_manager_signal(tmp_path):
+def test_executor_writes_manager_signal(tmp_path, monkeypatch):
     """AC3: executor redeploy writes manager_signal.json with action='restart'."""
     from agent.governance.redeploy_handler import handle_redeploy
 
-    # Patch the state dir to use tmp_path
-    state_dir = tmp_path / "tasks" / "state"
-    state_dir.mkdir(parents=True)
-    agent_dir = tmp_path
-
-    with patch.object(Path, "resolve", side_effect=lambda self=None: Path(tmp_path)):
-        # We need to patch the path computation inside handle_redeploy
-        # The handler computes: _agent_dir = Path(__file__).resolve().parent.parent
-        # Then: state_dir = _tasks_root / "state"
-        # Let's patch at a higher level
-        pass
-
-    # Direct approach: patch the path resolution in the executor branch
     import agent.governance.redeploy_handler as mod
 
-    original_handler = mod.handle_redeploy
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path))
+    signal_path = tmp_path / "codex-tasks" / "state" / "manager_signal.json"
 
-    # Create the state dir where the handler will write
-    # The handler uses: Path(__file__).resolve().parent.parent / "tasks" / "state"
-    handler_file = Path(mod.__file__).resolve()
-    agent_dir = handler_file.parent.parent  # agent/
-    tasks_state = agent_dir / "tasks" / "state"
-    tasks_state.mkdir(parents=True, exist_ok=True)
-    signal_path = tasks_state / "manager_signal.json"
-
-    # Clean up any existing signal file
-    if signal_path.exists():
-        signal_path.unlink()
-
-    # Patch _db_write_chain_version to avoid DB access
     with patch.object(mod, "_db_write_chain_version", return_value=True):
         result, status = mod.handle_redeploy("executor", {
             "expected_head": "abc123",
@@ -60,17 +32,23 @@ def test_executor_writes_manager_signal(tmp_path):
     assert status == 200, f"Expected 200, got {status}: {result}"
     assert result["ok"] is True
     assert result.get("mechanism") == "manager_signal.json"
+    assert result.get("signal_path") == str(signal_path)
 
-    # Verify the signal file was written
     assert signal_path.exists(), f"manager_signal.json not found at {signal_path}"
     data = json.loads(signal_path.read_text(encoding="utf-8"))
     assert data["action"] == "restart"
     assert data["expected_head"] == "abc123"
     assert data["task_id"] == "test-deploy-task"
 
-    # Clean up
-    if signal_path.exists():
-        signal_path.unlink()
+
+def test_executor_signal_path_matches_service_manager(tmp_path, monkeypatch):
+    """Redeploy handler and service manager must agree on the watched signal path."""
+    from agent.governance import redeploy_handler
+    from agent import service_manager
+
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path))
+
+    assert redeploy_handler._manager_signal_path() == service_manager._signal_file_path()
 
 
 def test_executor_source_references_manager_signal():

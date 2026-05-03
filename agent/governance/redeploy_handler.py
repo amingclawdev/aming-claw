@@ -51,6 +51,16 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _manager_signal_path() -> Path:
+    """Return the same restart signal path watched by service_manager.py."""
+    shared_volume = Path(os.getenv("SHARED_VOLUME_PATH", str(_repo_root() / "shared-volume")))
+    return shared_volume / "codex-tasks" / "state" / "manager_signal.json"
+
+
 def _find_pid_for_target(target: str) -> Optional[int]:
     """Best-effort: find the PID of the running target process."""
     try:
@@ -317,11 +327,9 @@ def handle_redeploy(target: str, body: dict) -> tuple[dict, int]:
     # state/manager_signal.json with action='restart'.
     if target == "executor":
         try:
-            _agent_dir = Path(__file__).resolve().parent.parent
-            _tasks_root = _agent_dir / "tasks"
-            state_dir = _tasks_root / "state"
+            signal_path = _manager_signal_path()
+            state_dir = signal_path.parent
             state_dir.mkdir(parents=True, exist_ok=True)
-            signal_path = state_dir / "manager_signal.json"
             payload = {
                 "action": "restart",
                 "requested_at": _utc_now(),
@@ -351,6 +359,7 @@ def handle_redeploy(target: str, body: dict) -> tuple[dict, int]:
             "ok": True,
             "target": target,
             "mechanism": "manager_signal.json",
+            "signal_path": str(signal_path),
             "new_chain_version": expected_head,
             "updated_at": _utc_now(),
             "db_write": db_ok,
