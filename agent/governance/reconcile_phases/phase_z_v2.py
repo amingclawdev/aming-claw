@@ -817,6 +817,8 @@ def write_dry_run_artifact(
     diff_report: Dict[str, Any],
     scratch_dir: Optional[str] = None,
     feature_clusters: Optional[List[Dict[str, Any]]] = None,
+    file_inventory: Optional[List[Dict[str, Any]]] = None,
+    file_inventory_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Write docs/dev/scratch/graph-v2-{date}.json with diff-vs-current report.
 
@@ -835,6 +837,8 @@ def write_dry_run_artifact(
         "nodes": nodes,
         "diff_report": diff_report,
         "feature_clusters": feature_clusters or [],
+        "file_inventory": file_inventory or [],
+        "file_inventory_summary": file_inventory_summary or {},
     }
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -1489,6 +1493,29 @@ def build_graph_v2_from_symbols(
     # Step 4: Diff against existing
     diff_report = diff_against_existing_graph(project_root, nodes)
 
+    run_id = datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")
+    try:
+        from agent.governance.reconcile_file_inventory import (
+            build_file_inventory,
+            summarize_file_inventory,
+        )
+        file_inventory = build_file_inventory(
+            project_root=project_root,
+            run_id=run_id,
+            nodes=nodes,
+            feature_clusters=feature_clusters,
+        )
+        file_inventory_summary = summarize_file_inventory(file_inventory)
+    except Exception:
+        file_inventory = []
+        file_inventory_summary = {
+            "total": 0,
+            "by_kind": {},
+            "by_status": {"error": 1},
+            "pending_decision_count": 0,
+            "pending_decision_sample": [],
+        }
+
     if dry_run:
         # R3: Write dry-run artifact
         report_path = write_dry_run_artifact(
@@ -1497,13 +1524,18 @@ def build_graph_v2_from_symbols(
             diff_report,
             scratch_dir=scratch_dir,
             feature_clusters=feature_clusters,
+            file_inventory=file_inventory,
+            file_inventory_summary=file_inventory_summary,
         )
         return {
             "status": "ok",
+            "run_id": run_id,
             "report_path": report_path,
             "node_count": len(nodes),
             "nodes": nodes,
             "feature_clusters": feature_clusters,
+            "file_inventory": file_inventory,
+            "file_inventory_summary": file_inventory_summary,
             "diff_report": diff_report,
         }
     else:
@@ -1529,9 +1561,12 @@ def build_graph_v2_from_symbols(
 
         return {
             "status": "ok",
+            "run_id": run_id,
             "graph_path": graph_path,
             "node_count": len(nodes),
             "nodes": nodes,
             "feature_clusters": feature_clusters,
+            "file_inventory": file_inventory,
+            "file_inventory_summary": file_inventory_summary,
             "diff_report": diff_report,
         }

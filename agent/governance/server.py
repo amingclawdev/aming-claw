@@ -1479,6 +1479,32 @@ def handle_reconcile_deferred_clusters_list(ctx: RequestContext):
     return {"clusters": items, "count": len(items)}
 
 
+@route("GET", "/api/reconcile/{project_id}/file-inventory")
+def handle_reconcile_file_inventory_list(ctx: RequestContext):
+    """List file inventory rows; supports ?run_id=&scan_status=&file_kind=&limit=."""
+    from .reconcile_file_inventory import query_file_inventory
+
+    project_id = ctx.get_project_id()
+    try:
+        limit = int(ctx.query.get("limit", "200"))
+    except (TypeError, ValueError):
+        limit = 200
+
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        result = query_file_inventory(
+            conn,
+            project_id,
+            run_id=ctx.query.get("run_id", ""),
+            scan_status=ctx.query.get("scan_status", ""),
+            file_kind=ctx.query.get("file_kind", ""),
+            limit=limit,
+        )
+    result["project_id"] = project_id
+    return result
+
+
 @route("GET", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}")
 def handle_reconcile_deferred_cluster_get(ctx: RequestContext):
     """Get a single deferred-cluster row by fingerprint."""

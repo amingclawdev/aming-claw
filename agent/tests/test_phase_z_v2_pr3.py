@@ -242,7 +242,7 @@ class TestSchemaMigration:
     def test_ac8_schema_version_is_current(self):
         """AC8: SCHEMA_VERSION matches the current governance schema."""
         from agent.governance.db import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 29
+        assert SCHEMA_VERSION == 30
 
     # Note: Testing actual migration requires DB access which is
     # integration-level; the unit test validates the constant.
