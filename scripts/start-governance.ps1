@@ -34,6 +34,21 @@ function Get-GovernancePythonProcesses {
     }
 }
 
+function Stop-GovernanceProcessTree {
+    param([int]$TargetPid)
+    try {
+        Start-Process -FilePath "taskkill.exe" `
+            -ArgumentList @("/F", "/T", "/PID", "$TargetPid") `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru `
+            -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+    }
+    Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
+}
+
 function Stop-GovernanceByPort {
     param([int]$ListenPort)
     $listeners = Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue
@@ -41,8 +56,7 @@ function Stop-GovernanceByPort {
     $pids = $listeners | Select-Object -ExpandProperty OwningProcess -Unique
     foreach ($pidVal in $pids) {
         Write-Host "Takeover: stopping governance port owner PID=$pidVal ..."
-        Stop-Process -Id $pidVal -Force -ErrorAction SilentlyContinue
-        taskkill /F /T /PID $pidVal 2>$null | Out-Null
+        Stop-GovernanceProcessTree -TargetPid $pidVal
     }
 }
 
@@ -108,8 +122,7 @@ if ($existing.Count -gt 0 -and -not $Takeover) {
 if ($existing.Count -gt 0 -and $Takeover) {
     foreach ($procId in ($existing | Select-Object -ExpandProperty ProcessId -Unique)) {
         Write-Host "Takeover: stopping existing governance PID=$procId ..."
-        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-        taskkill /F /T /PID $procId 2>$null | Out-Null
+        Stop-GovernanceProcessTree -TargetPid $procId
     }
 }
 
@@ -130,18 +143,29 @@ if (-not $env:CODEX_WORKSPACE) {
     $env:CODEX_WORKSPACE = (Get-Location).Path
 }
 New-Item -ItemType Directory -Force -Path $env:SHARED_VOLUME_PATH | Out-Null
+$logDir = Join-Path (Join-Path $env:SHARED_VOLUME_PATH "codex-tasks") "logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$logStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$stdoutLog = Join-Path $logDir "governance-$Port-$logStamp.out.log"
+$stderrLog = Join-Path $logDir "governance-$Port-$logStamp.err.log"
+$env:GOVERNANCE_STDOUT_LOG = $stdoutLog
+$env:GOVERNANCE_STDERR_LOG = $stderrLog
 
 Write-Host "Starting host governance..."
 Write-Host "  port:      $($env:GOVERNANCE_PORT)"
 Write-Host "  dbservice: $($env:DBSERVICE_URL)"
 Write-Host "  redis:     $($env:REDIS_URL)"
 Write-Host "  shared:    $($env:SHARED_VOLUME_PATH)"
+Write-Host "  stdout:    $stdoutLog"
+Write-Host "  stderr:    $stderrLog"
 
 try {
     $proc = Start-Process -FilePath $PYTHON `
         -ArgumentList @(".\start_governance.py") `
         -WorkingDirectory (Get-Location).Path `
         -WindowStyle Hidden `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
         -PassThru
     $health = Wait-GovernanceHealthy -WaitSeconds $HealthWaitSeconds -ListenPort $Port
     Write-Host "Governance healthy."
