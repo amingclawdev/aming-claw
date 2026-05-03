@@ -129,10 +129,11 @@ class TestChainContextStore(unittest.TestCase):
         self.assertIsNone(self.store.get_chain("t1"))
         self.assertIsNone(self.store.get_state("t1"))
 
-    def test_merge_completes_chain(self):
+    def test_merge_completes_chain_and_archives_memory(self):
         self._create_task("t1", "merge")
         self._complete_task("t1")
-        self.assertEqual(self.store.get_state("t1"), "completed")
+        self.assertIsNone(self.store.get_state("t1"))
+        self.assertIsNone(self.store.get_chain("t1"))
 
     def test_archive_releases_memory(self):
         self._create_task("t1", "pm")

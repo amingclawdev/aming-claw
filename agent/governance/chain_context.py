@@ -194,6 +194,7 @@ class ChainContextStore:
         result = payload.get("result", {})
         project_id = payload.get("project_id", "")
         task_type = payload.get("type", "pm")
+        archive_after_complete = False
 
         with self._lock:
             root_id = self._task_to_root.get(task_id)
@@ -218,11 +219,18 @@ class ChainContextStore:
             # If this was a merge, mark chain completed
             if stage.task_type == "merge":
                 chain.state = "completed"
+                archive_after_complete = True
 
         # Persist with core only (not raw) to limit DB size
         persist_payload = {**payload, "result": _extract_core(result)}
         self._persist_event(root_id, task_id, "task.completed",
                             persist_payload, project_id)
+
+        # Merge is the durable success boundary for the standard chain. Deploy is
+        # best-effort service hygiene; archiving here prevents deploy failures from
+        # keeping completed chains alive forever while chain_events retain audit data.
+        if archive_after_complete:
+            self.archive_chain(task_id, project_id)
 
     def on_gate_blocked(self, payload: dict):
         """Handle gate.blocked event. Append-only (audit)."""
