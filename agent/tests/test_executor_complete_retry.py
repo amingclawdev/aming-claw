@@ -55,6 +55,7 @@ def test_complete_task_uses_long_complete_timeout():
 
     worker._complete_task("task-timeout", "succeeded", {"summary": "done"})
 
+    assert executor_worker.COMPLETE_REQUEST_TIMEOUT >= 900
     assert worker._api.call_args.kwargs["timeout"] == executor_worker.COMPLETE_REQUEST_TIMEOUT
 
 

@@ -63,7 +63,7 @@ SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "120"))
 # Completion is the one API call where a transient governance outage can lose
 # finished work. Retry only after error-shaped responses from _api().
 COMPLETE_RETRY_DELAYS = (5, 15, 30)
-COMPLETE_REQUEST_TIMEOUT = int(os.getenv("COMPLETE_REQUEST_TIMEOUT", "240"))
+COMPLETE_REQUEST_TIMEOUT = int(os.getenv("COMPLETE_REQUEST_TIMEOUT", "900"))
 
 # Task type → role.
 # Timeout is no longer hardcoded per task type.  The ai_lifecycle streaming watchdog
