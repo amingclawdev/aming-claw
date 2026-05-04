@@ -31,6 +31,7 @@ if _repo_root not in sys.path:
 
 from agent.governance.reconcile_phases.phase_z_v2 import (  # noqa: E402
     build_graph_v2_from_symbols,
+    write_rebase_candidate_artifacts,
 )
 from agent.governance import symbol_disappearance_review  # noqa: E402
 from agent.governance import symbol_swap  # noqa: E402
@@ -124,6 +125,28 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     result = build_graph_v2_from_symbols(project_root, dry_run=True)
     _print_json(result)
     return 0 if result.get("status") in {"ok", None} else 1
+
+
+def cmd_candidate(args: argparse.Namespace) -> int:
+    """Write reviewable rebase candidate graph artifacts."""
+    project_root = args.project_root or _repo_root
+    result = build_graph_v2_from_symbols(
+        project_root,
+        dry_run=True,
+        scratch_dir=args.scratch_dir,
+    )
+    if result.get("status") not in {"ok", None}:
+        _print_json(result)
+        return 1
+    out = write_rebase_candidate_artifacts(
+        project_root,
+        result,
+        out_dir=args.out_dir,
+        session_id=args.session_id or "",
+        run_id=args.run_id or result.get("run_id", ""),
+    )
+    _print_json(out)
+    return 0 if (out.get("review") or {}).get("missing_link_count", 0) == 0 else 1
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -329,6 +352,23 @@ def _build_parser() -> argparse.ArgumentParser:
     # dry-run
     sub.add_parser("dry-run", help="Run driver in dry-run mode (no writes).")
 
+    candidate_p = sub.add_parser(
+        "candidate",
+        help="Write graph.rebase.candidate.json and review summary artifacts.",
+    )
+    candidate_p.add_argument(
+        "--out-dir",
+        required=True,
+        help="Directory for graph.rebase.candidate.json and graph.rebase.review.json.",
+    )
+    candidate_p.add_argument(
+        "--scratch-dir",
+        default=None,
+        help="Scratch directory for the underlying Phase Z v2 dry-run report.",
+    )
+    candidate_p.add_argument("--session-id", default="", help="Optional reconcile session id.")
+    candidate_p.add_argument("--run-id", default="", help="Optional run id override.")
+
     # review
     review_p = sub.add_parser(
         "review",
@@ -481,6 +521,7 @@ def main(argv: list | None = None) -> int:
 
     handlers = {
         "dry-run": cmd_dry_run,
+        "candidate": cmd_candidate,
         "review": cmd_review,
         "apply": cmd_apply,
         "rollback": cmd_rollback,

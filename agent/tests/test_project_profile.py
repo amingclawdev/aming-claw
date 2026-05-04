@@ -20,6 +20,7 @@ def test_project_profile_discovers_python_boundaries(tmp_path):
     _write(str(project / "scripts" / "cli.py"), "def main():\n    pass\n")
     _write(str(project / "docs" / "service.md"), "# Service\n")
     _write(str(project / "runtime" / "generated.py"), "def generated():\n    pass\n")
+    _write(str(project / "app.py"), "def app():\n    pass\n")
     _write(str(project / "pyproject.toml"), "[project]\nname='demo'\n")
     _write(str(project / "web" / "package.json"), "{\"name\":\"web\"}\n")
     _write(str(project / "web" / "src" / "index.js"), "export function main() {}\n")
@@ -29,6 +30,7 @@ def test_project_profile_discovers_python_boundaries(tmp_path):
     assert "python" in profile.languages
     assert "javascript" in profile.languages
     assert "agent" in profile.source_roots
+    assert "." in profile.source_roots
     assert "scripts" in profile.source_roots
     assert "web" in profile.source_roots
     assert "agent/tests" in profile.test_roots
@@ -37,6 +39,7 @@ def test_project_profile_discovers_python_boundaries(tmp_path):
     assert "runtime" in profile.exclude_roots
 
     assert profile.is_production_source_path("agent/service.py")
+    assert profile.is_production_source_path("app.py")
     assert not profile.is_production_source_path("agent/tests/test_service.py")
     assert not profile.is_production_source_path("tests/test_external.py")
     assert not profile.is_production_source_path("docs/service.md")

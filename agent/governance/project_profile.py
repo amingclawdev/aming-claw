@@ -176,6 +176,8 @@ def _discover_source_roots(
     exclude_roots: List[str],
 ) -> List[str]:
     roots = set()
+    if _contains_root_source_file(root):
+        roots.add(".")
     for child in sorted(root.iterdir(), key=lambda p: p.name):
         if not child.is_dir():
             continue
@@ -190,6 +192,17 @@ def _discover_source_roots(
         if _contains_source_file(child, root):
             roots.add(rel)
     return sorted(roots)
+
+
+def _contains_root_source_file(root: Path) -> bool:
+    for child in root.iterdir():
+        if not child.is_file():
+            continue
+        if child.name in DEFAULT_EXCLUDE_ROOTS:
+            continue
+        if child.suffix.lower() in SOURCE_EXTENSIONS:
+            return True
+    return False
 
 
 def _contains_source_file(path: Path, root: Path) -> bool:
