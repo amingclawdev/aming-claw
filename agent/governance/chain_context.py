@@ -11,15 +11,17 @@ Architecture:
                     │
                     ├── read: O(1) dict lookup
                     ├── write: event-driven, threading.Lock
-                    └── persist: sync INSERT to chain_events table
+                    └── persist: queued single-writer INSERT to chain_events
 
 Consistency boundary: single governance process.
 """
 
 import json
 import logging
+import queue
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,6 +94,144 @@ def _persist_connection(project_id: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000")
     return conn
+
+
+def _chain_event_spool_path(project_id: str) -> Path:
+    from .db import _project_db_path
+    return _project_db_path(project_id).parent / "chain_events_spool.jsonl"
+
+
+class _ChainEventWriteQueue:
+    """Single-writer queue for chain_events legacy persistence.
+
+    The event-bus path must not synchronously compete with the active auto-chain
+    transaction. Queueing keeps caller latency flat while a daemon writer drains
+    events in FIFO order through one SQLite writer.
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = None
+        self._lock = threading.Lock()
+        self._stats = {"enqueued": 0, "written": 0, "spooled": 0}
+
+    def enqueue(self, record: dict) -> None:
+        with self._lock:
+            self._stats["enqueued"] += 1
+        self._queue.put(record)
+
+    def start(self) -> None:
+        self._ensure_started()
+
+    def stop_for_tests(self, timeout: float = 5.0) -> bool:
+        thread = self._thread
+        if not thread:
+            return True
+        self._queue.put(None)
+        thread.join(timeout=timeout)
+        stopped = not thread.is_alive()
+        if stopped:
+            self._thread = None
+        return stopped
+
+    def stats(self) -> dict:
+        with self._lock:
+            out = dict(self._stats)
+        out["pending"] = self._queue.unfinished_tasks
+        return out
+
+    def drain_for_tests(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while self._queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def _ensure_started(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name="chain-events-writer",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            record = self._queue.get()
+            if record is None:
+                self._queue.task_done()
+                return
+            try:
+                self._write(record)
+                with self._lock:
+                    self._stats["written"] += 1
+            except Exception as exc:
+                self._spool(record, exc)
+                with self._lock:
+                    self._stats["spooled"] += 1
+            finally:
+                self._queue.task_done()
+
+    def _write(self, record: dict) -> None:
+        own_conn = _persist_connection(record["project_id"])
+        try:
+            own_conn.execute(
+                "INSERT INTO chain_events "
+                "(root_task_id, task_id, event_type, payload_json, ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    record["root_task_id"],
+                    record["task_id"],
+                    record["event_type"],
+                    record["payload_json"],
+                    record["ts"],
+                ),
+            )
+            own_conn.commit()
+        finally:
+            own_conn.close()
+
+    def _spool(self, record: dict, exc: Exception) -> None:
+        spool_path = _chain_event_spool_path(record["project_id"])
+        spool_path.parent.mkdir(parents=True, exist_ok=True)
+        spool_record = {
+            **record,
+            "spooled_at": _utc_iso(),
+            "error": str(exc),
+        }
+        with spool_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(spool_record, ensure_ascii=False, default=str) + "\n")
+        log.error(
+            "chain_context: queued event spooled (%s/%s): %s",
+            record.get("task_id", ""),
+            record.get("event_type", ""),
+            exc,
+        )
+
+
+_chain_event_write_queue = _ChainEventWriteQueue()
+
+
+def _drain_chain_event_write_queue_for_tests(timeout: float = 5.0) -> bool:
+    return _chain_event_write_queue.drain_for_tests(timeout=timeout)
+
+
+def _chain_event_write_queue_stats() -> dict:
+    return _chain_event_write_queue.stats()
+
+
+def _start_chain_event_write_queue_for_tests() -> None:
+    _chain_event_write_queue.start()
+
+
+def _stop_chain_event_write_queue_for_tests(timeout: float = 5.0) -> bool:
+    return _chain_event_write_queue.stop_for_tests(timeout=timeout)
 
 
 class StageSnapshot:
@@ -672,27 +812,15 @@ class ChainContextStore:
                           task_id, event_type, exc_info=True)
             return
 
-        # --- Legacy path: dedicated conn (event-bus subscribers) ---
-        try:
-            from .task_registry import _retry_on_db_lock
-
-            def _do_insert():
-                own_conn = _persist_connection(project_id)
-                try:
-                    own_conn.execute(
-                        "INSERT INTO chain_events "
-                        "(root_task_id, task_id, event_type, payload_json, ts) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (root_task_id, task_id, event_type, payload_json, ts),
-                    )
-                    own_conn.commit()
-                finally:
-                    own_conn.close()
-
-            _retry_on_db_lock(_do_insert, _context=f"persist_{event_type}")
-        except Exception:
-            log.error("chain_context: persist event failed (%s/%s)",
-                      task_id, event_type, exc_info=True)
+        # --- Event-bus path: enqueue for the single writer ---
+        _chain_event_write_queue.enqueue({
+            "project_id": project_id,
+            "root_task_id": root_task_id,
+            "task_id": task_id,
+            "event_type": event_type,
+            "payload_json": payload_json,
+            "ts": ts,
+        })
 
     def _project_id_for(self, root_task_id: str) -> str:
         chain = self._chains.get(root_task_id)
@@ -711,6 +839,7 @@ def get_store() -> ChainContextStore:
 def register_events():
     """Subscribe store handlers to EventBus. Call once on startup."""
     from . import event_bus
+    _chain_event_write_queue.start()
     bus = event_bus.get_event_bus()
     bus.subscribe("task.created", _store.on_task_created)
     bus.subscribe("task.completed", _store.on_task_completed)
