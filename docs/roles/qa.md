@@ -125,6 +125,11 @@ POST /api/wf/{pid}/verify-update
 
 ## Evidence Requirements
 
+QA evidence must cite only verified facts. If a QA result mentions a workspace
+file path, that path must exist; use chain events, backlog rows, or runtime
+records for audit evidence unless an actual document was created or already
+exists.
+
 | Transition | Evidence Type | Required Fields |
 |------------|--------------|-----------------|
 | t2_pass → qa_pass | `e2e_report` | `summary.passed > 0` |

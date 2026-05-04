@@ -11,7 +11,9 @@ Covers:
 import json
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 # Ensure agent package is importable
@@ -182,6 +184,83 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("must be 'pass' or 'reject'", reason)
 
+    def test_blocks_missing_evidence_path(self):
+        """QA cannot pass by citing a workspace path that does not exist."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "Audit doc docs/dev/reconcile-canary-mf003.md records the canary.",
+            "criteria_results": [
+                {
+                    "criterion": "audit evidence",
+                    "passed": True,
+                    "evidence": "Verified docs/dev/reconcile-canary-mf003.md",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertFalse(passed)
+        self.assertIn("QA evidence references missing workspace paths", reason)
+        self.assertIn("docs/dev/reconcile-canary-mf003.md", reason)
+
+    def test_allows_existing_evidence_path_and_glob(self):
+        """Existing paths are allowed, and glob mentions are not treated as files."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "Checked agent/governance/auto_chain.py.",
+            "criteria_results": [
+                {
+                    "criterion": "files exist",
+                    "passed": True,
+                    "evidence": "Glob agent/governance/reconcile_*.py returned expected files.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
+    def test_blocks_worktree_only_evidence_path_when_not_changed(self):
+        """Ignored/unmerged worktree files are not durable QA evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Path(tmp) / "docs" / "dev" / "reconcile-canary-mf003.md"
+            doc.parent.mkdir(parents=True)
+            doc.write_text("temporary audit note", encoding="utf-8")
+
+            result = {
+                "recommendation": "qa_pass",
+                "review_summary": "Audit doc docs/dev/reconcile-canary-mf003.md records the canary.",
+                "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+            }
+            metadata = _base_metadata(_worktree=tmp, changed_files=[])
+            proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+            passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+            self.assertFalse(passed)
+            self.assertIn("docs/dev/reconcile-canary-mf003.md", reason)
+
+    def test_allows_changed_worktree_evidence_path(self):
+        """A file produced by the chain is valid evidence when changed_files carries it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Path(tmp) / "docs" / "dev" / "reconcile-canary-mf003.md"
+            doc.parent.mkdir(parents=True)
+            doc.write_text("temporary audit note", encoding="utf-8")
+
+            result = {
+                "recommendation": "qa_pass",
+                "review_summary": "Audit doc docs/dev/reconcile-canary-mf003.md records the canary.",
+                "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+            }
+            metadata = _base_metadata(_worktree=tmp, changed_files=["docs/dev/reconcile-canary-mf003.md"])
+            proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+            passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+            self.assertTrue(passed)
+            self.assertEqual(reason, "ok")
+
 
 class TestBuildQaPromptGraphDelta(unittest.TestCase):
     """Test _build_qa_prompt graph delta review injection."""
@@ -200,6 +279,7 @@ class TestBuildQaPromptGraphDelta(unittest.TestCase):
         self.assertIn("graph.delta.proposed", prompt)
         self.assertIn("graph_delta_review", prompt)
         self.assertIn("decision", prompt)
+        self.assertIn("path MUST exist", prompt)
 
     def test_prompt_no_review_section_without_proposed(self):
         """No graph.delta.proposed -> no graph_delta_review instructions in prompt."""

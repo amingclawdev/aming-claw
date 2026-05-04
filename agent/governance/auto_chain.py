@@ -74,10 +74,109 @@ RECONCILIATION_BYPASS_POLICY = {
 # ---------------------------------------------------------------------------
 _PRD_GRAPH_DECLARATION_FIELDS = ("removed_nodes", "unmapped_files", "renamed_nodes", "remapped_files")
 
+_QA_EVIDENCE_PATH_RE = re.compile(
+    r"(?<![\w:.-])("
+    r"[A-Za-z]:[\\/][^\s,\"')\]}]+"
+    r"|(?:agent|docs|scripts|shared-volume|tests)[\\/][^\s,\"')\]}]+"
+    r"|(?:start_governance\.py|pyproject\.toml|README\.md|requirements(?:-[\w-]+)?\.txt)"
+    r")"
+)
+_QA_EVIDENCE_PATH_TRAIL = ".,;:)]}'\""
+_QA_EVIDENCE_GLOB_CHARS = set("*?[]")
+
 
 def _extract_prd_declarations(prd):
     """Extract the 4 PRD graph-declaration fields with empty-list defaults (R6)."""
     return {f: prd.get(f, []) for f in _PRD_GRAPH_DECLARATION_FIELDS}
+
+
+def _iter_qa_evidence_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_qa_evidence_strings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_qa_evidence_strings(child)
+
+
+def _project_workspace_root(project_id, metadata=None):
+    cwd = Path.cwd()
+    if (cwd / "agent" / "governance" / "auto_chain.py").exists():
+        return cwd
+    repo_root = Path(__file__).resolve().parents[2]
+    if (repo_root / "agent" / "governance" / "auto_chain.py").exists():
+        return repo_root
+    try:
+        from .db import _resolve_project_dir
+        root = _resolve_project_dir(project_id)
+        if root:
+            return Path(root)
+    except Exception:
+        pass
+    return Path(__file__).resolve().parents[2]
+
+
+def _extract_qa_evidence_paths(result):
+    """Return workspace path mentions from QA output, excluding globs."""
+    paths = []
+    seen = set()
+    for text in _iter_qa_evidence_strings(result):
+        for match in _QA_EVIDENCE_PATH_RE.finditer(text):
+            raw = match.group(1).rstrip(_QA_EVIDENCE_PATH_TRAIL)
+            if any(ch in raw for ch in _QA_EVIDENCE_GLOB_CHARS):
+                continue
+            key = raw.replace("\\", "/")
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(raw)
+    return paths
+
+
+def _missing_qa_evidence_paths(project_id, result, metadata=None):
+    metadata = metadata if isinstance(metadata, dict) else {}
+    root = _project_workspace_root(project_id, metadata)
+    task_root = root
+    raw_worktree = metadata.get("_worktree") or metadata.get("workspace") or metadata.get("project_root")
+    if raw_worktree:
+        candidate_root = Path(raw_worktree)
+        if candidate_root.exists():
+            task_root = candidate_root
+    changed_files = {
+        str(path).replace("\\", "/")
+        for path in (metadata.get("changed_files") or [])
+        if isinstance(path, str)
+    }
+    missing = []
+    for raw in _extract_qa_evidence_paths(result):
+        raw_path = Path(raw)
+        rel_key = raw.replace("\\", "/")
+        if raw_path.is_absolute():
+            for base in (task_root, root):
+                try:
+                    rel_key = str(raw_path.relative_to(base)).replace("\\", "/")
+                    break
+                except ValueError:
+                    pass
+
+        if rel_key in changed_files:
+            candidates = [task_root / rel_key, root / rel_key]
+        elif raw_path.is_absolute() and rel_key == raw.replace("\\", "/"):
+            candidates = [raw_path]
+        else:
+            # Evidence for unchanged paths must exist in the stable workspace.
+            # Worktree-only ignored files are not durable QA evidence.
+            candidates = [root / rel_key]
+
+        try:
+            exists = any(candidate.exists() for candidate in candidates)
+        except OSError:
+            exists = False
+        if not exists:
+            missing.append(raw)
+    return missing
 
 
 def validate_prd_graph_declarations(prd, dev_changed_files, current_graph):
@@ -4652,6 +4751,16 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             f"QA gate requires explicit recommendation ('qa_pass' or 'reject'). "
             f"Got: {rec!r}. QA agent must set result.recommendation."
         )
+
+    missing_evidence_paths = _missing_qa_evidence_paths(project_id, result, metadata)
+    if missing_evidence_paths:
+        preview = ", ".join(missing_evidence_paths[:5])
+        return False, (
+            "QA evidence references missing workspace paths: "
+            f"{preview}. Cite only files that exist in the workspace; "
+            "use chain_events/backlog evidence for runtime audit trails."
+        )
+
     if graph_governance_bypassed:
         log.warning("qa_gate: graph governance checks bypassed by backlog policy")
     else:
@@ -5342,7 +5451,10 @@ def _build_qa_prompt(task_id, result, metadata):
             "\nYou MUST evaluate each acceptance_criteria item individually.\n"
             "Include in your result:\n"
             "  criteria_results: [{criterion: \"<text>\", passed: true/false, evidence: \"<why>\"}]\n"
-            "Only set recommendation='qa_pass' if ALL criteria pass."
+            "Only set recommendation='qa_pass' if ALL criteria pass.\n"
+            "If evidence cites a workspace file path, that path MUST exist. "
+            "Do not invent audit docs; cite chain_events/backlog/runtime evidence "
+            "unless an actual doc file exists in changed_files or the workspace."
         )
     # 5d: Graph consistency check injection
     graph_docs = _get_graph_doc_associations(
@@ -5373,6 +5485,11 @@ def _build_qa_prompt(task_id, result, metadata):
             "If decision is 'reject', list specific issues. "
             "If decision is 'pass', issues should be an empty list."
         )
+    prompt_parts.append(
+        "Evidence path rule: if your QA result cites a workspace file path, "
+        "that path MUST exist. Do not invent audit docs; cite chain_events, "
+        "backlog rows, or runtime records unless an actual file exists."
+    )
     prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
     # R4/R7: Inject prior QA decisions section (graceful degradation)
     qa_memories = _inject_qa_memories(metadata)
