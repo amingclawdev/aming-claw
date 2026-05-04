@@ -287,7 +287,7 @@ def _has_active_session(conn: sqlite3.Connection, project_id: str) -> bool:
     try:
         row = conn.execute(
             "SELECT 1 FROM reconcile_sessions "
-            "WHERE project_id = ? AND status IN ('active','finalizing') LIMIT 1",
+            "WHERE project_id = ? AND status IN ('active','finalizing','finalize_failed') LIMIT 1",
             (project_id,),
         ).fetchone()
     except sqlite3.OperationalError:

@@ -18,7 +18,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 SCHEMA_SQL = """
 -- Node runtime state
@@ -254,7 +254,7 @@ CREATE TABLE IF NOT EXISTS reconcile_sessions (
     session_id              TEXT NOT NULL,
     run_id                  TEXT,
     status                  TEXT NOT NULL DEFAULT 'active'
-                              CHECK (status IN ('active','finalizing','finalized','rolled_back')),
+                              CHECK (status IN ('active','finalizing','finalize_failed','finalized','rolled_back')),
     started_at              TEXT NOT NULL,
     finalized_at            TEXT,
     cluster_count_total     INTEGER NOT NULL DEFAULT 0,
@@ -264,11 +264,13 @@ CREATE TABLE IF NOT EXISTS reconcile_sessions (
     started_by              TEXT,
     snapshot_path           TEXT,
     snapshot_head_sha       TEXT,
+    base_commit_sha         TEXT NOT NULL DEFAULT '',
+    finalize_error_json     TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (project_id, session_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reconcile_sessions_one_active
     ON reconcile_sessions (project_id)
-    WHERE status IN ('active','finalizing');
+    WHERE status IN ('active','finalizing','finalize_failed');
 
 -- Reconcile batch memory (PM semantic merge context for cluster batches)
 CREATE TABLE IF NOT EXISTS reconcile_batch_memory (
@@ -1079,7 +1081,58 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
             "ON reconcile_file_inventory (project_id, run_id, file_kind)"
         )
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23, 24: _migrate_v23_to_v24, 25: _migrate_v24_to_v25, 26: _migrate_v25_to_v26, 27: _migrate_v26_to_v27, 28: _migrate_v27_to_v28, 29: _migrate_v28_to_v29, 30: _migrate_v29_to_v30}
+    def _migrate_v30_to_v31(c):
+        """Add reconcile commit baseline and retryable finalize failure state."""
+        c.execute("DROP INDEX IF EXISTS idx_reconcile_sessions_one_active")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS reconcile_sessions_v31 (
+                project_id              TEXT NOT NULL,
+                session_id              TEXT NOT NULL,
+                run_id                  TEXT,
+                status                  TEXT NOT NULL DEFAULT 'active'
+                                          CHECK (status IN ('active','finalizing','finalize_failed','finalized','rolled_back')),
+                started_at              TEXT NOT NULL,
+                finalized_at            TEXT,
+                cluster_count_total     INTEGER NOT NULL DEFAULT 0,
+                cluster_count_resolved  INTEGER NOT NULL DEFAULT 0,
+                cluster_count_failed    INTEGER NOT NULL DEFAULT 0,
+                bypass_gates_json       TEXT NOT NULL DEFAULT '[]',
+                started_by              TEXT,
+                snapshot_path           TEXT,
+                snapshot_head_sha       TEXT,
+                base_commit_sha         TEXT NOT NULL DEFAULT '',
+                finalize_error_json     TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (project_id, session_id)
+            )
+        """)
+        columns = {
+            row[1] for row in c.execute("PRAGMA table_info(reconcile_sessions)").fetchall()
+        }
+        base_expr = "base_commit_sha" if "base_commit_sha" in columns else "COALESCE(snapshot_head_sha, '')"
+        err_expr = "finalize_error_json" if "finalize_error_json" in columns else "'{}'"
+        c.execute(f"""
+            INSERT OR REPLACE INTO reconcile_sessions_v31 (
+                project_id, session_id, run_id, status, started_at, finalized_at,
+                cluster_count_total, cluster_count_resolved, cluster_count_failed,
+                bypass_gates_json, started_by, snapshot_path, snapshot_head_sha,
+                base_commit_sha, finalize_error_json
+            )
+            SELECT
+                project_id, session_id, run_id, status, started_at, finalized_at,
+                cluster_count_total, cluster_count_resolved, cluster_count_failed,
+                bypass_gates_json, started_by, snapshot_path, snapshot_head_sha,
+                {base_expr}, {err_expr}
+            FROM reconcile_sessions
+        """)
+        c.execute("DROP TABLE reconcile_sessions")
+        c.execute("ALTER TABLE reconcile_sessions_v31 RENAME TO reconcile_sessions")
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reconcile_sessions_one_active "
+            "ON reconcile_sessions (project_id) "
+            "WHERE status IN ('active','finalizing','finalize_failed')"
+        )
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23, 24: _migrate_v23_to_v24, 25: _migrate_v24_to_v25, 26: _migrate_v25_to_v26, 27: _migrate_v26_to_v27, 28: _migrate_v27_to_v28, 29: _migrate_v28_to_v29, 30: _migrate_v29_to_v30, 31: _migrate_v30_to_v31}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)

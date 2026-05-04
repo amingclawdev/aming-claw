@@ -1,7 +1,7 @@
 """Reconcile session state machine (CR0a).
 
 Pure module: NO DB writes, NO filesystem I/O, NO network at import time.
-State machine: idle -> active -> finalizing -> finalized | rolled_back.
+State machine: idle -> active -> finalizing -> finalized | finalize_failed | rolled_back.
 """
 from __future__ import annotations
 import io, json, shutil, sqlite3, subprocess, tarfile, uuid
@@ -43,6 +43,8 @@ class ReconcileSession:
     started_by: Optional[str] = None
     snapshot_path: Optional[str] = None
     snapshot_head_sha: Optional[str] = None
+    base_commit_sha: str = ""
+    finalize_error: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -125,6 +127,35 @@ def _primary_paths(node: Any) -> list[str]:
     if isinstance(raw, (list, tuple)):
         return [_normalize_rel(str(p)) for p in raw if str(p).strip()]
     return []
+
+
+def _path_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [_normalize_rel(value)] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_rel(str(p)) for p in value if str(p).strip()]
+    return []
+
+
+def _merge_path_lists(*values: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        for path in _path_list(value):
+            if path and path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
+
+
+def _candidate_test_paths(node: dict) -> list[str]:
+    paths = _path_list(node.get("test"))
+    coverage = node.get("test_coverage")
+    if isinstance(coverage, dict):
+        paths.extend(_path_list(coverage.get("test_files")))
+    return _merge_path_lists(paths)
 
 
 def _path_exists(path: str, *, workspace_dir: Optional[Path],
@@ -218,12 +249,8 @@ def _overlay_to_graph_node(node_id: str, overlay_node: dict, *,
         or (node_id.split(".", 1)[0] if "." in node_id else "L7")
     )
     primary = _primary_paths(overlay_node)
-    secondary = overlay_node.get("secondary") or []
-    test = overlay_node.get("test") or []
-    if isinstance(secondary, str):
-        secondary = [secondary]
-    if isinstance(test, str):
-        test = [test]
+    secondary = _path_list(overlay_node.get("secondary"))
+    test = _path_list(overlay_node.get("test"))
     metadata = dict(overlay_node.get("metadata") or {})
     metadata.update({
         "materialized_from_overlay": True,
@@ -239,8 +266,8 @@ def _overlay_to_graph_node(node_id: str, overlay_node: dict, *,
         "gate_mode": overlay_node.get("gate_mode") or "auto",
         "test_coverage": overlay_node.get("test_coverage") or "none",
         "primary": primary,
-        "secondary": list(secondary),
-        "test": list(test),
+        "secondary": secondary,
+        "test": test,
         "artifacts": list(overlay_node.get("artifacts") or []),
         "_deps": deps,
         "deps": deps,
@@ -371,6 +398,58 @@ def _build_overlay_primary_map(overlay_nodes: dict[str, dict]) -> dict[str, str]
     return primary_to_overlay
 
 
+def _candidate_hierarchy_parent_map(candidate_doc: dict) -> dict[str, str]:
+    hierarchy = candidate_doc.get("hierarchy_graph")
+    parents: dict[str, str] = {}
+    if not isinstance(hierarchy, dict):
+        return parents
+    for edge in _node_link_links(hierarchy):
+        relation = str(edge.get("relation") or edge.get("type") or "")
+        if relation and relation != "contains":
+            continue
+        src, dst = _edge_endpoints(edge)
+        if src and dst:
+            parents.setdefault(dst, src)
+    return parents
+
+
+def _next_layer_id(layer: str, used_ids: set[str]) -> str:
+    prefix = layer if layer.startswith("L") else "L7"
+    max_suffix = 0
+    for nid in used_ids:
+        if not nid.startswith(prefix + "."):
+            continue
+        try:
+            max_suffix = max(max_suffix, int(nid.split(".", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    while True:
+        max_suffix += 1
+        candidate = f"{prefix}.{max_suffix}"
+        if candidate not in used_ids:
+            used_ids.add(candidate)
+            return candidate
+
+
+def _choose_overlay_final_id(
+        overlay_id: str, candidate_ids: list[str],
+        candidate_nodes: dict[str, dict], final_nodes: dict[str, dict],
+        used_ids: set[str]) -> str:
+    if overlay_id not in final_nodes:
+        used_ids.add(overlay_id)
+        return overlay_id
+    existing = final_nodes[overlay_id]
+    if _primary_paths(existing):
+        raise ValueError(f"overlay node id collides with candidate leaf node: {overlay_id}")
+    layers = {
+        str(candidate_nodes[cid].get("layer") or "")
+        for cid in candidate_ids if cid in candidate_nodes
+    }
+    non_empty_layers = sorted(layer for layer in layers if layer)
+    layer = non_empty_layers[0] if len(non_empty_layers) == 1 else "L7"
+    return _next_layer_id(layer, used_ids)
+
+
 def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
         overlay_nodes: dict[str, dict], session_id: str,
         finalized_at: str) -> tuple[dict[str, dict], list[dict], dict, dict[str, dict]]:
@@ -407,6 +486,8 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
     candidate_to_final: dict[str, str] = {}
     overlay_to_candidates: dict[str, list[str]] = {}
     final_nodes: dict[str, dict] = {}
+    overlay_to_final: dict[str, str] = {}
+    hierarchy_parents = _candidate_hierarchy_parent_map(candidate_doc)
 
     for candidate_id, candidate_node in candidate_nodes.items():
         primaries = _primary_paths(candidate_node)
@@ -431,8 +512,23 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
                 f"candidate node {candidate_id} maps to multiple overlay nodes: "
                 f"{sorted(overlay_ids)}")
         overlay_id = next(iter(overlay_ids))
-        candidate_to_final[candidate_id] = overlay_id
         overlay_to_candidates.setdefault(overlay_id, []).append(candidate_id)
+
+    used_ids = set(candidate_nodes) | set(overlay_nodes) | set(final_nodes)
+    for overlay_id, candidate_ids in sorted(overlay_to_candidates.items()):
+        parent_ids = {
+            hierarchy_parents[cid] for cid in candidate_ids
+            if cid in hierarchy_parents
+        }
+        if len(parent_ids) > 1:
+            raise ValueError(
+                "overlay node aggregates candidate leaves from multiple hierarchy parents: "
+                f"{overlay_id} -> {sorted(parent_ids)}")
+        final_id = _choose_overlay_final_id(
+            overlay_id, candidate_ids, candidate_nodes, final_nodes, used_ids)
+        overlay_to_final[overlay_id] = final_id
+        for candidate_id in candidate_ids:
+            candidate_to_final[candidate_id] = final_id
 
     for overlay_id, overlay_node in overlay_nodes.items():
         candidate_ids = overlay_to_candidates.get(overlay_id, [])
@@ -442,9 +538,24 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
             str(candidate_nodes[cid].get("layer") or "") for cid in candidate_ids
             if cid in candidate_nodes
         }
+        final_id = overlay_to_final[overlay_id]
         node = _overlay_to_graph_node(
-            overlay_id, overlay_node,
+            final_id, overlay_node,
             session_id=session_id, finalized_at=finalized_at,
+        )
+        candidate_leafs = [candidate_nodes[cid] for cid in candidate_ids if cid in candidate_nodes]
+        node["secondary"] = _merge_path_lists(
+            node.get("secondary"),
+            *[c.get("secondary") for c in candidate_leafs],
+            *[c.get("secondary_files") for c in candidate_leafs],
+        )
+        node["test"] = _merge_path_lists(
+            node.get("test"),
+            *[_candidate_test_paths(c) for c in candidate_leafs],
+        )
+        node["artifacts"] = _merge_path_lists(
+            node.get("artifacts"),
+            *[c.get("artifacts") for c in candidate_leafs],
         )
         if len(candidate_layers) == 1:
             layer = next(iter(candidate_layers))
@@ -455,10 +566,13 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
         metadata["candidate_node_ids"] = sorted(candidate_ids)
         metadata["candidate_graph_path"] = str(candidate_graph_path)
         metadata["materialized_with_candidate_hierarchy"] = True
+        if final_id != overlay_id:
+            metadata["overlay_node_id"] = overlay_id
+            metadata["reallocated_from_colliding_overlay_id"] = True
         node["metadata"] = metadata
-        final_nodes[overlay_id] = node
+        final_nodes[final_id] = node
 
-    missing_overlay_ids = sorted(set(overlay_nodes) - set(final_nodes))
+    missing_overlay_ids = sorted(set(overlay_nodes) - set(overlay_to_final))
     if missing_overlay_ids:
         raise ValueError(
             "overlay nodes were not represented in candidate graph: "
@@ -646,7 +760,8 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
 
     node_state_rows = []
     for nid, node in final_nodes.items():
-        source = "overlay" if nid in overlay_nodes else "carry_forward"
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        source = "overlay" if metadata.get("materialized_from_overlay") else "carry_forward"
         prior_state = existing_state.get(nid, {})
         verify_status = (
             node.get("verify_status")
@@ -688,6 +803,25 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
             ],
         )
 
+    counts = {
+        "new_overlay_nodes": len(overlay_nodes),
+        "carried_forward_nodes": len(carried_forward),
+        "archived_orphan_nodes": len(archived_old),
+        "replaced_old_nodes": len(replaced_old),
+        "final_node_count": len(final_nodes),
+        "final_edge_count": len(links),
+        "duplicate_primary_count": validation_summary["duplicate_primary_count"],
+    }
+    for key in (
+        "candidate_node_count",
+        "candidate_link_count",
+        "candidate_hierarchy_nodes",
+        "candidate_leaf_nodes_remapped",
+        "hierarchy_link_count",
+        "evidence_link_count",
+    ):
+        if key in candidate_meta:
+            counts[key] = candidate_meta[key]
     event_payload = {
         "event": "reconcile.session.materialized",
         "project_id": project_id,
@@ -695,15 +829,7 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
         "graph_path": str(graph_path),
         "graph_backup_path": str(backup_path),
         "overlay_path": str(overlay_path),
-        "counts": {
-            "new_overlay_nodes": len(overlay_nodes),
-            "carried_forward_nodes": len(carried_forward),
-            "archived_orphan_nodes": len(archived_old),
-            "replaced_old_nodes": len(replaced_old),
-            "final_node_count": len(final_nodes),
-            "final_edge_count": len(links),
-            "duplicate_primary_count": validation_summary["duplicate_primary_count"],
-        },
+        "counts": counts,
         "candidate_materialization": candidate_meta,
         "duplicate_primary_examples": validation_summary["duplicate_primary_examples"],
         "full_rebase_flag": bool(full_rebase),
@@ -726,6 +852,13 @@ def _row_to_session(row: sqlite3.Row) -> ReconcileSession:
         bypass = list(json.loads(raw) or [])
     except (TypeError, ValueError):
         bypass = []
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    finalize_error = {}
+    if "finalize_error_json" in keys:
+        try:
+            finalize_error = dict(json.loads(row["finalize_error_json"] or "{}") or {})
+        except (TypeError, ValueError):
+            finalize_error = {}
     return ReconcileSession(
         project_id=row["project_id"], session_id=row["session_id"],
         run_id=row["run_id"], status=row["status"],
@@ -735,6 +868,8 @@ def _row_to_session(row: sqlite3.Row) -> ReconcileSession:
         cluster_count_failed=int(row["cluster_count_failed"] or 0),
         bypass_gates=bypass, started_by=row["started_by"],
         snapshot_path=row["snapshot_path"], snapshot_head_sha=row["snapshot_head_sha"],
+        base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in keys else "",
+        finalize_error=finalize_error,
     )
 
 
@@ -747,13 +882,43 @@ def _git_head_sha(cwd: Optional[Path] = None) -> str:
         return ""
 
 
+def changed_files_since_base(base_commit_sha: str, *,
+                             head: str = "HEAD",
+                             cwd: Optional[Path] = None) -> list[str]:
+    """Return repo-relative files changed since a reconcile session baseline."""
+    base = str(base_commit_sha or "").strip()
+    if not base:
+        return []
+    try:
+        out = subprocess.check_output(
+            ["git", "diff", "--name-only", f"{base}..{head}"],
+            cwd=str(cwd or _repo_root()),
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return []
+    return [
+        _normalize_rel(line)
+        for line in out.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+
+
+def changed_files_for_session(session: Optional[ReconcileSession], *,
+                              head: str = "HEAD",
+                              cwd: Optional[Path] = None) -> list[str]:
+    if session is None:
+        return []
+    return changed_files_since_base(session.base_commit_sha, head=head, cwd=cwd)
+
+
 def get_active_session(conn: sqlite3.Connection, project_id: str) -> Optional[ReconcileSession]:
-    """Return the active or finalizing session for project_id, else None."""
+    """Return the active/finalizing/finalize_failed session for project_id, else None."""
     if conn.row_factory is None:
         conn.row_factory = sqlite3.Row
     row = conn.execute(
         "SELECT * FROM reconcile_sessions WHERE project_id = ? "
-        "AND status IN ('active','finalizing') LIMIT 1", (project_id,)).fetchone()
+        "AND status IN ('active','finalizing','finalize_failed') LIMIT 1", (project_id,)).fetchone()
     return _row_to_session(row) if row else None
 
 
@@ -763,6 +928,7 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
         bypass_gates: Optional[Sequence[str]] = None,
         full_rebase: bool = False,
         dropped_cluster_fingerprints: Optional[Sequence[str]] = None,
+        base_commit_sha: Optional[str] = None,
         governance_dir: Optional[Path] = None) -> ReconcileSession:
     """Insert a new active session; raise SessionAlreadyActiveError on conflict."""
     if full_rebase and not dropped_cluster_fingerprints:
@@ -770,12 +936,13 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
     sid = session_id or uuid.uuid4().hex
     now = _utcnow_iso()
     bypass_json = json.dumps(list(bypass_gates or []))
+    base_sha = (base_commit_sha or _git_head_sha(_repo_root())).strip()
     try:
         conn.execute(
             "INSERT INTO reconcile_sessions (project_id, session_id, run_id, status, "
-            "started_at, bypass_gates_json, started_by) "
-            "VALUES (?, ?, ?, 'active', ?, ?, ?)",
-            (project_id, sid, run_id, now, bypass_json, started_by))
+            "started_at, bypass_gates_json, started_by, base_commit_sha, snapshot_head_sha) "
+            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)",
+            (project_id, sid, run_id, now, bypass_json, started_by, base_sha, base_sha))
         conn.commit()
     except sqlite3.IntegrityError as exc:
         msg = str(exc).lower()
@@ -785,10 +952,15 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
         raise
     overlay = _overlay_path(governance_dir)
     overlay.parent.mkdir(parents=True, exist_ok=True)
-    overlay.write_text(json.dumps({"session_id": sid, "project_id": project_id}))
+    overlay.write_text(json.dumps({
+        "session_id": sid,
+        "project_id": project_id,
+        "base_commit_sha": base_sha,
+    }))
     return ReconcileSession(project_id=project_id, session_id=sid, run_id=run_id,
         status="active", started_at=now,
-        bypass_gates=list(bypass_gates or []), started_by=started_by)
+        bypass_gates=list(bypass_gates or []), started_by=started_by,
+        base_commit_sha=base_sha, snapshot_head_sha=base_sha)
 
 
 def transition_to_finalizing(conn: sqlite3.Connection, project_id: str,
@@ -840,7 +1012,7 @@ def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str,
             )
     row = conn.execute(
         "SELECT status FROM reconcile_sessions "
-        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing')",
+        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing','finalize_failed')",
         (project_id, session_id),
     ).fetchone()
     if row is None:
@@ -848,18 +1020,51 @@ def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str,
     now = _utcnow_iso()
     overlay = _overlay_path(governance_dir)
     target_graph = Path(graph_path) if graph_path is not None else _graph_path(governance_dir)
-    materialized = materialize_overlay_to_graph(
-        conn, project_id, session_id,
-        overlay_path=overlay,
-        graph_path=target_graph,
-        workspace_dir=workspace_dir,
-        candidate_graph_path=candidate_graph_path,
-        full_rebase=full_rebase,
-        finalized_at=now,
+    conn.execute(
+        "UPDATE reconcile_sessions SET status='finalizing', finalize_error_json='{}' "
+        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing','finalize_failed')",
+        (project_id, session_id),
     )
+    conn.commit()
+    try:
+        materialized = materialize_overlay_to_graph(
+            conn, project_id, session_id,
+            overlay_path=overlay,
+            graph_path=target_graph,
+            workspace_dir=workspace_dir,
+            candidate_graph_path=candidate_graph_path,
+            full_rebase=full_rebase,
+            finalized_at=now,
+        )
+    except Exception as exc:
+        conn.rollback()
+        error_payload = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "failed_at": _utcnow_iso(),
+            "overlay_path": str(overlay),
+            "graph_path": str(target_graph),
+        }
+        conn.execute(
+            "UPDATE reconcile_sessions SET status='finalize_failed', "
+            "finalize_error_json=? "
+            "WHERE project_id=? AND session_id=? AND status='finalizing'",
+            (json.dumps(error_payload, ensure_ascii=False), project_id, session_id),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, session_id, "reconcile.session.finalize_failed",
+                 json.dumps(error_payload, ensure_ascii=False), error_payload["failed_at"]),
+            )
+        except sqlite3.Error:
+            pass
+        conn.commit()
+        raise
     cur = conn.execute(
         "UPDATE reconcile_sessions SET status='finalized', finalized_at=? "
-        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing')",
+        "WHERE project_id=? AND session_id=? AND status='finalizing'",
         (now, project_id, session_id))
     if cur.rowcount == 0:
         raise ValueError(f"no in-flight session {session_id!r} for {project_id!r}")
@@ -881,11 +1086,12 @@ def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str,
 
 def rollback_session(conn: sqlite3.Connection, project_id: str, session_id: str, *,
         snapshot_path: Optional[Path] = None,
-        governance_dir: Optional[Path] = None) -> SessionRollbackResult:
+        governance_dir: Optional[Path] = None,
+        restore_graph_snapshot: bool = False) -> SessionRollbackResult:
     now = _utcnow_iso()
     cur = conn.execute(
         "UPDATE reconcile_sessions SET status='rolled_back', finalized_at=? "
-        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing')",
+        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing','finalize_failed')",
         (now, project_id, session_id))
     if cur.rowcount == 0:
         raise ValueError(f"no in-flight session {session_id!r} for {project_id!r}")
@@ -893,7 +1099,7 @@ def rollback_session(conn: sqlite3.Connection, project_id: str, session_id: str,
     if snapshot_path is None:
         snapshot_path = _snapshot_dir(governance_dir) / f"{session_id}.tar.gz"
     snapshot_path = Path(snapshot_path)
-    if snapshot_path.exists():
+    if restore_graph_snapshot and snapshot_path.exists():
         restore_snapshot(conn, project_id, session_id,
             snapshot_path=snapshot_path, governance_dir=governance_dir)
     overlay = _overlay_path(governance_dir)
@@ -968,6 +1174,16 @@ def capture_snapshot(conn: sqlite3.Connection, project_id: str, session_id: str,
         "taken_at": _utcnow_iso(), "node_count": int(node_count or 0),
         "verify_status_distribution": _verify_status_distribution(conn, project_id),
     }
+    try:
+        row = conn.execute(
+            "SELECT base_commit_sha FROM reconcile_sessions "
+            "WHERE project_id=? AND session_id=?",
+            (project_id, session_id),
+        ).fetchone()
+        if row is not None:
+            manifest["base_commit_sha"] = row["base_commit_sha"] if isinstance(row, sqlite3.Row) else row[0]
+    except sqlite3.Error:
+        pass
     manifest_bytes = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8")
 
     def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
@@ -1024,5 +1240,6 @@ __all__ = [
     "RestoreResult", "SessionAlreadyActiveError", "SessionClusterGateError",
     "get_active_session", "start_session", "transition_to_finalizing",
     "finalize_session", "rollback_session", "is_gate_bypassed",
-    "capture_snapshot", "restore_snapshot",
+    "capture_snapshot", "restore_snapshot", "changed_files_since_base",
+    "changed_files_for_session",
 ]

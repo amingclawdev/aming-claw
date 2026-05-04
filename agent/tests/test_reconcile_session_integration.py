@@ -173,10 +173,15 @@ def gov_db(tmp_path: Path, monkeypatch, gov_dir: Path):
 # ---------------------------------------------------------------------------
 
 def test_start_endpoint_201_and_409_on_dup(gov_db):
-    ctx = _StubCtx(body={"started_by": "tester", "bypass_gates": ["g1"]})
+    ctx = _StubCtx(body={
+        "started_by": "tester",
+        "bypass_gates": ["g1"],
+        "base_commit_sha": "base-http-1",
+    })
     status, body = _unwrap(server.handle_reconcile_session_start(ctx))
     assert status == 201, body
     assert body["session"]["status"] == "active"
+    assert body["session"]["base_commit_sha"] == "base-http-1"
     sid = body["session"]["session_id"]
 
     # Duplicate start -> 409 reconcile_session_active_exists

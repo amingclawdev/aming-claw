@@ -89,17 +89,22 @@ def test_get_active_returns_none_when_idle(conn):
 def test_start_session_creates_row(conn, gov_dir):
     sess = rs.start_session(conn, PROJECT_ID, started_by="tester",
                             bypass_gates=["gate-a", "gate-b"],
+                            base_commit_sha="abc123",
                             governance_dir=gov_dir)
     assert sess.project_id == PROJECT_ID
     assert sess.status == "active"
     assert sess.bypass_gates == ["gate-a", "gate-b"]
+    assert sess.base_commit_sha == "abc123"
     row = conn.execute(
-        "SELECT status, bypass_gates_json, started_by FROM reconcile_sessions "
+        "SELECT status, bypass_gates_json, started_by, base_commit_sha, "
+        "snapshot_head_sha FROM reconcile_sessions "
         "WHERE project_id=? AND session_id=?",
         (PROJECT_ID, sess.session_id)).fetchone()
     assert row[0] == "active"
     assert json.loads(row[1]) == ["gate-a", "gate-b"]
     assert row[2] == "tester"
+    assert row[3] == "abc123"
+    assert row[4] == "abc123"
 
 
 def test_concurrent_start_one_wins(tmp_path: Path):
@@ -226,7 +231,11 @@ def test_finalize_failure_preserves_overlay_graph_and_session(conn, gov_dir):
     assert overlay.exists()
     assert overlay.read_bytes() == overlay_before
     assert (gov_dir / "graph.json").read_bytes() == graph_before
-    assert rs.get_active_session(conn, PROJECT_ID).session_id == sess.session_id
+    failed = rs.get_active_session(conn, PROJECT_ID)
+    assert failed.session_id == sess.session_id
+    assert failed.status == "finalize_failed"
+    assert failed.finalize_error["type"] == "ValueError"
+    assert "missing primary paths" in failed.finalize_error["message"]
 
 
 def test_finalize_full_rebase_uses_candidate_hierarchy(conn, gov_dir):
@@ -311,6 +320,140 @@ def test_finalize_full_rebase_uses_candidate_hierarchy(conn, gov_dir):
     assert result.materialization_counts["final_edge_count"] == 2
 
 
+def test_finalize_full_rebase_reallocates_colliding_overlay_leaf_and_carries_assets(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    (gov_dir / "code_a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (gov_dir / "code_b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L2.8": {
+                "node_id": "L2.8",
+                "parent_layer": "L7",
+                "title": "Approved Aggregated Leaf",
+                "primary": ["code_a.py", "code_b.py"],
+            }
+        },
+    }), encoding="utf-8")
+    candidate = gov_dir / "graph.rebase.candidate.json"
+    hierarchy_nodes = [
+        {"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []},
+        {"id": "L2.8", "title": "Governance", "layer": "L2", "primary": []},
+        {"id": "L3.11", "title": "Reconcile", "layer": "L3", "primary": []},
+        {"id": "L3.33", "title": "Backlog", "layer": "L3", "primary": []},
+        {"id": "L7.64", "title": "Candidate A", "layer": "L7",
+         "primary": ["code_a.py"], "secondary": ["docs/a.md"],
+         "test_coverage": {"test_files": ["agent/tests/test_a.py"]}},
+        {"id": "L7.66", "title": "Candidate B", "layer": "L7",
+         "primary": ["code_b.py"], "secondary_files": ["docs/b.md"],
+         "test": ["agent/tests/test_b.py"]},
+    ]
+    hierarchy_links = [
+        {"source": "L1.1", "target": "L2.8", "relation": "contains"},
+        {"source": "L2.8", "target": "L3.11", "relation": "contains"},
+        {"source": "L2.8", "target": "L3.33", "relation": "contains"},
+        {"source": "L3.11", "target": "L7.64", "relation": "contains"},
+        {"source": "L3.11", "target": "L7.66", "relation": "contains"},
+    ]
+    candidate.write_text(json.dumps({
+        "version": 1,
+        "hierarchy_graph": {
+            "directed": True, "multigraph": False, "graph": {},
+            "nodes": hierarchy_nodes, "links": hierarchy_links,
+        },
+        "deps_graph": {
+            "directed": True, "multigraph": False, "graph": {},
+            "nodes": hierarchy_nodes, "links": hierarchy_links,
+        },
+        "evidence_graph": {
+            "directed": True, "multigraph": False, "graph": {},
+            "nodes": hierarchy_nodes,
+            "links": [
+                {"source": "L7.64", "target": "L2.8", "relation": "reads_state"},
+                {"source": "L7.66", "target": "L2.8", "relation": "writes_state"},
+            ],
+        },
+    }), encoding="utf-8")
+
+    result = rs.finalize_session(
+        conn, PROJECT_ID, sess.session_id,
+        governance_dir=gov_dir, workspace_dir=gov_dir,
+        candidate_graph_path=candidate, full_rebase=True,
+    )
+    graph = json.loads((gov_dir / "graph.json").read_text(encoding="utf-8"))
+    nodes = {n["id"]: n for n in graph["deps_graph"]["nodes"]}
+    approved_leaf_ids = [
+        nid for nid, node in nodes.items()
+        if node.get("metadata", {}).get("overlay_node_id") == "L2.8"
+    ]
+    assert approved_leaf_ids == ["L7.67"]
+    assert "L2.8" in nodes
+    assert nodes["L2.8"].get("primary") == []
+    leaf = nodes["L7.67"]
+    assert leaf["metadata"]["reallocated_from_colliding_overlay_id"] is True
+    assert leaf["metadata"]["candidate_node_ids"] == ["L7.64", "L7.66"]
+    assert leaf["secondary"] == ["docs/a.md", "docs/b.md"]
+    assert leaf["test"] == ["agent/tests/test_a.py", "agent/tests/test_b.py"]
+    hierarchy = graph["hierarchy_graph"]["links"]
+    assert {"source": "L1.1", "target": "L2.8", "relation": "contains"} in hierarchy
+    assert {"source": "L3.11", "target": "L7.67", "relation": "contains"} in hierarchy
+    assert {"source": "L3.11", "target": "L2.8", "relation": "contains"} not in hierarchy
+    assert result.materialization_counts["candidate_leaf_nodes_remapped"] == 1
+
+
+def test_finalize_full_rebase_rejects_aggregate_across_multiple_candidate_parents(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    (gov_dir / "code_a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (gov_dir / "code_c.py").write_text("def c():\n    return 3\n", encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L7.200": {
+                "node_id": "L7.200",
+                "title": "Cross Parent Aggregate",
+                "primary": ["code_a.py", "code_c.py"],
+            }
+        },
+    }), encoding="utf-8")
+    candidate = gov_dir / "graph.rebase.candidate.json"
+    nodes = [
+        {"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []},
+        {"id": "L3.1", "title": "A", "layer": "L3", "primary": []},
+        {"id": "L3.2", "title": "C", "layer": "L3", "primary": []},
+        {"id": "L7.1", "title": "A Leaf", "layer": "L7", "primary": ["code_a.py"]},
+        {"id": "L7.2", "title": "C Leaf", "layer": "L7", "primary": ["code_c.py"]},
+    ]
+    links = [
+        {"source": "L1.1", "target": "L3.1", "relation": "contains"},
+        {"source": "L1.1", "target": "L3.2", "relation": "contains"},
+        {"source": "L3.1", "target": "L7.1", "relation": "contains"},
+        {"source": "L3.2", "target": "L7.2", "relation": "contains"},
+    ]
+    candidate.write_text(json.dumps({
+        "version": 1,
+        "hierarchy_graph": {
+            "directed": True, "multigraph": False, "graph": {},
+            "nodes": nodes, "links": links,
+        },
+        "deps_graph": {
+            "directed": True, "multigraph": False, "graph": {},
+            "nodes": nodes, "links": links,
+        },
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="multiple hierarchy parents"):
+        rs.finalize_session(
+            conn, PROJECT_ID, sess.session_id,
+            governance_dir=gov_dir, workspace_dir=gov_dir,
+            candidate_graph_path=candidate, full_rebase=True,
+        )
+    assert rs.get_active_session(conn, PROJECT_ID).status == "finalize_failed"
+
+
 def test_finalize_candidate_missing_overlay_primary_preserves_state(conn, gov_dir):
     sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
     (gov_dir / "unseen.py").write_text("x = 1\n", encoding="utf-8")
@@ -350,7 +493,10 @@ def test_finalize_candidate_missing_overlay_primary_preserves_state(conn, gov_di
 
     assert overlay.read_bytes() == overlay_before
     assert (gov_dir / "graph.json").read_bytes() == graph_before
-    assert rs.get_active_session(conn, PROJECT_ID).session_id == sess.session_id
+    failed = rs.get_active_session(conn, PROJECT_ID)
+    assert failed.session_id == sess.session_id
+    assert failed.status == "finalize_failed"
+    assert "missing from candidate graph" in failed.finalize_error["message"]
 
 
 def test_finalize_blocks_until_reconcile_clusters_complete(conn, gov_dir):
@@ -435,12 +581,28 @@ def test_rollback_restores_graph_and_node_state(conn, gov_dir):
                  (PROJECT_ID,))
     conn.commit()
 
-    rs.rollback_session(conn, PROJECT_ID, sess.session_id, governance_dir=gov_dir)
+    rs.rollback_session(conn, PROJECT_ID, sess.session_id, governance_dir=gov_dir,
+                        restore_graph_snapshot=True)
     assert (gov_dir / "graph.json").read_bytes() == graph_before
     rows_after = conn.execute(
         "SELECT node_id, verify_status FROM node_state WHERE project_id=? "
         "ORDER BY node_id", (PROJECT_ID,)).fetchall()
     assert [tuple(r) for r in rows_after] == [tuple(r) for r in rows_before]
+
+
+def test_rollback_default_does_not_restore_graph_snapshot(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    rs.capture_snapshot(conn, PROJECT_ID, sess.session_id, governance_dir=gov_dir)
+    (gov_dir / "graph.json").write_text("MAINLINE CHANGE AFTER RECONCILE START")
+
+    rs.rollback_session(conn, PROJECT_ID, sess.session_id, governance_dir=gov_dir)
+
+    assert (gov_dir / "graph.json").read_text() == "MAINLINE CHANGE AFTER RECONCILE START"
+    row = conn.execute(
+        "SELECT status FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+        (PROJECT_ID, sess.session_id),
+    ).fetchone()
+    assert row[0] == "rolled_back"
 
 
 def test_full_rebase_precondition_explicit_force_drop(conn, gov_dir):

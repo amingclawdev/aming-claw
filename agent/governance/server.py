@@ -1155,6 +1155,8 @@ def _session_to_dict(sess) -> dict:
         "started_by": sess.started_by,
         "snapshot_path": sess.snapshot_path,
         "snapshot_head_sha": sess.snapshot_head_sha,
+        "base_commit_sha": getattr(sess, "base_commit_sha", "") or "",
+        "finalize_error": dict(getattr(sess, "finalize_error", {}) or {}),
     }
 
 
@@ -1167,6 +1169,13 @@ def _row_to_session_dict(row) -> dict:
         bypass = list(json.loads(raw) or [])
     except Exception:
         bypass = []
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    finalize_error = {}
+    if "finalize_error_json" in keys:
+        try:
+            finalize_error = dict(json.loads(row["finalize_error_json"] or "{}") or {})
+        except Exception:
+            finalize_error = {}
     return {
         "project_id": row["project_id"],
         "session_id": row["session_id"],
@@ -1181,6 +1190,8 @@ def _row_to_session_dict(row) -> dict:
         "started_by": row["started_by"],
         "snapshot_path": row["snapshot_path"],
         "snapshot_head_sha": row["snapshot_head_sha"],
+        "base_commit_sha": row["base_commit_sha"] if "base_commit_sha" in keys else "",
+        "finalize_error": finalize_error,
     }
 
 
@@ -1194,6 +1205,7 @@ def handle_reconcile_session_start(ctx: RequestContext):
     run_id = body.get("run_id")
     full_rebase = bool(body.get("full_rebase", False))
     dropped = body.get("dropped_cluster_fingerprints")
+    base_commit_sha = body.get("base_commit_sha") or body.get("base_commit")
     try:
         with DBContext(project_id) as conn:
             # Pre-check: active session already exists?
@@ -1211,6 +1223,7 @@ def handle_reconcile_session_start(ctx: RequestContext):
                 bypass_gates=list(bypass_gates),
                 full_rebase=full_rebase,
                 dropped_cluster_fingerprints=dropped,
+                base_commit_sha=base_commit_sha,
             )
     except reconcile_session.SessionAlreadyActiveError as exc:
         return 409, {
@@ -1360,7 +1373,13 @@ def handle_reconcile_session_rollback(ctx: RequestContext):
         if row is None:
             return 404, {"error": "session_not_found", "session_id": session_id}
         try:
-            result = reconcile_session.rollback_session(conn, project_id, session_id)
+            body = ctx.body or {}
+            result = reconcile_session.rollback_session(
+                conn,
+                project_id,
+                session_id,
+                restore_graph_snapshot=bool(body.get("restore_graph_snapshot", False)),
+            )
         except ValueError as exc:
             return 409, {"error": "invalid_state", "message": str(exc)}
         # Audit the rollback event
