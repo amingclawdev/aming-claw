@@ -46,6 +46,21 @@ def conn(tmp_path: Path):
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def isolate_reconcile_session_overlay(tmp_path: Path, monkeypatch):
+    """Keep auto-started reconcile sessions from touching the live repo overlay."""
+    from governance import reconcile_session as rs
+
+    real_start = rs.start_session
+    gov_dir = tmp_path / "session-governance"
+
+    def _start_with_tmp(c, pid, **kw):
+        kw.setdefault("governance_dir", gov_dir)
+        return real_start(c, pid, **kw)
+
+    monkeypatch.setattr(rs, "start_session", _start_with_tmp)
+
+
 # ---------------------------------------------------------------------------
 # Module API surface
 # ---------------------------------------------------------------------------
@@ -76,6 +91,17 @@ def test_enqueue(conn):
     assert out["status"] == "queued"
     assert out["retry_count"] == 0
     assert out["cluster_fingerprint"] == "fp-aaaa1111"
+
+
+def test_enqueue_does_not_touch_live_repo_overlay(conn):
+    live_overlay = _AGENT_DIR / "governance" / "graph.rebase.overlay.json"
+    before = live_overlay.read_text(encoding="utf-8") if live_overlay.exists() else None
+    q.enqueue_or_lookup(
+        PROJECT_ID, "fp-live-overlay-guard", payload={"a": 1},
+        run_id="run-live-overlay-guard", conn=conn,
+    )
+    after = live_overlay.read_text(encoding="utf-8") if live_overlay.exists() else None
+    assert after == before
 
 
 def test_dedup(conn):
