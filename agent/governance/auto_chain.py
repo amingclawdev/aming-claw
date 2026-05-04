@@ -2955,6 +2955,47 @@ def _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
     return True
 
 
+def _is_current_reconcile_cluster_terminal_source(
+    conn, project_id, task_id, metadata,
+) -> bool:
+    """Return True when this task is allowed to terminalize its cluster row."""
+    if not isinstance(metadata, dict):
+        return True
+    fp = str(metadata.get("cluster_fingerprint") or "").strip()
+    bug_id = str(metadata.get("bug_id") or "").strip()
+    if bug_id:
+        try:
+            row = conn.execute(
+                "SELECT current_task_id, root_task_id FROM backlog_bugs "
+                "WHERE bug_id = ?",
+                (bug_id,),
+            ).fetchone()
+        except Exception:
+            row = None
+        if row is not None:
+            current_task_id = str(row["current_task_id"] or "")
+            root_task_id = str(row["root_task_id"] or "")
+            if current_task_id and current_task_id != task_id:
+                return False
+            if not current_task_id and root_task_id and root_task_id != task_id:
+                return False
+    if fp:
+        try:
+            row = conn.execute(
+                "SELECT root_task_id FROM reconcile_deferred_clusters "
+                "WHERE project_id = ? AND cluster_fingerprint = ?",
+                (project_id, fp),
+            ).fetchone()
+        except Exception:
+            row = None
+        if row is not None:
+            root_task_id = str(row["root_task_id"] or "")
+            chain_id = str(metadata.get("chain_id") or metadata.get("root_task_id") or "")
+            if root_task_id and chain_id and root_task_id != chain_id:
+                return False
+    return True
+
+
 def _reconcile_cluster_terminal_hook(
     conn, project_id, task_id, task_type, status, result, metadata,
 ):
@@ -2990,16 +3031,26 @@ def _reconcile_cluster_terminal_hook(
             q.mark_terminal(project_id, fp, "resolved", f"merged@{commit}",
                             conn=conn)
             return {"hook": "reconcile_cluster_resolved", "fingerprint": fp}
-        if status == "cancelled" or (
+        is_cancel = status == "cancelled" or (
             isinstance(metadata.get("cancel_reason"), str) and metadata.get("cancel_reason")
+        )
+        is_failure = status in ("failed", "failed_terminal", "failed_retryable", "stalled")
+        if (is_cancel or is_failure) and not _is_current_reconcile_cluster_terminal_source(
+            conn, project_id, task_id, metadata,
         ):
+            return {
+                "hook": "reconcile_cluster_stale_terminal_ignored",
+                "fingerprint": fp,
+                "task_id": task_id,
+            }
+        if is_cancel:
             q.mark_terminal(
                 project_id, fp, "skipped",
                 metadata.get("cancel_reason") or "observer_cancel",
                 conn=conn,
             )
             return {"hook": "reconcile_cluster_skipped", "fingerprint": fp}
-        if status in ("failed", "failed_terminal", "failed_retryable", "stalled"):
+        if is_failure:
             outcome = q.requeue_after_failure(
                 project_id, fp, retry_count_delta=1,
                 reason=(

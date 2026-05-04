@@ -208,6 +208,50 @@ def test_terminal_withdrawn_hook(conn):
     assert row[1] == "observer_withdraw"
 
 
+def test_stale_duplicate_child_cancel_does_not_skip_cluster(conn):
+    """Cancelling a non-current duplicate child must not terminalize the cluster."""
+    from governance import auto_chain
+
+    bug_id = "OPT-BACKLOG-RECONCILE-test-stale-child"
+    q.enqueue_or_lookup(PROJECT_ID, "fp-stale-child", payload={}, run_id="r", conn=conn)
+    q.mark_filing(PROJECT_ID, "fp-stale-child", conn=conn)
+    q.mark_in_chain(
+        PROJECT_ID,
+        "fp-stale-child",
+        "task-root",
+        bug_id=bug_id,
+        conn=conn,
+    )
+    conn.execute(
+        "INSERT INTO backlog_bugs "
+        "(bug_id, title, status, current_task_id, root_task_id, created_at, updated_at) "
+        "VALUES (?, ?, 'OPEN', ?, ?, '2026-05-04T00:00:00Z', '2026-05-04T00:00:00Z')",
+        (bug_id, "cluster stale child guard", "task-real-dev", "task-root"),
+    )
+    conn.commit()
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "cluster_fingerprint": "fp-stale-child",
+        "bug_id": bug_id,
+        "chain_id": "task-root",
+    }
+
+    out = auto_chain._reconcile_cluster_terminal_hook(
+        conn, PROJECT_ID, "task-duplicate-dev", "dev", "cancelled", {}, metadata,
+    )
+    row = conn.execute(
+        "SELECT status, last_terminal_status, skipped_reason "
+        "FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (PROJECT_ID, "fp-stale-child"),
+    ).fetchone()
+
+    assert out["hook"] == "reconcile_cluster_stale_terminal_ignored"
+    assert row[0] == "in_chain"
+    assert row[1] is None
+    assert row[2] is None
+
+
 def test_on_task_failed_terminal_updates_deferred_queue(conn):
     """Terminal root failure must move reconcile deferred row out of in_chain."""
     from governance import auto_chain
