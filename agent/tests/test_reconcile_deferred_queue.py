@@ -575,3 +575,154 @@ def test_terminal_failure_hook_via_auto_chain(conn, tmp_path, monkeypatch):
     ).fetchone()
     assert row[0] == "failed_retryable"
     assert row[1] == 1
+
+
+# ---------------------------------------------------------------------------
+# Observer/MF queue ownership
+# ---------------------------------------------------------------------------
+
+
+def test_observer_takeover_blocks_finalize_until_patch_accepted(conn, tmp_path, monkeypatch):
+    from governance import reconcile_session as rs
+
+    real_start = rs.start_session
+
+    def _start_with_tmp(c, pid, **kw):
+        kw.setdefault("governance_dir", tmp_path)
+        return real_start(c, pid, **kw)
+
+    monkeypatch.setattr(rs, "start_session", _start_with_tmp)
+
+    q.register_feature_clusters(
+        PROJECT_ID,
+        "run-observer",
+        [
+            {"cluster_fingerprint": "fp-ok", "primary_files": ["ok.py"]},
+            {"cluster_fingerprint": "fp-mf", "primary_files": ["mf.py"]},
+        ],
+        conn=conn,
+    )
+    assert q.mark_terminal(PROJECT_ID, "fp-ok", "resolved", "merged@1", conn=conn)
+    assert q.mark_observer_takeover(
+        PROJECT_ID,
+        "fp-mf",
+        reason="chain_failed_quality_gate",
+        actor="codex",
+        conn=conn,
+    )
+
+    summary = q.completion_summary(PROJECT_ID, run_id="run-observer", conn=conn)
+    assert summary["ready_for_finalize"] is False
+    assert summary["status_counts"]["observer_takeover"] == 1
+    row = conn.execute(
+        "SELECT status FROM reconcile_sessions WHERE project_id = ?",
+        (PROJECT_ID,),
+    ).fetchone()
+    assert row[0] == "active"
+
+    assert q.mark_patch_accepted(
+        PROJECT_ID,
+        "fp-mf",
+        patch_id="MF-2026-05-04-001",
+        reason="manual_patch_reviewed",
+        conn=conn,
+    )
+    summary = q.completion_summary(PROJECT_ID, run_id="run-observer", conn=conn)
+    assert summary["ready_for_finalize"] is True
+    row = conn.execute(
+        "SELECT status, cluster_count_resolved FROM reconcile_sessions WHERE project_id = ?",
+        (PROJECT_ID,),
+    ).fetchone()
+    assert row[0] == "finalizing"
+    assert row[1] == 2
+
+
+def test_observer_release_can_return_cluster_to_queue(conn):
+    q.enqueue_or_lookup(PROJECT_ID, "fp-hold", payload={}, run_id="run-hold", conn=conn)
+    assert q.mark_observer_hold(
+        PROJECT_ID, "fp-hold", reason="batch_review", actor="observer", conn=conn,
+    )
+    assert q.release_observer_takeover(
+        PROJECT_ID,
+        "fp-hold",
+        next_status="queued",
+        reason="resume_auto_flow",
+        conn=conn,
+    )
+    row = conn.execute(
+        "SELECT status, takeover_reason FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (PROJECT_ID, "fp-hold"),
+    ).fetchone()
+    assert row[0] == "queued"
+    assert row[1] == "resume_auto_flow"
+
+
+def test_superseded_bad_run_is_terminal_safe(conn):
+    q.enqueue_or_lookup(
+        PROJECT_ID, "fp-bad-run", payload={"cluster": 1}, run_id="run-bad", conn=conn,
+    )
+    assert q.mark_superseded_bad_run(
+        PROJECT_ID,
+        "fp-bad-run",
+        reason="candidate_namespace_conflict_quarantined",
+        conn=conn,
+    )
+    summary = q.completion_summary(PROJECT_ID, run_id="run-bad", conn=conn)
+    assert summary["ready_for_finalize"] is True
+    assert summary["status_counts"]["superseded_bad_run"] == 1
+
+
+def test_queue_schema_migration_accepts_observer_statuses(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    c = sqlite3.connect(str(db_path))
+    _configure_connection(c, busy_timeout=2000)
+    c.executescript(
+        """
+        CREATE TABLE reconcile_deferred_clusters (
+            project_id TEXT NOT NULL,
+            cluster_fingerprint TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            payload_sha256 TEXT NOT NULL DEFAULT '',
+            run_id TEXT,
+            status TEXT NOT NULL DEFAULT 'queued'
+              CHECK (status IN (
+                'queued','filing','in_chain','resolved','failed_retryable',
+                'failed_terminal','skipped','expired'
+              )),
+            priority INTEGER NOT NULL DEFAULT 100,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            expires_at TEXT,
+            bug_id TEXT,
+            root_task_id TEXT,
+            filed_at TEXT,
+            last_terminal_status TEXT,
+            terminal_reason TEXT,
+            resolved_at TEXT,
+            skipped_reason TEXT,
+            next_retry_at TEXT,
+            PRIMARY KEY (project_id, cluster_fingerprint)
+        );
+        INSERT INTO reconcile_deferred_clusters (
+            project_id, cluster_fingerprint, payload_json, payload_sha256,
+            run_id, status, first_seen_at, last_seen_at
+        ) VALUES (
+            'p-test', 'fp-legacy', '{}', 'sha', 'run-legacy', 'queued',
+            '2026-05-04T00:00:00Z', '2026-05-04T00:00:00Z'
+        );
+        """
+    )
+    q.ensure_schema(c)
+    assert q.mark_observer_takeover(
+        PROJECT_ID, "fp-legacy", reason="legacy_migrated", conn=c,
+    )
+    row = c.execute(
+        "SELECT status, takeover_reason FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (PROJECT_ID, "fp-legacy"),
+    ).fetchone()
+    assert row[0] == "observer_takeover"
+    assert row[1] == "legacy_migrated"
+    c.close()

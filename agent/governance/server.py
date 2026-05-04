@@ -1719,6 +1719,111 @@ def handle_reconcile_deferred_cluster_retry(ctx: RequestContext):
             "force": force, "status": "queued" if changed else "unchanged"}
 
 
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/observer-hold")
+def handle_reconcile_deferred_cluster_observer_hold(ctx: RequestContext):
+    """Pause a cluster queue row before auto-flow picks it up again."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    reason = str(body.get("reason") or "observer_hold")
+    actor = str(body.get("actor") or "observer")
+    changed = q.mark_observer_hold(project_id, fp, reason=reason, actor=actor)
+    return {
+        "ok": bool(changed),
+        "cluster_fingerprint": fp,
+        "status": "observer_hold" if changed else "unchanged",
+        "reason": reason,
+    }
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/observer-takeover")
+def handle_reconcile_deferred_cluster_observer_takeover(ctx: RequestContext):
+    """Transfer a chain-owned cluster row to observer/MF ownership."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    reason = str(body.get("reason") or "observer_takeover")
+    actor = str(body.get("actor") or "observer")
+    changed = q.mark_observer_takeover(project_id, fp, reason=reason, actor=actor)
+    return {
+        "ok": bool(changed),
+        "cluster_fingerprint": fp,
+        "status": "observer_takeover" if changed else "unchanged",
+        "reason": reason,
+    }
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/observer-release")
+def handle_reconcile_deferred_cluster_observer_release(ctx: RequestContext):
+    """Release observer ownership back to queue or a terminal audit state."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    next_status = str(body.get("next_status") or "queued")
+    reason = str(body.get("reason") or "observer_release")
+    actor = str(body.get("actor") or "observer")
+    try:
+        changed = q.release_observer_takeover(
+            project_id,
+            fp,
+            next_status=next_status,
+            reason=reason,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return 422, {"error": "invalid_next_status", "message": str(exc)}
+    return {
+        "ok": bool(changed),
+        "cluster_fingerprint": fp,
+        "status": next_status if changed else "unchanged",
+        "reason": reason,
+    }
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/patch-accepted")
+def handle_reconcile_deferred_cluster_patch_accepted(ctx: RequestContext):
+    """Close an observer/MF repaired cluster as accepted."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    patch_id = str(body.get("patch_id") or "")
+    reason = str(body.get("reason") or "observer_patch_accepted")
+    changed = q.mark_patch_accepted(project_id, fp, patch_id=patch_id, reason=reason)
+    return {
+        "ok": bool(changed),
+        "cluster_fingerprint": fp,
+        "status": "patch_accepted" if changed else "unchanged",
+        "patch_id": patch_id,
+        "reason": reason,
+    }
+
+
+@route("POST", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}/supersede-bad-run")
+def handle_reconcile_deferred_cluster_supersede_bad_run(ctx: RequestContext):
+    """Quarantine a bad cluster run so finalize does not consume it."""
+    from . import reconcile_deferred_queue as q
+
+    project_id = ctx.get_project_id()
+    fp = ctx.path_params.get("cluster_fingerprint", "")
+    body = ctx.body or {}
+    reason = str(body.get("reason") or "superseded_bad_run")
+    changed = q.mark_superseded_bad_run(project_id, fp, reason=reason)
+    return {
+        "ok": bool(changed),
+        "cluster_fingerprint": fp,
+        "status": "superseded_bad_run" if changed else "unchanged",
+        "reason": reason,
+    }
+
+
 @route("POST", "/api/wf/{project_id}/node-create")
 def handle_node_create(ctx: RequestContext):
     """Create a single node. System allocates display_id.

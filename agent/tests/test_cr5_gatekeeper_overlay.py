@@ -93,6 +93,20 @@ def _hash(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _write_candidate_graph(gov_dir: Path, nodes: list[dict]) -> Path:
+    path = gov_dir / "graph.rebase.candidate.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "session_id": "sess-1",
+        "hierarchy_graph": {
+            "directed": True,
+            "nodes": nodes,
+            "links": [],
+        },
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # AC1
 # ---------------------------------------------------------------------------
@@ -471,6 +485,112 @@ def test_allocator_respects_overlay_for_next_id(graph_path: Path, overlay_path: 
     nid = res["allocated_node_ids"][0]
     assert nid.startswith("L7.")
     assert int(nid.split(".")[1]) > 5
+
+
+# ---------------------------------------------------------------------------
+# Candidate graph namespace guard
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_graph_requires_explicit_node_ref(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_path = _write_candidate_graph(gov_dir, [{
+        "id": "L7.21",
+        "primary": ["agent/governance/candidate.py"],
+        "parent_layer": "L7",
+        "title": "candidate",
+    }])
+    pm_prd = {"proposed_nodes": [
+        {"primary": ["agent/governance/candidate.py"], "parent_layer": "L7"},
+    ]}
+    dev_result = {"graph_delta": {"creates": pm_prd["proposed_nodes"]}}
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-missing",
+        pm_prd=pm_prd,
+        dev_result=dev_result,
+        metadata=_meta(candidate_graph_path=str(candidate_path)),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+    assert res["applied"] is False
+    assert res["fatal"] is True
+    assert res["stage"] == "candidate_namespace"
+    assert "candidate graph is active" in res["reason"]
+
+
+def test_candidate_graph_rejects_id_primary_conflict(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_path = _write_candidate_graph(gov_dir, [{
+        "id": "L7.21",
+        "primary": ["agent/governance/candidate.py"],
+        "parent_layer": "L7",
+        "title": "candidate",
+    }])
+    pm_prd = {"proposed_nodes": [
+        {
+            "node_id": "L7.21",
+            "primary": ["agent/governance/different.py"],
+            "parent_layer": "L7",
+        },
+    ]}
+    dev_result = {"graph_delta": {"creates": pm_prd["proposed_nodes"]}}
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-conflict",
+        pm_prd=pm_prd,
+        dev_result=dev_result,
+        metadata=_meta(candidate_graph_path=str(candidate_path)),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+    assert res["applied"] is False
+    assert res["fatal"] is True
+    assert res["stage"] == "candidate_namespace"
+    assert "namespace conflict" in res["reason"]
+
+
+def test_candidate_graph_uses_candidate_id_without_old_graph_allocation(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_path = _write_candidate_graph(gov_dir, [{
+        "id": "L7.1",
+        "primary": ["agent/governance/rebased_new.py"],
+        "parent_layer": "L7",
+        "title": "rebased-new",
+    }])
+    pm_prd = {"proposed_nodes": [
+        {
+            "candidate_node_id": "L7.1",
+            "primary": ["agent/governance/rebased_new.py"],
+            "parent_layer": "L7",
+        },
+    ]}
+    dev_result = {"graph_delta": {"creates": pm_prd["proposed_nodes"]}}
+    graph_before = graph_path.read_bytes()
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-success",
+        pm_prd=pm_prd,
+        dev_result=dev_result,
+        metadata=_meta(candidate_graph_path=str(candidate_path)),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+    assert res["applied"] is True, res
+    assert res["allocated_node_ids"] == ["L7.1"]
+    assert res["graph_json_updated"] is False
+    assert res["candidate_graph_sha256"]
+    assert graph_path.read_bytes() == graph_before
+    overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
+    assert overlay_doc["nodes"]["L7.1"]["primary"] == [
+        "agent/governance/rebased_new.py"
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 """Reconcile CR3 — persistent deferred queue for cluster-driven reconcile work.
 
-8-state machine:
+Durable state machine:
     queued -> filing -> in_chain -> {resolved | failed_retryable | failed_terminal | skipped | expired}
+    observer_hold / observer_takeover pause auto-flow for manual fix ownership.
+    patch_accepted and superseded_bad_run are audit-safe terminal outcomes.
 
 Public API (R2):
     * enqueue_or_lookup(project_id, cluster_fingerprint, payload, run_id) -> dict
@@ -50,6 +52,11 @@ __all__ = [
     "get_next_batch",
     "mark_filing",
     "mark_in_chain",
+    "mark_observer_hold",
+    "mark_observer_takeover",
+    "release_observer_takeover",
+    "mark_patch_accepted",
+    "mark_superseded_bad_run",
     "mark_terminal",
     "requeue_after_failure",
     "escalate",
@@ -65,12 +72,24 @@ RECONCILE_MAX_RETRIES = 3
 # past expires_at get auto-promoted to 'expired' on the next get_next_batch().
 DEFAULT_TTL_HOURS = 24
 
-TERMINAL_STATUSES = frozenset(
-    {"resolved", "failed_terminal", "skipped", "expired"}
+SAFE_TERMINAL_STATUSES = frozenset(
+    {"resolved", "patch_accepted", "skipped", "skipped_explicit", "superseded_bad_run"}
 )
-ACTIVE_STATUSES = frozenset({"queued", "filing", "in_chain", "failed_retryable"})
+UNRESOLVED_TERMINAL_STATUSES = frozenset({"failed_terminal", "expired"})
+TERMINAL_STATUSES = SAFE_TERMINAL_STATUSES | UNRESOLVED_TERMINAL_STATUSES
+ACTIVE_STATUSES = frozenset(
+    {
+        "queued",
+        "filing",
+        "in_chain",
+        "failed_retryable",
+        "observer_hold",
+        "observer_takeover",
+    }
+)
+QUEUE_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 
-# R1: schema — composite PK + 8-state CHECK + terminal-tracking columns +
+# R1: schema — composite PK + durable status CHECK + terminal-tracking columns +
 # 4 indexes (UNIQUE, status, priority+age, project+status).
 QUEUE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS reconcile_deferred_clusters (
@@ -83,7 +102,10 @@ CREATE TABLE IF NOT EXISTS reconcile_deferred_clusters (
                               CHECK (status IN (
                                   'queued','filing','in_chain',
                                   'resolved','failed_retryable',
-                                  'failed_terminal','skipped','expired'
+                                  'failed_terminal','skipped','expired',
+                                  'observer_hold','observer_takeover',
+                                  'patch_accepted','skipped_explicit',
+                                  'superseded_bad_run'
                               )),
     priority                INTEGER NOT NULL DEFAULT 100,
     retry_count             INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +120,12 @@ CREATE TABLE IF NOT EXISTS reconcile_deferred_clusters (
     resolved_at             TEXT,
     skipped_reason          TEXT,
     next_retry_at           TEXT,
+    candidate_hash          TEXT,
+    candidate_node_refs_json TEXT NOT NULL DEFAULT '{}',
+    accepted_patch_id       TEXT,
+    takeover_by             TEXT,
+    takeover_reason         TEXT,
+    takeover_at             TEXT,
     PRIMARY KEY (project_id, cluster_fingerprint)
 );
 
@@ -154,10 +182,89 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return out
 
 
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({_quote_ident(table_name)})").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [str(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in rows]
+
+
+def _queue_schema_needs_migration(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'reconcile_deferred_clusters'"
+    ).fetchone()
+    if row is None:
+        return False
+    sql = str(row["sql"] if isinstance(row, sqlite3.Row) else row[0])
+    if any(status not in sql for status in QUEUE_STATUSES):
+        return True
+    columns = set(_table_columns(conn, "reconcile_deferred_clusters"))
+    required = {
+        "candidate_hash",
+        "candidate_node_refs_json",
+        "accepted_patch_id",
+        "takeover_by",
+        "takeover_reason",
+        "takeover_at",
+    }
+    return not required.issubset(columns)
+
+
+def _migrate_queue_schema(conn: sqlite3.Connection) -> None:
+    """Recreate the queue table when SQLite CHECK constraints are stale."""
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    legacy = f"reconcile_deferred_clusters_legacy_{suffix}"
+    for idx in (
+        "idx_reconcile_deferred_unique",
+        "idx_reconcile_deferred_status",
+        "idx_reconcile_deferred_priority_age",
+        "idx_reconcile_deferred_project_status",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {_quote_ident(idx)}")
+    conn.execute(
+        "ALTER TABLE reconcile_deferred_clusters RENAME TO "
+        f"{_quote_ident(legacy)}"
+    )
+    conn.executescript(QUEUE_SCHEMA_SQL)
+    old_cols = set(_table_columns(conn, legacy))
+    new_cols = _table_columns(conn, "reconcile_deferred_clusters")
+    common = [col for col in new_cols if col in old_cols]
+    insert_cols = []
+    select_exprs = []
+    allowed = ",".join(f"'{s}'" for s in sorted(QUEUE_STATUSES))
+    for col in common:
+        insert_cols.append(_quote_ident(col))
+        if col == "status":
+            select_exprs.append(
+                f"CASE WHEN status IN ({allowed}) THEN status ELSE 'failed_retryable' END"
+            )
+        elif col == "candidate_node_refs_json":
+            select_exprs.append("COALESCE(candidate_node_refs_json, '{}')")
+        else:
+            select_exprs.append(_quote_ident(col))
+    if insert_cols:
+        conn.execute(
+            "INSERT OR IGNORE INTO reconcile_deferred_clusters ("
+            + ", ".join(insert_cols)
+            + ") SELECT "
+            + ", ".join(select_exprs)
+            + f" FROM {_quote_ident(legacy)}"
+        )
+    conn.execute(f"DROP TABLE {_quote_ident(legacy)}")
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the queue table + 4 indexes (idempotent)."""
+    """Create or migrate the queue table + 4 indexes (idempotent)."""
     if conn.row_factory is None:
         conn.row_factory = sqlite3.Row
+    if _queue_schema_needs_migration(conn):
+        _migrate_queue_schema(conn)
     conn.executescript(QUEUE_SCHEMA_SQL)
     conn.commit()
 
@@ -241,6 +348,69 @@ def _maybe_finalize_session(conn: sqlite3.Connection, project_id: str) -> None:
         )
 
 
+def _sync_backlog_runtime_for_cluster(
+    conn: sqlite3.Connection,
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    stage: str,
+    runtime_state: str,
+    reason: str = "",
+    takeover: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort mirror from cluster queue to its linked backlog row."""
+    try:
+        row = conn.execute(
+            "SELECT bug_id, root_task_id FROM reconcile_deferred_clusters "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (project_id, cluster_fingerprint),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if not row:
+        return
+    bug_id = row["bug_id"] if isinstance(row, sqlite3.Row) else row[0]
+    root_task_id = row["root_task_id"] if isinstance(row, sqlite3.Row) else row[1]
+    if not bug_id:
+        return
+    try:
+        from . import backlog_runtime  # noqa: WPS433
+
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            str(bug_id),
+            stage,
+            project_id=project_id,
+            failure_reason=reason,
+            runtime_state=runtime_state,
+            root_task_id=str(root_task_id or ""),
+            takeover=takeover,
+        )
+    except Exception:
+        log.debug(
+            "reconcile_deferred_queue: backlog runtime sync failed for %s",
+            bug_id,
+            exc_info=True,
+        )
+
+
+def _refresh_session_after_status(
+    conn: sqlite3.Connection,
+    project_id: str,
+    cluster_fingerprint: str,
+    status: str,
+) -> None:
+    row = conn.execute(
+        "SELECT run_id FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (project_id, cluster_fingerprint),
+    ).fetchone()
+    run_id = row["run_id"] if row is not None else None
+    sync_session_counts(project_id, run_id=run_id, conn=conn)
+    if status in TERMINAL_STATUSES:
+        _maybe_finalize_session(conn, project_id)
+
+
 # ---------------------------------------------------------------------------
 # Public API (R2)
 # ---------------------------------------------------------------------------
@@ -315,7 +485,9 @@ def enqueue_or_lookup(
             "  expires_at = ?, bug_id = NULL, root_task_id = NULL, "
             "  filed_at = NULL, last_terminal_status = NULL, "
             "  terminal_reason = NULL, resolved_at = NULL, "
-            "  skipped_reason = NULL, next_retry_at = NULL "
+            "  skipped_reason = NULL, next_retry_at = NULL, "
+            "  accepted_patch_id = NULL, takeover_by = NULL, "
+            "  takeover_reason = NULL, takeover_at = NULL "
             "WHERE project_id = ? AND cluster_fingerprint = ?",
             (blob, sha, run_id, now, expires, project_id, cluster_fingerprint),
         )
@@ -325,7 +497,9 @@ def enqueue_or_lookup(
                 "UPDATE reconcile_deferred_clusters SET last_seen_at = ?, "
                 "  bug_id = NULL, root_task_id = NULL, filed_at = NULL, "
                 "  last_terminal_status = NULL, terminal_reason = NULL, "
-                "  resolved_at = NULL, skipped_reason = NULL, next_retry_at = NULL "
+                "  resolved_at = NULL, skipped_reason = NULL, next_retry_at = NULL, "
+                "  accepted_patch_id = NULL, takeover_by = NULL, "
+                "  takeover_reason = NULL, takeover_at = NULL "
                 "WHERE project_id = ? AND cluster_fingerprint = ?",
                 (now, project_id, cluster_fingerprint),
             )
@@ -453,9 +627,8 @@ def completion_summary(
     missing = sorted(expected - seen)
     active_count = sum(status_counts.get(s, 0) for s in ACTIVE_STATUSES)
     terminal_count = sum(status_counts.get(s, 0) for s in TERMINAL_STATUSES)
-    unresolved_terminal_count = (
-        status_counts.get("failed_terminal", 0)
-        + status_counts.get("expired", 0)
+    unresolved_terminal_count = sum(
+        status_counts.get(s, 0) for s in UNRESOLVED_TERMINAL_STATUSES
     )
     total = len(rows)
     blocking_count = active_count + unresolved_terminal_count + len(missing)
@@ -493,6 +666,11 @@ def sync_session_counts(
         + summary["status_counts"].get("failed_terminal", 0)
         + summary["status_counts"].get("expired", 0)
     )
+    resolved = (
+        summary["status_counts"].get("resolved", 0)
+        + summary["status_counts"].get("patch_accepted", 0)
+        + summary["status_counts"].get("superseded_bad_run", 0)
+    )
     sql = (
         "UPDATE reconcile_sessions SET "
         "cluster_count_total = ?, cluster_count_resolved = ?, cluster_count_failed = ? "
@@ -500,7 +678,7 @@ def sync_session_counts(
     )
     args: List[Any] = [
         int(summary["total"]),
-        int(summary["status_counts"].get("resolved", 0)),
+        int(resolved),
         int(failed),
         project_id,
     ]
@@ -604,7 +782,214 @@ def mark_in_chain(
         (root_task_id, bug_id, project_id, cluster_fingerprint),
     )
     c.commit()
+    if (cur.rowcount or 0) > 0:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage="chain_in_progress",
+            runtime_state="running",
+        )
     return (cur.rowcount or 0) > 0
+
+
+def mark_observer_hold(
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    reason: str = "",
+    actor: str = "observer",
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Pause a cluster before automatic filing/dispatch can continue."""
+    c = _get_conn(conn, project_id)
+    cur = c.execute(
+        "UPDATE reconcile_deferred_clusters SET status = 'observer_hold', "
+        "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+        "WHERE project_id = ? AND cluster_fingerprint = ? "
+        "  AND status NOT IN ('resolved','patch_accepted','skipped',"
+        "                     'skipped_explicit','superseded_bad_run')",
+        (actor, reason, _utc_iso(), project_id, cluster_fingerprint),
+    )
+    c.commit()
+    changed = (cur.rowcount or 0) > 0
+    if changed:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage="observer_hold",
+            runtime_state="observer_hold",
+            reason=reason,
+            takeover={"mode": "observer_hold", "actor": actor, "reason": reason},
+        )
+        _refresh_session_after_status(c, project_id, cluster_fingerprint, "observer_hold")
+    return changed
+
+
+def mark_observer_takeover(
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    reason: str = "",
+    actor: str = "observer",
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Mark a chain-owned cluster as manually owned by observer/MF."""
+    c = _get_conn(conn, project_id)
+    cur = c.execute(
+        "UPDATE reconcile_deferred_clusters SET status = 'observer_takeover', "
+        "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+        "WHERE project_id = ? AND cluster_fingerprint = ? "
+        "  AND status NOT IN ('resolved','patch_accepted','skipped',"
+        "                     'skipped_explicit','superseded_bad_run')",
+        (actor, reason, _utc_iso(), project_id, cluster_fingerprint),
+    )
+    c.commit()
+    changed = (cur.rowcount or 0) > 0
+    if changed:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage="observer_takeover",
+            runtime_state="observer_takeover",
+            reason=reason,
+            takeover={"mode": "observer_takeover", "actor": actor, "reason": reason},
+        )
+        _refresh_session_after_status(
+            c, project_id, cluster_fingerprint, "observer_takeover",
+        )
+    return changed
+
+
+def release_observer_takeover(
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    next_status: str = "queued",
+    reason: str = "",
+    actor: str = "observer",
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Return an observer-owned cluster to auto-flow or a safe terminal state."""
+    if next_status not in {
+        "queued",
+        "failed_retryable",
+        "patch_accepted",
+        "skipped_explicit",
+        "superseded_bad_run",
+    }:
+        raise ValueError(
+            "release_observer_takeover: next_status must be queued, "
+            "failed_retryable, patch_accepted, skipped_explicit, or superseded_bad_run"
+        )
+    c = _get_conn(conn, project_id)
+    now = _utc_iso()
+    terminal_reason = reason if next_status in TERMINAL_STATUSES else None
+    resolved_at = now if next_status in TERMINAL_STATUSES else None
+    cur = c.execute(
+        "UPDATE reconcile_deferred_clusters SET status = ?, "
+        "  terminal_reason = COALESCE(?, terminal_reason), "
+        "  last_terminal_status = CASE WHEN ? != '' THEN ? ELSE last_terminal_status END, "
+        "  resolved_at = COALESCE(?, resolved_at), "
+        "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+        "WHERE project_id = ? AND cluster_fingerprint = ? "
+        "  AND status IN ('observer_hold','observer_takeover')",
+        (
+            next_status,
+            terminal_reason,
+            next_status if next_status in TERMINAL_STATUSES else "",
+            next_status if next_status in TERMINAL_STATUSES else "",
+            resolved_at,
+            actor,
+            reason,
+            now,
+            project_id,
+            cluster_fingerprint,
+        ),
+    )
+    c.commit()
+    changed = (cur.rowcount or 0) > 0
+    if changed:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage=f"observer_release_{next_status}",
+            runtime_state=next_status,
+            reason=reason,
+            takeover={"mode": "observer_release", "actor": actor, "reason": reason},
+        )
+        _refresh_session_after_status(c, project_id, cluster_fingerprint, next_status)
+    return changed
+
+
+def mark_patch_accepted(
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    patch_id: str = "",
+    reason: str = "observer_patch_accepted",
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Terminal marker for observer/MF repaired clusters."""
+    c = _get_conn(conn, project_id)
+    now = _utc_iso()
+    cur = c.execute(
+        "UPDATE reconcile_deferred_clusters SET status = 'patch_accepted', "
+        "  accepted_patch_id = ?, last_terminal_status = 'patch_accepted', "
+        "  terminal_reason = ?, resolved_at = ? "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (patch_id, reason, now, project_id, cluster_fingerprint),
+    )
+    c.commit()
+    changed = (cur.rowcount or 0) > 0
+    if changed:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage="observer_patch_accepted",
+            runtime_state="patch_accepted",
+            reason=reason,
+        )
+        _refresh_session_after_status(c, project_id, cluster_fingerprint, "patch_accepted")
+    return changed
+
+
+def mark_superseded_bad_run(
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    reason: str = "superseded_bad_run",
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Quarantine a bad cluster attempt so finalize ignores that run output."""
+    c = _get_conn(conn, project_id)
+    now = _utc_iso()
+    cur = c.execute(
+        "UPDATE reconcile_deferred_clusters SET status = 'superseded_bad_run', "
+        "  last_terminal_status = 'superseded_bad_run', terminal_reason = ?, "
+        "  resolved_at = ? "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (reason, now, project_id, cluster_fingerprint),
+    )
+    c.commit()
+    changed = (cur.rowcount or 0) > 0
+    if changed:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage="superseded_bad_run",
+            runtime_state="superseded_bad_run",
+            reason=reason,
+        )
+        _refresh_session_after_status(
+            c, project_id, cluster_fingerprint, "superseded_bad_run",
+        )
+    return changed
 
 
 def mark_terminal(
@@ -617,23 +1002,18 @@ def mark_terminal(
 ) -> bool:
     """{any active} -> terminal transition.
 
-    terminal_status must be one of: resolved, failed_terminal, skipped, expired,
-    or failed_retryable (for partial-failure path; not strictly terminal but
-    bookkeeping-wise treated as a non-active rest state).
+    terminal_status must be one of the durable queue statuses used as terminal
+    or retry handoff states.
     """
-    if terminal_status not in (
-        "resolved",
-        "failed_retryable",
-        "failed_terminal",
-        "skipped",
-        "expired",
-    ):
+    if terminal_status not in TERMINAL_STATUSES | {"failed_retryable"}:
         raise ValueError(
             f"reconcile_deferred_queue.mark_terminal: invalid status {terminal_status!r}"
         )
     c = _get_conn(conn, project_id)
     now = _utc_iso()
-    skipped_reason = reason if terminal_status == "skipped" else None
+    skipped_reason = (
+        reason if terminal_status in {"skipped", "skipped_explicit"} else None
+    )
     cur = c.execute(
         "UPDATE reconcile_deferred_clusters SET status = ?, "
         "  last_terminal_status = ?, terminal_reason = ?, "
@@ -645,16 +1025,15 @@ def mark_terminal(
     c.commit()
     changed = (cur.rowcount or 0) > 0
     if changed:
-        row = c.execute(
-            "SELECT run_id FROM reconcile_deferred_clusters "
-            "WHERE project_id = ? AND cluster_fingerprint = ?",
-            (project_id, cluster_fingerprint),
-        ).fetchone()
-        run_id = row["run_id"] if row is not None else None
-        sync_session_counts(project_id, run_id=run_id, conn=c)
-    if changed and terminal_status in TERMINAL_STATUSES:
-        # R5 — finalize session when no in-flight rows remain.
-        _maybe_finalize_session(c, project_id)
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage=f"queue_{terminal_status}",
+            runtime_state=terminal_status,
+            reason=reason,
+        )
+        _refresh_session_after_status(c, project_id, cluster_fingerprint, terminal_status)
     return changed
 
 

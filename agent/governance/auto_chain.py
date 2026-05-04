@@ -9,6 +9,7 @@ Each transition runs a gate check before advancing.
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -6077,8 +6078,9 @@ def validate_cluster_graph_delta_structure(creates, existing_node_ids):
         return False, "graph_delta.creates is not a list"
     cluster_ids = set()
     for c in creates:
-        if isinstance(c, dict) and isinstance(c.get("node_id"), str):
-            cluster_ids.add(c["node_id"])
+        explicit_id = _cluster_explicit_node_id(c) if isinstance(c, dict) else ""
+        if explicit_id:
+            cluster_ids.add(explicit_id)
     resolvable = set(existing_node_ids or []) | cluster_ids
     for idx, item in enumerate(creates):
         if not isinstance(item, dict):
@@ -6235,10 +6237,20 @@ def _cluster_load_graph_nodes(graph_path):
     if not isinstance(data, dict):
         return {}
     out = {}
-    if "deps_graph" in data and isinstance(data["deps_graph"], dict):
-        for n in data["deps_graph"].get("nodes", []) or []:
+    for graph_key in ("deps_graph", "hierarchy_graph"):
+        if graph_key in data and isinstance(data[graph_key], dict):
+            for n in data[graph_key].get("nodes", []) or []:
+                if isinstance(n, dict) and isinstance(n.get("id"), str):
+                    d = dict(n)
+                    d.setdefault("node_id", n["id"])
+                    out[n["id"]] = d
+            return out
+    if isinstance(data.get("nodes"), list):
+        for n in data.get("nodes", []) or []:
             if isinstance(n, dict) and isinstance(n.get("id"), str):
-                out[n["id"]] = dict(n)
+                d = dict(n)
+                d.setdefault("node_id", n["id"])
+                out[n["id"]] = d
         return out
     for k, v in data.items():
         if isinstance(v, dict):
@@ -6268,6 +6280,99 @@ def _cluster_load_overlay_nodes(overlay_path):
         return {}
     nodes = data.get("nodes") or {}
     return {k: dict(v) for k, v in nodes.items() if isinstance(v, dict)}
+
+
+def _cluster_explicit_node_id(item):
+    """Return a concrete candidate/node id declared by PM/Dev, if any."""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("node_id", "candidate_node_id", "id"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for key in ("node_id", "candidate_node_id", "id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _cluster_file_sha256(path):
+    try:
+        p = Path(path)
+        if p.exists():
+            return hashlib.sha256(p.read_bytes()).hexdigest()
+    except Exception:
+        return ""
+    return ""
+
+
+def _cluster_candidate_graph_path(metadata, graph_path):
+    """Resolve the active candidate graph path, if this session has one."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for key in (
+        "candidate_graph_path",
+        "graph_candidate_path",
+        "rebase_candidate_graph_path",
+    ):
+        value = metadata.get(key)
+        if value:
+            return Path(value)
+    try:
+        sibling = Path(graph_path).with_name("graph.rebase.candidate.json")
+        if sibling.exists():
+            return sibling
+    except Exception:
+        return None
+    return None
+
+
+def _cluster_primary_compatible(proposed, existing):
+    proposed_primary = _cluster_normalize_primary(proposed.get("primary"))
+    existing_primary = _cluster_normalize_primary(existing.get("primary"))
+    if proposed_primary and existing_primary and proposed_primary != existing_primary:
+        return False
+    proposed_layer = _cluster_normalize_layer(proposed.get("parent_layer"))
+    existing_layer = _cluster_normalize_layer(
+        existing.get("parent_layer") or existing.get("layer")
+    )
+    if proposed_layer and existing_layer and proposed_layer != existing_layer:
+        return False
+    return True
+
+
+def _validate_candidate_namespace(dev_creates, candidate_nodes, overlay_nodes):
+    """Candidate graph is the rebase namespace; Dev must reference it directly."""
+    if not candidate_nodes:
+        return True, "ok"
+    for idx, proposed in enumerate(dev_creates or []):
+        if not isinstance(proposed, dict):
+            continue
+        explicit_id = _cluster_explicit_node_id(proposed)
+        if not explicit_id:
+            return False, (
+                "candidate graph is active; creates[%d] must declare node_id "
+                "or candidate_node_id from graph.rebase.candidate.json"
+            ) % idx
+        candidate = candidate_nodes.get(explicit_id)
+        if candidate is None:
+            return False, (
+                f"candidate graph is active; creates[{idx}] references "
+                f"{explicit_id!r}, which is not present in graph.rebase.candidate.json"
+            )
+        if not _cluster_primary_compatible(proposed, candidate):
+            return False, (
+                f"candidate graph namespace conflict for {explicit_id}: "
+                "create primary/layer does not match candidate graph node"
+            )
+        existing_overlay = overlay_nodes.get(explicit_id)
+        if existing_overlay and not _cluster_primary_compatible(proposed, existing_overlay):
+            return False, (
+                f"overlay namespace conflict for {explicit_id}: existing overlay "
+                "node has a different primary/layer"
+            )
+    return True, "ok"
 
 
 def _allocate_cluster_next_id(graph_nodes, overlay_nodes, layer_prefix="L7"):
@@ -6462,8 +6567,16 @@ def apply_reconcile_cluster_to_overlay(
     # --- Load graph + overlay state for structural + allocator + match ------
     graph_nodes = _cluster_load_graph_nodes(graph_path)
     overlay_nodes = _cluster_load_overlay_nodes(overlay_path)
+    candidate_graph_path = _cluster_candidate_graph_path(metadata, graph_path)
+    candidate_nodes = (
+        _cluster_load_graph_nodes(candidate_graph_path) if candidate_graph_path else {}
+    )
+    candidate_sha256 = (
+        _cluster_file_sha256(candidate_graph_path) if candidate_graph_path else ""
+    )
 
-    existing_ids = set(graph_nodes.keys()) | set(overlay_nodes.keys())
+    namespace_nodes = candidate_nodes if candidate_nodes else graph_nodes
+    existing_ids = set(namespace_nodes.keys()) | set(overlay_nodes.keys())
 
     # --- Structural gatekeeper validation -----------------------------------
     struct_passed, struct_reason = validate_cluster_graph_delta_structure(
@@ -6476,6 +6589,21 @@ def apply_reconcile_cluster_to_overlay(
             "stage": "structural",
             "reason": struct_reason,
             "cluster_fingerprint": cluster_fp,
+        }
+
+    # --- Candidate graph namespace validation -------------------------------
+    namespace_passed, namespace_reason = _validate_candidate_namespace(
+        dev_creates, candidate_nodes, overlay_nodes,
+    )
+    if not namespace_passed:
+        return {
+            "applied": False,
+            "fatal": True,
+            "stage": "candidate_namespace",
+            "reason": namespace_reason,
+            "cluster_fingerprint": cluster_fp,
+            "candidate_graph_path": str(candidate_graph_path or ""),
+            "candidate_graph_sha256": candidate_sha256,
         }
 
     # --- Allocate ids + classify state-preservation match per create --------
@@ -6496,17 +6624,21 @@ def apply_reconcile_cluster_to_overlay(
         if not isinstance(proposed, dict):
             continue
         layer_prefix = _cluster_normalize_layer(proposed.get("parent_layer")) or "L7"
-        new_id = proposed.get("node_id") or _allocate_cluster_next_id(
-            graph_nodes, overlay_payload_nodes, layer_prefix=layer_prefix,
-        )
-        # Avoid in-cluster collision when id auto-allocated and another create
-        # already used that id this round.
-        while new_id in overlay_payload_nodes or new_id in graph_nodes:
-            # bump number
-            m = re.match(r"^(L\d+)\.(\d+)$", new_id)
-            if not m:
-                break
-            new_id = f"{m.group(1)}.{int(m.group(2)) + 1}"
+        explicit_id = _cluster_explicit_node_id(proposed)
+        if candidate_nodes:
+            new_id = explicit_id
+        else:
+            new_id = explicit_id or _allocate_cluster_next_id(
+                graph_nodes, overlay_payload_nodes, layer_prefix=layer_prefix,
+            )
+            # Avoid in-cluster collision when id auto-allocated and another
+            # create already used that id this round.
+            while new_id in overlay_payload_nodes or new_id in graph_nodes:
+                # bump number
+                m = re.match(r"^(L\d+)\.(\d+)$", new_id)
+                if not m:
+                    break
+                new_id = f"{m.group(1)}.{int(m.group(2)) + 1}"
 
         match_node_id, tier = classify_state_match_for_proposed(
             proposed, candidate_pool,
@@ -6528,6 +6660,7 @@ def apply_reconcile_cluster_to_overlay(
         # Build the overlay node entry with provenance metadata.
         overlay_entry = {
             "node_id": new_id,
+            "candidate_node_id": new_id if candidate_nodes else explicit_id,
             "parent_layer": _cluster_normalize_layer(proposed.get("parent_layer")),
             "primary": list(proposed.get("primary") or []),
             "secondary": list(proposed.get("secondary") or []),
@@ -6538,6 +6671,7 @@ def apply_reconcile_cluster_to_overlay(
             "metadata": {
                 **(proposed.get("metadata") or {}),
                 "rebased_from": rebased_from,
+                "candidate_graph_sha256": candidate_sha256,
             },
         }
 
@@ -6571,6 +6705,8 @@ def apply_reconcile_cluster_to_overlay(
         "session_id": (metadata.get("session_id") if isinstance(metadata, dict) else None) or "",
         "project_id": project_id or "",
         "cluster_fingerprint": cluster_fp,
+        "candidate_graph_path": str(candidate_graph_path or ""),
+        "candidate_graph_sha256": candidate_sha256,
         "nodes": overlay_payload_nodes,
     }
     # Compose the JSON payload up-front so any pre-write rollback path keeps
@@ -6612,6 +6748,10 @@ def apply_reconcile_cluster_to_overlay(
         "allocated_node_ids": allocated_node_ids,
         "state_transfers": state_transfers,
         "overlay_path": str(overlay_path),
+        "applies_to": "candidate_overlay",
+        "graph_json_updated": False,
+        "candidate_graph_path": str(candidate_graph_path or ""),
+        "candidate_graph_sha256": candidate_sha256,
     }
     chain_event_emitted = _cluster_emit_chain_event(
         conn,
@@ -6635,6 +6775,10 @@ def apply_reconcile_cluster_to_overlay(
         "allocated_node_ids": allocated_node_ids,
         "state_transfers": state_transfers,
         "overlay_path": str(overlay_path),
+        "applies_to": "candidate_overlay",
+        "graph_json_updated": False,
+        "candidate_graph_path": str(candidate_graph_path or ""),
+        "candidate_graph_sha256": candidate_sha256,
         "session_pending_inserts": list(session_pending),
         "chain_event_emitted": chain_event_emitted,
     }
