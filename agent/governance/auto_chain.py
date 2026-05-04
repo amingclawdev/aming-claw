@@ -82,7 +82,7 @@ _QA_EVIDENCE_PATH_RE = re.compile(
     r")"
 )
 _QA_EVIDENCE_PATH_TRAIL = ".,;:)]}'\""
-_QA_EVIDENCE_GLOB_CHARS = set("*?[]")
+_QA_EVIDENCE_GLOB_CHARS = set("*?[]{}")
 
 
 def _extract_prd_declarations(prd):

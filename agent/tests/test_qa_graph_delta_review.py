@@ -233,6 +233,26 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_allows_brace_shorthand_evidence_path_group(self):
+        """Brace shorthand is a path group, not a single missing file."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "Checked agent/governance/language_adapters/{base,filetree_adapter,python_adapter}.py.",
+            "criteria_results": [
+                {
+                    "criterion": "adapter files exist",
+                    "passed": True,
+                    "evidence": "All adapter files under agent/governance/language_adapters/{base,filetree_adapter,python_adapter}.py exist.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
     def test_blocks_worktree_only_evidence_path_when_not_changed(self):
         """Ignored/unmerged worktree files are not durable QA evidence."""
         with tempfile.TemporaryDirectory() as tmp:
