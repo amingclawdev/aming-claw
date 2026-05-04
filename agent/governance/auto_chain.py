@@ -6728,6 +6728,13 @@ def _cluster_load_overlay_nodes(overlay_path):
     which has only {"session_id", "project_id"} and no "nodes" key.
     Missing file / malformed JSON → {}.
     """
+    data = _cluster_load_overlay_doc(overlay_path)
+    nodes = data.get("nodes") or {}
+    return {k: dict(v) for k, v in nodes.items() if isinstance(v, dict)}
+
+
+def _cluster_load_overlay_doc(overlay_path):
+    """Load the full overlay document, preserving session-level audit metadata."""
     p = Path(overlay_path)
     if not p.exists():
         return {}
@@ -6738,8 +6745,7 @@ def _cluster_load_overlay_nodes(overlay_path):
         return {}
     if not isinstance(data, dict):
         return {}
-    nodes = data.get("nodes") or {}
-    return {k: dict(v) for k, v in nodes.items() if isinstance(v, dict)}
+    return dict(data)
 
 
 def _cluster_explicit_node_id(item):
@@ -7164,14 +7170,15 @@ def apply_reconcile_cluster_to_overlay(
         # for sibling proposals within the same cluster batch.
 
     # --- R5: write overlay (NOT graph.json) ---------------------------------
-    overlay_doc = {
+    overlay_doc = _cluster_load_overlay_doc(overlay_path)
+    overlay_doc.update({
         "session_id": (metadata.get("session_id") if isinstance(metadata, dict) else None) or "",
         "project_id": project_id or "",
         "cluster_fingerprint": cluster_fp,
         "candidate_graph_path": str(candidate_graph_path or ""),
         "candidate_graph_sha256": candidate_sha256,
         "nodes": overlay_payload_nodes,
-    }
+    })
     # Compose the JSON payload up-front so any pre-write rollback path keeps
     # graph.json byte-identical.
     overlay_serialised = json.dumps(

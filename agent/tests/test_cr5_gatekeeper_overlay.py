@@ -487,6 +487,45 @@ def test_allocator_respects_overlay_for_next_id(graph_path: Path, overlay_path: 
     assert int(nid.split(".")[1]) > 5
 
 
+def test_overlay_apply_preserves_session_baseline_metadata(
+    graph_path: Path, overlay_path: Path,
+):
+    """Cluster overlay writes must retain session-start audit metadata."""
+    overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
+    overlay_doc.update({
+        "base_commit_sha": "base-abc123",
+        "snapshot_head_sha": "base-abc123",
+        "started_at": "2026-05-04T00:00:00Z",
+        "run_id": "phase-z-v2-test",
+    })
+    overlay_path.write_text(json.dumps(overlay_doc, indent=2, sort_keys=True), encoding="utf-8")
+
+    pm_prd = {"proposed_nodes": [
+        {"primary": ["agent/governance/audit_meta.py"], "parent_layer": "L7"},
+    ]}
+    dev_result = {"graph_delta": {"creates": pm_prd["proposed_nodes"]}}
+
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-merge-meta",
+        pm_prd=pm_prd,
+        dev_result=dev_result,
+        metadata=_meta(cluster_fingerprint="cluster-meta"),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is True, res
+    after = json.loads(overlay_path.read_text(encoding="utf-8"))
+    assert after["base_commit_sha"] == "base-abc123"
+    assert after["snapshot_head_sha"] == "base-abc123"
+    assert after["started_at"] == "2026-05-04T00:00:00Z"
+    assert after["run_id"] == "phase-z-v2-test"
+    assert after["cluster_fingerprint"] == "cluster-meta"
+    assert after["nodes"]
+
+
 # ---------------------------------------------------------------------------
 # Candidate graph namespace guard
 # ---------------------------------------------------------------------------
