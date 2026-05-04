@@ -83,6 +83,7 @@ _QA_EVIDENCE_PATH_RE = re.compile(
 )
 _QA_EVIDENCE_PATH_TRAIL = ".,;:)]}'\""
 _QA_EVIDENCE_GLOB_CHARS = set("*?[]{}")
+_QA_EVIDENCE_LINE_SUFFIX_RE = re.compile(r":\d+(?::\d+)?$")
 
 
 def _extract_prd_declarations(prd):
@@ -125,6 +126,7 @@ def _extract_qa_evidence_paths(result):
     for text in _iter_qa_evidence_strings(result):
         for match in _QA_EVIDENCE_PATH_RE.finditer(text):
             raw = match.group(1).rstrip(_QA_EVIDENCE_PATH_TRAIL)
+            raw = _QA_EVIDENCE_LINE_SUFFIX_RE.sub("", raw)
             if any(ch in raw for ch in _QA_EVIDENCE_GLOB_CHARS):
                 continue
             key = raw.replace("\\", "/")

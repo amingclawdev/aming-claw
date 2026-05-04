@@ -253,6 +253,26 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_allows_existing_evidence_path_with_line_suffix(self):
+        """Existing file citations may include line or line/column suffixes."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "Checked agent/governance/auto_chain.py:82 and agent/governance/server.py:3134:9.",
+            "criteria_results": [
+                {
+                    "criterion": "line evidence",
+                    "passed": True,
+                    "evidence": "Definitions referenced at agent/governance/auto_chain.py:82 and agent/governance/server.py:3134:9.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
     def test_blocks_worktree_only_evidence_path_when_not_changed(self):
         """Ignored/unmerged worktree files are not durable QA evidence."""
         with tempfile.TemporaryDirectory() as tmp:
