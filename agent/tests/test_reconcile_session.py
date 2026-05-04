@@ -248,7 +248,7 @@ def test_finalize_full_rebase_uses_candidate_hierarchy(conn, gov_dir):
     candidate = gov_dir / "graph.rebase.candidate.json"
     candidate.write_text(json.dumps({
         "version": 1,
-        "deps_graph": {
+        "hierarchy_graph": {
             "directed": True,
             "multigraph": False,
             "graph": {},
@@ -263,6 +263,35 @@ def test_finalize_full_rebase_uses_candidate_hierarchy(conn, gov_dir):
                 {"source": "L3.1", "target": "L7.1", "relation": "contains"},
             ],
         },
+        "evidence_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [
+                {"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []},
+                {"id": "L3.1", "title": "Subsystem", "layer": "L3", "primary": []},
+                {"id": "L7.1", "title": "Candidate Leaf", "layer": "L7",
+                 "primary": ["new_module.py"]},
+            ],
+            "links": [
+                {"source": "L7.1", "target": "L3.1", "relation": "writes_state"},
+            ],
+        },
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [
+                {"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []},
+                {"id": "L3.1", "title": "Subsystem", "layer": "L3", "primary": []},
+                {"id": "L7.1", "title": "Candidate Leaf", "layer": "L7",
+                 "primary": ["new_module.py"]},
+            ],
+            "links": [
+                {"source": "L1.1", "target": "L3.1", "relation": "depends_on"},
+                {"source": "L3.1", "target": "L7.1", "relation": "depends_on"},
+            ],
+        },
     }), encoding="utf-8")
 
     result = rs.finalize_session(
@@ -274,9 +303,11 @@ def test_finalize_full_rebase_uses_candidate_hierarchy(conn, gov_dir):
     nodes = {n["id"]: n for n in graph["deps_graph"]["nodes"]}
     links = graph["deps_graph"]["edges"]
     assert set(nodes) == {"L1.1", "L3.1", "L7.99"}
-    assert {"source": "L3.1", "target": "L7.99", "relation": "contains"} in links
+    assert {"source": "L3.1", "target": "L7.99", "relation": "depends_on"} in links
     assert nodes["L7.99"]["metadata"]["candidate_node_ids"] == ["L7.1"]
     assert nodes["L7.99"]["_deps"] == ["L3.1"]
+    assert {"source": "L3.1", "target": "L7.99", "relation": "contains"} in graph["hierarchy_graph"]["links"]
+    assert {"source": "L7.99", "target": "L3.1", "relation": "writes_state"} in graph["evidence_graph"]["links"]
     assert result.materialization_counts["final_edge_count"] == 2
 
 

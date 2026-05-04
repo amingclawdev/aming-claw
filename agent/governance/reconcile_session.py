@@ -286,16 +286,22 @@ def _validate_materialized_graph(graph_doc: dict, *, graph_path: Path,
     }
 
 
-def _node_link_document(nodes: dict[str, dict], links: list[dict]) -> dict:
+def _node_link_section(nodes: dict[str, dict], links: list[dict], *,
+                       edge_key: str = "edges") -> dict:
     return {
+        "directed": True,
+        "multigraph": False,
+        "graph": {},
+        "nodes": list(nodes.values()),
+        edge_key: links,
+    }
+
+
+def _node_link_document(nodes: dict[str, dict], links: list[dict], *,
+                        extra_graphs: Optional[dict[str, dict]] = None) -> dict:
+    data = {
         "version": 1,
-        "deps_graph": {
-            "directed": True,
-            "multigraph": False,
-            "graph": {},
-            "nodes": list(nodes.values()),
-            "edges": links,
-        },
+        "deps_graph": _node_link_section(nodes, links, edge_key="edges"),
         "gates_graph": {
             "directed": True,
             "multigraph": False,
@@ -304,6 +310,9 @@ def _node_link_document(nodes: dict[str, dict], links: list[dict]) -> dict:
             "edges": [],
         },
     }
+    if extra_graphs:
+        data.update(extra_graphs)
+    return data
 
 
 def _edge_endpoints(edge: dict) -> tuple[str, str]:
@@ -320,6 +329,28 @@ def _canonical_edge(src: str, dst: str, edge: Optional[dict] = None) -> dict:
     edge["source"] = src
     edge["target"] = dst
     return edge
+
+
+def _remap_candidate_graph_section(section: Any,
+        candidate_to_final: dict[str, str],
+        final_nodes: dict[str, dict]) -> tuple[dict, int]:
+    if not isinstance(section, dict):
+        return {}, 0
+    links: list[dict] = []
+    seen_links: set[tuple[str, str, str]] = set()
+    for edge in _node_link_links(section):
+        src, dst = _edge_endpoints(edge)
+        remapped_src = candidate_to_final.get(src)
+        remapped_dst = candidate_to_final.get(dst)
+        if not remapped_src or not remapped_dst or remapped_src == remapped_dst:
+            continue
+        relation = str(edge.get("relation") or edge.get("type") or "")
+        key = (remapped_src, remapped_dst, relation)
+        if key in seen_links:
+            continue
+        links.append(_canonical_edge(remapped_src, remapped_dst, edge))
+        seen_links.add(key)
+    return _node_link_section(final_nodes, links, edge_key="links"), len(links)
 
 
 def _build_overlay_primary_map(overlay_nodes: dict[str, dict]) -> dict[str, str]:
@@ -342,7 +373,7 @@ def _build_overlay_primary_map(overlay_nodes: dict[str, dict]) -> dict[str, str]
 
 def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
         overlay_nodes: dict[str, dict], session_id: str,
-        finalized_at: str) -> tuple[dict[str, dict], list[dict], dict]:
+        finalized_at: str) -> tuple[dict[str, dict], list[dict], dict, dict[str, dict]]:
     """Use candidate deps_graph as skeleton and overlay as approved leaves."""
     candidate_doc = _load_json_object(candidate_graph_path)
     candidate_graph = candidate_doc.get("deps_graph")
@@ -457,6 +488,16 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
         final_nodes[nid]["_deps"] = deps
         final_nodes[nid]["deps"] = deps
 
+    extra_graphs: dict[str, dict] = {}
+    hierarchy_graph, hierarchy_link_count = _remap_candidate_graph_section(
+        candidate_doc.get("hierarchy_graph"), candidate_to_final, final_nodes)
+    if hierarchy_graph:
+        extra_graphs["hierarchy_graph"] = hierarchy_graph
+    evidence_graph, evidence_link_count = _remap_candidate_graph_section(
+        candidate_doc.get("evidence_graph"), candidate_to_final, final_nodes)
+    if evidence_graph:
+        extra_graphs["evidence_graph"] = evidence_graph
+
     return final_nodes, links, {
         "candidate_graph_path": str(candidate_graph_path),
         "candidate_node_count": len(candidate_nodes),
@@ -465,7 +506,9 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
             n for n in final_nodes.values() if not _primary_paths(n)
         ]),
         "candidate_leaf_nodes_remapped": len(overlay_to_candidates),
-    }
+        "hierarchy_link_count": hierarchy_link_count,
+        "evidence_link_count": evidence_link_count,
+    }, extra_graphs
 
 
 def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
@@ -512,8 +555,9 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
         raise ValueError("full_rebase finalize refuses an empty overlay")
 
     candidate_meta: dict = {}
+    extra_graphs: dict[str, dict] = {}
     if full_rebase and candidate_graph_path and Path(candidate_graph_path).exists():
-        final_nodes, links, candidate_meta = _compose_candidate_aware_graph(
+        final_nodes, links, candidate_meta, extra_graphs = _compose_candidate_aware_graph(
             candidate_graph_path=Path(candidate_graph_path),
             overlay_nodes=overlay_nodes,
             session_id=session_id,
@@ -585,7 +629,7 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
                         links.append({"source": dep_id, "target": overlay_id, "relation": "depends_on"})
                         seen_links.add(key)
 
-    final_doc = _node_link_document(final_nodes, links)
+    final_doc = _node_link_document(final_nodes, links, extra_graphs=extra_graphs)
     validation_summary = _validate_materialized_graph(
         final_doc, graph_path=graph_path, workspace_dir=workspace_dir)
 
