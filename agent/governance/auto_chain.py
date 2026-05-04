@@ -75,7 +75,7 @@ RECONCILIATION_BYPASS_POLICY = {
 _PRD_GRAPH_DECLARATION_FIELDS = ("removed_nodes", "unmapped_files", "renamed_nodes", "remapped_files")
 
 _QA_EVIDENCE_PATH_RE = re.compile(
-    r"(?<![\w:.-])("
+    r"(?<![\w:./\\-])("
     r"[A-Za-z]:[\\/][^\s,\"')\]}]+"
     r"|(?:agent|docs|scripts|shared-volume|tests)[\\/][^\s,\"')\]}]+"
     r"|(?:start_governance\.py|pyproject\.toml|README\.md|requirements(?:-[\w-]+)?\.txt)"

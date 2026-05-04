@@ -273,6 +273,26 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_ignores_category_phrase_containing_docs_test(self):
+        """Do not extract docs/test from prose like source/docs/test mutations."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "No source/docs/test mutations were needed for this overlay-only audit.",
+            "criteria_results": [
+                {
+                    "criterion": "overlay-only",
+                    "passed": True,
+                    "evidence": "No source/docs/test changes; graph delta is event-only.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
     def test_blocks_worktree_only_evidence_path_when_not_changed(self):
         """Ignored/unmerged worktree files are not durable QA evidence."""
         with tempfile.TemporaryDirectory() as tmp:
