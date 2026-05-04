@@ -32,7 +32,32 @@ def gov_dir(tmp_path: Path) -> Path:
     d = tmp_path / "governance"
     d.mkdir(parents=True, exist_ok=True)
     # Provide a graph.json so capture/restore can copy it.
-    (d / "graph.json").write_text('{"nodes": [{"id": "n1"}]}')
+    graph = {
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [{
+                "id": "L1.1",
+                "title": "Existing Root",
+                "layer": "L1",
+                "primary": [],
+                "secondary": [],
+                "test": [],
+                "_deps": [],
+            }],
+            "edges": [],
+        },
+        "gates_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [],
+            "edges": [],
+        },
+    }
+    (d / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
     return d
 
 
@@ -135,9 +160,73 @@ def test_finalize_clears_overlay_and_archives_bak(conn, gov_dir):
     sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
     overlay = gov_dir / "graph.rebase.overlay.json"
     assert overlay.exists()
-    rs.finalize_session(conn, PROJECT_ID, sess.session_id, governance_dir=gov_dir)
+    result = rs.finalize_session(conn, PROJECT_ID, sess.session_id, governance_dir=gov_dir)
     assert not overlay.exists()
     assert (gov_dir / "graph.rebase.overlay.json.bak").exists()
+    assert result.graph_path.endswith("graph.json")
+    assert result.materialized_node_count == 1
+
+
+def test_finalize_materializes_overlay_before_archiving(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    (gov_dir / "new_module.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L7.1": {
+                "node_id": "L7.1",
+                "parent_layer": "L7",
+                "title": "New Module",
+                "primary": ["new_module.py"],
+                "deps": [],
+                "verify_status": "pending",
+            }
+        },
+    }), encoding="utf-8")
+
+    result = rs.finalize_session(
+        conn, PROJECT_ID, sess.session_id,
+        governance_dir=gov_dir, workspace_dir=gov_dir,
+    )
+    graph = json.loads((gov_dir / "graph.json").read_text(encoding="utf-8"))
+    node_ids = {n["id"] for n in graph["deps_graph"]["nodes"]}
+    assert {"L1.1", "L7.1"}.issubset(node_ids)
+    assert result.materialization_counts["new_overlay_nodes"] == 1
+    assert result.materialization_counts["carried_forward_nodes"] == 1
+    assert result.graph_backup_path.endswith(f"{sess.session_id}.bak")
+    assert not overlay.exists()
+
+
+def test_finalize_failure_preserves_overlay_graph_and_session(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L7.2": {
+                "node_id": "L7.2",
+                "parent_layer": "L7",
+                "title": "Broken Module",
+                "primary": ["missing_module.py"],
+            }
+        },
+    }), encoding="utf-8")
+    graph_before = (gov_dir / "graph.json").read_bytes()
+    overlay_before = overlay.read_bytes()
+
+    with pytest.raises(ValueError, match="missing primary paths"):
+        rs.finalize_session(
+            conn, PROJECT_ID, sess.session_id,
+            governance_dir=gov_dir, workspace_dir=gov_dir,
+        )
+
+    assert overlay.exists()
+    assert overlay.read_bytes() == overlay_before
+    assert (gov_dir / "graph.json").read_bytes() == graph_before
+    assert rs.get_active_session(conn, PROJECT_ID).session_id == sess.session_id
 
 
 def test_finalize_blocks_until_reconcile_clusters_complete(conn, gov_dir):

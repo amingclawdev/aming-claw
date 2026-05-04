@@ -8,7 +8,7 @@ import io, json, shutil, sqlite3, subprocess, tarfile, uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 _GOVERNANCE_DIR = Path(__file__).resolve().parent
 _SNAPSHOT_DIRNAME = "reconcile_snapshots"
@@ -52,6 +52,10 @@ class SessionFinalizationResult:
     status: str
     finalized_at: str
     overlay_archived_to: Optional[str] = None
+    graph_path: Optional[str] = None
+    graph_backup_path: Optional[str] = None
+    materialized_node_count: int = 0
+    materialization_counts: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -85,6 +89,408 @@ def _overlay_path(base: Optional[Path] = None) -> Path:
 
 def _graph_path(base: Optional[Path] = None) -> Path:
     return _gov(base) / _GRAPH_FILENAME
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_json_object(path: Path) -> dict:
+    try:
+        with Path(path).open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to load JSON object from {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object in {path}")
+    return data
+
+
+def _node_id(node: dict) -> str:
+    return str(node.get("id") or node.get("node_id") or "").strip()
+
+
+def _normalize_rel(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip().lstrip("./")
+
+
+def _primary_paths(node: Any) -> list[str]:
+    if not isinstance(node, dict):
+        return []
+    raw = node.get("primary")
+    if raw is None:
+        raw = node.get("primary_files")
+    if isinstance(raw, str):
+        return [_normalize_rel(raw)] if raw else []
+    if isinstance(raw, (list, tuple)):
+        return [_normalize_rel(str(p)) for p in raw if str(p).strip()]
+    return []
+
+
+def _path_exists(path: str, *, workspace_dir: Optional[Path],
+                 graph_path: Path) -> bool:
+    rel = _normalize_rel(path)
+    if not rel:
+        return False
+    p = Path(rel)
+    if p.is_absolute():
+        return p.exists()
+    roots = [workspace_dir, _repo_root(), graph_path.parent]
+    return any((Path(root) / rel).exists() for root in roots if root is not None)
+
+
+def _graph_nodes_by_id(graph_doc: dict) -> dict[str, dict]:
+    deps_graph = graph_doc.get("deps_graph") if isinstance(graph_doc, dict) else {}
+    raw_nodes = deps_graph.get("nodes") if isinstance(deps_graph, dict) else []
+    out: dict[str, dict] = {}
+    if isinstance(raw_nodes, dict):
+        iterable = raw_nodes.values()
+    elif isinstance(raw_nodes, list):
+        iterable = raw_nodes
+    else:
+        iterable = []
+    for node in iterable:
+        if not isinstance(node, dict):
+            continue
+        nid = _node_id(node)
+        if nid:
+            clean = dict(node)
+            clean["id"] = nid
+            out[nid] = clean
+    return out
+
+
+def _graph_links(graph_doc: dict) -> list[dict]:
+    deps_graph = graph_doc.get("deps_graph") if isinstance(graph_doc, dict) else {}
+    if not isinstance(deps_graph, dict):
+        return []
+    raw = deps_graph.get("edges")
+    if raw is None:
+        raw = deps_graph.get("links")
+    if not isinstance(raw, list):
+        return []
+    return [dict(e) for e in raw if isinstance(e, dict)]
+
+
+def _overlay_nodes_by_id(overlay_doc: dict) -> dict[str, dict]:
+    raw_nodes = overlay_doc.get("nodes") if isinstance(overlay_doc, dict) else {}
+    out: dict[str, dict] = {}
+    if isinstance(raw_nodes, dict):
+        iterable = raw_nodes.items()
+    elif isinstance(raw_nodes, list):
+        iterable = ((None, n) for n in raw_nodes)
+    else:
+        iterable = []
+    for key, node in iterable:
+        if not isinstance(node, dict):
+            continue
+        nid = _node_id(node) or str(key or "").strip()
+        if not nid:
+            raise ValueError("overlay node missing id/node_id")
+        clean = dict(node)
+        clean["node_id"] = nid
+        out[nid] = clean
+    return out
+
+
+def _layer_verify_level(layer: str) -> int:
+    if isinstance(layer, str) and layer.startswith("L"):
+        try:
+            return max(1, int(layer[1:]) + 1)
+        except ValueError:
+            return 1
+    return 1
+
+
+def _overlay_to_graph_node(node_id: str, overlay_node: dict, *,
+                           session_id: str, finalized_at: str) -> dict:
+    layer = (
+        overlay_node.get("layer")
+        or overlay_node.get("parent_layer")
+        or (node_id.split(".", 1)[0] if "." in node_id else "L7")
+    )
+    primary = _primary_paths(overlay_node)
+    secondary = overlay_node.get("secondary") or []
+    test = overlay_node.get("test") or []
+    if isinstance(secondary, str):
+        secondary = [secondary]
+    if isinstance(test, str):
+        test = [test]
+    metadata = dict(overlay_node.get("metadata") or {})
+    metadata.update({
+        "materialized_from_overlay": True,
+        "reconcile_session_id": session_id,
+        "materialized_at": finalized_at,
+    })
+    deps = list(overlay_node.get("deps") or [])
+    return {
+        "id": node_id,
+        "title": overlay_node.get("title") or node_id,
+        "layer": str(layer),
+        "verify_level": overlay_node.get("verify_level") or _layer_verify_level(str(layer)),
+        "gate_mode": overlay_node.get("gate_mode") or "auto",
+        "test_coverage": overlay_node.get("test_coverage") or "none",
+        "primary": primary,
+        "secondary": list(secondary),
+        "test": list(test),
+        "artifacts": list(overlay_node.get("artifacts") or []),
+        "_deps": deps,
+        "deps": deps,
+        "metadata": metadata,
+        "verify_status": overlay_node.get("verify_status") or "pending",
+    }
+
+
+def _duplicate_primary_report(nodes: dict[str, dict]) -> list[dict]:
+    seen_primary: dict[str, str] = {}
+    duplicate_primary: list[dict] = []
+    for nid, node in nodes.items():
+        for primary in _primary_paths(node):
+            prior = seen_primary.get(primary)
+            if prior and prior != nid:
+                duplicate_primary.append({
+                    "primary": primary,
+                    "first_node_id": prior,
+                    "second_node_id": nid,
+                })
+            else:
+                seen_primary[primary] = nid
+    return duplicate_primary
+
+
+def _validate_materialized_graph(graph_doc: dict, *, graph_path: Path,
+                                 workspace_dir: Optional[Path]) -> dict:
+    nodes = _graph_nodes_by_id(graph_doc)
+    if not nodes:
+        raise ValueError("materialized graph has no nodes")
+    missing: list[dict] = []
+    for nid, node in nodes.items():
+        for primary in _primary_paths(node):
+            if not _path_exists(primary, workspace_dir=workspace_dir,
+                                graph_path=graph_path):
+                missing.append({"node_id": nid, "primary": primary})
+    if missing:
+        raise ValueError(f"materialized graph references missing primary paths: {missing[:10]}")
+    duplicates = _duplicate_primary_report(nodes)
+    return {
+        "duplicate_primary_count": len(duplicates),
+        "duplicate_primary_examples": duplicates[:10],
+    }
+
+
+def _node_link_document(nodes: dict[str, dict], links: list[dict]) -> dict:
+    return {
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": list(nodes.values()),
+            "edges": links,
+        },
+        "gates_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [],
+            "edges": [],
+        },
+    }
+
+
+def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
+        session_id: str, *, overlay_path: Path, graph_path: Path,
+        workspace_dir: Optional[Path] = None, full_rebase: bool = False,
+        finalized_at: Optional[str] = None) -> dict:
+    """Compose overlay + carry-forward nodes and atomically write graph.json.
+
+    The overlay remains untouched.  Callers archive/delete it only after this
+    function succeeds and the session row has been finalized.
+    """
+    finalized_at = finalized_at or _utcnow_iso()
+    overlay_path = Path(overlay_path)
+    graph_path = Path(graph_path)
+    if not overlay_path.exists():
+        raise ValueError(f"reconcile overlay not found: {overlay_path}")
+    if not graph_path.exists():
+        raise ValueError(f"graph.json not found: {graph_path}")
+
+    old_graph = _load_json_object(graph_path)
+    overlay_doc = _load_json_object(overlay_path)
+    old_nodes = _graph_nodes_by_id(old_graph)
+    overlay_nodes = _overlay_nodes_by_id(overlay_doc)
+    existing_state: dict[str, dict] = {}
+    try:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        for row in conn.execute(
+            "SELECT node_id, verify_status, build_status FROM node_state "
+            "WHERE project_id=?",
+            (project_id,),
+        ).fetchall():
+            existing_state[str(row["node_id"])] = {
+                "verify_status": row["verify_status"],
+                "build_status": row["build_status"],
+            }
+    except sqlite3.Error:
+        existing_state = {}
+
+    overlay_primary = {
+        p for node in overlay_nodes.values() for p in _primary_paths(node)
+    }
+    overlay_duplicates = _duplicate_primary_report(overlay_nodes)
+    if overlay_duplicates:
+        raise ValueError(f"overlay has duplicate primary coverage: {overlay_duplicates[:10]}")
+    if not overlay_primary and full_rebase:
+        raise ValueError("full_rebase finalize refuses an empty overlay")
+
+    final_nodes: dict[str, dict] = {}
+    replaced_old: list[str] = []
+    archived_old: list[str] = []
+    carried_forward: list[str] = []
+
+    for old_id, old_node in old_nodes.items():
+        primaries = _primary_paths(old_node)
+        covered = bool(set(primaries) & overlay_primary)
+        exists_on_disk = (
+            not primaries
+            or all(_path_exists(p, workspace_dir=workspace_dir, graph_path=graph_path)
+                   for p in primaries)
+        )
+        if covered:
+            replaced_old.append(old_id)
+            continue
+        if full_rebase or not exists_on_disk:
+            archived_old.append(old_id)
+            continue
+        clean = dict(old_node)
+        metadata = dict(clean.get("metadata") or {})
+        metadata["carry_forward_unverified"] = True
+        metadata["carry_forward_provenance"] = {
+            "session_id": session_id,
+            "source_node_id": old_id,
+            "original_status_at_carry": existing_state.get(old_id, {}).get("verify_status", ""),
+            "carried_at": finalized_at,
+        }
+        clean["metadata"] = metadata
+        final_nodes[old_id] = clean
+        carried_forward.append(old_id)
+
+    for overlay_id, overlay_node in overlay_nodes.items():
+        if overlay_id in final_nodes:
+            raise ValueError(f"overlay node id collides with carried-forward node: {overlay_id}")
+        final_nodes[overlay_id] = _overlay_to_graph_node(
+            overlay_id, overlay_node,
+            session_id=session_id, finalized_at=finalized_at,
+        )
+
+    links: list[dict] = []
+    final_id_set = set(final_nodes)
+    seen_links: set[tuple[str, str, str]] = set()
+    for edge in _graph_links(old_graph):
+        src = str(edge.get("source") or edge.get("from") or "").strip()
+        dst = str(edge.get("target") or edge.get("to") or "").strip()
+        if src in final_id_set and dst in final_id_set:
+            key = (src, dst, str(edge.get("relation") or edge.get("type") or ""))
+            if key not in seen_links:
+                links.append(edge)
+                seen_links.add(key)
+    for overlay_id, overlay_node in overlay_nodes.items():
+        for dep in overlay_node.get("deps") or []:
+            dep_id = str(dep).strip()
+            if dep_id and dep_id in final_id_set and dep_id != overlay_id:
+                key = (dep_id, overlay_id, "depends_on")
+                if key not in seen_links:
+                    links.append({"source": dep_id, "target": overlay_id, "relation": "depends_on"})
+                    seen_links.add(key)
+
+    final_doc = _node_link_document(final_nodes, links)
+    validation_summary = _validate_materialized_graph(
+        final_doc, graph_path=graph_path, workspace_dir=workspace_dir)
+
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = graph_path.with_name(
+        f"{graph_path.name}.symbol-archive-{session_id}.bak")
+    tmp_path = graph_path.with_name(f"{graph_path.name}.rebase-{session_id}.tmp")
+    tmp_path.write_text(
+        json.dumps(final_doc, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    shutil.copy2(str(graph_path), str(backup_path))
+    tmp_path.replace(graph_path)
+
+    node_state_rows = []
+    for nid, node in final_nodes.items():
+        source = "overlay" if nid in overlay_nodes else "carry_forward"
+        prior_state = existing_state.get(nid, {})
+        verify_status = (
+            node.get("verify_status")
+            or (prior_state.get("verify_status") if source == "carry_forward" else "")
+            or node.get("parsed_verify_status")
+            or "pending"
+        )
+        build_status = (
+            prior_state.get("build_status")
+            if source == "carry_forward" and prior_state.get("build_status")
+            else "impl:done"
+        )
+        node_state_rows.append(
+            (project_id, nid, verify_status, build_status,
+             json.dumps({
+                 "type": "reconcile_session_materialized",
+                 "session_id": session_id,
+                 "source": source,
+             }, ensure_ascii=False), "reconcile-session-finalize", finalized_at)
+        )
+    conn.executemany(
+        "INSERT OR REPLACE INTO node_state "
+        "(project_id, node_id, verify_status, build_status, evidence_json, "
+        "updated_by, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+        node_state_rows,
+    )
+    if archived_old:
+        conn.executemany(
+            "UPDATE node_state SET verify_status='archived_during_rebase', "
+            "evidence_json=?, updated_by='reconcile-session-finalize', "
+            "updated_at=?, version=version+1 "
+            "WHERE project_id=? AND node_id=?",
+            [
+                (json.dumps({
+                    "type": "reconcile_session_archived",
+                    "session_id": session_id,
+                }, ensure_ascii=False), finalized_at, project_id, nid)
+                for nid in archived_old
+            ],
+        )
+
+    event_payload = {
+        "event": "reconcile.session.materialized",
+        "project_id": project_id,
+        "session_id": session_id,
+        "graph_path": str(graph_path),
+        "graph_backup_path": str(backup_path),
+        "overlay_path": str(overlay_path),
+        "counts": {
+            "new_overlay_nodes": len(overlay_nodes),
+            "carried_forward_nodes": len(carried_forward),
+            "archived_orphan_nodes": len(archived_old),
+            "replaced_old_nodes": len(replaced_old),
+            "final_node_count": len(final_nodes),
+            "duplicate_primary_count": validation_summary["duplicate_primary_count"],
+        },
+        "duplicate_primary_examples": validation_summary["duplicate_primary_examples"],
+        "full_rebase_flag": bool(full_rebase),
+    }
+    try:
+        conn.execute(
+            "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, session_id, "reconcile.session.materialized",
+             json.dumps(event_payload, ensure_ascii=False), finalized_at),
+        )
+    except sqlite3.Error:
+        pass
+    return event_payload
 
 
 def _row_to_session(row: sqlite3.Row) -> ReconcileSession:
@@ -193,6 +599,9 @@ def _cluster_gate_summary(
 
 def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str, *,
         governance_dir: Optional[Path] = None,
+        graph_path: Optional[Path] = None,
+        workspace_dir: Optional[Path] = None,
+        full_rebase: bool = False,
         enforce_cluster_completion: bool = True) -> SessionFinalizationResult:
     if enforce_cluster_completion:
         summary = _cluster_gate_summary(conn, project_id, session_id)
@@ -201,23 +610,44 @@ def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str,
                 "reconcile clusters are not complete; finish cluster chain pass before finalize",
                 summary=summary,
             )
+    row = conn.execute(
+        "SELECT status FROM reconcile_sessions "
+        "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing')",
+        (project_id, session_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no in-flight session {session_id!r} for {project_id!r}")
     now = _utcnow_iso()
+    overlay = _overlay_path(governance_dir)
+    target_graph = Path(graph_path) if graph_path is not None else _graph_path(governance_dir)
+    materialized = materialize_overlay_to_graph(
+        conn, project_id, session_id,
+        overlay_path=overlay,
+        graph_path=target_graph,
+        workspace_dir=workspace_dir,
+        full_rebase=full_rebase,
+        finalized_at=now,
+    )
     cur = conn.execute(
         "UPDATE reconcile_sessions SET status='finalized', finalized_at=? "
         "WHERE project_id=? AND session_id=? AND status IN ('active','finalizing')",
         (now, project_id, session_id))
     if cur.rowcount == 0:
         raise ValueError(f"no in-flight session {session_id!r} for {project_id!r}")
-    conn.commit()
-    overlay = _overlay_path(governance_dir)
     archived: Optional[str] = None
     if overlay.exists():
         bak = overlay.with_suffix(overlay.suffix + ".bak")
         shutil.copy2(str(overlay), str(bak))
         overlay.unlink()
         archived = str(bak)
+    conn.commit()
+    counts = materialized.get("counts", {}) if isinstance(materialized, dict) else {}
     return SessionFinalizationResult(project_id=project_id, session_id=session_id,
-        status="finalized", finalized_at=now, overlay_archived_to=archived)
+        status="finalized", finalized_at=now, overlay_archived_to=archived,
+        graph_path=str(target_graph),
+        graph_backup_path=str(materialized.get("graph_backup_path") or ""),
+        materialized_node_count=int(counts.get("final_node_count") or 0),
+        materialization_counts=dict(counts))
 
 
 def rollback_session(conn: sqlite3.Connection, project_id: str, session_id: str, *,

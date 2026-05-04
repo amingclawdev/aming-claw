@@ -1304,8 +1304,19 @@ def handle_reconcile_session_finalize(ctx: RequestContext):
                 "status": current_status,
                 "message": "session is rolled_back; cannot finalize",
             }
+        body = ctx.body or {}
         try:
-            result = reconcile_session.finalize_session(conn, project_id, session_id)
+            from .db import _resolve_project_dir
+
+            project_dir = _resolve_project_dir(project_id)
+            result = reconcile_session.finalize_session(
+                conn,
+                project_id,
+                session_id,
+                graph_path=project_dir / "graph.json",
+                workspace_dir=Path(__file__).resolve().parents[2],
+                full_rebase=bool(body.get("full_rebase", False)),
+            )
         except reconcile_session.SessionClusterGateError as exc:
             return 409, {
                 "error": "reconcile_clusters_incomplete",
@@ -1321,6 +1332,10 @@ def handle_reconcile_session_finalize(ctx: RequestContext):
             "status": result.status,
             "finalized_at": result.finalized_at,
             "overlay_archived_to": result.overlay_archived_to,
+            "graph_path": result.graph_path,
+            "graph_backup_path": result.graph_backup_path,
+            "materialized_node_count": result.materialized_node_count,
+            "materialization_counts": result.materialization_counts,
         },
         "idempotent": False,
     }

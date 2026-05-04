@@ -111,17 +111,17 @@ def test_smoke_validate_rejects_duplicate_node_ids(tmp_path):
     assert "L1.1" in result.get("duplicates", [])
 
 
-def test_smoke_validate_rejects_layers_outside_l0_l6(tmp_path):
+def test_smoke_validate_rejects_layers_outside_l0_l7(tmp_path):
     primary = _make_primary_file(tmp_path)
     graph = _write_graph(
         tmp_path / "graph.json",
         [
-            {"node_id": "L7.5", "layer": "L7", "primary": [str(primary)]},
+            {"node_id": "L8.5", "layer": "L8", "primary": [str(primary)]},
         ],
     )
     result = smoke_validate(graph)
     assert result["ok"] is False
-    assert any(b["layer"] == "L7" for b in result.get("bad_layers", []))
+    assert any(b["layer"] == "L8" for b in result.get("bad_layers", []))
 
 
 def test_smoke_validate_rejects_missing_primary_paths(tmp_path):

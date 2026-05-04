@@ -81,7 +81,32 @@ def _unwrap(result):
 def gov_dir(tmp_path: Path) -> Path:
     d = tmp_path / "governance"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "graph.json").write_text('{"nodes": []}')
+    graph = {
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [{
+                "id": "L1.1",
+                "title": "Integration Root",
+                "layer": "L1",
+                "primary": [],
+                "secondary": [],
+                "test": [],
+                "_deps": [],
+            }],
+            "edges": [],
+        },
+        "gates_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [],
+            "edges": [],
+        },
+    }
+    (d / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
     return d
 
 
@@ -132,6 +157,8 @@ def gov_db(tmp_path: Path, monkeypatch, gov_dir: Path):
     monkeypatch.setattr("governance.auto_chain.DBContext", _FakeCtx, raising=False)
     monkeypatch.setattr("governance.db.get_connection",
                         lambda *_a, **_k: conn)
+    monkeypatch.setattr("governance.db._resolve_project_dir",
+                        lambda *_a, **_k: gov_dir)
 
     # Patch reconcile_session governance_dir to tmp_path so overlay file lifecycle
     # writes happen under tmp_path (not the real repo).

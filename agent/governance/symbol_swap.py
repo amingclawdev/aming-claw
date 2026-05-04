@@ -6,7 +6,7 @@ contract (spec §4.4 v6 / GPT R4) is:
 * :func:`atomic_swap` — single atomic rename pair with an in-process
   rollback fallback when the new graph fails :func:`smoke_validate`.
 * :func:`smoke_validate` — deterministic JSON-only validation: parses,
-  unique node_ids, layer in L0..L6, every primary path exists on disk.
+  unique node_ids, layer in L0..L7, every primary path exists on disk.
 * :func:`rollback` — restore the previous ``graph.json`` from the
   ``.json.bak`` written by :func:`atomic_swap`, refusing to restore a
   backup older than :data:`BAK_RETENTION_DAYS`.
@@ -35,7 +35,7 @@ BAK_RETENTION_DAYS: int = 30
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_VALID_LAYERS = {"L0", "L1", "L2", "L3", "L4", "L5", "L6"}
+_VALID_LAYERS = {"L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"}
 
 
 def _bak_path(graph_path: pathlib.Path) -> pathlib.Path:
@@ -90,7 +90,7 @@ def smoke_validate(graph_path: pathlib.Path) -> Dict[str, Any]:
     1. file exists and parses as JSON;
     2. ``nodes`` key resolves to a list / dict of dicts;
     3. every node has a unique ``node_id`` (or ``id``);
-    4. every node's ``layer`` is in L0..L6 inclusive;
+    4. every node's ``layer`` is in L0..L7 inclusive;
     5. every primary path on every node exists on the local filesystem.
 
     The function NEVER raises — it always returns a dict with ``ok``
@@ -148,7 +148,7 @@ def smoke_validate(graph_path: pathlib.Path) -> Dict[str, Any]:
             bad_layers.append({"node_id": str(nid), "layer": layer})
     if bad_layers:
         result["bad_layers"] = bad_layers
-        result["reason"] = f"layers outside L0-L6: {bad_layers}"
+        result["reason"] = f"layers outside L0-L7: {bad_layers}"
         return result
 
     # 3. primary paths exist on filesystem
