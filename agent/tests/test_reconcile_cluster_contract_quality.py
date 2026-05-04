@@ -169,3 +169,96 @@ def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeyp
 
     assert "graph_delta.creates" in prompt
     assert out_meta["doc_impact"] == {}
+
+
+def test_reconcile_cluster_build_qa_prompt_does_not_pull_old_graph_docs(monkeypatch):
+    def fail_graph_doc_lookup(*_args, **_kwargs):
+        raise AssertionError("reconcile-cluster QA should not query old graph doc associations")
+
+    monkeypatch.setattr(auto_chain, "_get_graph_doc_associations", fail_graph_doc_lookup)
+    monkeypatch.setattr(auto_chain, "_query_graph_delta_proposed", lambda *_args, **_kwargs: None)
+    result = {
+        "test_report": {"passed": 1, "failed": 0, "tool": "pytest"},
+        "changed_files": [],
+    }
+    metadata = {
+        **_candidate_metadata(),
+        "target_files": ["agent/governance/reconcile_batch_memory.py"],
+        "acceptance_criteria": ["AC1: preserve candidate node"],
+        "verification": {"command": "python -m pytest agent/tests/test_reconcile_batch_memory.py"},
+    }
+
+    prompt, out_meta = auto_chain._build_qa_prompt("test-task", result, metadata)
+
+    assert "criteria_results" in prompt
+    assert "Graph Consistency Check" not in prompt
+    assert out_meta["target_files"] == ["agent/governance/reconcile_batch_memory.py"]
+
+
+def test_reconcile_cluster_pm_prompt_uses_batch_memory_but_skips_old_graph_impact(monkeypatch, tmp_path):
+    from executor_worker import ExecutorWorker
+
+    target = tmp_path / "agent" / "governance" / "reconcile_batch_memory.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def create_or_get_batch():\n    return {}\n", encoding="utf-8")
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, *args, **kwargs):
+        if "/batch-memory/" in url:
+            return _Resp({
+                "batch": {
+                    "batch_id": "batch-qg",
+                    "session_id": "run-qg",
+                    "memory": {
+                        "processed_clusters": {"old": {}},
+                        "accepted_features": {},
+                        "open_conflicts": [],
+                    },
+                }
+            })
+        if "/api/context/" in url:
+            return _Resp({"exists": False})
+        if "/api/task/" in url:
+            return _Resp({"tasks": []})
+        return _Resp({})
+
+    def fake_post(url, *args, **kwargs):
+        if "/api/impact/" in url:
+            raise AssertionError("reconcile-cluster PM prompt must not query old graph impact")
+        return _Resp({})
+
+    monkeypatch.setattr("requests.get", fake_get)
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(ExecutorWorker, "_fetch_memories", lambda self, query: [])
+
+    worker = ExecutorWorker("aming-claw", governance_url="http://gov", workspace=str(tmp_path))
+    metadata = {
+        **_candidate_metadata(),
+        "batch_id": "batch-qg",
+        "cluster_fingerprint": "fp-qg",
+        "reconcile_run_id": "run-qg",
+        "target_files": ["agent/governance/reconcile_batch_memory.py"],
+    }
+    prompt = worker._build_prompt(
+        "Reconcile cluster fp-qg — produce PRD",
+        "pm",
+        {
+            "task_id": "pm-qg",
+            "metadata": metadata,
+            "operation_type": "reconcile-cluster",
+            "cluster_payload": metadata["cluster_payload"],
+            "cluster_report": metadata.get("cluster_report", {}),
+            "target_files": metadata["target_files"],
+            "test_files": ["agent/tests/test_reconcile_batch_memory.py"],
+        },
+    )
+
+    assert "Reconcile Batch Memory" in prompt
+    assert "Reconcile Cluster Source Of Truth" in prompt
+    assert "Graph Impact Analysis" not in prompt

@@ -31,7 +31,8 @@ log = logging.getLogger(__name__)
 RESULT_CORE_FIELDS = [
     "target_files", "changed_files", "verification", "requirements",
     "acceptance_criteria", "test_report", "prd", "proposed_nodes",
-    "summary", "related_nodes", "graph_delta",
+    "summary", "related_nodes", "graph_delta", "test_files", "doc_impact",
+    "skip_reasons", "criteria_results", "graph_delta_review",
 ]
 
 # Role-based visibility: which stage types each role can see
@@ -48,12 +49,18 @@ ROLE_VISIBLE_STAGES = {
 ROLE_RESULT_FIELDS = {
     "pm":          [],
     "dev":         ["target_files", "requirements", "acceptance_criteria",
-                    "verification", "prd", "changed_files"],  # +changed_files: retry scope (B28a)
+                    "verification", "prd", "changed_files", "test_files",
+                    "doc_impact", "skip_reasons", "proposed_nodes"],
     "test":        ["changed_files", "target_files"],
-    "qa":          ["test_report", "changed_files", "acceptance_criteria"],
-    "merge":       ["changed_files", "test_report"],
+    "qa":          ["test_report", "changed_files", "target_files",
+                    "requirements", "acceptance_criteria", "verification",
+                    "test_files", "doc_impact", "proposed_nodes",
+                    "graph_delta"],
+    "merge":       ["changed_files", "test_report", "criteria_results",
+                    "graph_delta_review", "doc_impact"],
     "coordinator": ["target_files", "changed_files", "summary",
-                    "test_report", "related_nodes"],
+                    "test_report", "related_nodes", "doc_impact",
+                    "test_files"],
 }
 
 # Valid chain states

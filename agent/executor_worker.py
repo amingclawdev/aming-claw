@@ -1401,10 +1401,58 @@ class ExecutorWorker:
                     or context.get("cluster_report")
                     or {}
                 )
+                batch_ref = metadata.get("batch_memory_ref")
+                if not isinstance(batch_ref, dict):
+                    batch_ref = {}
+                batch_id = (
+                    metadata.get("batch_id")
+                    or metadata.get("reconcile_batch_id")
+                    or batch_ref.get("batch_id")
+                    or ""
+                )
+                if batch_id:
+                    try:
+                        import requests as _req_batch
+                        batch_resp = _req_batch.get(
+                            f"{self.base_url}/api/reconcile/{self.project_id}/batch-memory/{batch_id}",
+                            timeout=3,
+                        ).json()
+                        batch = batch_resp.get("batch", {}) if isinstance(batch_resp, dict) else {}
+                        memory = batch.get("memory", {}) if isinstance(batch, dict) else {}
+                        related_features = []
+                        try:
+                            from governance import reconcile_batch_memory as _rbm
+                            related_features = _rbm.find_related_features(batch, cluster_payload)
+                        except Exception:
+                            related_features = []
+                        batch_context = {
+                            "batch_id": batch_id,
+                            "session_id": batch.get("session_id", ""),
+                            "processed_cluster_count": len(memory.get("processed_clusters", {}) or {}),
+                            "accepted_feature_count": len(memory.get("accepted_features", {}) or {}),
+                            "related_features": related_features[:8],
+                            "open_conflicts": (memory.get("open_conflicts", []) or [])[:8],
+                        }
+                        parts.append("\n## Reconcile Batch Memory")
+                        parts.append(
+                            "Use this as the batch-wide semantic memory. If this cluster "
+                            "overlaps an accepted feature, merge into that feature instead "
+                            "of inventing a parallel feature name."
+                        )
+                        parts.append(
+                            f"```json\n{json.dumps(batch_context, ensure_ascii=False, indent=2)}\n```"
+                        )
+                    except Exception:
+                        parts.append(
+                            "\n## Reconcile Batch Memory\n"
+                            f"Batch memory id {batch_id!r} was declared but could not be loaded. "
+                            "Do not assume this is the first cluster; keep feature naming conservative."
+                        )
                 cluster_scope = {
                     "operation_type": operation_type,
                     "cluster_fingerprint": metadata.get("cluster_fingerprint", ""),
                     "reconcile_run_id": metadata.get("reconcile_run_id", ""),
+                    "batch_id": batch_id,
                     "target_files": context.get("target_files", []),
                     "test_files": context.get("test_files", []),
                     "cluster_payload": cluster_payload,
@@ -1456,7 +1504,7 @@ class ExecutorWorker:
                 _bp_log(f"target files preview: {len(target_files)} files")
 
             # 6d: Graph impact for target_files
-            if target_files:
+            if target_files and operation_type != "reconcile-cluster":
                 try:
                     import requests as _req2
                     impact = _req2.post(
@@ -1522,6 +1570,7 @@ class ExecutorWorker:
                 "\nRules:\n"
                 "- target_files, requirements, acceptance_criteria, verification are MANDATORY (gate blocks if missing)\n"
                 "- test_files, proposed_nodes, doc_impact: provide OR explain in skip_reasons\n"
+                "- For test coverage, put only existing files in test_files/proposed_nodes[].test; list missing coverage in missing_test_gaps or skip_reasons\n"
                 "- Use Read/Grep to verify file paths exist before listing them\n"
                 "- Read at most 3-5 key files, then output the JSON\n"
                 "- Do NOT output actions, reply, or schema_version fields\n"
@@ -1657,11 +1706,23 @@ class ExecutorWorker:
                 parts.append(f"Verification contract: {json.dumps(verification, ensure_ascii=False)}")
             if doc_impact:
                 parts.append(f"Doc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+            has_chain_qa_contract = (
+                "criteria_results" in prompt
+                or "Graph Delta Review" in prompt
+                or "graph_delta_review" in prompt
+            )
             parts.append("\nYou are a QA reviewer. Review the test results and changed files above.")
-            parts.append("If tests passed and changes look reasonable, respond ONLY with this exact JSON:")
-            parts.append('{"recommendation": "qa_pass", "review_summary": "Tests pass, changes approved"}')
-            parts.append("If there are critical issues, respond with:")
-            parts.append('{"recommendation": "reject", "reason": "description of issue"}')
+            if has_chain_qa_contract:
+                parts.append(
+                    "Follow the stricter chain QA contract already present in the task prompt. "
+                    "Do not collapse the review to a generic tests-pass JSON; include every "
+                    "required structured field such as criteria_results and graph_delta_review."
+                )
+            else:
+                parts.append("If tests passed and changes look reasonable, respond ONLY with this exact JSON:")
+                parts.append('{"recommendation": "qa_pass", "review_summary": "Tests pass, changes approved"}')
+                parts.append("If there are critical issues, respond with:")
+                parts.append('{"recommendation": "reject", "reason": "description of issue"}')
 
         elif task_type == "gatekeeper":
             parts.append("\nYou are the isolated pre-merge gatekeeper.")

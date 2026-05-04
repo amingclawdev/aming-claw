@@ -114,6 +114,14 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("graph.delta.proposed present but QA result omits graph_delta_review", reason)
 
+    def test_blocks_missing_criteria_results_when_criteria_exist(self):
+        """QA pass must include per-criterion evidence when PM supplied ACs."""
+        result = {"recommendation": "qa_pass"}
+        metadata = _base_metadata(acceptance_criteria=["AC1: exact graph delta"])
+        passed, reason = self._call_gate(result, metadata, proposed_payload=None)
+        self.assertFalse(passed)
+        self.assertIn("missing criteria_results", reason)
+
     def test_ac5_block_when_decision_reject(self):
         """AC5: decision=='reject' -> block with issues in reason."""
         result = {

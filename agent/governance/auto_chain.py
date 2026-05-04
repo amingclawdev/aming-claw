@@ -2670,6 +2670,88 @@ def _normalize_related_nodes(related_nodes):
     return normalized
 
 
+def _record_reconcile_batch_pm_decision(conn, project_id, task_id, metadata, result, prd):
+    """Persist PM's feature decision into reconcile batch memory.
+
+    The batch memory is the cross-cluster semantic continuity layer. PM output
+    is normalized here so the next cluster can see accepted feature names,
+    owned files, docs/tests, and overlap conflicts through runtime context.
+    """
+    if not isinstance(metadata, dict):
+        return
+    batch_ref = metadata.get("batch_memory_ref")
+    if not isinstance(batch_ref, dict):
+        batch_ref = {}
+    batch_id = (
+        metadata.get("batch_id")
+        or metadata.get("reconcile_batch_id")
+        or batch_ref.get("batch_id")
+        or ""
+    )
+    cluster_fp = metadata.get("cluster_fingerprint", "")
+    if not batch_id or not cluster_fp:
+        return
+    prd = prd if isinstance(prd, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    proposed_nodes = result.get("proposed_nodes") or prd.get("proposed_nodes") or []
+    doc_impact = result.get("doc_impact") or prd.get("doc_impact") or {}
+    doc_files = doc_impact.get("files", []) if isinstance(doc_impact, dict) else []
+    feature_name = (
+        result.get("feature_name")
+        or prd.get("feature")
+        or prd.get("feature_name")
+        or (metadata.get("cluster_report") or {}).get("title")
+        or (metadata.get("cluster_report") or {}).get("purpose")
+        or (proposed_nodes[0].get("title") if proposed_nodes and isinstance(proposed_nodes[0], dict) else "")
+        or f"cluster:{cluster_fp[:8]}"
+    )
+    decision = (
+        result.get("batch_decision")
+        or result.get("decision")
+        or prd.get("batch_decision")
+        or prd.get("decision")
+        or "new_feature"
+    )
+    if result.get("target_feature") or result.get("merge_into") or prd.get("target_feature") or prd.get("merge_into"):
+        decision = "merge_into_existing_feature"
+    valid_decisions = {
+        "new_feature",
+        "merge_into_existing_feature",
+        "split",
+        "orphan_dead_code",
+        "defer",
+    }
+    if decision not in valid_decisions:
+        decision = "new_feature"
+    payload = {
+        "decision": decision,
+        "feature_name": feature_name,
+        "target_feature": result.get("target_feature") or result.get("merge_into") or prd.get("target_feature") or prd.get("merge_into") or "",
+        "owned_files": result.get("target_files") or prd.get("target_files") or metadata.get("target_files", []),
+        "candidate_tests": result.get("test_files") or prd.get("test_files") or metadata.get("test_files", []),
+        "candidate_docs": doc_files,
+        "purpose": prd.get("purpose") or prd.get("background") or (metadata.get("cluster_report") or {}).get("purpose"),
+        "reason": result.get("summary") or prd.get("scope") or "",
+        "decided_by": "pm",
+        "actor": "auto-chain",
+        "task_id": task_id,
+    }
+    try:
+        from . import reconcile_batch_memory as bm
+        bm.record_pm_decision(conn, project_id, batch_id, cluster_fp, payload)
+        log.info(
+            "auto_chain: recorded reconcile batch PM decision batch=%s cluster=%s feature=%s",
+            batch_id, cluster_fp, feature_name,
+        )
+    except KeyError:
+        log.warning(
+            "auto_chain: reconcile batch memory missing batch=%s cluster=%s",
+            batch_id, cluster_fp,
+        )
+    except Exception:
+        log.debug("auto_chain: record reconcile batch PM decision failed", exc_info=True)
+
+
 def _render_dev_contract_prompt(source_task_id, metadata):
     """Render the structured Dev contract from PM/task metadata."""
     is_cluster = is_reconcile_cluster_task(metadata)
@@ -3154,6 +3236,11 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                 json.dumps(prd_data, ensure_ascii=False),
                 metadata,
                 extra_structured={"task_id": task_id, "chain_stage": "pm"},
+            )
+
+        if is_reconcile_cluster_task(metadata):
+            _record_reconcile_batch_pm_decision(
+                conn, project_id, task_id, metadata, result, prd
             )
 
         # R3: Emit pm.prd.published event when PM result has non-empty proposed_nodes
@@ -4794,7 +4881,10 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                 # should not block QA when the agent omits graph_delta_review.
                 # Only dev-emitted deltas require explicit QA review.
                 _gd_source = _gd_proposed.get("source", "")
-                if _gd_source in ("auto-inferred", "dev-emitted+inferred-gaps"):
+                if (
+                    _gd_source == "auto-inferred"
+                    and not is_reconcile_cluster_task(metadata)
+                ):
                     gd_review = {
                         "decision": "pass",
                         "issues": [],
@@ -4841,9 +4931,16 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     criteria_results = result.get("criteria_results", [])
     if criteria:
         if not criteria_results:
-            log.warning("qa_gate: acceptance_criteria present (%d items) but QA result missing criteria_results — "
-                        "allowing pass but criteria not individually verified", len(criteria))
+            return False, (
+                "QA result missing criteria_results while acceptance_criteria are present. "
+                "QA must evaluate each criterion individually before qa_pass."
+            )
         else:
+            if len(criteria_results) < len(criteria):
+                return False, (
+                    "QA result criteria_results does not cover all acceptance_criteria: "
+                    f"{len(criteria_results)}/{len(criteria)} supplied"
+                )
             failed_criteria = [cr for cr in criteria_results if not cr.get("passed")]
             if failed_criteria:
                 names = [cr.get("criterion", "?")[:60] for cr in failed_criteria]
@@ -5457,9 +5554,11 @@ def _build_qa_prompt(task_id, result, metadata):
             "unless an actual doc file exists in changed_files or the workspace."
         )
     # 5d: Graph consistency check injection
-    graph_docs = _get_graph_doc_associations(
-        metadata.get("project_id", "aming-claw"),
-        metadata.get("target_files", []))
+    graph_docs = []
+    if not is_reconcile_cluster_task(metadata):
+        graph_docs = _get_graph_doc_associations(
+            metadata.get("project_id", "aming-claw"),
+            metadata.get("target_files", []))
     if graph_docs:
         prompt_parts.append(
             f"\n## Graph Consistency Check\n"

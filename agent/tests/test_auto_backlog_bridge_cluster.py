@@ -54,6 +54,14 @@ class MockHttpClient:
 
     def post(self, url: str, payload: dict) -> dict:
         self.posts.append((url, payload))
+        if url.endswith("/batch-memory"):
+            return {
+                "batch": {
+                    "batch_id": payload.get("batch_id", ""),
+                    "session_id": payload.get("session_id", ""),
+                    "memory": payload.get("initial_memory", {}),
+                }
+            }
         return dict(self.create_response)
 
 
@@ -118,12 +126,15 @@ def test_metadata_operation_type_reconcile_cluster():
         project_id=PROJECT_ID, http_client=mock,
     )
     assert out["filed"] is True
-    assert len(mock.posts) == 2
-    backlog_url, backlog_body = mock.posts[0]
+    assert len(mock.posts) == 3
+    batch_url, batch_body = mock.posts[0]
+    assert batch_url == f"/api/reconcile/{PROJECT_ID}/batch-memory"
+    assert batch_body["batch_id"] == "run-12345678"
+    backlog_url, backlog_body = mock.posts[1]
     assert backlog_url.startswith(f"/api/backlog/{PROJECT_ID}/")
     assert backlog_body["status"] == "OPEN"
     assert backlog_body["force_admit"] is True
-    url, body = mock.posts[1]
+    url, body = mock.posts[2]
     assert url == f"/api/task/{PROJECT_ID}/create"
     assert body["type"] == "pm"
     md = body["metadata"]
@@ -133,6 +144,8 @@ def test_metadata_operation_type_reconcile_cluster():
     assert md["cluster_report"] == cluster_report
     assert md["target_files"] == ["a.py"]
     assert md["test_files"] == []
+    assert md["batch_id"] == "run-12345678"
+    assert md["reconcile_batch_id"] == "run-12345678"
     assert md["bug_id"].startswith("OPT-BACKLOG-RECONCILE-")
     assert "-CLUSTER-" in md["bug_id"]
 
@@ -147,7 +160,7 @@ def test_cluster_task_metadata_carries_expected_test_files():
         project_id=PROJECT_ID, http_client=mock,
     )
     assert out["filed"] is True
-    _, body = mock.posts[1]
+    _, body = mock.posts[2]
     assert body["target_files"] == ["agent/a.py"]
     assert body["metadata"]["target_files"] == ["agent/a.py"]
     assert body["metadata"]["test_files"] == ["agent/tests/test_a.py"]
@@ -275,10 +288,11 @@ def test_file_cluster_upserts_backlog_before_task_create():
         cluster_group, {}, "run-audit1", PROJECT_ID, http_client=mock,
     )
     assert out["filed"] is True
-    assert len(mock.posts) == 2
-    assert mock.posts[0][0].startswith(f"/api/backlog/{PROJECT_ID}/")
-    assert mock.posts[1][0] == f"/api/task/{PROJECT_ID}/create"
-    assert mock.posts[0][1]["chain_trigger_json"]["cluster_fingerprint"] == "fp-audit1"
+    assert len(mock.posts) == 3
+    assert mock.posts[0][0] == f"/api/reconcile/{PROJECT_ID}/batch-memory"
+    assert mock.posts[1][0].startswith(f"/api/backlog/{PROJECT_ID}/")
+    assert mock.posts[2][0] == f"/api/task/{PROJECT_ID}/create"
+    assert mock.posts[1][1]["chain_trigger_json"]["cluster_fingerprint"] == "fp-audit1"
 
 
 def test_file_cluster_stops_when_backlog_upsert_fails():
@@ -299,4 +313,5 @@ def test_file_cluster_stops_when_backlog_upsert_fails():
     )
     assert out["filed"] is False
     assert out["reason"].startswith("backlog_upsert_failed:")
-    assert len(mock.posts) == 1
+    assert len(mock.posts) == 2
+    assert mock.posts[0][0] == f"/api/reconcile/{PROJECT_ID}/batch-memory"

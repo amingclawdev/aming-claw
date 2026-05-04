@@ -238,6 +238,7 @@ def file_cluster_as_backlog(
     creator: str = "reconcile-bridge",
     http_client: Any = None,
     operation_type: str = "reconcile-cluster",
+    batch_id: str = "",
 ) -> dict:
     """File one ``type='pm'`` task per cluster group (R4).
 
@@ -295,6 +296,49 @@ def file_cluster_as_backlog(
     if http_client is None:
         http_client = _DefaultHttpClient()
 
+    batch_id = (
+        batch_id
+        or str(cluster_group.get("batch_id") or "")
+        or str(cluster_report.get("batch_id") or "")
+        or str(run_id or "")
+    )
+    batch_ref: dict[str, Any] = {}
+    if operation_type == "reconcile-cluster" and batch_id:
+        try:
+            batch_resp = http_client.post(
+                f"/api/reconcile/{project_id}/batch-memory",
+                {
+                    "batch_id": batch_id,
+                    "session_id": run_id,
+                    "created_by": creator,
+                    "initial_memory": {
+                        "candidate_graph_path": (
+                            cluster_group.get("candidate_graph_path")
+                            or cluster_report.get("candidate_graph_path")
+                            or ""
+                        ),
+                        "known_clusters": {
+                            cluster_fp: {
+                                "primary_files": list(cluster_group.get("primary_files") or []),
+                                "cluster_fingerprint": cluster_fp,
+                                "purpose": cluster_report.get("purpose") or "",
+                            }
+                        } if cluster_fp else {},
+                    },
+                },
+            )
+            if isinstance(batch_resp, dict):
+                batch = batch_resp.get("batch") if isinstance(batch_resp.get("batch"), dict) else {}
+                batch_ref = {
+                    "batch_id": str(batch.get("batch_id") or batch_id),
+                    "session_id": str(batch.get("session_id") or run_id or ""),
+                }
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "auto_backlog_bridge: batch-memory create/get failed batch=%s err=%s",
+                batch_id, exc,
+            )
+
     metadata = {
         "bug_id": backlog_id,
         "operation_type": operation_type,
@@ -303,6 +347,13 @@ def file_cluster_as_backlog(
         "cluster_report": cluster_report,
         "reconcile_run_id": run_id,
     }
+    if batch_id:
+        metadata["batch_id"] = batch_ref.get("batch_id") or batch_id
+        metadata["reconcile_batch_id"] = metadata["batch_id"]
+        metadata["batch_memory_ref"] = batch_ref or {
+            "batch_id": batch_id,
+            "session_id": run_id,
+        }
     primary_files = list(
         cluster_group.get("primary_files")
         or cluster_report.get("expected_doc_sections")
