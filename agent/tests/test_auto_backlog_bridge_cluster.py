@@ -81,6 +81,21 @@ def conn(tmp_path: Path):
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def isolate_reconcile_session_overlay(tmp_path: Path, monkeypatch):
+    """Keep auto-started reconcile sessions from touching the live repo overlay."""
+    from governance import reconcile_session as rs
+
+    real_start = rs.start_session
+    gov_dir = tmp_path / "session-governance"
+
+    def _start_with_tmp(c, pid, **kw):
+        kw.setdefault("governance_dir", gov_dir)
+        return real_start(c, pid, **kw)
+
+    monkeypatch.setattr(rs, "start_session", _start_with_tmp)
+
+
 # ---------------------------------------------------------------------------
 # AC7 — file_cluster_as_backlog tests
 # ---------------------------------------------------------------------------
