@@ -665,14 +665,40 @@ def _build_auto_chain_response(chain_result: dict | None) -> dict:
     if chain_result is None:
         # Not a chain-eligible task or non-succeeded status
         return {"dispatched": False}
+    if chain_result.get("preflight_blocked"):
+        return {
+            "dispatched": False,
+            "preflight_blocked": True,
+            "stage": chain_result.get("stage", "preflight"),
+            "reason": chain_result.get("reason", "unknown"),
+        }
     if chain_result.get("gate_blocked"):
         return {
             "dispatched": False,
             "gate_blocked": True,
             "gate_reason": chain_result.get("reason", "unknown"),
         }
+    if chain_result.get("routing_blocked"):
+        return {
+            "dispatched": False,
+            "routing_blocked": True,
+            "reason": chain_result.get("reason", "unknown"),
+        }
     if chain_result.get("chain_stopped"):
         return {"dispatched": False, "chain_stopped": True, "reason": chain_result.get("reason", "")}
+    if chain_result.get("task_id"):
+        return {
+            "dispatched": True,
+            "task_id": chain_result.get("task_id"),
+            "type": chain_result.get("type"),
+            "dedup": bool(chain_result.get("dedup")),
+        }
+    if chain_result.get("next_task_id"):
+        return {
+            "dispatched": True,
+            "task_id": chain_result.get("next_task_id"),
+            "type": chain_result.get("type"),
+        }
     # Successful dispatch
     return {"dispatched": True}
 

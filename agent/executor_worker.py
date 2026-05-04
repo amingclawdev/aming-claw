@@ -1429,8 +1429,11 @@ class ExecutorWorker:
                     "cluster_payload.candidate_nodes one-for-one. When a "
                     "candidate node has a concrete node_id, copy that node_id "
                     "exactly; never set it to null or invent a replacement. "
-                    "Also preserve primary, title, and parent/parent_layer "
-                    "evidence so Dev can emit graph_delta.creates for the "
+                    "Also preserve primary and title exactly. Treat "
+                    "parent_layer as the candidate node's own layer (for example "
+                    "L7/7), and preserve the hierarchy parent (for example "
+                    "L3.18) via parent/parent_id or deps so Dev can emit "
+                    "graph_delta.creates for the "
                     "overlay without touching graph.json."
                 )
                 _bp_log("reconcile cluster metadata embedded")
@@ -2528,6 +2531,8 @@ class ExecutorWorker:
             chain_msg = ""
             if chain.get("gate_blocked"):
                 chain_msg = f"gate_blocked: {chain.get('reason') or chain.get('gate_reason') or 'unknown'}"
+            elif chain.get("preflight_blocked"):
+                chain_msg = f"preflight_blocked: {chain.get('reason') or 'unknown'}"
             elif chain.get("task_id"):
                 chain_msg = f"chain: {task_id} -> {chain['task_id']} ({chain.get('type')})"
             elif chain.get("deploy"):

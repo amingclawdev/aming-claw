@@ -16,6 +16,7 @@ def _candidate_metadata():
                 {
                     "node_id": "L7.72",
                     "title": "agent.governance.reconcile_batch_memory",
+                    "layer": "L7",
                     "parent": "L3.22",
                     "primary": ["agent/governance/reconcile_batch_memory.py"],
                 }
@@ -31,7 +32,7 @@ def test_reconcile_cluster_pm_preflight_rejects_null_candidate_id():
             {
                 "node_id": None,
                 "title": "agent.governance.reconcile_batch_memory",
-                "parent_layer": "L3",
+                "parent_layer": "L7",
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ]
@@ -54,7 +55,8 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
             {
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
-                "parent_layer": "L3",
+                "parent_layer": 7,
+                "deps": ["L3.22"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ]
@@ -68,6 +70,52 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
     assert passed, reason
 
 
+def test_reconcile_cluster_pm_preflight_rejects_missing_candidate_parent():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "parent relation" in reason
+    assert "L3.22" in reason
+
+
+def test_reconcile_cluster_pm_preflight_rejects_wrong_node_layer():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": "L6",
+                "deps": ["L3.22"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "node layer" in reason
+
+
 def test_reconcile_cluster_dev_prompt_uses_overlay_contract_not_generic_test_churn():
     metadata = {
         **_candidate_metadata(),
@@ -78,7 +126,8 @@ def test_reconcile_cluster_dev_prompt_uses_overlay_contract_not_generic_test_chu
             {
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
-                "parent_layer": "L3",
+                "parent_layer": 7,
+                "deps": ["L3.22"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ],
@@ -91,6 +140,7 @@ def test_reconcile_cluster_dev_prompt_uses_overlay_contract_not_generic_test_chu
     assert "graph_delta.creates" in prompt
     assert "graph.rebase.overlay.json" in prompt
     assert "Do not mutate graph.json" in prompt
+    assert "parent_layer as the node layer" in prompt
 
 
 def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeypatch):
@@ -108,7 +158,8 @@ def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeyp
             {
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
-                "parent_layer": "L3",
+                "parent_layer": 7,
+                "deps": ["L3.22"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ],

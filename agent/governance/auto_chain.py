@@ -2616,7 +2616,8 @@ def _render_dev_contract_prompt(source_task_id, metadata):
             parts.append(
                 "\nRequired for reconcile-cluster: return `graph_delta.creates` mirroring "
                 "`proposed_nodes` one-for-one. Preserve each concrete node_id/candidate_node_id, "
-                "primary, title, deps, and parent_layer/parent evidence. Do not mutate graph.json; "
+                "primary, title, parent_layer as the node layer, and parent evidence via deps or "
+                "parent/parent_id. Do not mutate graph.json; "
                 "Gatekeeper writes graph.rebase.overlay.json only after QA."
             )
         else:
@@ -6063,24 +6064,48 @@ def _cluster_payload_candidate_nodes(metadata):
     return []
 
 
-def _cluster_parent_layer_hint(item):
-    """Return a comparable parent/layer hint for candidate-vs-PRD checks."""
+def _cluster_node_layer_hint(item):
+    """Return the node's own layer hint, not its hierarchy parent node."""
     if not isinstance(item, dict):
         return ""
     raw = (
-        item.get("parent_layer")
-        or item.get("parent")
-        or item.get("parent_id")
-        or item.get("layer")
+        item.get("layer")
+        or item.get("parent_layer")
         or ""
     )
     if not raw:
         return ""
     text = str(raw).strip()
-    m = re.match(r"^[Ll](\d+)(?:\.\d+)?$", text)
-    if m:
-        return f"L{int(m.group(1))}"
     return _cluster_normalize_layer(text)
+
+
+def _cluster_parent_node_hint(item):
+    """Return an explicit hierarchy parent node id such as L3.18."""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("parent", "parent_id", "parent_node_id"):
+        raw = item.get(key)
+        if raw in (None, ""):
+            continue
+        text = str(raw).strip()
+        if re.match(r"^[Ll]\d+\.\d+$", text):
+            return f"L{text[1:]}" if text.startswith("l") else text
+    return ""
+
+
+def _cluster_proposed_parent_matches(proposed_node, candidate_parent):
+    """True when a PM proposal preserves the candidate hierarchy parent."""
+    if not candidate_parent:
+        return True
+    if not isinstance(proposed_node, dict):
+        return False
+    for key in ("parent", "parent_id", "parent_node_id"):
+        if str(proposed_node.get(key) or "").strip() == candidate_parent:
+            return True
+    deps = proposed_node.get("deps") or []
+    if isinstance(deps, list) and candidate_parent in deps:
+        return True
+    return False
 
 
 def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
@@ -6098,7 +6123,8 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
         expected[node_id] = {
             "primary": tuple(_cluster_normalize_primary(item.get("primary"))),
             "title": str(item.get("title") or "").strip(),
-            "parent": _cluster_parent_layer_hint(item),
+            "layer": _cluster_node_layer_hint(item),
+            "parent": _cluster_parent_node_hint(item),
             "index": idx,
         }
     if not expected:
@@ -6147,13 +6173,20 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
                 f"for {node_id} must match candidate; expected={cand_title!r} "
                 f"actual={prop_title!r}"
             )
-        cand_parent = candidate["parent"]
-        prop_parent = _cluster_parent_layer_hint(proposed_node)
-        if cand_parent and prop_parent and cand_parent != prop_parent:
+        cand_layer = candidate["layer"]
+        prop_layer = _cluster_node_layer_hint(proposed_node)
+        if cand_layer and prop_layer and cand_layer != prop_layer:
             return False, (
-                "FATAL preflight (reconcile-cluster): proposed_nodes parent/layer "
-                f"for {node_id} must match candidate; expected={cand_parent!r} "
-                f"actual={prop_parent!r}"
+                "FATAL preflight (reconcile-cluster): proposed_nodes node layer "
+                f"for {node_id} must match candidate; expected={cand_layer!r} "
+                f"actual={prop_layer!r}"
+            )
+        cand_parent = candidate["parent"]
+        if cand_parent and not _cluster_proposed_parent_matches(proposed_node, cand_parent):
+            return False, (
+                "FATAL preflight (reconcile-cluster): proposed_nodes parent relation "
+                f"for {node_id} must reference candidate parent via parent/parent_id/deps; "
+                f"expected={cand_parent!r}"
             )
     return True, "ok"
 

@@ -97,6 +97,8 @@ def test_reconcile_cluster_pm_prompt_embeds_cluster_metadata(tmp_path, monkeypat
     assert '"cluster_fingerprint": "fp-prompt1"' in prompt
     assert '"node_id": "L7.1"' in prompt
     assert "copy that node_id exactly" in prompt
+    assert "parent_layer as the candidate node's own layer" in prompt
+    assert "via parent/parent_id or deps" in prompt
     assert '"purpose": "Audit governance server surface"' in prompt
     assert "Do not widen scope beyond these files" in prompt
     assert "### agent/governance/server.py" in prompt

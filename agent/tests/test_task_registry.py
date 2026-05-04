@@ -49,7 +49,7 @@ class TestCompleteTaskAutoChain(unittest.TestCase):
         task_id, fence = self._create_and_claim("pm")
 
         def fake_chain(*args, **kwargs):
-            return {"next_task_id": "fake-123", "dispatched": True}
+            return {"task_id": "fake-123", "type": "dev", "dispatched": True}
 
         with mock.patch(
             "agent.governance.auto_chain.on_task_completed", side_effect=fake_chain
@@ -63,6 +63,35 @@ class TestCompleteTaskAutoChain(unittest.TestCase):
 
         self.assertEqual(result["status"], "succeeded")
         self.assertIn("auto_chain", result)
+        self.assertTrue(result["auto_chain"]["dispatched"])
+        self.assertEqual(result["auto_chain"]["task_id"], "fake-123")
+        self.assertEqual(result["auto_chain"]["type"], "dev")
+
+    def test_complete_reports_preflight_block_without_dispatch(self):
+        """Preflight blocks must be visible to the executor/operator."""
+        task_id, fence = self._create_and_claim("pm")
+
+        def fake_chain(*args, **kwargs):
+            return {
+                "preflight_blocked": True,
+                "stage": "pm",
+                "reason": "pm result preflight validation failed",
+            }
+
+        with mock.patch(
+            "agent.governance.auto_chain.on_task_completed", side_effect=fake_chain
+        ), mock.patch("agent.governance.db.get_connection", return_value=self.conn):
+            from agent.governance.task_registry import complete_task
+            result = complete_task(
+                self.conn, task_id, status="succeeded",
+                result={"summary": "done"}, project_id="proj",
+                fence_token=fence,
+            )
+
+        self.assertFalse(result["auto_chain"]["dispatched"])
+        self.assertTrue(result["auto_chain"]["preflight_blocked"])
+        self.assertEqual(result["auto_chain"]["stage"], "pm")
+        self.assertIn("preflight", result["auto_chain"]["reason"])
 
     def test_complete_calls_auto_chain_on_failure(self):
         """complete_task calls auto_chain on failure and reflects result."""
