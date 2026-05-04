@@ -131,8 +131,26 @@ def test_metadata_operation_type_reconcile_cluster():
     assert md["cluster_fingerprint"] == "fp-meta01"
     assert md["cluster_payload"] == cluster_group
     assert md["cluster_report"] == cluster_report
+    assert md["target_files"] == ["a.py"]
+    assert md["test_files"] == []
     assert md["bug_id"].startswith("OPT-BACKLOG-RECONCILE-")
     assert "-CLUSTER-" in md["bug_id"]
+
+
+def test_cluster_task_metadata_carries_expected_test_files():
+    """PM executor receives target/test files from metadata, not task body only."""
+    mock = MockHttpClient()
+    cluster_group = {"cluster_fingerprint": "fp-tests1", "primary_files": ["agent/a.py"]}
+    cluster_report = {"expected_test_files": ["agent/tests/test_a.py"]}
+    out = bridge.file_cluster_as_backlog(
+        cluster_group, cluster_report, run_id="run-tests1",
+        project_id=PROJECT_ID, http_client=mock,
+    )
+    assert out["filed"] is True
+    _, body = mock.posts[1]
+    assert body["target_files"] == ["agent/a.py"]
+    assert body["metadata"]["target_files"] == ["agent/a.py"]
+    assert body["metadata"]["test_files"] == ["agent/tests/test_a.py"]
 
 
 def test_terminal_success_hook(conn):

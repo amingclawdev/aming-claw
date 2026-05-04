@@ -530,6 +530,92 @@ class TestBacklogRuntimeMirrorForRegistryTransitions(unittest.TestCase):
         self.assertEqual(backlog_row["root_task_id"], task["task_id"])
         self.assertIn("Lease expired", backlog_row["last_failure_reason"])
 
+    def test_complete_terminal_failure_mirrors_backlog_runtime_failed(self):
+        from agent.governance.task_registry import create_task, claim_task, complete_task
+
+        bug_id = "OPT-BACKLOG-COMPLETE-FAIL-MIRROR"
+        self._insert_backlog(bug_id)
+        task = create_task(
+            self.conn,
+            "proj",
+            "pm task",
+            task_type="pm",
+            max_attempts=1,
+            metadata={"bug_id": bug_id},
+        )
+        self.conn.commit()
+        claimed, fence = claim_task(self.conn, "proj", "worker-1")
+        self.assertEqual(claimed["task_id"], task["task_id"])
+        self.conn.commit()
+
+        with mock.patch(
+            "agent.governance.task_registry._dispatch_auto_chain_failed",
+            return_value=None,
+        ):
+            result = complete_task(
+                self.conn,
+                task["task_id"],
+                status="failed",
+                result={"error": "Reached max turns (60)"},
+                project_id="proj",
+                fence_token=fence,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        backlog_row = self.conn.execute(
+            "SELECT runtime_state, chain_stage, current_task_id, root_task_id, last_failure_reason "
+            "FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        self.assertEqual(backlog_row["runtime_state"], "failed")
+        self.assertEqual(backlog_row["chain_stage"], "pm_failed")
+        self.assertEqual(backlog_row["current_task_id"], task["task_id"])
+        self.assertEqual(backlog_row["root_task_id"], task["task_id"])
+        self.assertIn("Reached max turns", backlog_row["last_failure_reason"])
+
+    def test_complete_retry_failure_mirrors_backlog_runtime_queued(self):
+        from agent.governance.task_registry import create_task, claim_task, complete_task
+
+        bug_id = "OPT-BACKLOG-COMPLETE-RETRY-MIRROR"
+        self._insert_backlog(bug_id)
+        task = create_task(
+            self.conn,
+            "proj",
+            "pm task",
+            task_type="pm",
+            max_attempts=2,
+            metadata={"bug_id": bug_id},
+        )
+        self.conn.commit()
+        claimed, fence = claim_task(self.conn, "proj", "worker-1")
+        self.assertEqual(claimed["task_id"], task["task_id"])
+        self.conn.commit()
+
+        with mock.patch(
+            "agent.governance.task_registry._dispatch_auto_chain_failed",
+            return_value=None,
+        ):
+            result = complete_task(
+                self.conn,
+                task["task_id"],
+                status="failed",
+                result={"error": "temporary model failure"},
+                project_id="proj",
+                fence_token=fence,
+            )
+
+        self.assertEqual(result["status"], "queued")
+        backlog_row = self.conn.execute(
+            "SELECT runtime_state, chain_stage, current_task_id, root_task_id, last_failure_reason "
+            "FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        self.assertEqual(backlog_row["runtime_state"], "queued")
+        self.assertEqual(backlog_row["chain_stage"], "pm_queued")
+        self.assertEqual(backlog_row["current_task_id"], task["task_id"])
+        self.assertEqual(backlog_row["root_task_id"], task["task_id"])
+        self.assertIn("temporary model failure", backlog_row["last_failure_reason"])
+
 
 class TestRetryOnDbLock(unittest.TestCase):
     """B5: Retry-with-backoff for sqlite3.OperationalError('database is locked')."""

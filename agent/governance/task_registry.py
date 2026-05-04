@@ -572,6 +572,32 @@ def complete_task(
         "retrying": exec_status == "queued",
         "completed_at": now,
     }
+    failure_reason = error_message or (result or {}).get("error", "")
+    mirror_task_type = task_type_val or "task"
+    if status == "failed" and exec_status in ("queued", "observer_hold"):
+        _mirror_backlog_runtime(
+            conn,
+            project_id,
+            task_id,
+            mirror_task_type,
+            row["metadata_json"],
+            f"{mirror_task_type}_{exec_status}",
+            runtime_state=exec_status,
+            failure_reason=failure_reason,
+            result=result or {},
+        )
+    elif exec_status in TERMINAL_STATUSES and exec_status != "succeeded":
+        _mirror_backlog_runtime(
+            conn,
+            project_id,
+            task_id,
+            mirror_task_type,
+            row["metadata_json"],
+            f"{mirror_task_type}_{exec_status}",
+            runtime_state=exec_status,
+            failure_reason=failure_reason,
+            result=result or {},
+        )
 
     # --- Subtask fan-in check (R6): when a merge task in a subtask group succeeds ---
     if exec_status == "succeeded" and task_type_val == "merge":

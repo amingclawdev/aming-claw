@@ -103,6 +103,49 @@ TASK_ROLE_MAP = _build_task_role_map()
 # Merge/test are script-based, see _execute_merge()/_execute_test()
 
 
+def _string_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip()]
+    if isinstance(value, tuple):
+        return [str(v) for v in value if str(v).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _dedupe_list(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _derive_target_files(metadata: dict) -> list[str]:
+    target_files = _string_list(metadata.get("target_files"))
+    if target_files:
+        return _dedupe_list(target_files)
+    cluster_payload = metadata.get("cluster_payload")
+    if isinstance(cluster_payload, dict):
+        primary_files = _string_list(cluster_payload.get("primary_files"))
+        if primary_files:
+            return _dedupe_list(primary_files)
+        return _dedupe_list(_string_list(cluster_payload.get("target_files")))
+    return []
+
+
+def _derive_test_files(metadata: dict) -> list[str]:
+    test_files = _string_list(metadata.get("test_files"))
+    if test_files:
+        return _dedupe_list(test_files)
+    cluster_report = metadata.get("cluster_report")
+    if isinstance(cluster_report, dict):
+        return _dedupe_list(_string_list(cluster_report.get("expected_test_files")))
+    return []
+
+
 def _parse_pytest_output(stdout: str, stderr: str, returncode: int) -> dict:
     """6c: Parse pytest output into structured test_report.
 
@@ -371,6 +414,9 @@ class ExecutorWorker:
         if task_type == "reconcile" or task_type.startswith("reconcile_"):
             return self._execute_reconcile(task_id, metadata)
 
+        target_files = _derive_target_files(metadata)
+        test_files = _derive_test_files(metadata)
+
         worktree_path = None
         branch_name = None
         execution_workspace = self.workspace
@@ -404,10 +450,14 @@ class ExecutorWorker:
             "task_id": task_id,
             "task_type": task_type,
             "project_id": self.project_id,
-            "target_files": metadata.get("target_files", []),
+            "metadata": metadata,
+            "operation_type": metadata.get("operation_type", ""),
+            "cluster_payload": metadata.get("cluster_payload", {}),
+            "cluster_report": metadata.get("cluster_report", {}),
+            "target_files": target_files,
             "changed_files": metadata.get("changed_files", []),
             "verification": metadata.get("verification", {}),
-            "test_files": metadata.get("test_files", []),
+            "test_files": test_files,
             "requirements": metadata.get("requirements", []),
             "acceptance_criteria": metadata.get("acceptance_criteria", []),
             "doc_impact": metadata.get("doc_impact", {}),
@@ -1331,6 +1381,50 @@ class ExecutorWorker:
             except Exception:
                 pass
             _bp_log("context + queue done")
+
+            metadata = context.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            operation_type = (
+                metadata.get("operation_type")
+                or context.get("operation_type")
+                or ""
+            )
+            if operation_type == "reconcile-cluster":
+                cluster_payload = (
+                    metadata.get("cluster_payload")
+                    or context.get("cluster_payload")
+                    or {}
+                )
+                cluster_report = (
+                    metadata.get("cluster_report")
+                    or context.get("cluster_report")
+                    or {}
+                )
+                cluster_scope = {
+                    "operation_type": operation_type,
+                    "cluster_fingerprint": metadata.get("cluster_fingerprint", ""),
+                    "reconcile_run_id": metadata.get("reconcile_run_id", ""),
+                    "target_files": context.get("target_files", []),
+                    "test_files": context.get("test_files", []),
+                    "cluster_payload": cluster_payload,
+                    "cluster_report": cluster_report,
+                }
+                cluster_json = json.dumps(
+                    cluster_scope, ensure_ascii=False, indent=2
+                )
+                if len(cluster_json) > 12000:
+                    cluster_json = cluster_json[:12000] + "\n...<truncated>"
+                parts.append("\n## Reconcile Cluster Source Of Truth")
+                parts.append(
+                    "Use this embedded cluster metadata as the audit scope. "
+                    "Do not widen scope beyond these files, and do not query "
+                    "Governance APIs to rediscover cluster_payload or "
+                    "cluster_report. Read at most 3-5 listed files only if "
+                    "needed to name precise requirements."
+                )
+                parts.append(f"```json\n{cluster_json}\n```")
+                _bp_log("reconcile cluster metadata embedded")
 
             # 4. Target file preview (help PM verify paths and understand scope)
             target_files = context.get("target_files", [])

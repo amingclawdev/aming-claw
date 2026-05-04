@@ -309,6 +309,11 @@ def file_cluster_as_backlog(
         or []
     )
     target_files = [str(f) for f in primary_files]
+    expected_test_files = [
+        str(f) for f in (cluster_report.get("expected_test_files") or [])
+    ]
+    metadata["target_files"] = target_files
+    metadata["test_files"] = expected_test_files
     backlog_payload = {
         "title": (
             f"Reconcile FeatureCluster {cluster_fp[:8]}: "
