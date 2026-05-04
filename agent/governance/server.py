@@ -1309,12 +1309,16 @@ def handle_reconcile_session_finalize(ctx: RequestContext):
             from .db import _resolve_project_dir
 
             project_dir = _resolve_project_dir(project_id)
+            candidate_graph_path = project_dir / "graph.rebase.candidate.json"
             result = reconcile_session.finalize_session(
                 conn,
                 project_id,
                 session_id,
                 graph_path=project_dir / "graph.json",
                 workspace_dir=Path(__file__).resolve().parents[2],
+                candidate_graph_path=(
+                    candidate_graph_path if candidate_graph_path.exists() else None
+                ),
                 full_rebase=bool(body.get("full_rebase", False)),
             )
         except reconcile_session.SessionClusterGateError as exc:

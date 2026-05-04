@@ -229,6 +229,99 @@ def test_finalize_failure_preserves_overlay_graph_and_session(conn, gov_dir):
     assert rs.get_active_session(conn, PROJECT_ID).session_id == sess.session_id
 
 
+def test_finalize_full_rebase_uses_candidate_hierarchy(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    (gov_dir / "new_module.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L7.99": {
+                "node_id": "L7.99",
+                "parent_layer": "L7",
+                "title": "Approved Leaf",
+                "primary": ["new_module.py"],
+            }
+        },
+    }), encoding="utf-8")
+    candidate = gov_dir / "graph.rebase.candidate.json"
+    candidate.write_text(json.dumps({
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [
+                {"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []},
+                {"id": "L3.1", "title": "Subsystem", "layer": "L3", "primary": []},
+                {"id": "L7.1", "title": "Candidate Leaf", "layer": "L7",
+                 "primary": ["new_module.py"]},
+            ],
+            "links": [
+                {"source": "L1.1", "target": "L3.1", "relation": "contains"},
+                {"source": "L3.1", "target": "L7.1", "relation": "contains"},
+            ],
+        },
+    }), encoding="utf-8")
+
+    result = rs.finalize_session(
+        conn, PROJECT_ID, sess.session_id,
+        governance_dir=gov_dir, workspace_dir=gov_dir,
+        candidate_graph_path=candidate, full_rebase=True,
+    )
+    graph = json.loads((gov_dir / "graph.json").read_text(encoding="utf-8"))
+    nodes = {n["id"]: n for n in graph["deps_graph"]["nodes"]}
+    links = graph["deps_graph"]["edges"]
+    assert set(nodes) == {"L1.1", "L3.1", "L7.99"}
+    assert {"source": "L3.1", "target": "L7.99", "relation": "contains"} in links
+    assert nodes["L7.99"]["metadata"]["candidate_node_ids"] == ["L7.1"]
+    assert nodes["L7.99"]["_deps"] == ["L3.1"]
+    assert result.materialization_counts["final_edge_count"] == 2
+
+
+def test_finalize_candidate_missing_overlay_primary_preserves_state(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    (gov_dir / "unseen.py").write_text("x = 1\n", encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L7.100": {
+                "node_id": "L7.100",
+                "parent_layer": "L7",
+                "title": "Unseen Leaf",
+                "primary": ["unseen.py"],
+            }
+        },
+    }), encoding="utf-8")
+    candidate = gov_dir / "graph.rebase.candidate.json"
+    candidate.write_text(json.dumps({
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [{"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []}],
+            "links": [],
+        },
+    }), encoding="utf-8")
+    graph_before = (gov_dir / "graph.json").read_bytes()
+    overlay_before = overlay.read_bytes()
+
+    with pytest.raises(ValueError, match="missing from candidate graph"):
+        rs.finalize_session(
+            conn, PROJECT_ID, sess.session_id,
+            governance_dir=gov_dir, workspace_dir=gov_dir,
+            candidate_graph_path=candidate, full_rebase=True,
+        )
+
+    assert overlay.read_bytes() == overlay_before
+    assert (gov_dir / "graph.json").read_bytes() == graph_before
+    assert rs.get_active_session(conn, PROJECT_ID).session_id == sess.session_id
+
+
 def test_finalize_blocks_until_reconcile_clusters_complete(conn, gov_dir):
     from governance import reconcile_deferred_queue as q
 

@@ -141,6 +141,10 @@ def _path_exists(path: str, *, workspace_dir: Optional[Path],
 
 def _graph_nodes_by_id(graph_doc: dict) -> dict[str, dict]:
     deps_graph = graph_doc.get("deps_graph") if isinstance(graph_doc, dict) else {}
+    return _node_link_nodes_by_id(deps_graph)
+
+
+def _node_link_nodes_by_id(deps_graph: dict) -> dict[str, dict]:
     raw_nodes = deps_graph.get("nodes") if isinstance(deps_graph, dict) else []
     out: dict[str, dict] = {}
     if isinstance(raw_nodes, dict):
@@ -162,6 +166,10 @@ def _graph_nodes_by_id(graph_doc: dict) -> dict[str, dict]:
 
 def _graph_links(graph_doc: dict) -> list[dict]:
     deps_graph = graph_doc.get("deps_graph") if isinstance(graph_doc, dict) else {}
+    return _node_link_links(deps_graph)
+
+
+def _node_link_links(deps_graph: dict) -> list[dict]:
     if not isinstance(deps_graph, dict):
         return []
     raw = deps_graph.get("edges")
@@ -298,9 +306,172 @@ def _node_link_document(nodes: dict[str, dict], links: list[dict]) -> dict:
     }
 
 
+def _edge_endpoints(edge: dict) -> tuple[str, str]:
+    return (
+        str(edge.get("source") or edge.get("from") or "").strip(),
+        str(edge.get("target") or edge.get("to") or "").strip(),
+    )
+
+
+def _canonical_edge(src: str, dst: str, edge: Optional[dict] = None) -> dict:
+    edge = dict(edge or {})
+    edge.pop("from", None)
+    edge.pop("to", None)
+    edge["source"] = src
+    edge["target"] = dst
+    return edge
+
+
+def _build_overlay_primary_map(overlay_nodes: dict[str, dict]) -> dict[str, str]:
+    primary_to_overlay: dict[str, str] = {}
+    duplicates: list[dict] = []
+    for overlay_id, node in overlay_nodes.items():
+        for primary in _primary_paths(node):
+            prior = primary_to_overlay.get(primary)
+            if prior and prior != overlay_id:
+                duplicates.append({
+                    "primary": primary,
+                    "first_node_id": prior,
+                    "second_node_id": overlay_id,
+                })
+            primary_to_overlay[primary] = overlay_id
+    if duplicates:
+        raise ValueError(f"overlay has duplicate primary coverage: {duplicates[:10]}")
+    return primary_to_overlay
+
+
+def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
+        overlay_nodes: dict[str, dict], session_id: str,
+        finalized_at: str) -> tuple[dict[str, dict], list[dict], dict]:
+    """Use candidate deps_graph as skeleton and overlay as approved leaves."""
+    candidate_doc = _load_json_object(candidate_graph_path)
+    candidate_graph = candidate_doc.get("deps_graph")
+    if not isinstance(candidate_graph, dict):
+        raise ValueError(f"candidate graph missing deps_graph: {candidate_graph_path}")
+    candidate_nodes = _node_link_nodes_by_id(candidate_graph)
+    candidate_links = _node_link_links(candidate_graph)
+    if not candidate_nodes:
+        raise ValueError(f"candidate graph has no nodes: {candidate_graph_path}")
+
+    primary_to_overlay = _build_overlay_primary_map(overlay_nodes)
+    candidate_by_primary: dict[str, list[str]] = {}
+    for candidate_id, candidate_node in candidate_nodes.items():
+        for primary in _primary_paths(candidate_node):
+            candidate_by_primary.setdefault(primary, []).append(candidate_id)
+
+    missing = [
+        primary for primary in sorted(primary_to_overlay)
+        if primary not in candidate_by_primary
+    ]
+    ambiguous = [
+        {"primary": primary, "candidate_node_ids": ids}
+        for primary, ids in sorted(candidate_by_primary.items())
+        if primary in primary_to_overlay and len(ids) > 1
+    ]
+    if missing:
+        raise ValueError(f"overlay primaries missing from candidate graph: {missing[:10]}")
+    if ambiguous:
+        raise ValueError(f"candidate graph has ambiguous primary coverage: {ambiguous[:10]}")
+
+    candidate_to_final: dict[str, str] = {}
+    overlay_to_candidates: dict[str, list[str]] = {}
+    final_nodes: dict[str, dict] = {}
+
+    for candidate_id, candidate_node in candidate_nodes.items():
+        primaries = _primary_paths(candidate_node)
+        if not primaries:
+            clean = dict(candidate_node)
+            clean["id"] = candidate_id
+            metadata = dict(clean.get("metadata") or {})
+            metadata["materialized_from_candidate_hierarchy"] = True
+            metadata["reconcile_session_id"] = session_id
+            metadata["materialized_at"] = finalized_at
+            clean["metadata"] = metadata
+            final_nodes[candidate_id] = clean
+            candidate_to_final[candidate_id] = candidate_id
+            continue
+        overlay_ids = {
+            primary_to_overlay[p] for p in primaries if p in primary_to_overlay
+        }
+        if not overlay_ids:
+            continue
+        if len(overlay_ids) > 1:
+            raise ValueError(
+                f"candidate node {candidate_id} maps to multiple overlay nodes: "
+                f"{sorted(overlay_ids)}")
+        overlay_id = next(iter(overlay_ids))
+        candidate_to_final[candidate_id] = overlay_id
+        overlay_to_candidates.setdefault(overlay_id, []).append(candidate_id)
+
+    for overlay_id, overlay_node in overlay_nodes.items():
+        candidate_ids = overlay_to_candidates.get(overlay_id, [])
+        if not candidate_ids:
+            continue
+        candidate_layers = {
+            str(candidate_nodes[cid].get("layer") or "") for cid in candidate_ids
+            if cid in candidate_nodes
+        }
+        node = _overlay_to_graph_node(
+            overlay_id, overlay_node,
+            session_id=session_id, finalized_at=finalized_at,
+        )
+        if len(candidate_layers) == 1:
+            layer = next(iter(candidate_layers))
+            if layer:
+                node["layer"] = layer
+                node["verify_level"] = _layer_verify_level(layer)
+        metadata = dict(node.get("metadata") or {})
+        metadata["candidate_node_ids"] = sorted(candidate_ids)
+        metadata["candidate_graph_path"] = str(candidate_graph_path)
+        metadata["materialized_with_candidate_hierarchy"] = True
+        node["metadata"] = metadata
+        final_nodes[overlay_id] = node
+
+    missing_overlay_ids = sorted(set(overlay_nodes) - set(final_nodes))
+    if missing_overlay_ids:
+        raise ValueError(
+            "overlay nodes were not represented in candidate graph: "
+            f"{missing_overlay_ids[:10]}")
+
+    links: list[dict] = []
+    seen_links: set[tuple[str, str, str]] = set()
+    for edge in candidate_links:
+        src, dst = _edge_endpoints(edge)
+        remapped_src = candidate_to_final.get(src)
+        remapped_dst = candidate_to_final.get(dst)
+        if not remapped_src or not remapped_dst or remapped_src == remapped_dst:
+            continue
+        relation = str(edge.get("relation") or edge.get("type") or "")
+        key = (remapped_src, remapped_dst, relation)
+        if key in seen_links:
+            continue
+        links.append(_canonical_edge(remapped_src, remapped_dst, edge))
+        seen_links.add(key)
+
+    deps_by_node: dict[str, list[str]] = {nid: [] for nid in final_nodes}
+    for edge in links:
+        src, dst = _edge_endpoints(edge)
+        if dst in deps_by_node and src not in deps_by_node[dst]:
+            deps_by_node[dst].append(src)
+    for nid, deps in deps_by_node.items():
+        final_nodes[nid]["_deps"] = deps
+        final_nodes[nid]["deps"] = deps
+
+    return final_nodes, links, {
+        "candidate_graph_path": str(candidate_graph_path),
+        "candidate_node_count": len(candidate_nodes),
+        "candidate_link_count": len(candidate_links),
+        "candidate_hierarchy_nodes": len([
+            n for n in final_nodes.values() if not _primary_paths(n)
+        ]),
+        "candidate_leaf_nodes_remapped": len(overlay_to_candidates),
+    }
+
+
 def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
         session_id: str, *, overlay_path: Path, graph_path: Path,
         workspace_dir: Optional[Path] = None, full_rebase: bool = False,
+        candidate_graph_path: Optional[Path] = None,
         finalized_at: Optional[str] = None) -> dict:
     """Compose overlay + carry-forward nodes and atomically write graph.json.
 
@@ -335,74 +506,84 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
     except sqlite3.Error:
         existing_state = {}
 
-    overlay_primary = {
-        p for node in overlay_nodes.values() for p in _primary_paths(node)
-    }
-    overlay_duplicates = _duplicate_primary_report(overlay_nodes)
-    if overlay_duplicates:
-        raise ValueError(f"overlay has duplicate primary coverage: {overlay_duplicates[:10]}")
+    primary_to_overlay = _build_overlay_primary_map(overlay_nodes)
+    overlay_primary = set(primary_to_overlay)
     if not overlay_primary and full_rebase:
         raise ValueError("full_rebase finalize refuses an empty overlay")
 
-    final_nodes: dict[str, dict] = {}
-    replaced_old: list[str] = []
-    archived_old: list[str] = []
-    carried_forward: list[str] = []
-
-    for old_id, old_node in old_nodes.items():
-        primaries = _primary_paths(old_node)
-        covered = bool(set(primaries) & overlay_primary)
-        exists_on_disk = (
-            not primaries
-            or all(_path_exists(p, workspace_dir=workspace_dir, graph_path=graph_path)
-                   for p in primaries)
+    candidate_meta: dict = {}
+    if full_rebase and candidate_graph_path and Path(candidate_graph_path).exists():
+        final_nodes, links, candidate_meta = _compose_candidate_aware_graph(
+            candidate_graph_path=Path(candidate_graph_path),
+            overlay_nodes=overlay_nodes,
+            session_id=session_id,
+            finalized_at=finalized_at,
         )
-        if covered:
-            replaced_old.append(old_id)
-            continue
-        if full_rebase or not exists_on_disk:
-            archived_old.append(old_id)
-            continue
-        clean = dict(old_node)
-        metadata = dict(clean.get("metadata") or {})
-        metadata["carry_forward_unverified"] = True
-        metadata["carry_forward_provenance"] = {
-            "session_id": session_id,
-            "source_node_id": old_id,
-            "original_status_at_carry": existing_state.get(old_id, {}).get("verify_status", ""),
-            "carried_at": finalized_at,
-        }
-        clean["metadata"] = metadata
-        final_nodes[old_id] = clean
-        carried_forward.append(old_id)
+        replaced_old = [
+            old_id for old_id, old_node in old_nodes.items()
+            if set(_primary_paths(old_node)) & overlay_primary
+        ]
+        archived_old = [old_id for old_id in old_nodes if old_id not in replaced_old]
+        carried_forward: list[str] = []
+    else:
+        final_nodes = {}
+        replaced_old = []
+        archived_old = []
+        carried_forward = []
 
-    for overlay_id, overlay_node in overlay_nodes.items():
-        if overlay_id in final_nodes:
-            raise ValueError(f"overlay node id collides with carried-forward node: {overlay_id}")
-        final_nodes[overlay_id] = _overlay_to_graph_node(
-            overlay_id, overlay_node,
-            session_id=session_id, finalized_at=finalized_at,
-        )
+        for old_id, old_node in old_nodes.items():
+            primaries = _primary_paths(old_node)
+            covered = bool(set(primaries) & overlay_primary)
+            exists_on_disk = (
+                not primaries
+                or all(_path_exists(p, workspace_dir=workspace_dir, graph_path=graph_path)
+                       for p in primaries)
+            )
+            if covered:
+                replaced_old.append(old_id)
+                continue
+            if full_rebase or not exists_on_disk:
+                archived_old.append(old_id)
+                continue
+            clean = dict(old_node)
+            metadata = dict(clean.get("metadata") or {})
+            metadata["carry_forward_unverified"] = True
+            metadata["carry_forward_provenance"] = {
+                "session_id": session_id,
+                "source_node_id": old_id,
+                "original_status_at_carry": existing_state.get(old_id, {}).get("verify_status", ""),
+                "carried_at": finalized_at,
+            }
+            clean["metadata"] = metadata
+            final_nodes[old_id] = clean
+            carried_forward.append(old_id)
 
-    links: list[dict] = []
-    final_id_set = set(final_nodes)
-    seen_links: set[tuple[str, str, str]] = set()
-    for edge in _graph_links(old_graph):
-        src = str(edge.get("source") or edge.get("from") or "").strip()
-        dst = str(edge.get("target") or edge.get("to") or "").strip()
-        if src in final_id_set and dst in final_id_set:
-            key = (src, dst, str(edge.get("relation") or edge.get("type") or ""))
-            if key not in seen_links:
-                links.append(edge)
-                seen_links.add(key)
-    for overlay_id, overlay_node in overlay_nodes.items():
-        for dep in overlay_node.get("deps") or []:
-            dep_id = str(dep).strip()
-            if dep_id and dep_id in final_id_set and dep_id != overlay_id:
-                key = (dep_id, overlay_id, "depends_on")
+        for overlay_id, overlay_node in overlay_nodes.items():
+            if overlay_id in final_nodes:
+                raise ValueError(f"overlay node id collides with carried-forward node: {overlay_id}")
+            final_nodes[overlay_id] = _overlay_to_graph_node(
+                overlay_id, overlay_node,
+                session_id=session_id, finalized_at=finalized_at,
+            )
+
+        links = []
+        final_id_set = set(final_nodes)
+        seen_links: set[tuple[str, str, str]] = set()
+        for edge in _graph_links(old_graph):
+            src, dst = _edge_endpoints(edge)
+            if src in final_id_set and dst in final_id_set:
+                key = (src, dst, str(edge.get("relation") or edge.get("type") or ""))
                 if key not in seen_links:
-                    links.append({"source": dep_id, "target": overlay_id, "relation": "depends_on"})
+                    links.append(_canonical_edge(src, dst, edge))
                     seen_links.add(key)
+        for overlay_id, overlay_node in overlay_nodes.items():
+            for dep in overlay_node.get("deps") or []:
+                dep_id = str(dep).strip()
+                if dep_id and dep_id in final_id_set and dep_id != overlay_id:
+                    key = (dep_id, overlay_id, "depends_on")
+                    if key not in seen_links:
+                        links.append({"source": dep_id, "target": overlay_id, "relation": "depends_on"})
+                        seen_links.add(key)
 
     final_doc = _node_link_document(final_nodes, links)
     validation_summary = _validate_materialized_graph(
@@ -476,8 +657,10 @@ def materialize_overlay_to_graph(conn: sqlite3.Connection, project_id: str,
             "archived_orphan_nodes": len(archived_old),
             "replaced_old_nodes": len(replaced_old),
             "final_node_count": len(final_nodes),
+            "final_edge_count": len(links),
             "duplicate_primary_count": validation_summary["duplicate_primary_count"],
         },
+        "candidate_materialization": candidate_meta,
         "duplicate_primary_examples": validation_summary["duplicate_primary_examples"],
         "full_rebase_flag": bool(full_rebase),
     }
@@ -601,6 +784,7 @@ def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str,
         governance_dir: Optional[Path] = None,
         graph_path: Optional[Path] = None,
         workspace_dir: Optional[Path] = None,
+        candidate_graph_path: Optional[Path] = None,
         full_rebase: bool = False,
         enforce_cluster_completion: bool = True) -> SessionFinalizationResult:
     if enforce_cluster_completion:
@@ -625,6 +809,7 @@ def finalize_session(conn: sqlite3.Connection, project_id: str, session_id: str,
         overlay_path=overlay,
         graph_path=target_graph,
         workspace_dir=workspace_dir,
+        candidate_graph_path=candidate_graph_path,
         full_rebase=full_rebase,
         finalized_at=now,
     )
