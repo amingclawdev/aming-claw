@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -797,6 +798,7 @@ def find_doc_coverage(
     Returns dict with doc_files (list of paths) and covered_lines (int).
     """
     doc_files: List[str] = []
+    ignored_doc_files: List[str] = []
     covered_lines = 0
 
     rel = os.path.relpath(primary_file, project_root) if os.path.isabs(primary_file) else primary_file
@@ -811,6 +813,10 @@ def find_doc_coverage(
             if not fname.endswith(".md"):
                 continue
             fpath = os.path.join(dirpath, fname)
+            doc_rel = _repo_relpath(project_root, fpath)
+            if _is_git_ignored_path(project_root, doc_rel):
+                ignored_doc_files.append(fpath)
+                continue
             try:
                 content = _read_file(fpath)
                 if rel_normalized in content or os.path.basename(primary_file) in content:
@@ -819,7 +825,57 @@ def find_doc_coverage(
             except OSError:
                 pass
 
-    return {"doc_files": doc_files, "covered_lines": covered_lines}
+    return {
+        "doc_files": doc_files,
+        "covered_lines": covered_lines,
+        "ignored_doc_files": ignored_doc_files,
+    }
+
+
+_GIT_IGNORED_CACHE: Dict[Tuple[str, str], bool] = {}
+_GIT_REPO_CACHE: Dict[str, bool] = {}
+
+
+def _is_git_repo(project_root: str) -> bool:
+    root = os.path.abspath(project_root)
+    cached = _GIT_REPO_CACHE.get(root)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        is_repo = proc.returncode == 0 and proc.stdout.strip().lower() == "true"
+    except (OSError, subprocess.SubprocessError):
+        is_repo = False
+    _GIT_REPO_CACHE[root] = is_repo
+    return is_repo
+
+
+def _is_git_ignored_path(project_root: str, rel_path: str) -> bool:
+    """Return True when a path will be absent from git-created chain worktrees."""
+    normalized = str(rel_path or "").replace("\\", "/").strip("/")
+    if not normalized or not _is_git_repo(project_root):
+        return False
+    key = (os.path.abspath(project_root), normalized)
+    cached = _GIT_IGNORED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            ["git", "-C", os.path.abspath(project_root), "check-ignore", "-q", "--", normalized],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        ignored = proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ignored = False
+    _GIT_IGNORED_CACHE[key] = ignored
+    return ignored
 
 
 # ---------------------------------------------------------------------------

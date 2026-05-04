@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -157,6 +158,29 @@ class TestCoverageLookup:
         assert isinstance(result["doc_files"], list)
         assert isinstance(result["covered_lines"], int)
         assert len(result["doc_files"]) >= 1
+
+    def test_find_doc_coverage_excludes_git_ignored_docs(self):
+        """Ignored docs are not visible in chain worktrees, so exclude them."""
+        project = _make_temp_project({
+            ".gitignore": "docs/dev/\n",
+            "agent/mymod.py": "def hello():\n    pass\n",
+            "docs/ref.md": "# Reference\nSee agent/mymod.py for details.\n",
+            "docs/dev/ignored.md": "# Scratch\nSee agent/mymod.py for details.\n",
+        })
+        try:
+            init = subprocess.run(["git", "init"], cwd=project, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pytest.skip("git unavailable")
+        if init.returncode != 0:
+            pytest.skip("git init unavailable")
+
+        result = find_doc_coverage(project, os.path.join(project, "agent", "mymod.py"))
+        doc_files = {os.path.relpath(p, project).replace(os.sep, "/") for p in result["doc_files"]}
+        ignored = {os.path.relpath(p, project).replace(os.sep, "/") for p in result["ignored_doc_files"]}
+
+        assert "docs/ref.md" in doc_files
+        assert "docs/dev/ignored.md" not in doc_files
+        assert "docs/dev/ignored.md" in ignored
 
 
 class TestDiffAgainstExistingGraph:
