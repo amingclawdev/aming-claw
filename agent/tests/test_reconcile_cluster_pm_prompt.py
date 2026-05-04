@@ -42,7 +42,7 @@ def test_reconcile_cluster_pm_prompt_embeds_cluster_metadata(tmp_path, monkeypat
             "primary_files": ["agent/governance/server.py"],
             "candidate_nodes": [
                 {
-                    "node_id": None,
+                    "node_id": "L7.1",
                     "title": "Governance server",
                     "primary": "agent/governance/server.py",
                 }
@@ -95,6 +95,8 @@ def test_reconcile_cluster_pm_prompt_embeds_cluster_metadata(tmp_path, monkeypat
 
     assert "## Reconcile Cluster Source Of Truth" in prompt
     assert '"cluster_fingerprint": "fp-prompt1"' in prompt
+    assert '"node_id": "L7.1"' in prompt
+    assert "copy that node_id exactly" in prompt
     assert '"purpose": "Audit governance server surface"' in prompt
     assert "Do not widen scope beyond these files" in prompt
     assert "### agent/governance/server.py" in prompt

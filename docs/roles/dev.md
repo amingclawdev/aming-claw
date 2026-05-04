@@ -28,7 +28,7 @@ Body: {"project_id": "<pid>", "status": "idle"}
 
 ## Task Workflow
 
-> **Reconcile-cluster note:** When the dev task carries `metadata.operation_type == "reconcile-cluster"`, the PRD originates from a reconcile-driven cluster audit (always-bootstrap mode). Dev MUST update every file listed in PRD `doc_impact` AND every file listed in PRD `test_files` — code changes alone do not satisfy the audit contract; docs and tests are first-class deliverables that pin the `ClusterReport.purpose`. Additionally, when PM `proposed_nodes` contain null IDs (the default for reconcile-cluster), dev MUST leave `graph_delta=None` in the result (omit the field). The auto-inferrer Rule J + the ID allocator materialise the graph mutations from `doc_impact` + `test_files` + `changed_files` automatically; emitting a partial `graph_delta` with placeholder IDs will be rejected.
+> **Reconcile-cluster note:** When the dev task carries `metadata.operation_type == "reconcile-cluster"`, the PRD originates from a reconcile-driven cluster audit (always-bootstrap mode). Treat PRD `doc_impact` and `test_files` as audit evidence: inspect or update them according to acceptance criteria, but do not create churn solely because a path is listed. PM `proposed_nodes` must preserve concrete candidate node IDs; dev MUST return `graph_delta.creates` mirroring those nodes one-for-one by `node_id` and `primary`, and MUST NOT mutate `graph.json` directly. Gatekeeper applies `graph.rebase.overlay.json` after QA.
 
 ### 1. Query memory before starting
 

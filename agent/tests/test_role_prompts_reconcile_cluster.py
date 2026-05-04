@@ -30,8 +30,8 @@ def test_pm_role_prompt_mentions_reconcile_cluster_operation_type():
     The PM Python-default prompt MUST contain the literal substring
     'reconcile-cluster', a 'Reconcile cluster audit' heading, the
     bootstrap-only directive 'MUST NOT declare removed_nodes', and
-    instruct PM to read both metadata.cluster_payload and
-    metadata.cluster_report.
+    instruct PM to preserve concrete candidate node ids from
+    metadata.cluster_payload/metadata.cluster_report.
     """
     pm_prompt = _DEFAULT_ROLE_PROMPTS["pm"]
     assert "reconcile-cluster" in pm_prompt, (
@@ -45,6 +45,9 @@ def test_pm_role_prompt_mentions_reconcile_cluster_operation_type():
     )
     assert "metadata.cluster_report" in pm_prompt, (
         "PM prompt must instruct reading metadata.cluster_report"
+    )
+    assert "copy that node_id exactly" in pm_prompt, (
+        "PM prompt must preserve concrete candidate node ids"
     )
 
 
@@ -82,7 +85,7 @@ def test_pm_prompt_forbids_removed_nodes_for_reconcile_cluster():
 
 def test_dev_role_prompt_covers_reconcile_cluster_doc_test_responsibility():
     """AC4 + AC5 + AC7: Dev prompt + dev doc carry the reconcile-cluster
-    contract (Reconcile cluster work heading, graph_delta=None directive,
+    contract (Reconcile cluster work heading, graph_delta.creates directive,
     doc_impact + test_files responsibilities)."""
     dev_prompt = _DEFAULT_ROLE_PROMPTS["dev"]
     assert "reconcile-cluster" in dev_prompt, (
@@ -91,8 +94,8 @@ def test_dev_role_prompt_covers_reconcile_cluster_doc_test_responsibility():
     assert "Reconcile cluster work" in dev_prompt, (
         "Dev prompt missing 'Reconcile cluster work' heading"
     )
-    assert "graph_delta=None" in dev_prompt, (
-        "Dev prompt missing literal 'graph_delta=None'"
+    assert "graph_delta.creates" in dev_prompt, (
+        "Dev prompt missing literal 'graph_delta.creates'"
     )
     assert "doc_impact" in dev_prompt, (
         "Dev prompt must instruct dev to update doc_impact for reconcile-cluster"
@@ -111,8 +114,8 @@ def test_dev_role_prompt_covers_reconcile_cluster_doc_test_responsibility():
     assert "reconcile-cluster" in workflow_body, (
         "docs/roles/dev.md '## Task Workflow' missing 'reconcile-cluster'"
     )
-    assert "graph_delta=None" in workflow_body, (
-        "docs/roles/dev.md '## Task Workflow' missing 'graph_delta=None'"
+    assert "graph_delta.creates" in workflow_body, (
+        "docs/roles/dev.md '## Task Workflow' missing 'graph_delta.creates'"
     )
     assert "doc_impact" in workflow_body, (
         "docs/roles/dev.md '## Task Workflow' missing 'doc_impact'"

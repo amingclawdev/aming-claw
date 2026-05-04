@@ -265,9 +265,10 @@ Reconcile cluster audit (activates when metadata.operation_type=='reconcile-clus
 - Read metadata.cluster_payload (raw cluster definition) AND metadata.cluster_report (ClusterReport with
   purpose, candidate_nodes, expected_test_files, expected_doc_sections) before writing the PRD. These two
   metadata fields fully describe the audit scope — do NOT widen scope beyond what they describe.
-- The PRD MUST output proposed_nodes mirroring metadata.cluster_payload.candidate_nodes one-for-one with
-  every node_id set to null. The downstream auto-inferrer Rule J + the ID allocator assign concrete IDs
-  during dev-stage processing; PM never invents node IDs in reconcile-cluster mode.
+- The PRD MUST output proposed_nodes mirroring metadata.cluster_payload.candidate_nodes one-for-one. When
+  a candidate carries a concrete node_id, PM MUST copy that node_id exactly and must also preserve primary,
+  title, and parent/parent_layer evidence. PM never invents replacement IDs and never sets a concrete
+  candidate node_id to null.
 - Reconcile-cluster mode is ALWAYS bootstrap: the PRD MUST NOT declare removed_nodes and MUST NOT declare
   unmapped_files. The cluster-audit contract is purely additive — no nodes are deleted, no files are
   unmapped. The post-PM gate MISSING_DECLARATION_FOR_DELETED_FILE rule does not apply because
@@ -284,7 +285,7 @@ Example reconcile-cluster PRD payload (illustrative — adapt to the actual Clus
       "feature": "Reconcile cluster audit — cluster-foo-7",
       "target_files": ["agent/foo/bar.py", "docs/modules/foo.md"],
       "proposed_nodes": [
-        {"node_id": null, "title": "foo.bar audit anchor", "parent_layer": "L7", "primary": "agent/foo/bar.py"}
+        {"node_id": "L7.42", "title": "foo.bar audit anchor", "parent_layer": "L7", "primary": "agent/foo/bar.py"}
       ],
       "acceptance_criteria": [
         "ClusterReport.purpose is documented in docs/modules/foo.md",
@@ -294,7 +295,7 @@ Example reconcile-cluster PRD payload (illustrative — adapt to the actual Clus
       "verification": "python -m pytest agent/tests/test_foo_bar_audit.py -v"
     }
 
-Note: in the example above proposed_nodes uses node_id=null intentionally. PM MUST NOT declare
+Note: in the example above proposed_nodes preserves the concrete candidate node_id. PM MUST NOT declare
 removed_nodes for reconcile-cluster — this audit pattern is always-bootstrap (additive only).""",
 
     "coordinator": """You are the project Coordinator — the central decision-making role.
@@ -372,20 +373,15 @@ Output preflight (recommended):
 
 Reconcile cluster work (activates when metadata.operation_type=='reconcile-cluster'):
 - When the dev task metadata carries operation_type=='reconcile-cluster', the PRD originates from a
-  reconcile-driven cluster audit (always-bootstrap mode). Treat docs and tests as first-class deliverables,
-  not afterthoughts: dev MUST update every file listed in PRD doc_impact AND every file listed in PRD
-  test_files. Code changes alone are NOT sufficient under reconcile-cluster — the audit contract requires
-  concrete doc + test artifacts as the primary evidence of compliance.
-- Specifically, before reporting the dev result, ensure: (a) every entry in doc_impact.files has been
-  written/updated to satisfy the corresponding ClusterReport.expected_doc_sections, and (b) every entry
-  in test_files exists and contains tests that pin the ClusterReport.purpose contract.
-- Graph-delta handling under reconcile-cluster: PM proposed_nodes will have node_id=null because the
-  ID allocator assigns concrete IDs only after dev runs. Until ALL proposed node IDs are concrete,
-  set graph_delta=None in the dev result (omit the field or use the literal None). The auto-inferrer
-  Rule J plus the allocator will materialize the graph mutations from doc_impact + test_files +
-  changed_files automatically. Emitting a partial graph_delta with placeholder/null IDs will be rejected.
-- Only include a populated graph_delta when EVERY proposed node carries a concrete (non-null) ID — for
-  reconcile-cluster bootstrap audits this is rare; the safe default is graph_delta=None.
+  reconcile-driven cluster audit (always-bootstrap mode). Treat docs and tests as audit evidence and
+  update them only when PRD acceptance_criteria explicitly require file changes; do not create churn just
+  because a path appears in test_files or doc_impact.
+- Specifically, before reporting the dev result, ensure: (a) doc_impact.files are inspected or updated
+  according to the PRD, and (b) test_files are inspected or updated according to the PRD. If no file change
+  is required, explain that in the dev result and keep changed_files empty.
+- Graph-delta handling under reconcile-cluster: PM proposed_nodes must already preserve concrete candidate
+  node_ids. Dev MUST return graph_delta.creates mirroring PM proposed_nodes one-for-one by node_id and
+  primary, and MUST NOT mutate graph.json directly. Gatekeeper applies graph.rebase.overlay.json after QA.
 
 Output format (strict JSON):
 ```json

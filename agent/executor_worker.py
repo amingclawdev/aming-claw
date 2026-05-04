@@ -1424,6 +1424,15 @@ class ExecutorWorker:
                     "needed to name precise requirements."
                 )
                 parts.append(f"```json\n{cluster_json}\n```")
+                parts.append(
+                    "Reconcile-cluster PRD contract: proposed_nodes MUST mirror "
+                    "cluster_payload.candidate_nodes one-for-one. When a "
+                    "candidate node has a concrete node_id, copy that node_id "
+                    "exactly; never set it to null or invent a replacement. "
+                    "Also preserve primary, title, and parent/parent_layer "
+                    "evidence so Dev can emit graph_delta.creates for the "
+                    "overlay without touching graph.json."
+                )
                 _bp_log("reconcile cluster metadata embedded")
 
             # 4. Target file preview (help PM verify paths and understand scope)
@@ -1486,6 +1495,7 @@ class ExecutorWorker:
                 '  "verification": {"method": "automated test", "command": "pytest agent/tests/"}, // MANDATORY\n'
                 '  "proposed_nodes": [                        // soft-mandatory (or skip_reasons)\n'
                 '    {\n'
+                '      "node_id": "L7.x",                      // required when supplied by reconcile-cluster candidate_nodes\n'
                 '      "parent_layer": 7,\n'
                 '      "title": "Node title",\n'
                 '      "deps": ["L3.2"],\n'

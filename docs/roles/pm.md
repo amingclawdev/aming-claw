@@ -95,7 +95,7 @@ PM MUST read both before drafting the PRD. Do not widen scope beyond what these 
 
 ### Output rules
 
-1. `proposed_nodes` mirrors `cluster_payload.candidate_nodes` one-for-one with **every `node_id` set to `null`**. The downstream auto-inferrer Rule J + the ID allocator assign concrete IDs during dev-stage processing — PM never invents node IDs in reconcile-cluster mode.
+1. `proposed_nodes` mirrors `cluster_payload.candidate_nodes` one-for-one. When a candidate carries a concrete `node_id`, PM MUST copy that `node_id` exactly and preserve `primary`, `title`, and `parent`/`parent_layer` evidence. PM never invents replacement IDs and never sets a concrete candidate `node_id` to `null`.
 2. **Always-bootstrap:** the PRD MUST NOT declare `removed_nodes` and MUST NOT declare `unmapped_files`. The cluster-audit contract is purely additive. The post-PM `MISSING_DECLARATION_FOR_DELETED_FILE` rule does not apply because `acceptance_criteria` should NOT contain delete-keywords (`DELETE`, `remove`, `replaces`, `replaced_by`).
 3. `acceptance_criteria` reflect the `ClusterReport` contract: each criterion references `purpose`, lists every entry from `expected_test_files`, and lists every entry from `expected_doc_sections`. Criteria must be concretely testable (substring scan, file-exists check, pytest-runnable assertion).
 
@@ -107,7 +107,7 @@ PM MUST read both before drafting the PRD. Do not widen scope beyond what these 
   "feature": "Reconcile cluster audit — cluster-foo-7",
   "target_files": ["agent/foo/bar.py", "docs/modules/foo.md"],
   "proposed_nodes": [
-    {"node_id": null, "title": "foo.bar audit anchor", "parent_layer": "L7", "primary": "agent/foo/bar.py"}
+    {"node_id": "L7.42", "title": "foo.bar audit anchor", "parent_layer": "L7", "primary": "agent/foo/bar.py"}
   ],
   "acceptance_criteria": [
     "ClusterReport.purpose is documented in docs/modules/foo.md",
@@ -118,7 +118,7 @@ PM MUST read both before drafting the PRD. Do not widen scope beyond what these 
 }
 ```
 
-In the example above, `proposed_nodes` deliberately uses `node_id=null`. The dev stage's auto-inferrer Rule J + the allocator handle ID assignment after dev runs; PM never speculates IDs.
+In the example above, `proposed_nodes` preserves the concrete candidate `node_id`. The dev stage must mirror that ID in `graph_delta.creates`; Gatekeeper applies the overlay without mutating `graph.json` during the active rebase session.
 
 ## Gate: `_gate_post_pm`
 

@@ -2573,13 +2573,14 @@ def _normalize_related_nodes(related_nodes):
 
 def _render_dev_contract_prompt(source_task_id, metadata):
     """Render the structured Dev contract from PM/task metadata."""
+    is_cluster = is_reconcile_cluster_task(metadata)
     target_files = metadata.get("target_files", [])
     requirements = metadata.get("requirements", [])
     criteria = metadata.get("acceptance_criteria", [])
     verification = metadata.get("verification", {})
 
     parts = [
-        f"Implement per PRD from {source_task_id}.\n",
+        f"{'Process reconcile-cluster PRD' if is_cluster else 'Implement per PRD'} from {source_task_id}.\n",
         f"target_files: {json.dumps(target_files)}",
         f"requirements: {json.dumps(requirements, ensure_ascii=False)}",
         f"acceptance_criteria: {json.dumps(criteria, ensure_ascii=False)}",
@@ -2590,23 +2591,43 @@ def _render_dev_contract_prompt(source_task_id, metadata):
 
     test_files = metadata.get("test_files", [])
     if test_files:
-        parts.append(f"\nTest files to create/modify: {json.dumps(test_files)}")
+        if is_cluster:
+            parts.append(
+                "\nCluster test evidence files to inspect or update only when "
+                f"acceptance_criteria explicitly require file changes: {json.dumps(test_files)}"
+            )
+        else:
+            parts.append(f"\nTest files to create/modify: {json.dumps(test_files)}")
 
     doc_impact = metadata.get("doc_impact", {})
     if doc_impact:
-        parts.append(f"\nDoc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+        if is_cluster:
+            parts.append(
+                "\nCluster doc evidence to inspect or update only when "
+                f"acceptance_criteria explicitly require file changes: {json.dumps(doc_impact, ensure_ascii=False)}"
+            )
+        else:
+            parts.append(f"\nDoc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
 
     # R5: Document optional graph_delta field for dev results (not required)
     proposed_nodes = metadata.get("proposed_nodes", [])
     if proposed_nodes:
-        parts.append(
-            "\nOptional: Your result JSON MAY include a `graph_delta` field to propose graph changes. "
-            "Shape: {\"creates\": [{\"node_id\": \"...\", \"parent_layer\": \"...\", \"title\": \"...\", "
-            "\"deps\": [...], \"primary\": \"...\", \"description\": \"...\"}], "
-            "\"updates\": [{\"node_id\": \"...\", \"fields\": {}}], "
-            "\"links\": [{\"from_node\": \"...\", \"to_node\": \"...\", \"relation\": \"...\"}]}. "
-            "All sub-arrays default to []. Pure-refactor tasks may omit this field entirely."
-        )
+        if is_cluster:
+            parts.append(
+                "\nRequired for reconcile-cluster: return `graph_delta.creates` mirroring "
+                "`proposed_nodes` one-for-one. Preserve each concrete node_id/candidate_node_id, "
+                "primary, title, deps, and parent_layer/parent evidence. Do not mutate graph.json; "
+                "Gatekeeper writes graph.rebase.overlay.json only after QA."
+            )
+        else:
+            parts.append(
+                "\nOptional: Your result JSON MAY include a `graph_delta` field to propose graph changes. "
+                "Shape: {\"creates\": [{\"node_id\": \"...\", \"parent_layer\": \"...\", \"title\": \"...\", "
+                "\"deps\": [...], \"primary\": \"...\", \"description\": \"...\"}], "
+                "\"updates\": [{\"node_id\": \"...\", \"fields\": {}}], "
+                "\"links\": [{\"from_node\": \"...\", \"to_node\": \"...\", \"relation\": \"...\"}]}. "
+                "All sub-arrays default to []. Pure-refactor tasks may omit this field entirely."
+            )
 
     return "\n".join(parts)
 
@@ -2736,6 +2757,17 @@ def _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
             "preflight: pm result validation passed with %d warning(s) for %s",
             len(vr.warnings), task_id,
         )
+    if is_reconcile_cluster_task(metadata):
+        cluster_ok, cluster_reason = preflight_reconcile_cluster_pm(
+            result or {},
+            candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+        )
+        if not cluster_ok:
+            log.warning(
+                "preflight: reconcile-cluster PM contract FAILED for task %s: %s",
+                task_id, cluster_reason,
+            )
+            return False
     return True
 
 
@@ -4118,6 +4150,14 @@ def _gate_post_pm(conn, project_id, result, metadata):
     if soft_missing:
         return False, f"PRD fields missing without skip_reasons: {soft_missing}. Provide the field OR explain in skip_reasons why it's not needed."
 
+    if is_reconcile_cluster_task(metadata):
+        cluster_ok, cluster_reason = preflight_reconcile_cluster_pm(
+            result,
+            candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+        )
+        if not cluster_ok:
+            return False, cluster_reason
+
     # === Subtask validation (R4) ===
     subtasks = result.get("subtasks") or prd.get("subtasks")
     if subtasks:
@@ -5180,20 +5220,22 @@ def _build_dev_prompt(task_id, result, metadata):
                     requirements = parent_result.get("requirements", requirements)
         except Exception:
             pass
-    # 5b: Merge graph-derived docs into doc_impact
-    graph_docs = _get_graph_doc_associations(
-        metadata.get("project_id", "aming-claw"), target_files)
-    if graph_docs:
-        if isinstance(doc_impact, dict):
-            existing = set(doc_impact.get("files", []))
-            new_docs = [d for d in graph_docs if d not in existing]
-            if new_docs:
-                doc_impact = dict(doc_impact)  # copy
-                doc_impact["files"] = list(existing | set(new_docs))
-                doc_impact.setdefault("changes", []).append(
-                    f"Graph-linked docs added: {new_docs[:5]}")
-        else:
-            doc_impact = {"files": graph_docs, "changes": ["Graph-derived doc associations"]}
+    # 5b: Merge graph-derived docs into doc_impact. Reconcile-cluster rebuilds
+    # a candidate graph, so old graph doc links are advisory noise here.
+    if not is_reconcile_cluster_task(metadata):
+        graph_docs = _get_graph_doc_associations(
+            metadata.get("project_id", "aming-claw"), target_files)
+        if graph_docs:
+            if isinstance(doc_impact, dict):
+                existing = set(doc_impact.get("files", []))
+                new_docs = [d for d in graph_docs if d not in existing]
+                if new_docs:
+                    doc_impact = dict(doc_impact)  # copy
+                    doc_impact["files"] = list(existing | set(new_docs))
+                    doc_impact.setdefault("changes", []).append(
+                        f"Graph-linked docs added: {new_docs[:5]}")
+            else:
+                doc_impact = {"files": graph_docs, "changes": ["Graph-derived doc associations"]}
 
     out_meta = {
         **metadata,  # preserves skip_doc_check, changed_files, related_nodes, etc.
@@ -6008,7 +6050,115 @@ def _cluster_normalize_layer(value):
     return f"L{int(m.group(1))}"
 
 
-def preflight_reconcile_cluster_pm(prd):
+def _cluster_payload_candidate_nodes(metadata):
+    """Return candidate_nodes embedded in reconcile-cluster metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    payload = metadata.get("cluster_payload")
+    if isinstance(payload, dict) and isinstance(payload.get("candidate_nodes"), list):
+        return payload.get("candidate_nodes") or []
+    report = metadata.get("cluster_report")
+    if isinstance(report, dict) and isinstance(report.get("candidate_nodes"), list):
+        return report.get("candidate_nodes") or []
+    return []
+
+
+def _cluster_parent_layer_hint(item):
+    """Return a comparable parent/layer hint for candidate-vs-PRD checks."""
+    if not isinstance(item, dict):
+        return ""
+    raw = (
+        item.get("parent_layer")
+        or item.get("parent")
+        or item.get("parent_id")
+        or item.get("layer")
+        or ""
+    )
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    m = re.match(r"^[Ll](\d+)(?:\.\d+)?$", text)
+    if m:
+        return f"L{int(m.group(1))}"
+    return _cluster_normalize_layer(text)
+
+
+def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
+    """Ensure PM preserves concrete candidate ids before Dev sees the task."""
+    if not candidate_nodes:
+        return True, "ok"
+
+    expected = {}
+    for idx, item in enumerate(candidate_nodes or []):
+        if not isinstance(item, dict):
+            continue
+        node_id = _cluster_explicit_node_id(item)
+        if not node_id:
+            continue
+        expected[node_id] = {
+            "primary": tuple(_cluster_normalize_primary(item.get("primary"))),
+            "title": str(item.get("title") or "").strip(),
+            "parent": _cluster_parent_layer_hint(item),
+            "index": idx,
+        }
+    if not expected:
+        return True, "ok"
+
+    seen = {}
+    missing_id_indexes = []
+    for idx, item in enumerate(proposed or []):
+        if not isinstance(item, dict):
+            return False, f"proposed_nodes[{idx}] is not an object"
+        node_id = _cluster_explicit_node_id(item)
+        if not node_id:
+            missing_id_indexes.append(idx)
+            continue
+        seen[node_id] = item
+    if missing_id_indexes:
+        return False, (
+            "FATAL preflight (reconcile-cluster): proposed_nodes must preserve "
+            f"candidate node_id; missing/null indexes={missing_id_indexes}"
+        )
+
+    expected_ids = set(expected)
+    seen_ids = set(seen)
+    if expected_ids != seen_ids:
+        return False, (
+            "FATAL preflight (reconcile-cluster): proposed_nodes node_id set must "
+            f"match cluster_payload.candidate_nodes exactly; missing={sorted(expected_ids - seen_ids)} "
+            f"extra={sorted(seen_ids - expected_ids)}"
+        )
+
+    for node_id, candidate in expected.items():
+        proposed_node = seen[node_id]
+        cand_primary = candidate["primary"]
+        prop_primary = tuple(_cluster_normalize_primary(proposed_node.get("primary")))
+        if cand_primary != prop_primary:
+            return False, (
+                "FATAL preflight (reconcile-cluster): proposed_nodes primary "
+                f"for {node_id} must match candidate; expected={list(cand_primary)} "
+                f"actual={list(prop_primary)}"
+            )
+        cand_title = candidate["title"]
+        prop_title = str(proposed_node.get("title") or "").strip()
+        if cand_title and prop_title != cand_title:
+            return False, (
+                "FATAL preflight (reconcile-cluster): proposed_nodes title "
+                f"for {node_id} must match candidate; expected={cand_title!r} "
+                f"actual={prop_title!r}"
+            )
+        cand_parent = candidate["parent"]
+        prop_parent = _cluster_parent_layer_hint(proposed_node)
+        if cand_parent and prop_parent and cand_parent != prop_parent:
+            return False, (
+                "FATAL preflight (reconcile-cluster): proposed_nodes parent/layer "
+                f"for {node_id} must match candidate; expected={cand_parent!r} "
+                f"actual={prop_parent!r}"
+            )
+    return True, "ok"
+
+
+def preflight_reconcile_cluster_pm(prd, candidate_nodes=None):
     """Stage 1 preflight — PM PRD must declare proposed_nodes for reconcile-cluster.
 
     Returns (passed: bool, reason: str).  Any FATAL outcome here is a preflight
@@ -6021,11 +6171,19 @@ def preflight_reconcile_cluster_pm(prd):
             "proposed_nodes cannot be validated"
         )
     proposed = prd.get("proposed_nodes", [])
+    nested_prd = prd.get("prd") if isinstance(prd.get("prd"), dict) else {}
+    if not proposed and nested_prd:
+        proposed = nested_prd.get("proposed_nodes", [])
     if not proposed or not isinstance(proposed, list):
         return False, (
             "FATAL preflight (reconcile-cluster): PM PRD must declare a non-empty "
             "proposed_nodes list before merge can apply the cluster overlay"
         )
+    candidate_passed, candidate_reason = _validate_cluster_prd_against_candidates(
+        proposed, candidate_nodes or [],
+    )
+    if not candidate_passed:
+        return False, candidate_reason
     return True, "ok"
 
 
@@ -6539,7 +6697,10 @@ def apply_reconcile_cluster_to_overlay(
     cluster_fp = _cluster_compute_fingerprint(metadata, (dev_result or {}).get("graph_delta", {}).get("creates", []))
 
     # --- Stage 1: PM PRD validation -----------------------------------------
-    pm_passed, pm_reason = preflight_reconcile_cluster_pm(pm_prd)
+    pm_passed, pm_reason = preflight_reconcile_cluster_pm(
+        pm_prd,
+        candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+    )
     if not pm_passed:
         return {
             "applied": False,
