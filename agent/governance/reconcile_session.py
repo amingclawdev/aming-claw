@@ -79,6 +79,89 @@ class RestoreResult:
     node_state_rows: int
 
 
+def _latest_file_inventory_rows(
+        conn: sqlite3.Connection, project_id: str, session_id: str) -> list[dict]:
+    """Load latest reconcile file inventory rows for doc-index signoff."""
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    run_id = ""
+    try:
+        row = conn.execute(
+            "SELECT run_id FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+            (project_id, session_id),
+        ).fetchone()
+        run_id = row["run_id"] if row and row["run_id"] else ""
+    except sqlite3.Error:
+        run_id = ""
+    params: tuple[Any, ...]
+    if run_id:
+        sql = (
+            "SELECT path, file_kind, language, sha256, scan_status, cluster_id, "
+            "candidate_node_id, attached_to, reason, decision, updated_at "
+            "FROM reconcile_file_inventory WHERE project_id=? AND run_id=? "
+            "ORDER BY path"
+        )
+        params = (project_id, run_id)
+    else:
+        sql = (
+            "SELECT path, file_kind, language, sha256, scan_status, cluster_id, "
+            "candidate_node_id, attached_to, reason, decision, updated_at "
+            "FROM reconcile_file_inventory WHERE project_id=? "
+            "ORDER BY updated_at DESC, path"
+        )
+        params = (project_id,)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(row) for row in rows]
+
+
+def generate_final_doc_index_report(
+        conn: sqlite3.Connection, project_id: str, session_id: str, *,
+        governance_dir: Optional[Path] = None,
+        candidate_graph_path: Optional[Path] = None,
+        overlay_path: Optional[Path] = None,
+        output_dir: Optional[Path] = None,
+        file_inventory_rows: Optional[list[dict]] = None) -> dict:
+    """Generate final doc/test/source coverage artifacts before signoff.
+
+    This is intentionally review-only: it writes report artifacts but never
+    mutates graph.json or session state.
+    """
+    gov_dir = _gov(governance_dir)
+    candidate = Path(candidate_graph_path) if candidate_graph_path else gov_dir / "graph.rebase.candidate.json"
+    overlay = Path(overlay_path) if overlay_path else _overlay_path(governance_dir)
+    out_dir = Path(output_dir) if output_dir else gov_dir
+    rows = file_inventory_rows
+    if rows is None:
+        rows = _latest_file_inventory_rows(conn, project_id, session_id)
+    from .reconcile_doc_index import write_final_doc_index
+    report = write_final_doc_index(
+        project_id=project_id,
+        session_id=session_id,
+        candidate_graph_path=candidate,
+        overlay_path=overlay,
+        output_dir=out_dir,
+        file_inventory_rows=rows,
+    )
+    try:
+        conn.execute(
+            "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, session_id, "reconcile.session.doc_index_generated",
+             json.dumps({
+                 "project_id": project_id,
+                 "session_id": session_id,
+                 "summary": report.get("summary", {}),
+                 "artifact_paths": report.get("artifact_paths", {}),
+             }, ensure_ascii=False), _utcnow_iso()),
+        )
+    except sqlite3.Error:
+        pass
+    return report
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 

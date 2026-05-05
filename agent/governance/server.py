@@ -1293,6 +1293,42 @@ def handle_reconcile_session_get(ctx: RequestContext):
     return {"session": _row_to_session_dict(row)}
 
 
+@route("POST", "/api/reconcile/{project_id}/sessions/{session_id}/doc-index")
+def handle_reconcile_session_doc_index(ctx: RequestContext):
+    """Generate final reconcile doc/test/source coverage report for signoff."""
+    project_id = ctx.get_project_id()
+    session_id = ctx.path_params.get("session_id", "")
+    body = ctx.body or {}
+    with DBContext(project_id) as conn:
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status FROM reconcile_sessions WHERE project_id=? AND session_id=?",
+            (project_id, session_id),
+        ).fetchone()
+        if row is None:
+            return 404, {"error": "session_not_found", "session_id": session_id}
+        try:
+            from .db import _resolve_project_dir
+
+            project_dir = _resolve_project_dir(project_id)
+            candidate = Path(body.get("candidate_graph_path") or project_dir / "graph.rebase.candidate.json")
+            overlay = Path(body.get("overlay_path") or project_dir / "graph.rebase.overlay.json")
+            report = reconcile_session.generate_final_doc_index_report(
+                conn,
+                project_id,
+                session_id,
+                governance_dir=project_dir,
+                candidate_graph_path=candidate,
+                overlay_path=overlay,
+                output_dir=project_dir,
+            )
+            conn.commit()
+        except ValueError as exc:
+            return 400, {"error": "doc_index_failed", "message": str(exc)}
+    return {"result": report}
+
+
 @route("POST", "/api/reconcile/{project_id}/sessions/{session_id}/finalize")
 def handle_reconcile_session_finalize(ctx: RequestContext):
     """Transition session to finalizing then finalize it. Idempotent on already-finalized sessions."""

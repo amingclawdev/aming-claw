@@ -553,6 +553,66 @@ def test_finalize_candidate_leaf_missing_from_overlay_preserves_state(conn, gov_
     assert "missing.py" in failed.finalize_error["message"]
 
 
+def test_generate_final_doc_index_report_is_review_only(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir,
+                            run_id="phase-z-doc-index")
+    candidate = gov_dir / "graph.rebase.candidate.json"
+    candidate.write_text(json.dumps({
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [{
+                "id": "L7.1",
+                "title": "Feature",
+                "primary": ["feature.py"],
+                "secondary": ["docs/feature.md"],
+                "test": ["tests/test_feature.py"],
+            }],
+            "links": [],
+        },
+    }), encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "nodes": {
+            "L7.1": {
+                "node_id": "L7.1",
+                "title": "Feature",
+                "primary": ["feature.py"],
+                "secondary": ["docs/feature.md"],
+                "test": ["tests/test_feature.py"],
+            }
+        }
+    }), encoding="utf-8")
+    graph_before = (gov_dir / "graph.json").read_bytes()
+    conn.execute(
+        "INSERT INTO reconcile_file_inventory "
+        "(project_id, run_id, path, file_kind, language, sha256, scan_status, "
+        "cluster_id, candidate_node_id, attached_to, reason, decision, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (PROJECT_ID, "phase-z-doc-index", "README.md", "doc", "markdown",
+         "sha", "orphan", "", "", "", "index doc", "pending", "now"),
+    )
+
+    report = rs.generate_final_doc_index_report(
+        conn, PROJECT_ID, sess.session_id,
+        governance_dir=gov_dir,
+        candidate_graph_path=candidate,
+        overlay_path=overlay,
+        output_dir=gov_dir,
+    )
+
+    assert report["summary"]["ready_for_signoff"] is True
+    assert (gov_dir / "graph.rebase.doc-index.review.json").exists()
+    assert (gov_dir / "graph.rebase.doc-index.review.md").exists()
+    assert (gov_dir / "graph.json").read_bytes() == graph_before
+    event = conn.execute(
+        "SELECT event_type FROM chain_events WHERE event_type=?",
+        ("reconcile.session.doc_index_generated",),
+    ).fetchone()
+    assert event is not None
+
+
 def test_finalize_blocks_until_reconcile_clusters_complete(conn, gov_dir):
     from governance import reconcile_deferred_queue as q
 
