@@ -430,44 +430,82 @@ class TestMCPToolDefinitions(unittest.TestCase):
 class TestTryBacklogCloseViaDb(unittest.TestCase):
     """AC7: _try_backlog_close_via_db helper."""
 
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SHARED_VOLUME_PATH"] = self.tmp.name
+        self._conns = []
+
+    def tearDown(self):
+        for c in self._conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        os.environ.pop("SHARED_VOLUME_PATH", None)
+        _safe_cleanup(self.tmp)
+
+    def _get_conn(self, pid="test-project"):
+        from governance.db import get_connection
+        conn = get_connection(pid)
+        self._conns.append(conn)
+        return conn
+
+    def _insert_bug(self, bug_id="B99", status="OPEN"):
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT INTO backlog_bugs (bug_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (bug_id, status, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        conn.commit()
+        return conn
+
     def test_success_returns_true(self):
         from governance.auto_chain import _try_backlog_close_via_db
 
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = b'{"ok": true}'
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        conn = self._insert_bug("B99")
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = _try_backlog_close_via_db("test-project", "B99", "abc123")
-            self.assertTrue(result)
+        result = _try_backlog_close_via_db("test-project", "B99", "abc123")
 
-    def test_404_returns_false_and_logs_warning(self):
-        from governance.auto_chain import _try_backlog_close_via_db
-        import urllib.error
-        import logging
+        self.assertTrue(result)
+        row = conn.execute(
+            "SELECT status, \"commit\", runtime_state, chain_stage "
+            "FROM backlog_bugs WHERE bug_id='B99'"
+        ).fetchone()
+        self.assertEqual(row["status"], "FIXED")
+        self.assertEqual(row["commit"], "abc123")
+        self.assertEqual(row["runtime_state"], "fixed")
+        self.assertEqual(row["chain_stage"], "fixed")
 
-        exc = urllib.error.HTTPError(
-            "http://test", 404, "Not Found", {}, None
-        )
-        with patch("urllib.request.urlopen", side_effect=exc):
-            with self.assertLogs("governance.auto_chain", level="WARNING") as cm:
-                result = _try_backlog_close_via_db("test-project", "MISSING", "abc")
-                self.assertFalse(result)
-                # Check log message contains 'backlog' and '404'
-                log_text = " ".join(cm.output)
-                self.assertRegex(log_text, r"backlog.*404")
-
-    def test_connection_error_returns_false(self):
+    def test_already_fixed_returns_true(self):
         from governance.auto_chain import _try_backlog_close_via_db
 
-        with patch("urllib.request.urlopen", side_effect=ConnectionError("refused")):
-            with self.assertLogs("governance.auto_chain", level="WARNING") as cm:
-                result = _try_backlog_close_via_db("test-project", "B1", "abc")
-                self.assertFalse(result)
-                log_text = " ".join(cm.output)
-                self.assertRegex(log_text, r"backlog.*fallback")
+        self._insert_bug("DONE", status="FIXED")
+
+        result = _try_backlog_close_via_db("test-project", "DONE", "abc123")
+
+        self.assertTrue(result)
+
+    def test_missing_returns_false_and_logs_warning(self):
+        from governance.auto_chain import _try_backlog_close_via_db
+
+        self._get_conn()
+        with self.assertLogs("governance.auto_chain", level="WARNING") as cm:
+            result = _try_backlog_close_via_db("test-project", "MISSING", "abc")
+            self.assertFalse(result)
+            log_text = " ".join(cm.output)
+            self.assertRegex(log_text, r"backlog.*missing")
+
+    def test_invalid_status_returns_false(self):
+        from governance.auto_chain import _try_backlog_close_via_db
+
+        self._insert_bug("B1", status="FAILED")
+
+        with self.assertLogs("governance.auto_chain", level="WARNING") as cm:
+            result = _try_backlog_close_via_db("test-project", "B1", "abc")
+            self.assertFalse(result)
+            log_text = " ".join(cm.output)
+            self.assertRegex(log_text, r"invalid status")
 
 
 class TestObserverDocUpdate(unittest.TestCase):

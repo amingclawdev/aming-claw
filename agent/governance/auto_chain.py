@@ -6092,40 +6092,67 @@ def _build_deploy_prompt(task_id, result, metadata):
 
 
 def _try_backlog_close_via_db(project_id, bug_id, commit_hash):
-    """Attempt to close a backlog bug via the DB-first REST endpoint.
+    """Attempt to close a backlog bug directly in the governance DB.
 
     Called from merge-stage finalize path when metadata.bug_id is set.
-    On success returns True. On 404 or connection error, logs a warning
-    (grep for 'backlog.*fallback' or 'backlog.*404') and returns False.
+    On success returns True. Missing rows or DB errors return False with a
+    warning. This intentionally avoids posting to the local governance HTTP
+    server from inside the finalize request, which can self-timeout under load.
     """
-    import urllib.request
-    import urllib.error
-
-    gov_url = os.environ.get("GOVERNANCE_URL", "http://localhost:40000").rstrip("/")
-    url = f"{gov_url}/api/backlog/{project_id}/{bug_id}/close"
-    data = json.dumps({"commit": commit_hash, "actor": "auto-chain"}).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
+    conn = None
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status < 300:
-                log.info("backlog close: bug %s closed with commit %s", bug_id, commit_hash)
-                return True
-            log.warning("backlog close: unexpected status %d for bug %s — fallback to md", resp.status, bug_id)
+        from .db import get_connection as _get_connection
+
+        conn = _get_connection(project_id)
+        row = conn.execute(
+            "SELECT bug_id, status FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
+        ).fetchone()
+        if not row:
+            log.warning("backlog close: bug %s missing in DB", bug_id)
             return False
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            log.warning("backlog close: bug %s returned 404 — backlog fallback to md path", bug_id)
-        else:
-            log.warning("backlog close: HTTP %d for bug %s — backlog fallback to md path", exc.code, bug_id)
-        return False
+
+        prior_status = row["status"] if hasattr(row, "keys") else row[1]
+        if prior_status == "FIXED":
+            log.info("backlog close: bug %s already fixed", bug_id)
+            return True
+        if prior_status not in ("OPEN", "MF_IN_PROGRESS"):
+            log.warning(
+                "backlog close: bug %s has invalid status %s",
+                bug_id, prior_status,
+            )
+            return False
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            """UPDATE backlog_bugs
+               SET status='FIXED',
+                   "commit"=?,
+                   fixed_at=?,
+                   updated_at=?
+               WHERE bug_id=?""",
+            (commit_hash or "", now, now, bug_id),
+        )
+        backlog_runtime.update_backlog_runtime(
+            conn,
+            bug_id,
+            "manual_fix" if prior_status == "MF_IN_PROGRESS" else "fixed",
+            project_id=project_id,
+            result={"commit": commit_hash or ""},
+            runtime_state="fixed",
+        )
+        conn.commit()
+        log.info("backlog close: bug %s closed with commit %s", bug_id, commit_hash)
+        return True
     except Exception as exc:
-        log.warning("backlog close: connection error for bug %s (%s) — backlog fallback to md path", bug_id, exc)
+        log.warning("backlog close: DB error for bug %s (%s)", bug_id, exc)
         return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _post_manager_redeploy_governance_from_chain(chain_version: str) -> dict:
