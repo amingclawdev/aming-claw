@@ -477,6 +477,23 @@ class TestTryBacklogCloseViaDb(unittest.TestCase):
         self.assertEqual(row["runtime_state"], "fixed")
         self.assertEqual(row["chain_stage"], "fixed")
 
+    def test_supplied_connection_avoids_opening_second_connection(self):
+        from governance.auto_chain import _try_backlog_close_via_db
+
+        conn = self._insert_bug("B100")
+
+        with patch("governance.db.get_connection", side_effect=AssertionError("unused")):
+            result = _try_backlog_close_via_db(
+                "test-project", "B100", "abc123", conn=conn,
+            )
+
+        self.assertTrue(result)
+        row = conn.execute(
+            "SELECT status, \"commit\" FROM backlog_bugs WHERE bug_id='B100'"
+        ).fetchone()
+        self.assertEqual(row["status"], "FIXED")
+        self.assertEqual(row["commit"], "abc123")
+
     def test_already_fixed_returns_true(self):
         from governance.auto_chain import _try_backlog_close_via_db
 

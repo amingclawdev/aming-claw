@@ -6091,7 +6091,7 @@ def _build_deploy_prompt(task_id, result, metadata):
     }
 
 
-def _try_backlog_close_via_db(project_id, bug_id, commit_hash):
+def _try_backlog_close_via_db(project_id, bug_id, commit_hash, conn=None):
     """Attempt to close a backlog bug directly in the governance DB.
 
     Called from merge-stage finalize path when metadata.bug_id is set.
@@ -6099,11 +6099,13 @@ def _try_backlog_close_via_db(project_id, bug_id, commit_hash):
     warning. This intentionally avoids posting to the local governance HTTP
     server from inside the finalize request, which can self-timeout under load.
     """
-    conn = None
+    close_conn = False
     try:
-        from .db import get_connection as _get_connection
+        if conn is None:
+            from .db import get_connection as _get_connection
 
-        conn = _get_connection(project_id)
+            conn = _get_connection(project_id)
+            close_conn = True
         row = conn.execute(
             "SELECT bug_id, status FROM backlog_bugs WHERE bug_id = ?",
             (bug_id,),
@@ -6148,7 +6150,7 @@ def _try_backlog_close_via_db(project_id, bug_id, commit_hash):
         log.warning("backlog close: DB error for bug %s (%s)", bug_id, exc)
         return False
     finally:
-        if conn is not None:
+        if close_conn and conn is not None:
             try:
                 conn.close()
             except Exception:
@@ -6319,7 +6321,7 @@ def _finalize_chain(conn, project_id, task_id, result, metadata):
     bug_id = metadata.get("bug_id", "")
     if bug_id:
         commit_hash = result.get("merge_commit", metadata.get("merge_commit", ""))
-        closed = _try_backlog_close_via_db(project_id, bug_id, commit_hash)
+        closed = _try_backlog_close_via_db(project_id, bug_id, commit_hash, conn=conn)
         finalize_result["backlog_closed"] = closed
         if closed:
             finalize_result["backlog_bug_id"] = bug_id
