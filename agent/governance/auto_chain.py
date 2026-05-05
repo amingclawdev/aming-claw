@@ -134,6 +134,8 @@ def _extract_qa_evidence_paths(result):
             symbol_match = _QA_EVIDENCE_SYMBOL_SUFFIX_RE.match(raw.replace("\\", "/"))
             if symbol_match:
                 raw = symbol_match.group(1)
+            if "<" in raw or ">" in raw:
+                continue
             if any(ch in raw for ch in _QA_EVIDENCE_GLOB_CHARS):
                 continue
             key = raw.replace("\\", "/")

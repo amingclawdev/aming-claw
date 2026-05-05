@@ -339,6 +339,26 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_ignores_placeholder_evidence_path(self):
+        """Template placeholders are prose, not concrete workspace paths."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "Checked files under agent/governance/<module>.py placeholders.",
+            "criteria_results": [
+                {
+                    "criterion": "template evidence",
+                    "passed": True,
+                    "evidence": "The pattern agent/governance/<module>.py describes the module family.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
     def test_blocks_worktree_only_evidence_path_when_not_changed(self):
         """Ignored/unmerged worktree files are not durable QA evidence."""
         with tempfile.TemporaryDirectory() as tmp:
