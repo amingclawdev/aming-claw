@@ -177,6 +177,7 @@ def test_pm_prd_published_fires_before_gate_blocks(pm_env):
         "test_files": ["agent/tests/test_pm_prd_publish_pre_gate.py"],
         "requirements": ["R1: do something"],
         "acceptance_criteria": ["AC1: verify it"],
+        "verification": {"method": "automated test", "command": "pytest agent/tests/test_pm_prd_publish_pre_gate.py -q"},
     }
     metadata = {
         "related_nodes": [],
@@ -225,6 +226,7 @@ def test_pm_prd_published_fires_before_gate_blocks(pm_env):
     payload = json.loads(rows[0]["payload_json"])
     assert payload["proposed_nodes"] == ["L1.3", "L1.4"]
     assert payload["target_files"] == ["agent/governance/auto_chain.py"]
+    assert payload["verification"]["command"] == "pytest agent/tests/test_pm_prd_publish_pre_gate.py -q"
 
     # AC2 + AC5: Gate blocked, no dev task created
     assert chain_result is not None
@@ -239,3 +241,47 @@ def test_pm_prd_published_fires_before_gate_blocks(pm_env):
     assert len(dev_tasks) == 0, (
         f"Expected 0 dev tasks (gate should block dispatch), got {len(dev_tasks)}"
     )
+
+
+def test_load_pm_prd_payload_hydrates_verification_from_root_task(pm_env):
+    """Older pm.prd.published events omitted verification; overlay apply must
+    recover it from the root PM result."""
+    conn, _fake_store = pm_env
+    pm_result = {
+        "proposed_nodes": [{"node_id": "L7.55"}],
+        "target_files": ["agent/governance/llm_cache.py"],
+        "test_files": ["agent/tests/test_llm_cache.py"],
+        "requirements": ["R1"],
+        "acceptance_criteria": ["AC1"],
+        "verification": {
+            "method": "automated test",
+            "command": "pytest agent/tests/test_llm_cache.py -v",
+        },
+    }
+    conn.execute(
+        "UPDATE tasks SET result_json = ? WHERE task_id = ?",
+        (json.dumps(pm_result), "pm-task-1"),
+    )
+    conn.execute(
+        "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "pm-task-1",
+            "pm-task-1",
+            "pm.prd.published",
+            json.dumps({
+                "proposed_nodes": pm_result["proposed_nodes"],
+                "target_files": pm_result["target_files"],
+                "test_files": pm_result["test_files"],
+                "requirements": pm_result["requirements"],
+                "acceptance_criteria": pm_result["acceptance_criteria"],
+            }),
+            "2026-01-01T00:00:01Z",
+        ),
+    )
+
+    from agent.governance.auto_chain import _load_pm_prd_payload_for_chain
+
+    payload = _load_pm_prd_payload_for_chain(conn, "pm-task-1")
+
+    assert payload["verification"]["command"] == "pytest agent/tests/test_llm_cache.py -v"

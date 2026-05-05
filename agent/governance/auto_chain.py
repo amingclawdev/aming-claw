@@ -3618,6 +3618,9 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
                         "acceptance_criteria": result.get("acceptance_criteria",
                                                           prd.get("acceptance_criteria", [])),
                     }
+                _verification = result.get("verification", prd.get("verification", {}))
+                if _verification:
+                    _prd_payload["verification"] = _verification
                 # R1/AC1: Persist 4 PRD graph-declaration fields
                 for _gdf in _PRD_GRAPH_DECLARATION_FIELDS:
                     _gdf_val = result.get(_gdf, prd.get(_gdf, []))
@@ -5456,6 +5459,54 @@ def _metadata_with_reconcile_session(conn, project_id, metadata):
     return out
 
 
+def _load_pm_prd_payload_for_chain(conn, root_task_id):
+    """Load the PM PRD payload used by later graph/reconcile gates.
+
+    pm.prd.published is the normal source for graph declarations, but older
+    payloads did not carry verification.  Hydrate missing PM fields from the
+    root PM task result so reconcile overlay apply can re-run PM preflight
+    without losing the verification contract.
+    """
+    payload = _query_chain_event_payload(conn, root_task_id, "pm.prd.published") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    needs_hydration = not payload.get("verification")
+    if not needs_hydration:
+        return payload
+
+    try:
+        row = conn.execute(
+            "SELECT result_json FROM tasks WHERE task_id = ? AND type = 'pm' LIMIT 1",
+            (root_task_id,),
+        ).fetchone()
+        if not row or not row["result_json"]:
+            return payload
+        pm_result = json.loads(row["result_json"])
+    except Exception:
+        return payload
+    if not isinstance(pm_result, dict):
+        return payload
+
+    prd = pm_result.get("prd") if isinstance(pm_result.get("prd"), dict) else {}
+    for key in (
+        "proposed_nodes",
+        "test_files",
+        "target_files",
+        "requirements",
+        "acceptance_criteria",
+        "verification",
+    ):
+        if payload.get(key):
+            continue
+        value = pm_result.get(key)
+        if not value:
+            value = prd.get(key)
+        if value:
+            payload[key] = value
+    return payload
+
+
 def _apply_graph_delta_after_gatekeeper(conn, project_id, metadata):
     """Close the graph event lifecycle after gatekeeper approves merge.
 
@@ -5495,7 +5546,7 @@ def _apply_graph_delta_after_gatekeeper(conn, project_id, metadata):
         if isinstance(prior_applied, dict) and prior_applied.get("cluster_fingerprint") == cluster_fp:
             return True, "ok"
 
-        pm_prd = _query_chain_event_payload(conn, root_task_id, "pm.prd.published") or {}
+        pm_prd = _load_pm_prd_payload_for_chain(conn, root_task_id)
         dev_result = {"graph_delta": graph_delta}
         apply_result = apply_reconcile_cluster_to_overlay(
             conn,
