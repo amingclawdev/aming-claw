@@ -3282,7 +3282,13 @@ def _reconcile_cluster_terminal_hook(
 
     try:
         if task_type == "merge" and status == "succeeded":
-            commit = (result or {}).get("merge_commit") or (result or {}).get("commit") or ""
+            commit = (
+                (result or {}).get("merge_commit")
+                or (result or {}).get("commit")
+                or metadata.get("reconcile_target_head")
+                or metadata.get("merge_commit")
+                or ""
+            )
             session_id = (
                 metadata.get("reconcile_session_id")
                 or metadata.get("session_id")
@@ -3315,7 +3321,17 @@ def _reconcile_cluster_terminal_hook(
                     )
             q.mark_terminal(project_id, fp, "resolved", f"merged@{commit}",
                             conn=conn)
-            return {"hook": "reconcile_cluster_resolved", "fingerprint": fp}
+            backlog_closed = False
+            bug_id = str(metadata.get("bug_id") or "").strip()
+            if bug_id:
+                backlog_closed = _try_backlog_close_via_db(
+                    project_id, bug_id, commit, conn=conn,
+                )
+            return {
+                "hook": "reconcile_cluster_resolved",
+                "fingerprint": fp,
+                "backlog_closed": backlog_closed,
+            }
         is_cancel = status == "cancelled" or (
             isinstance(metadata.get("cancel_reason"), str) and metadata.get("cancel_reason")
         )

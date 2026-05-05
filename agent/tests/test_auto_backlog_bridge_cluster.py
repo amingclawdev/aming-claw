@@ -320,6 +320,49 @@ def test_terminal_success_hook(conn):
     assert sess_after["target_head_sha"] == "abc1234"
 
 
+def test_terminal_success_hook_closes_linked_backlog(conn):
+    """reconcile-cluster merge success resolves queue and closes linked backlog."""
+    from governance import auto_chain
+
+    bug_id = "OPT-BACKLOG-RECONCILE-test-close"
+    now = "2026-05-05T00:00:00Z"
+    conn.execute(
+        "INSERT INTO backlog_bugs (bug_id, title, status, created_at, updated_at) "
+        "VALUES (?, ?, 'OPEN', ?, ?)",
+        (bug_id, "reconcile cluster close regression", now, now),
+    )
+    q.enqueue_or_lookup(PROJECT_ID, "fp-close1", payload={"x": 1},
+                        run_id="run-1", conn=conn)
+    metadata = {
+        "bug_id": bug_id,
+        "operation_type": "reconcile-cluster",
+        "cluster_fingerprint": "fp-close1",
+        "chain_id": "task-root-close",
+    }
+
+    out = auto_chain._reconcile_cluster_terminal_hook(
+        conn, PROJECT_ID, "task-merge-close", "merge", "succeeded",
+        {"merge_commit": "abc1234"}, metadata,
+    )
+
+    assert out["hook"] == "reconcile_cluster_resolved"
+    assert out["backlog_closed"] is True
+    qrow = conn.execute(
+        "SELECT status, terminal_reason FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (PROJECT_ID, "fp-close1"),
+    ).fetchone()
+    assert qrow["status"] == "resolved"
+    assert "abc1234" in (qrow["terminal_reason"] or "")
+    brow = conn.execute(
+        'SELECT status, "commit", runtime_state FROM backlog_bugs WHERE bug_id=?',
+        (bug_id,),
+    ).fetchone()
+    assert brow["status"] == "FIXED"
+    assert brow["commit"] == "abc1234"
+    assert brow["runtime_state"] == "fixed"
+
+
 def test_terminal_withdrawn_hook(conn):
     """observer cancel -> mark_terminal('skipped', cancel_reason)."""
     from governance import auto_chain
