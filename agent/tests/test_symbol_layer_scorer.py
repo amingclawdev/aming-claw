@@ -12,6 +12,26 @@ import pytest
 # Load phase_z_v2 + symbol_layer_scorer directly (Python 3.9 compat)
 _here = os.path.dirname(os.path.abspath(__file__))
 _gov = os.path.join(_here, "..", "governance")
+_MODULE_NAMES_TO_RESTORE = [
+    "agent",
+    "agent.governance",
+    "agent.governance.reconcile_phases",
+    "agent.governance.reconcile_phases.phase_z_v2",
+    "agent.governance.symbol_layer_scorer",
+]
+_ORIGINAL_MODULES = {
+    _name: sys.modules.get(_name) for _name in _MODULE_NAMES_TO_RESTORE
+}
+
+
+def teardown_module(_module):
+    """Restore temporary direct-load packages so later tests import normally."""
+    for _name in reversed(_MODULE_NAMES_TO_RESTORE):
+        _original = _ORIGINAL_MODULES.get(_name)
+        if _original is None:
+            sys.modules.pop(_name, None)
+        else:
+            sys.modules[_name] = _original
 
 # Ensure parent packages exist in sys.modules
 for _name in [
