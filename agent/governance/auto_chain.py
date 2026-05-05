@@ -3070,6 +3070,31 @@ def _reconcile_cluster_terminal_hook(
     try:
         if task_type == "merge" and status == "succeeded":
             commit = (result or {}).get("merge_commit") or (result or {}).get("commit") or ""
+            session_id = (
+                metadata.get("reconcile_session_id")
+                or metadata.get("session_id")
+                or ""
+            )
+            target_branch = (
+                (result or {}).get("reconcile_target_branch")
+                or metadata.get("reconcile_target_branch")
+                or ""
+            )
+            if commit and (session_id or target_branch):
+                if session_id:
+                    conn.execute(
+                        "UPDATE reconcile_sessions SET target_head_sha=? "
+                        "WHERE project_id=? AND session_id=? "
+                        "AND status IN ('active','finalizing','finalize_failed')",
+                        (commit, project_id, session_id),
+                    )
+                elif target_branch:
+                    conn.execute(
+                        "UPDATE reconcile_sessions SET target_head_sha=? "
+                        "WHERE project_id=? AND target_branch=? "
+                        "AND status IN ('active','finalizing','finalize_failed')",
+                        (commit, project_id, target_branch),
+                    )
             q.mark_terminal(project_id, fp, "resolved", f"merged@{commit}",
                             conn=conn)
             return {"hook": "reconcile_cluster_resolved", "fingerprint": fp}
@@ -5134,13 +5159,15 @@ def _default_reconcile_overlay_path(metadata=None):
 
 def _metadata_with_reconcile_session(conn, project_id, metadata):
     out = dict(metadata or {})
-    if out.get("session_id"):
-        return out
     try:
         from . import reconcile_session as _rs
         sess = _rs.get_active_session(conn, project_id)
         if sess and sess.session_id:
             out["session_id"] = sess.session_id
+            out["reconcile_session_id"] = sess.session_id
+            out.setdefault("reconcile_target_branch", getattr(sess, "target_branch", "") or "")
+            out.setdefault("reconcile_target_base_commit", getattr(sess, "base_commit_sha", "") or "")
+            out.setdefault("reconcile_target_head", getattr(sess, "target_head_sha", "") or "")
             return out
     except Exception:
         pass
@@ -5781,7 +5808,11 @@ def _build_gatekeeper_prompt(task_id, result, metadata):
 
 
 def _build_merge_prompt(task_id, result, metadata):
-    prompt = f"Merge dev branch for {task_id} to main."
+    target_branch = metadata.get("reconcile_target_branch") if is_reconcile_cluster_task(metadata) else ""
+    if target_branch:
+        prompt = f"Merge dev branch for {task_id} to reconcile target branch {target_branch}."
+    else:
+        prompt = f"Merge dev branch for {task_id} to main."
     return prompt, {
         **metadata,  # preserves skip_doc_check and all other original task metadata
         # Prioritise original metadata values; only fall back to result if metadata lacks them
@@ -5795,15 +5826,32 @@ def _build_merge_prompt(task_id, result, metadata):
 
 def _build_deploy_prompt(task_id, result, metadata):
     changed_files = metadata.get("changed_files") or result.get("changed_files", [])
-    prompt = (
-        f"Deploy changes after merge task {task_id}.\n"
-        f"changed_files: {json.dumps(changed_files)}\n"
-        "Run host-side deploy orchestration and smoke checks."
+    target_branch = (
+        metadata.get("reconcile_target_branch")
+        or result.get("reconcile_target_branch", "")
     )
+    if is_reconcile_cluster_task(metadata) and target_branch:
+        prompt = (
+            f"Record branch-local reconcile deploy after merge task {task_id}.\n"
+            f"target_branch: {target_branch}\n"
+            f"changed_files: {json.dumps(changed_files)}\n"
+            "Do not redeploy main services; this reconcile cluster is isolated until session signoff."
+        )
+    else:
+        prompt = (
+            f"Deploy changes after merge task {task_id}.\n"
+            f"changed_files: {json.dumps(changed_files)}\n"
+            "Run host-side deploy orchestration and smoke checks."
+        )
     return prompt, {
         **metadata,
         "changed_files": changed_files,
         "merge_commit": result.get("merge_commit", metadata.get("merge_commit", "")),
+        "reconcile_target_branch": target_branch or metadata.get("reconcile_target_branch", ""),
+        "reconcile_target_base_commit": (
+            metadata.get("reconcile_target_base_commit")
+            or result.get("reconcile_target_base_commit", "")
+        ),
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
     }
 

@@ -275,3 +275,104 @@ def test_noop_worktree_branch_already_ancestor_returns_success(tmp_path):
     assert result["result"]["merge_mode"] == "already_merged_replay"
     assert result["result"]["merge_commit"] == "abc123456789"
     assert result["result"]["files_changed"] == 0
+
+
+def test_reconcile_merge_advances_target_branch_not_main(tmp_path):
+    """Reconcile cluster merge updates the session target branch, not main."""
+    worker = _make_worker(workspace=str(tmp_path))
+    worker._branch_exists = lambda branch: True
+    worker._branch_already_merged = lambda branch, target_ref="HEAD": False
+    worker._create_integration_worktree = mock.Mock(
+        return_value=(str(tmp_path / "merge-task"), "merge/task-merge-7", "")
+    )
+    worker._remove_worktree = mock.Mock()
+    worker._api = mock.Mock()
+    worktree = tmp_path / "dev-task"
+    worktree.mkdir()
+    metadata = {
+        "parent_task_id": "task-parent-7",
+        "operation_type": "reconcile-cluster",
+        "reconcile_target_branch": "reconcile/p-test-session",
+        "reconcile_target_base_commit": "base123",
+        "_branch": "dev/task-parent-7",
+        "_worktree": str(worktree),
+        "changed_files": ["agent/example.py"],
+    }
+    run_calls = []
+
+    def _run(cmd, **kwargs):
+        run_calls.append((cmd, kwargs.get("cwd")))
+        result = subprocess.CompletedProcess(cmd, 0)
+        result.stdout = ""
+        result.stderr = ""
+        if cmd[:3] == ["git", "diff", "--cached"]:
+            result.stdout = "agent/example.py\n"
+        return result
+
+    with mock.patch("subprocess.run", side_effect=_run), \
+         mock.patch("agent.governance.chain_trailer.get_chain_state",
+                    return_value={"chain_sha": "parent123"}), \
+         mock.patch("agent.governance.chain_trailer.write_merge_with_trailer",
+                    return_value=(True, "merge123", "")):
+        result = worker._execute_merge("task-merge-7", metadata)
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["branch"] == "reconcile/p-test-session"
+    assert result["result"]["merge_mode"] == "reconcile_target_branch"
+    assert result["result"]["main_redeployed"] is False
+    worker._create_integration_worktree.assert_called_once_with(
+        "task-merge-7", base_ref="reconcile/p-test-session"
+    )
+    assert (["git", "branch", "-f", "reconcile/p-test-session", "merge123"],
+            str(tmp_path)) in run_calls
+    assert not any(call[0][:3] == ["git", "merge", "--ff-only"] for call in run_calls)
+    worker._api.assert_not_called()
+
+
+def test_reconcile_dev_worktree_uses_target_branch_base(tmp_path):
+    """Dev worktrees for reconcile clusters are created from the session branch."""
+    worker = _make_worker(workspace=str(tmp_path))
+    worker._ensure_branch_at_ref = mock.Mock(return_value=(True, ""))
+    run_calls = []
+
+    def _run(cmd, **kwargs):
+        run_calls.append((cmd, kwargs.get("cwd")))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with mock.patch("subprocess.run", side_effect=_run), mock.patch("os.makedirs"):
+        worktree_path, branch = worker._create_worktree(
+            "task-dev-8",
+            base_ref="reconcile/p-test-session",
+            base_commit="base123",
+        )
+
+    assert branch == "dev/task-dev-8"
+    assert worktree_path
+    worker._ensure_branch_at_ref.assert_called_once_with(
+        "reconcile/p-test-session", "base123"
+    )
+    assert any(
+        call[0] == [
+            "git", "worktree", "add", "-b", "dev/task-dev-8",
+            str(tmp_path / ".worktrees" / "dev-task-dev-8"),
+            "reconcile/p-test-session",
+        ]
+        for call in run_calls
+    )
+
+
+def test_reconcile_deploy_skips_main_redeploy():
+    """Deploy stage is a branch-local record for reconcile clusters."""
+    worker = _make_worker()
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "reconcile_target_branch": "reconcile/p-test-session",
+        "merge_commit": "merge123",
+        "changed_files": [],
+    }
+    with mock.patch.object(worker, "_report_progress"):
+        result = worker._execute_deploy("task-deploy-9", metadata)
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["report"]["main_redeployed"] is False
+    assert "branch-local" in result["result"]["report"]["note"]

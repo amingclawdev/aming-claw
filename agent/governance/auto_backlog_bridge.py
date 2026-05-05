@@ -302,6 +302,17 @@ def file_cluster_as_backlog(
         or str(cluster_report.get("batch_id") or "")
         or str(run_id or "")
     )
+    active_session: dict[str, Any] = {}
+    if operation_type == "reconcile-cluster":
+        try:
+            session_resp = http_client.get(f"/api/reconcile/{project_id}/sessions/active")
+            if isinstance(session_resp, dict) and isinstance(session_resp.get("session"), dict):
+                active_session = session_resp["session"]
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "auto_backlog_bridge: active reconcile session lookup failed run=%s err=%s",
+                run_id, exc,
+            )
     batch_ref: dict[str, Any] = {}
     if operation_type == "reconcile-cluster" and batch_id:
         try:
@@ -309,7 +320,7 @@ def file_cluster_as_backlog(
                 f"/api/reconcile/{project_id}/batch-memory",
                 {
                     "batch_id": batch_id,
-                    "session_id": run_id,
+                    "session_id": active_session.get("session_id") or run_id,
                     "created_by": creator,
                     "initial_memory": {
                         "candidate_graph_path": (
@@ -347,12 +358,20 @@ def file_cluster_as_backlog(
         "cluster_report": cluster_report,
         "reconcile_run_id": run_id,
     }
+    if active_session:
+        metadata.update({
+            "session_id": active_session.get("session_id", ""),
+            "reconcile_session_id": active_session.get("session_id", ""),
+            "reconcile_target_branch": active_session.get("target_branch", ""),
+            "reconcile_target_base_commit": active_session.get("base_commit_sha", ""),
+            "reconcile_target_head": active_session.get("target_head_sha", ""),
+        })
     if batch_id:
         metadata["batch_id"] = batch_ref.get("batch_id") or batch_id
         metadata["reconcile_batch_id"] = metadata["batch_id"]
         metadata["batch_memory_ref"] = batch_ref or {
             "batch_id": batch_id,
-            "session_id": run_id,
+            "session_id": active_session.get("session_id") or run_id,
         }
     primary_files = list(
         cluster_group.get("primary_files")
@@ -389,6 +408,9 @@ def file_cluster_as_backlog(
             "operation_type": operation_type,
             "reconcile_run_id": run_id,
             "cluster_fingerprint": cluster_fp,
+            "reconcile_session_id": active_session.get("session_id", ""),
+            "reconcile_target_branch": active_session.get("target_branch", ""),
+            "reconcile_target_base_commit": active_session.get("base_commit_sha", ""),
         },
         "force_admit": True,
         "actor": creator,

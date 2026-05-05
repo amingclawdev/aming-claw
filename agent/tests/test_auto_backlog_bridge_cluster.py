@@ -39,13 +39,16 @@ PROJECT_ID = "p-test"
 
 
 class MockHttpClient:
-    def __init__(self, create_response: dict | None = None):
+    def __init__(self, create_response: dict | None = None, active_session: dict | None = None):
         self.gets: list[str] = []
         self.posts: list[tuple[str, dict]] = []
         self.create_response = create_response or {"task_id": "t-cluster-1"}
+        self.active_session = active_session
 
     def get(self, url: str) -> dict:
         self.gets.append(url)
+        if url.endswith("/sessions/active"):
+            return {"session": self.active_session}
         if "/list" in url:
             return {"tasks": [], "count": 0}
         if "/exists" in url:
@@ -165,6 +168,39 @@ def test_metadata_operation_type_reconcile_cluster():
     assert "-CLUSTER-" in md["bug_id"]
 
 
+def test_cluster_task_metadata_carries_reconcile_target_branch():
+    """Cluster PM tasks inherit active session branch/base provenance."""
+    mock = MockHttpClient(active_session={
+        "session_id": "sess-branch1",
+        "target_branch": "reconcile/p-test-sess-branch1",
+        "base_commit_sha": "base123",
+        "target_head_sha": "head123",
+    })
+    cluster_group = {"cluster_fingerprint": "fp-branch1", "slug": "BranchTest",
+                     "primary_files": ["agent/a.py"]}
+    cluster_report = {"purpose": "p"}
+    out = bridge.file_cluster_as_backlog(
+        cluster_group, cluster_report, run_id="run-branch1",
+        project_id=PROJECT_ID, http_client=mock,
+    )
+    assert out["filed"] is True
+    assert f"/api/reconcile/{PROJECT_ID}/sessions/active" in mock.gets
+    batch_url, batch_body = mock.posts[0]
+    assert batch_url == f"/api/reconcile/{PROJECT_ID}/batch-memory"
+    assert batch_body["session_id"] == "sess-branch1"
+    _, backlog_body = mock.posts[1]
+    trigger = backlog_body["chain_trigger_json"]
+    assert trigger["reconcile_session_id"] == "sess-branch1"
+    assert trigger["reconcile_target_branch"] == "reconcile/p-test-sess-branch1"
+    _, task_body = mock.posts[2]
+    md = task_body["metadata"]
+    assert md["session_id"] == "sess-branch1"
+    assert md["reconcile_session_id"] == "sess-branch1"
+    assert md["reconcile_target_branch"] == "reconcile/p-test-sess-branch1"
+    assert md["reconcile_target_base_commit"] == "base123"
+    assert md["reconcile_target_head"] == "head123"
+
+
 def test_cluster_task_metadata_carries_expected_test_files():
     """PM executor receives target/test files from metadata, not task body only."""
     mock = MockHttpClient()
@@ -187,9 +223,15 @@ def test_terminal_success_hook(conn):
 
     q.enqueue_or_lookup(PROJECT_ID, "fp-suc1", payload={"x": 1},
                         run_id="run-1", conn=conn)
+    sess = conn.execute(
+        "SELECT session_id, target_branch FROM reconcile_sessions WHERE project_id=?",
+        (PROJECT_ID,),
+    ).fetchone()
     metadata = {"operation_type": "reconcile-cluster",
                 "cluster_fingerprint": "fp-suc1",
-                "chain_id": "task-root-1"}
+                "chain_id": "task-root-1",
+                "reconcile_session_id": sess["session_id"],
+                "reconcile_target_branch": sess["target_branch"]}
     auto_chain._reconcile_cluster_terminal_hook(
         conn, PROJECT_ID, "task-merge-1", "merge", "succeeded",
         {"merge_commit": "abc1234"}, metadata,
@@ -201,6 +243,11 @@ def test_terminal_success_hook(conn):
     ).fetchone()
     assert row[0] == "resolved"
     assert "abc1234" in (row[1] or "")
+    sess_after = conn.execute(
+        "SELECT target_head_sha FROM reconcile_sessions WHERE project_id=?",
+        (PROJECT_ID,),
+    ).fetchone()
+    assert sess_after["target_head_sha"] == "abc1234"
 
 
 def test_terminal_withdrawn_hook(conn):

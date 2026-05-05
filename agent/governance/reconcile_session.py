@@ -4,7 +4,7 @@ Pure module: NO DB writes, NO filesystem I/O, NO network at import time.
 State machine: idle -> active -> finalizing -> finalized | finalize_failed | rolled_back.
 """
 from __future__ import annotations
-import io, json, shutil, sqlite3, subprocess, tarfile, uuid
+import io, json, re, shutil, sqlite3, subprocess, tarfile, uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +44,8 @@ class ReconcileSession:
     snapshot_path: Optional[str] = None
     snapshot_head_sha: Optional[str] = None
     base_commit_sha: str = ""
+    target_branch: str = ""
+    target_head_sha: str = ""
     finalize_error: dict = field(default_factory=dict)
 
 
@@ -95,6 +97,17 @@ def _graph_path(base: Optional[Path] = None) -> Path:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _branch_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+    slug = re.sub(r"-+", "-", slug).strip("-._")
+    return slug or "project"
+
+
+def default_target_branch(project_id: str, session_id: str) -> str:
+    """Return the branch used to accumulate one reconcile session."""
+    return f"reconcile/{_branch_slug(project_id)}-{str(session_id or '')[:12]}"
 
 
 def _load_json_object(path: Path) -> dict:
@@ -869,6 +882,14 @@ def _row_to_session(row: sqlite3.Row) -> ReconcileSession:
         bypass_gates=bypass, started_by=row["started_by"],
         snapshot_path=row["snapshot_path"], snapshot_head_sha=row["snapshot_head_sha"],
         base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in keys else "",
+        target_branch=(
+            row["target_branch"] if "target_branch" in keys and row["target_branch"]
+            else default_target_branch(row["project_id"], row["session_id"])
+        ),
+        target_head_sha=(
+            row["target_head_sha"] if "target_head_sha" in keys and row["target_head_sha"]
+            else (row["base_commit_sha"] if "base_commit_sha" in keys else "")
+        ),
         finalize_error=finalize_error,
     )
 
@@ -929,6 +950,7 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
         full_rebase: bool = False,
         dropped_cluster_fingerprints: Optional[Sequence[str]] = None,
         base_commit_sha: Optional[str] = None,
+        target_branch: Optional[str] = None,
         governance_dir: Optional[Path] = None) -> ReconcileSession:
     """Insert a new active session; raise SessionAlreadyActiveError on conflict."""
     if full_rebase and not dropped_cluster_fingerprints:
@@ -937,12 +959,15 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
     now = _utcnow_iso()
     bypass_json = json.dumps(list(bypass_gates or []))
     base_sha = (base_commit_sha or _git_head_sha(_repo_root())).strip()
+    branch_name = (target_branch or default_target_branch(project_id, sid)).strip()
     try:
         conn.execute(
             "INSERT INTO reconcile_sessions (project_id, session_id, run_id, status, "
-            "started_at, bypass_gates_json, started_by, base_commit_sha, snapshot_head_sha) "
-            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)",
-            (project_id, sid, run_id, now, bypass_json, started_by, base_sha, base_sha))
+            "started_at, bypass_gates_json, started_by, base_commit_sha, "
+            "snapshot_head_sha, target_branch, target_head_sha) "
+            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+            (project_id, sid, run_id, now, bypass_json, started_by, base_sha,
+             base_sha, branch_name, base_sha))
         conn.commit()
     except sqlite3.IntegrityError as exc:
         msg = str(exc).lower()
@@ -956,11 +981,14 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
         "session_id": sid,
         "project_id": project_id,
         "base_commit_sha": base_sha,
+        "target_branch": branch_name,
+        "target_head_sha": base_sha,
     }))
     return ReconcileSession(project_id=project_id, session_id=sid, run_id=run_id,
         status="active", started_at=now,
         bypass_gates=list(bypass_gates or []), started_by=started_by,
-        base_commit_sha=base_sha, snapshot_head_sha=base_sha)
+        base_commit_sha=base_sha, snapshot_head_sha=base_sha,
+        target_branch=branch_name, target_head_sha=base_sha)
 
 
 def transition_to_finalizing(conn: sqlite3.Connection, project_id: str,
@@ -1241,5 +1269,5 @@ __all__ = [
     "get_active_session", "start_session", "transition_to_finalizing",
     "finalize_session", "rollback_session", "is_gate_bypassed",
     "capture_snapshot", "restore_snapshot", "changed_files_since_base",
-    "changed_files_for_session",
+    "changed_files_for_session", "default_target_branch",
 ]

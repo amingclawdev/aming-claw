@@ -22,6 +22,21 @@ class TestMergeRound2(unittest.TestCase):
         self.assertEqual(out_meta["_worktree"], "C:/repo/.worktrees/dev-task-1")
         self.assertEqual(out_meta["_branch"], "dev/task-1")
 
+    def test_reconcile_merge_prompt_targets_session_branch(self):
+        from governance.auto_chain import _build_merge_prompt
+
+        prompt, out_meta = _build_merge_prompt(
+            "task-gatekeeper-2",
+            {"_worktree": "C:/repo/.worktrees/dev-task-2", "_branch": "dev/task-2"},
+            {
+                "operation_type": "reconcile-cluster",
+                "reconcile_target_branch": "reconcile/aming-claw-session",
+            },
+        )
+
+        self.assertIn("reconcile target branch reconcile/aming-claw-session", prompt)
+        self.assertEqual(out_meta["reconcile_target_branch"], "reconcile/aming-claw-session")
+
     def test_branch_merge_uses_isolated_integration_worktree(self):
         from executor_worker import ExecutorWorker
 
@@ -53,7 +68,12 @@ class TestMergeRound2(unittest.TestCase):
         self.assertEqual(out["status"], "succeeded")
         self.assertEqual(out["result"]["merge_mode"], "isolated_integration")
         self.assertEqual(out["result"]["merge_commit"], "mergehash123")
-        self.assertIn((["git", "merge", "dev/task-1", "--no-ff", "-m", "Auto-merge: task-1"], "C:/repo/.worktrees/merge-task-1"), run_calls)
+        self.assertIn((["git", "merge", "dev/task-1", "--no-ff", "--no-commit"], "C:/repo/.worktrees/merge-task-1"), run_calls)
+        self.assertTrue(any(
+            cmd[:3] == ["git", "commit", "-m"]
+            and "Chain-Source-Stage: merge" in cmd[3]
+            for cmd, _cwd in run_calls
+        ))
         # Verify ff-only advance of main workspace
         self.assertIn((["git", "merge", "--ff-only", "mergehash123"], "C:/repo"), run_calls)
         remove_worktree.assert_any_call("C:/repo/.worktrees/dev-task-1", "dev/task-1", delete_branch=False)

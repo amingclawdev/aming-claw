@@ -1156,6 +1156,8 @@ def _session_to_dict(sess) -> dict:
         "snapshot_path": sess.snapshot_path,
         "snapshot_head_sha": sess.snapshot_head_sha,
         "base_commit_sha": getattr(sess, "base_commit_sha", "") or "",
+        "target_branch": getattr(sess, "target_branch", "") or "",
+        "target_head_sha": getattr(sess, "target_head_sha", "") or "",
         "finalize_error": dict(getattr(sess, "finalize_error", {}) or {}),
     }
 
@@ -1191,6 +1193,14 @@ def _row_to_session_dict(row) -> dict:
         "snapshot_path": row["snapshot_path"],
         "snapshot_head_sha": row["snapshot_head_sha"],
         "base_commit_sha": row["base_commit_sha"] if "base_commit_sha" in keys else "",
+        "target_branch": (
+            row["target_branch"] if "target_branch" in keys and row["target_branch"]
+            else reconcile_session.default_target_branch(row["project_id"], row["session_id"])
+        ),
+        "target_head_sha": (
+            row["target_head_sha"] if "target_head_sha" in keys and row["target_head_sha"]
+            else (row["base_commit_sha"] if "base_commit_sha" in keys else "")
+        ),
         "finalize_error": finalize_error,
     }
 
@@ -1206,6 +1216,7 @@ def handle_reconcile_session_start(ctx: RequestContext):
     full_rebase = bool(body.get("full_rebase", False))
     dropped = body.get("dropped_cluster_fingerprints")
     base_commit_sha = body.get("base_commit_sha") or body.get("base_commit")
+    target_branch = body.get("target_branch")
     try:
         with DBContext(project_id) as conn:
             # Pre-check: active session already exists?
@@ -1224,6 +1235,7 @@ def handle_reconcile_session_start(ctx: RequestContext):
                 full_rebase=full_rebase,
                 dropped_cluster_fingerprints=dropped,
                 base_commit_sha=base_commit_sha,
+                target_branch=target_branch,
             )
     except reconcile_session.SessionAlreadyActiveError as exc:
         return 409, {

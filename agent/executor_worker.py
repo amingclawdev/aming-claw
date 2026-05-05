@@ -31,6 +31,7 @@ import time
 import argparse
 import threading
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -422,7 +423,11 @@ class ExecutorWorker:
         execution_workspace = self.workspace
         if task_type == "dev":
             _timing("worktree: starting")
-            worktree_path, branch_name = self._create_worktree(task_id)
+            worktree_path, branch_name = self._create_worktree(
+                task_id,
+                base_ref=self._dev_worktree_base_ref(metadata),
+                base_commit=metadata.get("reconcile_target_base_commit", ""),
+            )
             if worktree_path:
                 execution_workspace = worktree_path
                 _timing(f"worktree: created {worktree_path}")
@@ -820,6 +825,13 @@ class ExecutorWorker:
         changed = metadata.get("changed_files", [])
         branch = metadata.get("_branch", "")
         worktree = metadata.get("_worktree", "")
+        reconcile_target_branch = (
+            metadata.get("reconcile_target_branch", "")
+            if metadata.get("operation_type") == "reconcile-cluster" else ""
+        )
+        reconcile_target_base = metadata.get("reconcile_target_base_commit", "")
+        merge_target_ref = reconcile_target_branch or "HEAD"
+        merge_target_label = reconcile_target_branch or "main"
         self._report_progress(task_id, {"step": "merging"})
 
         # Chained merge without isolation metadata: check if changes already on main
@@ -896,6 +908,10 @@ class ExecutorWorker:
             if branch:
                 if not self._branch_exists(branch):
                     return {"status": "failed", "error": f"Merge branch missing for chained merge: {branch}"}
+                if reconcile_target_branch:
+                    ok, err = self._ensure_branch_at_ref(reconcile_target_branch, reconcile_target_base or "HEAD")
+                    if not ok:
+                        return {"status": "failed", "error": f"reconcile target branch setup failed: {err[:300]}"}
 
                 worktree_available = bool(worktree and os.path.isdir(worktree))
                 branch_already_merged = False
@@ -911,27 +927,40 @@ class ExecutorWorker:
                                                      cwd=worktree, capture_output=True, text=True, timeout=30)
                         if commit_proc.returncode != 0:
                             return {"status": "failed", "error": f"git commit failed in dev worktree: {commit_proc.stderr[:300]}"}
-                    branch_already_merged = self._branch_already_merged(branch)
+                        branch_already_merged = False
+                    elif reconcile_target_branch:
+                        branch_already_merged = self._branch_already_merged(branch, merge_target_ref)
+                    else:
+                        branch_already_merged = self._branch_already_merged(branch)
                 else:
-                    branch_already_merged = self._branch_already_merged(branch)
+                    if reconcile_target_branch:
+                        branch_already_merged = self._branch_already_merged(branch, merge_target_ref)
+                    else:
+                        branch_already_merged = self._branch_already_merged(branch)
                     if not branch_already_merged:
                         log.info("merge replay without dev worktree: task=%s branch=%s", task_id, branch)
 
                 if branch_already_merged:
-                    rev = subprocess.run(["git", "rev-parse", "HEAD"],
+                    rev = subprocess.run(["git", "rev-parse", merge_target_ref],
                                          cwd=self.workspace, capture_output=True, text=True, timeout=5)
                     return {"status": "succeeded", "result": {
                         "merge_commit": rev.stdout.strip(),
-                        "branch": "main",
+                        "branch": merge_target_label,
                         "merge_mode": "already_merged_replay",
                         "files_changed": len(changed),
                         "changed_files": changed,
+                        "reconcile_target_branch": reconcile_target_branch,
+                        "reconcile_target_base_commit": reconcile_target_base,
+                        "main_redeployed": False if reconcile_target_branch else True,
                     }}
 
                 integration_worktree = ""
                 integration_branch = ""
                 try:
-                    integration_worktree, integration_branch, create_error = self._create_integration_worktree(task_id)
+                    integration_worktree, integration_branch, create_error = self._create_integration_worktree(
+                        task_id,
+                        base_ref=merge_target_ref,
+                    )
                     if not integration_worktree:
                         return {"status": "failed", "error": f"Integration worktree setup failed: {create_error[:300]}"}
 
@@ -949,6 +978,30 @@ class ExecutorWorker:
                         bug_id=bug_id)
                     if not success:
                         return {"status": "failed", "error": f"Merge conflict: {err[:300]}"}
+
+                    if reconcile_target_branch:
+                        ff_proc = subprocess.run(
+                            ["git", "branch", "-f", reconcile_target_branch, merge_commit],
+                            cwd=self.workspace, capture_output=True, text=True, timeout=30)
+                        if ff_proc.returncode != 0:
+                            return {"status": "failed", "error": f"ff-only advance of reconcile branch failed: {ff_proc.stderr[:300]}"}
+                        rev_proc = subprocess.run(
+                            ["git", "rev-parse", reconcile_target_branch],
+                            cwd=self.workspace, capture_output=True, text=True, timeout=5)
+                        if rev_proc.returncode == 0 and rev_proc.stdout.strip():
+                            merge_commit = rev_proc.stdout.strip()
+                        if worktree_available:
+                            self._remove_worktree(worktree, branch, delete_branch=False)
+                        return {"status": "succeeded", "result": {
+                            "merge_commit": merge_commit,
+                            "branch": reconcile_target_branch,
+                            "merge_mode": "reconcile_target_branch",
+                            "files_changed": len(changed),
+                            "changed_files": changed,
+                            "reconcile_target_branch": reconcile_target_branch,
+                            "reconcile_target_base_commit": reconcile_target_base,
+                            "main_redeployed": False,
+                        }}
 
                     # B20: Clean leaked staged/untracked files before ff-only merge
                     try:
@@ -1140,10 +1193,10 @@ class ExecutorWorker:
         except Exception:
             return False
 
-    def _branch_already_merged(self, branch_name: str) -> bool:
+    def _branch_already_merged(self, branch_name: str, target_ref: str = "HEAD") -> bool:
         try:
             proc = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", branch_name, "HEAD"],
+                ["git", "merge-base", "--is-ancestor", branch_name, target_ref or "HEAD"],
                 cwd=self.workspace,
                 capture_output=True,
                 timeout=10,
@@ -1151,6 +1204,31 @@ class ExecutorWorker:
             return proc.returncode == 0
         except Exception:
             return False
+
+    def _dev_worktree_base_ref(self, metadata: dict) -> str:
+        if metadata.get("operation_type") == "reconcile-cluster":
+            return metadata.get("reconcile_target_branch") or "HEAD"
+        return "HEAD"
+
+    def _ensure_branch_at_ref(self, branch_name: str, base_ref: str) -> tuple[bool, str]:
+        """Ensure branch_name exists, creating it at base_ref when needed."""
+        branch_name = str(branch_name or "").strip()
+        base_ref = str(base_ref or "HEAD").strip()
+        if not branch_name or self._branch_exists(branch_name):
+            return True, ""
+        try:
+            proc = subprocess.run(
+                ["git", "branch", branch_name, base_ref],
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode == 0:
+                return True, ""
+            return False, (proc.stderr or proc.stdout or "").strip()
+        except Exception as exc:
+            return False, str(exc)
 
     def _execute_reconcile(self, task_id: str, metadata: dict) -> dict:
         """observer-hotfix-3 2026-04-25: Run reconcile pipeline via Phase J task type.
@@ -1187,6 +1265,28 @@ class ExecutorWorker:
         """Run deploy orchestration on the host executor, not in governance."""
         changed = metadata.get("changed_files", [])
         self._report_progress(task_id, {"step": "deploying"})
+        if metadata.get("operation_type") == "reconcile-cluster" and metadata.get("reconcile_target_branch"):
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            report = {
+                "started_at": now,
+                "changed_files": changed,
+                "affected_services": [],
+                "steps": {},
+                "smoke_test": {},
+                "success": True,
+                "finished_at": now,
+                "note": "Reconcile cluster merge is branch-local; main services are not redeployed until session signoff.",
+                "reconcile_target_branch": metadata.get("reconcile_target_branch", ""),
+                "merge_commit": metadata.get("merge_commit", ""),
+                "main_redeployed": False,
+            }
+            return {"status": "succeeded", "result": {
+                "deploy": "completed",
+                "report": report,
+                "changed_files": changed,
+                "reconcile_target_branch": metadata.get("reconcile_target_branch", ""),
+                "merge_commit": metadata.get("merge_commit", ""),
+            }}
         try:
             from deploy_chain import run_deploy
 
@@ -2063,7 +2163,8 @@ class ExecutorWorker:
 
     _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/"}
 
-    def _create_worktree(self, task_id: str, worker_id: str = ""):
+    def _create_worktree(self, task_id: str, worker_id: str = "",
+                         base_ref: str = "HEAD", base_commit: str = ""):
         """Create isolated git worktree for a dev task.
 
         Args:
@@ -2077,6 +2178,11 @@ class ExecutorWorker:
         else:
             worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}")
         try:
+            base_ref = str(base_ref or "HEAD").strip()
+            if base_ref and base_ref != "HEAD":
+                ok, _err = self._ensure_branch_at_ref(base_ref, base_commit or "HEAD")
+                if not ok:
+                    return None, None
             os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
             # R3: Fetch latest origin/main so worktree baseline includes recent merges
             subprocess.run(
@@ -2087,7 +2193,7 @@ class ExecutorWorker:
                 timeout=30,
             )
             proc = subprocess.run(
-                ["git", "worktree", "add", "-b", branch_name, worktree_dir, "HEAD"],
+                ["git", "worktree", "add", "-b", branch_name, worktree_dir, base_ref or "HEAD"],
                 cwd=self.workspace,
                 capture_output=True,
                 text=True,
@@ -2121,14 +2227,14 @@ class ExecutorWorker:
         except Exception:
             pass
 
-    def _create_integration_worktree(self, task_id: str):
+    def _create_integration_worktree(self, task_id: str, base_ref: str = "HEAD"):
         """Create a clean integration worktree used only for merge verification."""
         branch_name = f"merge/{task_id}"
         worktree_dir = os.path.join(self.workspace, ".worktrees", f"merge-{task_id}")
         try:
             os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
             proc = subprocess.run(
-                ["git", "worktree", "add", "-b", branch_name, worktree_dir, "HEAD"],
+                ["git", "worktree", "add", "-b", branch_name, worktree_dir, base_ref or "HEAD"],
                 cwd=self.workspace,
                 capture_output=True,
                 text=True,

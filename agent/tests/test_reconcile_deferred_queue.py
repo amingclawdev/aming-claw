@@ -104,6 +104,23 @@ def test_enqueue_does_not_touch_live_repo_overlay(conn):
     assert after == before
 
 
+def test_auto_session_start_records_target_branch(conn):
+    """Auto-started sessions carry branch/base provenance for cluster worktrees."""
+    out = q.enqueue_or_lookup(
+        PROJECT_ID, "fp-session-branch", payload={"a": 1},
+        run_id="run-session-branch", conn=conn,
+    )
+    assert out["status"] == "queued"
+    row = conn.execute(
+        "SELECT session_id, base_commit_sha, target_branch, target_head_sha "
+        "FROM reconcile_sessions WHERE project_id=? AND run_id=?",
+        (PROJECT_ID, "run-session-branch"),
+    ).fetchone()
+    assert row is not None
+    assert row["target_branch"].startswith(f"reconcile/{PROJECT_ID}-")
+    assert row["target_head_sha"] == row["base_commit_sha"]
+
+
 def test_dedup(conn):
     """Re-enqueue with identical payload returns existing row, no duplicate."""
     q.enqueue_or_lookup(PROJECT_ID, "fp-dup", payload={"a": 1},
