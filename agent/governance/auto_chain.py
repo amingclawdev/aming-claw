@@ -6778,6 +6778,33 @@ def _cluster_normalize_deps(value):
     return tuple(sorted(set(out)))
 
 
+def _cluster_normalize_scalar(value):
+    """Normalize scalar candidate identity fields such as test_coverage."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _cluster_candidate_secondary(item):
+    if not isinstance(item, dict):
+        return tuple()
+    value = item.get("secondary")
+    if value is None:
+        value = item.get("secondary_files")
+    return tuple(_cluster_normalize_primary(value))
+
+
+def _cluster_candidate_test(item):
+    if not isinstance(item, dict):
+        return tuple()
+    value = item.get("test")
+    if value is None:
+        value = item.get("tests")
+    if value is None:
+        value = item.get("test_files")
+    return tuple(_cluster_normalize_primary(value))
+
+
 def _cluster_normalize_layer(value):
     """Normalize a parent_layer value to canonical 'L<N>' form (or '' on bad)."""
     if value is None:
@@ -6863,6 +6890,10 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
             "deps": _cluster_normalize_deps(
                 item.get("_deps") if item.get("_deps") is not None else item.get("deps")
             ),
+            "secondary": _cluster_candidate_secondary(item),
+            "test": _cluster_candidate_test(item),
+            "test_coverage": _cluster_normalize_scalar(item.get("test_coverage")),
+            "has_test_coverage": "test_coverage" in item,
             "index": idx,
         }
     if not expected:
@@ -6935,6 +6966,27 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
                 f"expected={list(cand_deps)} actual={list(prop_deps)}. "
                 "Do not put hierarchy parent in deps; use parent/parent_id."
             )
+        for field in ("secondary", "test"):
+            cand_paths = candidate[field]
+            prop_paths = tuple(_cluster_normalize_primary(proposed_node.get(field)))
+            if cand_paths != prop_paths:
+                return False, (
+                    "FATAL preflight (reconcile-cluster): proposed_nodes "
+                    f"{field} for {node_id} must match candidate exactly; "
+                    f"expected={list(cand_paths)} actual={list(prop_paths)}. "
+                    "Candidate doc/test consumers are graph identity; do not drop, "
+                    "move, or invent them in PM."
+                )
+        if candidate["has_test_coverage"]:
+            cand_coverage = candidate["test_coverage"]
+            prop_coverage = _cluster_normalize_scalar(proposed_node.get("test_coverage"))
+            if cand_coverage != prop_coverage:
+                return False, (
+                    "FATAL preflight (reconcile-cluster): proposed_nodes "
+                    f"test_coverage for {node_id} must match candidate exactly; "
+                    f"expected={cand_coverage!r} actual={prop_coverage!r}. "
+                    "Preserve coverage classification from the candidate graph."
+                )
     return True, "ok"
 
 
@@ -7071,25 +7123,40 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_no
             f"do not match PM proposed_nodes 1:1 — only_pm={only_pm} "
             f"only_dev={only_dev}"
         )
-    expected_deps = {}
+    expected_contract = {}
     for item in candidate_nodes or []:
         if not isinstance(item, dict):
             continue
         node_id = _cluster_explicit_node_id(item)
         if not node_id:
             continue
-        expected_deps[node_id] = _cluster_normalize_deps(
-            item.get("_deps") if item.get("_deps") is not None else item.get("deps")
-        )
-    if expected_deps:
+        expected_contract[node_id] = {
+            "deps": _cluster_normalize_deps(
+                item.get("_deps") if item.get("_deps") is not None else item.get("deps")
+            ),
+            "secondary": _cluster_candidate_secondary(item),
+            "test": _cluster_candidate_test(item),
+            "test_coverage": _cluster_normalize_scalar(item.get("test_coverage")),
+            "has_test_coverage": "test_coverage" in item,
+        }
+    if expected_contract:
         for idx, item in enumerate(dev_creates or []):
             if not isinstance(item, dict):
                 return False, f"graph_delta.creates[{idx}] is not an object"
             node_id = _cluster_explicit_node_id(item)
-            if node_id not in expected_deps:
-                continue
+            if not node_id:
+                return False, (
+                    "FATAL preflight (reconcile-cluster): graph_delta.creates "
+                    f"index {idx} must preserve candidate node_id/candidate_node_id"
+                )
+            if node_id not in expected_contract:
+                return False, (
+                    "FATAL preflight (reconcile-cluster): graph_delta.creates "
+                    f"references non-candidate node_id {node_id!r}; "
+                    f"expected one of {sorted(expected_contract)}"
+                )
             actual = _cluster_normalize_deps(item.get("deps"))
-            expected = expected_deps[node_id]
+            expected = expected_contract[node_id]["deps"]
             if actual != expected:
                 return False, (
                     "FATAL preflight (reconcile-cluster): graph_delta.creates deps "
@@ -7097,6 +7164,25 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_no
                     f"expected={list(expected)} actual={list(actual)}. "
                     "Do not put hierarchy parent in deps; use parent/parent_id."
                 )
+            for field in ("secondary", "test"):
+                expected_paths = expected_contract[node_id][field]
+                actual_paths = tuple(_cluster_normalize_primary(item.get(field)))
+                if actual_paths != expected_paths:
+                    return False, (
+                        "FATAL preflight (reconcile-cluster): graph_delta.creates "
+                        f"{field} for {node_id} must match candidate exactly; "
+                        f"expected={list(expected_paths)} actual={list(actual_paths)}. "
+                        "Candidate doc/test consumers are graph identity."
+                    )
+            if expected_contract[node_id]["has_test_coverage"]:
+                expected_coverage = expected_contract[node_id]["test_coverage"]
+                actual_coverage = _cluster_normalize_scalar(item.get("test_coverage"))
+                if actual_coverage != expected_coverage:
+                    return False, (
+                        "FATAL preflight (reconcile-cluster): graph_delta.creates "
+                        f"test_coverage for {node_id} must match candidate exactly; "
+                        f"expected={expected_coverage!r} actual={actual_coverage!r}."
+                    )
     return True, "ok"
 
 
@@ -7742,6 +7828,7 @@ def apply_reconcile_cluster_to_overlay(
             "primary": list(proposed.get("primary") or []),
             "secondary": list(proposed.get("secondary") or []),
             "test": list(proposed.get("test") or []),
+            "test_coverage": proposed.get("test_coverage", ""),
             "title": proposed.get("title", ""),
             "deps": list(proposed.get("deps") or []),
             "verify_status": new_status,

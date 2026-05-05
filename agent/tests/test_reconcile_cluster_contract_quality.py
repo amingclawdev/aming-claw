@@ -20,6 +20,9 @@ def _candidate_metadata():
                     "parent": "L3.22",
                     "_deps": ["L7.11"],
                     "primary": ["agent/governance/reconcile_batch_memory.py"],
+                    "secondary": ["docs/governance/reconcile-workflow.md"],
+                    "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                    "test_coverage": "direct",
                 }
             ]
         },
@@ -60,6 +63,9 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
                 "parent_id": "L3.22",
                 "deps": ["L7.11"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": ["docs/governance/reconcile-workflow.md"],
+                "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                "test_coverage": "direct",
             }
         ]
     }
@@ -70,6 +76,90 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
     )
 
     assert passed, reason
+
+
+def test_reconcile_cluster_pm_preflight_rejects_dropped_candidate_test_consumer():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": ["docs/governance/reconcile-workflow.md"],
+                "test": [],
+                "test_coverage": "direct",
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "proposed_nodes test" in reason
+    assert "test_reconcile_batch_memory.py" in reason
+
+
+def test_reconcile_cluster_pm_preflight_rejects_dropped_candidate_doc_consumer():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": [],
+                "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                "test_coverage": "direct",
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "proposed_nodes secondary" in reason
+    assert "reconcile-workflow.md" in reason
+
+
+def test_reconcile_cluster_pm_preflight_rejects_candidate_test_coverage_drift():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": ["docs/governance/reconcile-workflow.md"],
+                "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                "test_coverage": "none",
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "test_coverage" in reason
+    assert "direct" in reason
 
 
 def test_reconcile_cluster_pm_preflight_rejects_parent_in_deps():
@@ -184,6 +274,9 @@ def test_reconcile_cluster_dev_preflight_rejects_candidate_deps_drift():
             "parent_id": "L3.22",
             "deps": ["L7.11"],
             "primary": ["agent/governance/reconcile_batch_memory.py"],
+            "secondary": ["docs/governance/reconcile-workflow.md"],
+            "test": ["agent/tests/test_reconcile_batch_memory.py"],
+            "test_coverage": "direct",
         }
     ]
     dev_creates = [
@@ -194,6 +287,9 @@ def test_reconcile_cluster_dev_preflight_rejects_candidate_deps_drift():
             "parent_id": "L3.22",
             "deps": ["L7.11", "L3.22"],
             "primary": ["agent/governance/reconcile_batch_memory.py"],
+            "secondary": ["docs/governance/reconcile-workflow.md"],
+            "test": ["agent/tests/test_reconcile_batch_memory.py"],
+            "test_coverage": "direct",
         }
     ]
 
@@ -206,6 +302,102 @@ def test_reconcile_cluster_dev_preflight_rejects_candidate_deps_drift():
     assert not passed
     assert "graph_delta.creates deps" in reason
     assert "L3.22" in reason
+
+
+def test_reconcile_cluster_dev_preflight_rejects_dropped_candidate_test_consumer():
+    metadata = _candidate_metadata()
+    pm_nodes = [
+        {
+            "node_id": "L7.72",
+            "title": "agent.governance.reconcile_batch_memory",
+            "parent_layer": 7,
+            "parent_id": "L3.22",
+            "deps": ["L7.11"],
+            "primary": ["agent/governance/reconcile_batch_memory.py"],
+            "secondary": ["docs/governance/reconcile-workflow.md"],
+            "test": ["agent/tests/test_reconcile_batch_memory.py"],
+            "test_coverage": "direct",
+        }
+    ]
+    dev_creates = [
+        {
+            "node_id": "L7.72",
+            "title": "agent.governance.reconcile_batch_memory",
+            "parent_layer": 7,
+            "parent_id": "L3.22",
+            "deps": ["L7.11"],
+            "primary": ["agent/governance/reconcile_batch_memory.py"],
+            "secondary": ["docs/governance/reconcile-workflow.md"],
+            "test": [],
+            "test_coverage": "direct",
+        }
+    ]
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_dev(
+        pm_nodes,
+        dev_creates,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "graph_delta.creates test" in reason
+    assert "Candidate doc/test consumers" in reason
+
+
+def test_reconcile_cluster_preflight_blocks_phase_z_test_superset_loss():
+    """Regression for 82d80141: L7.92 must keep the full candidate test list."""
+    candidate_tests = [
+        "agent/tests/test_phase_z.py",
+        "agent/tests/test_phase_z_ai_cluster_wiring.py",
+        "agent/tests/test_phase_z_cluster_groups_smoke.py",
+        "agent/tests/test_phase_z_v2_architecture_relations.py",
+        "agent/tests/test_phase_z_v2_calibrate_script.py",
+        "agent/tests/test_phase_z_v2_feature_clusters.py",
+        "agent/tests/test_phase_z_v2_pr1.py",
+        "agent/tests/test_phase_z_v2_pr2.py",
+        "agent/tests/test_phase_z_v2_pr3.py",
+        "agent/tests/test_phase_z_v2_project_profile.py",
+        "agent/tests/test_phase_z_v2_traversal.py",
+    ]
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "cluster_payload": {
+            "candidate_nodes": [
+                {
+                    "node_id": "L7.92",
+                    "title": "agent.governance.reconcile_phases.phase_z",
+                    "layer": "L7",
+                    "parent": "L3.34",
+                    "_deps": [],
+                    "primary": ["agent/governance/reconcile_phases/phase_z.py"],
+                    "test": candidate_tests,
+                    "test_coverage": "direct",
+                }
+            ]
+        },
+    }
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.92",
+                "title": "agent.governance.reconcile_phases.phase_z",
+                "parent_layer": "L7",
+                "parent_id": "L3.34",
+                "deps": [],
+                "primary": ["agent/governance/reconcile_phases/phase_z.py"],
+                "test": candidate_tests[:3],
+                "test_coverage": "direct",
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "test_phase_z_v2_feature_clusters.py" in reason
 
 
 def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeypatch):
@@ -234,7 +426,7 @@ def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeyp
     prompt, out_meta = auto_chain._build_dev_prompt("pm-task", result, _candidate_metadata())
 
     assert "graph_delta.creates" in prompt
-    assert out_meta["doc_impact"] == {}
+    assert out_meta["doc_impact"]["files"] == ["docs/governance/reconcile-workflow.md"]
 
 
 def test_reconcile_cluster_build_qa_prompt_does_not_pull_old_graph_docs(monkeypatch):
@@ -257,7 +449,8 @@ def test_reconcile_cluster_build_qa_prompt_does_not_pull_old_graph_docs(monkeypa
     prompt, out_meta = auto_chain._build_qa_prompt("test-task", result, metadata)
 
     assert "criteria_results" in prompt
-    assert "Graph Consistency Check" not in prompt
+    assert "Graph Consistency Check" in prompt
+    assert "docs/governance/reconcile-workflow.md" in prompt
     assert out_meta["target_files"] == ["agent/governance/reconcile_batch_memory.py"]
 
 

@@ -45,6 +45,7 @@ def test_reconcile_cluster_no_test_overlay_graph_delta_can_advance_without_synth
             "parent_id": "L3.29",
             "primary": ["agent/telegram_gateway/chat_proxy.py"],
             "deps": [],
+            "test_coverage": "none",
         },
         {
             "node_id": "L7.133",
@@ -52,6 +53,7 @@ def test_reconcile_cluster_no_test_overlay_graph_delta_can_advance_without_synth
             "primary": ["agent/telegram_gateway/gateway.py"],
             "secondary": ["docs/governance/design-spec-full.md"],
             "deps": ["L7.123"],
+            "test_coverage": "none",
         },
     ]
     candidate_nodes = [
@@ -83,6 +85,7 @@ def test_reconcile_cluster_no_test_overlay_graph_delta_can_advance_without_synth
                         "parent_id": "L3.29",
                         "primary": ["agent/telegram_gateway/chat_proxy.py"],
                         "deps": [],
+                        "test_coverage": "none",
                     },
                     {
                         "node_id": "L7.133",
@@ -90,6 +93,7 @@ def test_reconcile_cluster_no_test_overlay_graph_delta_can_advance_without_synth
                         "primary": ["agent/telegram_gateway/gateway.py"],
                         "secondary": ["docs/governance/design-spec-full.md"],
                         "deps": ["L7.123"],
+                        "test_coverage": "none",
                     },
                 ],
             },

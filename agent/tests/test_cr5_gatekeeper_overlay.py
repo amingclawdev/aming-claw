@@ -673,6 +673,7 @@ def test_candidate_graph_uses_candidate_id_without_old_graph_allocation(
             "candidate_node_id": "L7.1",
             "primary": ["agent/governance/rebased_new.py"],
             "parent_layer": "L7",
+            "test_coverage": "direct",
         },
     ]}
     dev_result = {"graph_delta": {"creates": pm_prd["proposed_nodes"]}}
@@ -696,6 +697,7 @@ def test_candidate_graph_uses_candidate_id_without_old_graph_allocation(
     assert overlay_doc["nodes"]["L7.1"]["primary"] == [
         "agent/governance/rebased_new.py"
     ]
+    assert overlay_doc["nodes"]["L7.1"]["test_coverage"] == "direct"
 
 
 def test_candidate_graph_path_resolves_from_cluster_payload(
