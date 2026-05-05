@@ -495,6 +495,14 @@ def _compose_candidate_aware_graph(*, candidate_graph_path: Path,
         raise ValueError(f"overlay primaries missing from candidate graph: {missing[:10]}")
     if ambiguous:
         raise ValueError(f"candidate graph has ambiguous primary coverage: {ambiguous[:10]}")
+    missing_overlay = [
+        primary for primary in sorted(candidate_by_primary)
+        if primary not in primary_to_overlay
+    ]
+    if missing_overlay:
+        raise ValueError(
+            "candidate leaf primaries missing from overlay: "
+            f"count={len(missing_overlay)} sample={missing_overlay[:10]}")
 
     candidate_to_final: dict[str, str] = {}
     overlay_to_candidates: dict[str, list[str]] = {}

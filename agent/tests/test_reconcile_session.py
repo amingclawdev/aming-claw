@@ -499,6 +499,60 @@ def test_finalize_candidate_missing_overlay_primary_preserves_state(conn, gov_di
     assert "missing from candidate graph" in failed.finalize_error["message"]
 
 
+def test_finalize_candidate_leaf_missing_from_overlay_preserves_state(conn, gov_dir):
+    sess = rs.start_session(conn, PROJECT_ID, governance_dir=gov_dir)
+    (gov_dir / "covered.py").write_text("x = 1\n", encoding="utf-8")
+    (gov_dir / "missing.py").write_text("y = 2\n", encoding="utf-8")
+    overlay = gov_dir / "graph.rebase.overlay.json"
+    overlay.write_text(json.dumps({
+        "session_id": sess.session_id,
+        "project_id": PROJECT_ID,
+        "nodes": {
+            "L7.10": {
+                "node_id": "L7.10",
+                "parent_layer": "L7",
+                "title": "Covered Leaf",
+                "primary": ["covered.py"],
+            }
+        },
+    }), encoding="utf-8")
+    candidate = gov_dir / "graph.rebase.candidate.json"
+    nodes = [
+        {"id": "L1.1", "title": "Runtime", "layer": "L1", "primary": []},
+        {"id": "L7.1", "title": "Covered", "layer": "L7", "primary": ["covered.py"]},
+        {"id": "L7.2", "title": "Missing", "layer": "L7", "primary": ["missing.py"]},
+    ]
+    candidate.write_text(json.dumps({
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": nodes,
+            "links": [
+                {"source": "L1.1", "target": "L7.1", "relation": "contains"},
+                {"source": "L1.1", "target": "L7.2", "relation": "contains"},
+            ],
+        },
+    }), encoding="utf-8")
+    graph_before = (gov_dir / "graph.json").read_bytes()
+    overlay_before = overlay.read_bytes()
+
+    with pytest.raises(ValueError, match="candidate leaf primaries missing from overlay"):
+        rs.finalize_session(
+            conn, PROJECT_ID, sess.session_id,
+            governance_dir=gov_dir, workspace_dir=gov_dir,
+            candidate_graph_path=candidate, full_rebase=True,
+        )
+
+    assert overlay.read_bytes() == overlay_before
+    assert (gov_dir / "graph.json").read_bytes() == graph_before
+    failed = rs.get_active_session(conn, PROJECT_ID)
+    assert failed.session_id == sess.session_id
+    assert failed.status == "finalize_failed"
+    assert "missing.py" in failed.finalize_error["message"]
+
+
 def test_finalize_blocks_until_reconcile_clusters_complete(conn, gov_dir):
     from governance import reconcile_deferred_queue as q
 

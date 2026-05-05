@@ -517,13 +517,17 @@ MAX_CHAIN_DEPTH = 10
 # ---------------------------------------------------------------------------
 
 
-def _get_graph_doc_associations(project_id, target_files):
+def _get_graph_doc_associations(project_id, target_files, metadata=None):
     """Query graph for doc associations of target_files.
 
     Returns list of doc paths that the graph considers related to the changed code.
     Uses confirmed secondary associations from graph nodes.
     """
     try:
+        if isinstance(metadata, dict) and metadata.get("operation_type") == "reconcile-cluster":
+            from .chain_graph_context import get_graph_doc_associations
+            return get_graph_doc_associations(
+                project_id, target_files, metadata=metadata)
         from .graph import AcceptanceGraph
         state_root = os.path.join(
             os.environ.get("SHARED_VOLUME_PATH",
@@ -565,6 +569,64 @@ def _get_graph_doc_associations(project_id, target_files):
     except Exception:
         log.debug("_get_graph_doc_associations failed (non-critical)", exc_info=True)
         return []
+
+
+def _get_task_graph_doc_associations(project_id, target_files, metadata=None):
+    """Return doc associations for this task's graph context."""
+    try:
+        if isinstance(metadata, dict) and metadata.get("operation_type") == "reconcile-cluster":
+            from .chain_graph_context import get_graph_doc_associations
+            return get_graph_doc_associations(
+                project_id, target_files, metadata=metadata)
+    except Exception:
+        log.debug("_get_task_graph_doc_associations failed for reconcile context", exc_info=True)
+        return []
+    return _get_graph_doc_associations(project_id, target_files)
+
+
+def _get_graph_related_nodes(project_id, target_files, metadata=None):
+    """Return graph node ids related to target files for the active task context."""
+    try:
+        if isinstance(metadata, dict) and metadata.get("operation_type") == "reconcile-cluster":
+            from .chain_graph_context import get_related_nodes
+            return get_related_nodes(project_id, target_files, metadata=metadata)
+        from .graph import AcceptanceGraph
+        state_root = os.path.join(
+            os.environ.get("SHARED_VOLUME_PATH",
+                           os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
+            "codex-tasks", "state", "governance", project_id)
+        graph_path = os.path.join(state_root, "graph.json")
+        if not os.path.exists(graph_path):
+            return []
+        graph = AcceptanceGraph()
+        graph.load(graph_path)
+        target_set = set(target_files or [])
+        matched_nodes = []
+        for node_id in graph.list_nodes():
+            try:
+                node_data = graph.get_node(node_id)
+            except Exception:
+                continue
+            primary = node_data.get("primary", [])
+            if any(f in target_set for f in primary):
+                matched_nodes.append(node_id)
+        return sorted(matched_nodes)
+    except Exception:
+        log.debug("_get_graph_related_nodes failed (non-critical)", exc_info=True)
+        return []
+
+
+def _build_reconcile_graph_preflight(project_id, metadata, proposed_nodes=None):
+    """Build session-local graph preflight context for reconcile-cluster tasks."""
+    if not isinstance(metadata, dict) or metadata.get("operation_type") != "reconcile-cluster":
+        return {}
+    try:
+        from .chain_graph_context import build_reconcile_graph_preflight
+        return build_reconcile_graph_preflight(
+            project_id, metadata, proposed_nodes=proposed_nodes)
+    except Exception:
+        log.debug("_build_reconcile_graph_preflight failed (non-critical)", exc_info=True)
+        return {}
 
 
 def _audit_doc_gap(conn, project_id, task_id, stage, missing_docs, changed_files):
@@ -2202,7 +2264,7 @@ def _compute_gate_static_allowed(project_id, metadata):
     doc_impact = metadata.get("doc_impact", {})
     if isinstance(doc_impact, dict):
         allowed.update(doc_impact.get("files", []) or [])
-    graph_docs = _get_graph_doc_associations(project_id, list(target))
+    graph_docs = _get_task_graph_doc_associations(project_id, list(target), metadata)
     if graph_docs:
         allowed.update(graph_docs)
     # B36-fix(4): tests importing any target — prevents PM under-specification from ping-ponging dev
@@ -2833,6 +2895,14 @@ def _render_dev_contract_prompt(source_task_id, metadata):
             )
         else:
             parts.append(f"\nDoc impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+
+    graph_preflight = metadata.get("graph_preflight", {})
+    if is_cluster and graph_preflight:
+        parts.append(
+            "\nReconcile session graph preflight. Use this as the graph-governance "
+            "context for this cluster instead of active graph.json:\n"
+            f"{json.dumps(graph_preflight, ensure_ascii=False, indent=2)}"
+        )
 
     # R5: Document optional graph_delta field for dev results (not required)
     proposed_nodes = metadata.get("proposed_nodes", [])
@@ -4413,7 +4483,7 @@ def _gate_post_pm(conn, project_id, result, metadata):
     # G4: Auto-populate doc_impact from graph if PM left it empty
     doc_impact = result.get("doc_impact") or prd.get("doc_impact")
     if not doc_impact or (isinstance(doc_impact, dict) and not doc_impact.get("files")):
-        graph_docs = _get_graph_doc_associations(project_id, target_files)
+        graph_docs = _get_task_graph_doc_associations(project_id, target_files, metadata)
         # R2: Filter to only .md files — code files must never appear in doc_impact
         graph_docs = [f for f in graph_docs if f.endswith(".md")]
         if graph_docs:
@@ -4424,30 +4494,9 @@ def _gate_post_pm(conn, project_id, result, metadata):
 
     # G8: Auto-populate related_nodes from graph when PM left it empty
     if not result.get("related_nodes") and target_files:
-        try:
-            from .graph import AcceptanceGraph
-            state_root = os.path.join(
-                os.environ.get("SHARED_VOLUME_PATH",
-                               os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "shared-volume")),
-                "codex-tasks", "state", "governance", project_id)
-            graph_path = os.path.join(state_root, "graph.json")
-            if os.path.exists(graph_path):
-                graph = AcceptanceGraph()
-                graph.load(graph_path)
-                target_set = set(target_files)
-                matched_nodes = []
-                for node_id in graph.list_nodes():
-                    try:
-                        node_data = graph.get_node(node_id)
-                    except Exception:
-                        continue
-                    primary = node_data.get("primary", [])
-                    if any(f in target_set for f in primary):
-                        matched_nodes.append(node_id)
-                if matched_nodes:
-                    result["related_nodes"] = matched_nodes
-        except Exception:
-            pass  # G8: graph lookup failure is non-critical
+        matched_nodes = _get_graph_related_nodes(project_id, target_files, metadata)
+        if matched_nodes:
+            result["related_nodes"] = matched_nodes
 
     # === Soft-mandatory: provide OR explain in skip_reasons ===
     skip_reasons = result.get("skip_reasons", prd.get("skip_reasons", {}))
@@ -4469,6 +4518,12 @@ def _gate_post_pm(conn, project_id, result, metadata):
         )
         if not cluster_ok:
             return False, cluster_reason
+        graph_preflight = _build_reconcile_graph_preflight(
+            project_id, metadata,
+            proposed_nodes=result.get("proposed_nodes") or prd.get("proposed_nodes") or [],
+        )
+        if graph_preflight:
+            result["graph_preflight"] = graph_preflight
 
     # === Subtask validation (R4) ===
     subtasks = result.get("subtasks") or prd.get("subtasks")
@@ -4517,7 +4572,7 @@ def _gate_post_pm(conn, project_id, result, metadata):
     # === 5a: Graph doc classification validation (observation mode) ===
     target_files = (result.get("target_files") or prd.get("target_files")
                     or metadata.get("target_files") or [])
-    graph_docs = _get_graph_doc_associations(project_id, target_files)
+    graph_docs = _get_task_graph_doc_associations(project_id, target_files, metadata)
     if graph_docs:
         doc_impact = result.get("doc_impact") or prd.get("doc_impact") or {}
         declared_docs = set()
@@ -4534,7 +4589,7 @@ def _gate_post_pm(conn, project_id, result, metadata):
     # === Merge all fields into result for downstream ===
     for field in ("target_files", "verification", "acceptance_criteria",
                   "test_files", "proposed_nodes", "doc_impact", "skip_reasons",
-                  "requirements", "related_nodes"):
+                  "requirements", "related_nodes", "graph_preflight"):
         if not result.get(field):
             result[field] = prd.get(field) or metadata.get(field)
 
@@ -4633,7 +4688,7 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     # B36-fix(2): single source of truth shared with retry-prompt scope_line
     target, allowed = _compute_gate_static_allowed(project_id, metadata)
     # graph_docs still needed downstream for observation-mode doc check
-    graph_docs = _get_graph_doc_associations(project_id, list(target))
+    graph_docs = _get_task_graph_doc_associations(project_id, list(target), metadata)
     # B36-fix(1): on retry, inherit accumulated_changed_files from prior succeeded
     # dev stages so consecutive attempts can build on each other.
     if metadata.get("parent_task_id"):
@@ -5111,7 +5166,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
         # 5e: Graph doc verification (observation mode)
         if _GRAPH_DOC_OBSERVATION_MODE:
             target_files = metadata.get("target_files", [])
-            graph_docs = _get_graph_doc_associations(project_id, target_files)
+            graph_docs = _get_task_graph_doc_associations(project_id, target_files, metadata)
             if graph_docs:
                 changed = metadata.get("changed_files", [])
                 doc_files_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
@@ -5177,7 +5232,9 @@ def _metadata_with_reconcile_session(conn, project_id, metadata):
     except Exception:
         pass
     out["session_id"] = (
-        out.get("reconcile_run_id")
+        out.get("session_id")
+        or out.get("reconcile_session_id")
+        or out.get("reconcile_run_id")
         or out.get("chain_id")
         or out.get("parent_task_id")
         or ""
@@ -5569,22 +5626,28 @@ def _build_dev_prompt(task_id, result, metadata):
                     requirements = parent_result.get("requirements", requirements)
         except Exception:
             pass
-    # 5b: Merge graph-derived docs into doc_impact. Reconcile-cluster rebuilds
-    # a candidate graph, so old graph doc links are advisory noise here.
-    if not is_reconcile_cluster_task(metadata):
-        graph_docs = _get_graph_doc_associations(
-            metadata.get("project_id", "aming-claw"), target_files)
-        if graph_docs:
-            if isinstance(doc_impact, dict):
-                existing = set(doc_impact.get("files", []))
-                new_docs = [d for d in graph_docs if d not in existing]
-                if new_docs:
-                    doc_impact = dict(doc_impact)  # copy
-                    doc_impact["files"] = list(existing | set(new_docs))
-                    doc_impact.setdefault("changes", []).append(
-                        f"Graph-linked docs added: {new_docs[:5]}")
-            else:
-                doc_impact = {"files": graph_docs, "changes": ["Graph-derived doc associations"]}
+    # 5b: Merge graph-derived docs into doc_impact. Reconcile-cluster tasks use
+    # the session-local candidate/overlay graph instead of stale active graph.json.
+    graph_docs = _get_task_graph_doc_associations(
+        metadata.get("project_id", "aming-claw"), target_files, metadata)
+    if graph_docs:
+        if isinstance(doc_impact, dict):
+            existing = set(doc_impact.get("files", []))
+            new_docs = [d for d in graph_docs if d not in existing]
+            if new_docs:
+                doc_impact = dict(doc_impact)  # copy
+                doc_impact["files"] = list(existing | set(new_docs))
+                doc_impact.setdefault("changes", []).append(
+                    f"Graph-linked docs added: {new_docs[:5]}")
+        else:
+            doc_impact = {"files": graph_docs, "changes": ["Graph-derived doc associations"]}
+
+    graph_preflight = result.get("graph_preflight") or metadata.get("graph_preflight")
+    if is_reconcile_cluster_task(metadata) and not graph_preflight:
+        graph_preflight = _build_reconcile_graph_preflight(
+            metadata.get("project_id", "aming-claw"), metadata,
+            proposed_nodes=proposed_nodes,
+        )
 
     out_meta = {
         **metadata,  # preserves skip_doc_check, changed_files, related_nodes, etc.
@@ -5597,6 +5660,7 @@ def _build_dev_prompt(task_id, result, metadata):
         "skip_reasons": skip_reasons,
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes", result.get("related_nodes", []))),
         "proposed_nodes": proposed_nodes,
+        "graph_preflight": graph_preflight,
     }
     prompt = _render_dev_contract_prompt(task_id, out_meta)
     # R3/R7: Inject prior pitfalls section (graceful degradation)
@@ -5632,6 +5696,7 @@ def _build_test_prompt(task_id, result, metadata):
         "dev_changed_files": changed,
         "dev_needs_review": result.get("needs_review", False),
         "dev_retry_context": result.get("retry_context", {}),
+        "graph_preflight": metadata.get("graph_preflight", {}),
     }
     # Propagate worktree info from dev result → test → qa → merge
     if result.get("_worktree"):
@@ -5690,7 +5755,20 @@ def _build_qa_prompt(task_id, result, metadata):
         prompt_parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
     if doc_impact:
         prompt_parts.append(f"doc_impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+    graph_preflight = metadata.get("graph_preflight", {})
     if is_reconcile_cluster_task(metadata):
+        graph_preflight = graph_preflight or _build_reconcile_graph_preflight(
+            metadata.get("project_id", "aming-claw"), metadata,
+            proposed_nodes=metadata.get("proposed_nodes", []),
+        )
+        if graph_preflight:
+            prompt_parts.append(
+                "\n## Reconcile Session Graph Context\n"
+                "Use this candidate/overlay graph context for doc/test/node "
+                "consistency checks. Do not use stale active graph.json for "
+                "this reconcile-cluster review.\n"
+                f"{json.dumps(graph_preflight, ensure_ascii=False, indent=2)}"
+            )
         dev_context = {
             "dev_result_summary": metadata.get("dev_result_summary", ""),
             "dev_test_results": metadata.get("dev_test_results", {}),
@@ -5719,11 +5797,11 @@ def _build_qa_prompt(task_id, result, metadata):
             "unless an actual doc file exists in changed_files or the workspace."
         )
     # 5d: Graph consistency check injection
-    graph_docs = []
-    if not is_reconcile_cluster_task(metadata):
-        graph_docs = _get_graph_doc_associations(
-            metadata.get("project_id", "aming-claw"),
-            metadata.get("target_files", []))
+    graph_docs = _get_task_graph_doc_associations(
+        metadata.get("project_id", "aming-claw"),
+        metadata.get("target_files", []),
+        metadata,
+    )
     if graph_docs:
         prompt_parts.append(
             f"\n## Graph Consistency Check\n"
@@ -5771,6 +5849,7 @@ def _build_qa_prompt(task_id, result, metadata):
         "acceptance_criteria": criteria,
         "verification": verification,
         "doc_impact": doc_impact,
+        "graph_preflight": graph_preflight,
     }
     if result.get("_worktree"):
         meta["_worktree"] = result["_worktree"]
@@ -5781,6 +5860,7 @@ def _build_qa_prompt(task_id, result, metadata):
 def _build_gatekeeper_prompt(task_id, result, metadata):
     # R5/R7: Inject prior decisions section (graceful degradation)
     gk_memories = _inject_gatekeeper_memories(metadata)
+    graph_preflight = metadata.get("graph_preflight", {})
     prompt = (
         f"Gatekeeper review for {task_id}.\n"
         "You are the final isolated acceptance check before merge.\n"
@@ -5793,6 +5873,7 @@ def _build_gatekeeper_prompt(task_id, result, metadata):
         f"test_report: {json.dumps(metadata.get('test_report', {}), ensure_ascii=False)}\n"
         f"qa_review: {json.dumps({'review_summary': result.get('review_summary', ''), 'issues': result.get('issues', []), 'doc_updates_applied': result.get('doc_updates_applied', [])}, ensure_ascii=False)}\n"
         f"changed_files: {json.dumps(metadata.get('changed_files', []))}\n"
+        f"graph_preflight: {json.dumps(graph_preflight, ensure_ascii=False)}\n"
         "Respond with strict JSON: "
         "{\"schema_version\":\"v1\",\"review_summary\":\"...\",\"recommendation\":\"merge_pass|reject\",\"pm_alignment\":\"pass|partial|fail\",\"checked_requirements\":[\"R1\"],\"reason\":\"\"}"
     )
@@ -5801,6 +5882,7 @@ def _build_gatekeeper_prompt(task_id, result, metadata):
     meta = {
         **metadata,
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes", result.get("related_nodes", []))),
+        "graph_preflight": graph_preflight,
     }
     # Propagate worktree isolation metadata through gatekeeper → merge
     if metadata.get("_worktree"):
@@ -5826,6 +5908,7 @@ def _build_merge_prompt(task_id, result, metadata):
         "_worktree": metadata.get("_worktree") or result.get("_worktree", ""),
         "_branch": metadata.get("_branch") or result.get("_branch", ""),
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
+        "graph_preflight": metadata.get("graph_preflight", {}),
     }
 
 
@@ -7252,6 +7335,8 @@ def apply_reconcile_cluster_to_overlay(
         pm_proposed,
         payload_candidate_nodes,
     )
+    graph_preflight = _build_reconcile_graph_preflight(
+        project_id, metadata, proposed_nodes=dev_creates)
 
     # --- Load graph + overlay state for structural + allocator + match ------
     graph_nodes = _cluster_load_graph_nodes(graph_path)
@@ -7452,6 +7537,7 @@ def apply_reconcile_cluster_to_overlay(
         "graph_json_updated": False,
         "candidate_graph_path": str(candidate_graph_path or ""),
         "candidate_graph_sha256": candidate_sha256,
+        "graph_preflight": graph_preflight,
     }
     chain_event_emitted = _cluster_emit_chain_event(
         conn,
@@ -7481,6 +7567,7 @@ def apply_reconcile_cluster_to_overlay(
         "candidate_graph_sha256": candidate_sha256,
         "session_pending_inserts": list(session_pending),
         "chain_event_emitted": chain_event_emitted,
+        "graph_preflight": graph_preflight,
     }
 
 
