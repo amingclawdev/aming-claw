@@ -147,6 +147,33 @@ def _derive_test_files(metadata: dict) -> list[str]:
     return []
 
 
+def _is_reconcile_cluster_without_tests(metadata: dict) -> bool:
+    """Return True when a reconcile-cluster declares no test consumers."""
+    if metadata.get("operation_type") != "reconcile-cluster":
+        return False
+    if _string_list(metadata.get("test_files")):
+        return False
+
+    cluster_report = metadata.get("cluster_report")
+    if isinstance(cluster_report, dict) and _string_list(cluster_report.get("expected_test_files")):
+        return False
+
+    nodes = metadata.get("proposed_nodes") or []
+    cluster_payload = metadata.get("cluster_payload")
+    if isinstance(cluster_payload, dict):
+        nodes = cluster_payload.get("candidate_nodes") or nodes
+    if not isinstance(nodes, list):
+        return True
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        declared_tests = node.get("test") or node.get("tests") or node.get("test_files")
+        if _string_list(declared_tests):
+            return False
+    return True
+
+
 def _reconcile_candidate_manifest(cluster_payload: dict) -> list[dict]:
     """Compact, non-truncated manifest of candidate nodes for PM prompts."""
     if not isinstance(cluster_payload, dict):
@@ -736,8 +763,26 @@ class ExecutorWorker:
         if inherited_worktree and os.path.isdir(inherited_worktree):
             execution_workspace = inherited_worktree
 
+        if _is_reconcile_cluster_without_tests(metadata):
+            return {
+                "status": "succeeded",
+                "result": {
+                    "test_report": {
+                        "tool": "reconcile-structural",
+                        "passed": 0,
+                        "failed": 0,
+                        "errors": 0,
+                        "skipped": True,
+                        "reason": "no expected_test_files for overlay-only reconcile cluster",
+                    },
+                    "changed_files": metadata.get("changed_files", []),
+                    "_worktree": inherited_worktree,
+                    "_branch": metadata.get("_branch", ""),
+                },
+            }
+
         # 6a: Pre-flight file check — verify test files exist
-        test_files = metadata.get("test_files", [])
+        test_files = _derive_test_files(metadata)
         verification = metadata.get("verification", {})
         if not test_files and isinstance(verification, dict):
             cmd_str = verification.get("command", "")

@@ -229,6 +229,64 @@ class TestWorktreeFailure:
         assert result.get("error", "") == "" or "worktree creation failed" not in result.get("error", "")
 
 
+class TestReconcileClusterTestStage:
+    """Reconcile overlay-only clusters can have intentionally empty test consumers."""
+
+    def test_reconcile_cluster_without_expected_tests_skips_verification_command(self, worker):
+        """AI-invented pytest paths must not become required tests for no-test clusters."""
+        metadata = {
+            "operation_type": "reconcile-cluster",
+            "reconcile_run_id": "phase-z-test",
+            "test_files": [],
+            "verification": {
+                "command": "python -m pytest agent/tests/test_reconcile_cluster_missing.py -v",
+            },
+            "cluster_report": {"expected_test_files": []},
+            "cluster_payload": {
+                "candidate_nodes": [
+                    {"node_id": "L7.test", "primary": ["agent/governance/enums.py"], "test": []},
+                ],
+            },
+            "changed_files": [],
+        }
+
+        with patch("subprocess.run") as mock_run:
+            result = worker._execute_test("task-no-tests", metadata)
+
+        assert result["status"] == "succeeded"
+        report = result["result"]["test_report"]
+        assert report["tool"] == "reconcile-structural"
+        assert report["passed"] == 0
+        assert report["failed"] == 0
+        assert report["errors"] == 0
+        assert report["skipped"] is True
+        mock_run.assert_not_called()
+
+    def test_reconcile_cluster_with_expected_tests_keeps_missing_file_preflight(self, worker):
+        """Declared expected_test_files still go through the normal file pre-flight."""
+        metadata = {
+            "operation_type": "reconcile-cluster",
+            "reconcile_run_id": "phase-z-test",
+            "verification": {
+                "command": "python -m pytest agent/tests/test_reconcile_cluster_missing.py -v",
+            },
+            "cluster_report": {"expected_test_files": ["agent/tests/test_reconcile_cluster_missing.py"]},
+            "cluster_payload": {
+                "candidate_nodes": [
+                    {"node_id": "L7.test", "primary": ["agent/governance/enums.py"], "test": []},
+                ],
+            },
+        }
+
+        with patch("subprocess.run") as mock_run:
+            result = worker._execute_test("task-with-tests", metadata)
+
+        assert result["status"] == "failed"
+        assert "Pre-flight: test files missing" in result["result"]["error"]
+        assert result["result"]["test_report"]["tool"] == "pre-flight"
+        mock_run.assert_not_called()
+
+
 class TestStallThresholdConfig:
     """EXECUTOR_STALL_THRESHOLD is configurable."""
 
