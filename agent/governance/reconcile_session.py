@@ -1065,7 +1065,7 @@ def start_session(conn: sqlite3.Connection, project_id: str, *,
         target_branch: Optional[str] = None,
         governance_dir: Optional[Path] = None) -> ReconcileSession:
     """Insert a new active session; raise SessionAlreadyActiveError on conflict."""
-    if full_rebase and not dropped_cluster_fingerprints:
+    if full_rebase and dropped_cluster_fingerprints is None:
         raise ValueError("full_rebase=True requires explicit dropped_cluster_fingerprints")
     sid = session_id or uuid.uuid4().hex
     now = _utcnow_iso()

@@ -778,6 +778,11 @@ def test_full_rebase_precondition_explicit_force_drop(conn, gov_dir):
     # Active session may have been left behind by a partial start. None should exist
     # because start_session validates the precondition before any DB write.
     assert rs.get_active_session(conn, PROJECT_ID) is None
+    sess_empty = rs.start_session(conn, PROJECT_ID, full_rebase=True,
+                                  dropped_cluster_fingerprints=[],
+                                  governance_dir=gov_dir)
+    assert sess_empty.status == "active"
+    rs.rollback_session(conn, PROJECT_ID, sess_empty.session_id, governance_dir=gov_dir)
     sess = rs.start_session(conn, PROJECT_ID, full_rebase=True,
                             dropped_cluster_fingerprints=["fp-a", "fp-b"],
                             governance_dir=gov_dir)
