@@ -323,6 +323,38 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_allows_absent_known_reconcile_graph_artifact_reference(self):
+        """Reconcile QA may say an absent legacy graph artifact was not mutated."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": (
+                "Overlay-only reconcile passed; no mutation of "
+                "agent/governance/graph.v2.json or graph.rebase.candidate.json."
+            ),
+            "criteria_results": [
+                {
+                    "criterion": "graph artifacts untouched",
+                    "passed": True,
+                    "evidence": (
+                        "agent/governance/graph.v2.json was treated as absent legacy "
+                        "graph artifact context, not workspace file evidence."
+                    ),
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata(
+            changed_files=[],
+            operation_type="reconcile-cluster",
+            reconcile_session_id="session-1",
+            reconcile_run_id="run-1",
+        )
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L7.1"}]}}
+
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+
+        self.assertTrue(passed, reason)
+
     def test_allows_existing_evidence_path_and_glob(self):
         """Existing paths are allowed, and glob mentions are not treated as files."""
         result = {

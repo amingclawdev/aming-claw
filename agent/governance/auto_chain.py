@@ -125,6 +125,7 @@ def _project_workspace_root(project_id, metadata=None):
 
 _RECONCILE_STATE_ARTIFACT_NAMES = {
     "graph.json",
+    "graph.v2.json",
     "graph.rebase.candidate.json",
     "graph.rebase.overlay.json",
     "graph.rebase.review.json",
@@ -135,7 +136,13 @@ _RECONCILE_STATE_ARTIFACT_NAMES = {
 
 
 def _is_reconcile_state_artifact_path(project_id, raw_path, metadata):
-    """Return True when QA cites a graph artifact that lives in project state."""
+    """Return True when QA cites a known reconcile graph artifact.
+
+    Reconcile reviews often need to say that active graph artifacts were not
+    mutated.  Some legacy artifact names (for example graph.v2.json) may be
+    absent in the current workspace; treating those mentions as missing
+    workspace evidence creates a false QA retry even when graph_delta passed.
+    """
     metadata = metadata if isinstance(metadata, dict) else {}
     is_reconcile_task = (
         metadata.get("reconcile_session_id")
@@ -181,9 +188,14 @@ def _is_reconcile_state_artifact_path(project_id, raw_path, metadata):
         candidates.append(raw)
 
     try:
-        return any(candidate.exists() for candidate in candidates)
+        if any(candidate.exists() for candidate in candidates):
+            return True
     except OSError:
         return False
+
+    # Known graph artifact names are allowed as reconcile audit references even
+    # when absent, because absence/non-mutation is itself the audited claim.
+    return True
 
 
 def _extract_qa_evidence_paths(result):
@@ -2979,7 +2991,10 @@ def _render_dev_contract_prompt(source_task_id, metadata):
                 "primary, title, parent_layer as the node layer, and hierarchy parent via "
                 "parent/parent_id. Preserve deps exactly from candidate `_deps`/`deps`; "
                 "do not put hierarchy parents in deps. Do not mutate the active graph artifact; "
-                "Gatekeeper writes graph.rebase.overlay.json only after QA."
+                "Gatekeeper writes graph.rebase.overlay.json only after QA. When reporting "
+                "graph artifact safety, cite only artifact paths that exist in metadata or "
+                "graph_preflight; for absent legacy artifacts, say 'no active graph artifact "
+                "mutation' without presenting the absent path as workspace evidence."
             )
         else:
             parts.append(
@@ -5983,7 +5998,9 @@ def _build_qa_prompt(task_id, result, metadata):
                 "are allowed when Dev's verification proves a real defect owned "
                 "by this cluster and changed_files stay within the declared "
                 "cluster scope. Use this context when judging whether changed "
-                "test/doc/source files are justified."
+                "test/doc/source files are justified. Do not cite nonexistent "
+                "graph artifact paths as workspace evidence; cite candidate/overlay "
+                "paths from Reconcile Session Graph Context when present."
             )
     if criteria:
         prompt_parts.append(
@@ -6029,7 +6046,10 @@ def _build_qa_prompt(task_id, result, metadata):
     prompt_parts.append(
         "Evidence path rule: if your QA result cites a workspace file path, "
         "that path MUST exist. Do not invent audit docs; cite chain_events, "
-        "backlog rows, or runtime records unless an actual file exists."
+        "backlog rows, or runtime records unless an actual file exists. For "
+        "reconcile graph artifacts, cite only concrete candidate/overlay paths "
+        "shown in the graph context, or describe absent legacy artifacts without "
+        "using them as file evidence."
     )
     prompt_parts.append("IMPORTANT: result.recommendation MUST be exactly 'qa_pass' or 'reject' (no other values accepted by the gate).")
     # R4/R7: Inject prior QA decisions section (graceful degradation)
