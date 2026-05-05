@@ -71,3 +71,31 @@ def test_reconcile_context_uses_candidate_and_overlay_docs(tmp_path):
     assert preflight["related_tests"] == ["agent/tests/test_foo.py"]
     assert preflight["coverage"][0]["doc_status"] == "covered"
     assert preflight["coverage"][0]["test_status"] == "covered"
+
+
+def test_reconcile_context_ignores_none_sentinel_test_values(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "foo.md").write_text("# Foo\n", encoding="utf-8")
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text(json.dumps({
+        "deps_graph": _graph([{
+            "id": "L7.1",
+            "title": "Foo",
+            "primary": ["agent/foo.py"],
+            "secondary": ["docs/foo.md"],
+            "test": "none",
+        }]),
+    }), encoding="utf-8")
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "target_files": ["agent/foo.py"],
+        "cluster_payload": {"candidate_graph_path": str(candidate)},
+    }
+
+    preflight = build_reconcile_graph_preflight(
+        "test-project", metadata,
+        proposed_nodes=[{"primary": ["agent/foo.py"]}],
+    )
+
+    assert preflight["related_tests"] == []
+    assert preflight["coverage"][0]["test_status"] == "missing"

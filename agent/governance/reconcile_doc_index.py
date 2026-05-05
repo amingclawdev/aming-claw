@@ -17,6 +17,8 @@ DOC_SUFFIXES = {".md", ".rst", ".txt", ".adoc"}
 
 def _normalize(path: Any) -> str:
     text = str(path or "").replace("\\", "/").strip()
+    if text.lower() in {"none", "null", "n/a", "na", "-"}:
+        return ""
     while text.startswith("./"):
         text = text[2:]
     return text.strip("/")

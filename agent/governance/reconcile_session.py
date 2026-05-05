@@ -209,7 +209,10 @@ def _node_id(node: dict) -> str:
 
 
 def _normalize_rel(path: str) -> str:
-    return str(path or "").replace("\\", "/").strip().lstrip("./")
+    text = str(path or "").replace("\\", "/").strip()
+    if text.lower() in {"none", "null", "n/a", "na", "-"}:
+        return ""
+    return text.lstrip("./")
 
 
 def _primary_paths(node: Any) -> list[str]:

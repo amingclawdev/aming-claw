@@ -121,3 +121,41 @@ def test_final_doc_index_writes_json_and_markdown_ready_report(tmp_path):
     markdown = render_markdown(report)
     assert "ready_for_signoff: `True`" in markdown
     assert "`README.md`" in markdown
+
+
+def test_final_doc_index_treats_none_sentinel_as_missing_test(tmp_path):
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text(json.dumps({
+        "deps_graph": _graph([{
+            "id": "L7.1",
+            "title": "Feature Without Test",
+            "primary": ["agent/feature.py"],
+            "secondary": ["docs/feature.md"],
+            "test": "none",
+        }]),
+    }), encoding="utf-8")
+    overlay = tmp_path / "overlay.json"
+    overlay.write_text(json.dumps({
+        "nodes": {
+            "L7.1": {
+                "node_id": "L7.1",
+                "title": "Feature Without Test",
+                "primary": ["agent/feature.py"],
+                "secondary": ["docs/feature.md"],
+                "test": "none",
+            },
+        },
+    }), encoding="utf-8")
+
+    report = build_final_doc_index(
+        project_id="test-project",
+        session_id="sess-none",
+        candidate_graph_path=candidate,
+        overlay_path=overlay,
+        file_inventory_rows=[],
+    )
+
+    assert report["features"][0]["tests"] == []
+    assert report["features"][0]["test_status"] == "missing"
+    assert report["summary"]["missing_test_count"] == 1
+    assert report["summary"]["ready_for_signoff"] is False
