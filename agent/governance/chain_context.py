@@ -188,19 +188,22 @@ class _ChainEventWriteQueue:
     def _write(self, record: dict) -> None:
         own_conn = _persist_connection(record["project_id"])
         try:
-            own_conn.execute(
-                "INSERT INTO chain_events "
-                "(root_task_id, task_id, event_type, payload_json, ts) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    record["root_task_id"],
-                    record["task_id"],
-                    record["event_type"],
-                    record["payload_json"],
-                    record["ts"],
-                ),
-            )
-            own_conn.commit()
+            from .db import sqlite_write_lock
+
+            with sqlite_write_lock():
+                own_conn.execute(
+                    "INSERT INTO chain_events "
+                    "(root_task_id, task_id, event_type, payload_json, ts) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        record["root_task_id"],
+                        record["task_id"],
+                        record["event_type"],
+                        record["payload_json"],
+                        record["ts"],
+                    ),
+                )
+                own_conn.commit()
         finally:
             own_conn.close()
 

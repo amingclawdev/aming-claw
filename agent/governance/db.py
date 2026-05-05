@@ -9,6 +9,7 @@ Manages:
 import os
 import sys
 import sqlite3
+import threading
 from pathlib import Path
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
@@ -19,6 +20,20 @@ from utils import tasks_root
 
 
 SCHEMA_VERSION = 32
+
+_SQLITE_WRITE_LOCK = threading.RLock()
+
+
+def sqlite_write_lock() -> threading.RLock:
+    """Process-local write serialization for governance SQLite mutations.
+
+    SQLite WAL permits concurrent readers but still has a single writer.  The
+    governance HTTP server is threaded, so short task/queue writes can collide
+    inside one process before SQLite's busy timeout has a chance to smooth the
+    flow.  Callers should hold this lock only around direct DB mutation +
+    commit blocks, never around model calls or slow external work.
+    """
+    return _SQLITE_WRITE_LOCK
 
 SCHEMA_SQL = """
 -- Node runtime state

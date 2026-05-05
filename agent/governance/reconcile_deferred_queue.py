@@ -35,10 +35,52 @@ import json
 import logging
 import math
 import sqlite3
+import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
+
+
+def _governance_write_lock():
+    try:
+        from .db import sqlite_write_lock
+
+        return sqlite_write_lock()
+    except Exception:
+        return nullcontext()
+
+
+def _write_with_retry(fn, *, context: str, conn: sqlite3.Connection):
+    delays = (0.1, 0.3, 0.9)
+    last: sqlite3.OperationalError | None = None
+    for attempt in range(len(delays) + 1):
+        try:
+            with _governance_write_lock():
+                result = fn()
+                conn.commit()
+                return result
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            last = exc
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt < len(delays):
+                delay = delays[attempt]
+                log.warning(
+                    "reconcile_deferred_queue DB lock retry %d/%d (%s): %.2fs — %s",
+                    attempt + 1,
+                    len(delays),
+                    context,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+    raise last  # type: ignore[misc]
 
 __all__ = [
     "RECONCILE_MAX_RETRIES",
@@ -756,10 +798,14 @@ def mark_filing(
     """queued -> filing transition.  Returns True on a state change."""
     c = _get_conn(conn, project_id)
     now = _utc_iso()
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'filing', filed_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ? AND status IN ('queued','failed_retryable')",
-        (now, project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'filing', filed_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ? AND status IN ('queued','failed_retryable')",
+            (now, project_id, cluster_fingerprint),
+        ),
+        context=f"mark_filing({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     return (cur.rowcount or 0) > 0
@@ -775,11 +821,15 @@ def mark_in_chain(
 ) -> bool:
     """filing -> in_chain transition.  Records root_task_id and (optional) bug_id."""
     c = _get_conn(conn, project_id)
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'in_chain', "
-        "  root_task_id = ?, bug_id = COALESCE(?, bug_id) "
-        "WHERE project_id = ? AND cluster_fingerprint = ? AND status IN ('filing','queued')",
-        (root_task_id, bug_id, project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'in_chain', "
+            "  root_task_id = ?, bug_id = COALESCE(?, bug_id) "
+            "WHERE project_id = ? AND cluster_fingerprint = ? AND status IN ('filing','queued')",
+            (root_task_id, bug_id, project_id, cluster_fingerprint),
+        ),
+        context=f"mark_in_chain({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     if (cur.rowcount or 0) > 0:
@@ -803,13 +853,17 @@ def mark_observer_hold(
 ) -> bool:
     """Pause a cluster before automatic filing/dispatch can continue."""
     c = _get_conn(conn, project_id)
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'observer_hold', "
-        "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ? "
-        "  AND status NOT IN ('resolved','patch_accepted','skipped',"
-        "                     'skipped_explicit','superseded_bad_run')",
-        (actor, reason, _utc_iso(), project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'observer_hold', "
+            "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ? "
+            "  AND status NOT IN ('resolved','patch_accepted','skipped',"
+            "                     'skipped_explicit','superseded_bad_run')",
+            (actor, reason, _utc_iso(), project_id, cluster_fingerprint),
+        ),
+        context=f"mark_observer_hold({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
@@ -837,13 +891,17 @@ def mark_observer_takeover(
 ) -> bool:
     """Mark a chain-owned cluster as manually owned by observer/MF."""
     c = _get_conn(conn, project_id)
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'observer_takeover', "
-        "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ? "
-        "  AND status NOT IN ('resolved','patch_accepted','skipped',"
-        "                     'skipped_explicit','superseded_bad_run')",
-        (actor, reason, _utc_iso(), project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'observer_takeover', "
+            "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ? "
+            "  AND status NOT IN ('resolved','patch_accepted','skipped',"
+            "                     'skipped_explicit','superseded_bad_run')",
+            (actor, reason, _utc_iso(), project_id, cluster_fingerprint),
+        ),
+        context=f"mark_observer_takeover({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
@@ -888,26 +946,30 @@ def release_observer_takeover(
     now = _utc_iso()
     terminal_reason = reason if next_status in TERMINAL_STATUSES else None
     resolved_at = now if next_status in TERMINAL_STATUSES else None
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = ?, "
-        "  terminal_reason = COALESCE(?, terminal_reason), "
-        "  last_terminal_status = CASE WHEN ? != '' THEN ? ELSE last_terminal_status END, "
-        "  resolved_at = COALESCE(?, resolved_at), "
-        "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ? "
-        "  AND status IN ('observer_hold','observer_takeover')",
-        (
-            next_status,
-            terminal_reason,
-            next_status if next_status in TERMINAL_STATUSES else "",
-            next_status if next_status in TERMINAL_STATUSES else "",
-            resolved_at,
-            actor,
-            reason,
-            now,
-            project_id,
-            cluster_fingerprint,
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = ?, "
+            "  terminal_reason = COALESCE(?, terminal_reason), "
+            "  last_terminal_status = CASE WHEN ? != '' THEN ? ELSE last_terminal_status END, "
+            "  resolved_at = COALESCE(?, resolved_at), "
+            "  takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ? "
+            "  AND status IN ('observer_hold','observer_takeover')",
+            (
+                next_status,
+                terminal_reason,
+                next_status if next_status in TERMINAL_STATUSES else "",
+                next_status if next_status in TERMINAL_STATUSES else "",
+                resolved_at,
+                actor,
+                reason,
+                now,
+                project_id,
+                cluster_fingerprint,
+            ),
         ),
+        context=f"release_observer_takeover({cluster_fingerprint}:{next_status})",
+        conn=c,
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
@@ -936,12 +998,16 @@ def mark_patch_accepted(
     """Terminal marker for observer/MF repaired clusters."""
     c = _get_conn(conn, project_id)
     now = _utc_iso()
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'patch_accepted', "
-        "  accepted_patch_id = ?, last_terminal_status = 'patch_accepted', "
-        "  terminal_reason = ?, resolved_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ?",
-        (patch_id, reason, now, project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'patch_accepted', "
+            "  accepted_patch_id = ?, last_terminal_status = 'patch_accepted', "
+            "  terminal_reason = ?, resolved_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (patch_id, reason, now, project_id, cluster_fingerprint),
+        ),
+        context=f"mark_patch_accepted({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
@@ -968,12 +1034,16 @@ def mark_superseded_bad_run(
     """Quarantine a bad cluster attempt so finalize ignores that run output."""
     c = _get_conn(conn, project_id)
     now = _utc_iso()
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'superseded_bad_run', "
-        "  last_terminal_status = 'superseded_bad_run', terminal_reason = ?, "
-        "  resolved_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ?",
-        (reason, now, project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'superseded_bad_run', "
+            "  last_terminal_status = 'superseded_bad_run', terminal_reason = ?, "
+            "  resolved_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (reason, now, project_id, cluster_fingerprint),
+        ),
+        context=f"mark_superseded_bad_run({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
@@ -1014,13 +1084,17 @@ def mark_terminal(
     skipped_reason = (
         reason if terminal_status in {"skipped", "skipped_explicit"} else None
     )
-    cur = c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = ?, "
-        "  last_terminal_status = ?, terminal_reason = ?, "
-        "  skipped_reason = COALESCE(?, skipped_reason), resolved_at = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ?",
-        (terminal_status, terminal_status, reason, skipped_reason, now,
-         project_id, cluster_fingerprint),
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = ?, "
+            "  last_terminal_status = ?, terminal_reason = ?, "
+            "  skipped_reason = COALESCE(?, skipped_reason), resolved_at = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (terminal_status, terminal_status, reason, skipped_reason, now,
+             project_id, cluster_fingerprint),
+        ),
+        context=f"mark_terminal({cluster_fingerprint}:{terminal_status})",
+        conn=c,
     )
     c.commit()
     changed = (cur.rowcount or 0) > 0
@@ -1071,10 +1145,14 @@ def requeue_after_failure(
             project_id, cluster_fingerprint, "failed_terminal",
             reason=reason or "retry_count exhausted", conn=c,
         )
-        c.execute(
-            "UPDATE reconcile_deferred_clusters SET retry_count = ? "
-            "WHERE project_id = ? AND cluster_fingerprint = ?",
-            (new_count, project_id, cluster_fingerprint),
+        _write_with_retry(
+            lambda: c.execute(
+                "UPDATE reconcile_deferred_clusters SET retry_count = ? "
+                "WHERE project_id = ? AND cluster_fingerprint = ?",
+                (new_count, project_id, cluster_fingerprint),
+            ),
+            context=f"requeue_after_failure_exhausted({cluster_fingerprint})",
+            conn=c,
         )
         c.commit()
         bug_id = escalate(project_id, cluster_fingerprint, conn=c)
@@ -1083,11 +1161,15 @@ def requeue_after_failure(
     # Still within budget — schedule retry.
     backoff_h = max(1, int(math.pow(2, max(0, new_count))))
     next_retry = _utc_iso(datetime.now(timezone.utc) + timedelta(hours=backoff_h))
-    c.execute(
-        "UPDATE reconcile_deferred_clusters SET status = 'failed_retryable', "
-        "  retry_count = ?, next_retry_at = ?, terminal_reason = ? "
-        "WHERE project_id = ? AND cluster_fingerprint = ?",
-        (new_count, next_retry, reason, project_id, cluster_fingerprint),
+    _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'failed_retryable', "
+            "  retry_count = ?, next_retry_at = ?, terminal_reason = ? "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (new_count, next_retry, reason, project_id, cluster_fingerprint),
+        ),
+        context=f"requeue_after_failure({cluster_fingerprint})",
+        conn=c,
     )
     c.commit()
     return {"status": "failed_retryable", "retry_count": new_count,

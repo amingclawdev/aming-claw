@@ -16,8 +16,18 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 
 log = logging.getLogger(__name__)
+
+
+def _governance_write_lock():
+    try:
+        from .db import sqlite_write_lock
+
+        return sqlite_write_lock()
+    except Exception:
+        return nullcontext()
 
 # ---------------------------------------------------------------------------
 # DB lock retry helper (B5)
@@ -27,7 +37,13 @@ _DB_LOCK_MAX_RETRIES = 3
 _DB_LOCK_BASE_DELAY = 0.1  # seconds; backoff = base * 3^attempt
 
 
-def _retry_on_db_lock(func, *args, _context: str = "", **kwargs):
+def _retry_on_db_lock(
+    func,
+    *args,
+    _context: str = "",
+    _conn: sqlite3.Connection | None = None,
+    **kwargs,
+):
     """Retry *func* on sqlite3.OperationalError('database is locked').
 
     Uses exponential backoff: 0.1s, 0.3s, 0.9s.
@@ -40,6 +56,11 @@ def _retry_on_db_lock(func, *args, _context: str = "", **kwargs):
         except sqlite3.OperationalError as exc:
             if "database is locked" not in str(exc):
                 raise
+            if _conn is not None:
+                try:
+                    _conn.rollback()
+                except Exception:
+                    pass
             last_err = exc
             if attempt < _DB_LOCK_MAX_RETRIES:
                 delay = _DB_LOCK_BASE_DELAY * (3 ** attempt)
@@ -259,22 +280,27 @@ def create_task(
     initial_status = "observer_hold" if _is_observer_mode(conn, project_id) else "queued"
 
     notify = "pending" if metadata.get("chat_id") else "none"
-    conn.execute(
-        """INSERT INTO tasks
-           (task_id, project_id, status, execution_status, notification_status,
-            type, prompt, related_nodes,
-            created_by, created_at, updated_at, priority, max_attempts, metadata_json,
-            parent_task_id, retry_round, trace_id, chain_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            task_id, project_id, initial_status, initial_status, notify,
-            task_type, prompt,
-            json.dumps(related_nodes or []),
-            created_by, now, now, priority, max_attempts,
-            json.dumps(metadata or {}),
-            parent_task_id, retry_round, trace_id, chain_id,
-        ),
-    )
+    def _do_create_task():
+        with _governance_write_lock():
+            conn.execute(
+                """INSERT INTO tasks
+                   (task_id, project_id, status, execution_status, notification_status,
+                    type, prompt, related_nodes,
+                    created_by, created_at, updated_at, priority, max_attempts, metadata_json,
+                    parent_task_id, retry_round, trace_id, chain_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_id, project_id, initial_status, initial_status, notify,
+                    task_type, prompt,
+                    json.dumps(related_nodes or []),
+                    created_by, now, now, priority, max_attempts,
+                    json.dumps(metadata or {}),
+                    parent_task_id, retry_round, trace_id, chain_id,
+                ),
+            )
+            conn.commit()
+
+    _retry_on_db_lock(_do_create_task, _context=f"create_task({task_id})", _conn=conn)
 
     log.info("Task created: %s (project: %s, type: %s, status: %s, retry_round: %d, trace_id: %s)",
              task_id, project_id, task_type, initial_status, retry_round, trace_id)
@@ -313,77 +339,86 @@ def claim_task(
 
     Returns (task_dict, fence_token) or (None, "") if no tasks.
     """
-    now = _utc_iso()
-    row = conn.execute(
-        """SELECT task_id, type, prompt, related_nodes, priority, attempt_count, max_attempts, metadata_json
-           FROM tasks
-           WHERE project_id = ? AND execution_status IN ('queued')
-           ORDER BY priority DESC, created_at ASC
-           LIMIT 1""",
-        (project_id,),
-    ).fetchone()
+    def _do_claim():
+        now = _utc_iso()
+        with _governance_write_lock():
+            row = conn.execute(
+                """SELECT task_id, type, prompt, related_nodes, priority, attempt_count, max_attempts, metadata_json
+                   FROM tasks
+                   WHERE project_id = ? AND execution_status IN ('queued')
+                   ORDER BY priority DESC, created_at ASC
+                   LIMIT 1""",
+                (project_id,),
+            ).fetchone()
 
-    if not row:
-        return None, ""
+            if not row:
+                return None, ""
 
-    task_id = row["task_id"]
-    attempt_num = row["attempt_count"] + 1
-    fence_token = f"fence-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    lease_expires = _utc_iso_after(300)  # 5 min lease
+            task_id = row["task_id"]
+            attempt_num = row["attempt_count"] + 1
+            fence_token = f"fence-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+            lease_expires = _utc_iso_after(300)  # 5 min lease
 
-    # Use caller_pid if provided, otherwise fall back to current process PID
-    effective_pid = caller_pid if caller_pid else os.getpid()
+            # Use caller_pid if provided, otherwise fall back to current process PID
+            effective_pid = caller_pid if caller_pid else os.getpid()
 
-    stale_attempt_result = json.dumps({
-        "error": "attempt_superseded",
-        "reason": "Task was reclaimed after retry or executor recovery",
-    }, ensure_ascii=False)
+            stale_attempt_result = json.dumps({
+                "error": "attempt_superseded",
+                "reason": "Task was reclaimed after retry or executor recovery",
+            }, ensure_ascii=False)
 
-    # CAS update: only queued -> claimed. Clear terminal fields from a prior
-    # retry/recovery so an active task cannot still look completed.
-    result = conn.execute(
-        """UPDATE tasks SET status = 'claimed', execution_status = 'claimed',
-           assigned_to = ?, started_at = ?, updated_at = ?, attempt_count = ?,
-           completed_at = NULL, result_json = NULL, error_message = '',
-           metadata_json = json_set(COALESCE(metadata_json, '{}'),
-             '$.fence_token', ?,
-             '$.lease_owner', ?,
-             '$.lease_expires_at', ?,
-             '$.worker_pid', ?
-           )
-           WHERE task_id = ? AND execution_status IN ('queued')""",
-        (assigned_to, now, now, attempt_num,
-         fence_token, worker_id or assigned_to, lease_expires, str(effective_pid),
-         task_id),
+            # CAS update: only queued -> claimed. Clear terminal fields from a prior
+            # retry/recovery so an active task cannot still look completed.
+            result = conn.execute(
+                """UPDATE tasks SET status = 'claimed', execution_status = 'claimed',
+                   assigned_to = ?, started_at = ?, updated_at = ?, attempt_count = ?,
+                   completed_at = NULL, result_json = NULL, error_message = '',
+                   metadata_json = json_set(COALESCE(metadata_json, '{}'),
+                     '$.fence_token', ?,
+                     '$.lease_owner', ?,
+                     '$.lease_expires_at', ?,
+                     '$.worker_pid', ?
+                   )
+                   WHERE task_id = ? AND execution_status IN ('queued')""",
+                (assigned_to, now, now, attempt_num,
+                 fence_token, worker_id or assigned_to, lease_expires, str(effective_pid),
+                 task_id),
+            )
+            if result.rowcount == 0:
+                return None, ""  # Already claimed by another worker
+
+            conn.execute(
+                """UPDATE task_attempts SET status = 'failed',
+                     completed_at = COALESCE(completed_at, ?),
+                     result_json = COALESCE(result_json, ?),
+                     error_message = COALESCE(error_message, ?)
+                   WHERE task_id = ? AND status = 'running'""",
+                (now, stale_attempt_result, "Task reclaimed by a new attempt", task_id),
+            )
+            conn.execute(
+                """INSERT INTO task_attempts (task_id, attempt_num, status, started_at)
+                   VALUES (?, ?, 'running', ?)""",
+                (task_id, attempt_num, now),
+            )
+            conn.commit()
+
+        log.info("task.claimed: %s type=%s by=%s attempt=%d fence=%s",
+                 task_id, row["type"], worker_id or assigned_to, attempt_num, fence_token)
+        return {
+            "task_id": task_id,
+            "type": row["type"],
+            "prompt": row["prompt"],
+            "related_nodes": json.loads(row["related_nodes"] or "[]"),
+            "priority": row["priority"],
+            "attempt_num": attempt_num,
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+        }, fence_token
+
+    return _retry_on_db_lock(
+        _do_claim,
+        _context=f"claim_task({project_id})",
+        _conn=conn,
     )
-    if result.rowcount == 0:
-        return None, ""  # Already claimed by another worker
-
-    conn.execute(
-        """UPDATE task_attempts SET status = 'failed',
-             completed_at = COALESCE(completed_at, ?),
-             result_json = COALESCE(result_json, ?),
-             error_message = COALESCE(error_message, ?)
-           WHERE task_id = ? AND status = 'running'""",
-        (now, stale_attempt_result, "Task reclaimed by a new attempt", task_id),
-    )
-    conn.execute(
-        """INSERT INTO task_attempts (task_id, attempt_num, status, started_at)
-           VALUES (?, ?, 'running', ?)""",
-        (task_id, attempt_num, now),
-    )
-
-    log.info("task.claimed: %s type=%s by=%s attempt=%d fence=%s",
-             task_id, row["type"], worker_id or assigned_to, attempt_num, fence_token)
-    return {
-        "task_id": task_id,
-        "type": row["type"],
-        "prompt": row["prompt"],
-        "related_nodes": json.loads(row["related_nodes"] or "[]"),
-        "priority": row["priority"],
-        "attempt_num": attempt_num,
-        "metadata": json.loads(row["metadata_json"] or "{}"),
-    }, fence_token
 
 
 def complete_task(
@@ -560,58 +595,64 @@ def complete_task(
              task_id, int(row["attempt_count"] or 0)),
         )
 
-    _retry_on_db_lock(_do_complete_updates, _context=f"complete_task({task_id})")
-
-    result_summary = str(result)[:200] if result else "{}"
-    log.info("task.complete: %s status=%s exec_status=%s by=%s result=%s",
-             task_id, status, exec_status, completed_by or assigned_to, result_summary)
-
-    response = {
-        "task_id": task_id,
-        "status": exec_status,
-        "retrying": exec_status == "queued",
-        "completed_at": now,
-    }
-    failure_reason = error_message or (result or {}).get("error", "")
-    mirror_task_type = task_type_val or "task"
-    if status == "failed" and exec_status in ("queued", "observer_hold"):
-        _mirror_backlog_runtime(
-            conn,
-            project_id,
-            task_id,
-            mirror_task_type,
-            row["metadata_json"],
-            f"{mirror_task_type}_{exec_status}",
-            runtime_state=exec_status,
-            failure_reason=failure_reason,
-            result=result or {},
-        )
-    elif exec_status in TERMINAL_STATUSES and exec_status != "succeeded":
-        _mirror_backlog_runtime(
-            conn,
-            project_id,
-            task_id,
-            mirror_task_type,
-            row["metadata_json"],
-            f"{mirror_task_type}_{exec_status}",
-            runtime_state=exec_status,
-            failure_reason=failure_reason,
-            result=result or {},
+    with _governance_write_lock():
+        _retry_on_db_lock(
+            _do_complete_updates,
+            _context=f"complete_task({task_id})",
+            _conn=conn,
         )
 
-    # --- Subtask fan-in check (R6): when a merge task in a subtask group succeeds ---
-    if exec_status == "succeeded" and task_type_val == "merge":
-        try:
-            _check_subtask_fanin(conn, project_id, task_id)
-        except Exception:
-            log.error("subtask fan-in check failed for %s", task_id, exc_info=True)
+        result_summary = str(result)[:200] if result else "{}"
+        log.info("task.complete: %s status=%s exec_status=%s by=%s result=%s",
+                 task_id, status, exec_status, completed_by or assigned_to, result_summary)
 
-    # --- Subtask failure cascade (R9): terminal failure in a subtask chain ---
-    if exec_status in TERMINAL_STATUSES and exec_status != "succeeded":
-        try:
-            _check_subtask_failure_cascade(conn, project_id, task_id, row)
-        except Exception:
-            log.error("subtask failure cascade check failed for %s", task_id, exc_info=True)
+        response = {
+            "task_id": task_id,
+            "status": exec_status,
+            "retrying": exec_status == "queued",
+            "completed_at": now,
+        }
+        failure_reason = error_message or (result or {}).get("error", "")
+        mirror_task_type = task_type_val or "task"
+        if status == "failed" and exec_status in ("queued", "observer_hold"):
+            _mirror_backlog_runtime(
+                conn,
+                project_id,
+                task_id,
+                mirror_task_type,
+                row["metadata_json"],
+                f"{mirror_task_type}_{exec_status}",
+                runtime_state=exec_status,
+                failure_reason=failure_reason,
+                result=result or {},
+            )
+        elif exec_status in TERMINAL_STATUSES and exec_status != "succeeded":
+            _mirror_backlog_runtime(
+                conn,
+                project_id,
+                task_id,
+                mirror_task_type,
+                row["metadata_json"],
+                f"{mirror_task_type}_{exec_status}",
+                runtime_state=exec_status,
+                failure_reason=failure_reason,
+                result=result or {},
+            )
+
+        # --- Subtask fan-in check (R6): when a merge task in a subtask group succeeds ---
+        if exec_status == "succeeded" and task_type_val == "merge":
+            try:
+                _check_subtask_fanin(conn, project_id, task_id)
+            except Exception:
+                log.error("subtask fan-in check failed for %s", task_id, exc_info=True)
+
+        # --- Subtask failure cascade (R9): terminal failure in a subtask chain ---
+        if exec_status in TERMINAL_STATUSES and exec_status != "succeeded":
+            try:
+                _check_subtask_failure_cascade(conn, project_id, task_id, row)
+            except Exception:
+                log.error("subtask failure cascade check failed for %s", task_id, exc_info=True)
+        conn.commit()
 
     # Auto-chain: dispatch next stage asynchronously on success/failure.
     # Non-chain types (task, coordinator) are ignored by auto_chain.CHAIN
