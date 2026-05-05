@@ -235,6 +235,44 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertIn("QA evidence references missing workspace paths", reason)
         self.assertIn("docs/dev/reconcile-canary-mf003.md", reason)
 
+    def test_allows_reconcile_state_graph_artifact_evidence(self):
+        """Reconcile QA may cite state graph artifacts outside repo paths."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            graph_path = state_dir / "graph.json"
+            candidate_path = state_dir / "graph.rebase.candidate.json"
+            overlay_path = state_dir / "graph.rebase.overlay.json"
+            for path in (graph_path, candidate_path, overlay_path):
+                path.write_text("{}", encoding="utf-8")
+
+            result = {
+                "recommendation": "qa_pass",
+                "review_summary": (
+                    "Verified agent/governance/graph.json is untouched; "
+                    f"candidate state artifact {candidate_path} exists."
+                ),
+                "criteria_results": [
+                    {
+                        "criterion": "state graph artifacts",
+                        "passed": True,
+                        "evidence": "agent/governance/graph.json was treated as active graph artifact evidence.",
+                    }
+                ],
+                "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+            }
+            metadata = _base_metadata(
+                changed_files=[],
+                operation_type="reconcile-cluster",
+                reconcile_session_id="session-1",
+                candidate_graph_path=str(candidate_path),
+                overlay_path=str(overlay_path),
+            )
+            proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L7.1"}]}}
+            passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
     def test_allows_existing_evidence_path_and_glob(self):
         """Existing paths are allowed, and glob mentions are not treated as files."""
         result = {

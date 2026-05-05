@@ -312,7 +312,7 @@ def _controlled_reconcile_prompt() -> str:
         "only with existing tracked consumer files listed in "
         "cluster_report.expected_test_files/expected_doc_files or with direct "
         "evidence. Dev must emit graph_delta.creates one-for-one with PM "
-        "proposed_nodes and must not mutate graph.json or graph.rebase.candidate.json. "
+        "proposed_nodes and must not mutate the active graph or candidate graph artifacts. "
         "Default outcome is overlay-only changed_files=[]; modify source/docs/tests "
         "only if verification proves a real defect. Do not cite ignored docs/dev "
         "proposal files as required evidence."

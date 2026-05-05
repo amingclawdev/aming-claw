@@ -123,6 +123,69 @@ def _project_workspace_root(project_id, metadata=None):
     return Path(__file__).resolve().parents[2]
 
 
+_RECONCILE_STATE_ARTIFACT_NAMES = {
+    "graph.json",
+    "graph.rebase.candidate.json",
+    "graph.rebase.overlay.json",
+    "graph.rebase.review.json",
+    "graph.rebase.coverage-ledger.json",
+    "graph.rebase.doc-index.review.json",
+    "graph.rebase.doc-index.review.md",
+}
+
+
+def _is_reconcile_state_artifact_path(project_id, raw_path, metadata):
+    """Return True when QA cites a graph artifact that lives in project state."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    is_reconcile_task = (
+        metadata.get("reconcile_session_id")
+        or metadata.get("reconcile_run_id")
+        or metadata.get("operation_type") == "reconcile-cluster"
+        or metadata.get("candidate_graph_path")
+        or metadata.get("overlay_path")
+        or metadata.get("reconcile_overlay_path")
+    )
+    if not is_reconcile_task or not isinstance(raw_path, str):
+        return False
+
+    normalized = raw_path.replace("\\", "/")
+    artifact_name = PurePosixPath(normalized).name
+    if artifact_name not in _RECONCILE_STATE_ARTIFACT_NAMES:
+        return False
+
+    candidates = []
+    for key in (
+        "candidate_graph_path",
+        "overlay_path",
+        "reconcile_overlay_path",
+        "review_graph_path",
+        "coverage_ledger_path",
+        "doc_index_path",
+    ):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        path = Path(value)
+        candidates.append(path)
+        candidates.append(path.parent / artifact_name)
+
+    try:
+        from .db import _resolve_project_dir
+        state_root = Path(_resolve_project_dir(project_id))
+        candidates.append(state_root / artifact_name)
+    except Exception:
+        pass
+
+    raw = Path(raw_path)
+    if raw.is_absolute():
+        candidates.append(raw)
+
+    try:
+        return any(candidate.exists() for candidate in candidates)
+    except OSError:
+        return False
+
+
 def _extract_qa_evidence_paths(result):
     """Return workspace path mentions from QA output, excluding globs."""
     paths = []
@@ -162,6 +225,8 @@ def _missing_qa_evidence_paths(project_id, result, metadata=None):
     }
     missing = []
     for raw in _extract_qa_evidence_paths(result):
+        if _is_reconcile_state_artifact_path(project_id, raw, metadata):
+            continue
         raw_path = Path(raw)
         rel_key = raw.replace("\\", "/")
         if raw_path.is_absolute():
@@ -2900,7 +2965,7 @@ def _render_dev_contract_prompt(source_task_id, metadata):
     if is_cluster and graph_preflight:
         parts.append(
             "\nReconcile session graph preflight. Use this as the graph-governance "
-            "context for this cluster instead of active graph.json:\n"
+            "context for this cluster instead of the active graph artifact:\n"
             f"{json.dumps(graph_preflight, ensure_ascii=False, indent=2)}"
         )
 
@@ -2912,7 +2977,7 @@ def _render_dev_contract_prompt(source_task_id, metadata):
                 "\nRequired for reconcile-cluster: return `graph_delta.creates` mirroring "
                 "`proposed_nodes` one-for-one. Preserve each concrete node_id/candidate_node_id, "
                 "primary, title, parent_layer as the node layer, and parent evidence via deps or "
-                "parent/parent_id. Do not mutate graph.json; "
+                "parent/parent_id. Do not mutate the active graph artifact; "
                 "Gatekeeper writes graph.rebase.overlay.json only after QA."
             )
         else:
