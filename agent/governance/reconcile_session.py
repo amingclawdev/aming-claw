@@ -114,6 +114,24 @@ def _latest_file_inventory_rows(
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.Error:
         return []
+    if run_id and not rows:
+        try:
+            latest = conn.execute(
+                "SELECT run_id FROM reconcile_file_inventory "
+                "WHERE project_id=? ORDER BY updated_at DESC, run_id DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            latest_run_id = latest["run_id"] if latest and latest["run_id"] else ""
+            if latest_run_id and latest_run_id != run_id:
+                rows = conn.execute(
+                    "SELECT path, file_kind, language, sha256, scan_status, cluster_id, "
+                    "candidate_node_id, attached_to, reason, decision, updated_at "
+                    "FROM reconcile_file_inventory WHERE project_id=? AND run_id=? "
+                    "ORDER BY path",
+                    (project_id, latest_run_id),
+                ).fetchall()
+        except sqlite3.Error:
+            return []
     return [dict(row) for row in rows]
 
 

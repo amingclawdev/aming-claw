@@ -134,6 +134,7 @@ def cmd_candidate(args: argparse.Namespace) -> int:
         project_root,
         dry_run=True,
         scratch_dir=args.scratch_dir,
+        run_id=args.run_id or None,
     )
     if result.get("status") not in {"ok", None}:
         _print_json(result)

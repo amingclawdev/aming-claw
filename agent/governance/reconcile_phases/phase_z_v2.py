@@ -3224,6 +3224,7 @@ def build_graph_v2_from_symbols(
     dry_run: bool = True,
     owner: Optional[str] = None,
     scratch_dir: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Orchestrate the full symbol-level topology pipeline.
 
@@ -3303,7 +3304,7 @@ def build_graph_v2_from_symbols(
     # Step 4: Diff against existing
     diff_report = diff_against_existing_graph(project_root, nodes)
 
-    run_id = datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")
+    run_id = run_id or datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")
     try:
         from agent.governance.reconcile_file_inventory import (
             build_file_inventory,

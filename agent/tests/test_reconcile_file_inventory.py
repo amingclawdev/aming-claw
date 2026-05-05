@@ -154,11 +154,19 @@ def test_phase_z_artifact_contains_file_inventory(tmp_path):
         str(project),
         dry_run=True,
         scratch_dir=str(scratch),
+        run_id="phase-z-explicit-run",
     )
 
+    assert result["run_id"] == "phase-z-explicit-run"
     assert result["file_inventory"]
+    assert {row["run_id"] for row in result["file_inventory"]} == {
+        "phase-z-explicit-run"
+    }
     assert result["file_inventory_summary"]["total"] >= 3
     with open(result["report_path"], "r", encoding="utf-8") as f:
         payload = json.load(f)
     assert payload["file_inventory"]
+    assert {row["run_id"] for row in payload["file_inventory"]} == {
+        "phase-z-explicit-run"
+    }
     assert payload["file_inventory_summary"]["total"] >= 3
