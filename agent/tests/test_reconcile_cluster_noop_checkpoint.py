@@ -34,6 +34,84 @@ def test_reconcile_cluster_noop_audit_can_advance_to_test(isolated_gov_db):
     assert reason == "reconcile-cluster no-op audit accepted"
 
 
+def test_reconcile_cluster_no_test_overlay_graph_delta_can_advance_without_synthetic_test(
+    isolated_gov_db,
+):
+    from governance.auto_chain import _gate_checkpoint
+
+    proposed_nodes = [
+        {
+            "node_id": "L7.132",
+            "parent_id": "L3.29",
+            "primary": ["agent/telegram_gateway/chat_proxy.py"],
+            "deps": [],
+        },
+        {
+            "node_id": "L7.133",
+            "parent_id": "L3.29",
+            "primary": ["agent/telegram_gateway/gateway.py"],
+            "secondary": ["docs/governance/design-spec-full.md"],
+            "deps": ["L7.123"],
+        },
+    ]
+    candidate_nodes = [
+        {
+            "node_id": "L7.132",
+            "primary": ["agent/telegram_gateway/chat_proxy.py"],
+            "_deps": [],
+            "test_coverage": "none",
+        },
+        {
+            "node_id": "L7.133",
+            "primary": ["agent/telegram_gateway/gateway.py"],
+            "_deps": ["L7.123"],
+            "secondary": ["docs/governance/design-spec-full.md"],
+            "test_coverage": "none",
+        },
+    ]
+
+    passed, reason = _gate_checkpoint(
+        isolated_gov_db,
+        "aming-claw",
+        {
+            "summary": "Overlay-only graph_delta is candidate-exact; no file edits required.",
+            "changed_files": [],
+            "graph_delta": {
+                "creates": [
+                    {
+                        "node_id": "L7.132",
+                        "parent_id": "L3.29",
+                        "primary": ["agent/telegram_gateway/chat_proxy.py"],
+                        "deps": [],
+                    },
+                    {
+                        "node_id": "L7.133",
+                        "parent_id": "L3.29",
+                        "primary": ["agent/telegram_gateway/gateway.py"],
+                        "secondary": ["docs/governance/design-spec-full.md"],
+                        "deps": ["L7.123"],
+                    },
+                ],
+            },
+        },
+        {
+            "operation_type": "reconcile-cluster",
+            "target_files": [
+                "agent/telegram_gateway/chat_proxy.py",
+                "agent/telegram_gateway/gateway.py",
+            ],
+            "proposed_nodes": proposed_nodes,
+            "cluster_payload": {
+                "candidate_nodes": candidate_nodes,
+                "cluster_report": {"expected_test_files": []},
+            },
+        },
+    )
+
+    assert passed is True
+    assert reason == "reconcile-cluster no-test overlay-only graph_delta accepted"
+
+
 def test_reconcile_cluster_noop_with_failed_tests_gets_actionable_reason(isolated_gov_db):
     from governance.auto_chain import _gate_checkpoint
 

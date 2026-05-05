@@ -4808,29 +4808,64 @@ def _gate_checkpoint(conn, project_id, result, metadata):
             failed_count = int(test_results.get("failed") or 0) if isinstance(test_results, dict) else 1
         except (TypeError, ValueError):
             failed_count = 1
-        if (
-            metadata.get("operation_type") == CLUSTER_OPERATION_TYPE
-            and isinstance(test_results, dict)
-            and test_results.get("ran") is True
-            and failed_count == 0
-            and result.get("summary")
-        ):
-            return True, "reconcile-cluster no-op audit accepted"
-        if (
-            metadata.get("operation_type") == CLUSTER_OPERATION_TYPE
-            and isinstance(test_results, dict)
-            and test_results.get("ran") is True
-            and failed_count > 0
-        ):
-            return False, (
-                "reconcile-cluster verification failed with "
-                f"{failed_count} failing tests and changed_files=[]. "
-                "If failures are real cluster-owned defects, fix the allowed "
-                "source/doc/test files and include the pre-fix failure evidence "
-                "in retry_context; if they are not cluster-owned, observer "
-                "takeover is required before this cluster can be accepted. "
-                f"test_results={json.dumps(test_results, ensure_ascii=False)}"
+        if metadata.get("operation_type") == CLUSTER_OPERATION_TYPE:
+            if (
+                isinstance(test_results, dict)
+                and test_results.get("ran") is True
+                and failed_count > 0
+            ):
+                return False, (
+                    "reconcile-cluster verification failed with "
+                    f"{failed_count} failing tests and changed_files=[]. "
+                    "If failures are real cluster-owned defects, fix the allowed "
+                    "source/doc/test files and include the pre-fix failure evidence "
+                    "in retry_context; if they are not cluster-owned, observer "
+                    "takeover is required before this cluster can be accepted. "
+                    f"test_results={json.dumps(test_results, ensure_ascii=False)}"
+                )
+            if (
+                isinstance(test_results, dict)
+                and test_results.get("ran") is True
+                and failed_count == 0
+                and result.get("summary")
+            ):
+                return True, "reconcile-cluster no-op audit accepted"
+
+            cluster_payload = metadata.get("cluster_payload")
+            if not isinstance(cluster_payload, dict):
+                cluster_payload = {}
+            cluster_report = metadata.get("cluster_report")
+            if not isinstance(cluster_report, dict):
+                cluster_report = {}
+            payload_report = cluster_payload.get("cluster_report")
+            if not isinstance(payload_report, dict):
+                payload_report = {}
+            expected_tests = (
+                cluster_report.get("expected_test_files")
+                if "expected_test_files" in cluster_report
+                else payload_report.get("expected_test_files", metadata.get("expected_test_files", []))
             )
+            if expected_tests is None:
+                expected_tests = []
+            graph_delta = result.get("graph_delta") if isinstance(result.get("graph_delta"), dict) else {}
+            creates = graph_delta.get("creates") if isinstance(graph_delta, dict) else []
+            if (
+                not expected_tests
+                and result.get("summary")
+                and isinstance(creates, list)
+                and creates
+            ):
+                cluster_dev_ok, cluster_dev_reason = preflight_reconcile_cluster_dev(
+                    metadata.get("proposed_nodes", []),
+                    creates,
+                    candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+                )
+                if cluster_dev_ok:
+                    return True, "reconcile-cluster no-test overlay-only graph_delta accepted"
+                log.warning(
+                    "checkpoint_gate: no-test reconcile graph_delta did not pass candidate preflight: %s",
+                    cluster_dev_reason,
+                )
         return False, "No files changed"
 
     # B36-fix(2): single source of truth shared with retry-prompt scope_line
