@@ -36,8 +36,8 @@ def _get_column_names(conn: sqlite3.Connection, table: str) -> list[str]:
 
 
 def test_schema_version_is_23():
-    """AC1: SCHEMA_VERSION should be 23."""
-    assert SCHEMA_VERSION == 23
+    """AC1: SCHEMA_VERSION includes at least the v23 backlog columns."""
+    assert SCHEMA_VERSION >= 23
 
 
 def test_migrate_v22_to_v23():

@@ -68,8 +68,10 @@ class TestSchemaV19(BaselineTestBase):
     """AC-I12: version_baselines table exists with correct columns."""
 
     def test_schema_version_is_19(self):
+        # AC-I12: version_baselines was introduced at SCHEMA_VERSION=19.
+        # Later migrations are additive; this test protects the lower bound.
         from governance.db import SCHEMA_VERSION
-        self.assertEqual(SCHEMA_VERSION, 19)
+        self.assertGreaterEqual(SCHEMA_VERSION, 19)
 
     def test_version_baselines_table_exists(self):
         conn = self._get_conn()
