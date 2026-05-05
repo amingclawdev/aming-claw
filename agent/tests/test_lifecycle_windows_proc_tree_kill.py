@@ -61,3 +61,13 @@ def test_timeout_path_does_not_call_proc_kill():
     source = inspect.getsource(ai_lifecycle.AILifecycleManager.create_session)
     assert "proc.kill()" not in source
     assert "_kill_process_tree(proc.pid or session.pid)" in source
+
+
+def test_create_session_uses_streaming_reader_watchdog():
+    from agent import ai_lifecycle
+
+    source = inspect.getsource(ai_lifecycle.AILifecycleManager.create_session)
+    assert "proc.communicate(input=stdin_prompt, timeout=_MAX_TIMEOUT)" not in source
+    assert "stdout_thread.start()" in source
+    assert "session.last_heartbeat" in source
+    assert "no CLI output" in source

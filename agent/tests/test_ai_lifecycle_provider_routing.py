@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import io
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -131,16 +132,38 @@ class TestAILifecycleProviderRouting(unittest.TestCase):
 
 
 class TestB14StdinPromptPassedToCommunicate(unittest.TestCase):
-    """B14: proc.communicate() must pass input=stdin_prompt to Claude CLI."""
+    """B14: stdin_prompt must be passed to the CLI process."""
 
     @patch("ai_lifecycle.subprocess.Popen")
-    def test_communicate_receives_stdin_prompt(self, mock_popen):
+    def test_process_stdin_receives_prompt(self, mock_popen):
         from ai_lifecycle import AILifecycleManager
 
-        fake_proc = mock_popen.return_value
-        fake_proc.pid = 999
-        fake_proc.returncode = 0
-        fake_proc.communicate.return_value = ('{"result":"ok"}', "")
+        class CaptureStdin:
+            def __init__(self):
+                self.value = ""
+
+            def write(self, value):
+                self.value += value
+
+            def close(self):
+                pass
+
+        class FakeProc:
+            def __init__(self):
+                self.pid = 999
+                self.returncode = 0
+                self.stdin = CaptureStdin()
+                self.stdout = io.StringIO('{"result":"ok"}\n')
+                self.stderr = io.StringIO("")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        fake_proc = FakeProc()
+        mock_popen.return_value = fake_proc
 
         mgr = AILifecycleManager()
         session = mgr.create_session(
@@ -152,13 +175,7 @@ class TestB14StdinPromptPassedToCommunicate(unittest.TestCase):
         )
         mgr.wait_for_output(session.session_id)
 
-        # The key assertion: communicate was called WITH input= containing the prompt
-        fake_proc.communicate.assert_called_once()
-        call_kwargs = fake_proc.communicate.call_args
-        # input= can be positional or keyword
-        input_val = call_kwargs.kwargs.get("input") or (call_kwargs.args[0] if call_kwargs.args else None)
-        self.assertIsNotNone(input_val, "communicate() must be called with input= parameter")
-        self.assertIn("Analyze this requirement", input_val)
+        self.assertIn("Analyze this requirement", fake_proc.stdin.value)
 
 
 if __name__ == "__main__":

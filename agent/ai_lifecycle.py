@@ -30,10 +30,19 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
-# Heartbeat constants — used by the streaming watchdog in create_session._run()
-_HANG_TIMEOUT = 120    # seconds of stdout silence → treat as hung (non-coordinator roles)
-_COORDINATOR_HANG_TIMEOUT = 300  # coordinator has no tools; waits longer for single-turn output
-_MAX_TIMEOUT = 1200    # absolute session cap regardless of activity
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Heartbeat constants — used by the streaming watchdog in create_session._run().
+# Claude often stays silent while a Bash tool is running, so the default
+# no-output window is intentionally longer than a short HTTP/task lease.
+_HANG_TIMEOUT = _int_env("AI_HANG_TIMEOUT_SEC", 300)
+_COORDINATOR_HANG_TIMEOUT = _int_env("AI_COORDINATOR_HANG_TIMEOUT_SEC", 300)
+_MAX_TIMEOUT = _int_env("AI_MAX_TIMEOUT_SEC", 1200)
 _DEFAULT_CLAUDE_ROLE_TURN_CAPS = {
     "coordinator": "1",
     "pm": "60",
@@ -332,9 +341,10 @@ class AILifecycleManager:
                 _al_log(f"Session registered: sid={session_id} pid={session.pid}")
             # else: pid==0, suppress pid-dependent log until Popen assigns real PID
 
-        # Run CLI in background thread using Popen + communicate().
-        # communicate() avoids pipe deadlock (same as subprocess.run internally).
-        # Popen gives us immediate PID access for tracking/kill.
+        # Run CLI in a background thread using Popen and pipe reader threads.
+        # This keeps stdout/stderr drained while the process runs, allowing the
+        # heartbeat watchdog to kill silent sessions instead of waiting for the
+        # absolute communicate() timeout.
         def _run():
             try:
                 # Save input for replay/debug
@@ -369,11 +379,79 @@ class AILifecycleManager:
                 proc = subprocess.Popen(cmd, **popen_kwargs)
                 session.pid = proc.pid
                 _al_log(f"Popen started: pid={proc.pid}")
-                stdout_data, stderr_data = proc.communicate(input=stdin_prompt, timeout=_MAX_TIMEOUT)
-                session.stdout = stdout_data or ""
-                session.stderr = stderr_data or ""
-                session.exit_code = proc.returncode
-                session.status = "completed" if proc.returncode == 0 else "failed"
+
+                stdout_parts: list[str] = []
+                stderr_parts: list[str] = []
+                io_lock = threading.Lock()
+
+                def _read_pipe(pipe, parts: list[str], label: str) -> None:
+                    try:
+                        while True:
+                            chunk = pipe.readline()
+                            if chunk == "":
+                                break
+                            with io_lock:
+                                parts.append(chunk)
+                            session.last_heartbeat = time.time()
+                    except Exception as exc:
+                        with io_lock:
+                            parts.append(f"\n[{label} reader error: {exc}]\n")
+
+                stdout_thread = threading.Thread(
+                    target=_read_pipe, args=(proc.stdout, stdout_parts, "stdout"), daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=_read_pipe, args=(proc.stderr, stderr_parts, "stderr"), daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+
+                try:
+                    if proc.stdin:
+                        proc.stdin.write(stdin_prompt)
+                        proc.stdin.close()
+                except Exception as exc:
+                    _al_log(f"stdin write failed: {exc}")
+
+                max_timeout = min(_MAX_TIMEOUT, int(session.timeout_sec or _MAX_TIMEOUT))
+                hang_timeout = _COORDINATOR_HANG_TIMEOUT if role == "coordinator" else _HANG_TIMEOUT
+                timeout_reason = ""
+                while proc.poll() is None:
+                    now = time.time()
+                    if now - session.started_at > max_timeout:
+                        timeout_reason = f"max runtime exceeded after {max_timeout}s"
+                        break
+                    if now - session.last_heartbeat > hang_timeout:
+                        timeout_reason = f"no CLI output for {hang_timeout}s"
+                        break
+                    time.sleep(0.5)
+
+                if timeout_reason:
+                    _al_log(f"Popen watchdog timeout: {timeout_reason}")
+                    _kill_process_tree(proc.pid or session.pid)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+
+                stdout_thread.join(timeout=2)
+                stderr_thread.join(timeout=2)
+
+                with io_lock:
+                    session.stdout = "".join(stdout_parts)
+                    session.stderr = "".join(stderr_parts)
+                if timeout_reason:
+                    session.exit_code = -1
+                    session.status = "timeout"
+                    session.stderr = (session.stderr + f"\n{timeout_reason}").strip()
+                else:
+                    session.exit_code = proc.returncode
+                    session.status = "completed" if proc.returncode == 0 else "failed"
                 if provider == "openai" and os.path.exists(output_last):
                     try:
                         session.stdout = Path(output_last).read_text(encoding="utf-8")
