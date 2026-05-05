@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "compose_bug_id", "file_remediation_plan",
     "compose_cluster_bug_id", "file_cluster_as_backlog",
+    "enrich_feature_cluster_payload",
     "DEFAULT_CREATOR_ALLOWLIST", "MAX_DUP_SUFFIX",
 ]
 
@@ -229,6 +230,178 @@ def compose_cluster_bug_id(
     )
 
 
+def _normalize_path(value: Any) -> str:
+    text = str(value or "").replace("\\", "/").strip()
+    if text.lower() in {"none", "null", "n/a", "na", "-"}:
+        return ""
+    return text
+
+
+def _path_list(*values: Any) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            candidates = value
+        else:
+            candidates = [value]
+        for item in candidates:
+            text = _normalize_path(item)
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
+def _node_id(node: dict[str, Any]) -> str:
+    return str(node.get("id") or node.get("node_id") or node.get("candidate_node_id") or "").strip()
+
+
+def _candidate_nodes(candidate_graph: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("deps_graph", "hierarchy_graph", "evidence_graph"):
+        section = candidate_graph.get(key)
+        if not isinstance(section, dict):
+            continue
+        raw = section.get("nodes")
+        if isinstance(raw, dict):
+            nodes = [dict(v, id=str(k)) for k, v in raw.items() if isinstance(v, dict)]
+        elif isinstance(raw, list):
+            nodes = [dict(n) for n in raw if isinstance(n, dict)]
+        else:
+            nodes = []
+        leafs = [n for n in nodes if _path_list(n.get("primary"), n.get("primary_files"))]
+        if leafs:
+            return leafs
+    return []
+
+
+def _node_test_files(node: dict[str, Any]) -> list[str]:
+    coverage = node.get("test_coverage")
+    coverage_files = coverage.get("test_files") if isinstance(coverage, dict) else []
+    return _path_list(
+        node.get("test"),
+        node.get("tests"),
+        node.get("test_files"),
+        coverage_files,
+    )
+
+
+def _node_doc_files(node: dict[str, Any]) -> list[str]:
+    return [
+        p for p in _path_list(node.get("secondary"), node.get("secondary_files"))
+        if p.lower().endswith((".md", ".mdx", ".rst", ".txt")) or p.startswith("docs/")
+    ]
+
+
+def _cluster_slug_hint(cluster: dict[str, Any], matched_nodes: list[dict[str, Any]]) -> str:
+    if cluster.get("slug"):
+        return str(cluster["slug"])
+    modules = cluster.get("modules") if isinstance(cluster.get("modules"), list) else []
+    if modules:
+        return " ".join(str(m).split(".")[-1] for m in modules[:2])
+    if matched_nodes:
+        return str(matched_nodes[0].get("title") or _node_id(matched_nodes[0]) or "cluster")
+    return str(cluster.get("cluster_fingerprint") or "cluster")
+
+
+def _controlled_reconcile_prompt() -> str:
+    return (
+        "Controlled graph rebase rollout cluster. PM must propose exactly the "
+        "candidate node_id set from cluster_payload.candidate_nodes, preserving "
+        "node_id, parent, title, primary, and layer. PM may augment test/secondary "
+        "only with existing tracked consumer files listed in "
+        "cluster_report.expected_test_files/expected_doc_files or with direct "
+        "evidence. Dev must emit graph_delta.creates one-for-one with PM "
+        "proposed_nodes and must not mutate graph.json or graph.rebase.candidate.json. "
+        "Default outcome is overlay-only changed_files=[]; modify source/docs/tests "
+        "only if verification proves a real defect. Do not cite ignored docs/dev "
+        "proposal files as required evidence."
+    )
+
+
+def enrich_feature_cluster_payload(
+    cluster: dict[str, Any],
+    *,
+    candidate_graph: dict[str, Any] | None = None,
+    candidate_graph_path: str = "",
+    overlay_path: str = "",
+    run_id: str = "",
+) -> dict[str, Any]:
+    """Attach candidate graph context before a FeatureCluster enters the chain."""
+    payload = dict(cluster or {})
+    primaries = set(_path_list(payload.get("primary_files")))
+    matched_nodes: list[dict[str, Any]] = []
+    for node in _candidate_nodes(candidate_graph or {}):
+        node_primaries = set(_path_list(node.get("primary"), node.get("primary_files")))
+        if primaries and primaries.intersection(node_primaries):
+            normalized = dict(node)
+            nid = _node_id(normalized)
+            if nid:
+                normalized["node_id"] = nid
+            normalized["primary"] = _path_list(
+                normalized.get("primary"),
+                normalized.get("primary_files"),
+            )
+            normalized["secondary"] = _path_list(
+                normalized.get("secondary"),
+                normalized.get("secondary_files"),
+            )
+            normalized["test"] = _node_test_files(normalized)
+            matched_nodes.append(normalized)
+    matched_nodes.sort(key=lambda n: _node_id(n) or ",".join(_path_list(n.get("primary"))))
+
+    secondary_files = _path_list(payload.get("secondary_files"))
+    expected_tests = _path_list(
+        *[_node_test_files(n) for n in matched_nodes],
+        [p for p in secondary_files if "/test" in f"/{p.lower()}" or p.lower().endswith(("_test.py", ".test.js", ".spec.js"))],
+    )
+    expected_docs = _path_list(
+        *[_node_doc_files(n) for n in matched_nodes],
+        [p for p in secondary_files if p.lower().endswith((".md", ".mdx", ".rst", ".txt")) or p.startswith("docs/")],
+    )
+
+    if candidate_graph_path:
+        payload["candidate_graph_path"] = candidate_graph_path
+    if overlay_path:
+        payload["overlay_path"] = overlay_path
+        payload["reconcile_overlay_path"] = overlay_path
+    if run_id:
+        payload.setdefault("batch_id", run_id)
+    if matched_nodes:
+        payload["candidate_nodes"] = matched_nodes
+
+    report = dict(payload.get("cluster_report") or {})
+    report.setdefault(
+        "purpose",
+        (
+            "Controlled graph rebase rollout: validate this FeatureCluster, "
+            "preserve candidate node identity, attach tracked doc/test consumers "
+            "when evidence exists, and write overlay-only graph_delta."
+        ),
+    )
+    report.setdefault("title", _cluster_slug_hint(payload, matched_nodes))
+    report["expected_test_files"] = _path_list(report.get("expected_test_files"), expected_tests)
+    report["expected_doc_files"] = _path_list(report.get("expected_doc_files"), expected_docs)
+    report["expected_doc_sections"] = _path_list(report.get("expected_doc_sections"), expected_docs)
+    report.setdefault(
+        "coverage_audit",
+        (
+            "PM must inspect candidate_nodes plus expected_doc_files/"
+            "expected_test_files; if an expected test/doc is a consumer, add it "
+            "to graph_delta node.test/secondary without editing files unless a "
+            "real defect is proven."
+        ),
+    )
+    if candidate_graph_path:
+        report.setdefault("candidate_graph_path", candidate_graph_path)
+    if overlay_path:
+        report.setdefault("overlay_path", overlay_path)
+    payload["cluster_report"] = report
+    payload.setdefault("prompt", _controlled_reconcile_prompt())
+    payload.setdefault("slug", _cluster_slug_hint(payload, matched_nodes))
+    return payload
+
+
 def file_cluster_as_backlog(
     cluster_group: dict,
     cluster_report: dict,
@@ -358,6 +531,19 @@ def file_cluster_as_backlog(
         "cluster_report": cluster_report,
         "reconcile_run_id": run_id,
     }
+    if operation_type == "reconcile-cluster":
+        metadata.update({
+            "skip_version_check": True,
+            "operator_id": creator,
+            "bypass_reason": (
+                "reconcile-cluster branch-local graph rebase; observer preflight "
+                "validated runtime before filing"
+            ),
+        })
+        for key in ("candidate_graph_path", "overlay_path", "reconcile_overlay_path"):
+            value = cluster_group.get(key) or cluster_report.get(key)
+            if value:
+                metadata[key] = str(value)
     if active_session:
         metadata.update({
             "session_id": active_session.get("session_id", ""),

@@ -164,6 +164,9 @@ def test_metadata_operation_type_reconcile_cluster():
     assert md["test_files"] == []
     assert md["batch_id"] == "run-12345678"
     assert md["reconcile_batch_id"] == "run-12345678"
+    assert md["skip_version_check"] is True
+    assert md["operator_id"] == "reconcile-bridge"
+    assert "reconcile-cluster" in md["bypass_reason"]
     assert md["bug_id"].startswith("OPT-BACKLOG-RECONCILE-")
     assert "-CLUSTER-" in md["bug_id"]
 
@@ -215,6 +218,67 @@ def test_cluster_task_metadata_carries_expected_test_files():
     assert body["target_files"] == ["agent/a.py"]
     assert body["metadata"]["target_files"] == ["agent/a.py"]
     assert body["metadata"]["test_files"] == ["agent/tests/test_a.py"]
+
+
+def test_enrich_feature_cluster_payload_attaches_candidate_nodes_and_prompt():
+    candidate_graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.19",
+                    "title": "agent.governance.ai_cluster_processor",
+                    "parent": "L3.12",
+                    "layer": "L7",
+                    "primary": ["agent/governance/ai_cluster_processor.py"],
+                    "secondary": ["docs/governance/reconcile-workflow.md"],
+                    "test": ["agent/tests/test_ai_cluster_processor.py"],
+                },
+                {
+                    "id": "L7.22",
+                    "title": "agent.governance.auto_backlog_bridge",
+                    "parent": "L3.14",
+                    "layer": "L7",
+                    "primary": ["agent/governance/auto_backlog_bridge.py"],
+                    "test": [
+                        "agent/tests/test_auto_backlog_bridge.py",
+                        "agent/tests/test_auto_backlog_bridge_cluster.py",
+                    ],
+                },
+                {
+                    "id": "L7.99",
+                    "title": "unrelated",
+                    "primary": ["agent/other.py"],
+                },
+            ],
+            "links": [],
+        }
+    }
+    payload = bridge.enrich_feature_cluster_payload(
+        {
+            "cluster_fingerprint": "fp-enrich",
+            "primary_files": [
+                "agent/governance/ai_cluster_processor.py",
+                "agent/governance/auto_backlog_bridge.py",
+            ],
+            "secondary_files": ["docs/governance/reconcile-workflow.md"],
+        },
+        candidate_graph=candidate_graph,
+        candidate_graph_path="state/graph.rebase.candidate.json",
+        overlay_path="state/graph.rebase.overlay.json",
+        run_id="run-enrich",
+    )
+
+    assert [node["node_id"] for node in payload["candidate_nodes"]] == ["L7.19", "L7.22"]
+    assert payload["candidate_graph_path"] == "state/graph.rebase.candidate.json"
+    assert payload["overlay_path"] == "state/graph.rebase.overlay.json"
+    assert "candidate node_id set" in payload["prompt"]
+    report = payload["cluster_report"]
+    assert report["expected_test_files"] == [
+        "agent/tests/test_ai_cluster_processor.py",
+        "agent/tests/test_auto_backlog_bridge.py",
+        "agent/tests/test_auto_backlog_bridge_cluster.py",
+    ]
+    assert report["expected_doc_files"] == ["docs/governance/reconcile-workflow.md"]
 
 
 def test_terminal_success_hook(conn):

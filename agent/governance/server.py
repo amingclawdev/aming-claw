@@ -1219,6 +1219,9 @@ def handle_reconcile_session_start(ctx: RequestContext):
     target_branch = body.get("target_branch")
     try:
         with DBContext(project_id) as conn:
+            from .db import _resolve_project_dir
+
+            project_dir = _resolve_project_dir(project_id)
             # Pre-check: active session already exists?
             existing = reconcile_session.get_active_session(conn, project_id)
             if existing is not None:
@@ -1236,6 +1239,7 @@ def handle_reconcile_session_start(ctx: RequestContext):
                 dropped_cluster_fingerprints=dropped,
                 base_commit_sha=base_commit_sha,
                 target_branch=target_branch,
+                governance_dir=project_dir,
             )
     except reconcile_session.SessionAlreadyActiveError as exc:
         return 409, {
@@ -1375,6 +1379,7 @@ def handle_reconcile_session_finalize(ctx: RequestContext):
                 conn,
                 project_id,
                 session_id,
+                governance_dir=project_dir,
                 graph_path=project_dir / "graph.json",
                 workspace_dir=Path(__file__).resolve().parents[2],
                 candidate_graph_path=(
@@ -1422,10 +1427,14 @@ def handle_reconcile_session_rollback(ctx: RequestContext):
             return 404, {"error": "session_not_found", "session_id": session_id}
         try:
             body = ctx.body or {}
+            from .db import _resolve_project_dir
+
+            project_dir = _resolve_project_dir(project_id)
             result = reconcile_session.rollback_session(
                 conn,
                 project_id,
                 session_id,
+                governance_dir=project_dir,
                 restore_graph_snapshot=bool(body.get("restore_graph_snapshot", False)),
             )
         except ValueError as exc:
@@ -1595,6 +1604,7 @@ def handle_reconcile_deferred_clusters_summary(ctx: RequestContext):
 def handle_reconcile_deferred_clusters_register_run(ctx: RequestContext):
     """Register all FeatureClusters from a Phase Z run into the durable queue."""
     from . import reconcile_deferred_queue as q
+    from . import auto_backlog_bridge
 
     project_id = ctx.get_project_id()
     body = ctx.body or {}
@@ -1608,6 +1618,31 @@ def handle_reconcile_deferred_clusters_register_run(ctx: RequestContext):
         priority = int(body.get("priority", 100))
     except (TypeError, ValueError):
         priority = 100
+    try:
+        from .db import _resolve_project_dir
+
+        project_dir = _resolve_project_dir(project_id)
+        candidate_path = project_dir / "graph.rebase.candidate.json"
+        overlay_path = project_dir / "graph.rebase.overlay.json"
+        candidate_graph = {}
+        if candidate_path.exists():
+            candidate_graph = json.loads(candidate_path.read_text(encoding="utf-8"))
+        clusters = [
+            auto_backlog_bridge.enrich_feature_cluster_payload(
+                cluster,
+                candidate_graph=candidate_graph,
+                candidate_graph_path=str(candidate_path),
+                overlay_path=str(overlay_path),
+                run_id=run_id,
+            )
+            for cluster in clusters
+            if isinstance(cluster, dict)
+        ]
+    except Exception:
+        log.warning(
+            "reconcile_deferred_clusters.register-run: payload enrichment skipped",
+            exc_info=True,
+        )
     with DBContext(project_id) as conn:
         if conn.row_factory is None:
             conn.row_factory = sqlite3.Row
