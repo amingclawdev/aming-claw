@@ -147,6 +147,39 @@ def _derive_test_files(metadata: dict) -> list[str]:
     return []
 
 
+def _reconcile_candidate_manifest(cluster_payload: dict) -> list[dict]:
+    """Compact, non-truncated manifest of candidate nodes for PM prompts."""
+    if not isinstance(cluster_payload, dict):
+        return []
+    raw_nodes = cluster_payload.get("candidate_nodes")
+    if not isinstance(raw_nodes, list):
+        return []
+    manifest: list[dict] = []
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            continue
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        item = {
+            "node_id": str(raw.get("node_id") or raw.get("id") or "").strip(),
+            "title": str(raw.get("title") or "").strip(),
+            "primary": _string_list(raw.get("primary") or raw.get("primary_files")),
+            "layer": raw.get("layer"),
+            "parent_layer": raw.get("parent_layer"),
+            "hierarchy_parent": (
+                raw.get("hierarchy_parent")
+                or raw.get("parent")
+                or raw.get("parent_id")
+                or metadata.get("hierarchy_parent")
+            ),
+            "deps": _string_list(raw.get("_deps") or raw.get("deps")),
+            "secondary": _string_list(raw.get("secondary") or raw.get("secondary_files")),
+            "test": _string_list(raw.get("test") or raw.get("tests") or raw.get("test_files")),
+            "test_coverage": raw.get("test_coverage"),
+        }
+        manifest.append({k: v for k, v in item.items() if v not in (None, "", [])})
+    return manifest
+
+
 def _parse_pytest_output(stdout: str, stderr: str, returncode: int) -> dict:
     """6c: Parse pytest output into structured test_report.
 
@@ -1548,6 +1581,19 @@ class ExecutorWorker:
                             f"Batch memory id {batch_id!r} was declared but could not be loaded. "
                             "Do not assume this is the first cluster; keep feature naming conservative."
                         )
+                candidate_manifest = _reconcile_candidate_manifest(cluster_payload)
+                if candidate_manifest:
+                    parts.append("\n## Reconcile Candidate Node Manifest (Authoritative)")
+                    parts.append(
+                        "This compact manifest is never truncated. PM MUST copy every "
+                        "candidate node below into proposed_nodes exactly once. If this "
+                        "manifest and the larger metadata block disagree, this manifest "
+                        "wins for node_id/primary/title/layer/hierarchy_parent."
+                    )
+                    parts.append(f"candidate_node_count: {len(candidate_manifest)}")
+                    parts.append(
+                        f"```json\n{json.dumps(candidate_manifest, ensure_ascii=False, indent=2)}\n```"
+                    )
                 cluster_scope = {
                     "operation_type": operation_type,
                     "cluster_fingerprint": metadata.get("cluster_fingerprint", ""),

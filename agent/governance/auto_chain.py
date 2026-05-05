@@ -3132,6 +3132,68 @@ def _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
     return True
 
 
+def _preflight_failure_reason(stage, conn, project_id, task_id, result, metadata):
+    """Return a compact operator-facing reason for a preflight block."""
+    fallback = f"{stage} result preflight validation failed"
+    if stage == "pm":
+        try:
+            mode = (os.environ.get("OPT_PREFLIGHT_VALIDATOR_MODE") or "warn").strip().lower()
+            chain_context = None
+            try:
+                from .chain_context import get_store
+                chain_context = get_store().get_chain(task_id)
+            except Exception:
+                chain_context = None
+            vr = validate_pm_output(result or {}, chain_context, mode=mode)
+            if not vr.valid:
+                messages = [
+                    f"{e.field_path}: {e.message}"
+                    for e in (vr.errors or [])[:3]
+                ]
+                if messages:
+                    return f"{fallback}: " + "; ".join(messages)
+        except Exception:
+            pass
+        if is_reconcile_cluster_task(metadata):
+            try:
+                ok, reason = preflight_reconcile_cluster_pm(
+                    result or {},
+                    candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+                )
+                if not ok and reason:
+                    return reason
+            except Exception:
+                pass
+    return fallback
+
+
+def _mark_reconcile_cluster_preflight_blocked(
+    conn, project_id, metadata, stage, reason,
+):
+    """Move a reconcile cluster out of in_chain when a stage preflight blocks."""
+    if not is_reconcile_cluster_task(metadata):
+        return None
+    fp = str(metadata.get("cluster_fingerprint") or "").strip()
+    if not fp:
+        return None
+    try:
+        from . import reconcile_deferred_queue as q
+        return q.requeue_after_failure(
+            project_id,
+            fp,
+            retry_count_delta=1,
+            reason=f"{stage}_preflight_blocked: {reason}",
+            conn=conn,
+        )
+    except Exception:
+        log.warning(
+            "auto_chain: failed to mark reconcile cluster %s preflight-blocked",
+            fp,
+            exc_info=True,
+        )
+        return {"status": "mark_failed", "cluster_fingerprint": fp}
+
+
 def _is_current_reconcile_cluster_terminal_source(
     conn, project_id, task_id, metadata,
 ) -> bool:
@@ -3320,8 +3382,18 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
     # over-fire on PR1e-style "Rule J respects dev removes" ACs.
     if task_type == "pm":
         if not _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
-            return {"preflight_blocked": True, "stage": "pm",
-                    "reason": "pm result preflight validation failed"}
+            reason = _preflight_failure_reason(
+                "pm", conn, project_id, task_id, result, metadata,
+            )
+            queue_outcome = _mark_reconcile_cluster_preflight_blocked(
+                conn, project_id, metadata, "pm", reason,
+            )
+            return {
+                "preflight_blocked": True,
+                "stage": "pm",
+                "reason": reason,
+                "queue_outcome": queue_outcome,
+            }
 
     # PR1 PRIMARY: dev result preflight validator — runs right after dev
     # succeeds and BEFORE next-stage dispatch (_do_chain). Returns False to
@@ -3329,8 +3401,18 @@ def on_task_completed(conn, project_id, task_id, task_type, status, result, meta
     # when mode='disabled' or observer_emergency_bypass is in effect.
     if task_type == "dev":
         if not _validate_dev_at_transition(conn, project_id, task_id, result, metadata):
-            return {"preflight_blocked": True, "stage": "dev",
-                    "reason": "dev result preflight validation failed"}
+            reason = _preflight_failure_reason(
+                "dev", conn, project_id, task_id, result, metadata,
+            )
+            queue_outcome = _mark_reconcile_cluster_preflight_blocked(
+                conn, project_id, metadata, "dev", reason,
+            )
+            return {
+                "preflight_blocked": True,
+                "stage": "dev",
+                "reason": reason,
+                "queue_outcome": queue_outcome,
+            }
 
     # Use independent connection — don't hold caller's lock during chain ops
     from .db import get_connection

@@ -666,12 +666,15 @@ def _build_auto_chain_response(chain_result: dict | None) -> dict:
         # Not a chain-eligible task or non-succeeded status
         return {"dispatched": False}
     if chain_result.get("preflight_blocked"):
-        return {
+        response = {
             "dispatched": False,
             "preflight_blocked": True,
             "stage": chain_result.get("stage", "preflight"),
             "reason": chain_result.get("reason", "unknown"),
         }
+        if chain_result.get("queue_outcome") is not None:
+            response["queue_outcome"] = chain_result.get("queue_outcome")
+        return response
     if chain_result.get("gate_blocked"):
         return {
             "dispatched": False,

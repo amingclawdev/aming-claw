@@ -434,6 +434,71 @@ def test_on_task_failed_terminal_updates_deferred_queue(conn):
     assert "executor_crash_recovery" in row[2]
 
 
+def test_pm_preflight_block_updates_deferred_queue(conn):
+    """A reconcile PM preflight block must not leave the cluster stuck in_chain."""
+    from governance import auto_chain
+
+    q.enqueue_or_lookup(PROJECT_ID, "fp-preflight", payload={}, run_id="r", conn=conn)
+    q.mark_filing(PROJECT_ID, "fp-preflight", conn=conn)
+    q.mark_in_chain(PROJECT_ID, "fp-preflight", "task-root-preflight", conn=conn)
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "cluster_fingerprint": "fp-preflight",
+        "cluster_payload": {
+            "candidate_nodes": [
+                {
+                    "node_id": "L7.1",
+                    "title": "node one",
+                    "primary": ["agent/one.py"],
+                    "layer": "L7",
+                },
+                {
+                    "node_id": "L7.2",
+                    "title": "node two",
+                    "primary": ["agent/two.py"],
+                    "layer": "L7",
+                },
+            ],
+        },
+    }
+    pm_result = {
+        "target_files": ["agent/one.py", "agent/two.py"],
+        "acceptance_criteria": ["AC1: preserve candidate nodes"],
+        "requirements": ["R1: one-for-one"],
+        "verification": {"method": "automated test", "command": "python -c \"print('ok')\""},
+        "proposed_nodes": [
+            {
+                "node_id": "L7.1",
+                "title": "node one",
+                "primary": ["agent/one.py"],
+                "layer": "L7",
+            }
+        ],
+    }
+
+    out = auto_chain.on_task_completed(
+        conn,
+        PROJECT_ID,
+        "task-root-preflight",
+        "pm",
+        "succeeded",
+        pm_result,
+        metadata,
+    )
+
+    assert out["preflight_blocked"] is True
+    assert out["stage"] == "pm"
+    assert out["queue_outcome"]["status"] == "failed_retryable"
+    row = conn.execute(
+        "SELECT status, retry_count, terminal_reason "
+        "FROM reconcile_deferred_clusters WHERE project_id=? AND cluster_fingerprint=?",
+        (PROJECT_ID, "fp-preflight"),
+    ).fetchone()
+    assert row[0] == "failed_retryable"
+    assert row[1] == 1
+    assert "missing=['L7.2']" in row[2]
+
+
 def test_compose_cluster_bug_id_format():
     """Direct unit test on compose_cluster_bug_id helper."""
     bid = bridge.compose_cluster_bug_id(

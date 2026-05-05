@@ -102,3 +102,76 @@ def test_reconcile_cluster_pm_prompt_embeds_cluster_metadata(tmp_path, monkeypat
     assert '"purpose": "Audit governance server surface"' in prompt
     assert "Do not widen scope beyond these files" in prompt
     assert "### agent/governance/server.py" in prompt
+
+
+def test_reconcile_cluster_pm_prompt_keeps_candidate_manifest_untruncated(tmp_path, monkeypatch):
+    import requests
+    from executor_worker import ExecutorWorker, _derive_target_files, _derive_test_files
+
+    source = tmp_path / "agent" / "governance" / "orchestrator.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def run_orchestrated():\n    return True\n", encoding="utf-8")
+
+    noisy_nodes = []
+    for idx, node_id in enumerate(["L7.107", "L7.110", "L7.159", "L7.163", "L7.168", "L7.82"]):
+        primary = "agent/governance/reconcile_phases/orchestrator.py" if node_id == "L7.82" else f"scripts/file_{idx}.py"
+        noisy_nodes.append(
+            {
+                "node_id": node_id,
+                "title": f"node {node_id}",
+                "primary": [primary],
+                "layer": "L7",
+                "metadata": {
+                    "hierarchy_parent": "L3.18",
+                    "large_evidence": "x" * 3000,
+                },
+            }
+        )
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "cluster_fingerprint": "fp-truncate",
+        "cluster_payload": {
+            "primary_files": ["agent/governance/orchestrator.py"],
+            "candidate_nodes": noisy_nodes,
+        },
+        "cluster_report": {},
+    }
+
+    class _Resp:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _Resp({"exists": False, "tasks": []}))
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Resp({"affected_nodes": []}))
+
+    worker = ExecutorWorker.__new__(ExecutorWorker)
+    worker.project_id = "aming-claw"
+    worker.base_url = "http://localhost:40000"
+    worker.workspace = str(tmp_path)
+    worker._fetch_memories = lambda query: []
+
+    prompt = worker._build_prompt(
+        "Reconcile cluster fp-truncate - produce PRD",
+        "pm",
+        {
+            "task_id": "task-truncate",
+            "metadata": metadata,
+            "operation_type": "reconcile-cluster",
+            "cluster_payload": metadata["cluster_payload"],
+            "cluster_report": metadata["cluster_report"],
+            "target_files": _derive_target_files(metadata),
+            "test_files": _derive_test_files(metadata),
+        },
+    )
+
+    manifest_start = prompt.index("## Reconcile Candidate Node Manifest")
+    source_start = prompt.index("## Reconcile Cluster Source Of Truth")
+    manifest = prompt[manifest_start:source_start]
+    assert "candidate_node_count: 6" in manifest
+    assert '"node_id": "L7.82"' in manifest
+    assert '"primary": [\n      "agent/governance/reconcile_phases/orchestrator.py"' in manifest
+    assert '"hierarchy_parent": "L3.18"' in manifest
+    assert "...<truncated>" in prompt

@@ -139,7 +139,7 @@ def test_reconcile_cluster_dev_prompt_uses_overlay_contract_not_generic_test_chu
     assert "Cluster test evidence files" in prompt
     assert "graph_delta.creates" in prompt
     assert "graph.rebase.overlay.json" in prompt
-    assert "Do not mutate graph.json" in prompt
+    assert "Do not mutate the active graph artifact" in prompt
     assert "parent_layer as the node layer" in prompt
 
 
