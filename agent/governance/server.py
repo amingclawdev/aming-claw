@@ -1820,11 +1820,11 @@ def handle_reconcile_deferred_cluster_retry(ctx: RequestContext):
             conn.row_factory = sqlite3.Row
         q.ensure_schema(conn)
         if force:
-            cur = conn.execute(
-                "UPDATE reconcile_deferred_clusters SET status = 'queued', "
-                "  retry_count = 0, next_retry_at = NULL "
-                "WHERE project_id = ? AND cluster_fingerprint = ?",
-                (project_id, fp),
+            changed = q.force_retry(
+                project_id,
+                fp,
+                reason=str(body.get("reason") or "force_retry"),
+                conn=conn,
             )
         else:
             cur = conn.execute(
@@ -1834,8 +1834,8 @@ def handle_reconcile_deferred_cluster_retry(ctx: RequestContext):
                 "  AND status IN ('failed_retryable','expired')",
                 (project_id, fp),
             )
-        conn.commit()
-        changed = (cur.rowcount or 0) > 0
+            conn.commit()
+            changed = (cur.rowcount or 0) > 0
     return {"ok": changed, "cluster_fingerprint": fp,
             "force": force, "status": "queued" if changed else "unchanged"}
 

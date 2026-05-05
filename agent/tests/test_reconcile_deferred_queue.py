@@ -716,6 +716,72 @@ def test_superseded_bad_run_is_terminal_safe(conn):
     assert summary["status_counts"]["superseded_bad_run"] == 1
 
 
+def test_force_retry_clears_stale_linkage_preserves_prior_terminal_audit(conn):
+    q.enqueue_or_lookup(
+        PROJECT_ID,
+        "fp-force-retry",
+        payload={},
+        run_id="run-r",
+        conn=conn,
+    )
+    q.mark_in_chain(
+        PROJECT_ID,
+        "fp-force-retry",
+        "task-old-root",
+        bug_id="BUG-OLD",
+        conn=conn,
+    )
+    q.mark_terminal(
+        PROJECT_ID,
+        "fp-force-retry",
+        "resolved",
+        "merged@old",
+        conn=conn,
+    )
+    conn.execute(
+        "UPDATE reconcile_deferred_clusters SET accepted_patch_id = ?, "
+        "takeover_by = ?, takeover_reason = ?, takeover_at = ? "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (
+            "patch-old",
+            "observer",
+            "bad evidence",
+            "2026-05-05T00:00:00Z",
+            PROJECT_ID,
+            "fp-force-retry",
+        ),
+    )
+    conn.commit()
+
+    assert q.force_retry(
+        PROJECT_ID,
+        "fp-force-retry",
+        reason="bad run replay",
+        conn=conn,
+    )
+    row = conn.execute(
+        "SELECT status, retry_count, bug_id, root_task_id, filed_at, "
+        "resolved_at, skipped_reason, accepted_patch_id, takeover_by, "
+        "takeover_reason, takeover_at, last_terminal_status, terminal_reason "
+        "FROM reconcile_deferred_clusters "
+        "WHERE project_id = ? AND cluster_fingerprint = ?",
+        (PROJECT_ID, "fp-force-retry"),
+    ).fetchone()
+    assert row["status"] == "queued"
+    assert row["retry_count"] == 0
+    assert row["bug_id"] is None
+    assert row["root_task_id"] is None
+    assert row["filed_at"] is None
+    assert row["resolved_at"] is None
+    assert row["skipped_reason"] is None
+    assert row["accepted_patch_id"] is None
+    assert row["takeover_by"] is None
+    assert row["takeover_reason"] is None
+    assert row["takeover_at"] is None
+    assert row["last_terminal_status"] == "resolved"
+    assert row["terminal_reason"] == "merged@old"
+
+
 def test_queue_schema_migration_accepts_observer_statuses(tmp_path):
     db_path = tmp_path / "legacy.db"
     c = sqlite3.connect(str(db_path))

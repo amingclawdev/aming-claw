@@ -99,6 +99,7 @@ __all__ = [
     "release_observer_takeover",
     "mark_patch_accepted",
     "mark_superseded_bad_run",
+    "force_retry",
     "mark_terminal",
     "requeue_after_failure",
     "escalate",
@@ -1059,6 +1060,51 @@ def mark_superseded_bad_run(
         _refresh_session_after_status(
             c, project_id, cluster_fingerprint, "superseded_bad_run",
         )
+    return changed
+
+
+def force_retry(
+    project_id: str,
+    cluster_fingerprint: str,
+    *,
+    reason: str = "force_retry",
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Reset a cluster row to a clean queued state for observer replay.
+
+    This intentionally preserves ``last_terminal_status`` and
+    ``terminal_reason`` as the audit trail for the prior run, while clearing
+    live chain linkage so the next file-now creates a fresh root task.
+    """
+    c = _get_conn(conn, project_id)
+    now = _utc_iso()
+    cur = _write_with_retry(
+        lambda: c.execute(
+            "UPDATE reconcile_deferred_clusters SET status = 'queued', "
+            "  retry_count = 0, next_retry_at = NULL, last_seen_at = ?, "
+            "  bug_id = NULL, root_task_id = NULL, filed_at = NULL, "
+            "  resolved_at = NULL, skipped_reason = NULL, "
+            "  accepted_patch_id = NULL, takeover_by = NULL, "
+            "  takeover_reason = NULL, takeover_at = NULL "
+            "WHERE project_id = ? AND cluster_fingerprint = ?",
+            (now, project_id, cluster_fingerprint),
+        ),
+        context=f"force_retry({cluster_fingerprint})",
+        conn=c,
+    )
+    c.commit()
+    changed = (cur.rowcount or 0) > 0
+    if changed:
+        _sync_backlog_runtime_for_cluster(
+            c,
+            project_id,
+            cluster_fingerprint,
+            stage="queue_force_retry",
+            runtime_state="queued",
+            reason=reason,
+            takeover={"mode": "force_retry", "actor": "observer", "reason": reason},
+        )
+        _refresh_session_after_status(c, project_id, cluster_fingerprint, "queued")
     return changed
 
 
