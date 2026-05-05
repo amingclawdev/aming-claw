@@ -18,6 +18,7 @@ def _candidate_metadata():
                     "title": "agent.governance.reconcile_batch_memory",
                     "layer": "L7",
                     "parent": "L3.22",
+                    "_deps": ["L7.11"],
                     "primary": ["agent/governance/reconcile_batch_memory.py"],
                 }
             ]
@@ -56,7 +57,8 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
                 "parent_layer": 7,
-                "deps": ["L3.22"],
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ]
@@ -70,6 +72,31 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
     assert passed, reason
 
 
+def test_reconcile_cluster_pm_preflight_rejects_parent_in_deps():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11", "L3.22"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+            }
+        ]
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "deps" in reason
+    assert "Do not put hierarchy parent in deps" in reason
+
+
 def test_reconcile_cluster_pm_preflight_rejects_missing_candidate_parent():
     metadata = _candidate_metadata()
     prd = {
@@ -78,6 +105,7 @@ def test_reconcile_cluster_pm_preflight_rejects_missing_candidate_parent():
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
                 "parent_layer": 7,
+                "deps": ["L7.11"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ]
@@ -101,7 +129,8 @@ def test_reconcile_cluster_pm_preflight_rejects_wrong_node_layer():
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
                 "parent_layer": "L6",
-                "deps": ["L3.22"],
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ]
@@ -127,7 +156,8 @@ def test_reconcile_cluster_dev_prompt_uses_overlay_contract_not_generic_test_chu
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
                 "parent_layer": 7,
-                "deps": ["L3.22"],
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ],
@@ -141,6 +171,41 @@ def test_reconcile_cluster_dev_prompt_uses_overlay_contract_not_generic_test_chu
     assert "graph.rebase.overlay.json" in prompt
     assert "Do not mutate the active graph artifact" in prompt
     assert "parent_layer as the node layer" in prompt
+    assert "do not put hierarchy parents in deps" in prompt
+
+
+def test_reconcile_cluster_dev_preflight_rejects_candidate_deps_drift():
+    metadata = _candidate_metadata()
+    pm_nodes = [
+        {
+            "node_id": "L7.72",
+            "title": "agent.governance.reconcile_batch_memory",
+            "parent_layer": 7,
+            "parent_id": "L3.22",
+            "deps": ["L7.11"],
+            "primary": ["agent/governance/reconcile_batch_memory.py"],
+        }
+    ]
+    dev_creates = [
+        {
+            "node_id": "L7.72",
+            "title": "agent.governance.reconcile_batch_memory",
+            "parent_layer": 7,
+            "parent_id": "L3.22",
+            "deps": ["L7.11", "L3.22"],
+            "primary": ["agent/governance/reconcile_batch_memory.py"],
+        }
+    ]
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_dev(
+        pm_nodes,
+        dev_creates,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "graph_delta.creates deps" in reason
+    assert "L3.22" in reason
 
 
 def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeypatch):
@@ -159,7 +224,8 @@ def test_reconcile_cluster_build_dev_prompt_does_not_pull_old_graph_docs(monkeyp
                 "node_id": "L7.72",
                 "title": "agent.governance.reconcile_batch_memory",
                 "parent_layer": 7,
-                "deps": ["L3.22"],
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
                 "primary": ["agent/governance/reconcile_batch_memory.py"],
             }
         ],

@@ -1638,7 +1638,7 @@ class ExecutorWorker:
                         "This compact manifest is never truncated. PM MUST copy every "
                         "candidate node below into proposed_nodes exactly once. If this "
                         "manifest and the larger metadata block disagree, this manifest "
-                        "wins for node_id/primary/title/layer/hierarchy_parent."
+                        "wins for node_id/primary/title/layer/hierarchy_parent/deps."
                     )
                     parts.append(f"candidate_node_count: {len(candidate_manifest)}")
                     parts.append(
@@ -1676,8 +1676,9 @@ class ExecutorWorker:
                     "Also preserve primary and title exactly. Treat "
                     "parent_layer as the candidate node's own layer (for example "
                     "L7/7), and preserve the hierarchy parent (for example "
-                    "L3.18) via parent/parent_id or deps so Dev can emit "
-                    "graph_delta.creates for the "
+                    "L3.18) via parent/parent_id only. Preserve deps exactly "
+                    "from candidate _deps/deps; do not put hierarchy parents in "
+                    "deps. Dev must emit graph_delta.creates for the "
                     "overlay without touching graph.json."
                 )
                 _bp_log("reconcile cluster metadata embedded")

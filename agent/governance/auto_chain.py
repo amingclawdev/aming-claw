@@ -2976,8 +2976,9 @@ def _render_dev_contract_prompt(source_task_id, metadata):
             parts.append(
                 "\nRequired for reconcile-cluster: return `graph_delta.creates` mirroring "
                 "`proposed_nodes` one-for-one. Preserve each concrete node_id/candidate_node_id, "
-                "primary, title, parent_layer as the node layer, and parent evidence via deps or "
-                "parent/parent_id. Do not mutate the active graph artifact; "
+                "primary, title, parent_layer as the node layer, and hierarchy parent via "
+                "parent/parent_id. Preserve deps exactly from candidate `_deps`/`deps`; "
+                "do not put hierarchy parents in deps. Do not mutate the active graph artifact; "
                 "Gatekeeper writes graph.rebase.overlay.json only after QA."
             )
         else:
@@ -5236,6 +5237,22 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                     log.info("qa_gate: auto-generated graph_delta_review pass for source=%s", _gd_source)
                 else:
                     return False, "graph.delta.proposed present but QA result omits graph_delta_review"
+            if is_reconcile_cluster_task(metadata):
+                payload_candidate_nodes = _cluster_payload_candidate_nodes(metadata)
+                proposed_delta = _gd_proposed.get("graph_delta", {}) if isinstance(_gd_proposed, dict) else {}
+                proposed_creates = (
+                    proposed_delta.get("creates", [])
+                    if isinstance(proposed_delta, dict)
+                    else []
+                )
+                if payload_candidate_nodes:
+                    cluster_dev_ok, cluster_dev_reason = preflight_reconcile_cluster_dev(
+                        metadata.get("proposed_nodes", []),
+                        proposed_creates,
+                        candidate_nodes=payload_candidate_nodes,
+                    )
+                    if not cluster_dev_ok:
+                        return False, cluster_dev_reason
             gd_decision = gd_review.get("decision", "")
             if gd_decision == "reject":
                 issues = gd_review.get("issues", [])
@@ -6706,6 +6723,26 @@ def _cluster_normalize_primary(value):
     return tuple(sorted(out))
 
 
+def _cluster_normalize_deps(value):
+    """Normalize graph dependency ids for exact candidate/developer comparison."""
+    if value is None:
+        return tuple()
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [str(value)]
+    out = []
+    for it in items:
+        if not isinstance(it, str):
+            it = str(it)
+        dep = it.strip()
+        if dep:
+            out.append(dep)
+    return tuple(sorted(set(out)))
+
+
 def _cluster_normalize_layer(value):
     """Normalize a parent_layer value to canonical 'L<N>' form (or '' on bad)."""
     if value is None:
@@ -6768,9 +6805,6 @@ def _cluster_proposed_parent_matches(proposed_node, candidate_parent):
     for key in ("parent", "parent_id", "parent_node_id"):
         if str(proposed_node.get(key) or "").strip() == candidate_parent:
             return True
-    deps = proposed_node.get("deps") or []
-    if isinstance(deps, list) and candidate_parent in deps:
-        return True
     return False
 
 
@@ -6791,6 +6825,9 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
             "title": str(item.get("title") or "").strip(),
             "layer": _cluster_node_layer_hint(item),
             "parent": _cluster_parent_node_hint(item),
+            "deps": _cluster_normalize_deps(
+                item.get("_deps") if item.get("_deps") is not None else item.get("deps")
+            ),
             "index": idx,
         }
     if not expected:
@@ -6851,8 +6888,17 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
         if cand_parent and not _cluster_proposed_parent_matches(proposed_node, cand_parent):
             return False, (
                 "FATAL preflight (reconcile-cluster): proposed_nodes parent relation "
-                f"for {node_id} must reference candidate parent via parent/parent_id/deps; "
+                f"for {node_id} must reference candidate parent via parent/parent_id; "
                 f"expected={cand_parent!r}"
+            )
+        cand_deps = candidate["deps"]
+        prop_deps = _cluster_normalize_deps(proposed_node.get("deps"))
+        if cand_deps != prop_deps:
+            return False, (
+                "FATAL preflight (reconcile-cluster): proposed_nodes deps "
+                f"for {node_id} must match candidate _deps/deps exactly; "
+                f"expected={list(cand_deps)} actual={list(prop_deps)}. "
+                "Do not put hierarchy parent in deps; use parent/parent_id."
             )
     return True, "ok"
 
@@ -6967,7 +7013,7 @@ def _cluster_hydrate_create_parent_layers(dev_creates, pm_proposed_nodes, candid
     return hydrated
 
 
-def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates):
+def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_nodes=None):
     """Stage 2 preflight — Dev's graph_delta.creates ⇔ PM proposed_nodes 1:1 by primary.
 
     FATAL when count differs or when primary identity does not 1:1 match.
@@ -6990,6 +7036,32 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates):
             f"do not match PM proposed_nodes 1:1 — only_pm={only_pm} "
             f"only_dev={only_dev}"
         )
+    expected_deps = {}
+    for item in candidate_nodes or []:
+        if not isinstance(item, dict):
+            continue
+        node_id = _cluster_explicit_node_id(item)
+        if not node_id:
+            continue
+        expected_deps[node_id] = _cluster_normalize_deps(
+            item.get("_deps") if item.get("_deps") is not None else item.get("deps")
+        )
+    if expected_deps:
+        for idx, item in enumerate(dev_creates or []):
+            if not isinstance(item, dict):
+                return False, f"graph_delta.creates[{idx}] is not an object"
+            node_id = _cluster_explicit_node_id(item)
+            if node_id not in expected_deps:
+                continue
+            actual = _cluster_normalize_deps(item.get("deps"))
+            expected = expected_deps[node_id]
+            if actual != expected:
+                return False, (
+                    "FATAL preflight (reconcile-cluster): graph_delta.creates deps "
+                    f"for {node_id} must match candidate _deps/deps exactly; "
+                    f"expected={list(expected)} actual={list(actual)}. "
+                    "Do not put hierarchy parent in deps; use parent/parent_id."
+                )
     return True, "ok"
 
 
@@ -7310,6 +7382,17 @@ def _validate_candidate_namespace(dev_creates, candidate_nodes, overlay_nodes):
                 f"candidate graph namespace conflict for {explicit_id}: "
                 "create primary/layer does not match candidate graph node"
             )
+        expected_deps = _cluster_normalize_deps(
+            candidate.get("_deps") if candidate.get("_deps") is not None else candidate.get("deps")
+        )
+        actual_deps = _cluster_normalize_deps(proposed.get("deps"))
+        if expected_deps != actual_deps:
+            return False, (
+                f"candidate graph namespace conflict for {explicit_id}: "
+                "create deps do not match candidate _deps/deps exactly; "
+                f"expected={list(expected_deps)} actual={list(actual_deps)}. "
+                "Do not put hierarchy parent in deps; use parent/parent_id."
+            )
         existing_overlay = overlay_nodes.get(explicit_id)
         if existing_overlay and not _cluster_primary_compatible(proposed, existing_overlay):
             return False, (
@@ -7502,7 +7585,11 @@ def apply_reconcile_cluster_to_overlay(
     dev_creates = graph_delta.get("creates", []) if isinstance(graph_delta, dict) else []
 
     # --- Stage 2: Dev creates 1:1 with PM proposed_nodes by primary ---------
-    dev_passed, dev_reason = preflight_reconcile_cluster_dev(pm_proposed, dev_creates)
+    dev_passed, dev_reason = preflight_reconcile_cluster_dev(
+        pm_proposed,
+        dev_creates,
+        candidate_nodes=payload_candidate_nodes,
+    )
     if not dev_passed:
         return {
             "applied": False,

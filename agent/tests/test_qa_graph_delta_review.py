@@ -161,6 +161,56 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertIn("graph delta rejected by QA", reason)
         self.assertIn("node L3.1 has wrong parent_layer", reason)
 
+    def test_reconcile_cluster_blocks_pass_when_candidate_deps_drift(self):
+        """QA cannot pass a reconcile cluster whose proposed deps differ from candidate deps."""
+        result = {
+            "recommendation": "qa_pass",
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata(
+            operation_type="reconcile-cluster",
+            proposed_nodes=[
+                {
+                    "node_id": "L7.169",
+                    "parent_id": "L3.36",
+                    "parent_layer": "L7",
+                    "primary": ["scripts/validate_stage_output.py"],
+                    "deps": ["L7.64"],
+                }
+            ],
+            cluster_payload={
+                "candidate_nodes": [
+                    {
+                        "node_id": "L7.169",
+                        "parent": "L3.36",
+                        "layer": "L7",
+                        "primary": ["scripts/validate_stage_output.py"],
+                        "_deps": ["L7.64"],
+                    }
+                ]
+            },
+        )
+        proposed = {
+            "source_task_id": "task-dev-1",
+            "graph_delta": {
+                "creates": [
+                    {
+                        "node_id": "L7.169",
+                        "parent_id": "L3.36",
+                        "parent_layer": "L7",
+                        "primary": ["scripts/validate_stage_output.py"],
+                        "deps": ["L7.64", "L3.36"],
+                    }
+                ]
+            },
+        }
+
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+
+        self.assertFalse(passed)
+        self.assertIn("graph_delta.creates deps", reason)
+        self.assertIn("Do not put hierarchy parent in deps", reason)
+
     def test_ac6_pass_writes_validated_event(self):
         """AC6: decision=='pass' -> writes graph.delta.validated event."""
         from agent.governance.auto_chain import _gate_qa_pass
