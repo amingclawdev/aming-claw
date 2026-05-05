@@ -1,9 +1,9 @@
 """Tests for gatekeeper graph delta transactional commit (PR-C).
 
 AC13: At least 5 tests covering:
-  - transactional rollback
+  - transactional graph delta commit
   - idempotent re-run
-  - collision rejection
+  - attempted-vs-committed collision accounting
   - sequence generation
   - event lifecycle
 """
@@ -116,8 +116,8 @@ class TestCommitGraphDelta(unittest.TestCase):
         result = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
 
         self.assertIsNotNone(result)
-        self.assertIn("L5.4", result)
-        self.assertIn("L5.5", result)
+        self.assertIn("L5.4", result["committed_node_ids"])
+        self.assertIn("L5.5", result["committed_node_ids"])
 
         # Verify nodes in DB
         row = self.conn.execute(
@@ -126,8 +126,8 @@ class TestCommitGraphDelta(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
 
-    def test_collision_rejection(self):
-        """AC5: Explicit node_id collision causes batch rejection (all-or-nothing)."""
+    def test_collision_records_attempt_without_commit(self):
+        """Explicit node_id collision is audited but not counted as committed."""
         self.conn.execute(
             "INSERT INTO node_state (project_id, node_id, verify_status, build_status, updated_at, version) "
             "VALUES (?, 'L3.1', 'qa_pass', 'unknown', datetime('now'), 1)",
@@ -146,21 +146,23 @@ class TestCommitGraphDelta(unittest.TestCase):
         metadata = self._make_metadata()
         result = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
 
-        # Batch should be rejected
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertIn("L3.99", result["attempted_node_ids"])
+        self.assertIn("L3.1", result["attempted_node_ids"])
+        self.assertIn("L3.99", result["committed_node_ids"])
+        self.assertNotIn("L3.1", result["committed_node_ids"])
 
-        # L3.99 should NOT have been committed (rollback)
+        # Non-colliding creates still commit.
         row = self.conn.execute(
             "SELECT node_id FROM node_state WHERE project_id = ? AND node_id = 'L3.99'",
             (self.project_id,),
         ).fetchone()
-        self.assertIsNone(row)
+        self.assertIsNotNone(row)
 
-        # graph.delta.failed event should be written
         failed = self.conn.execute(
             "SELECT payload_json FROM chain_events WHERE event_type = 'graph.delta.failed'"
         ).fetchone()
-        self.assertIsNotNone(failed)
+        self.assertIsNone(failed)
 
     def test_idempotent_rerun(self):
         """AC6: Second commit with same source_event_id returns stored node_ids."""
@@ -173,7 +175,7 @@ class TestCommitGraphDelta(unittest.TestCase):
         # First run
         result1 = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
         self.assertIsNotNone(result1)
-        self.assertEqual(len(result1), 1)
+        self.assertEqual(len(result1["committed_node_ids"]), 1)
 
         # Second run — should return same node_ids without writing
         result2 = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
@@ -210,10 +212,8 @@ class TestCommitGraphDelta(unittest.TestCase):
         self.assertEqual(payload["source_event_id"], "dev-001")
         self.assertIn("L7.1", payload["committed_node_ids"])
 
-    def test_transactional_rollback_on_error(self):
-        """AC2: Exception during commit triggers rollback + graph.delta.failed event."""
-        # Create a situation that will cause an error mid-transaction
-        # Use explicit node_id collision: first item OK, second collides
+    def test_collision_does_not_mark_attempt_as_committed(self):
+        """Explicit collisions keep intent evidence without reporting mutation."""
         self.conn.execute(
             "INSERT INTO node_state (project_id, node_id, verify_status, build_status, updated_at, version) "
             "VALUES (?, 'L2.5', 'pending', 'unknown', datetime('now'), 1)",
@@ -232,16 +232,16 @@ class TestCommitGraphDelta(unittest.TestCase):
         metadata = self._make_metadata()
         result = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
 
-        # Should have failed
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertIn("L2.6", result["attempted_node_ids"])
+        self.assertIn("L2.5", result["attempted_node_ids"])
+        self.assertIn("L2.6", result["committed_node_ids"])
+        self.assertNotIn("L2.5", result["committed_node_ids"])
 
-        # graph.delta.failed should exist
         failed = self.conn.execute(
             "SELECT payload_json FROM chain_events WHERE event_type = 'graph.delta.failed'"
         ).fetchone()
-        self.assertIsNotNone(failed)
-        failed_payload = json.loads(failed["payload_json"])
-        self.assertIn("collision", failed_payload["error"].lower())
+        self.assertIsNone(failed)
 
     def test_malformed_creates_skipped(self):
         """AC11: creates[] items with missing parent_layer are skipped without blocking."""
@@ -257,8 +257,8 @@ class TestCommitGraphDelta(unittest.TestCase):
         result = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
 
         self.assertIsNotNone(result)
-        self.assertEqual(len(result), 1)
-        self.assertIn("L8.1", result)
+        self.assertEqual(len(result["committed_node_ids"]), 1)
+        self.assertIn("L8.1", result["committed_node_ids"])
 
     def test_links_logged_as_skipped(self):
         """AC12: links[] items are logged but not persisted (no edges table)."""
@@ -273,7 +273,7 @@ class TestCommitGraphDelta(unittest.TestCase):
 
         # Creates should succeed despite links being present
         self.assertIsNotNone(result)
-        self.assertIn("L9.1", result)
+        self.assertIn("L9.1", result["committed_node_ids"])
 
     def test_related_nodes_carryforward(self):
         """AC7: After commit, new node_ids appended to metadata related_nodes."""

@@ -164,7 +164,7 @@ class TestGatekeeperGraphCommitBlocking(unittest.TestCase):
 
 
 class TestCommitGraphDeltaReRaises(unittest.TestCase):
-    """Tests C6/C7: _commit_graph_delta re-raises after writing failed events."""
+    """Tests C6/C7: _commit_graph_delta failure handling."""
 
     def setUp(self):
         self.conn = _make_db()
@@ -182,8 +182,8 @@ class TestCommitGraphDeltaReRaises(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def test_c6_reraises_valueerror(self):
-        """C6: _commit_graph_delta re-raises ValueError after failed event write."""
+    def test_c6_collision_is_attempted_not_committed(self):
+        """C6: explicit ID collision is tracked without raising."""
         from governance.auto_chain import _commit_graph_delta
 
         # Seed a validated event that tries to create a node with colliding ID
@@ -200,15 +200,20 @@ class TestCommitGraphDeltaReRaises(unittest.TestCase):
         )
         metadata = {"chain_id": self.root_task_id, "task_id": "qa-task"}
 
-        with self.assertRaises(ValueError) as ctx:
-            _commit_graph_delta(self.conn, self.project_id, metadata)
-        self.assertIn("L2.5", str(ctx.exception))
+        result = _commit_graph_delta(self.conn, self.project_id, metadata)
+        self.assertIsNotNone(result)
+        self.assertIn("L2.5", result["attempted_node_ids"])
+        self.assertNotIn("L2.5", result["committed_node_ids"])
 
-        # Verify failed event was written
+        # Collision dedup is a committed audit event, not a failed graph transaction.
         row = self.conn.execute(
             "SELECT payload_json FROM chain_events WHERE event_type = 'graph.delta.failed'"
         ).fetchone()
-        self.assertIsNotNone(row, "graph.delta.failed event should be written before re-raise")
+        self.assertIsNone(row)
+        committed = self.conn.execute(
+            "SELECT payload_json FROM chain_events WHERE event_type = 'graph.delta.committed'"
+        ).fetchone()
+        self.assertIsNotNone(committed)
 
     def test_c7_reraises_generic_exception(self):
         """C7: _commit_graph_delta re-raises Exception after failed event write."""

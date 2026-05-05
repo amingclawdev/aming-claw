@@ -64,14 +64,15 @@ class TestPersistEvent(unittest.TestCase):
             },
         }
 
-        with patch("governance.db.get_connection", return_value=wrapped):
-            store._persist_event(
-                root_task_id="root-task-001",
-                task_id="dev-task-001",
-                event_type="graph.delta.proposed",
-                payload=payload,
-                project_id="test-proj",
-            )
+        store._persist_event(
+            root_task_id="root-task-001",
+            task_id="dev-task-001",
+            event_type="graph.delta.proposed",
+            payload=payload,
+            project_id="test-proj",
+            conn=wrapped,
+        )
+        raw_conn.commit()
 
         rows = raw_conn.execute(
             "SELECT * FROM chain_events WHERE event_type = 'graph.delta.proposed'"
