@@ -195,6 +195,41 @@ def test_overlay_records_reconcile_target_metadata(graph_path: Path, overlay_pat
     assert overlay_doc["target_head_sha"] == "head456"
 
 
+def test_overlay_hydrates_missing_parent_layer_from_layer_and_pm(
+    graph_path: Path, overlay_path: Path,
+):
+    """Dev may emit layer while PM carries parent_layer; overlay normalizes it."""
+    pm_node = {
+        "node_id": "L7.9",
+        "parent_layer": "L7",
+        "title": "layer hydration",
+        "primary": ["agent/governance/layer_hydration.py"],
+        "deps": [],
+    }
+    dev_node = {
+        "node_id": "L7.9",
+        "layer": 7,
+        "title": "layer hydration",
+        "primary": ["agent/governance/layer_hydration.py"],
+        "deps": [],
+    }
+
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-merge-layer-hydration",
+        pm_prd={"feature": "layer hydration", "proposed_nodes": [pm_node]},
+        dev_result={"graph_delta": {"creates": [dev_node]}},
+        metadata=_meta(),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is True, res
+    overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
+    assert overlay_doc["nodes"]["L7.9"]["parent_layer"] == "L7"
+
+
 # ---------------------------------------------------------------------------
 # AC3
 # ---------------------------------------------------------------------------
@@ -234,9 +269,9 @@ def test_gate_unresolvable_dep_block(graph_path: Path, overlay_path: Path):
 
     Two scenarios — missing parent_layer and unresolvable dep — both block.
     """
-    # Scenario A — missing parent_layer
+    # Scenario A — missing parent_layer with no layer/PM fallback
     pm_prd = {"proposed_nodes": [
-        {"primary": ["agent/governance/new_a.py"], "parent_layer": "L7"},
+        {"primary": ["agent/governance/new_a.py"]},
     ]}
     dev_result_missing_layer = {"graph_delta": {"creates": [
         {"primary": ["agent/governance/new_a.py"]},  # parent_layer absent

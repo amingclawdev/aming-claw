@@ -6632,6 +6632,77 @@ def _cluster_collect_primaries(entries):
     return sorted(set(flat))
 
 
+def _cluster_parent_layer_hint(item):
+    """Return a canonical node layer hint from parent_layer or layer."""
+    if not isinstance(item, dict):
+        return ""
+    parent_raw = item.get("parent_layer")
+    if parent_raw not in (None, ""):
+        return _cluster_normalize_layer(parent_raw)
+    return _cluster_normalize_layer(item.get("layer"))
+
+
+def _cluster_parent_layer_lookup(*collections):
+    """Build parent-layer hints keyed by node id and primary tuple."""
+    by_id = {}
+    by_primary = {}
+    for collection in collections:
+        for item in collection or []:
+            if not isinstance(item, dict):
+                continue
+            hint = _cluster_parent_layer_hint(item)
+            if not hint:
+                continue
+            node_id = _cluster_explicit_node_id(item)
+            if node_id and node_id not in by_id:
+                by_id[node_id] = hint
+            primary = tuple(_cluster_normalize_primary(item.get("primary")))
+            if primary and primary not in by_primary:
+                by_primary[primary] = hint
+    return by_id, by_primary
+
+
+def _cluster_hydrate_create_parent_layers(dev_creates, pm_proposed_nodes, candidate_nodes):
+    """Fill omitted parent_layer from safe reconcile-cluster context.
+
+    Dev output sometimes preserves the candidate's own ``layer`` field but
+    omits the CR5 ``parent_layer`` field consumed by structural validation.
+    Hydration is intentionally conservative: only missing/empty parent_layer is
+    filled, and unresolved creates still fail the normal structural gate.
+    """
+    if not isinstance(dev_creates, list):
+        return dev_creates
+    by_id, by_primary = _cluster_parent_layer_lookup(
+        pm_proposed_nodes,
+        candidate_nodes,
+    )
+    hydrated = []
+    for item in dev_creates:
+        if not isinstance(item, dict):
+            hydrated.append(item)
+            continue
+        out = dict(item)
+        parent_raw = out.get("parent_layer")
+        if parent_raw in (None, ""):
+            hint = _cluster_normalize_layer(out.get("layer"))
+            if not hint:
+                node_id = _cluster_explicit_node_id(out)
+                if node_id:
+                    hint = by_id.get(node_id, "")
+            if not hint:
+                primary = tuple(_cluster_normalize_primary(out.get("primary")))
+                if primary:
+                    hint = by_primary.get(primary, "")
+            if hint:
+                out["parent_layer"] = hint
+        else:
+            canonical = _cluster_normalize_layer(parent_raw)
+            if canonical:
+                out["parent_layer"] = canonical
+        hydrated.append(out)
+    return hydrated
+
+
 def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates):
     """Stage 2 preflight — Dev's graph_delta.creates ⇔ PM proposed_nodes 1:1 by primary.
 
@@ -7148,9 +7219,10 @@ def apply_reconcile_cluster_to_overlay(
     cluster_fp = _cluster_compute_fingerprint(metadata, (dev_result or {}).get("graph_delta", {}).get("creates", []))
 
     # --- Stage 1: PM PRD validation -----------------------------------------
+    payload_candidate_nodes = _cluster_payload_candidate_nodes(metadata)
     pm_passed, pm_reason = preflight_reconcile_cluster_pm(
         pm_prd,
-        candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+        candidate_nodes=payload_candidate_nodes,
     )
     if not pm_passed:
         return {
@@ -7175,6 +7247,11 @@ def apply_reconcile_cluster_to_overlay(
             "reason": dev_reason,
             "cluster_fingerprint": cluster_fp,
         }
+    dev_creates = _cluster_hydrate_create_parent_layers(
+        dev_creates,
+        pm_proposed,
+        payload_candidate_nodes,
+    )
 
     # --- Load graph + overlay state for structural + allocator + match ------
     graph_nodes = _cluster_load_graph_nodes(graph_path)
