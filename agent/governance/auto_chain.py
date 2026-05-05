@@ -3077,16 +3077,21 @@ def _reconcile_cluster_terminal_hook(
             )
             target_branch = (
                 (result or {}).get("reconcile_target_branch")
+                or (result or {}).get("target_branch")
                 or metadata.get("reconcile_target_branch")
                 or ""
             )
             if commit and (session_id or target_branch):
                 if session_id:
                     conn.execute(
-                        "UPDATE reconcile_sessions SET target_head_sha=? "
+                        "UPDATE reconcile_sessions "
+                        "SET target_head_sha=?, "
+                        "target_branch=CASE "
+                        "WHEN COALESCE(target_branch, '') = '' THEN ? "
+                        "ELSE target_branch END "
                         "WHERE project_id=? AND session_id=? "
                         "AND status IN ('active','finalizing','finalize_failed')",
-                        (commit, project_id, session_id),
+                        (commit, target_branch, project_id, session_id),
                     )
                 elif target_branch:
                     conn.execute(
@@ -7299,9 +7304,19 @@ def apply_reconcile_cluster_to_overlay(
 
     # --- R5: write overlay (NOT graph.json) ---------------------------------
     overlay_doc = _cluster_load_overlay_doc(overlay_path)
+    session_target_branch = ""
+    session_target_head = ""
+    session_base_commit = ""
+    if isinstance(metadata, dict):
+        session_target_branch = str(metadata.get("reconcile_target_branch") or "")
+        session_target_head = str(metadata.get("reconcile_target_head") or "")
+        session_base_commit = str(metadata.get("reconcile_target_base_commit") or "")
     overlay_doc.update({
         "session_id": (metadata.get("session_id") if isinstance(metadata, dict) else None) or "",
         "project_id": project_id or "",
+        "target_branch": session_target_branch or overlay_doc.get("target_branch") or "",
+        "target_head_sha": session_target_head or overlay_doc.get("target_head_sha") or "",
+        "base_commit_sha": session_base_commit or overlay_doc.get("base_commit_sha") or "",
         "cluster_fingerprint": cluster_fp,
         "candidate_graph_path": str(candidate_graph_path or ""),
         "candidate_graph_sha256": candidate_sha256,

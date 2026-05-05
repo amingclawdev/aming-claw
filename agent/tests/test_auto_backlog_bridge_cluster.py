@@ -227,11 +227,16 @@ def test_terminal_success_hook(conn):
         "SELECT session_id, target_branch FROM reconcile_sessions WHERE project_id=?",
         (PROJECT_ID,),
     ).fetchone()
+    target_branch = sess["target_branch"] or "reconcile/p-test-sess-branch"
+    conn.execute(
+        "UPDATE reconcile_sessions SET target_branch='' WHERE project_id=? AND session_id=?",
+        (PROJECT_ID, sess["session_id"]),
+    )
     metadata = {"operation_type": "reconcile-cluster",
                 "cluster_fingerprint": "fp-suc1",
                 "chain_id": "task-root-1",
                 "reconcile_session_id": sess["session_id"],
-                "reconcile_target_branch": sess["target_branch"]}
+                "reconcile_target_branch": target_branch}
     auto_chain._reconcile_cluster_terminal_hook(
         conn, PROJECT_ID, "task-merge-1", "merge", "succeeded",
         {"merge_commit": "abc1234"}, metadata,
@@ -244,9 +249,10 @@ def test_terminal_success_hook(conn):
     assert row[0] == "resolved"
     assert "abc1234" in (row[1] or "")
     sess_after = conn.execute(
-        "SELECT target_head_sha FROM reconcile_sessions WHERE project_id=?",
+        "SELECT target_branch, target_head_sha FROM reconcile_sessions WHERE project_id=?",
         (PROJECT_ID,),
     ).fetchone()
+    assert sess_after["target_branch"] == target_branch
     assert sess_after["target_head_sha"] == "abc1234"
 
 

@@ -164,6 +164,37 @@ def test_dev_count_mismatch_fatal(graph_path: Path, overlay_path: Path):
     assert "1" in res["reason"] and "2" in res["reason"]
 
 
+def test_overlay_records_reconcile_target_metadata(graph_path: Path, overlay_path: Path):
+    """Overlay keeps target branch/base/head for branch-isolated audit."""
+    pm_node = {
+        "node_id": "L7.9",
+        "parent_layer": "L7",
+        "title": "branch audit",
+        "primary": ["agent/governance/branch_audit.py"],
+        "deps": [],
+    }
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-merge-branch-audit",
+        pm_prd={"feature": "branch audit", "proposed_nodes": [pm_node]},
+        dev_result={"graph_delta": {"creates": [pm_node]}},
+        metadata=_meta(
+            reconcile_target_branch="reconcile/p-cr5-sess-1",
+            reconcile_target_base_commit="base123",
+            reconcile_target_head="head456",
+        ),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is True
+    overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
+    assert overlay_doc["target_branch"] == "reconcile/p-cr5-sess-1"
+    assert overlay_doc["base_commit_sha"] == "base123"
+    assert overlay_doc["target_head_sha"] == "head456"
+
+
 # ---------------------------------------------------------------------------
 # AC3
 # ---------------------------------------------------------------------------
