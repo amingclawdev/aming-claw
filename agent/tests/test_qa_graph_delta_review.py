@@ -114,6 +114,28 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("graph.delta.proposed present but QA result omits graph_delta_review", reason)
 
+    def test_reject_reason_preserves_qa_issues_and_failed_criteria(self):
+        """QA reject retries should get actionable issues, not 'no reason given'."""
+        result = {
+            "recommendation": "reject",
+            "review_summary": "Changed tests lacked pre-fix failure evidence.",
+            "issues": ["AC5 changed_files mismatch"],
+            "criteria_results": [
+                {
+                    "criterion": "AC5: overlay-only unless defect proven",
+                    "passed": False,
+                    "evidence": "Dev changed tests but QA did not see failing-test context.",
+                }
+            ],
+        }
+        metadata = _base_metadata()
+        passed, reason = self._call_gate(result, metadata, proposed_payload=None)
+        self.assertFalse(passed)
+        self.assertIn("Changed tests lacked pre-fix failure evidence", reason)
+        self.assertIn("AC5 changed_files mismatch", reason)
+        self.assertIn("overlay-only unless defect proven", reason)
+        self.assertNotIn("no reason given", reason)
+
     def test_blocks_missing_criteria_results_when_criteria_exist(self):
         """QA pass must include per-criterion evidence when PM supplied ACs."""
         result = {"recommendation": "qa_pass"}
@@ -372,6 +394,39 @@ class TestBuildQaPromptGraphDelta(unittest.TestCase):
         self.assertIn("graph_delta_review", prompt)
         self.assertIn("decision", prompt)
         self.assertIn("path MUST exist", prompt)
+
+    def test_reconcile_cluster_qa_prompt_includes_dev_audit_context(self):
+        """QA sees Dev's self-test evidence when judging cluster-owned test edits."""
+        from agent.governance.auto_chain import _build_qa_prompt
+
+        metadata = _base_metadata(
+            operation_type="reconcile-cluster",
+            dev_result_summary="Pre-fix verification had two stale SCHEMA_VERSION assertions.",
+            dev_test_results={"ran": True, "passed": 105, "failed": 2},
+            dev_changed_files=[
+                "agent/tests/test_baseline_service.py",
+                "agent/tests/test_db_migrations.py",
+            ],
+            dev_retry_context={
+                "test_failure_classification": "cluster-owned stale schema assertions",
+            },
+        )
+
+        with patch("agent.governance.auto_chain._query_graph_delta_proposed", return_value=None), \
+             patch("agent.governance.auto_chain._get_graph_doc_associations", return_value=[]):
+            prompt, meta = _build_qa_prompt(
+                "task-test-1",
+                {
+                    "test_report": {"passed": 107, "failed": 0},
+                    "changed_files": metadata["dev_changed_files"],
+                },
+                metadata,
+            )
+
+        self.assertIn("Reconcile Cluster Dev Audit Context", prompt)
+        self.assertIn("Pre-fix verification had two stale SCHEMA_VERSION assertions", prompt)
+        self.assertIn("cluster-owned stale schema assertions", prompt)
+        self.assertIn("edits are allowed when Dev's verification proves a real defect", prompt)
 
     def test_prompt_no_review_section_without_proposed(self):
         """No graph.delta.proposed -> no graph_delta_review instructions in prompt."""

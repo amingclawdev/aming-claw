@@ -34,6 +34,33 @@ def test_reconcile_cluster_noop_audit_can_advance_to_test(isolated_gov_db):
     assert reason == "reconcile-cluster no-op audit accepted"
 
 
+def test_reconcile_cluster_noop_with_failed_tests_gets_actionable_reason(isolated_gov_db):
+    from governance.auto_chain import _gate_checkpoint
+
+    passed, reason = _gate_checkpoint(
+        isolated_gov_db,
+        "aming-claw",
+        {
+            "summary": "Audit found failing schema tests but made no changes.",
+            "changed_files": [],
+            "test_results": {
+                "ran": True,
+                "passed": 105,
+                "failed": 2,
+                "command": "pytest agent/tests/test_baseline_service.py -v",
+            },
+        },
+        {
+            "operation_type": "reconcile-cluster",
+            "target_files": ["agent/governance/db.py"],
+        },
+    )
+
+    assert passed is False
+    assert "verification failed with 2 failing tests" in reason
+    assert "fix the allowed source/doc/test files" in reason
+
+
 def test_empty_non_reconcile_dev_result_still_blocks(isolated_gov_db):
     from governance.auto_chain import _gate_checkpoint
 

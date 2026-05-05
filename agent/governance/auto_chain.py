@@ -188,6 +188,39 @@ def _missing_qa_evidence_paths(project_id, result, metadata=None):
     return missing
 
 
+def _format_qa_rejection_reason(result, fallback="QA rejected: no reason given"):
+    """Preserve actionable QA rejection context for downstream Dev retries."""
+    if not isinstance(result, dict):
+        return fallback
+
+    parts = []
+    explicit = str(result.get("reason") or "").strip()
+    if explicit:
+        parts.append(explicit)
+
+    summary = str(result.get("review_summary") or result.get("summary") or "").strip()
+    if summary:
+        parts.append(f"review_summary: {summary}")
+
+    issues = result.get("issues")
+    if issues:
+        parts.append(f"issues: {json.dumps(issues, ensure_ascii=False)}")
+
+    failed_criteria = []
+    for item in result.get("criteria_results") or []:
+        if isinstance(item, dict) and item.get("passed") is False:
+            failed_criteria.append({
+                "criterion": item.get("criterion", ""),
+                "evidence": item.get("evidence", ""),
+            })
+    if failed_criteria:
+        parts.append(f"failed_criteria: {json.dumps(failed_criteria, ensure_ascii=False)}")
+
+    if not parts:
+        return fallback
+    return "QA rejected: " + " | ".join(parts)
+
+
 def validate_prd_graph_declarations(prd, dev_changed_files, current_graph):
     """Validate PRD graph declarations against dev changed_files and graph (R2/R5).
 
@@ -3518,7 +3551,7 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             failure_reason = reason
             if task_type == "qa":
                 # Prefer specific rejection reason from QA result over gate reason
-                failure_reason = result.get("reason", reason)
+                failure_reason = _format_qa_rejection_reason(result, reason)
             original_prompt = metadata.get("_original_prompt", "")
             if not original_prompt:
                 try:
@@ -4548,6 +4581,21 @@ def _gate_checkpoint(conn, project_id, result, metadata):
             and result.get("summary")
         ):
             return True, "reconcile-cluster no-op audit accepted"
+        if (
+            metadata.get("operation_type") == CLUSTER_OPERATION_TYPE
+            and isinstance(test_results, dict)
+            and test_results.get("ran") is True
+            and failed_count > 0
+        ):
+            return False, (
+                "reconcile-cluster verification failed with "
+                f"{failed_count} failing tests and changed_files=[]. "
+                "If failures are real cluster-owned defects, fix the allowed "
+                "source/doc/test files and include the pre-fix failure evidence "
+                "in retry_context; if they are not cluster-owned, observer "
+                "takeover is required before this cluster can be accepted. "
+                f"test_results={json.dumps(test_results, ensure_ascii=False)}"
+            )
         return False, "No files changed"
 
     # B36-fix(2): single source of truth shared with retry-prompt scope_line
@@ -4891,7 +4939,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
     if rec == "qa_pass":
         pass  # Explicit pass
     elif rec in ("reject", "rejected"):
-        return False, f"QA rejected: {result.get('reason', 'no reason given')}"
+        return False, _format_qa_rejection_reason(result)
     else:
         # No explicit recommendation — BLOCK. Auto-pass is a security risk.
         return False, (
@@ -5545,6 +5593,11 @@ def _build_test_prompt(task_id, result, metadata):
         "related_nodes": _normalize_related_nodes(metadata.get("related_nodes") or result.get("related_nodes", [])),
         "verification": verification,
         "test_files": test_files,
+        "dev_result_summary": result.get("summary", ""),
+        "dev_test_results": result.get("test_results", {}),
+        "dev_changed_files": changed,
+        "dev_needs_review": result.get("needs_review", False),
+        "dev_retry_context": result.get("retry_context", {}),
     }
     # Propagate worktree info from dev result → test → qa → merge
     if result.get("_worktree"):
@@ -5603,6 +5656,24 @@ def _build_qa_prompt(task_id, result, metadata):
         prompt_parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
     if doc_impact:
         prompt_parts.append(f"doc_impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+    if is_reconcile_cluster_task(metadata):
+        dev_context = {
+            "dev_result_summary": metadata.get("dev_result_summary", ""),
+            "dev_test_results": metadata.get("dev_test_results", {}),
+            "dev_changed_files": metadata.get("dev_changed_files", []),
+            "dev_needs_review": metadata.get("dev_needs_review", False),
+            "dev_retry_context": metadata.get("dev_retry_context", {}),
+        }
+        if any(value not in ("", [], {}, None, False) for value in dev_context.values()):
+            prompt_parts.append(
+                "\n## Reconcile Cluster Dev Audit Context\n"
+                f"{json.dumps(dev_context, ensure_ascii=False, indent=2)}\n"
+                "Overlay-only is the default outcome, but source/doc/test edits "
+                "are allowed when Dev's verification proves a real defect owned "
+                "by this cluster and changed_files stay within the declared "
+                "cluster scope. Use this context when judging whether changed "
+                "test/doc/source files are justified."
+            )
     if criteria:
         prompt_parts.append(
             "\nYou MUST evaluate each acceptance_criteria item individually.\n"
