@@ -454,12 +454,17 @@ class ExecutorWorker:
         worktree_path = None
         branch_name = None
         execution_workspace = self.workspace
+        try:
+            attempt_num = int(task.get("attempt_num") or metadata.get("attempt_num") or 1)
+        except Exception:
+            attempt_num = 1
         if task_type == "dev":
             _timing("worktree: starting")
             worktree_path, branch_name = self._create_worktree(
                 task_id,
                 base_ref=self._dev_worktree_base_ref(metadata),
                 base_commit=metadata.get("reconcile_target_base_commit", ""),
+                attempt_num=attempt_num,
             )
             if worktree_path:
                 execution_workspace = worktree_path
@@ -2210,7 +2215,8 @@ class ExecutorWorker:
     _IGNORE_PATTERNS = {".claude/", "__pycache__/", ".pyc", ".lock", ".worktrees/"}
 
     def _create_worktree(self, task_id: str, worker_id: str = "",
-                         base_ref: str = "HEAD", base_commit: str = ""):
+                         base_ref: str = "HEAD", base_commit: str = "",
+                         attempt_num: int = 1):
         """Create isolated git worktree for a dev task.
 
         Args:
@@ -2218,11 +2224,16 @@ class ExecutorWorker:
             worker_id: Optional worker prefix for parallel dispatch (R3).
                        When set, worktree is placed under .worktrees/worker-{N}/dev-task-{id}.
         """
-        branch_name = f"dev/{task_id}"
+        try:
+            attempt_num = int(attempt_num or 1)
+        except Exception:
+            attempt_num = 1
+        attempt_suffix = f"-attempt-{attempt_num}" if attempt_num > 1 else ""
+        branch_name = f"dev/{task_id}{attempt_suffix}"
         if worker_id:
-            worktree_dir = os.path.join(self.workspace, ".worktrees", worker_id, f"dev-task-{task_id}")
+            worktree_dir = os.path.join(self.workspace, ".worktrees", worker_id, f"dev-task-{task_id}{attempt_suffix}")
         else:
-            worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}")
+            worktree_dir = os.path.join(self.workspace, ".worktrees", f"dev-{task_id}{attempt_suffix}")
         try:
             base_ref = str(base_ref or "HEAD").strip()
             if base_ref and base_ref != "HEAD":

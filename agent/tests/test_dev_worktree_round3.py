@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -76,6 +77,34 @@ class TestDevWorktreeRound3(unittest.TestCase):
         self.assertIn("agent/staged_new.py", files)
         self.assertIn("agent/untracked_new.py", files)
         self.assertEqual(len(files), 3)
+
+    def test_create_worktree_uses_attempt_scoped_path_for_retry(self):
+        with tempfile.TemporaryDirectory() as repo:
+            worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=repo)
+            ok = MagicMock(returncode=0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=[ok, ok]) as mock_run:
+                worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=2)
+
+            self.assertEqual(branch_name, "dev/task-abc-attempt-2")
+            self.assertEqual(
+                worktree_path,
+                os.path.join(repo, ".worktrees", "dev-task-abc-attempt-2"),
+            )
+            add_cmd = mock_run.call_args_list[1].args[0]
+            self.assertEqual(add_cmd[:5], ["git", "worktree", "add", "-b", "dev/task-abc-attempt-2"])
+            self.assertEqual(add_cmd[5], worktree_path)
+
+    def test_create_worktree_keeps_first_attempt_names(self):
+        with tempfile.TemporaryDirectory() as repo:
+            worker = ExecutorWorker("aming-claw", governance_url="http://localhost:40000", workspace=repo)
+            ok = MagicMock(returncode=0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=[ok, ok]):
+                worktree_path, branch_name = worker._create_worktree("task-abc", attempt_num=1)
+
+            self.assertEqual(branch_name, "dev/task-abc")
+            self.assertEqual(worktree_path, os.path.join(repo, ".worktrees", "dev-task-abc"))
 
 
 if __name__ == "__main__":
