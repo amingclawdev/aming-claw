@@ -6918,6 +6918,16 @@ def _cluster_candidate_graph_path(metadata, graph_path):
         value = metadata.get(key)
         if value:
             return Path(value)
+    cluster_payload = metadata.get("cluster_payload")
+    if isinstance(cluster_payload, dict):
+        for key in (
+            "candidate_graph_path",
+            "graph_candidate_path",
+            "rebase_candidate_graph_path",
+        ):
+            value = cluster_payload.get(key)
+            if value:
+                return Path(value)
     try:
         sibling = Path(graph_path).with_name("graph.rebase.candidate.json")
         if sibling.exists():

@@ -663,6 +663,48 @@ def test_candidate_graph_uses_candidate_id_without_old_graph_allocation(
     ]
 
 
+def test_candidate_graph_path_resolves_from_cluster_payload(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_path = _write_candidate_graph(gov_dir, [
+        {
+            "id": "L3.14",
+            "primary": [],
+            "parent_layer": "L3",
+            "title": "Backlog State Management",
+        },
+        {
+            "id": "L7.22",
+            "primary": ["agent/governance/auto_backlog_bridge.py"],
+            "parent_layer": "L7",
+            "title": "agent.governance.auto_backlog_bridge",
+        },
+    ])
+    proposed = {
+        "node_id": "L7.22",
+        "candidate_node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "parent_layer": "L7",
+        "deps": ["L3.14"],
+    }
+
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-nested-path",
+        pm_prd={"proposed_nodes": [proposed]},
+        dev_result={"graph_delta": {"creates": [proposed]}},
+        metadata=_meta(cluster_payload={"candidate_graph_path": str(candidate_path)}),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is True, res
+    assert res["allocated_node_ids"] == ["L7.22"]
+    overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
+    assert overlay_doc["nodes"]["L7.22"]["deps"] == ["L3.14"]
+
+
 # ---------------------------------------------------------------------------
 # AC11
 # ---------------------------------------------------------------------------
