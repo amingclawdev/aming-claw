@@ -107,7 +107,15 @@ def _proposed_node_ids(proposed_nodes: list) -> set:
     return ids
 
 
-def _pm_has_concrete_id_for_primary(proposed_nodes: list, primary: str) -> bool:
+def _primary_paths(primary: Any) -> list[str]:
+    if isinstance(primary, str):
+        return [primary] if primary else []
+    if isinstance(primary, (list, tuple, set)):
+        return [p for p in primary if isinstance(p, str) and p]
+    return []
+
+
+def _pm_has_concrete_id_for_primary(proposed_nodes: list, primary: Any) -> bool:
     """Return True iff PM proposed_nodes contains an entry whose 'primary'
     matches `primary` AND its id field is a non-empty string.
 
@@ -120,12 +128,14 @@ def _pm_has_concrete_id_for_primary(proposed_nodes: list, primary: str) -> bool:
     Accepts dict-shaped proposed_nodes only (string entries don't carry a
     primary). The id field is checked under both 'node_id' and 'id' keys.
     """
-    if not primary or not isinstance(proposed_nodes, list):
+    primary_set = set(_primary_paths(primary))
+    if not primary_set or not isinstance(proposed_nodes, list):
         return False
     for n in proposed_nodes:
         if not isinstance(n, dict):
             continue
-        if n.get("primary") != primary:
+        node_primary_set = set(_primary_paths(n.get("primary")))
+        if not node_primary_set.intersection(primary_set):
             continue
         nid = n.get("node_id")
         if nid is None:
@@ -214,7 +224,8 @@ def validate_dev_output(payload: dict, chain_context: Any = None,
             # stage is absent, OR PM had a concrete id for this primary
             # (anti-regression: protects against silently dropping a
             # PM-allocated id).
-            primary = c.get("primary", "") if isinstance(c.get("primary", ""), str) else ""
+            primary = c.get("primary", "")
+            primary_label = ", ".join(_primary_paths(primary))
             pm_has_concrete = _pm_has_concrete_id_for_primary(
                 pm_proposed_nodes, primary
             )
@@ -225,7 +236,7 @@ def validate_dev_output(payload: dict, chain_context: Any = None,
                     (
                         "creates[].node_id is empty and PM did not allocate "
                         "a concrete id for primary "
-                        f"'{primary}' (PM acted as proposer); "
+                        f"'{primary_label}' (PM acted as proposer); "
                         "auto-inferrer Rule H will assign downstream"
                     ),
                     "error",
@@ -255,13 +266,13 @@ def validate_dev_output(payload: dict, chain_context: Any = None,
             if not isinstance(c, dict):
                 continue
             nid = c.get("node_id", "")
-            primary = c.get("primary", "")
-            if primary and primary in unmapped:
-                errors.append(ValidationError(
-                    error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE,
-                    f"$.graph_delta.creates[{i}].primary",
-                    f"create binds to unmapped file '{primary}' declared by PM",
-                    "error"))
+            for primary in _primary_paths(c.get("primary", "")):
+                if primary in unmapped:
+                    errors.append(ValidationError(
+                        error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE,
+                        f"$.graph_delta.creates[{i}].primary",
+                        f"create binds to unmapped file '{primary}' declared by PM",
+                        "error"))
             if nid and nid in removed:
                 errors.append(ValidationError(
                     error_codes.PHANTOM_CREATE_FOR_DECLARED_REMOVED,

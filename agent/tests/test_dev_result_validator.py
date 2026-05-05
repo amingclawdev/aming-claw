@@ -56,6 +56,25 @@ def test_phantom_create_for_unmapped_file():
     assert error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE in err_codes
 
 
+def test_phantom_create_for_unmapped_file_with_list_primary():
+    ctx = _pm_context(unmapped_files=["legacy/old.py"])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {
+                "node_id": "L7.1",
+                "primary": ["legacy/old.py"],
+                "parent_layer": "L7",
+            }
+        ]
+    })
+
+    res = validate_dev_output(payload, ctx, mode="warn")
+
+    assert res.valid is False
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.PHANTOM_CREATE_FOR_UNMAPPED_FILE in err_codes
+
+
 def test_phantom_for_declared_removed_is_fatal_in_warn_mode():
     """PR1b: PHANTOM_CREATE_FOR_DECLARED_REMOVED is FATAL even under warn."""
     ctx = _pm_context(removed_nodes=["L7.21"])
@@ -169,6 +188,22 @@ def test_happy_path_valid():
     assert isinstance(res.to_human_readable(), str)
 
 
+def test_happy_path_valid_with_list_primary():
+    ctx = _pm_context(proposed_nodes=[
+        {"node_id": "L7.1", "primary": ["a.py"]},
+    ])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {"node_id": "L7.1", "primary": ["a.py"], "parent_layer": "L7"}
+        ]
+    })
+
+    res = validate_dev_output(payload, ctx, mode="warn")
+
+    assert res.valid is True
+    assert res.errors == []
+
+
 def test_empty_node_id_demoted_when_pm_also_empty():
     """PR1f: dev node_id='' demoted to CREATE_NOT_IN_PROPOSED_NODES warning
     when PM proposed_nodes also has no concrete id for the same primary.
@@ -212,6 +247,27 @@ def test_empty_node_id_fatal_when_pm_has_concrete_id():
         ]
     })
     res = validate_dev_output(payload, ctx, mode="warn")
+    assert res.valid is False
+    err_codes = [e.code for e in res.errors]
+    assert error_codes.EMPTY_NODE_ID in err_codes
+
+
+def test_empty_node_id_fatal_when_pm_has_concrete_id_with_list_primary():
+    ctx = _pm_context(proposed_nodes=[
+        {"node_id": "L7.99", "primary": ["agent/governance/new_feature.py"]},
+    ])
+    payload = _base_payload(graph_delta={
+        "creates": [
+            {
+                "node_id": "",
+                "primary": ["agent/governance/new_feature.py"],
+                "parent_layer": "L7",
+            }
+        ]
+    })
+
+    res = validate_dev_output(payload, ctx, mode="warn")
+
     assert res.valid is False
     err_codes = [e.code for e in res.errors]
     assert error_codes.EMPTY_NODE_ID in err_codes
