@@ -6389,16 +6389,21 @@ def _finalize_version_sync(conn, project_id, task_id):
             cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         )
         dirty_files = [
-            line[3:] for line in (dirty_result.stdout or "").strip().split("\n")
+            line[3:] for line in (dirty_result.stdout or "").splitlines()
             if line.strip()
         ] if dirty_result.returncode == 0 else []
     except Exception:
         dirty_files = []
 
     conn.execute(
-        "INSERT OR REPLACE INTO project_version (project_id, chain_version, git_head, dirty_files, updated_at) "
-        "VALUES (?, ?, ?, ?, datetime('now'))",
-        (project_id, new_head, new_head, json.dumps(dirty_files)),
+        "INSERT INTO project_version "
+        "(project_id, chain_version, git_head, dirty_files, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, datetime('now'), ?) "
+        "ON CONFLICT(project_id) DO UPDATE SET "
+        "git_head=excluded.git_head, "
+        "dirty_files=excluded.dirty_files, "
+        "updated_at=excluded.updated_at",
+        (project_id, new_head, new_head, json.dumps(dirty_files), f"auto-chain:{task_id}"),
     )
     log.info(
         "_finalize_version_sync: version-sync project=%s head=%s dirty=%d",
