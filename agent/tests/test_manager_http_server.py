@@ -1,189 +1,159 @@
-"""Tests for agent/manager_http_server.py.
+"""Tests for agent.manager_http_server's stdlib HTTP sidecar."""
 
-Covers:
-  (a) HTTP 400 for target=service_manager (mutual-exclusion guard)
-  (b) HTTP 404 for unknown target
-  (c) Successful governance redeploy writes chain_version exactly once
-  (d) Failed spawn does NOT write chain_version
-  (e) Missing chain_version returns 400
-"""
+from __future__ import annotations
 
+import json
 import sys
-import os
+import threading
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch, MagicMock, AsyncMock
-
-import pytest
-
-# Ensure agent directory is on the path
-_agent_dir = str(Path(__file__).resolve().parents[1])
-if _agent_dir not in sys.path:
-    sys.path.insert(0, _agent_dir)
-
-# Ensure project root is on the path for agent.manager_http_server import
-_project_root = str(Path(__file__).resolve().parents[2])
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
-from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
-
-from agent.manager_http_server import create_app, handle_redeploy
+from unittest.mock import MagicMock, patch
 
 
-# ---------------------------------------------------------------------------
-# pytest-aiohttp style tests (preferred)
-# ---------------------------------------------------------------------------
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from agent import manager_http_server as manager_http_server  # noqa: E402
 
 
-@pytest.fixture
-def app():
-    """Create the aiohttp application for testing."""
-    return create_app()
+@contextmanager
+def _running_manager():
+    server = manager_http_server.create_server("127.0.0.1", 0)
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
-@pytest.fixture
-def client(event_loop, aiohttp_client, app):
-    """Create a test client for the app."""
-    return event_loop.run_until_complete(aiohttp_client(app))
+def _post_json(base_url: str, path: str, payload: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        f"{base_url}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
-class TestMutualExclusionGuard:
-    """AC3: target=service_manager returns HTTP 400."""
-
-    @pytest.mark.asyncio
-    async def test_service_manager_target_returns_400(self, aiohttp_client, app):
-        """POST /api/manager/redeploy/service_manager must return 400."""
-        client = await aiohttp_client(app)
-        resp = await client.post(
+def test_service_manager_target_returns_400():
+    with _running_manager() as base:
+        status, body = _post_json(
+            base,
             "/api/manager/redeploy/service_manager",
-            json={"chain_version": "abc1234"},
+            {"chain_version": "abc1234"},
         )
-        assert resp.status == 400
-        body = await resp.json()
-        assert body["ok"] is False
-        assert "service_manager" in body["detail"]
-        assert body["error_code"] == "SELF_REDEPLOY_FORBIDDEN"
+
+    assert status == 400
+    assert body["ok"] is False
+    assert body["error_code"] == "SELF_REDEPLOY_FORBIDDEN"
+    assert "self" in body["detail"]
 
 
-class TestUnknownTarget:
-    """AC4: unknown target returns HTTP 404."""
-
-    @pytest.mark.asyncio
-    async def test_unknown_target_returns_404(self, aiohttp_client, app):
-        """POST /api/manager/redeploy/foobar must return 404."""
-        client = await aiohttp_client(app)
-        resp = await client.post(
+def test_unknown_target_returns_404():
+    with _running_manager() as base:
+        status, body = _post_json(
+            base,
             "/api/manager/redeploy/foobar",
-            json={"chain_version": "abc1234"},
+            {"chain_version": "abc1234"},
         )
-        assert resp.status == 404
-        body = await resp.json()
-        assert body["ok"] is False
-        assert body["error_code"] == "UNKNOWN_TARGET"
 
-    @pytest.mark.asyncio
-    async def test_executor_target_returns_404(self, aiohttp_client, app):
-        """POST /api/manager/redeploy/executor must return 404 (not a valid target)."""
-        client = await aiohttp_client(app)
-        resp = await client.post(
+    assert status == 404
+    assert body["ok"] is False
+    assert body["error_code"] == "UNKNOWN_TARGET"
+
+
+def test_executor_target_returns_404():
+    with _running_manager() as base:
+        status, body = _post_json(
+            base,
             "/api/manager/redeploy/executor",
-            json={"chain_version": "abc1234"},
+            {"chain_version": "abc1234"},
         )
-        assert resp.status == 404
+
+    assert status == 404
+    assert body["ok"] is False
+    assert body["error_code"] == "UNKNOWN_TARGET"
 
 
-class TestGovernanceRedeploySuccess:
-    """AC7/R5: Successful governance redeploy writes chain_version exactly once."""
+def test_successful_redeploy_writes_chain_version_once():
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
 
-    @pytest.mark.asyncio
-    async def test_successful_redeploy_writes_chain_version(self, aiohttp_client, app):
-        """Full success path: stop → spawn → health → version-update → 200."""
-        mock_proc = MagicMock()
-        mock_proc.pid = 99999
-
-        with patch("agent.manager_http_server._stop_governance_process", return_value=True), \
-             patch("agent.manager_http_server._spawn_governance_process", return_value=mock_proc), \
-             patch("agent.manager_http_server._wait_for_health", return_value=True), \
-             patch("agent.manager_http_server._write_chain_version", return_value=True) as mock_write:
-
-            client = await aiohttp_client(app)
-            resp = await client.post(
-                "/api/manager/redeploy/governance",
-                json={"chain_version": "abc1234"},
-            )
-
-            assert resp.status == 200
-            body = await resp.json()
-            assert body["ok"] is True
-            assert body["pid"] == 99999
-            assert body["chain_version"] == "abc1234"
-
-            # chain_version written exactly once
-            mock_write.assert_called_once_with("abc1234")
-
-
-class TestGovernanceRedeployFailure:
-    """R5: Failed spawn does NOT write chain_version."""
-
-    @pytest.mark.asyncio
-    async def test_failed_spawn_does_not_write_chain_version(self, aiohttp_client, app):
-        """If spawn raises, version-update must NOT be called."""
-        with patch("agent.manager_http_server._stop_governance_process", return_value=True), \
-             patch("agent.manager_http_server._spawn_governance_process", side_effect=RuntimeError("spawn failed")), \
-             patch("agent.manager_http_server._write_chain_version") as mock_write:
-
-            client = await aiohttp_client(app)
-            resp = await client.post(
-                "/api/manager/redeploy/governance",
-                json={"chain_version": "abc1234"},
-            )
-
-            assert resp.status == 500
-            body = await resp.json()
-            assert body["ok"] is False
-            assert "spawn" in body["detail"].lower()
-
-            # chain_version must NOT be written
-            mock_write.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_failed_health_check_does_not_write_chain_version(self, aiohttp_client, app):
-        """If health check fails, version-update must NOT be called."""
-        mock_proc = MagicMock()
-        mock_proc.pid = 88888
-
-        with patch("agent.manager_http_server._stop_governance_process", return_value=True), \
-             patch("agent.manager_http_server._spawn_governance_process", return_value=mock_proc), \
-             patch("agent.manager_http_server._wait_for_health", return_value=False), \
-             patch("agent.manager_http_server._write_chain_version") as mock_write:
-
-            client = await aiohttp_client(app)
-            resp = await client.post(
-                "/api/manager/redeploy/governance",
-                json={"chain_version": "abc1234"},
-            )
-
-            assert resp.status == 500
-            body = await resp.json()
-            assert body["ok"] is False
-
-            # chain_version must NOT be written
-            mock_write.assert_not_called()
-
-
-class TestMissingChainVersion:
-    """Missing chain_version in request body returns 400."""
-
-    @pytest.mark.asyncio
-    async def test_missing_chain_version_returns_400(self, aiohttp_client, app):
-        """POST /api/manager/redeploy/governance without chain_version → 400."""
-        client = await aiohttp_client(app)
-        resp = await client.post(
+    with patch.object(manager_http_server, "_stop_governance_process", return_value=True), \
+            patch.object(manager_http_server, "_spawn_governance_process", return_value=mock_proc), \
+            patch.object(manager_http_server, "_wait_for_health", return_value=True), \
+            patch.object(manager_http_server, "_write_chain_version", return_value=True) as mock_write, \
+            _running_manager() as base:
+        status, body = _post_json(
+            base,
             "/api/manager/redeploy/governance",
-            json={},
+            {"chain_version": "abc1234"},
         )
-        assert resp.status == 400
-        body = await resp.json()
-        assert body["ok"] is False
-        assert "chain_version" in body["detail"]
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["pid"] == 99999
+    assert body["chain_version"] == "abc1234"
+    mock_write.assert_called_once_with("abc1234")
+
+
+def test_failed_spawn_does_not_write_chain_version():
+    with patch.object(manager_http_server, "_stop_governance_process", return_value=True), \
+            patch.object(
+                manager_http_server,
+                "_spawn_governance_process",
+                side_effect=RuntimeError("spawn failed"),
+            ), \
+            patch.object(manager_http_server, "_write_chain_version") as mock_write, \
+            _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/redeploy/governance",
+            {"chain_version": "abc1234"},
+        )
+
+    assert status == 500
+    assert body["ok"] is False
+    assert "spawn" in body["detail"].lower()
+    mock_write.assert_not_called()
+
+
+def test_failed_health_check_does_not_write_chain_version():
+    mock_proc = MagicMock()
+    mock_proc.pid = 88888
+
+    with patch.object(manager_http_server, "_stop_governance_process", return_value=True), \
+            patch.object(manager_http_server, "_spawn_governance_process", return_value=mock_proc), \
+            patch.object(manager_http_server, "_wait_for_health", return_value=False), \
+            patch.object(manager_http_server, "_write_chain_version") as mock_write, \
+            _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/redeploy/governance",
+            {"chain_version": "abc1234"},
+        )
+
+    assert status == 500
+    assert body["ok"] is False
+    mock_write.assert_not_called()
+
+
+def test_missing_chain_version_returns_400():
+    with _running_manager() as base:
+        status, body = _post_json(base, "/api/manager/redeploy/governance", {})
+
+    assert status == 400
+    assert body["ok"] is False
+    assert "chain_version" in body["detail"]
