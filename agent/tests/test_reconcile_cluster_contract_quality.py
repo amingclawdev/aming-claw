@@ -67,7 +67,11 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
                 "test": ["agent/tests/test_reconcile_batch_memory.py"],
                 "test_coverage": "direct",
             }
-        ]
+        ],
+        "verification": {
+            "method": "automated test",
+            "command": "pytest agent/tests/test_reconcile_batch_memory.py -v",
+        },
     }
 
     passed, reason = auto_chain.preflight_reconcile_cluster_pm(
@@ -76,6 +80,73 @@ def test_reconcile_cluster_pm_preflight_accepts_exact_candidate_contract():
     )
 
     assert passed, reason
+
+
+def test_reconcile_cluster_pm_preflight_rejects_path_only_verification_for_candidate_tests():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": ["docs/governance/reconcile-workflow.md"],
+                "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                "test_coverage": "direct",
+            }
+        ],
+        "verification": {
+            "method": "automated test",
+            "command": (
+                "python -c \"import pathlib; "
+                "assert pathlib.Path('agent/tests/test_reconcile_batch_memory.py').exists()\""
+            ),
+        },
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "verification.command must run pytest" in reason
+    assert "test_reconcile_batch_memory.py" in reason
+
+
+def test_reconcile_cluster_pm_preflight_rejects_pytest_command_missing_candidate_test():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": ["docs/governance/reconcile-workflow.md"],
+                "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                "test_coverage": "direct",
+            }
+        ],
+        "verification": {
+            "method": "automated test",
+            "command": "pytest agent/tests/test_other.py -v",
+        },
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+    )
+
+    assert not passed
+    assert "verification.command must include all candidate Python test consumers" in reason
+    assert "test_reconcile_batch_memory.py" in reason
 
 
 def test_reconcile_cluster_pm_preflight_rejects_dropped_candidate_test_consumer():

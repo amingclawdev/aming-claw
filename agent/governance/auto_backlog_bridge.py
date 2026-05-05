@@ -315,7 +315,10 @@ def _controlled_reconcile_prompt() -> str:
         "and must preserve the same identity fields before writing overlay. "
         "Do not mutate the active graph or candidate graph artifacts. "
         "Default outcome is overlay-only changed_files=[]; modify source/docs/tests "
-        "only if verification proves a real defect. Do not cite ignored docs/dev "
+        "only if verification proves a real defect. If candidate nodes declare "
+        "Python test consumers, PM verification.command must run pytest over "
+        "those exact test files; path-existence verification is allowed only "
+        "when the candidate has no Python tests. Do not cite ignored docs/dev "
         "proposal files as required evidence."
     )
 

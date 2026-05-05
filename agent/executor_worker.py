@@ -1685,7 +1685,10 @@ class ExecutorWorker:
                     "as candidate graph identity; do not drop paths, move paths "
                     "between sibling nodes, or invent coverage during PM. Dev "
                     "must emit graph_delta.creates for the overlay without "
-                    "touching graph.json."
+                    "touching graph.json. If the candidate manifest declares "
+                    "Python test consumers, verification.command MUST run pytest "
+                    "over those exact files; use a path-existence python -c check "
+                    "only when the candidate has no Python tests."
                 )
                 _bp_log("reconcile cluster metadata embedded")
 
@@ -1776,6 +1779,7 @@ class ExecutorWorker:
                 "- target_files, requirements, acceptance_criteria, verification are MANDATORY (gate blocks if missing)\n"
                 "- test_files, proposed_nodes, doc_impact: provide OR explain in skip_reasons\n"
                 "- For test coverage, put only existing files in test_files/proposed_nodes[].test; list missing coverage in missing_test_gaps or skip_reasons\n"
+                "- For reconcile-cluster with Python files in proposed_nodes[].test, verification.command MUST run pytest over those exact test files\n"
                 "- Use Read/Grep to verify file paths exist before listing them\n"
                 "- Read at most 3-5 key files, then output the JSON\n"
                 "- Do NOT output actions, reply, or schema_version fields\n"

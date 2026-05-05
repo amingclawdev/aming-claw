@@ -6825,6 +6825,42 @@ def _cluster_candidate_test(item):
     return tuple(_cluster_normalize_primary(value))
 
 
+def _cluster_candidate_python_tests(candidate_nodes):
+    tests = []
+    for item in candidate_nodes or []:
+        for path in _cluster_candidate_test(item):
+            if path.lower().endswith(".py"):
+                tests.append(path)
+    return tuple(sorted(set(tests)))
+
+
+def _validate_cluster_verification_against_candidate_tests(prd, candidate_nodes):
+    """Require real pytest execution when candidate graph declares Python tests."""
+    expected_tests = _cluster_candidate_python_tests(candidate_nodes)
+    if not expected_tests:
+        return True, "ok"
+    verification = prd.get("verification") if isinstance(prd, dict) else {}
+    if not isinstance(verification, dict):
+        verification = {}
+    command = str(verification.get("command") or "").replace("\\", "/")
+    command_l = command.lower()
+    if "pytest" not in command_l:
+        return False, (
+            "FATAL preflight (reconcile-cluster): candidate nodes declare Python "
+            f"test consumers, so verification.command must run pytest; expected_tests={list(expected_tests)} "
+            f"actual_command={command!r}. Path-existence checks are allowed only when "
+            "candidate_nodes have no Python tests."
+        )
+    missing = [path for path in expected_tests if path not in command]
+    if missing:
+        return False, (
+            "FATAL preflight (reconcile-cluster): verification.command must include "
+            f"all candidate Python test consumers; missing={missing} "
+            f"actual_command={command!r}"
+        )
+    return True, "ok"
+
+
 def _cluster_normalize_layer(value):
     """Normalize a parent_layer value to canonical 'L<N>' form (or '' on bad)."""
     if value is None:
@@ -7036,6 +7072,12 @@ def preflight_reconcile_cluster_pm(prd, candidate_nodes=None):
     )
     if not candidate_passed:
         return False, candidate_reason
+    verification_passed, verification_reason = _validate_cluster_verification_against_candidate_tests(
+        prd,
+        candidate_nodes or [],
+    )
+    if not verification_passed:
+        return False, verification_reason
     return True, "ok"
 
 
