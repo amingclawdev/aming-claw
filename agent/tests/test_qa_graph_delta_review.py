@@ -273,6 +273,30 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_allows_existing_evidence_path_with_symbol_title_suffix(self):
+        """Existing file citations may be followed by a symbol/title segment."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": "Checked graph script evidence.",
+            "criteria_results": [
+                {
+                    "criterion": "symbol evidence",
+                    "passed": True,
+                    "evidence": (
+                        "Verified L7.157->scripts/apply_graph.py/scripts.apply_graph, "
+                        "L7.161->scripts/phase-z-v2.py/scripts.phase-z-v2, and "
+                        "L7.166->scripts/reconcile-scoped.py/scripts.reconcile-scoped."
+                    ),
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L3.1"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed)
+        self.assertEqual(reason, "ok")
+
     def test_ignores_category_phrase_containing_docs_test(self):
         """Do not extract docs/test from prose like source/docs/test mutations."""
         result = {
