@@ -743,6 +743,144 @@ def test_candidate_graph_path_resolves_from_cluster_payload(
     assert overlay_doc["nodes"]["L7.22"]["deps"] == []
 
 
+def test_candidate_graph_preserves_metadata_hierarchy_parent_to_overlay(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_leaf = {
+        "id": "L7.22",
+        "node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "layer": "L7",
+        "title": "agent.governance.auto_backlog_bridge",
+        "deps": [],
+        "metadata": {"hierarchy_parent": "L3.14"},
+    }
+    candidate_path = _write_candidate_graph(gov_dir, [
+        {
+            "id": "L3.14",
+            "primary": [],
+            "layer": "L3",
+            "title": "Backlog State Management",
+        },
+        candidate_leaf,
+    ])
+    proposed = {
+        "node_id": "L7.22",
+        "candidate_node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "parent_layer": "L7",
+        "parent": "L3.14",
+        "parent_id": "L3.14",
+        "hierarchy_parent": "L3.14",
+        "title": "agent.governance.auto_backlog_bridge",
+        "deps": [],
+    }
+
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-parent-preserved",
+        pm_prd={"proposed_nodes": [proposed]},
+        dev_result={"graph_delta": {"creates": [proposed]}},
+        metadata=_meta(cluster_payload={
+            "candidate_graph_path": str(candidate_path),
+            "candidate_nodes": [candidate_leaf],
+        }),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is True, res
+    overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
+    node = overlay_doc["nodes"]["L7.22"]
+    assert node["parent"] == "L3.14"
+    assert node["parent_id"] == "L3.14"
+    assert node["hierarchy_parent"] == "L3.14"
+
+
+def test_candidate_graph_rejects_pm_dropping_metadata_hierarchy_parent(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_leaf = {
+        "id": "L7.22",
+        "node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "layer": "L7",
+        "title": "agent.governance.auto_backlog_bridge",
+        "deps": [],
+        "metadata": {"hierarchy_parent": "L3.14"},
+    }
+    candidate_path = _write_candidate_graph(gov_dir, [candidate_leaf])
+    proposed = {
+        "node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "parent_layer": "L7",
+        "title": "agent.governance.auto_backlog_bridge",
+        "deps": [],
+    }
+
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-pm-parent-drop",
+        pm_prd={"proposed_nodes": [proposed]},
+        dev_result={"graph_delta": {"creates": [proposed]}},
+        metadata=_meta(cluster_payload={
+            "candidate_graph_path": str(candidate_path),
+            "candidate_nodes": [candidate_leaf],
+        }),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is False
+    assert res["stage"] == "preflight_pm"
+    assert "parent relation" in res["reason"]
+
+
+def test_candidate_graph_rejects_dev_dropping_metadata_hierarchy_parent(
+    gov_dir: Path, graph_path: Path, overlay_path: Path,
+):
+    candidate_leaf = {
+        "id": "L7.22",
+        "node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "layer": "L7",
+        "title": "agent.governance.auto_backlog_bridge",
+        "deps": [],
+        "metadata": {"hierarchy_parent": "L3.14"},
+    }
+    candidate_path = _write_candidate_graph(gov_dir, [candidate_leaf])
+    pm_node = {
+        "node_id": "L7.22",
+        "primary": ["agent/governance/auto_backlog_bridge.py"],
+        "parent_layer": "L7",
+        "hierarchy_parent": "L3.14",
+        "title": "agent.governance.auto_backlog_bridge",
+        "deps": [],
+    }
+    dev_node = dict(pm_node)
+    dev_node.pop("hierarchy_parent")
+
+    res = auto_chain.apply_reconcile_cluster_to_overlay(
+        conn=None,
+        project_id=PROJECT_ID,
+        task_id="t-candidate-dev-parent-drop",
+        pm_prd={"proposed_nodes": [pm_node]},
+        dev_result={"graph_delta": {"creates": [dev_node]}},
+        metadata=_meta(cluster_payload={
+            "candidate_graph_path": str(candidate_path),
+            "candidate_nodes": [candidate_leaf],
+        }),
+        graph_path=graph_path,
+        overlay_path=overlay_path,
+    )
+
+    assert res["applied"] is False
+    assert res["stage"] == "preflight_dev"
+    assert "hierarchy parent" in res["reason"]
+
+
 def test_candidate_graph_rejects_hierarchy_parent_in_deps(
     gov_dir: Path, graph_path: Path, overlay_path: Path,
 ):

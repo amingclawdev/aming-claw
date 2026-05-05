@@ -2989,7 +2989,7 @@ def _render_dev_contract_prompt(source_task_id, metadata):
                 "\nRequired for reconcile-cluster: return `graph_delta.creates` mirroring "
                 "`proposed_nodes` one-for-one. Preserve each concrete node_id/candidate_node_id, "
                 "primary, title, parent_layer as the node layer, and hierarchy parent via "
-                "parent/parent_id. Preserve deps exactly from candidate `_deps`/`deps`; "
+                "parent/parent_id/hierarchy_parent. Preserve deps exactly from candidate `_deps`/`deps`; "
                 "do not put hierarchy parents in deps. Do not mutate the active graph artifact; "
                 "Gatekeeper writes graph.rebase.overlay.json only after QA. When reporting "
                 "graph artifact safety, cite only artifact paths that exist in metadata or "
@@ -6955,8 +6955,16 @@ def _cluster_parent_node_hint(item):
     """Return an explicit hierarchy parent node id such as L3.18."""
     if not isinstance(item, dict):
         return ""
-    for key in ("parent", "parent_id", "parent_node_id"):
+    for key in ("parent", "parent_id", "parent_node_id", "hierarchy_parent"):
         raw = item.get(key)
+        if raw in (None, ""):
+            continue
+        text = str(raw).strip()
+        if re.match(r"^[Ll]\d+\.\d+$", text):
+            return f"L{text[1:]}" if text.startswith("l") else text
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for key in ("hierarchy_parent", "parent", "parent_id", "parent_node_id"):
+        raw = metadata.get(key)
         if raw in (None, ""):
             continue
         text = str(raw).strip()
@@ -6971,10 +6979,7 @@ def _cluster_proposed_parent_matches(proposed_node, candidate_parent):
         return True
     if not isinstance(proposed_node, dict):
         return False
-    for key in ("parent", "parent_id", "parent_node_id"):
-        if str(proposed_node.get(key) or "").strip() == candidate_parent:
-            return True
-    return False
+    return _cluster_parent_node_hint(proposed_node) == candidate_parent
 
 
 def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
@@ -7247,6 +7252,7 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_no
             "deps": _cluster_normalize_deps(
                 item.get("_deps") if item.get("_deps") is not None else item.get("deps")
             ),
+            "parent": _cluster_parent_node_hint(item),
             "secondary": _cluster_candidate_secondary(item),
             "test": _cluster_candidate_test(item),
             "test_coverage": _cluster_normalize_scalar(item.get("test_coverage")),
@@ -7276,6 +7282,14 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_no
                     f"for {node_id} must match candidate _deps/deps exactly; "
                     f"expected={list(expected)} actual={list(actual)}. "
                     "Do not put hierarchy parent in deps; use parent/parent_id."
+                )
+            expected_parent = expected_contract[node_id]["parent"]
+            if expected_parent and not _cluster_proposed_parent_matches(item, expected_parent):
+                return False, (
+                    "FATAL preflight (reconcile-cluster): graph_delta.creates "
+                    f"hierarchy parent for {node_id} must match candidate; "
+                    f"expected={expected_parent!r}. Preserve it via parent, "
+                    "parent_id, or hierarchy_parent."
                 )
             for field in ("secondary", "test"):
                 expected_paths = expected_contract[node_id][field]
@@ -7627,6 +7641,13 @@ def _validate_candidate_namespace(dev_creates, candidate_nodes, overlay_nodes):
                 f"expected={list(expected_deps)} actual={list(actual_deps)}. "
                 "Do not put hierarchy parent in deps; use parent/parent_id."
             )
+        expected_parent = _cluster_parent_node_hint(candidate)
+        if expected_parent and not _cluster_proposed_parent_matches(proposed, expected_parent):
+            return False, (
+                f"candidate graph namespace conflict for {explicit_id}: "
+                "create hierarchy parent does not match candidate graph node; "
+                f"expected={expected_parent!r}"
+            )
         existing_overlay = overlay_nodes.get(explicit_id)
         if existing_overlay and not _cluster_primary_compatible(proposed, existing_overlay):
             return False, (
@@ -7934,6 +7955,7 @@ def apply_reconcile_cluster_to_overlay(
         }
 
         # Build the overlay node entry with provenance metadata.
+        parent_node_id = _cluster_parent_node_hint(proposed)
         overlay_entry = {
             "node_id": new_id,
             "candidate_node_id": new_id if candidate_nodes else explicit_id,
@@ -7951,6 +7973,10 @@ def apply_reconcile_cluster_to_overlay(
                 "candidate_graph_sha256": candidate_sha256,
             },
         }
+        if parent_node_id:
+            overlay_entry["parent"] = parent_node_id
+            overlay_entry["parent_id"] = parent_node_id
+            overlay_entry["hierarchy_parent"] = parent_node_id
 
         # R7: stage node_state insert into session_pending — never commit
         # directly to node_state from this path.  The session-finalize step
