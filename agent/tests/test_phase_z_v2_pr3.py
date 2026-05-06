@@ -148,6 +148,26 @@ class TestCoverageLookup:
         assert isinstance(result["test_files"], list)
         assert isinstance(result["covered_lines"], int)
 
+    def test_find_test_coverage_finds_recursive_and_js_colocated_tests(self):
+        project = _make_temp_project({
+            "agent/deep/mymod.py": "def hello():\n    pass\n",
+            "agent/tests/deep/test_mymod_extra.py": "def test_hello():\n    assert True\n",
+            ".claude/worktrees/stale/agent/tests/deep/test_mymod_extra.py": "def test_stale():\n    assert True\n",
+            "dbservice/lib/contextAssembly.js": "export function run() { return 1; }\n",
+            "dbservice/lib/contextAssembly.test.js": "test('run', () => {});\n",
+            ".claude/worktrees/stale/dbservice/lib/contextAssembly.test.js": "test('stale', () => {});\n",
+        })
+
+        py_result = find_test_coverage(project, os.path.join(project, "agent", "deep", "mymod.py"))
+        js_result = find_test_coverage(project, os.path.join(project, "dbservice", "lib", "contextAssembly.js"))
+        py_files = {os.path.relpath(p, project).replace(os.sep, "/") for p in py_result["test_files"]}
+        js_files = {os.path.relpath(p, project).replace(os.sep, "/") for p in js_result["test_files"]}
+
+        assert "agent/tests/deep/test_mymod_extra.py" in py_files
+        assert ".claude/worktrees/stale/agent/tests/deep/test_mymod_extra.py" not in py_files
+        assert "dbservice/lib/contextAssembly.test.js" in js_files
+        assert ".claude/worktrees/stale/dbservice/lib/contextAssembly.test.js" not in js_files
+
     def test_ac5_find_doc_coverage(self):
         """AC5: find_doc_coverage returns doc_files list + covered_lines int."""
         project = _make_temp_project({
@@ -158,6 +178,17 @@ class TestCoverageLookup:
         assert isinstance(result["doc_files"], list)
         assert isinstance(result["covered_lines"], int)
         assert len(result["doc_files"]) >= 1
+
+    def test_find_doc_coverage_includes_root_index_docs(self):
+        project = _make_temp_project({
+            "agent/mymod.py": "def hello():\n    pass\n",
+            "README.md": "# Project\nSee agent.mymod for details.\n",
+        })
+
+        result = find_doc_coverage(project, os.path.join(project, "agent", "mymod.py"))
+        doc_files = {os.path.relpath(p, project).replace(os.sep, "/") for p in result["doc_files"]}
+
+        assert "README.md" in doc_files
 
     def test_find_doc_coverage_excludes_git_ignored_docs(self):
         """Ignored docs are not visible in chain worktrees, so exclude them."""

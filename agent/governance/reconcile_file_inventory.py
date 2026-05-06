@@ -26,6 +26,8 @@ GENERATED_FILENAMES = {
 }
 GENERATED_EXTENSIONS = {".log", ".db", ".sqlite", ".sqlite3", ".pyc"}
 GENERATED_DIR_MARKERS = {"generated", "__generated__", "gen"}
+GENERATED_DIR_SUFFIXES = (".egg-info",)
+GENERATED_PATH_PREFIXES = ("docs/dev/scratch/", "docs/dev/observer/logs/")
 
 
 @dataclass(frozen=True)
@@ -112,16 +114,22 @@ def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
     suffix = Path(rel).suffix.lower()
     parts = {p.lower() for p in rel.split("/") if p}
 
-    if name in GENERATED_FILENAMES or suffix in GENERATED_EXTENSIONS or parts & GENERATED_DIR_MARKERS:
+    if (
+        name in GENERATED_FILENAMES
+        or suffix in GENERATED_EXTENSIONS
+        or parts & GENERATED_DIR_MARKERS
+        or any(part.endswith(GENERATED_DIR_SUFFIXES) for part in parts)
+        or any(rel.startswith(prefix) for prefix in GENERATED_PATH_PREFIXES)
+    ):
         return "generated"
+    if name in CONFIG_FILENAMES or name.startswith("Dockerfile") or suffix in CONFIG_EXTENSIONS:
+        return "config"
     if profile.is_test_path(rel):
         return "test"
     if profile.is_doc_path(rel) or suffix in DOC_EXTENSIONS:
         return "doc"
     if profile.is_production_source_path(rel):
         return "source"
-    if name in CONFIG_FILENAMES or name.startswith("Dockerfile") or suffix in CONFIG_EXTENSIONS:
-        return "config"
     if suffix in SCRIPT_EXTENSIONS or rel.startswith("scripts/"):
         return "script"
     return "unknown"

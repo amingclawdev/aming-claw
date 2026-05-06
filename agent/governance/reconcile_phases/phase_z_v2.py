@@ -762,29 +762,76 @@ def find_test_coverage(
     test_files: List[str] = []
     covered_lines = 0
 
-    # Derive the module basename for matching
-    base = os.path.basename(primary_file)
-    if base.endswith(".py"):
-        base = base[:-3]
+    stem = os.path.splitext(os.path.basename(primary_file))[0].lower()
+    primary_ext = os.path.splitext(primary_file)[1].lower()
+    skip_dirs = {
+        ".git",
+        ".claude",
+        ".hg",
+        ".svn",
+        ".worktrees",
+        ".observer-cache",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "runtime",
+        "search-workspace",
+        "shared-volume",
+        "venv",
+        ".venv",
+    }
 
-    # Search common test dirs
-    test_dirs = ["tests", "agent/tests", "test"]
-    for td in test_dirs:
-        tpath = os.path.join(project_root, td)
-        if not os.path.isdir(tpath):
-            continue
-        for fname in os.listdir(tpath):
-            if not fname.endswith(".py"):
+    def _is_test_like(rel: str, fname: str) -> bool:
+        rel_norm = rel.replace("\\", "/").lower()
+        parts = {p for p in rel_norm.split("/") if p}
+        lower = fname.lower()
+        return (
+            bool(parts & {"test", "tests", "__tests__"})
+            or lower.startswith("test_")
+            or ".test." in lower
+            or ".spec." in lower
+            or lower.endswith("_test.py")
+        )
+
+    def _matches_primary(fname: str) -> bool:
+        lower = fname.lower()
+        if primary_ext in {".py", ".pyi"}:
+            return (
+                lower == f"test_{stem}.py"
+                or lower.startswith(f"test_{stem}_")
+                or lower == f"{stem}_test.py"
+            )
+        suffixes = {primary_ext}
+        if primary_ext in {".jsx", ".tsx"}:
+            suffixes.add(primary_ext[-3:])
+        return any(
+            lower in {
+                f"{stem}.test{suffix}",
+                f"{stem}.spec{suffix}",
+                f"test_{stem}{suffix}",
+                f"{stem}_test{suffix}",
+            }
+            or lower.startswith(f"test_{stem}_")
+            for suffix in suffixes
+            if suffix
+        )
+
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
+        for fname in filenames:
+            if not fname.lower().endswith((".py", ".pyi", ".js", ".jsx", ".ts", ".tsx")):
                 continue
-            # Match test_<module>.py or test_<module>_*.py patterns
-            if fname == f"test_{base}.py" or fname.startswith(f"test_{base}_"):
-                full = os.path.join(tpath, fname)
-                test_files.append(full)
-                try:
-                    content = _read_file(full)
-                    covered_lines += content.count("\n")
-                except OSError:
-                    pass
+            fpath = os.path.join(dirpath, fname)
+            rel = _repo_relpath(project_root, fpath)
+            if not _is_test_like(rel, fname) or not _matches_primary(fname):
+                continue
+            test_files.append(fpath)
+            try:
+                content = _read_file(fpath)
+                covered_lines += content.count("\n")
+            except OSError:
+                pass
 
     return {"test_files": test_files, "covered_lines": covered_lines}
 
@@ -802,24 +849,47 @@ def find_doc_coverage(
     covered_lines = 0
 
     rel = os.path.relpath(primary_file, project_root) if os.path.isabs(primary_file) else primary_file
-    rel_normalized = rel.replace(os.sep, "/")
+    rel_normalized = rel.replace(os.sep, "/").strip("/")
+    module_token = os.path.splitext(rel_normalized)[0].replace("/", ".")
+    basename = os.path.basename(primary_file)
+    skip_dirs = {
+        ".git",
+        ".claude",
+        ".hg",
+        ".svn",
+        ".worktrees",
+        ".observer-cache",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "runtime",
+        "search-workspace",
+        "shared-volume",
+        "venv",
+        ".venv",
+    }
+    skip_rel_prefixes = {
+        "docs/dev/scratch/",
+        "docs/dev/observer/logs/",
+    }
 
-    docs_dir = os.path.join(project_root, "docs")
-    if not os.path.isdir(docs_dir):
-        return {"doc_files": doc_files, "covered_lines": covered_lines}
-
-    for dirpath, _dirnames, filenames in os.walk(docs_dir):
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
         for fname in filenames:
-            if not fname.endswith(".md"):
+            if not fname.lower().endswith((".md", ".rst", ".txt", ".adoc")):
                 continue
             fpath = os.path.join(dirpath, fname)
             doc_rel = _repo_relpath(project_root, fpath)
+            if any(doc_rel.startswith(prefix) for prefix in skip_rel_prefixes):
+                ignored_doc_files.append(fpath)
+                continue
             if _is_git_ignored_path(project_root, doc_rel):
                 ignored_doc_files.append(fpath)
                 continue
             try:
                 content = _read_file(fpath)
-                if rel_normalized in content or os.path.basename(primary_file) in content:
+                if rel_normalized in content or basename in content or module_token in content:
                     doc_files.append(fpath)
                     covered_lines += content.count("\n")
             except OSError:

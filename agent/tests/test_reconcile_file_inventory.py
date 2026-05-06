@@ -32,7 +32,10 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     _write(str(project / "tests" / "test_orphan.py"), "def test_orphan():\n    assert True\n")
     _write(str(project / "docs" / "service.md"), "See agent/service.py\n")
     _write(str(project / "docs" / "orphan.md"), "Unattached note\n")
+    _write(str(project / "docs" / "dev" / "scratch" / "backlog.json"), "{}\n")
     _write(str(project / "pyproject.toml"), "[project]\nname='x'\n")
+    _write(str(project / "requirements.txt"), "requests\n")
+    _write(str(project / "aming_claw_governance.egg-info" / "SOURCES.txt"), "generated\n")
     _write(str(project / ".coverage"), "generated\n")
     _write(str(project / "Dockerfile.governance"), "FROM python:3.12\n")
     _write(str(project / "node_modules" / "pkg" / "index.js"), "ignored();\n")
@@ -68,17 +71,23 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert rows_by_path["docs/orphan.md"]["scan_status"] == "orphan"
     assert rows_by_path["pyproject.toml"]["file_kind"] == "config"
     assert rows_by_path["pyproject.toml"]["scan_status"] == "pending_decision"
+    assert rows_by_path["requirements.txt"]["file_kind"] == "config"
+    assert rows_by_path["requirements.txt"]["scan_status"] == "pending_decision"
     assert rows_by_path["Dockerfile.governance"]["file_kind"] == "config"
     assert rows_by_path[".coverage"]["file_kind"] == "generated"
     assert rows_by_path[".coverage"]["scan_status"] == "ignored"
+    assert rows_by_path["aming_claw_governance.egg-info/SOURCES.txt"]["file_kind"] == "generated"
+    assert rows_by_path["aming_claw_governance.egg-info/SOURCES.txt"]["scan_status"] == "ignored"
+    assert rows_by_path["docs/dev/scratch/backlog.json"]["file_kind"] == "generated"
+    assert rows_by_path["docs/dev/scratch/backlog.json"]["scan_status"] == "ignored"
     assert rows_by_path["agent/service.py"]["sha256"]
 
     summary = summarize_file_inventory(rows)
     assert summary["by_status"]["clustered"] == 1
     assert summary["by_status"]["secondary_attached"] == 2
     assert summary["by_status"]["orphan"] == 3
-    assert summary["by_status"]["pending_decision"] == 2
-    assert summary["by_status"]["ignored"] == 1
+    assert summary["by_status"]["pending_decision"] == 3
+    assert summary["by_status"]["ignored"] == 3
 
 
 def test_inventory_persists_to_governance_table(tmp_path):
