@@ -13,7 +13,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .reconcile_phases.orchestrator import run_commit_sweep_orchestrated
 
@@ -30,6 +30,16 @@ ACTIONABLE_MATERIALIZATION_TYPES = frozenset({
     "doc_value_drift",
     "contract_no_test",
 })
+WAIVED_DOC_DEBT_STATUSES = frozenset({"waived", "waiver"})
+DOC_DEBT_KINDS = frozenset({
+    "doc_debt",
+    "doc-debt",
+    "doc debt",
+    "documentation_debt",
+    "documentation debt",
+    "missing_doc",
+})
+DOC_DEBT_PATH_KEYS = ("path", "file", "file_path", "doc", "doc_path", "target", "target_file")
 
 
 class ScopeCatchupError(RuntimeError):
@@ -145,9 +155,122 @@ def _extract_discrepancy_path(discrepancy: Dict[str, Any]) -> str:
     return str(discrepancy.get("path") or discrepancy.get("file") or "")
 
 
+def _normalize_repo_path(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    path = value.strip().replace("\\", "/").strip(",;")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
 def _is_actionable_discrepancy(discrepancy: Dict[str, Any]) -> bool:
     dtype = str(discrepancy.get("type") or "")
     return dtype in ACTIONABLE_MATERIALIZATION_TYPES
+
+
+def _looks_like_doc_debt_kind(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {kind.replace("-", "_").replace(" ", "_") for kind in DOC_DEBT_KINDS}
+
+
+def _is_waived_doc_debt_entry(entry: Any, *, implied_doc_debt: bool = False) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    status = str(entry.get("status") or entry.get("decision") or "").strip().lower()
+    if status not in WAIVED_DOC_DEBT_STATUSES:
+        return False
+    if implied_doc_debt:
+        return True
+    for key in ("kind", "type", "category"):
+        if _looks_like_doc_debt_kind(entry.get(key)):
+            return True
+    reason = str(entry.get("reason") or entry.get("evidence") or "").lower()
+    return "doc_debt" in reason or "doc debt" in reason or "documentation debt" in reason
+
+
+def _iter_doc_debt_entries(value: Any, *, implied_doc_debt: bool = False) -> Iterable[tuple[Dict[str, Any], bool]]:
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_doc_debt_entries(item, implied_doc_debt=implied_doc_debt)
+    elif isinstance(value, dict):
+        yield value, implied_doc_debt
+
+
+def _entry_path_keys(entry: Dict[str, Any]) -> Set[str]:
+    paths = set()
+    for key in DOC_DEBT_PATH_KEYS:
+        path = _normalize_repo_path(entry.get(key))
+        if path:
+            paths.add(path)
+    return paths
+
+
+def _extract_doc_debt_waiver_paths_from_graph_delta(graph_delta: Any) -> Set[str]:
+    if not isinstance(graph_delta, dict):
+        return set()
+    paths = set()
+    for entry, implied in _iter_doc_debt_entries(graph_delta.get("waivers", []), implied_doc_debt=False):
+        if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
+            paths.update(_entry_path_keys(entry))
+    for key in ("doc_debt", "doc_debt_waivers"):
+        for entry, implied in _iter_doc_debt_entries(graph_delta.get(key, []), implied_doc_debt=True):
+            if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
+                paths.update(_entry_path_keys(entry))
+    return paths
+
+
+def _extract_doc_debt_waiver_paths_from_event_payload(payload: Any) -> Set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    paths = set()
+    paths.update(_extract_doc_debt_waiver_paths_from_graph_delta(payload))
+    paths.update(_extract_doc_debt_waiver_paths_from_graph_delta(payload.get("graph_delta")))
+    proposed = payload.get("proposed_payload")
+    if isinstance(proposed, dict):
+        paths.update(_extract_doc_debt_waiver_paths_from_graph_delta(proposed))
+        paths.update(_extract_doc_debt_waiver_paths_from_graph_delta(proposed.get("graph_delta")))
+    return paths
+
+
+def _load_committed_doc_debt_waiver_paths(project_id: str) -> Set[str]:
+    """Read durable graph-delta waiver evidence from this project's audit DB."""
+    try:
+        from .db import get_connection  # noqa: WPS433
+    except Exception:
+        return set()
+
+    conn = None
+    try:
+        conn = get_connection(project_id)
+        rows = conn.execute(
+            "SELECT payload_json FROM chain_events "
+            "WHERE event_type = 'graph.delta.committed' "
+            "ORDER BY ts"
+        ).fetchall()
+    except Exception:
+        return set()
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    paths = set()
+    for row in rows:
+        try:
+            raw = row["payload_json"]
+        except (TypeError, KeyError, IndexError):
+            raw = row[0] if row else ""
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            continue
+        paths.update(_extract_doc_debt_waiver_paths_from_event_payload(payload))
+    return paths
 
 
 def _materialization_bug_id(
@@ -176,11 +299,22 @@ def _summarize_materialization_backlog(
     sweep: Dict[str, Any],
     bug_id: Optional[str] = None,
     since_baseline: Optional[str] = None,
+    waived_doc_debt_paths: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    actionable = [
-        dict(d) for d in sweep.get("dedup_discrepancies", []) or []
-        if isinstance(d, dict) and _is_actionable_discrepancy(d)
-    ]
+    waiver_paths = {_normalize_repo_path(path) for path in waived_doc_debt_paths or []}
+    waiver_paths.discard("")
+    actionable = []
+    waived_actionable = []
+    for d in sweep.get("dedup_discrepancies", []) or []:
+        if not isinstance(d, dict) or not _is_actionable_discrepancy(d):
+            continue
+        item = dict(d)
+        path = _normalize_repo_path(_extract_discrepancy_path(item))
+        if path and path in waiver_paths:
+            item["waiver"] = "committed_doc_debt"
+            waived_actionable.append(item)
+            continue
+        actionable.append(item)
     target_files = []
     for path in list(sweep.get("hot_files", []) or []):
         if path and path not in target_files:
@@ -204,6 +338,9 @@ def _summarize_materialization_backlog(
         "target_files": target_files[:50],
         "test_files": test_files[:50],
         "discrepancies": actionable[:20],
+        "waived_actionable_count": len(waived_actionable),
+        "waived_doc_debt_paths": sorted(waiver_paths),
+        "waived_discrepancies": waived_actionable[:20],
     }
 
 
@@ -344,12 +481,14 @@ def run_scope_catchup(
 
     summary = _sweep_summary(sweep)
     resolved_since_baseline = sweep.get("since_baseline") or since_baseline
+    waived_doc_debt_paths = _load_committed_doc_debt_waiver_paths(project_id)
     materialization = _summarize_materialization_backlog(
         project_id=project_id,
         worktree=worktree,
         sweep=sweep,
         bug_id=materialization_bug_id,
         since_baseline=resolved_since_baseline,
+        waived_doc_debt_paths=waived_doc_debt_paths,
     )
 
     result = {

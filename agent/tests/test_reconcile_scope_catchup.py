@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 from agent.governance.reconcile_scope_catchup import (
     DEFAULT_PHASES,
+    _load_committed_doc_debt_waiver_paths,
     _summarize_materialization_backlog,
     ensure_catchup_worktree,
     run_scope_catchup,
@@ -210,6 +212,93 @@ def test_run_scope_catchup_can_file_materialization_backlog(tmp_path):
         "agent/tests/test_new_runtime.py",
     ]
     assert summary["test_files"] == ["agent/tests/test_new_runtime.py"]
+
+
+def test_materialization_summary_suppresses_committed_doc_debt_waived_path():
+    summary = _summarize_materialization_backlog(
+        project_id="aming-claw",
+        worktree={
+            "base_short": "abcdef1",
+            "worktree_head": "abcdef1234567890",
+        },
+        sweep={
+            "hot_files": ["agent/new_runtime.py"],
+            "dedup_discrepancies": [
+                {
+                    "type": "unmapped_file",
+                    "detail": "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md",
+                },
+                {"type": "unmapped_file", "detail": "agent/new_runtime.py"},
+            ],
+        },
+        waived_doc_debt_paths={"docs/dev/scratch/reconcile-comprehensive-2026-05-06.md"},
+    )
+
+    assert summary["actionable_count"] == 1
+    assert summary["actionable_types"] == ["unmapped_file"]
+    assert summary["target_files"] == ["agent/new_runtime.py"]
+    assert summary["waived_actionable_count"] == 1
+    assert summary["waived_discrepancies"][0]["waiver"] == "committed_doc_debt"
+    assert summary["waived_doc_debt_paths"] == [
+        "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md"
+    ]
+
+
+def test_load_committed_doc_debt_waiver_paths_reads_graph_delta_events():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE chain_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, root_task_id TEXT, task_id TEXT, "
+        "event_type TEXT, payload_json TEXT, ts TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "root",
+            "gate",
+            "graph.delta.committed",
+            json.dumps({
+                "waivers": [
+                    {
+                        "path": "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md",
+                        "kind": "doc_debt",
+                        "status": "waived",
+                    }
+                ]
+            }),
+            "2026-05-06T18:17:55Z",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            "root",
+            "qa",
+            "graph.delta.validated",
+            json.dumps({
+                "proposed_payload": {
+                    "graph_delta": {
+                        "waivers": [
+                            {
+                                "path": "docs/dev/scratch/uncommitted.md",
+                                "kind": "doc_debt",
+                                "status": "waived",
+                            }
+                        ]
+                    }
+                }
+            }),
+            "2026-05-06T18:17:28Z",
+        ),
+    )
+
+    with patch("agent.governance.db.get_connection", return_value=conn):
+        paths = _load_committed_doc_debt_waiver_paths("aming-claw")
+
+    assert paths == {"docs/dev/scratch/reconcile-comprehensive-2026-05-06.md"}
 
 
 def test_apply_blocks_baseline_when_actionable_drift_is_unfiled(tmp_path):
