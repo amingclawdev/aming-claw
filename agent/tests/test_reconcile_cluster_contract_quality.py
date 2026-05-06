@@ -205,6 +205,88 @@ def test_reconcile_cluster_pm_preflight_rejects_dropped_candidate_doc_consumer()
     assert "reconcile-workflow.md" in reason
 
 
+def test_reconcile_orphan_doc_test_review_pm_allows_supplied_doc_test_superset():
+    metadata = _candidate_metadata()
+    metadata["cluster_report"] = {
+        "allow_doc_test_augmentation": True,
+        "purpose": "Final orphan doc/test review",
+        "expected_doc_files": ["docs/governance/reconcile-doc-index.md"],
+        "expected_test_files": ["agent/tests/test_reconcile_doc_index.py"],
+    }
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": [
+                    "docs/governance/reconcile-workflow.md",
+                    "docs/governance/reconcile-doc-index.md",
+                ],
+                "test": [
+                    "agent/tests/test_reconcile_batch_memory.py",
+                    "agent/tests/test_reconcile_doc_index.py",
+                ],
+                "test_coverage": "direct",
+            }
+        ],
+        "verification": {
+            "method": "automated test",
+            "command": (
+                "pytest agent/tests/test_reconcile_batch_memory.py "
+                "agent/tests/test_reconcile_doc_index.py -v"
+            ),
+        },
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+        metadata=metadata,
+    )
+
+    assert passed, reason
+
+
+def test_reconcile_normal_cluster_pm_rejects_doc_test_superset():
+    metadata = _candidate_metadata()
+    prd = {
+        "proposed_nodes": [
+            {
+                "node_id": "L7.72",
+                "title": "agent.governance.reconcile_batch_memory",
+                "parent_layer": 7,
+                "parent_id": "L3.22",
+                "deps": ["L7.11"],
+                "primary": ["agent/governance/reconcile_batch_memory.py"],
+                "secondary": [
+                    "docs/governance/reconcile-workflow.md",
+                    "docs/governance/reconcile-doc-index.md",
+                ],
+                "test": ["agent/tests/test_reconcile_batch_memory.py"],
+                "test_coverage": "direct",
+            }
+        ],
+        "verification": {
+            "method": "automated test",
+            "command": "pytest agent/tests/test_reconcile_batch_memory.py -v",
+        },
+    }
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_pm(
+        prd,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+        metadata=metadata,
+    )
+
+    assert not passed
+    assert "must match candidate exactly" in reason
+    assert "reconcile-doc-index.md" in reason
+
+
 def test_reconcile_cluster_pm_preflight_rejects_candidate_test_coverage_drift():
     metadata = _candidate_metadata()
     prd = {
@@ -413,6 +495,45 @@ def test_reconcile_cluster_dev_preflight_rejects_dropped_candidate_test_consumer
     assert not passed
     assert "graph_delta.creates test" in reason
     assert "Candidate doc/test consumers" in reason
+
+
+def test_reconcile_orphan_doc_test_review_dev_allows_supplied_doc_test_superset():
+    metadata = _candidate_metadata()
+    metadata["cluster_report"] = {
+        "allow_doc_test_augmentation": True,
+        "purpose": "Final orphan doc/test review",
+        "expected_doc_files": ["docs/governance/reconcile-doc-index.md"],
+        "expected_test_files": ["agent/tests/test_reconcile_doc_index.py"],
+    }
+    pm_nodes = [
+        {
+            "node_id": "L7.72",
+            "title": "agent.governance.reconcile_batch_memory",
+            "parent_layer": 7,
+            "parent_id": "L3.22",
+            "deps": ["L7.11"],
+            "primary": ["agent/governance/reconcile_batch_memory.py"],
+            "secondary": [
+                "docs/governance/reconcile-workflow.md",
+                "docs/governance/reconcile-doc-index.md",
+            ],
+            "test": [
+                "agent/tests/test_reconcile_batch_memory.py",
+                "agent/tests/test_reconcile_doc_index.py",
+            ],
+            "test_coverage": "direct",
+        }
+    ]
+    dev_creates = [dict(pm_nodes[0])]
+
+    passed, reason = auto_chain.preflight_reconcile_cluster_dev(
+        pm_nodes,
+        dev_creates,
+        candidate_nodes=auto_chain._cluster_payload_candidate_nodes(metadata),
+        metadata=metadata,
+    )
+
+    assert passed, reason
 
 
 def test_reconcile_cluster_preflight_blocks_phase_z_test_superset_loss():

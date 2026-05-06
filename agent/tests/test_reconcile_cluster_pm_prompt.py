@@ -176,3 +176,78 @@ def test_reconcile_cluster_pm_prompt_keeps_candidate_manifest_untruncated(tmp_pa
     assert '"primary": [\n      "agent/governance/reconcile_phases/orchestrator.py"' in manifest
     assert '"hierarchy_parent": "L3.18"' in manifest
     assert "...<truncated>" in prompt
+
+
+def test_reconcile_orphan_doc_test_review_prompt_allows_evidence_based_augments(tmp_path, monkeypatch):
+    import requests
+    from executor_worker import ExecutorWorker, _derive_target_files, _derive_test_files
+
+    source = tmp_path / "agent" / "governance" / "reconcile_doc_index.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def build_final_doc_index():\n    return {}\n", encoding="utf-8")
+
+    metadata = {
+        "operation_type": "reconcile-cluster",
+        "cluster_fingerprint": "fp-orphan-review",
+        "cluster_payload": {
+            "primary_files": ["agent/governance/reconcile_doc_index.py"],
+            "secondary_files": [
+                "docs/governance/reconcile-workflow.md",
+                "agent/tests/test_reconcile_doc_index.py",
+            ],
+            "candidate_nodes": [
+                {
+                    "node_id": "L7.76",
+                    "title": "agent.governance.reconcile_doc_index",
+                    "primary": ["agent/governance/reconcile_doc_index.py"],
+                    "layer": "L7",
+                    "secondary": [],
+                    "test": ["agent/tests/test_reconcile_doc_index.py"],
+                    "test_coverage": "direct",
+                }
+            ],
+            "prompt": "Final orphan doc/test review for reconcile core",
+        },
+        "cluster_report": {
+            "title": "final orphan doc/test review: reconcile core",
+            "purpose": "Final reconcile orphan pass for doc/test inventory",
+            "allow_doc_test_augmentation": True,
+            "expected_doc_files": ["docs/governance/reconcile-workflow.md"],
+            "expected_test_files": ["agent/tests/test_reconcile_doc_index.py"],
+        },
+    }
+
+    class _Resp:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _Resp({"exists": False, "tasks": []}))
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Resp({"affected_nodes": []}))
+
+    worker = ExecutorWorker.__new__(ExecutorWorker)
+    worker.project_id = "aming-claw"
+    worker.base_url = "http://localhost:40000"
+    worker.workspace = str(tmp_path)
+    worker._fetch_memories = lambda query: []
+
+    prompt = worker._build_prompt(
+        "Final orphan doc/test review for reconcile core",
+        "pm",
+        {
+            "task_id": "task-orphan-review",
+            "metadata": metadata,
+            "operation_type": "reconcile-cluster",
+            "cluster_payload": metadata["cluster_payload"],
+            "cluster_report": metadata["cluster_report"],
+            "target_files": _derive_target_files(metadata),
+            "test_files": _derive_test_files(metadata),
+        },
+    )
+
+    assert "explicit orphan doc/test review" in prompt
+    assert "minimum baselines, not a ceiling" in prompt
+    assert "only when the PRD includes concrete evidence" in prompt
+    assert "Preserve secondary, test, and test_coverage exactly" not in prompt

@@ -3163,6 +3163,7 @@ def _validate_pm_at_transition(conn, project_id, task_id, result, metadata):
         cluster_ok, cluster_reason = preflight_reconcile_cluster_pm(
             result or {},
             candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+            metadata=metadata,
         )
         if not cluster_ok:
             log.warning(
@@ -3200,6 +3201,7 @@ def _preflight_failure_reason(stage, conn, project_id, task_id, result, metadata
                 ok, reason = preflight_reconcile_cluster_pm(
                     result or {},
                     candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+                    metadata=metadata,
                 )
                 if not ok and reason:
                     return reason
@@ -4722,6 +4724,7 @@ def _gate_post_pm(conn, project_id, result, metadata):
         cluster_ok, cluster_reason = preflight_reconcile_cluster_pm(
             result,
             candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+            metadata=metadata,
         )
         if not cluster_ok:
             return False, cluster_reason
@@ -4918,6 +4921,7 @@ def _gate_checkpoint(conn, project_id, result, metadata):
                     metadata.get("proposed_nodes", []),
                     creates,
                     candidate_nodes=_cluster_payload_candidate_nodes(metadata),
+                    metadata=metadata,
                 )
                 if cluster_dev_ok:
                     return True, "reconcile-cluster no-test overlay-only graph_delta accepted"
@@ -5344,6 +5348,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
                         metadata.get("proposed_nodes", []),
                         proposed_creates,
                         candidate_nodes=payload_candidate_nodes,
+                        metadata=metadata,
                     )
                     if not cluster_dev_ok:
                         return False, cluster_dev_reason
@@ -6926,6 +6931,107 @@ def _cluster_candidate_python_tests(candidate_nodes):
     return tuple(sorted(set(tests)))
 
 
+def _cluster_is_test_path(path):
+    text = str(path or "").replace("\\", "/").lower()
+    name = text.rsplit("/", 1)[-1]
+    return (
+        text.startswith("agent/tests/")
+        or "/tests/" in text
+        or name.startswith("test_")
+        or ".test." in name
+        or ".spec." in name
+    )
+
+
+def _cluster_is_doc_path(path):
+    text = str(path or "").lower()
+    return text.endswith((".md", ".rst", ".txt", ".adoc"))
+
+
+def _cluster_doc_test_augmentation_policy(metadata=None):
+    """Return explicit doc/test augmentation policy for orphan asset review.
+
+    Normal reconcile clusters preserve candidate doc/test identity exactly.  A
+    final orphan doc/test review cluster may append existing, supplied consumer
+    paths so long as it never drops candidate paths.
+    """
+    if not isinstance(metadata, dict):
+        metadata = {}
+    payload = metadata.get("cluster_payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    report = metadata.get("cluster_report")
+    if not isinstance(report, dict):
+        report = {}
+
+    text_parts = [
+        metadata.get("prompt", ""),
+        payload.get("prompt", ""),
+        payload.get("slug", ""),
+        report.get("title", ""),
+        report.get("purpose", ""),
+        report.get("coverage_audit", ""),
+    ]
+    haystack = " ".join(str(x or "").lower() for x in text_parts)
+    allow = bool(
+        metadata.get("allow_doc_test_augmentation")
+        or payload.get("allow_doc_test_augmentation")
+        or report.get("allow_doc_test_augmentation")
+        or (
+            "orphan" in haystack
+            and ("doc/test" in haystack or ("doc" in haystack and "test" in haystack))
+            and ("review" in haystack or "pass" in haystack)
+        )
+    )
+
+    allowed_secondary = set()
+    allowed_test = set()
+    for value in (
+        report.get("expected_doc_files"),
+        report.get("expected_doc_sections"),
+        metadata.get("required_docs"),
+    ):
+        for path in _cluster_normalize_primary(value):
+            if _cluster_is_doc_path(path):
+                allowed_secondary.add(path)
+    for value in (
+        report.get("expected_test_files"),
+        metadata.get("test_files"),
+    ):
+        for path in _cluster_normalize_primary(value):
+            if _cluster_is_test_path(path):
+                allowed_test.add(path)
+    for path in _cluster_normalize_primary(payload.get("secondary_files")):
+        if _cluster_is_test_path(path):
+            allowed_test.add(path)
+        elif _cluster_is_doc_path(path):
+            allowed_secondary.add(path)
+
+    return {
+        "allow": allow,
+        "secondary": tuple(sorted(allowed_secondary)),
+        "test": tuple(sorted(allowed_test)),
+    }
+
+
+def _cluster_doc_test_paths_match(field, candidate_paths, actual_paths, policy):
+    candidate_paths = tuple(candidate_paths or ())
+    actual_paths = tuple(actual_paths or ())
+    if actual_paths == candidate_paths:
+        return True, "ok"
+    if not policy.get("allow"):
+        return False, "exact"
+    candidate_set = set(candidate_paths)
+    actual_set = set(actual_paths)
+    if not candidate_set.issubset(actual_set):
+        return False, "dropped_candidate_paths"
+    additions = actual_set - candidate_set
+    allowed = set(policy.get(field) or ())
+    if additions and not additions.issubset(allowed):
+        return False, "unapproved_added_paths"
+    return True, "ok"
+
+
 def _validate_cluster_verification_against_candidate_tests(prd, candidate_nodes):
     """Require real pytest execution when candidate graph declares Python tests."""
     expected_tests = _cluster_candidate_python_tests(candidate_nodes)
@@ -7023,7 +7129,7 @@ def _cluster_proposed_parent_matches(proposed_node, candidate_parent):
     return _cluster_parent_node_hint(proposed_node) == candidate_parent
 
 
-def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
+def _validate_cluster_prd_against_candidates(proposed, candidate_nodes, metadata=None):
     """Ensure PM preserves concrete candidate ids before Dev sees the task."""
     if not candidate_nodes:
         return True, "ok"
@@ -7077,6 +7183,7 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
             f"extra={sorted(seen_ids - expected_ids)}"
         )
 
+    augmentation_policy = _cluster_doc_test_augmentation_policy(metadata)
     for node_id, candidate in expected.items():
         proposed_node = seen[node_id]
         cand_primary = candidate["primary"]
@@ -7122,18 +7229,43 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
         for field in ("secondary", "test"):
             cand_paths = candidate[field]
             prop_paths = tuple(_cluster_normalize_primary(proposed_node.get(field)))
-            if cand_paths != prop_paths:
+            paths_ok, path_reason = _cluster_doc_test_paths_match(
+                field,
+                cand_paths,
+                prop_paths,
+                augmentation_policy,
+            )
+            if not paths_ok:
+                if path_reason == "dropped_candidate_paths":
+                    detail = "Candidate doc/test consumers cannot be dropped."
+                elif path_reason == "unapproved_added_paths":
+                    detail = (
+                        "Added doc/test consumers must be supplied by this "
+                        "orphan review cluster's expected_doc_files/"
+                        "expected_test_files."
+                    )
+                else:
+                    detail = (
+                        "Candidate doc/test consumers are graph identity; do not drop, "
+                        "move, or invent them in PM."
+                    )
                 return False, (
                     "FATAL preflight (reconcile-cluster): proposed_nodes "
                     f"{field} for {node_id} must match candidate exactly; "
                     f"expected={list(cand_paths)} actual={list(prop_paths)}. "
-                    "Candidate doc/test consumers are graph identity; do not drop, "
-                    "move, or invent them in PM."
+                    f"{detail}"
                 )
         if candidate["has_test_coverage"]:
             cand_coverage = candidate["test_coverage"]
             prop_coverage = _cluster_normalize_scalar(proposed_node.get("test_coverage"))
-            if cand_coverage != prop_coverage:
+            test_paths_changed = tuple(_cluster_normalize_primary(proposed_node.get("test"))) != candidate["test"]
+            coverage_augmented = (
+                augmentation_policy.get("allow")
+                and test_paths_changed
+                and cand_coverage in ("", "none")
+                and prop_coverage not in ("", "none")
+            )
+            if cand_coverage != prop_coverage and not coverage_augmented:
                 return False, (
                     "FATAL preflight (reconcile-cluster): proposed_nodes "
                     f"test_coverage for {node_id} must match candidate exactly; "
@@ -7143,7 +7275,7 @@ def _validate_cluster_prd_against_candidates(proposed, candidate_nodes):
     return True, "ok"
 
 
-def preflight_reconcile_cluster_pm(prd, candidate_nodes=None):
+def preflight_reconcile_cluster_pm(prd, candidate_nodes=None, metadata=None):
     """Stage 1 preflight — PM PRD must declare proposed_nodes for reconcile-cluster.
 
     Returns (passed: bool, reason: str).  Any FATAL outcome here is a preflight
@@ -7165,7 +7297,7 @@ def preflight_reconcile_cluster_pm(prd, candidate_nodes=None):
             "proposed_nodes list before merge can apply the cluster overlay"
         )
     candidate_passed, candidate_reason = _validate_cluster_prd_against_candidates(
-        proposed, candidate_nodes or [],
+        proposed, candidate_nodes or [], metadata=metadata,
     )
     if not candidate_passed:
         return False, candidate_reason
@@ -7259,7 +7391,12 @@ def _cluster_hydrate_create_parent_layers(dev_creates, pm_proposed_nodes, candid
     return hydrated
 
 
-def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_nodes=None):
+def preflight_reconcile_cluster_dev(
+    pm_proposed_nodes,
+    dev_creates,
+    candidate_nodes=None,
+    metadata=None,
+):
     """Stage 2 preflight — Dev's graph_delta.creates ⇔ PM proposed_nodes 1:1 by primary.
 
     FATAL when count differs or when primary identity does not 1:1 match.
@@ -7299,6 +7436,7 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_no
             "test_coverage": _cluster_normalize_scalar(item.get("test_coverage")),
             "has_test_coverage": "test_coverage" in item,
         }
+    augmentation_policy = _cluster_doc_test_augmentation_policy(metadata)
     if expected_contract:
         for idx, item in enumerate(dev_creates or []):
             if not isinstance(item, dict):
@@ -7335,17 +7473,40 @@ def preflight_reconcile_cluster_dev(pm_proposed_nodes, dev_creates, candidate_no
             for field in ("secondary", "test"):
                 expected_paths = expected_contract[node_id][field]
                 actual_paths = tuple(_cluster_normalize_primary(item.get(field)))
-                if actual_paths != expected_paths:
+                paths_ok, path_reason = _cluster_doc_test_paths_match(
+                    field,
+                    expected_paths,
+                    actual_paths,
+                    augmentation_policy,
+                )
+                if not paths_ok:
+                    if path_reason == "dropped_candidate_paths":
+                        detail = "Candidate doc/test consumers cannot be dropped."
+                    elif path_reason == "unapproved_added_paths":
+                        detail = (
+                            "Added doc/test consumers must be supplied by this "
+                            "orphan review cluster's expected_doc_files/"
+                            "expected_test_files."
+                        )
+                    else:
+                        detail = "Candidate doc/test consumers are graph identity."
                     return False, (
                         "FATAL preflight (reconcile-cluster): graph_delta.creates "
                         f"{field} for {node_id} must match candidate exactly; "
                         f"expected={list(expected_paths)} actual={list(actual_paths)}. "
-                        "Candidate doc/test consumers are graph identity."
+                        f"{detail}"
                     )
             if expected_contract[node_id]["has_test_coverage"]:
                 expected_coverage = expected_contract[node_id]["test_coverage"]
                 actual_coverage = _cluster_normalize_scalar(item.get("test_coverage"))
-                if actual_coverage != expected_coverage:
+                test_paths_changed = tuple(_cluster_normalize_primary(item.get("test"))) != expected_contract[node_id]["test"]
+                coverage_augmented = (
+                    augmentation_policy.get("allow")
+                    and test_paths_changed
+                    and expected_coverage in ("", "none")
+                    and actual_coverage not in ("", "none")
+                )
+                if actual_coverage != expected_coverage and not coverage_augmented:
                     return False, (
                         "FATAL preflight (reconcile-cluster): graph_delta.creates "
                         f"test_coverage for {node_id} must match candidate exactly; "
@@ -7866,6 +8027,7 @@ def apply_reconcile_cluster_to_overlay(
     pm_passed, pm_reason = preflight_reconcile_cluster_pm(
         pm_prd,
         candidate_nodes=payload_candidate_nodes,
+        metadata=metadata,
     )
     if not pm_passed:
         return {
@@ -7885,6 +8047,7 @@ def apply_reconcile_cluster_to_overlay(
         pm_proposed,
         dev_creates,
         candidate_nodes=payload_candidate_nodes,
+        metadata=metadata,
     )
     if not dev_passed:
         return {

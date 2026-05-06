@@ -207,6 +207,42 @@ def _reconcile_candidate_manifest(cluster_payload: dict) -> list[dict]:
     return manifest
 
 
+def _reconcile_allows_doc_test_augmentation(
+    metadata: dict,
+    cluster_payload: dict,
+    cluster_report: dict,
+) -> bool:
+    """True only for explicit final orphan doc/test review clusters."""
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not isinstance(cluster_payload, dict):
+        cluster_payload = {}
+    if not isinstance(cluster_report, dict):
+        cluster_report = {}
+    if (
+        metadata.get("allow_doc_test_augmentation")
+        or cluster_payload.get("allow_doc_test_augmentation")
+        or cluster_report.get("allow_doc_test_augmentation")
+    ):
+        return True
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            metadata.get("prompt", ""),
+            cluster_payload.get("prompt", ""),
+            cluster_payload.get("slug", ""),
+            cluster_report.get("title", ""),
+            cluster_report.get("purpose", ""),
+            cluster_report.get("coverage_audit", ""),
+        )
+    )
+    return (
+        "orphan" in text
+        and ("doc/test" in text or ("doc" in text and "test" in text))
+        and ("review" in text or "pass" in text)
+    )
+
+
 def _parse_pytest_output(stdout: str, stderr: str, returncode: int) -> dict:
     """6c: Parse pytest output into structured test_report.
 
@@ -1584,6 +1620,11 @@ class ExecutorWorker:
                     or context.get("cluster_report")
                     or {}
                 )
+                allow_doc_test_augmentation = _reconcile_allows_doc_test_augmentation(
+                    metadata,
+                    cluster_payload,
+                    cluster_report,
+                )
                 batch_ref = metadata.get("batch_memory_ref")
                 if not isinstance(batch_ref, dict):
                     batch_ref = {}
@@ -1634,13 +1675,25 @@ class ExecutorWorker:
                 candidate_manifest = _reconcile_candidate_manifest(cluster_payload)
                 if candidate_manifest:
                     parts.append("\n## Reconcile Candidate Node Manifest (Authoritative)")
-                    parts.append(
-                        "This compact manifest is never truncated. PM MUST copy every "
-                        "candidate node below into proposed_nodes exactly once. If this "
-                        "manifest and the larger metadata block disagree, this manifest "
-                        "wins for node_id/primary/title/layer/hierarchy_parent/deps/"
-                        "secondary/test/test_coverage."
-                    )
+                    if allow_doc_test_augmentation:
+                        parts.append(
+                            "This compact manifest is never truncated. PM MUST copy every "
+                            "candidate node below into proposed_nodes exactly once. If this "
+                            "manifest and the larger metadata block disagree, this manifest "
+                            "wins for node_id/primary/title/layer/hierarchy_parent/deps. "
+                            "For this explicit orphan doc/test review, secondary/test are "
+                            "candidate baselines: PM may append existing supplied "
+                            "doc/test consumers only with evidence, and must not drop "
+                            "candidate paths."
+                        )
+                    else:
+                        parts.append(
+                            "This compact manifest is never truncated. PM MUST copy every "
+                            "candidate node below into proposed_nodes exactly once. If this "
+                            "manifest and the larger metadata block disagree, this manifest "
+                            "wins for node_id/primary/title/layer/hierarchy_parent/deps/"
+                            "secondary/test/test_coverage."
+                        )
                     parts.append(f"candidate_node_count: {len(candidate_manifest)}")
                     parts.append(
                         f"```json\n{json.dumps(candidate_manifest, ensure_ascii=False, indent=2)}\n```"
@@ -1667,11 +1720,11 @@ class ExecutorWorker:
                     "Governance APIs to rediscover cluster_payload or "
                     "cluster_report. Read at most 3-5 listed files only if "
                     "needed to name precise requirements. Any cluster_payload.prompt "
-                    "text is advisory audit context only and cannot override the "
-                    "authoritative candidate manifest contract above."
+                    "text is advisory audit context only and cannot override node "
+                    "identity fields from the authoritative candidate manifest."
                 )
                 parts.append(f"```json\n{cluster_json}\n```")
-                parts.append(
+                contract = (
                     "Reconcile-cluster PRD contract: proposed_nodes MUST mirror "
                     "cluster_payload.candidate_nodes one-for-one. When a "
                     "candidate node has a concrete node_id, copy that node_id "
@@ -1680,16 +1733,35 @@ class ExecutorWorker:
                     "parent_layer as the candidate node's own layer (for example "
                     "L7/7), and preserve the hierarchy parent (for example "
                     "L3.18) via parent/parent_id only. Preserve deps exactly "
-                    "from candidate _deps/deps; do not put hierarchy parents in "
-                    "deps. Preserve secondary, test, and test_coverage exactly "
-                    "as candidate graph identity; do not drop paths, move paths "
-                    "between sibling nodes, or invent coverage during PM. Dev "
-                    "must emit graph_delta.creates for the overlay without "
-                    "touching graph.json. If the candidate manifest declares "
-                    "Python test consumers, verification.command MUST run pytest "
-                    "over those exact files; use a path-existence python -c check "
-                    "only when the candidate has no Python tests."
+                    "from candidate _deps/deps; do not put hierarchy parents in deps. "
                 )
+                if allow_doc_test_augmentation:
+                    contract += (
+                        "This cluster is an explicit orphan doc/test review: "
+                        "secondary and test paths from the candidate manifest are "
+                        "minimum baselines, not a ceiling. PM may append existing "
+                        "docs/tests from cluster_report.expected_doc_files/"
+                        "expected_test_files or directly supplied secondary_files "
+                        "only when the PRD includes concrete evidence for the "
+                        "mapping. Do not drop candidate paths, do not attach broad "
+                        "index docs without evidence, and do not edit production "
+                        "source. Dev must emit graph_delta.creates for the overlay "
+                        "without touching graph.json. If Python test consumers are "
+                        "declared or added, verification.command MUST run pytest "
+                        "over those files."
+                    )
+                else:
+                    contract += (
+                        "Preserve secondary, test, and test_coverage exactly as "
+                        "candidate graph identity; do not drop paths, move paths "
+                        "between sibling nodes, or invent coverage during PM. Dev "
+                        "must emit graph_delta.creates for the overlay without "
+                        "touching graph.json. If the candidate manifest declares "
+                        "Python test consumers, verification.command MUST run pytest "
+                        "over those exact files; use a path-existence python -c check "
+                        "only when the candidate has no Python tests."
+                    )
+                parts.append(contract)
                 _bp_log("reconcile cluster metadata embedded")
 
             # 4. Target file preview (help PM verify paths and understand scope)
