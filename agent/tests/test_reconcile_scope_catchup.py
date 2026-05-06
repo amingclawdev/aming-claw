@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from agent.governance.reconcile_scope_catchup import (
     DEFAULT_PHASES,
+    _summarize_materialization_backlog,
     ensure_catchup_worktree,
     run_scope_catchup,
 )
@@ -261,3 +262,22 @@ def test_apply_blocks_baseline_when_actionable_drift_is_unfiled(tmp_path):
     assert "baseline_blocked_reason" in result
     assert mock_sweep.call_count == 1
     assert mock_sweep.call_args.kwargs["dry_run"] is True
+
+
+def test_materialization_bug_id_uses_since_baseline_range():
+    summary = _summarize_materialization_backlog(
+        project_id="aming-claw",
+        worktree={
+            "base_short": "headish",
+            "worktree_head": "abcdef1234567890",
+        },
+        sweep={
+            "hot_files": ["agent/new_runtime.py"],
+            "dedup_discrepancies": [
+                {"type": "unmapped_file", "detail": "agent/new_runtime.py"},
+            ],
+        },
+        since_baseline="1234567890abcdef",
+    )
+
+    assert summary["bug_id"].startswith("RECONCILE-SCOPE-MATERIALIZE-1234567-abcdef1-")

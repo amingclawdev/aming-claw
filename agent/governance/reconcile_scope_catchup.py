@@ -150,10 +150,15 @@ def _is_actionable_discrepancy(discrepancy: Dict[str, Any]) -> bool:
     return dtype in ACTIONABLE_MATERIALIZATION_TYPES
 
 
-def _materialization_bug_id(project_id: str, worktree: Dict[str, str], sweep: Dict[str, Any]) -> str:
+def _materialization_bug_id(
+    project_id: str,
+    worktree: Dict[str, str],
+    sweep: Dict[str, Any],
+    since_baseline: Optional[str] = None,
+) -> str:
     import hashlib
 
-    base = worktree.get("base_short") or "base"
+    base = (since_baseline or "")[:7] or worktree.get("base_short") or "base"
     head = worktree.get("worktree_head", "")[:7] or "head"
     hot = "\n".join(sorted(str(p) for p in sweep.get("hot_files", []) or []))
     digest = hashlib.sha1((project_id + "\n" + base + "\n" + head + "\n" + hot).encode("utf-8")).hexdigest()[:8]
@@ -170,6 +175,7 @@ def _summarize_materialization_backlog(
     worktree: Dict[str, str],
     sweep: Dict[str, Any],
     bug_id: Optional[str] = None,
+    since_baseline: Optional[str] = None,
 ) -> Dict[str, Any]:
     actionable = [
         dict(d) for d in sweep.get("dedup_discrepancies", []) or []
@@ -192,7 +198,7 @@ def _summarize_materialization_backlog(
     return {
         "enabled": False,
         "filed": False,
-        "bug_id": bug_id or _materialization_bug_id(project_id, worktree, sweep),
+        "bug_id": bug_id or _materialization_bug_id(project_id, worktree, sweep, since_baseline),
         "actionable_count": len(actionable),
         "actionable_types": sorted({str(d.get("type") or "") for d in actionable}),
         "target_files": target_files[:50],
@@ -342,6 +348,7 @@ def run_scope_catchup(
         worktree=worktree,
         sweep=sweep,
         bug_id=materialization_bug_id,
+        since_baseline=since_baseline,
     )
 
     result = {
