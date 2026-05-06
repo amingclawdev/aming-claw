@@ -30,8 +30,12 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     _write(str(project / "agent" / "orphan_source.py"), "VALUE = 1\n")
     _write(str(project / "tests" / "test_service.py"), "def test_run():\n    assert True\n")
     _write(str(project / "tests" / "test_orphan.py"), "def test_orphan():\n    assert True\n")
+    _write(str(project / "tests" / "conftest.py"), "import pytest\n")
+    _write(str(project / "tests" / "fixtures" / "replay_data.py"), "DATA = {}\n")
     _write(str(project / "docs" / "service.md"), "See agent/service.py\n")
     _write(str(project / "docs" / "orphan.md"), "Unattached note\n")
+    _write(str(project / "docs" / "dev" / "handoff-2026-04-24-post-audit.md"), "Session handoff\n")
+    _write(str(project / "MEMORY.md"), "Operator memory\n")
     _write(str(project / "docs" / "dev" / "scratch" / "backlog.json"), "{}\n")
     _write(str(project / "pyproject.toml"), "[project]\nname='x'\n")
     _write(str(project / "requirements.txt"), "requests\n")
@@ -39,6 +43,7 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     _write(str(project / ".coverage"), "generated\n")
     _write(str(project / "Dockerfile.governance"), "FROM python:3.12\n")
     _write(str(project / "node_modules" / "pkg" / "index.js"), "ignored();\n")
+    _write(str(project / "search-workspace" / "long_task_test.txt"), "scratch\n")
     _write(str(project / ".observer-cache" / "scratch.json"), "{}\n")
 
     rows = build_file_inventory(
@@ -61,6 +66,7 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     rows_by_path = _by_path(rows)
 
     assert "node_modules/pkg/index.js" not in rows_by_path
+    assert "search-workspace/long_task_test.txt" not in rows_by_path
     assert ".observer-cache/scratch.json" not in rows_by_path
     assert rows_by_path["agent/service.py"]["scan_status"] == "clustered"
     assert rows_by_path["agent/service.py"]["candidate_node_id"] == "agent.service"
@@ -68,7 +74,11 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert rows_by_path["docs/service.md"]["scan_status"] == "secondary_attached"
     assert rows_by_path["agent/orphan_source.py"]["scan_status"] == "orphan"
     assert rows_by_path["tests/test_orphan.py"]["scan_status"] == "orphan"
+    assert rows_by_path["tests/conftest.py"]["scan_status"] == "support"
+    assert rows_by_path["tests/fixtures/replay_data.py"]["scan_status"] == "support"
     assert rows_by_path["docs/orphan.md"]["scan_status"] == "orphan"
+    assert rows_by_path["docs/dev/handoff-2026-04-24-post-audit.md"]["scan_status"] == "archive"
+    assert rows_by_path["MEMORY.md"]["scan_status"] == "archive"
     assert rows_by_path["pyproject.toml"]["file_kind"] == "config"
     assert rows_by_path["pyproject.toml"]["scan_status"] == "pending_decision"
     assert rows_by_path["requirements.txt"]["file_kind"] == "config"
@@ -86,6 +96,8 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert summary["by_status"]["clustered"] == 1
     assert summary["by_status"]["secondary_attached"] == 2
     assert summary["by_status"]["orphan"] == 3
+    assert summary["by_status"]["support"] == 2
+    assert summary["by_status"]["archive"] == 2
     assert summary["by_status"]["pending_decision"] == 3
     assert summary["by_status"]["ignored"] == 3
 

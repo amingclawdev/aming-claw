@@ -28,6 +28,20 @@ GENERATED_EXTENSIONS = {".log", ".db", ".sqlite", ".sqlite3", ".pyc"}
 GENERATED_DIR_MARKERS = {"generated", "__generated__", "gen"}
 GENERATED_DIR_SUFFIXES = (".egg-info",)
 GENERATED_PATH_PREFIXES = ("docs/dev/scratch/", "docs/dev/observer/logs/")
+TEST_SUPPORT_FILENAMES = {"__init__.py", "conftest.py"}
+TEST_SUPPORT_DIRS = {"fixtures", "fixture", "testdata", "test_data", "snapshots", "__snapshots__"}
+DOC_ARCHIVE_PREFIXES = ("Ying_work/doc/",)
+DOC_ARCHIVE_NAME_PREFIXES = (
+    "audit-",
+    "case-study-",
+    "handoff-",
+    "manual-fix-current-",
+    "mf-",
+    "next-session-prompt-",
+    "observer-hotfix-record-",
+    "postmortem-",
+)
+DOC_ARCHIVE_FILENAMES = {"MEMORY.md"}
 
 
 @dataclass(frozen=True)
@@ -135,6 +149,25 @@ def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
     return "unknown"
 
 
+def is_test_support_path(rel_path: str) -> bool:
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    name = Path(rel).name
+    parts = {p.lower() for p in rel.split("/") if p}
+    return name in TEST_SUPPORT_FILENAMES or bool(parts & TEST_SUPPORT_DIRS)
+
+
+def is_archive_doc_path(rel_path: str) -> bool:
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    name = Path(rel).name
+    if name in DOC_ARCHIVE_FILENAMES:
+        return True
+    if any(rel.startswith(prefix) for prefix in DOC_ARCHIVE_PREFIXES):
+        return True
+    if rel.startswith("docs/dev/") and name.lower().endswith((".md", ".rst", ".txt", ".adoc")):
+        return name.lower().startswith(DOC_ARCHIVE_NAME_PREFIXES)
+    return False
+
+
 def _walk_project_files(project_root: str, profile: ProjectProfile) -> Iterable[str]:
     root = Path(project_root)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -220,6 +253,14 @@ def build_file_inventory(
             attached_to = cluster_id
             decision = "attach_to_node"
             reason = "attached as test/doc consumer evidence"
+        elif kind == "test" and is_test_support_path(rel):
+            scan_status = "support"
+            decision = "keep"
+            reason = "test support file; audited as non-feature-specific support"
+        elif kind == "doc" and is_archive_doc_path(rel):
+            scan_status = "archive"
+            decision = "keep"
+            reason = "historical or operator archive doc; audited as nonblocking"
         elif kind in {"source", "test", "doc"}:
             scan_status = "orphan"
             reason = f"{kind} file not attached to any feature cluster"

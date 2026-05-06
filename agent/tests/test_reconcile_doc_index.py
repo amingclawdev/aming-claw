@@ -53,6 +53,8 @@ def test_final_doc_index_reports_coverage_and_keeps_index_docs_nonblocking(tmp_p
         {"path": "agent/feature_a.py", "file_kind": "source", "scan_status": "orphan", "reason": "stale scan"},
         {"path": "docs/feature-a.md", "file_kind": "doc", "scan_status": "orphan", "reason": "stale scan"},
         {"path": "agent/tests/test_feature_a.py", "file_kind": "test", "scan_status": "orphan", "reason": "stale scan"},
+        {"path": "agent/tests/conftest.py", "file_kind": "test", "scan_status": "support", "reason": "test support"},
+        {"path": "docs/dev/handoff-2026-04-24.md", "file_kind": "doc", "scan_status": "archive", "reason": "historical handoff"},
         {"path": "agent/orphan.py", "file_kind": "source", "scan_status": "orphan", "reason": "not clustered"},
         {"path": "agent/tests/test_orphan.py", "file_kind": "test", "scan_status": "orphan", "reason": "not attached"},
     ]
@@ -81,6 +83,10 @@ def test_final_doc_index_reports_coverage_and_keeps_index_docs_nonblocking(tmp_p
         "agent/feature_a.py",
         "docs/feature-a.md",
         "agent/tests/test_feature_a.py",
+    }
+    assert {item["path"] for item in report["inventory"]["nonblocking_unreferenced_files"]} == {
+        "agent/tests/conftest.py",
+        "docs/dev/handoff-2026-04-24.md",
     }
 
     approved = next(f for f in report["features"] if f["candidate_node_id"] == "L7.1")
@@ -129,6 +135,7 @@ def test_final_doc_index_writes_json_and_markdown_ready_report(tmp_path):
     markdown = render_markdown(report)
     assert "ready_for_signoff: `True`" in markdown
     assert "`README.md`" in markdown
+    assert "## Nonblocking Unreferenced Files" in markdown
 
 
 def test_final_doc_index_treats_none_sentinel_as_missing_test(tmp_path):

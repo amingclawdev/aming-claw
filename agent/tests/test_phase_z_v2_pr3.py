@@ -168,6 +168,40 @@ class TestCoverageLookup:
         assert "dbservice/lib/contextAssembly.test.js" in js_files
         assert ".claude/worktrees/stale/dbservice/lib/contextAssembly.test.js" not in js_files
 
+    def test_find_test_coverage_uses_import_evidence_and_compact_stems(self):
+        project = _make_temp_project({
+            "agent/governance/auto_chain.py": "def run():\n    return 1\n",
+            "agent/manager_http_server.py": "def run():\n    return 1\n",
+            "agent/tests/test_autochain_new_file_binding.py": (
+                "from agent.governance.auto_chain import run\n\n"
+                "def test_run():\n    assert run() == 1\n"
+            ),
+            "agent/tests/test_managerhttpserver_spawn.py": "def test_spawn():\n    assert True\n",
+            "agent/tests/test_unrelated.py": "def test_other():\n    assert True\n",
+        })
+
+        import_result = find_test_coverage(
+            project,
+            os.path.join(".", "agent", "governance", "auto_chain.py"),
+        )
+        compact_result = find_test_coverage(
+            project,
+            os.path.join(project, "agent", "manager_http_server.py"),
+        )
+        import_files = {
+            os.path.relpath(p, project).replace(os.sep, "/")
+            for p in import_result["test_files"]
+        }
+        compact_files = {
+            os.path.relpath(p, project).replace(os.sep, "/")
+            for p in compact_result["test_files"]
+        }
+
+        assert "agent/tests/test_autochain_new_file_binding.py" in import_files
+        assert "agent/tests/test_managerhttpserver_spawn.py" in compact_files
+        assert "agent/tests/test_unrelated.py" not in import_files
+        assert "agent/tests/test_unrelated.py" not in compact_files
+
     def test_ac5_find_doc_coverage(self):
         """AC5: find_doc_coverage returns doc_files list + covered_lines int."""
         project = _make_temp_project({

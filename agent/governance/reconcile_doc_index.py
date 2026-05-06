@@ -134,6 +134,7 @@ def _is_index_doc(path: str) -> bool:
 def _inventory_summary(rows: list[dict[str, Any]], referenced_files: set[str]) -> dict[str, Any]:
     unresolved: list[dict[str, str]] = []
     resolved_referenced: list[dict[str, str]] = []
+    nonblocking_unreferenced: list[dict[str, str]] = []
     index_docs: list[dict[str, Any]] = []
     by_kind: dict[str, int] = {}
     by_status: dict[str, int] = {}
@@ -168,12 +169,23 @@ def _inventory_summary(rows: list[dict[str, Any]], referenced_files: set[str]) -
                 "scan_status": status,
                 "reason": str(row.get("reason") or ""),
             })
+        elif status in {"archive", "support", "ignored"} and kind in {"source", "test", "doc"}:
+            if path not in referenced_files:
+                nonblocking_unreferenced.append({
+                    "path": path,
+                    "file_kind": kind,
+                    "scan_status": status,
+                    "reason": str(row.get("reason") or ""),
+                })
     return {
         "by_kind": dict(sorted(by_kind.items())),
         "by_status": dict(sorted(by_status.items())),
         "index_docs": sorted(index_docs, key=lambda x: x["path"]),
         "resolved_referenced_files": sorted(
             resolved_referenced, key=lambda x: (x["file_kind"], x["path"])
+        ),
+        "nonblocking_unreferenced_files": sorted(
+            nonblocking_unreferenced, key=lambda x: (x["file_kind"], x["path"])
         ),
         "unresolved_files": sorted(unresolved, key=lambda x: (x["file_kind"], x["path"])),
     }
@@ -314,6 +326,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"prior_status=`{item.get('scan_status')}` resolution=`{item.get('resolution')}`"
         )
     if not report.get("inventory", {}).get("resolved_referenced_files"):
+        lines.append("- none")
+    lines.extend(["", "## Nonblocking Unreferenced Files"])
+    for item in report.get("inventory", {}).get("nonblocking_unreferenced_files", []):
+        lines.append(
+            f"- `{item.get('path')}` kind=`{item.get('file_kind')}` "
+            f"status=`{item.get('scan_status')}` reason={item.get('reason', '')}"
+        )
+    if not report.get("inventory", {}).get("nonblocking_unreferenced_files"):
         lines.append("- none")
     lines.extend(["", "## Unresolved Files"])
     for item in report.get("inventory", {}).get("unresolved_files", []):

@@ -764,6 +764,14 @@ def find_test_coverage(
 
     stem = os.path.splitext(os.path.basename(primary_file))[0].lower()
     primary_ext = os.path.splitext(primary_file)[1].lower()
+    rel = os.path.relpath(primary_file, project_root) if os.path.isabs(primary_file) else primary_file
+    rel_normalized = rel.replace(os.sep, "/").strip("/")
+    while rel_normalized.startswith("./"):
+        rel_normalized = rel_normalized[2:]
+    rel_without_ext = os.path.splitext(rel_normalized)[0]
+    module_token = rel_without_ext.replace("/", ".")
+    basename = os.path.basename(primary_file)
+    compact_stem = re.sub(r"[^a-z0-9]+", "", stem)
     skip_dirs = {
         ".git",
         ".claude",
@@ -797,10 +805,20 @@ def find_test_coverage(
     def _matches_primary(fname: str) -> bool:
         lower = fname.lower()
         if primary_ext in {".py", ".pyi"}:
-            return (
+            if (
                 lower == f"test_{stem}.py"
                 or lower.startswith(f"test_{stem}_")
                 or lower == f"{stem}_test.py"
+            ):
+                return True
+            file_stem = os.path.splitext(lower)[0]
+            compact_file_stem = re.sub(r"[^a-z0-9]+", "", file_stem)
+            return bool(
+                compact_stem
+                and (
+                    compact_file_stem.startswith(f"test{compact_stem}")
+                    or compact_file_stem.endswith(f"{compact_stem}test")
+                )
             )
         suffixes = {primary_ext}
         if primary_ext in {".jsx", ".tsx"}:
@@ -817,6 +835,21 @@ def find_test_coverage(
             if suffix
         )
 
+    def _content_matches_primary(content: str) -> bool:
+        lowered = content.lower()
+        tokens = [
+            rel_normalized.lower(),
+            rel_without_ext.lower(),
+            basename.lower(),
+            module_token.lower(),
+            module_token.replace("_", "").lower(),
+            f"from {module_token.lower()} import",
+            f"import {module_token.lower()}",
+        ]
+        if stem and len(stem) >= 8:
+            tokens.append(stem)
+        return any(token and token in lowered for token in tokens)
+
     for dirpath, dirnames, filenames in os.walk(project_root):
         dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
         for fname in filenames:
@@ -824,14 +857,21 @@ def find_test_coverage(
                 continue
             fpath = os.path.join(dirpath, fname)
             rel = _repo_relpath(project_root, fpath)
-            if not _is_test_like(rel, fname) or not _matches_primary(fname):
+            if not _is_test_like(rel, fname):
                 continue
+            name_match = _matches_primary(fname)
+            content_match = False
+            content = ""
             test_files.append(fpath)
             try:
                 content = _read_file(fpath)
-                covered_lines += content.count("\n")
+                content_match = _content_matches_primary(content)
             except OSError:
-                pass
+                content = ""
+            if not name_match and not content_match:
+                test_files.pop()
+                continue
+            covered_lines += content.count("\n")
 
     return {"test_files": test_files, "covered_lines": covered_lines}
 

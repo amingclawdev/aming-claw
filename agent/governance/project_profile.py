@@ -23,7 +23,7 @@ DEFAULT_EXCLUDE_ROOTS = {
     "__pycache__", ".git", "node_modules", ".venv", "venv", ".tox",
     ".claude", ".worktrees", "shared-volume", "runtime", ".mypy_cache",
     ".pytest_cache", ".observer-cache", ".governance-cache", "build", "dist",
-    "target", "coverage", ".next", ".nuxt", ".eggs",
+    "target", "coverage", ".next", ".nuxt", ".eggs", "search-workspace",
 }
 MANIFEST_LANGUAGE_HINTS = {
     "pyproject.toml": "python",
