@@ -41,9 +41,20 @@ class AcceptanceGraph:
     def load(self, path: str | Path) -> None:
         with open(str(path), "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.G = nx.node_link_graph(data["deps_graph"])
+        self.G = self._node_link_graph(data["deps_graph"])
         if "gates_graph" in data:
-            self.gates_G = nx.node_link_graph(data["gates_graph"])
+            self.gates_G = self._node_link_graph(data["gates_graph"])
+
+    @staticmethod
+    def _node_link_graph(section: dict):
+        """Load NetworkX node-link data using either links or edges.
+
+        Older graph writers used ``links`` while reconcile materialization writes
+        ``edges``.  NetworkX 3.2 still defaults to ``links``, so choose the
+        present key explicitly instead of tying graph loading to one writer.
+        """
+        link_key = "links" if "links" in section else "edges"
+        return nx.node_link_graph(section, link=link_key)
 
     def save(self, path: str | Path) -> None:
         data = {

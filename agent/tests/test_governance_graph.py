@@ -104,6 +104,39 @@ class TestAcceptanceGraph(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_load_accepts_edges_key(self):
+        graph_doc = {
+            "version": 1,
+            "deps_graph": {
+                "directed": True,
+                "multigraph": False,
+                "graph": {},
+                "nodes": [
+                    {"id": "L0.1", "primary": ["a.py"]},
+                    {"id": "L1.1", "primary": ["b.py"]},
+                ],
+                "edges": [{"source": "L0.1", "target": "L1.1"}],
+            },
+            "gates_graph": {
+                "directed": True,
+                "multigraph": False,
+                "graph": {},
+                "nodes": [],
+                "edges": [],
+            },
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as f:
+            json.dump(graph_doc, f)
+            path = f.name
+        try:
+            loaded = AcceptanceGraph()
+            loaded.load(path)
+            self.assertTrue(loaded.has_node("L0.1"))
+            self.assertIn("L0.1", loaded.direct_deps("L1.1"))
+        finally:
+            os.unlink(path)
+
     def test_export_mermaid(self):
         self.graph.add_node(NodeDef(id="L0.1", title="Test"))
         mermaid = self.graph.export_mermaid({"L0.1": "qa_pass"})
