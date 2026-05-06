@@ -101,6 +101,16 @@ _QA_EVIDENCE_CATEGORY_SEGMENTS = {
     "tests",
 }
 
+SCOPE_MATERIALIZATION_OPERATION_TYPE = "scope-materialization"
+
+
+def _is_scope_materialization_task(metadata):
+    """Return True for scoped reconcile materialization catch-up chains."""
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("operation_type") == SCOPE_MATERIALIZATION_OPERATION_TYPE
+    )
+
 
 def _extract_prd_declarations(prd):
     """Extract the 4 PRD graph-declaration fields with empty-list defaults (R6)."""
@@ -5949,9 +5959,12 @@ def _build_dev_prompt(task_id, result, metadata):
             pass
     # 5b: Merge graph-derived docs into doc_impact. Reconcile-cluster tasks use
     # the session-local candidate/overlay graph instead of stale active graph.json.
+    # Scope-materialization chains must preserve PM's explicit doc_impact: their
+    # job is to repair graph/doc/test materialization drift, so broad active-graph
+    # docs are QA observation context, not checkpoint-mandatory Dev edits.
     graph_docs = _get_task_graph_doc_associations(
         metadata.get("project_id", "aming-claw"), target_files, metadata)
-    if graph_docs:
+    if graph_docs and not _is_scope_materialization_task(metadata):
         if isinstance(doc_impact, dict):
             existing = set(doc_impact.get("files", []))
             new_docs = [d for d in graph_docs if d not in existing]
