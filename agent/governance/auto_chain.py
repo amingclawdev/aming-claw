@@ -88,6 +88,18 @@ _QA_EVIDENCE_SYMBOL_SUFFIX_RE = re.compile(
     r"^(.+\.(?:c|cc|cpp|cs|go|h|hpp|java|js|jsx|json|kt|md|mjs|mts|ps1|py|rs|sh|toml|ts|tsx|txt|yaml|yml))"
     r"/[A-Za-z_][\w.-]*$"
 )
+_QA_EVIDENCE_CATEGORY_SEGMENTS = {
+    "artifact",
+    "artifacts",
+    "code",
+    "doc",
+    "docs",
+    "source",
+    "sources",
+    "src",
+    "test",
+    "tests",
+}
 
 
 def _extract_prd_declarations(prd):
@@ -104,6 +116,17 @@ def _iter_qa_evidence_strings(value):
     elif isinstance(value, (list, tuple)):
         for child in value:
             yield from _iter_qa_evidence_strings(child)
+
+
+def _is_qa_evidence_category_path(raw_path):
+    """Return True for prose categories such as tests/docs, not file evidence."""
+    if not isinstance(raw_path, str):
+        return False
+    normalized = raw_path.replace("\\", "/")
+    if ":" in normalized or "." in PurePosixPath(normalized).name:
+        return False
+    parts = [part.lower() for part in normalized.split("/") if part]
+    return len(parts) >= 2 and all(part in _QA_EVIDENCE_CATEGORY_SEGMENTS for part in parts)
 
 
 def _project_workspace_root(project_id, metadata=None):
@@ -212,6 +235,8 @@ def _extract_qa_evidence_paths(result):
             if "<" in raw or ">" in raw:
                 continue
             if any(ch in raw for ch in _QA_EVIDENCE_GLOB_CHARS):
+                continue
+            if _is_qa_evidence_category_path(raw):
                 continue
             key = raw.replace("\\", "/")
             if key in seen:

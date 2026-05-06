@@ -443,12 +443,15 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         """Do not extract docs/test from prose like source/docs/test mutations."""
         result = {
             "recommendation": "qa_pass",
-            "review_summary": "No source/docs/test mutations were needed for this overlay-only audit.",
+            "review_summary": (
+                "No source/docs/test mutations were needed for this overlay-only audit; "
+                "tests/docs coverage is graph-link evidence only."
+            ),
             "criteria_results": [
                 {
                     "criterion": "overlay-only",
                     "passed": True,
-                    "evidence": "No source/docs/test changes; graph delta is event-only.",
+                    "evidence": "No source/docs/test or tests/docs changes; graph delta is event-only.",
                 }
             ],
             "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
