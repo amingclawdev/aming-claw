@@ -194,6 +194,49 @@ def test_scope_materialization_qa_prompt_scopes_global_release_gate():
     assert "MUST NOT set recommendation='reject'" in prompt
 
 
+def test_scope_materialization_qa_prompt_includes_dev_doc_debt_context():
+    from governance.auto_chain import _build_qa_prompt, _build_test_prompt
+
+    dev_result = {
+        "summary": "Recorded absent scratch doc as doc_debt.",
+        "changed_files": [],
+        "test_results": {"ran": True, "passed": 1, "failed": 0},
+        "retry_context": {"is_retry": True, "fix_applied": "Added doc_debt."},
+        "doc_debt": [
+            {
+                "path": "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md",
+                "reason": "Absent scratch record; not durable graph-owned docs.",
+            }
+        ],
+    }
+    pm_metadata = {
+        "project_id": "aming-claw",
+        "operation_type": "scope-materialization",
+        "target_files": ["docs/governance/README.md"],
+        "acceptance_criteria": [
+            "AC4: Dev output explicitly records scratch docs as doc_debt.",
+        ],
+        "doc_impact": {"files": ["docs/governance/README.md"]},
+    }
+
+    _, test_meta = _build_test_prompt("task-dev", dev_result, pm_metadata)
+
+    assert test_meta["dev_doc_debt"] == dev_result["doc_debt"]
+
+    test_result = {
+        "test_report": {"tool": "pytest", "passed": 1, "failed": 0, "errors": 0},
+        "changed_files": [],
+    }
+    with mock.patch("governance.auto_chain._query_graph_delta_proposed", return_value=None):
+        prompt, qa_meta = _build_qa_prompt("task-test", test_result, test_meta)
+
+    assert qa_meta["test_report"] == test_result["test_report"]
+    assert "Scope Materialization Dev Audit Context" in prompt
+    assert "dev_doc_debt" in prompt
+    assert "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md" in prompt
+    assert "Test may carry only test_report and changed_files" in prompt
+
+
 def test_existing_graph_node_create_is_normalized_to_update():
     from governance.auto_chain import _normalize_existing_node_creates
 

@@ -6345,6 +6345,7 @@ def _build_test_prompt(task_id, result, metadata):
         "dev_changed_files": changed,
         "dev_needs_review": result.get("needs_review", False),
         "dev_retry_context": result.get("retry_context", {}),
+        "dev_doc_debt": result.get("doc_debt", []),
         "graph_preflight": metadata.get("graph_preflight", {}),
     }
     # Propagate worktree info from dev result → test → qa → merge
@@ -6416,6 +6417,23 @@ def _build_qa_prompt(task_id, result, metadata):
             "you notice unrelated release-gate blockers, mention them as residual "
             "risk while still returning qa_pass when all scoped acceptance criteria pass."
         )
+        dev_context = {
+            "dev_result_summary": metadata.get("dev_result_summary", ""),
+            "dev_test_results": metadata.get("dev_test_results", {}),
+            "dev_changed_files": metadata.get("dev_changed_files", []),
+            "dev_needs_review": metadata.get("dev_needs_review", False),
+            "dev_retry_context": metadata.get("dev_retry_context", {}),
+            "dev_doc_debt": metadata.get("dev_doc_debt", []),
+        }
+        if any(value not in ("", [], {}, None, False) for value in dev_context.values()):
+            prompt_parts.append(
+                "\n## Scope Materialization Dev Audit Context\n"
+                f"{json.dumps(dev_context, ensure_ascii=False, indent=2)}\n"
+                "Use this Dev evidence when evaluating scoped acceptance "
+                "criteria such as explicit doc_debt decisions. Do not reject "
+                "only because the Test result payload is narrower than the "
+                "Dev result; Test may carry only test_report and changed_files."
+            )
     graph_preflight = metadata.get("graph_preflight", {})
     if is_reconcile_cluster_task(metadata):
         graph_preflight = graph_preflight or _build_reconcile_graph_preflight(
