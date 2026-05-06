@@ -263,3 +263,22 @@ This pattern must be followed in all paths where DB writes precede event publica
 The `pm.prd.published` event fires **after** the PM gate check passes, not before. This means downstream consumers (e.g., backlog chain-trigger) only receive the event once the PRD has been validated and the Dev task dispatch is already underway.
 
 **Design consideration (OPT-BACKLOG-PM-PRD-PUBLISH-PRE-GATE):** Moving `pm.prd.published` to fire *before* the gate would allow subscribers to react to the raw PRD output even if the gate rejects it. This is noted as a potential optimization but has not been implemented, as the current post-gate ordering ensures subscribers only see valid PRDs.
+
+## Scope-Materialization Graph Delta Fixes
+
+The 2026-05-06 scope-materialization fixes are tracked as:
+
+- `MF-2026-05-06-051` — QA graph_delta retry hardening for scoped review
+  evidence, covered by `agent/tests/test_qa_graph_delta_review.py`.
+- `MF-2026-05-06-054` — scope-materialization doc gate scoping for doc-only
+  materialization chains, covered by
+  `agent/tests/test_auto_chain_scope_materialization_doc_gate.py`.
+- `MF-2026-05-06-056` — scope-materialization QA release-gate scoping plus
+  create-to-update normalization for graph_delta entries that name existing
+  graph nodes, covered by `agent/tests/test_graph_delta_auto_infer.py`.
+
+For L7.23 (`agent/governance/auto_chain.py`), these tests are the scoped direct
+owners for the materialization behavior. Dev graph_delta payloads that reference
+existing nodes such as L7.23 must express those entries as updates, not creates;
+the create-to-update normalization path is a hardening fallback, not permission
+to duplicate existing graph nodes.

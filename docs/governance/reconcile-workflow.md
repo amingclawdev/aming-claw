@@ -728,3 +728,33 @@ attribution.
 yield identical outputs for identical inputs. The contract is locked down by
 `agent/tests/test_language_adapters.py`; `test_cluster_grouper.py` exercises
 the same surface indirectly via the grouper.
+
+---
+
+## §15 Scope-Catchup Materialization Contract
+
+The `scope-catchup` wrapper closes reconcile scope-materialization backlog items
+such as `RECONCILE-SCOPE-MATERIALIZE-45d31bd-9050487-335273de` without redeploying
+the governance service. It creates a temporary branch and worktree for the
+requested commit range, runs the scope catchup phases, and leaves runtime
+governance code untouched unless the operator explicitly applies generated
+backlog materialization.
+
+The wrapper entrypoint is `scripts/reconcile-scope-catchup.py`, backed by
+`agent/governance/reconcile_scope_catchup.py`. Its default phase list is
+`DEFAULT_PHASES = K,A,E,D,F`, matching the catchup path that discovers scoped
+materialization gaps, resolves actionable files, and emits backlog evidence.
+Only entries classified in `ACTIONABLE_MATERIALIZATION_TYPES` are eligible for
+materialization; non-actionable findings remain audit evidence.
+
+Operator modes are explicit:
+
+- `--dry-run` inspects the range and reports candidate materialization without
+  writing backlog state.
+- `--apply` writes the selected materialization results.
+- `--file-materialization-backlog` points at the backlog artifact used to carry
+  file-scoped materialization evidence between dry-run review and apply.
+
+The no-redeploy behavior is part of the contract: the wrapper performs all work
+from the isolated branch/worktree checkout and does not require governance
+service restart, image rebuild, or executor redeploy.
