@@ -793,6 +793,8 @@ def test_candidate_graph_preserves_metadata_hierarchy_parent_to_overlay(
     assert res["applied"] is True, res
     overlay_doc = json.loads(overlay_path.read_text(encoding="utf-8"))
     node = overlay_doc["nodes"]["L7.22"]
+    assert node["layer"] == "L7"
+    assert node["parent_layer"] == "L7"
     assert node["parent"] == "L3.14"
     assert node["parent_id"] == "L3.14"
     assert node["hierarchy_parent"] == "L3.14"

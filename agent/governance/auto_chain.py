@@ -7975,6 +7975,7 @@ def apply_reconcile_cluster_to_overlay(
         overlay_entry = {
             "node_id": new_id,
             "candidate_node_id": new_id if candidate_nodes else explicit_id,
+            "layer": layer_prefix,
             "parent_layer": _cluster_normalize_layer(proposed.get("parent_layer")),
             "primary": list(proposed.get("primary") or []),
             "secondary": list(proposed.get("secondary") or []),
