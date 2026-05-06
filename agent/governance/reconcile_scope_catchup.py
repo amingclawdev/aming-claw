@@ -15,7 +15,9 @@ from typing import Any, Dict, Iterable, List, Optional
 from .reconcile_phases.orchestrator import run_commit_sweep_orchestrated
 
 
-DEFAULT_PHASES = ["K", "A", "E", "D", "F", "G"]
+# Phase G is a global chain-closure audit, not a commit/file scoped check. Keep
+# it opt-in so MF catch-up does not drown hot-file drift in historical queue noise.
+DEFAULT_PHASES = ["K", "A", "E", "D", "F"]
 
 
 class ScopeCatchupError(RuntimeError):
@@ -196,7 +198,8 @@ def run_scope_catchup(
         "doc_update_mode": "scan_only",
         "doc_update_note": (
             "scope-catchup runs commit-sweep scanning and optional baseline writes only; "
-            "README/doc materialization must be filed as a separate chain/backlog task."
+            "README/doc materialization must be filed as a separate chain/backlog task. "
+            "Global chain-closure checks are opt-in via --phases when needed."
         ),
     }
     output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")

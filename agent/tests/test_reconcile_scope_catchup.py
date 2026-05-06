@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.governance.reconcile_scope_catchup import (
+    DEFAULT_PHASES,
     ensure_catchup_worktree,
     run_scope_catchup,
 )
@@ -123,3 +124,8 @@ def test_run_scope_catchup_writes_output_and_marks_scan_only(tmp_path):
         phases=["K", "A"],
         dry_run=True,
     )
+
+
+def test_default_scope_catchup_phases_exclude_global_chain_closure():
+    assert DEFAULT_PHASES == ["K", "A", "E", "D", "F"]
+    assert "G" not in DEFAULT_PHASES
