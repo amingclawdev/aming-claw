@@ -143,7 +143,9 @@ def test_sweep_dedup_newest(mock_subproc, mock_rename, mock_slice):
 
     log_result = MagicMock()
     log_result.returncode = 0
-    log_result.stdout = "commit1\ncommit2\n"
+    # git log returns newest first, so the implementation must replay oldest
+    # first before applying last-write-wins dedup.
+    log_result.stdout = "commit2\ncommit1\n"
     mock_subproc.return_value = log_result
 
     # commit1 produces a discrepancy
@@ -179,6 +181,7 @@ def test_sweep_dedup_newest(mock_subproc, mock_rename, mock_slice):
     assert len(result["dedup_discrepancies"]) == 1
     # The kept one should be from commit2 (newest = last write wins)
     assert result["dedup_discrepancies"][0]["attribution_commit"] == "commit2"
+    assert [call.args[2] for call in mock_slice.call_args_list] == ["commit1", "commit2"]
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +192,7 @@ def test_sweep_dedup_newest(mock_subproc, mock_rename, mock_slice):
 @patch(f"{MODULE}._build_rename_map", return_value={})
 @patch(f"{MODULE}.subprocess.run")
 def test_sweep_hot_file_coverage(mock_subproc, mock_rename, mock_slice):
-    """Coverage computed against hot_files (files in since..HEAD), not total project."""
+    """Coverage counts scanned hot files, not only files with discrepancies."""
     orch = _import_orchestrator()
 
     log_result = MagicMock()
@@ -224,10 +227,9 @@ def test_sweep_hot_file_coverage(mock_subproc, mock_rename, mock_slice):
 
     # hot_files = {a.py, b.py, c.py} → 3 files
     assert len(result["hot_files"]) == 3
-    # Only a.py has a discrepancy → covered_hot = [a.py]
-    assert result["covered_hot"] == ["a.py"]
-    # coverage_pct = 1/3
-    assert abs(result["coverage_pct"] - 1 / 3) < 0.01
+    # All three hot files were scanned, even though only a.py had a discrepancy.
+    assert result["covered_hot"] == ["a.py", "b.py", "c.py"]
+    assert result["coverage_pct"] == 1.0
 
 
 # ---------------------------------------------------------------------------

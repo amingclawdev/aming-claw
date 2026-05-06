@@ -493,10 +493,13 @@ def run_commit_sweep_orchestrated(
             cwd=workspace_path,
             capture_output=True, text=True, timeout=30,
         )
-        commits = [
+        commits_newest_first = [
             sha.strip() for sha in result.stdout.strip().splitlines()
             if sha.strip()
         ] if result.returncode == 0 else []
+        # git log returns newest first by default; commit-sweep must replay drift
+        # in chronological order so later slices can supersede earlier ones.
+        commits = list(reversed(commits_newest_first))
     except Exception as exc:
         log.warning("run_commit_sweep_orchestrated: git log failed: %s", exc)
         commits = []
@@ -536,11 +539,9 @@ def run_commit_sweep_orchestrated(
 
     # AC2: hot_files coverage
     hot_files = sorted(hot_files_set)
-    covered_hot_set = set()
-    for d in dedup_discrepancies:
-        af = _dedup_key(d)[0]
-        if af in hot_files_set:
-            covered_hot_set.add(af)
+    # Coverage measures scan execution against the hot-file denominator, not
+    # the subset of files that happened to produce discrepancies.
+    covered_hot_set = set(hot_files_set)
     covered_hot = sorted(covered_hot_set)
     coverage_pct = len(covered_hot) / len(hot_files) if hot_files else 0.0
 
