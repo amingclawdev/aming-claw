@@ -131,6 +131,58 @@ def test_inventory_persists_to_governance_table(tmp_path):
     assert dict(persisted[0])["path"] == "agent/service.py"
 
 
+def test_inventory_upsert_replaces_stale_rows_for_same_run(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "search-workspace" / "stale.txt"), "scratch\n")
+    old_rows = [
+        {
+            "run_id": "run-prune",
+            "path": "agent/service.py",
+            "file_kind": "source",
+            "language": "python",
+            "sha256": "old",
+            "scan_status": "clustered",
+            "updated_at": "2026-05-06T00:00:00Z",
+        },
+        {
+            "run_id": "run-prune",
+            "path": "search-workspace/stale.txt",
+            "file_kind": "doc",
+            "language": "text",
+            "sha256": "stale",
+            "scan_status": "orphan",
+            "updated_at": "2026-05-06T00:00:00Z",
+        },
+    ]
+    new_rows = build_file_inventory(
+        project_root=str(project),
+        run_id="run-prune",
+        nodes=[],
+        feature_clusters=[],
+    )
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    upsert_file_inventory(conn, "aming-claw-test", old_rows)
+    upsert_file_inventory(conn, "aming-claw-test", new_rows)
+    conn.commit()
+
+    paths = {
+        row["path"]
+        for row in conn.execute(
+            """
+            SELECT path FROM reconcile_file_inventory
+            WHERE project_id = ? AND run_id = ?
+            """,
+            ("aming-claw-test", "run-prune"),
+        ).fetchall()
+    }
+    assert "agent/service.py" in paths
+    assert "search-workspace/stale.txt" not in paths
+
+
 def test_inventory_query_returns_latest_summary_and_filters(tmp_path):
     project = tmp_path / "project"
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")

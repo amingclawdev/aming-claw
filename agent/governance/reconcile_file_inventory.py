@@ -319,10 +319,50 @@ def summarize_file_inventory(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def upsert_file_inventory(conn, project_id: str, rows: Iterable[dict[str, Any]]) -> int:
-    """Persist inventory rows into ``reconcile_file_inventory``."""
+def upsert_file_inventory(
+    conn,
+    project_id: str,
+    rows: Iterable[dict[str, Any]],
+    *,
+    replace_run: bool = True,
+) -> int:
+    """Persist inventory rows into ``reconcile_file_inventory``.
+
+    File inventory is produced as a full-project snapshot for a run_id.  When
+    ``replace_run`` is true, paths that existed for the same run_id but are no
+    longer present in the latest scan are pruned so exclusions/profile changes
+    cannot leave stale orphan blockers behind.
+    """
+    materialized_rows = list(rows)
+    if replace_run:
+        paths_by_run: dict[str, set[str]] = {}
+        for row in materialized_rows:
+            run_id = str(row.get("run_id") or "")
+            path = str(row.get("path") or "")
+            if run_id and path:
+                paths_by_run.setdefault(run_id, set()).add(path)
+        for run_id, current_paths in paths_by_run.items():
+            existing = conn.execute(
+                """
+                SELECT path FROM reconcile_file_inventory
+                WHERE project_id = ? AND run_id = ?
+                """,
+                (project_id, run_id),
+            ).fetchall()
+            stale_paths = {
+                row["path"] if hasattr(row, "keys") else row[0]
+                for row in existing
+            } - current_paths
+            for stale_path in sorted(stale_paths):
+                conn.execute(
+                    """
+                    DELETE FROM reconcile_file_inventory
+                    WHERE project_id = ? AND run_id = ? AND path = ?
+                    """,
+                    (project_id, run_id, stale_path),
+                )
     count = 0
-    for row in rows:
+    for row in materialized_rows:
         conn.execute(
             """
             INSERT INTO reconcile_file_inventory
