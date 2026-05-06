@@ -147,6 +147,14 @@ Until OPT-DB-GRAPH lands, the discipline is: **every code change that introduces
 
 **"Where's the old node definition text?"** — in `graph.json`'s `description` field for each node, and in git history for this file pre-2026-04-21.
 
+## 7.1 NetworkX Compatibility
+
+`MF-2026-05-06-052` records the compatibility contract for loading graph JSON
+with NetworkX. `AcceptanceGraph` must call `node_link_graph` with the `edges`
+keyword so current NetworkX releases do not warn or drift when parsing
+node-link edge payloads. The scoped L7.47 direct test owner for this contract is
+`agent/tests/test_governance_graph.py`.
+
 ---
 
 ## 8. Audit cluster — agent.governance core (FeatureCluster 03825084)
