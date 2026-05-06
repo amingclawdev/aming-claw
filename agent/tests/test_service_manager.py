@@ -475,6 +475,40 @@ class TestCheckRestartSignal(unittest.TestCase):
         self.assertFalse(self.signal_file.exists())
 
     @patch("service_manager.subprocess.Popen")
+    def test_respawn_executor_signal_alias_restarts_executor(self, mock_popen):
+        """Manager /respawn-executor legacy action is still consumable."""
+        fake1 = _make_fake_process(pid=1000)
+        fake2 = _make_fake_process(pid=2000)
+        mock_popen.return_value = fake2
+
+        self.mgr._process = fake1
+        self.mgr._get_active_task_count = MagicMock(return_value=0)
+        self.signal_file.write_text('{"action": "respawn_executor"}', encoding="utf-8")
+
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        self.assertEqual(self.mgr._process.pid, 2000)
+        self.assertFalse(self.signal_file.exists())
+
+    @patch("service_manager.subprocess.Popen")
+    def test_restart_signal_accepts_utf8_bom(self, mock_popen):
+        """Operator-created UTF-8-BOM signal files should not be discarded."""
+        fake1 = _make_fake_process(pid=1000)
+        fake2 = _make_fake_process(pid=2000)
+        mock_popen.return_value = fake2
+
+        self.mgr._process = fake1
+        self.mgr._get_active_task_count = MagicMock(return_value=0)
+        self.signal_file.write_text('{"action": "restart"}', encoding="utf-8-sig")
+
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        self.assertEqual(self.mgr._process.pid, 2000)
+        self.assertFalse(self.signal_file.exists())
+
+    @patch("service_manager.subprocess.Popen")
     def test_restart_signal_defers_while_active_tasks_running(self, mock_popen):
         """A restart signal is left in place until active executor tasks drain."""
         fake = _make_fake_process(pid=1100)
@@ -531,6 +565,26 @@ class TestCheckRestartSignal(unittest.TestCase):
         # Circuit breaker counters should be unchanged
         self.assertEqual(self.mgr.restart_count, restart_count_before)
         self.assertEqual(len(self.mgr._restart_times), restart_times_before)
+        self.assertFalse(self.mgr._circuit_breaker_tripped)
+
+    @patch("service_manager.subprocess.Popen")
+    def test_restart_signal_clears_tripped_circuit_breaker(self, mock_popen):
+        """An operator restart is an explicit recovery action after gov comes back."""
+        fake = _make_fake_process(pid=7000)
+        mock_popen.return_value = fake
+        self.mgr._process = None
+        self.mgr._get_active_task_count = MagicMock(return_value=0)
+        self.mgr._restart_times = [1.0, 2.0, 3.0, 4.0, 5.0]
+        self.mgr.restart_count = 5
+        self.mgr._circuit_breaker_tripped = True
+
+        self.signal_file.write_text('{"action": "restart"}', encoding="utf-8")
+        with self._patch_signal_path():
+            self.mgr._check_restart_signal()
+
+        self.assertEqual(self.mgr._process.pid, 7000)
+        self.assertEqual(self.mgr.restart_count, 0)
+        self.assertEqual(self.mgr._restart_times, [])
         self.assertFalse(self.mgr._circuit_breaker_tripped)
 
     @patch("service_manager.subprocess.Popen")

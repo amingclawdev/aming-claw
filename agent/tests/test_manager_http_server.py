@@ -87,6 +87,25 @@ def test_executor_target_returns_404():
     assert body["error_code"] == "UNKNOWN_TARGET"
 
 
+def test_respawn_executor_writes_restart_signal(tmp_path):
+    with patch.object(manager_http_server, "_project_root", return_value=tmp_path), \
+            _running_manager() as base:
+        status, body = _post_json(
+            base,
+            "/api/manager/respawn-executor",
+            {"chain_version": "abc1234"},
+        )
+
+    signal_path = tmp_path / "shared-volume" / "codex-tasks" / "state" / "manager_signal.json"
+    payload = json.loads(signal_path.read_text(encoding="utf-8"))
+
+    assert status == 200
+    assert body["ok"] is True
+    assert payload["action"] == "restart"
+    assert payload["requested_action"] == "respawn_executor"
+    assert payload["chain_version"] == "abc1234"
+
+
 def test_successful_redeploy_writes_chain_version_once():
     mock_proc = MagicMock()
     mock_proc.pid = 99999

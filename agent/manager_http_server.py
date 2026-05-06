@@ -350,8 +350,12 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         try:
             state_dir = _project_root() / "shared-volume" / "codex-tasks" / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
-            sig = {"action": "respawn_executor", "chain_version": body.get("chain_version", ""),
-                   "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            sig = {
+                "action": "restart",
+                "requested_action": "respawn_executor",
+                "chain_version": body.get("chain_version", ""),
+                "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
             (state_dir / "manager_signal.json").write_text(json.dumps(sig), encoding="utf-8")
             self._send_json({"ok": True, "detail": "signal written"})
         except Exception as exc:

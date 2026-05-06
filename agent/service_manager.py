@@ -51,6 +51,7 @@ except ImportError:  # pragma: no cover — requests may be absent in minimal te
     requests = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
+_RESTART_SIGNAL_ACTIONS = {"restart", "respawn_executor"}
 
 # ---------------------------------------------------------------------------
 # Configuration defaults (all overridable via environment variables)
@@ -576,7 +577,7 @@ class ServiceManager:
                     )
 
     def _check_restart_signal(self) -> None:
-        """Read manager_signal.json; if action==restart, stop+start executor (R1-R5).
+        """Read manager_signal.json; if action requests restart, stop+start executor (R1-R5).
 
         * Missing file → no-op (R4/AC5).
         * Malformed JSON → log warning, delete corrupt file (R4/AC6).
@@ -589,7 +590,7 @@ class ServiceManager:
 
         # Read and parse the signal file
         try:
-            raw = signal_path.read_text(encoding="utf-8")
+            raw = signal_path.read_text(encoding="utf-8-sig")
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning(
@@ -606,7 +607,7 @@ class ServiceManager:
             return
 
         action = data.get("action") if isinstance(data, dict) else None
-        if action != "restart":
+        if action not in _RESTART_SIGNAL_ACTIONS:
             log.debug(
                 "ServiceManager._check_restart_signal: unknown action %r; ignoring", action
             )
@@ -623,6 +624,9 @@ class ServiceManager:
         # R2: Perform intentional restart (R5: do NOT count toward circuit breaker)
         log.info("ServiceManager._check_restart_signal: restart signal received; restarting executor")
         with self._lock:
+            self._restart_times.clear()
+            self.restart_count = 0
+            self._circuit_breaker_tripped = False
             self._stop_locked()
             try:
                 self._process = self._spawn_executor_process()
