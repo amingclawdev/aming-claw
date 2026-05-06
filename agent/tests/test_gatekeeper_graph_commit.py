@@ -212,6 +212,37 @@ class TestCommitGraphDelta(unittest.TestCase):
         self.assertEqual(payload["source_event_id"], "dev-001")
         self.assertIn("L7.1", payload["committed_node_ids"])
 
+    def test_validated_create_is_qa_pass_with_evidence(self):
+        """Validated creates must not re-block release gates as pending nodes."""
+        _seed_validated_event(
+            self.conn, self.root_task_id, "dev-001",
+            creates=[{"parent_layer": 7, "title": "MaterializedNode"}],
+        )
+
+        metadata = self._make_metadata(task_id="gatekeeper-001")
+        result = self.ac._commit_graph_delta(self.conn, self.project_id, metadata)
+
+        self.assertIn("L7.1", result["committed_node_ids"])
+        row = self.conn.execute(
+            "SELECT verify_status, build_status, evidence_json, updated_by "
+            "FROM node_state WHERE project_id = ? AND node_id = 'L7.1'",
+            (self.project_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["verify_status"], "qa_pass")
+        self.assertEqual(row["build_status"], "impl:done")
+        self.assertEqual(row["updated_by"], "graph-delta-commit")
+
+        evidence = json.loads(row["evidence_json"])
+        self.assertEqual(evidence["type"], "graph_delta_committed_create")
+        self.assertEqual(evidence["source_task_id"], "dev-001")
+        self.assertEqual(evidence["gatekeeper_task_id"], "gatekeeper-001")
+
+        passed, reason = self.ac._check_nodes_min_status(
+            self.conn, self.project_id, ["L7.1"], "qa_pass",
+        )
+        self.assertTrue(passed, reason)
+
     def test_collision_does_not_mark_attempt_as_committed(self):
         """Explicit collisions keep intent evidence without reporting mutation."""
         self.conn.execute(

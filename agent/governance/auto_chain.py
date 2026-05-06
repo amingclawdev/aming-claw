@@ -1973,27 +1973,50 @@ def _commit_graph_delta(conn, project_id, metadata):
             # R1: Record intent before INSERT
             attempted_node_ids.append(display_id)
 
-            # Insert node_state — R2: check rowcount to detect dedup-skip
+            create_fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+            create_verify_status = (
+                create_fields.get("verify_status")
+                or item.get("verify_status")
+                or "qa_pass"
+            )
+            create_build_status = (
+                create_fields.get("build_status")
+                or item.get("build_status")
+                or "impl:done"
+            )
+            title = item.get("title", display_id)
+            create_evidence = {
+                "type": "graph_delta_committed_create",
+                "source": "graph.delta.validated",
+                "root_task_id": root_task_id,
+                "source_task_id": source_event_id,
+                "gatekeeper_task_id": metadata.get("task_id", ""),
+                "title": title,
+                "deps": item.get("deps", []),
+                "primary": item.get("primary", []),
+                "graph_delta_review": validated_payload.get("graph_delta_review", {}),
+            }
+            evidence_json = json.dumps(create_evidence, ensure_ascii=False)
+
+            # Insert node_state — R2: check rowcount to detect dedup-skip.
+            # A validated graph_delta create is already QA/Gatekeeper-approved;
+            # leaving it pending makes the following release gate block on the
+            # node that the same chain just accepted.
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO node_state
-                   (project_id, node_id, verify_status, build_status, updated_at, version)
-                   VALUES (?, ?, 'pending', 'unknown', ?, 1)""",
-                (project_id, display_id, now),
+                   (project_id, node_id, verify_status, build_status, evidence_json, updated_by, updated_at, version)
+                   VALUES (?, ?, ?, ?, ?, 'graph-delta-commit', ?, 1)""",
+                (project_id, display_id, create_verify_status, create_build_status, evidence_json, now),
             )
 
             if cursor.rowcount > 0:
                 # Record in node_history
                 try:
-                    title = item.get("title", display_id)
                     conn.execute(
                         """INSERT INTO node_history
                            (project_id, node_id, from_status, to_status, role, evidence_json, session_id, ts, version)
-                           VALUES (?, ?, 'none', 'pending', 'auto-chain', ?, 'graph-delta-commit', ?, 1)""",
-                        (project_id, display_id,
-                         json.dumps({"title": title, "deps": item.get("deps", []),
-                                     "primary": item.get("primary", []),
-                                     "source": "graph.delta.committed"}),
-                         now),
+                           VALUES (?, ?, 'none', ?, 'auto-chain', ?, 'graph-delta-commit', ?, 1)""",
+                        (project_id, display_id, create_verify_status, evidence_json, now),
                     )
                 except Exception:
                     pass  # History is nice-to-have

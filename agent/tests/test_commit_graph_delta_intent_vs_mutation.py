@@ -27,6 +27,7 @@ def _make_db():
             node_id TEXT,
             verify_status TEXT DEFAULT 'pending',
             build_status TEXT DEFAULT 'unknown',
+            evidence_json TEXT,
             updated_at TEXT,
             updated_by TEXT DEFAULT '',
             version INTEGER DEFAULT 1,
