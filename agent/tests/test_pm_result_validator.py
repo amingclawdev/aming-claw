@@ -257,6 +257,67 @@ def test_s5_proposed_node_list_primary_with_strings_is_ok():
     ), f"unexpected primary error: {res.errors}"
 
 
+def test_s5_doc_only_proposed_node_with_secondary_docs_is_ok():
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "target_files": ["docs/governance/README.md"],
+        "proposed_nodes": [
+            {
+                "node_id": None,
+                "primary": [],
+                "secondary": [
+                    "docs/governance/README.md",
+                    "docs/roles/gatekeeper.md",
+                ],
+                "title": "Governance documentation index",
+            }
+        ],
+    }
+    res = validate_pm_output(payload, mode="warn")
+    assert not any(
+        "$.proposed_nodes[0].primary" in e.field_path for e in res.errors
+    ), f"unexpected primary error for doc-only node: {res.errors}"
+
+
+def test_s5_test_only_proposed_node_with_test_assets_is_ok():
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "target_files": ["tests/test_governance_docs.py"],
+        "proposed_nodes": [
+            {
+                "node_id": None,
+                "primary": "",
+                "test": ["tests/test_governance_docs.py"],
+                "title": "Governance documentation checks",
+            }
+        ],
+    }
+    res = validate_pm_output(payload, mode="warn")
+    assert not any(
+        "$.proposed_nodes[0].primary" in e.field_path for e in res.errors
+    ), f"unexpected primary error for test-only node: {res.errors}"
+
+
+def test_s5_empty_primary_with_non_doc_secondary_is_fatal():
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "target_files": ["agent/foo.py"],
+        "proposed_nodes": [
+            {
+                "node_id": None,
+                "primary": [],
+                "secondary": ["agent/foo.py"],
+                "title": "Ambiguous asset-only node",
+            }
+        ],
+    }
+    res = validate_pm_output(payload, mode="warn")
+    assert res.valid is False
+    assert any(
+        "$.proposed_nodes[0].primary" in e.field_path for e in res.errors
+    ), f"expected primary error for non-doc asset-only node: {res.errors}"
+
+
 def test_s5_proposed_node_not_a_dict_is_fatal():
     payload = {
         "acceptance_criteria": ["AC1"],

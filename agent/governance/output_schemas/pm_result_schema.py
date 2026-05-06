@@ -17,7 +17,8 @@ Structural checks (S1–S7):
     S3  any AC element is not a string            → MISSING_REQUIRED_FIELD
     S4  empty work scope (target_files empty AND  → MISSING_REQUIRED_FIELD
         proposed_nodes empty)
-    S5  any proposed_nodes element missing a non-empty 'primary' (list[str] or non-empty str)
+    S5  any proposed_nodes element missing both a non-empty 'primary'
+        (list[str] or non-empty str) and a doc/test asset scope
     S6  removed_nodes / unmapped_files present    → MALFORMED_JSON
         but not a list
     S7  bypass_validations key present in payload → UNAUTHORIZED_SELF_WAIVER
@@ -49,6 +50,57 @@ def _is_empty_list(value: Any) -> bool:
     if isinstance(value, list):
         return len(value) == 0
     # Non-list types (e.g. dict shapes) — treat as missing/empty for safety.
+    return False
+
+
+def _non_empty_path_list(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return bool(value) and all(
+            isinstance(p, str) and p.strip() for p in value
+        )
+    return False
+
+
+def _iter_paths(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [p.strip() for p in value if isinstance(p, str) and p.strip()]
+    return []
+
+
+def _is_doc_or_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    filename = normalized.rsplit("/", 1)[-1]
+    return (
+        normalized.startswith("docs/")
+        or filename in {"readme.md", "readme.rst", "readme.txt"}
+        or filename.endswith((".md", ".rst", ".txt", ".adoc"))
+        or normalized.startswith("tests/")
+        or normalized.startswith("test/")
+        or filename.startswith("test_")
+        or filename.endswith(
+            ("_test.py", ".spec.ts", ".spec.tsx", ".test.ts", ".test.tsx")
+        )
+    )
+
+
+def _has_doc_or_test_asset_scope(node: dict[str, Any]) -> bool:
+    """Allow asset-only proposed nodes for doc indexes and test harnesses.
+
+    PM may need to materialize documentation or test assets that do not have a
+    single production-code primary file. Keep the exception narrow: the node
+    still needs a non-empty secondary/test path and at least one path must look
+    like a doc or test asset.
+    """
+    for field in ("secondary", "test"):
+        value = node.get(field)
+        if _non_empty_path_list(value) and any(
+            _is_doc_or_test_path(p) for p in _iter_paths(value)
+        ):
+            return True
     return False
 
 
@@ -156,7 +208,8 @@ def validate_pm_output(payload: dict, chain_context: Any = None,
             ),
         ))
 
-    # S5: every proposed_nodes element must have a non-empty 'primary'.
+    # S5: every proposed_nodes element must have a non-empty 'primary', unless
+    # it is an explicit doc/test asset-only node with secondary/test coverage.
     if isinstance(proposed_nodes, list):
         for i, n in enumerate(proposed_nodes):
             if not isinstance(n, dict):
@@ -173,15 +226,20 @@ def validate_pm_output(payload: dict, chain_context: Any = None,
                     primary_valid = True
             elif isinstance(primary, str) and primary.strip():
                 primary_valid = True
-            if not primary_valid:
+            if not primary_valid and not _has_doc_or_test_asset_scope(n):
                 errors.append(ValidationError(
                     error_codes.MISSING_REQUIRED_FIELD,
                     f"$.proposed_nodes[{i}].primary",
-                    "proposed_nodes element missing non-empty 'primary' (list[str] or non-empty str)",
+                    (
+                        "proposed_nodes element missing non-empty 'primary' "
+                        "(list[str] or non-empty str) or doc/test asset scope"
+                    ),
                     "error",
                     suggested_fix=(
                         "set 'primary' to a list of file paths "
-                        "(e.g. ['agent/foo.py']) or a non-empty string"
+                        "(e.g. ['agent/foo.py']) or, for doc/test-only "
+                        "nodes, set 'secondary' or 'test' to non-empty "
+                        "documentation/test paths"
                     ),
                 ))
 

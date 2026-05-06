@@ -252,6 +252,30 @@ def test_proposed_node_primary_as_empty_list_fails():
     assert bad, f"expected MISSING_REQUIRED_FIELD on primary; got {res.errors}"
 
 
+def test_proposed_node_primary_as_empty_list_with_doc_assets_passes():
+    """S5: doc-only proposed_nodes may omit primary when secondary owns docs."""
+    payload = {
+        "acceptance_criteria": ["AC1"],
+        "target_files": ["docs/governance/README.md"],
+        "proposed_nodes": [
+            {
+                "primary": [],
+                "secondary": [
+                    "docs/governance/README.md",
+                    "docs/roles/gatekeeper.md",
+                ],
+                "title": "Documentation index assets",
+            },
+        ],
+    }
+    res = validate_pm_output(payload, None, mode="warn")
+    assert res.valid is True, f"expected valid doc-only node; got {res.errors}"
+    bad = [e for e in res.errors
+           if e.code == error_codes.MISSING_REQUIRED_FIELD
+           and "proposed_nodes[0].primary" in e.field_path]
+    assert not bad, f"unexpected primary errors: {bad}"
+
+
 def test_proposed_node_primary_as_list_with_empty_string_fails():
     """S5: proposed_nodes element with primary=[''] (or whitespace-only) fails."""
     payload = {
