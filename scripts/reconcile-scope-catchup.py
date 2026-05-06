@@ -37,8 +37,23 @@ def main(argv=None):
     parser.add_argument("--branch", default=None, help="Catch-up branch name")
     parser.add_argument("--worktree", default=None, help="Catch-up worktree path")
     parser.add_argument("--since-baseline", default=None, help="Commit SHA to start from")
-    parser.add_argument("--phases", default=None, help="Comma-separated phases; default K,A,E,D,F,G")
+    parser.add_argument("--phases", default=None, help="Comma-separated phases; default K,A,E,D,F")
     parser.add_argument("--output", default=None, help="JSON output path, relative to worktree if not absolute")
+    parser.add_argument(
+        "--file-materialization-backlog",
+        action="store_true",
+        help="Upsert a backlog row when actionable graph/doc/test materialization drift is found",
+    )
+    parser.add_argument(
+        "--materialization-api-base",
+        default="http://localhost:40000",
+        help="Governance API base used when filing materialization backlog rows",
+    )
+    parser.add_argument(
+        "--materialization-bug-id",
+        default=None,
+        help="Optional explicit backlog bug_id for the materialization handoff",
+    )
     args = parser.parse_args(argv)
 
     from agent.governance.reconcile_scope_catchup import run_scope_catchup
@@ -53,6 +68,9 @@ def main(argv=None):
         phases=_parse_phases(args.phases),
         dry_run=not args.apply,
         output_path=args.output,
+        file_materialization_backlog=args.file_materialization_backlog,
+        materialization_api_base=args.materialization_api_base,
+        materialization_bug_id=args.materialization_bug_id,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     return 0

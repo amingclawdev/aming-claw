@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -18,6 +21,15 @@ from .reconcile_phases.orchestrator import run_commit_sweep_orchestrated
 # Phase G is a global chain-closure audit, not a commit/file scoped check. Keep
 # it opt-in so MF catch-up does not drown hot-file drift in historical queue noise.
 DEFAULT_PHASES = ["K", "A", "E", "D", "F"]
+ACTIONABLE_MATERIALIZATION_TYPES = frozenset({
+    "unmapped_file",
+    "unmapped_doc",
+    "unmapped_medium_conf_suggest",
+    "stale_doc_ref",
+    "doc_stale",
+    "doc_value_drift",
+    "contract_no_test",
+})
 
 
 class ScopeCatchupError(RuntimeError):
@@ -122,6 +134,152 @@ def _default_worktree(root: Path, base_short: str) -> Path:
     return root / ".worktrees" / ("scope-catchup-" + base_short)
 
 
+def _extract_discrepancy_path(discrepancy: Dict[str, Any]) -> str:
+    detail = str(discrepancy.get("detail") or "")
+    for pattern in (r"\bfile=([^\s]+)", r"\bdoc=([^\s]+)", r"\btarget=([^\s]+)"):
+        match = re.search(pattern, detail)
+        if match:
+            return match.group(1).strip().strip(",;")
+    if detail and "/" in detail and " " not in detail:
+        return detail.strip().strip(",;")
+    return str(discrepancy.get("path") or discrepancy.get("file") or "")
+
+
+def _is_actionable_discrepancy(discrepancy: Dict[str, Any]) -> bool:
+    dtype = str(discrepancy.get("type") or "")
+    return dtype in ACTIONABLE_MATERIALIZATION_TYPES
+
+
+def _materialization_bug_id(project_id: str, worktree: Dict[str, str], sweep: Dict[str, Any]) -> str:
+    import hashlib
+
+    base = worktree.get("base_short") or "base"
+    head = worktree.get("worktree_head", "")[:7] or "head"
+    hot = "\n".join(sorted(str(p) for p in sweep.get("hot_files", []) or []))
+    digest = hashlib.sha1((project_id + "\n" + base + "\n" + head + "\n" + hot).encode("utf-8")).hexdigest()[:8]
+    return "RECONCILE-SCOPE-MATERIALIZE-{base}-{head}-{digest}".format(
+        base=base,
+        head=head,
+        digest=digest,
+    )
+
+
+def _summarize_materialization_backlog(
+    *,
+    project_id: str,
+    worktree: Dict[str, str],
+    sweep: Dict[str, Any],
+    bug_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    actionable = [
+        dict(d) for d in sweep.get("dedup_discrepancies", []) or []
+        if isinstance(d, dict) and _is_actionable_discrepancy(d)
+    ]
+    target_files = []
+    for path in list(sweep.get("hot_files", []) or []):
+        if path and path not in target_files:
+            target_files.append(path)
+    for d in actionable:
+        path = _extract_discrepancy_path(d)
+        if path and path not in target_files:
+            target_files.append(path)
+
+    test_files = [
+        p for p in target_files
+        if p.endswith(".py") and ("/test" in p or "\\test" in p or Path(p).name.startswith("test_"))
+    ]
+
+    return {
+        "enabled": False,
+        "filed": False,
+        "bug_id": bug_id or _materialization_bug_id(project_id, worktree, sweep),
+        "actionable_count": len(actionable),
+        "actionable_types": sorted({str(d.get("type") or "") for d in actionable}),
+        "target_files": target_files[:50],
+        "test_files": test_files[:50],
+        "discrepancies": actionable[:20],
+    }
+
+
+def _file_materialization_backlog(
+    *,
+    project_id: str,
+    summary: Dict[str, Any],
+    api_base: str,
+    provenance_path: str,
+) -> Dict[str, Any]:
+    if not summary.get("actionable_count"):
+        result = dict(summary)
+        result["enabled"] = True
+        result["filed"] = False
+        result["reason"] = "no actionable materialization discrepancies"
+        return result
+
+    base = api_base.rstrip("/") or "http://localhost:40000"
+    bug_id = str(summary["bug_id"])
+    url = "{base}/api/backlog/{project_id}/{bug_id}".format(
+        base=base,
+        project_id=project_id,
+        bug_id=bug_id,
+    )
+    payload = {
+        "title": "Scope reconcile materialization drift for " + bug_id,
+        "status": "OPEN",
+        "priority": "P1",
+        "target_files": summary.get("target_files", []),
+        "test_files": summary.get("test_files", []),
+        "acceptance_criteria": [
+            "Every target file is mapped to an appropriate graph node or explicitly waived.",
+            "Runtime behavior changes have node-scoped documentation or explicit doc_debt.",
+            "New or changed test files are attached to the owning graph node.",
+            "QA verifies graph/doc/test coverage before closing this materialization backlog.",
+        ],
+        "details_md": (
+            "Auto-filed by scope reconcile catch-up. The commit-sweep found actionable "
+            "graph/doc/test materialization drift that should be handled by the standard "
+            "PM -> Dev -> Test -> QA -> Merge chain, not by silently advancing a baseline.\n\n"
+            "Actionable types: {types}\n\n"
+            "Discrepancy sample:\n```json\n{sample}\n```"
+        ).format(
+            types=", ".join(summary.get("actionable_types", [])),
+            sample=json.dumps(summary.get("discrepancies", [])[:10], indent=2, ensure_ascii=False),
+        ),
+        "provenance_paths": [provenance_path],
+        "force_admit": True,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = dict(summary)
+    result["enabled"] = True
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        result["filed"] = bool(body.get("ok"))
+        result["response"] = body
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        result["filed"] = False
+        result["error"] = str(exc)
+    return result
+
+
+def _sweep_summary(sweep: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "commits": len(sweep.get("commits", [])),
+        "all_discrepancies": len(sweep.get("all_discrepancies", [])),
+        "dedup_discrepancies": len(sweep.get("dedup_discrepancies", [])),
+        "hot_files": len(sweep.get("hot_files", [])),
+        "covered_hot": len(sweep.get("covered_hot", [])),
+        "coverage_pct": sweep.get("coverage_pct", 0.0),
+        "baseline_written": bool(sweep.get("baseline_written")),
+    }
+
+
 def run_scope_catchup(
     *,
     project_id: str = "aming-claw",
@@ -133,6 +291,9 @@ def run_scope_catchup(
     phases: Optional[List[str]] = None,
     dry_run: bool = True,
     output_path: str | Path | None = None,
+    file_materialization_backlog: bool = False,
+    materialization_api_base: str = "http://localhost:40000",
+    materialization_bug_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Prepare a catch-up worktree and run scoped commit-sweep.
 
@@ -155,12 +316,13 @@ def run_scope_catchup(
     )
 
     effective_phases = phases or list(DEFAULT_PHASES)
+    scan_dry_run = True if not dry_run else dry_run
     sweep = run_commit_sweep_orchestrated(
         project_id,
         worktree["worktree_path"],
         since_baseline=since_baseline,
         phases=effective_phases,
-        dry_run=dry_run,
+        dry_run=scan_dry_run,
     )
 
     mode = "dry_run" if dry_run else "apply"
@@ -174,15 +336,13 @@ def run_scope_catchup(
             output = Path(worktree["worktree_path"]) / output
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    summary = {
-        "commits": len(sweep.get("commits", [])),
-        "all_discrepancies": len(sweep.get("all_discrepancies", [])),
-        "dedup_discrepancies": len(sweep.get("dedup_discrepancies", [])),
-        "hot_files": len(sweep.get("hot_files", [])),
-        "covered_hot": len(sweep.get("covered_hot", [])),
-        "coverage_pct": sweep.get("coverage_pct", 0.0),
-        "baseline_written": bool(sweep.get("baseline_written")),
-    }
+    summary = _sweep_summary(sweep)
+    materialization = _summarize_materialization_backlog(
+        project_id=project_id,
+        worktree=worktree,
+        sweep=sweep,
+        bug_id=materialization_bug_id,
+    )
 
     result = {
         "ok": True,
@@ -201,6 +361,34 @@ def run_scope_catchup(
             "README/doc materialization must be filed as a separate chain/backlog task. "
             "Global chain-closure checks are opt-in via --phases when needed."
         ),
+        "materialization_backlog": materialization,
     }
     output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    if file_materialization_backlog:
+        result["materialization_backlog"] = _file_materialization_backlog(
+            project_id=project_id,
+            summary=materialization,
+            api_base=materialization_api_base,
+            provenance_path=str(output),
+        )
+        output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not dry_run:
+        materialization_state = result.get("materialization_backlog", {})
+        if materialization.get("actionable_count") and not materialization_state.get("filed"):
+            result["baseline_blocked_reason"] = (
+                "actionable materialization drift found; file materialization backlog "
+                "or pass a waiver before advancing commit_sweep baseline"
+            )
+            result["summary"]["baseline_written"] = False
+        else:
+            apply_sweep = run_commit_sweep_orchestrated(
+                project_id,
+                worktree["worktree_path"],
+                since_baseline=since_baseline,
+                phases=effective_phases,
+                dry_run=False,
+            )
+            result["result"] = apply_sweep
+            result["summary"] = _sweep_summary(apply_sweep)
+        output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     return result
