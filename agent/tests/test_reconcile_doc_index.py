@@ -2,7 +2,10 @@ import json
 
 from agent.governance.reconcile_doc_index import (
     build_final_doc_index,
+    materialize_repo_feature_index,
     render_markdown,
+    render_repo_feature_index,
+    upsert_governance_readme_feature_index,
     write_final_doc_index,
 )
 
@@ -174,3 +177,125 @@ def test_final_doc_index_treats_none_sentinel_as_missing_test(tmp_path):
     assert report["features"][0]["test_status"] == "missing"
     assert report["summary"]["missing_test_count"] == 1
     assert report["summary"]["ready_for_signoff"] is False
+
+
+def test_repo_feature_index_renders_compact_feature_table():
+    report = {
+        "project_id": "test-project",
+        "session_id": "sess-idx",
+        "summary": {
+            "candidate_leaf_count": 2,
+            "approved_leaf_count": 2,
+            "missing_source_leaf_count": 0,
+            "missing_doc_count": 1,
+            "missing_test_count": 1,
+            "unresolved_file_count": 1,
+            "index_doc_count": 1,
+            "blocking_issues": ["approved_feature_missing_doc"],
+        },
+        "features": [
+            {
+                "candidate_node_id": "L7.2",
+                "overlay_node_id": "L7.2",
+                "title": "Documented Feature",
+                "primary": ["agent/feature_b.py"],
+                "docs": ["docs/feature-b.md"],
+                "tests": ["agent/tests/test_feature_b.py"],
+                "approved": True,
+                "doc_status": "covered",
+                "test_status": "covered",
+            },
+            {
+                "candidate_node_id": "L7.10",
+                "overlay_node_id": "L7.10",
+                "title": "Debt Feature",
+                "primary": ["agent/feature_a.py"],
+                "docs": [],
+                "tests": [],
+                "approved": True,
+                "doc_status": "missing",
+                "test_status": "missing",
+            },
+        ],
+        "inventory": {
+            "unresolved_files": [
+                {"path": "agent/orphan.py", "file_kind": "source", "scan_status": "orphan", "reason": "not referenced"}
+            ],
+            "index_docs": [
+                {"path": "README.md", "scan_status": "orphan", "graph_referenced": False}
+            ],
+        },
+    }
+
+    markdown = render_repo_feature_index(report, source_path="shared-volume/review.json")
+
+    assert "# Governance Feature Index" in markdown
+    assert "| `L7.2` | Documented Feature |" in markdown
+    assert "| `L7.10` | Debt Feature |" in markdown
+    assert "`docs/feature-b.md`" in markdown
+    assert "| `agent/orphan.py` | `source` | `orphan` | not referenced |" in markdown
+    assert "doc, test" in markdown
+
+
+def test_upsert_governance_readme_feature_index_is_stable():
+    original = "# Governance Documentation\n\n## Specifications\n\nbody\n"
+    first = upsert_governance_readme_feature_index(
+        original,
+        feature_index_path="feature-index.md",
+        summary={"approved_leaf_count": 1, "candidate_leaf_count": 2, "missing_doc_count": 3, "missing_test_count": 4},
+    )
+    second = upsert_governance_readme_feature_index(
+        first,
+        feature_index_path="feature-index.md",
+        summary={"approved_leaf_count": 1, "candidate_leaf_count": 2, "missing_doc_count": 3, "missing_test_count": 4},
+    )
+
+    assert first == second
+    assert "Generated Indices" in first
+    assert "[feature-index.md](feature-index.md)" in first
+    assert first.index("Generated Indices") < first.index("## Specifications")
+
+
+def test_materialize_repo_feature_index_writes_doc_and_readme(tmp_path):
+    review = tmp_path / "graph.rebase.doc-index.review.json"
+    review.write_text(json.dumps({
+        "project_id": "test-project",
+        "session_id": "sess-materialize",
+        "summary": {
+            "candidate_leaf_count": 1,
+            "approved_leaf_count": 1,
+            "missing_source_leaf_count": 0,
+            "missing_doc_count": 0,
+            "missing_test_count": 0,
+            "unresolved_file_count": 0,
+            "index_doc_count": 0,
+            "blocking_issues": [],
+        },
+        "features": [{
+            "candidate_node_id": "L7.1",
+            "overlay_node_id": "L7.1",
+            "title": "Feature",
+            "primary": ["agent/feature.py"],
+            "docs": ["docs/feature.md"],
+            "tests": ["agent/tests/test_feature.py"],
+            "approved": True,
+            "doc_status": "covered",
+            "test_status": "covered",
+        }],
+        "inventory": {"unresolved_files": [], "index_docs": []},
+    }), encoding="utf-8")
+    readme = tmp_path / "docs" / "governance" / "README.md"
+    readme.parent.mkdir(parents=True)
+    readme.write_text("# Governance Documentation\n\n## Specifications\n\n", encoding="utf-8")
+    feature_index = tmp_path / "docs" / "governance" / "feature-index.md"
+
+    result = materialize_repo_feature_index(
+        review_json_path=review,
+        feature_index_path=feature_index,
+        governance_readme_path=readme,
+    )
+
+    assert result["readme_updated"] is True
+    assert feature_index.exists()
+    assert "Governance Feature Index" in feature_index.read_text(encoding="utf-8")
+    assert "[feature-index.md](feature-index.md)" in readme.read_text(encoding="utf-8")

@@ -8,11 +8,15 @@ never mutates graph.json.
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
 
 DOC_SUFFIXES = {".md", ".rst", ".txt", ".adoc"}
+FEATURE_INDEX_MARKER_START = "<!-- RECONCILE-FEATURE-INDEX:START -->"
+FEATURE_INDEX_MARKER_END = "<!-- RECONCILE-FEATURE-INDEX:END -->"
 
 
 def _normalize(path: Any) -> str:
@@ -53,6 +57,13 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"expected JSON object in {p}")
     return data
+
+
+def _write_text_lf(path: str | Path, text: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
 
 
 def _node_id(node: dict[str, Any]) -> str:
@@ -118,6 +129,34 @@ def _merge_unique(*values: Iterable[str]) -> list[str]:
             if path and path not in out:
                 out.append(path)
     return out
+
+
+def _node_sort_key(node_id: str) -> tuple[int, int, str]:
+    match = re.match(r"^L(\d+)\.(\d+)$", str(node_id or ""))
+    if match:
+        return (int(match.group(1)), int(match.group(2)), "")
+    return (999, 999, str(node_id or ""))
+
+
+def _markdown_cell(value: Any) -> str:
+    text = str(value if value is not None else "").replace("\n", " ").strip()
+    return text.replace("|", "\\|")
+
+
+def _format_paths(paths: Iterable[str], *, max_items: int = 3) -> str:
+    clean = [_normalize(path) for path in paths or []]
+    clean = [path for path in clean if path]
+    if not clean:
+        return "missing"
+    shown = clean[:max_items]
+    rendered = "<br>".join(f"`{_markdown_cell(path)}`" for path in shown)
+    if len(clean) > max_items:
+        rendered += f"<br>+{len(clean) - max_items} more"
+    return rendered
+
+
+def _feature_node_id(feature: dict[str, Any]) -> str:
+    return str(feature.get("overlay_node_id") or feature.get("candidate_node_id") or "")
 
 
 def _is_doc_path(path: str) -> bool:
@@ -347,6 +386,212 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_repo_feature_index(report: dict[str, Any], *, source_path: str | Path | None = None) -> str:
+    """Render the compact repository-facing feature index.
+
+    Unlike the review artifact, this file is intended to be checked into docs.
+    It keeps coverage debt visible without requiring the user to inspect
+    shared-volume artifacts directly.
+    """
+    summary = report.get("summary", {})
+    features = sorted(
+        [f for f in report.get("features", []) if isinstance(f, dict)],
+        key=lambda f: _node_sort_key(_feature_node_id(f)),
+    )
+    inventory = report.get("inventory", {}) if isinstance(report.get("inventory"), dict) else {}
+    source_label = _normalize(source_path) if source_path else _normalize(report.get("candidate_graph_path"))
+    lines = [
+        "# Governance Feature Index",
+        "",
+        "This index is generated from the latest reconcile doc-index review. It is",
+        "the repo-level entry point for feature nodes, owned code, linked docs,",
+        "linked tests, and remaining doc/test debt.",
+        "",
+        "## Source",
+        "",
+        f"- project_id: `{report.get('project_id', '')}`",
+        f"- session_id: `{report.get('session_id', '')}`",
+        f"- source_review: `{source_label}`",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Candidate feature leaves | `{summary.get('candidate_leaf_count', 0)}` |",
+        f"| Approved feature leaves | `{summary.get('approved_leaf_count', 0)}` |",
+        f"| Missing source leaves | `{summary.get('missing_source_leaf_count', 0)}` |",
+        f"| Missing docs | `{summary.get('missing_doc_count', 0)}` |",
+        f"| Missing tests | `{summary.get('missing_test_count', 0)}` |",
+        f"| Unresolved files | `{summary.get('unresolved_file_count', 0)}` |",
+        f"| Index docs tracked | `{summary.get('index_doc_count', 0)}` |",
+        "",
+        "## Blocking Issues",
+        "",
+    ]
+    issues = summary.get("blocking_issues") or []
+    if issues:
+        lines.extend(f"- `{issue}`" for issue in issues)
+    else:
+        lines.append("- none")
+
+    lines.extend([
+        "",
+        "## Feature Nodes",
+        "",
+        "| Node | Feature | Code | Docs | Tests | Debt |",
+        "|---|---|---|---|---|---|",
+    ])
+    for feature in features:
+        debt = []
+        if not feature.get("approved"):
+            debt.append("unapproved")
+        if feature.get("doc_status") != "covered":
+            debt.append("doc")
+        if feature.get("test_status") != "covered":
+            debt.append("test")
+        lines.append(
+            "| {node} | {title} | {code} | {docs} | {tests} | {debt} |".format(
+                node=f"`{_markdown_cell(_feature_node_id(feature))}`",
+                title=_markdown_cell(feature.get("title", "")),
+                code=_format_paths(feature.get("primary", [])),
+                docs=_format_paths(feature.get("docs", [])),
+                tests=_format_paths(feature.get("tests", [])),
+                debt=", ".join(debt) if debt else "none",
+            )
+        )
+
+    lines.extend([
+        "",
+        "## Unresolved Files",
+        "",
+    ])
+    unresolved = inventory.get("unresolved_files") or []
+    if unresolved:
+        lines.extend([
+            "| Path | Kind | Status | Reason |",
+            "|---|---|---|---|",
+        ])
+        for item in unresolved:
+            lines.append(
+                "| `{path}` | `{kind}` | `{status}` | {reason} |".format(
+                    path=_markdown_cell(item.get("path", "")),
+                    kind=_markdown_cell(item.get("file_kind", "")),
+                    status=_markdown_cell(item.get("scan_status", "")),
+                    reason=_markdown_cell(item.get("reason", "")),
+                )
+            )
+    else:
+        lines.append("- none")
+
+    lines.extend([
+        "",
+        "## Index Docs",
+        "",
+    ])
+    index_docs = inventory.get("index_docs") or []
+    if index_docs:
+        lines.extend([
+            "| Path | Status | Graph Referenced |",
+            "|---|---|---:|",
+        ])
+        for item in index_docs:
+            lines.append(
+                "| `{path}` | `{status}` | `{referenced}` |".format(
+                    path=_markdown_cell(item.get("path", "")),
+                    status=_markdown_cell(item.get("scan_status", "")),
+                    referenced=_markdown_cell(item.get("graph_referenced", "")),
+                )
+            )
+    else:
+        lines.append("- none")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_governance_readme_feature_index_block(
+    *,
+    feature_index_path: str = "feature-index.md",
+    summary: dict[str, Any] | None = None,
+) -> str:
+    summary = summary or {}
+    return "\n".join([
+        FEATURE_INDEX_MARKER_START,
+        "## Generated Indices",
+        "",
+        "| File | Description |",
+        "|------|-------------|",
+        (
+            f"| [{feature_index_path}]({feature_index_path}) | Reconcile feature index: "
+            f"{summary.get('approved_leaf_count', 0)}/{summary.get('candidate_leaf_count', 0)} "
+            f"approved feature nodes, {summary.get('missing_doc_count', 0)} doc gaps, "
+            f"{summary.get('missing_test_count', 0)} test gaps |"
+        ),
+        FEATURE_INDEX_MARKER_END,
+        "",
+        "",
+    ])
+
+
+def upsert_governance_readme_feature_index(
+    readme_text: str,
+    *,
+    feature_index_path: str = "feature-index.md",
+    summary: dict[str, Any] | None = None,
+) -> str:
+    block = render_governance_readme_feature_index_block(
+        feature_index_path=feature_index_path,
+        summary=summary,
+    )
+    pattern = re.compile(
+        re.escape(FEATURE_INDEX_MARKER_START)
+        + r".*?"
+        + re.escape(FEATURE_INDEX_MARKER_END)
+        + r"(?:\r?\n)*",
+        re.DOTALL,
+    )
+    if pattern.search(readme_text):
+        return pattern.sub(block, readme_text)
+    anchor = "\n## Specifications\n"
+    if anchor in readme_text:
+        return readme_text.replace(anchor, "\n" + block + anchor.lstrip("\n"), 1)
+    return readme_text.rstrip() + "\n\n" + block
+
+
+def materialize_repo_feature_index(
+    *,
+    review_json_path: str | Path,
+    feature_index_path: str | Path,
+    governance_readme_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Write repo-facing feature index and optionally update governance README."""
+    report = _load_json(review_json_path)
+    feature_path = Path(feature_index_path)
+    _write_text_lf(
+        feature_path,
+        render_repo_feature_index(report, source_path=review_json_path),
+    )
+
+    readme_updated = False
+    if governance_readme_path is not None:
+        readme_path = Path(governance_readme_path)
+        existing = readme_path.read_text(encoding="utf-8") if readme_path.exists() else "# Governance Documentation\n"
+        rel = os.path.relpath(feature_path, start=readme_path.parent).replace("\\", "/")
+        updated = upsert_governance_readme_feature_index(
+            existing,
+            feature_index_path=rel,
+            summary=report.get("summary", {}),
+        )
+        _write_text_lf(readme_path, updated)
+        readme_updated = updated != existing
+
+    return {
+        "feature_index_path": str(feature_path),
+        "governance_readme_path": str(governance_readme_path or ""),
+        "readme_updated": readme_updated,
+        "summary": report.get("summary", {}),
+    }
+
+
 def write_final_doc_index(
     *,
     project_id: str,
@@ -368,7 +613,7 @@ def write_final_doc_index(
     out.mkdir(parents=True, exist_ok=True)
     json_path = out / "graph.rebase.doc-index.review.json"
     md_path = out / "graph.rebase.doc-index.review.md"
-    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    md_path.write_text(render_markdown(report), encoding="utf-8")
+    _write_text_lf(json_path, json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    _write_text_lf(md_path, render_markdown(report))
     report["artifact_paths"] = {"json": str(json_path), "markdown": str(md_path)}
     return report

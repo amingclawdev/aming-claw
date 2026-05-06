@@ -2,6 +2,14 @@
 
 This directory contains governance-related documentation for the Aming Claw project.
 
+<!-- RECONCILE-FEATURE-INDEX:START -->
+## Generated Indices
+
+| File | Description |
+|------|-------------|
+| [feature-index.md](feature-index.md) | Reconcile feature index: 171/171 approved feature nodes, 107 doc gaps, 26 test gaps |
+<!-- RECONCILE-FEATURE-INDEX:END -->
+
 ## Specifications
 
 | File | Description |
