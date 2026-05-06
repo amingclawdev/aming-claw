@@ -1836,6 +1836,128 @@ def _emit_graph_delta_event_with_source(project_id, task_id, result, source, met
 import uuid as _uuid
 
 
+_GRAPH_DELTA_GRAPH_CREATE_FIELDS = (
+    "title",
+    "primary",
+    "secondary",
+    "test",
+    "test_coverage",
+    "propagation",
+    "guard",
+    "version",
+    "gates",
+    "verify_requires",
+    "description",
+    "metadata",
+)
+_GRAPH_DELTA_GRAPH_UPDATE_FIELDS = _GRAPH_DELTA_GRAPH_CREATE_FIELDS
+
+
+def _graph_delta_layer_prefix(parent_layer):
+    raw = str(parent_layer or "").strip()
+    match = re.match(r"^[Ll]?(\d+)$", raw)
+    if not match:
+        return ""
+    return f"L{int(match.group(1))}"
+
+
+def _graph_delta_node_attrs(node_id, item):
+    layer = _graph_delta_layer_prefix(item.get("parent_layer"))
+    attrs = {
+        "id": node_id,
+        "title": item.get("title", node_id),
+        "layer": layer or "L0",
+        "verify_level": item.get("verify_level", 1),
+        "gate_mode": item.get("gate_mode", "auto"),
+        "test_coverage": item.get("test_coverage", "none"),
+        "primary": item.get("primary", []),
+        "secondary": item.get("secondary", []),
+        "test": item.get("test", []),
+        "propagation": item.get("propagation"),
+        "guard": item.get("guard", False),
+        "version": item.get("version", ""),
+        "gates": item.get("gates", []),
+        "verify_requires": item.get("verify_requires", []),
+    }
+    for key in ("description", "metadata"):
+        if key in item:
+            attrs[key] = item.get(key)
+    for key in _GRAPH_DELTA_GRAPH_CREATE_FIELDS:
+        if key in item and key not in attrs:
+            attrs[key] = item.get(key)
+    return attrs
+
+
+def _materialize_graph_delta_to_project_graph(project_id, committed_creates, committed_updates):
+    """Persist committed graph_delta changes into project graph.json.
+
+    node_state is the verification ledger; graph.json is the reader-facing
+    topology. A committed graph_delta must update both, otherwise later
+    release gates and impact readers cannot see newly materialized nodes.
+    """
+    if not committed_creates and not committed_updates:
+        return {"graph_updated": False, "created": [], "updated": []}
+
+    from .db import _resolve_project_dir
+    from .graph import AcceptanceGraph
+
+    graph_path = _resolve_project_dir(project_id) / "graph.json"
+    if not graph_path.exists():
+        log.info(
+            "_commit_graph_delta: graph.json not found for %s; node_state commit only",
+            project_id,
+        )
+        return {"graph_updated": False, "created": [], "updated": [], "missing_graph": True}
+
+    graph = AcceptanceGraph()
+    graph.load(graph_path)
+    created_ids = []
+    updated_ids = []
+
+    for node_id, item in committed_creates:
+        if node_id in graph.G:
+            continue
+        attrs = _graph_delta_node_attrs(node_id, item)
+        graph.G.add_node(node_id, **attrs)
+        for dep in item.get("deps", []) or []:
+            if dep in graph.G:
+                graph.G.add_edge(dep, node_id)
+        for gate_req in item.get("gates", []) or []:
+            gate_node_id = gate_req.get("node_id") if isinstance(gate_req, dict) else str(gate_req)
+            if gate_node_id in graph.G:
+                graph.gates_G.add_node(gate_node_id)
+                graph.gates_G.add_node(node_id)
+                graph.gates_G.add_edge(gate_node_id, node_id)
+        created_ids.append(node_id)
+
+    for item in committed_updates:
+        if not isinstance(item, dict):
+            continue
+        node_id = item.get("node_id")
+        if not node_id or node_id not in graph.G:
+            continue
+        fields = item.get("fields", {})
+        if not isinstance(fields, dict):
+            continue
+        safe_fields = {
+            key: value
+            for key, value in fields.items()
+            if key in _GRAPH_DELTA_GRAPH_UPDATE_FIELDS
+        }
+        if safe_fields:
+            graph.update_node_attrs(node_id, safe_fields)
+            updated_ids.append(node_id)
+
+    if created_ids or updated_ids:
+        graph.save(graph_path)
+
+    return {
+        "graph_updated": bool(created_ids or updated_ids),
+        "created": created_ids,
+        "updated": updated_ids,
+    }
+
+
 def _commit_graph_delta(conn, project_id, metadata):
     """Consume graph.delta.validated event and apply creates[]/updates[] to node_state.
 
@@ -1919,6 +2041,8 @@ def _commit_graph_delta(conn, project_id, metadata):
     now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     committed_node_ids = []
     attempted_node_ids = []  # R1: all creates[] node_ids regardless of dedup outcome
+    committed_creates = []
+    committed_updates = []
 
     try:
         # Begin transaction — conn should already be in autocommit=off mode
@@ -2022,6 +2146,7 @@ def _commit_graph_delta(conn, project_id, metadata):
                     pass  # History is nice-to-have
 
                 committed_node_ids.append(display_id)
+                committed_creates.append((display_id, item))
 
         # Process updates[]
         for item in updates:
@@ -2050,6 +2175,10 @@ def _commit_graph_delta(conn, project_id, metadata):
                 if field_name in fields:
                     update_parts.append(f"{field_name} = ?")
                     update_vals.append(fields[field_name])
+            graph_update_requested = any(
+                field_name in _GRAPH_DELTA_GRAPH_UPDATE_FIELDS
+                for field_name in fields
+            )
             if update_parts:
                 update_parts.append("updated_at = ?")
                 update_vals.append(now)
@@ -2064,6 +2193,18 @@ def _commit_graph_delta(conn, project_id, metadata):
                 # R3: Only count as committed if UPDATE actually modified a row
                 if cursor.rowcount > 0 and node_id not in committed_node_ids:
                     committed_node_ids.append(node_id)
+                if cursor.rowcount > 0 or graph_update_requested:
+                    committed_updates.append(item)
+            elif graph_update_requested:
+                if node_id not in committed_node_ids:
+                    committed_node_ids.append(node_id)
+                committed_updates.append(item)
+
+        graph_materialization = _materialize_graph_delta_to_project_graph(
+            project_id,
+            committed_creates,
+            committed_updates,
+        )
 
         # AC3: Write graph.delta.committed event — write to same conn (transactional)
         committed_payload = {
@@ -2074,6 +2215,7 @@ def _commit_graph_delta(conn, project_id, metadata):
             "creates_count": len(creates),
             "updates_count": len(updates),
             "links_skipped": len(links),
+            "graph_materialization": graph_materialization,
         }
         conn.execute(
             "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "

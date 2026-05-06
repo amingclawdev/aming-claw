@@ -12,13 +12,17 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 _agent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from governance.db import SCHEMA_SQL
+from governance.graph import AcceptanceGraph
 
 
 def _make_db():
@@ -242,6 +246,75 @@ class TestCommitGraphDelta(unittest.TestCase):
             self.conn, self.project_id, ["L7.1"], "qa_pass",
         )
         self.assertTrue(passed, reason)
+
+    def test_committed_create_and_update_are_persisted_to_project_graph(self):
+        """Committed graph_delta mutations must be visible to graph readers."""
+        with tempfile.TemporaryDirectory() as td:
+            project_dir = Path(td) / self.project_id
+            project_dir.mkdir(parents=True)
+            graph_path = project_dir / "graph.json"
+            graph = AcceptanceGraph()
+            graph.G.add_node(
+                "L7.23",
+                id="L7.23",
+                title="Existing",
+                layer="L7",
+                verify_level=1,
+                gate_mode="auto",
+                test_coverage="none",
+                primary=[],
+                secondary=[],
+                test=[],
+                propagation=None,
+                guard=False,
+                version="",
+                gates=[],
+                verify_requires=[],
+            )
+            graph.save(graph_path)
+
+            self.conn.execute(
+                "INSERT INTO node_state (project_id, node_id, verify_status, build_status, updated_at, version) "
+                "VALUES (?, 'L7.23', 'qa_pass', 'impl:done', datetime('now'), 1)",
+                (self.project_id,),
+            )
+            self.conn.commit()
+
+            _seed_validated_event(
+                self.conn, self.root_task_id, "dev-001",
+                creates=[{
+                    "parent_layer": 7,
+                    "title": "Scope Catch-up Materialization",
+                    "primary": ["agent/governance/reconcile_scope_catchup.py"],
+                    "secondary": ["docs/governance/reconcile-workflow.md"],
+                }],
+                updates=[{
+                    "node_id": "L7.23",
+                    "fields": {"secondary": ["docs/governance/auto-chain.md"]},
+                }],
+            )
+
+            with mock.patch("governance.db._resolve_project_dir", return_value=project_dir):
+                result = self.ac._commit_graph_delta(
+                    self.conn,
+                    self.project_id,
+                    self._make_metadata(task_id="gatekeeper-001"),
+                )
+
+            self.assertIn("L7.24", result["committed_node_ids"])
+            self.assertIn("L7.23", result["committed_node_ids"])
+
+            reloaded = AcceptanceGraph()
+            reloaded.load(graph_path)
+            self.assertIn("L7.24", reloaded.list_nodes())
+            self.assertEqual(
+                reloaded.get_node("L7.24")["primary"],
+                ["agent/governance/reconcile_scope_catchup.py"],
+            )
+            self.assertEqual(
+                reloaded.get_node("L7.23")["secondary"],
+                ["docs/governance/auto-chain.md"],
+            )
 
     def test_collision_does_not_mark_attempt_as_committed(self):
         """Explicit collisions keep intent evidence without reporting mutation."""
