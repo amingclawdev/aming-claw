@@ -9,6 +9,7 @@ import re
 import json
 import sys
 import logging
+import inspect
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,9 @@ class AcceptanceGraph:
         present key explicitly instead of tying graph loading to one writer.
         """
         link_key = "links" if "links" in section else "edges"
+        params = inspect.signature(nx.node_link_graph).parameters
+        if "edges" in params:
+            return nx.node_link_graph(section, edges=link_key)
         return nx.node_link_graph(section, link=link_key)
 
     def save(self, path: str | Path) -> None:

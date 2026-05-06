@@ -4,11 +4,12 @@ import sys
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
-    import networkx  # noqa: F401
+    import networkx as nx
     _has_networkx = True
 except ImportError:
     _has_networkx = False
@@ -136,6 +137,32 @@ class TestAcceptanceGraph(unittest.TestCase):
             self.assertIn("L0.1", loaded.direct_deps("L1.1"))
         finally:
             os.unlink(path)
+
+    def test_node_link_graph_uses_edges_keyword_when_runtime_requires_it(self):
+        calls = {}
+
+        def fake_node_link_graph(section, *, edges="edges"):
+            calls["edges"] = edges
+            graph = nx.DiGraph()
+            for node in section.get("nodes", []):
+                graph.add_node(node["id"], **node)
+            for edge in section.get(edges, []):
+                graph.add_edge(edge["source"], edge["target"])
+            return graph
+
+        section = {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [{"id": "L0.1"}, {"id": "L1.1"}],
+            "links": [{"source": "L0.1", "target": "L1.1"}],
+        }
+
+        with patch("governance.graph.nx.node_link_graph", fake_node_link_graph):
+            loaded = AcceptanceGraph._node_link_graph(section)
+
+        self.assertEqual(calls["edges"], "links")
+        self.assertIn("L0.1", loaded.predecessors("L1.1"))
 
     def test_export_mermaid(self):
         self.graph.add_node(NodeDef(id="L0.1", title="Test"))
