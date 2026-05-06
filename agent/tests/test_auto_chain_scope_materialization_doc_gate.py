@@ -93,6 +93,81 @@ def test_scope_materialization_checkpoint_honors_explicit_pm_docs_only():
     assert passed, reason
 
 
+def test_scope_materialization_graph_delta_only_checkpoint_can_advance():
+    from governance.auto_chain import _gate_checkpoint
+
+    result = {
+        "summary": "Docs already exist; graph_delta materializes doc assets.",
+        "changed_files": [],
+        "test_results": {
+            "ran": True,
+            "passed": 1,
+            "failed": 0,
+            "command": "python -c \"print('ok')\"",
+        },
+        "graph_delta": {
+            "creates": [
+                {
+                    "parent_layer": 7,
+                    "title": "Governance documentation index",
+                    "primary": [],
+                    "secondary": [
+                        "docs/governance/README.md",
+                        "docs/roles/gatekeeper.md",
+                    ],
+                    "test_coverage": "doc_assertion",
+                }
+            ],
+            "updates": [],
+            "links": [],
+        },
+    }
+    metadata = {
+        "operation_type": "scope-materialization",
+        "target_files": ["docs/governance/README.md", "docs/roles/gatekeeper.md"],
+    }
+
+    passed, reason = _gate_checkpoint(None, "aming-claw", result, metadata)
+
+    assert passed is True
+    assert reason == "scope-materialization graph_delta-only accepted"
+
+
+def test_scope_materialization_graph_delta_only_failed_tests_block():
+    from governance.auto_chain import _gate_checkpoint
+
+    result = {
+        "summary": "Docs already exist; graph_delta materializes doc assets.",
+        "changed_files": [],
+        "test_results": {
+            "ran": True,
+            "passed": 0,
+            "failed": 1,
+            "command": "python -c \"raise AssertionError('missing docs')\"",
+        },
+        "graph_delta": {
+            "creates": [
+                {
+                    "parent_layer": 7,
+                    "title": "Doc node",
+                    "secondary": ["docs/a.md"],
+                }
+            ],
+            "updates": [],
+            "links": [],
+        },
+    }
+    metadata = {
+        "operation_type": "scope-materialization",
+        "target_files": ["docs/a.md"],
+    }
+
+    passed, reason = _gate_checkpoint(None, "aming-claw", result, metadata)
+
+    assert passed is False
+    assert "scope-materialization verification failed with 1 failing tests" in reason
+
+
 def test_scope_materialization_qa_prompt_scopes_global_release_gate():
     from governance.auto_chain import _build_qa_prompt
 

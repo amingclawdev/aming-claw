@@ -5172,6 +5172,39 @@ def _gate_checkpoint(conn, project_id, result, metadata):
             failed_count = int(test_results.get("failed") or 0) if isinstance(test_results, dict) else 1
         except (TypeError, ValueError):
             failed_count = 1
+        if metadata.get("operation_type") == SCOPE_MATERIALIZATION_OPERATION_TYPE:
+            if (
+                isinstance(test_results, dict)
+                and test_results.get("ran") is True
+                and failed_count > 0
+            ):
+                return False, (
+                    "scope-materialization verification failed with "
+                    f"{failed_count} failing tests and changed_files=[]. "
+                    "Fix the scoped doc/test/graph materialization evidence "
+                    "or record an explicit observer-reviewed doc_debt decision. "
+                    f"test_results={json.dumps(test_results, ensure_ascii=False)}"
+                )
+
+            graph_delta = (
+                result.get("graph_delta")
+                if isinstance(result.get("graph_delta"), dict)
+                else {}
+            )
+            has_graph_delta = any(
+                isinstance(graph_delta.get(key), list)
+                and bool(graph_delta.get(key))
+                for key in ("creates", "updates", "links")
+            )
+            if (
+                isinstance(test_results, dict)
+                and test_results.get("ran") is True
+                and failed_count == 0
+                and result.get("summary")
+                and has_graph_delta
+            ):
+                return True, "scope-materialization graph_delta-only accepted"
+
         if metadata.get("operation_type") == CLUSTER_OPERATION_TYPE:
             if (
                 isinstance(test_results, dict)
