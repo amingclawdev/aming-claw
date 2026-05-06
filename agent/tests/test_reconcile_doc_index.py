@@ -50,6 +50,9 @@ def test_final_doc_index_reports_coverage_and_keeps_index_docs_nonblocking(tmp_p
     inventory = [
         {"path": "README.md", "file_kind": "doc", "scan_status": "orphan"},
         {"path": "docs/README.md", "file_kind": "doc", "scan_status": "orphan"},
+        {"path": "agent/feature_a.py", "file_kind": "source", "scan_status": "orphan", "reason": "stale scan"},
+        {"path": "docs/feature-a.md", "file_kind": "doc", "scan_status": "orphan", "reason": "stale scan"},
+        {"path": "agent/tests/test_feature_a.py", "file_kind": "test", "scan_status": "orphan", "reason": "stale scan"},
         {"path": "agent/orphan.py", "file_kind": "source", "scan_status": "orphan", "reason": "not clustered"},
         {"path": "agent/tests/test_orphan.py", "file_kind": "test", "scan_status": "orphan", "reason": "not attached"},
     ]
@@ -73,6 +76,11 @@ def test_final_doc_index_reports_coverage_and_keeps_index_docs_nonblocking(tmp_p
     assert {item["path"] for item in report["inventory"]["unresolved_files"]} == {
         "agent/orphan.py",
         "agent/tests/test_orphan.py",
+    }
+    assert {item["path"] for item in report["inventory"]["resolved_referenced_files"]} == {
+        "agent/feature_a.py",
+        "docs/feature-a.md",
+        "agent/tests/test_feature_a.py",
     }
 
     approved = next(f for f in report["features"] if f["candidate_node_id"] == "L7.1")
