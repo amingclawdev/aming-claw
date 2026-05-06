@@ -336,6 +336,7 @@ def test_sweep_since_baseline_default(mock_subproc, mock_rename, mock_slice):
     assert mock_subproc.called
     git_log_cmd = mock_subproc.call_args[0][0]
     assert "resolved_base_sha..HEAD" in " ".join(git_log_cmd)
+    assert result["since_baseline"] == "resolved_base_sha"
 
 
 # ---------------------------------------------------------------------------

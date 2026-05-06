@@ -343,12 +343,13 @@ def run_scope_catchup(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     summary = _sweep_summary(sweep)
+    resolved_since_baseline = sweep.get("since_baseline") or since_baseline
     materialization = _summarize_materialization_backlog(
         project_id=project_id,
         worktree=worktree,
         sweep=sweep,
         bug_id=materialization_bug_id,
-        since_baseline=since_baseline,
+        since_baseline=resolved_since_baseline,
     )
 
     result = {
@@ -357,6 +358,7 @@ def run_scope_catchup(
         "mode": mode,
         "phases": effective_phases,
         "since_baseline": since_baseline,
+        "resolved_since_baseline": resolved_since_baseline,
         "worktree": worktree,
         "summary": summary,
         "result": sweep,

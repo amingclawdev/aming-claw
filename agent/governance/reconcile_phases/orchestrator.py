@@ -572,6 +572,7 @@ def run_commit_sweep_orchestrated(
             log.warning("run_commit_sweep_orchestrated: baseline write failed: %s", exc)
 
     return {
+        "since_baseline": since_baseline,
         "commits": commits,
         "all_discrepancies": all_discrepancies,
         "dedup_discrepancies": dedup_discrepancies,
