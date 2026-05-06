@@ -183,6 +183,29 @@ def _entry_path_keys(entry):
     return paths
 
 
+def _extract_dev_doc_debt(result):
+    if not isinstance(result, dict):
+        return []
+    debt = []
+    raw = result.get("doc_debt")
+    if isinstance(raw, list):
+        debt.extend(raw)
+
+    graph_delta = result.get("graph_delta") if isinstance(result.get("graph_delta"), dict) else {}
+    for key in ("doc_debt", "doc_debt_waivers"):
+        value = graph_delta.get(key)
+        if isinstance(value, list):
+            debt.extend(value)
+
+    waivers = graph_delta.get("waivers")
+    if isinstance(waivers, list):
+        debt.extend(
+            entry for entry in waivers
+            if _is_waived_doc_debt_entry(entry, implied_doc_debt=False)
+        )
+    return debt
+
+
 def _scope_materialization_waived_doc_debt_paths(metadata, proposed_graph_delta=None):
     """Return absent doc paths explicitly waived by a scope-materialization graph delta."""
     if not _is_scope_materialization_task(metadata):
@@ -198,6 +221,9 @@ def _scope_materialization_waived_doc_debt_paths(metadata, proposed_graph_delta=
         if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
             allowed.update(_entry_path_keys(entry))
     for entry, implied in _iter_doc_debt_entries(graph_delta.get("doc_debt", []), implied_doc_debt=True):
+        if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
+            allowed.update(_entry_path_keys(entry))
+    for entry, implied in _iter_doc_debt_entries(graph_delta.get("doc_debt_waivers", []), implied_doc_debt=True):
         if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
             allowed.update(_entry_path_keys(entry))
     return allowed
@@ -997,7 +1023,7 @@ def _normalize_existing_node_creates(project_id, graph_delta):
     }, moved
 
 
-_GRAPH_DELTA_EXTRA_EVENT_FIELDS = ("waivers", "doc_debt")
+_GRAPH_DELTA_EXTRA_EVENT_FIELDS = ("waivers", "doc_debt", "doc_debt_waivers")
 
 
 def _graph_delta_extra_event_fields(graph_delta):
@@ -1810,6 +1836,14 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata, task_type=
             _emit_graph_delta_event_with_source(project_id, task_id, result, "dev-emitted", metadata)
         return
 
+    extras = _graph_delta_extra_event_fields(graph_delta) if isinstance(graph_delta, dict) else {}
+    normalized_delta = {
+        "creates": final_creates,
+        "updates": final_updates,
+        "links": final_links,
+    }
+    normalized_delta.update(extras)
+
     # Emit graph.delta.proposed with source
     try:
         from .chain_context import get_store
@@ -1823,11 +1857,7 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata, task_type=
             payload={
                 "source_task_id": task_id,
                 "source": source,
-                "graph_delta": {
-                    "creates": final_creates,
-                    "updates": final_updates,
-                    "links": final_links,
-                },
+                "graph_delta": normalized_delta,
             },
             project_id=project_id,
         )
@@ -6436,7 +6466,7 @@ def _build_test_prompt(task_id, result, metadata):
         "dev_changed_files": changed,
         "dev_needs_review": result.get("needs_review", False),
         "dev_retry_context": result.get("retry_context", {}),
-        "dev_doc_debt": result.get("doc_debt", []),
+        "dev_doc_debt": _extract_dev_doc_debt(result),
         "graph_preflight": metadata.get("graph_preflight", {}),
     }
     # Propagate worktree info from dev result → test → qa → merge

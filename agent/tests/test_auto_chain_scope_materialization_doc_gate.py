@@ -237,6 +237,36 @@ def test_scope_materialization_qa_prompt_includes_dev_doc_debt_context():
     assert "Test may carry only test_report and changed_files" in prompt
 
 
+def test_scope_materialization_test_prompt_carries_graph_delta_doc_debt_waivers():
+    from governance.auto_chain import _build_test_prompt
+
+    waiver = {
+        "path": "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md",
+        "status": "waived",
+        "reason": "Absent scratch record; not durable graph-owned docs.",
+    }
+    dev_result = {
+        "summary": "Recorded absent scratch doc as graph_delta doc_debt_waivers.",
+        "changed_files": [],
+        "test_results": {"ran": True, "passed": 1, "failed": 0},
+        "graph_delta": {
+            "creates": [],
+            "updates": [],
+            "links": [],
+            "doc_debt_waivers": [waiver],
+        },
+    }
+    pm_metadata = {
+        "project_id": "aming-claw",
+        "operation_type": "scope-materialization",
+        "target_files": ["docs/governance/README.md"],
+    }
+
+    _, test_meta = _build_test_prompt("task-dev", dev_result, pm_metadata)
+
+    assert test_meta["dev_doc_debt"] == [waiver]
+
+
 def test_existing_graph_node_create_is_normalized_to_update():
     from governance.auto_chain import _normalize_existing_node_creates
 

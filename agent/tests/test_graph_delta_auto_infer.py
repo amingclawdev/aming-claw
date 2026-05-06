@@ -413,6 +413,13 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
                 "creates": [{"node_id": "N1", "title": "Test", "primary": ["a.py"]}],
                 "updates": [],
                 "links": [],
+                "waivers": [
+                    {
+                        "kind": "doc_debt",
+                        "path": "docs/dev/scratch/missing.md",
+                        "status": "waived",
+                    }
+                ],
             },
         }
         metadata = {"chain_id": "pm-root"}
@@ -450,6 +457,13 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
                         "status": "waived",
                     }
                 ],
+                "doc_debt_waivers": [
+                    {
+                        "path": "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md",
+                        "status": "waived",
+                        "reason": "Absent scratch reconcile record remains doc debt.",
+                    }
+                ],
             },
         }
         metadata = {"chain_id": "pm-root"}
@@ -468,6 +482,7 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
         self.assertGreaterEqual(len(proposed), 1)
         delta = proposed[0]["payload"]["graph_delta"]
         self.assertEqual(delta["waivers"], result["graph_delta"]["waivers"])
+        self.assertEqual(delta["doc_debt_waivers"], result["graph_delta"]["doc_debt_waivers"])
         self.assertEqual(len(delta["creates"]), 1)
 
     def test_existing_node_create_normalized_before_emit(self):
@@ -484,6 +499,13 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
                 ],
                 "updates": [],
                 "links": [],
+                "waivers": [
+                    {
+                        "kind": "doc_debt",
+                        "path": "docs/dev/scratch/missing.md",
+                        "status": "waived",
+                    }
+                ],
             },
         }
         metadata = {"chain_id": "pm-root"}
@@ -581,6 +603,13 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
                 ],
                 "updates": [],
                 "links": [],
+                "waivers": [
+                    {
+                        "kind": "doc_debt",
+                        "path": "docs/dev/scratch/missing.md",
+                        "status": "waived",
+                    }
+                ],
             },
         }
         metadata = {"chain_id": "pm-root"}
@@ -607,6 +636,10 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
         proposed = [e for e in self._persisted_events if e["event_type"] == "graph.delta.proposed"]
         self.assertGreaterEqual(len(proposed), 1)
         self.assertEqual(proposed[0]["payload"]["source"], "dev-emitted+inferred-gaps")
+        self.assertEqual(
+            proposed[0]["payload"]["graph_delta"]["waivers"],
+            result["graph_delta"]["waivers"],
+        )
 
 
 class TestInferGraphDeltaRuleH_L7(unittest.TestCase):
