@@ -844,6 +844,91 @@ def _audit_reconcile_bypass(conn, project_id, gate_name, run_id, task_id):
 # The pending_nodes table had no downstream consumer (pn['docs'] never populated by PM).
 
 
+_GRAPH_DELTA_CREATE_TO_UPDATE_FIELDS = (
+    "title",
+    "parent_layer",
+    "parent",
+    "parent_id",
+    "deps",
+    "verify_requires",
+    "primary",
+    "secondary",
+    "test",
+    "test_coverage",
+    "test_strategy",
+    "description",
+)
+
+
+def _normalize_existing_node_creates(project_id, graph_delta):
+    """Move creates for already-known node IDs into updates.
+
+    PM/Dev prompts often say "preserve L7.x and add tests". When an agent puts
+    such an existing node under creates[], the graph_delta becomes ambiguous:
+    commit code may treat it as a new node, while QA treats it as preservation.
+    Normalize it before persisting graph.delta.proposed so downstream gates see
+    the intended update semantics.
+    """
+    if not graph_delta or not isinstance(graph_delta, dict):
+        return graph_delta, 0
+
+    creates = graph_delta.get("creates", []) or []
+    updates = graph_delta.get("updates", []) or []
+    links = graph_delta.get("links", []) or []
+    if not creates:
+        return {"creates": creates, "updates": updates, "links": links}, 0
+
+    try:
+        from . import project_service
+        existing_nodes = set(project_service.load_project_graph(project_id).list_nodes())
+    except Exception:
+        log.debug("graph_delta normalize: active graph lookup failed", exc_info=True)
+        return {"creates": creates, "updates": updates, "links": links}, 0
+
+    normalized_creates = []
+    normalized_updates = list(updates)
+    update_by_id = {
+        entry.get("node_id"): entry
+        for entry in normalized_updates
+        if isinstance(entry, dict) and entry.get("node_id")
+    }
+    moved = 0
+
+    for entry in creates:
+        if not isinstance(entry, dict):
+            normalized_creates.append(entry)
+            continue
+        node_id = str(entry.get("node_id") or "").strip()
+        op = str(entry.get("op") or "").strip()
+        if not node_id or node_id not in existing_nodes or op in {"remove_node", "delete_node"}:
+            normalized_creates.append(entry)
+            continue
+
+        fields = {
+            key: entry[key]
+            for key in _GRAPH_DELTA_CREATE_TO_UPDATE_FIELDS
+            if key in entry and entry[key] is not None
+        }
+        existing_update = update_by_id.get(node_id)
+        if existing_update is None:
+            existing_update = {"node_id": node_id, "fields": {}}
+            normalized_updates.append(existing_update)
+            update_by_id[node_id] = existing_update
+        existing_fields = existing_update.setdefault("fields", {})
+        if isinstance(existing_fields, dict):
+            existing_fields.update(fields)
+        else:
+            existing_update["fields"] = fields
+        existing_update["normalized_from_create"] = True
+        moved += 1
+
+    return {
+        "creates": normalized_creates,
+        "updates": normalized_updates,
+        "links": links,
+    }, moved
+
+
 def _emit_graph_delta_event(project_id, task_id, result):
     """Emit graph.delta.proposed event if result contains non-empty graph_delta.
 
@@ -854,6 +939,10 @@ def _emit_graph_delta_event(project_id, task_id, result):
     graph_delta = result.get("graph_delta") if isinstance(result, dict) else None
     if not graph_delta or not isinstance(graph_delta, dict):
         return
+
+    graph_delta, moved = _normalize_existing_node_creates(project_id, graph_delta)
+    if moved:
+        log.info("graph_delta normalize: moved %d existing-node creates to updates", moved)
 
     # Normalize: default missing sub-arrays to []
     creates = graph_delta.get("creates", [])
@@ -1614,6 +1703,20 @@ def _emit_or_infer_graph_delta(project_id, task_id, result, metadata, task_type=
     final_updates = inferred_delta.get("updates", [])
     final_links = inferred_delta.get("links", [])
 
+    normalized_delta, moved_existing = _normalize_existing_node_creates(
+        project_id,
+        {"creates": final_creates, "updates": final_updates, "links": final_links},
+    )
+    if moved_existing:
+        log.info(
+            "_emit_or_infer_graph_delta: normalized %d existing-node creates to updates for task=%s",
+            moved_existing,
+            task_id,
+        )
+        final_creates = normalized_delta.get("creates", [])
+        final_updates = normalized_delta.get("updates", [])
+        final_links = normalized_delta.get("links", [])
+
     if not final_creates and not final_updates and not final_links:
         # Nothing to emit — still emit empty proposed for audit trail
         log.info("_emit_or_infer_graph_delta: early-return empty inference task=%s dev_has_delta=%s", task_id, dev_has_delta)
@@ -1681,6 +1784,20 @@ def _emit_graph_delta_event_with_source(project_id, task_id, result, source, met
     creates = graph_delta.get("creates", [])
     updates = graph_delta.get("updates", [])
     links = graph_delta.get("links", [])
+
+    graph_delta, moved = _normalize_existing_node_creates(
+        project_id,
+        {"creates": creates, "updates": updates, "links": links},
+    )
+    if moved:
+        log.info(
+            "graph_delta passthrough normalize: moved %d existing-node creates to updates for task=%s",
+            moved,
+            task_id,
+        )
+        creates = graph_delta.get("creates", [])
+        updates = graph_delta.get("updates", [])
+        links = graph_delta.get("links", [])
 
     if not creates and not updates and not links:
         return
@@ -6089,6 +6206,18 @@ def _build_qa_prompt(task_id, result, metadata):
         prompt_parts.append(f"verification: {json.dumps(verification, ensure_ascii=False)}")
     if doc_impact:
         prompt_parts.append(f"doc_impact: {json.dumps(doc_impact, ensure_ascii=False)}")
+    if _is_scope_materialization_task(metadata):
+        prompt_parts.append(
+            "\n## Scope Materialization QA Scope\n"
+            "This is a scoped governance materialization review. Judge only the "
+            "PM-declared doc_impact, changed_files, verification result, and "
+            "graph_delta payload for this backlog row. Do not call or require "
+            "the global /api/wf/{project_id}/release-gate check for qa_pass; "
+            "global release-gate debt from unrelated graph nodes is observation-only "
+            "and MUST NOT set recommendation='reject' for this scoped task. If "
+            "you notice unrelated release-gate blockers, mention them as residual "
+            "risk while still returning qa_pass when all scoped acceptance criteria pass."
+        )
     graph_preflight = metadata.get("graph_preflight", {})
     if is_reconcile_cluster_task(metadata):
         graph_preflight = graph_preflight or _build_reconcile_graph_preflight(
@@ -6162,6 +6291,10 @@ def _build_qa_prompt(task_id, result, metadata):
             "  }\n"
             "If decision is 'reject', list specific issues. "
             "If decision is 'pass', issues should be an empty list."
+            "\nExisting graph nodes that are being preserved or extended must be "
+            "represented as updates, not creates. Reject a graph_delta that puts "
+            "an already-existing non-null node_id under creates unless the payload "
+            "explicitly proves that node_id is not present in the active graph."
         )
     prompt_parts.append(
         "Evidence path rule: if your QA result cites a workspace file path, "

@@ -429,6 +429,47 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
         self.assertGreaterEqual(len(proposed), 1)
         self.assertEqual(proposed[0]["payload"]["source"], "dev-emitted")
 
+    def test_existing_node_create_normalized_before_emit(self):
+        """Existing graph node IDs under creates[] are persisted as updates[]."""
+        result = {
+            "graph_delta": {
+                "creates": [
+                    {
+                        "node_id": "L7.23",
+                        "title": "Auto-chain",
+                        "primary": ["agent/governance/auto_chain.py"],
+                        "test": ["agent/tests/test_auto_chain_scope_materialization_doc_gate.py"],
+                    }
+                ],
+                "updates": [],
+                "links": [],
+            },
+        }
+        metadata = {"chain_id": "pm-root"}
+
+        import unittest.mock as mock
+        mock_conn = mock.MagicMock()
+        mock_conn.execute.return_value.fetchone.return_value = None
+        fake_graph = mock.MagicMock()
+        fake_graph.list_nodes.return_value = ["L7.23"]
+
+        with mock.patch("governance.db.get_connection", return_value=mock_conn), mock.patch(
+            "governance.project_service.load_project_graph",
+            return_value=fake_graph,
+        ):
+            _emit_or_infer_graph_delta(self.pid, "dev-001", result, metadata)
+
+        proposed = [e for e in self._persisted_events if e["event_type"] == "graph.delta.proposed"]
+        self.assertGreaterEqual(len(proposed), 1)
+        delta = proposed[0]["payload"]["graph_delta"]
+        self.assertEqual(delta["creates"], [])
+        self.assertEqual(delta["updates"][0]["node_id"], "L7.23")
+        self.assertTrue(delta["updates"][0]["normalized_from_create"])
+        self.assertEqual(
+            delta["updates"][0]["fields"]["test"],
+            ["agent/tests/test_auto_chain_scope_materialization_doc_gate.py"],
+        )
+
     def test_a3_auto_inferred_when_no_graph_delta(self):
         """A3: Dev result without graph_delta + PM nodes → source='auto-inferred'."""
         result = {"changed_files": ["agent/auth.py"]}

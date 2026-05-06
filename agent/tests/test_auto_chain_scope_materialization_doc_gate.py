@@ -91,3 +91,70 @@ def test_scope_materialization_checkpoint_honors_explicit_pm_docs_only():
         passed, reason = _gate_checkpoint(None, "aming-claw", result, metadata)
 
     assert passed, reason
+
+
+def test_scope_materialization_qa_prompt_scopes_global_release_gate():
+    from governance.auto_chain import _build_qa_prompt
+
+    result = {
+        "test_report": {"tool": "pytest", "passed": 1, "failed": 0, "errors": 0},
+        "changed_files": ["docs/governance/auto-chain.md"],
+    }
+    metadata = {
+        "project_id": "aming-claw",
+        "operation_type": "scope-materialization",
+        "target_files": ["docs/governance/auto-chain.md"],
+        "acceptance_criteria": ["AC1: scoped docs updated"],
+        "doc_impact": {"files": ["docs/governance/auto-chain.md"], "changes": ["scoped"]},
+    }
+
+    with mock.patch("governance.auto_chain._query_graph_delta_proposed", return_value=None), mock.patch(
+        "governance.auto_chain._get_task_graph_doc_associations",
+        return_value=[],
+    ):
+        prompt, _ = _build_qa_prompt("task-test", result, metadata)
+
+    assert "Scope Materialization QA Scope" in prompt
+    assert "Do not call or require the global /api/wf/{project_id}/release-gate" in prompt
+    assert "MUST NOT set recommendation='reject'" in prompt
+
+
+def test_existing_graph_node_create_is_normalized_to_update():
+    from governance.auto_chain import _normalize_existing_node_creates
+
+    fake_graph = mock.Mock()
+    fake_graph.list_nodes.return_value = ["L7.23", "L7.47"]
+    delta = {
+        "creates": [
+            {
+                "node_id": "L7.23",
+                "title": "Auto-chain",
+                "primary": ["agent/governance/auto_chain.py"],
+                "test": ["agent/tests/test_auto_chain_scope_materialization_doc_gate.py"],
+            },
+            {
+                "node_id": None,
+                "title": "New scope catchup wrapper",
+                "primary": ["agent/governance/reconcile_scope_catchup.py"],
+            },
+        ],
+        "updates": [],
+        "links": [],
+    }
+
+    with mock.patch("governance.project_service.load_project_graph", return_value=fake_graph):
+        normalized, moved = _normalize_existing_node_creates("aming-claw", delta)
+
+    assert moved == 1
+    assert [c.get("title") for c in normalized["creates"]] == ["New scope catchup wrapper"]
+    assert normalized["updates"] == [
+        {
+            "node_id": "L7.23",
+            "fields": {
+                "title": "Auto-chain",
+                "primary": ["agent/governance/auto_chain.py"],
+                "test": ["agent/tests/test_auto_chain_scope_materialization_doc_gate.py"],
+            },
+            "normalized_from_create": True,
+        }
+    ]
