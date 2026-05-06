@@ -81,7 +81,7 @@ _QA_EVIDENCE_PATH_RE = re.compile(
     r"|(?:start_governance\.py|pyproject\.toml|README\.md|requirements(?:-[\w-]+)?\.txt)"
     r")"
 )
-_QA_EVIDENCE_PATH_TRAIL = ".,;:)]}'\""
+_QA_EVIDENCE_PATH_TRAIL = ".,;:)]}'\"`"
 _QA_EVIDENCE_GLOB_CHARS = set("*?[]{}")
 _QA_EVIDENCE_LINE_SUFFIX_RE = re.compile(r":\d+(?::\d+)?$")
 _QA_EVIDENCE_SYMBOL_SUFFIX_RE = re.compile(
@@ -292,12 +292,22 @@ def _missing_qa_evidence_paths(project_id, result, metadata=None):
     return missing
 
 
-def _format_qa_rejection_reason(result, fallback="QA rejected: no reason given"):
+_DEFAULT_QA_REJECTION_FALLBACK = "QA rejected: no reason given"
+
+
+def _format_qa_rejection_reason(result, fallback=_DEFAULT_QA_REJECTION_FALLBACK):
     """Preserve actionable QA rejection context for downstream Dev retries."""
     if not isinstance(result, dict):
         return fallback
 
     parts = []
+    fallback_text = str(fallback or "").strip()
+    if fallback_text and fallback_text != _DEFAULT_QA_REJECTION_FALLBACK:
+        if fallback_text.startswith("QA rejected: "):
+            fallback_text = fallback_text[len("QA rejected: "):].strip()
+        if fallback_text:
+            parts.append(f"gate_block_reason: {fallback_text}")
+
     explicit = str(result.get("reason") or "").strip()
     if explicit:
         parts.append(explicit)

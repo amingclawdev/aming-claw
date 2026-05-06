@@ -375,6 +375,36 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(reason, "ok")
 
+    def test_allows_markdown_inline_code_evidence_paths(self):
+        """Inline-code backticks are punctuation around evidence paths, not path characters."""
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": (
+                "Checked `agent/governance/reconcile_scope_catchup.py`, "
+                "`agent/tests/test_reconcile_scope_catchup.py`, "
+                "`agent/tests/test_reconcile_commit_sweep.py`, "
+                "`agent/governance/reconcile_phases/orchestrator.py`, and "
+                "`agent/governance/reconcile_phases/`."
+            ),
+            "criteria_results": [
+                {
+                    "criterion": "runtime audit evidence",
+                    "passed": True,
+                    "evidence": (
+                        "Existing evidence paths: `agent/governance/reconcile_scope_catchup.py`, "
+                        "`agent/tests/test_reconcile_scope_catchup.py`, and "
+                        "`agent/governance/reconcile_phases/`."
+                    ),
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata(changed_files=["docs/governance/reconcile-workflow.md"])
+        proposed = {"source_task_id": "task-dev-1", "graph_delta": {"creates": [{"node_id": "L7.172"}]}}
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+        self.assertTrue(passed, reason)
+        self.assertEqual(reason, "ok")
+
     def test_allows_brace_shorthand_evidence_path_group(self):
         """Brace shorthand is a path group, not a single missing file."""
         result = {
@@ -517,6 +547,28 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
             passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
             self.assertTrue(passed)
             self.assertEqual(reason, "ok")
+
+
+class TestFormatQaRejectionReason(unittest.TestCase):
+    """Test retry reason assembly for QA gate failures."""
+
+    def test_gate_block_reason_survives_qa_pass_summary(self):
+        from agent.governance.auto_chain import _format_qa_rejection_reason
+
+        reason = _format_qa_rejection_reason(
+            {
+                "recommendation": "qa_pass",
+                "review_summary": "All acceptance criteria passed.",
+            },
+            (
+                "QA evidence references missing workspace paths: "
+                "agent/governance/reconcile_scope_catchup.py`"
+            ),
+        )
+
+        self.assertIn("gate_block_reason: QA evidence references missing workspace paths", reason)
+        self.assertIn("agent/governance/reconcile_scope_catchup.py`", reason)
+        self.assertIn("review_summary: All acceptance criteria passed.", reason)
 
 
 class TestBuildQaPromptGraphDelta(unittest.TestCase):
