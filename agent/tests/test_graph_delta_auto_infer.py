@@ -429,6 +429,47 @@ class TestEmitOrInferGraphDelta(unittest.TestCase):
         self.assertGreaterEqual(len(proposed), 1)
         self.assertEqual(proposed[0]["payload"]["source"], "dev-emitted")
 
+    def test_dev_emitted_passthrough_preserves_waivers(self):
+        """Dev-emitted non-topology graph_delta audit fields survive event emit."""
+        result = {
+            "graph_delta": {
+                "creates": [
+                    {
+                        "node_id": None,
+                        "title": "Doc wrapper",
+                        "primary": [],
+                        "secondary": ["docs/governance/README.md"],
+                    }
+                ],
+                "updates": [],
+                "links": [],
+                "waivers": [
+                    {
+                        "kind": "doc_debt",
+                        "path": "docs/dev/scratch/missing.md",
+                        "status": "waived",
+                    }
+                ],
+            },
+        }
+        metadata = {"chain_id": "pm-root"}
+
+        import unittest.mock as mock
+        mock_conn = mock.MagicMock()
+        mock_conn.execute.return_value.fetchone.return_value = None
+
+        with mock.patch("governance.db.get_connection", return_value=mock_conn):
+            _emit_or_infer_graph_delta(self.pid, "dev-001", result, metadata)
+
+        proposed = [
+            e for e in self._persisted_events
+            if e["event_type"] == "graph.delta.proposed"
+        ]
+        self.assertGreaterEqual(len(proposed), 1)
+        delta = proposed[0]["payload"]["graph_delta"]
+        self.assertEqual(delta["waivers"], result["graph_delta"]["waivers"])
+        self.assertEqual(len(delta["creates"]), 1)
+
     def test_existing_node_create_normalized_before_emit(self):
         """Existing graph node IDs under creates[] are persisted as updates[]."""
         result = {

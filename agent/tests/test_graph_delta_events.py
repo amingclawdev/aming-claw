@@ -310,6 +310,7 @@ class TestCommitGraphDeltaL7Nodes(unittest.TestCase):
                 node_id TEXT NOT NULL,
                 verify_status TEXT NOT NULL DEFAULT 'pending',
                 build_status TEXT NOT NULL DEFAULT 'unknown',
+                evidence_json TEXT,
                 updated_at TEXT,
                 version INTEGER DEFAULT 1,
                 updated_by TEXT,
@@ -367,7 +368,7 @@ class TestCommitGraphDeltaL7Nodes(unittest.TestCase):
             "SELECT node_id, verify_status FROM node_state WHERE project_id='test-proj' AND node_id='L7.1'"
         ).fetchone()
         self.assertIsNotNone(row, "L7.1 should be inserted into node_state")
-        self.assertEqual(row["verify_status"], "pending")
+        self.assertEqual(row["verify_status"], "qa_pass")
 
     def test_l7_int_parent_layer_inserted(self):
         """AC2: parent_layer=7 (integer) is accepted and auto-generates L7.N node_id."""

@@ -929,6 +929,20 @@ def _normalize_existing_node_creates(project_id, graph_delta):
     }, moved
 
 
+_GRAPH_DELTA_EXTRA_EVENT_FIELDS = ("waivers", "doc_debt")
+
+
+def _graph_delta_extra_event_fields(graph_delta):
+    if not isinstance(graph_delta, dict):
+        return {}
+    extras = {}
+    for field in _GRAPH_DELTA_EXTRA_EVENT_FIELDS:
+        value = graph_delta.get(field)
+        if isinstance(value, list) and value:
+            extras[field] = value
+    return extras
+
+
 def _emit_graph_delta_event(project_id, task_id, result):
     """Emit graph.delta.proposed event if result contains non-empty graph_delta.
 
@@ -944,13 +958,16 @@ def _emit_graph_delta_event(project_id, task_id, result):
     if moved:
         log.info("graph_delta normalize: moved %d existing-node creates to updates", moved)
 
+    extras = _graph_delta_extra_event_fields(graph_delta)
+
     # Normalize: default missing sub-arrays to []
     creates = graph_delta.get("creates", [])
     updates = graph_delta.get("updates", [])
     links = graph_delta.get("links", [])
+    extras = _graph_delta_extra_event_fields(graph_delta)
 
     # R3: Skip if all sub-arrays are empty
-    if not creates and not updates and not links:
+    if not creates and not updates and not links and not extras:
         return
 
     normalized_delta = {
@@ -958,6 +975,7 @@ def _emit_graph_delta_event(project_id, task_id, result):
         "updates": updates,
         "links": links,
     }
+    normalized_delta.update(extras)
 
     try:
         from .chain_context import get_store
@@ -1784,6 +1802,7 @@ def _emit_graph_delta_event_with_source(project_id, task_id, result, source, met
     creates = graph_delta.get("creates", [])
     updates = graph_delta.get("updates", [])
     links = graph_delta.get("links", [])
+    extras = _graph_delta_extra_event_fields(graph_delta)
 
     graph_delta, moved = _normalize_existing_node_creates(
         project_id,
@@ -1799,8 +1818,14 @@ def _emit_graph_delta_event_with_source(project_id, task_id, result, source, met
         updates = graph_delta.get("updates", [])
         links = graph_delta.get("links", [])
 
-    if not creates and not updates and not links:
+    if not creates and not updates and not links and not extras:
         return
+    normalized_delta = {
+        "creates": creates,
+        "updates": updates,
+        "links": links,
+    }
+    normalized_delta.update(extras)
 
     try:
         from .chain_context import get_store
@@ -1815,11 +1840,7 @@ def _emit_graph_delta_event_with_source(project_id, task_id, result, source, met
             payload={
                 "source_task_id": task_id,
                 "source": source,
-                "graph_delta": {
-                    "creates": creates,
-                    "updates": updates,
-                    "links": links,
-                },
+                "graph_delta": normalized_delta,
             },
             project_id=project_id,
         )
@@ -2005,6 +2026,7 @@ def _commit_graph_delta(conn, project_id, metadata):
     creates = graph_delta.get("creates", [])
     updates = graph_delta.get("updates", [])
     links = graph_delta.get("links", [])
+    extras = _graph_delta_extra_event_fields(graph_delta)
 
     if not creates and not updates and not links:
         return
@@ -2217,6 +2239,7 @@ def _commit_graph_delta(conn, project_id, metadata):
             "links_skipped": len(links),
             "graph_materialization": graph_materialization,
         }
+        committed_payload.update(extras)
         conn.execute(
             "INSERT INTO chain_events (root_task_id, task_id, event_type, payload_json, ts) "
             "VALUES (?, ?, 'graph.delta.committed', ?, ?)",
