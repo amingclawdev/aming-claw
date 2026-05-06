@@ -139,6 +139,70 @@ def _is_qa_evidence_category_path(raw_path):
     return len(parts) >= 2 and all(part in _QA_EVIDENCE_CATEGORY_SEGMENTS for part in parts)
 
 
+_WAIVED_DOC_DEBT_STATUSES = {"waived", "waiver"}
+_DOC_DEBT_KINDS = {"doc_debt", "doc-debt", "doc debt", "documentation_debt", "documentation debt", "missing_doc"}
+_DOC_DEBT_PATH_KEYS = ("path", "file", "file_path", "doc", "doc_path", "target", "target_file")
+
+
+def _looks_like_doc_debt_kind(value):
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {kind.replace("-", "_").replace(" ", "_") for kind in _DOC_DEBT_KINDS}
+
+
+def _is_waived_doc_debt_entry(entry, *, implied_doc_debt=False):
+    if not isinstance(entry, dict):
+        return False
+    status = str(entry.get("status") or entry.get("decision") or "").strip().lower()
+    if status not in _WAIVED_DOC_DEBT_STATUSES:
+        return False
+    if implied_doc_debt:
+        return True
+    for key in ("kind", "type", "category"):
+        if _looks_like_doc_debt_kind(entry.get(key)):
+            return True
+    reason = str(entry.get("reason") or entry.get("evidence") or "").lower()
+    return "doc_debt" in reason or "doc debt" in reason or "documentation debt" in reason
+
+
+def _iter_doc_debt_entries(value, *, implied_doc_debt=False):
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_doc_debt_entries(item, implied_doc_debt=implied_doc_debt)
+    elif isinstance(value, dict):
+        yield value, implied_doc_debt
+
+
+def _entry_path_keys(entry):
+    paths = set()
+    for key in _DOC_DEBT_PATH_KEYS:
+        value = entry.get(key) if isinstance(entry, dict) else None
+        if isinstance(value, str) and value.strip():
+            paths.add(value.strip().replace("\\", "/"))
+    return paths
+
+
+def _scope_materialization_waived_doc_debt_paths(metadata, proposed_graph_delta=None):
+    """Return absent doc paths explicitly waived by a scope-materialization graph delta."""
+    if not _is_scope_materialization_task(metadata):
+        return set()
+    if not isinstance(proposed_graph_delta, dict):
+        return set()
+    graph_delta = proposed_graph_delta.get("graph_delta", proposed_graph_delta)
+    if not isinstance(graph_delta, dict):
+        return set()
+
+    allowed = set()
+    for entry, implied in _iter_doc_debt_entries(graph_delta.get("waivers", []), implied_doc_debt=False):
+        if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
+            allowed.update(_entry_path_keys(entry))
+    for entry, implied in _iter_doc_debt_entries(graph_delta.get("doc_debt", []), implied_doc_debt=True):
+        if _is_waived_doc_debt_entry(entry, implied_doc_debt=implied):
+            allowed.update(_entry_path_keys(entry))
+    return allowed
+
+
 def _project_workspace_root(project_id, metadata=None):
     cwd = Path.cwd()
     if (cwd / "agent" / "governance" / "auto_chain.py").exists():
@@ -256,7 +320,7 @@ def _extract_qa_evidence_paths(result):
     return paths
 
 
-def _missing_qa_evidence_paths(project_id, result, metadata=None):
+def _missing_qa_evidence_paths(project_id, result, metadata=None, proposed_graph_delta=None):
     metadata = metadata if isinstance(metadata, dict) else {}
     root = _project_workspace_root(project_id, metadata)
     task_root = root
@@ -270,6 +334,7 @@ def _missing_qa_evidence_paths(project_id, result, metadata=None):
         for path in (metadata.get("changed_files") or [])
         if isinstance(path, str)
     }
+    waived_doc_debt_paths = _scope_materialization_waived_doc_debt_paths(metadata, proposed_graph_delta)
     missing = []
     for raw in _extract_qa_evidence_paths(result):
         if _is_reconcile_state_artifact_path(project_id, raw, metadata):
@@ -283,6 +348,9 @@ def _missing_qa_evidence_paths(project_id, result, metadata=None):
                     break
                 except ValueError:
                     pass
+
+        if rel_key in waived_doc_debt_paths or raw.replace("\\", "/") in waived_doc_debt_paths:
+            continue
 
         if rel_key in changed_files:
             candidates = [task_root / rel_key, root / rel_key]
@@ -5638,7 +5706,7 @@ def _gate_qa_pass(conn, project_id, result, metadata):
             f"Got: {rec!r}. QA agent must set result.recommendation."
         )
 
-    missing_evidence_paths = _missing_qa_evidence_paths(project_id, result, metadata)
+    missing_evidence_paths = _missing_qa_evidence_paths(project_id, result, metadata, _gd_proposed)
     if missing_evidence_paths:
         preview = ", ".join(missing_evidence_paths[:5])
         return False, (

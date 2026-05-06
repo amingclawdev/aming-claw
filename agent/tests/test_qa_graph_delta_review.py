@@ -285,6 +285,71 @@ class TestGateQaPassGraphDeltaReview(unittest.TestCase):
         self.assertIn("QA evidence references missing workspace paths", reason)
         self.assertIn("docs/dev/reconcile-canary-mf003.md", reason)
 
+    def test_allows_scope_materialization_waived_doc_debt_path(self):
+        """Scope materialization may cite an absent file when graph_delta waives it as doc_debt."""
+        missing_doc = "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md"
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": f"Validated explicit doc_debt waiver for absent {missing_doc}.",
+            "criteria_results": [
+                {
+                    "criterion": "doc debt waiver",
+                    "passed": True,
+                    "evidence": f"{missing_doc} is absent and intentionally waived as doc_debt.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata(operation_type="scope-materialization")
+        proposed = {
+            "source_task_id": "task-dev-1",
+            "graph_delta": {
+                "creates": [{"node_id": None, "title": "Scope docs materialization"}],
+                "waivers": [
+                    {
+                        "kind": "doc_debt",
+                        "status": "waived",
+                        "path": missing_doc,
+                        "reason": "Absent scratch audit doc should remain doc_debt.",
+                    }
+                ],
+            },
+        }
+
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+
+        self.assertTrue(passed, reason)
+
+    def test_waived_doc_debt_path_still_blocks_outside_scope_materialization(self):
+        """The doc_debt path allowance is not a general QA evidence bypass."""
+        missing_doc = "docs/dev/scratch/reconcile-comprehensive-2026-05-06.md"
+        result = {
+            "recommendation": "qa_pass",
+            "review_summary": f"Validated explicit doc_debt waiver for absent {missing_doc}.",
+            "criteria_results": [
+                {
+                    "criterion": "doc debt waiver",
+                    "passed": True,
+                    "evidence": f"{missing_doc} is absent and intentionally waived as doc_debt.",
+                }
+            ],
+            "graph_delta_review": {"decision": "pass", "issues": [], "suggested_diff": {}},
+        }
+        metadata = _base_metadata()
+        proposed = {
+            "source_task_id": "task-dev-1",
+            "graph_delta": {
+                "creates": [{"node_id": "L3.1"}],
+                "waivers": [{"kind": "doc_debt", "status": "waived", "path": missing_doc}],
+            },
+        }
+
+        passed, reason = self._call_gate(result, metadata, proposed_payload=proposed)
+
+        self.assertFalse(passed)
+        self.assertIn("QA evidence references missing workspace paths", reason)
+        self.assertIn(missing_doc, reason)
+
     def test_allows_reconcile_state_graph_artifact_evidence(self):
         """Reconcile QA may cite state graph artifacts outside repo paths."""
         with tempfile.TemporaryDirectory() as tmp:
