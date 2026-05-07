@@ -247,6 +247,94 @@ def test_graph_governance_drift_api_records_and_lists_rows(conn):
     assert listed["drift"][0]["evidence"]["source"] == "unit-test"
 
 
+def test_graph_governance_snapshot_files_api_reads_companion_inventory(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-files-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        file_inventory=[
+            {
+                "path": "agent/service.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+                "decision": "govern",
+                "mapped_node_ids": ["L7.1"],
+            },
+            {
+                "path": "docs/missing.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "decision": "pending",
+                "mapped_node_ids": [],
+            },
+        ],
+    )
+    conn.commit()
+
+    files = server.handle_graph_governance_snapshot_files(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"scan_status": "orphan"},
+        )
+    )
+
+    assert files["ok"] is True
+    assert files["summary"]["by_scan_status"]["orphan"] == 1
+    assert files["filtered_count"] == 1
+    assert files["files"][0]["path"] == "docs/missing.md"
+
+
+def test_graph_governance_drift_file_backlog_files_bug_and_updates_drift(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-drift-backlog",
+        commit_sha="head",
+        snapshot_kind="full",
+    )
+    store.record_drift(
+        conn,
+        PID,
+        snapshot_id=snapshot["snapshot_id"],
+        commit_sha="head",
+        path="README.md",
+        drift_type="missing_test",
+        target_symbol="doc:index",
+        evidence={"source": "unit-test"},
+    )
+    conn.commit()
+
+    code, result = server.handle_graph_governance_drift_file_backlog(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": snapshot["snapshot_id"],
+                "path": "README.md",
+                "drift_type": "missing_test",
+                "target_symbol": "doc:index",
+                "bug_id": "GRAPH-DRIFT-UNIT-1",
+                "actor": "unit-test",
+            },
+        )
+    )
+
+    assert code == 201
+    assert result["bug_id"] == "GRAPH-DRIFT-UNIT-1"
+    assert result["drift"]["status"] == "backlog_filed"
+    row = conn.execute(
+        "SELECT bug_id, status, target_files FROM backlog_bugs WHERE bug_id = ?",
+        ("GRAPH-DRIFT-UNIT-1",),
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "OPEN"
+    assert "README.md" in row["target_files"]
+
+
 def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()

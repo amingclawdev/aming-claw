@@ -9,6 +9,7 @@ import json
 import re
 import sys
 import uuid
+import hashlib
 import traceback
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -1735,6 +1736,25 @@ def _raise_graph_api_conflict(exc: Exception):
     raise GovernanceError("graph_snapshot_conflict", str(exc), 409) from exc
 
 
+def _resolve_graph_snapshot_id(conn, project_id: str, snapshot_id: str) -> str:
+    if snapshot_id and snapshot_id != "active":
+        return snapshot_id
+    from . import graph_snapshot_store as store
+
+    active = store.get_active_graph_snapshot(conn, project_id)
+    if not active:
+        from .errors import ValidationError
+        raise ValidationError("no active graph snapshot for project")
+    return active["snapshot_id"]
+
+
+def _graph_drift_backlog_id(snapshot_id: str, path: str, drift_type: str, target_symbol: str) -> str:
+    seed = f"{snapshot_id}|{path}|{drift_type}|{target_symbol}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
+    safe_type = re.sub(r"[^A-Za-z0-9]+", "-", drift_type or "drift").strip("-").upper()
+    return f"GRAPH-DRIFT-{safe_type}-{digest}"
+
+
 @route("GET", "/api/graph-governance/{project_id}/status")
 def handle_graph_governance_status(ctx: RequestContext):
     """Return active graph snapshot, scan baseline, and pending scope status."""
@@ -1820,6 +1840,44 @@ def handle_graph_governance_snapshot_edges(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/files")
+def handle_graph_governance_snapshot_files(ctx: RequestContext):
+    """List snapshot file inventory rows for dashboard orphan/doc/test review."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        try:
+            result = store.list_graph_snapshot_files(
+                conn,
+                project_id,
+                snapshot_id,
+                limit=_query_int(ctx.query, "limit", 200),
+                offset=_query_int(ctx.query, "offset", 0),
+                file_kind=str(ctx.query.get("file_kind") or ""),
+                scan_status=str(ctx.query.get("scan_status") or ""),
+                graph_status=str(ctx.query.get("graph_status") or ""),
+                decision=str(ctx.query.get("decision") or ""),
+                path_contains=str(ctx.query.get("path") or ""),
+            )
+        except KeyError as exc:
+            _raise_graph_api_validation(exc)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "summary": result["summary"],
+            "total_count": result["total_count"],
+            "filtered_count": result["filtered_count"],
+            "files": result["files"],
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/drift")
 def handle_graph_governance_drift_list(ctx: RequestContext):
     """List graph drift ledger rows for dashboard/operator review."""
@@ -1884,6 +1942,153 @@ def handle_graph_governance_drift_record(ctx: RequestContext):
             limit=20,
         )
         return 201, {"ok": True, "project_id": project_id, "drift": row}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/drift/file-backlog")
+def handle_graph_governance_drift_file_backlog(ctx: RequestContext):
+    """File one graph drift row into backlog and mark it backlog_filed."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    required = ["snapshot_id", "path", "drift_type"]
+    missing = [key for key in required if not str(body.get(key) or "").strip()]
+    if missing:
+        from .errors import ValidationError
+        raise ValidationError(f"missing required drift field(s): {', '.join(missing)}")
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.drift.file-backlog")
+        with sqlite_write_lock():
+            snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or ""))
+            target_symbol_raw = body.get("target_symbol")
+            target_symbol = None if target_symbol_raw is None else str(target_symbol_raw)
+            try:
+                drift = store.get_graph_drift(
+                    conn,
+                    project_id,
+                    snapshot_id=snapshot_id,
+                    path=str(body.get("path") or ""),
+                    drift_type=str(body.get("drift_type") or ""),
+                    target_symbol=target_symbol,
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+
+            bug_id = str(body.get("bug_id") or "").strip() or _graph_drift_backlog_id(
+                snapshot_id,
+                drift["path"],
+                drift["drift_type"],
+                drift["target_symbol"],
+            )
+            now = _utc_now()
+            actor = str(body.get("actor") or "graph_governance_api")
+            title = str(body.get("title") or "").strip() or (
+                f"Resolve graph drift: {drift['drift_type']} in {drift['path']}"
+            )
+            details_md = str(body.get("details_md") or "").strip()
+            if not details_md:
+                details_md = "\n".join([
+                    f"Graph drift row filed from snapshot `{snapshot_id}`.",
+                    "",
+                    f"- path: `{drift['path']}`",
+                    f"- drift_type: `{drift['drift_type']}`",
+                    f"- node_id: `{drift['node_id']}`",
+                    f"- target_symbol: `{drift['target_symbol']}`",
+                    f"- commit: `{drift['commit_sha']}`",
+                    "",
+                    "Review the graph/drift evidence, then either repair through chain or explicitly waive.",
+                ])
+            acceptance = body.get("acceptance_criteria")
+            if not isinstance(acceptance, list):
+                acceptance = [
+                    "Drift row is fixed, waived, or converted into a more precise graph/document/test task.",
+                    "Backlog close evidence references the graph snapshot and affected path.",
+                    "Scope reconcile materializes graph state after any merge.",
+                ]
+            priority = str(body.get("priority") or "P2")
+            target_files = body.get("target_files") if isinstance(body.get("target_files"), list) else [drift["path"]]
+            conn.execute(
+                """INSERT INTO backlog_bugs
+                   (bug_id, title, status, priority, target_files, test_files,
+                    acceptance_criteria, chain_task_id, "commit", discovered_at,
+                    fixed_at, details_md, chain_trigger_json, required_docs,
+                    provenance_paths, bypass_policy_json, mf_type, takeover_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, 'OPEN', ?, ?, ?, ?, '', ?, ?, '', ?, ?, ?, ?, '{}', '', '{}', ?, ?)
+                   ON CONFLICT(bug_id) DO UPDATE SET
+                     title = excluded.title,
+                     status = 'OPEN',
+                     priority = excluded.priority,
+                     target_files = excluded.target_files,
+                     acceptance_criteria = excluded.acceptance_criteria,
+                     details_md = excluded.details_md,
+                     chain_trigger_json = excluded.chain_trigger_json,
+                     provenance_paths = excluded.provenance_paths,
+                     updated_at = excluded.updated_at
+                """,
+                (
+                    bug_id,
+                    title,
+                    priority,
+                    json.dumps(target_files, ensure_ascii=False, sort_keys=True),
+                    json.dumps(body.get("test_files") if isinstance(body.get("test_files"), list) else [], ensure_ascii=False),
+                    json.dumps(acceptance, ensure_ascii=False, sort_keys=True),
+                    drift["commit_sha"],
+                    now,
+                    details_md,
+                    json.dumps({
+                        "source": "graph_drift_ledger",
+                        "snapshot_id": snapshot_id,
+                        "drift_type": drift["drift_type"],
+                        "graph_gate_mode": "advisory",
+                    }, ensure_ascii=False, sort_keys=True),
+                    json.dumps(body.get("required_docs") if isinstance(body.get("required_docs"), list) else [], ensure_ascii=False),
+                    json.dumps([drift["path"], f"graph_snapshot:{snapshot_id}"], ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            filed = store.update_graph_drift_status(
+                conn,
+                project_id,
+                snapshot_id=snapshot_id,
+                path=drift["path"],
+                drift_type=drift["drift_type"],
+                target_symbol=drift["target_symbol"],
+                status="backlog_filed",
+                evidence={
+                    "backlog_bug_id": bug_id,
+                    "filed_by": actor,
+                    "filed_at": now,
+                },
+            )
+            try:
+                audit_service.record(
+                    conn,
+                    project_id,
+                    "graph_drift_backlog_filed",
+                    actor=actor,
+                    bug_id=bug_id,
+                    details=json.dumps({
+                        "snapshot_id": snapshot_id,
+                        "path": drift["path"],
+                        "drift_type": drift["drift_type"],
+                        "target_symbol": drift["target_symbol"],
+                    }, ensure_ascii=False, sort_keys=True),
+                )
+            except Exception:
+                pass
+            conn.commit()
+        return 201, {
+            "ok": True,
+            "project_id": project_id,
+            "bug_id": bug_id,
+            "drift": filed,
+        }
     finally:
         conn.close()
 

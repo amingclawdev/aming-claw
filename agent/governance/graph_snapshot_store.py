@@ -326,6 +326,14 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _read_json_artifact(path: Path, default: Any) -> Any:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    return payload if payload is not None else default
+
+
 def _current_graph_path(project_id: str) -> Path:
     from .db import _governance_root
 
@@ -836,6 +844,88 @@ def list_graph_snapshot_edges(
     ]
 
 
+def summarize_file_inventory_rows(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Compact dashboard summary for snapshot file inventory rows."""
+    row_list = list(rows)
+    by_kind: dict[str, int] = {}
+    by_scan_status: dict[str, int] = {}
+    by_graph_status: dict[str, int] = {}
+    by_decision: dict[str, int] = {}
+    pending: list[str] = []
+    for row in row_list:
+        kind = str(row.get("file_kind") or "")
+        scan = str(row.get("scan_status") or "")
+        graph = str(row.get("graph_status") or "")
+        decision = str(row.get("decision") or "")
+        if kind:
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        if scan:
+            by_scan_status[scan] = by_scan_status.get(scan, 0) + 1
+        if graph:
+            by_graph_status[graph] = by_graph_status.get(graph, 0) + 1
+        if decision:
+            by_decision[decision] = by_decision.get(decision, 0) + 1
+        if scan in {"orphan", "pending_decision", "error"} or graph in {"unmapped", "error"}:
+            path = str(row.get("path") or "")
+            if path:
+                pending.append(path)
+    return {
+        "total": len(row_list),
+        "by_kind": dict(sorted(by_kind.items())),
+        "by_scan_status": dict(sorted(by_scan_status.items())),
+        "by_graph_status": dict(sorted(by_graph_status.items())),
+        "by_decision": dict(sorted(by_decision.items())),
+        "pending_count": len(pending),
+        "pending_sample": pending[:25],
+    }
+
+
+def list_graph_snapshot_files(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    file_kind: str = "",
+    scan_status: str = "",
+    graph_status: str = "",
+    decision: str = "",
+    path_contains: str = "",
+) -> dict[str, Any]:
+    """List file inventory rows stored with a snapshot companion artifact."""
+    ensure_schema(conn)
+    snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+    raw = _read_json_artifact(snapshot_companion_dir(project_id, snapshot_id) / "file_inventory.json", [])
+    rows = [dict(row) for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+
+    def _matches(row: dict[str, Any]) -> bool:
+        if file_kind and str(row.get("file_kind") or "") != file_kind:
+            return False
+        if scan_status and str(row.get("scan_status") or "") != scan_status:
+            return False
+        if graph_status and str(row.get("graph_status") or "") != graph_status:
+            return False
+        if decision and str(row.get("decision") or "") != decision:
+            return False
+        if path_contains and path_contains not in str(row.get("path") or ""):
+            return False
+        return True
+
+    filtered = [row for row in rows if _matches(row)]
+    start = max(0, int(offset or 0))
+    end = start + max(1, min(int(limit or 200), 1000))
+    return {
+        "snapshot": snapshot,
+        "summary": summarize_file_inventory_rows(rows),
+        "total_count": len(rows),
+        "filtered_count": len(filtered),
+        "files": filtered[start:end],
+    }
+
+
 def abandon_graph_snapshot(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1101,6 +1191,102 @@ def list_graph_drift(
     ]
 
 
+def get_graph_drift(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    snapshot_id: str,
+    path: str,
+    drift_type: str,
+    target_symbol: str | None = None,
+) -> dict[str, Any]:
+    """Fetch one drift row. If target_symbol is omitted, the match must be unique."""
+    ensure_schema(conn)
+    params: list[Any] = [project_id, snapshot_id, path, drift_type]
+    sql = """
+        SELECT project_id, snapshot_id, commit_sha, path, node_id,
+               target_symbol, drift_type, status, evidence_json, updated_at
+        FROM graph_drift_ledger
+        WHERE project_id = ?
+          AND snapshot_id = ?
+          AND path = ?
+          AND drift_type = ?
+    """
+    if target_symbol is not None:
+        sql += " AND target_symbol = ?"
+        params.append(target_symbol)
+    rows = conn.execute(sql, params).fetchall()
+    if not rows:
+        raise KeyError(f"graph drift row not found: {snapshot_id}/{path}/{drift_type}")
+    if target_symbol is None and len(rows) > 1:
+        raise ValueError("multiple drift rows match; target_symbol is required")
+    row = rows[0]
+    return {
+        "project_id": row["project_id"],
+        "snapshot_id": row["snapshot_id"],
+        "commit_sha": row["commit_sha"],
+        "path": row["path"],
+        "node_id": row["node_id"],
+        "target_symbol": row["target_symbol"],
+        "drift_type": row["drift_type"],
+        "status": row["status"],
+        "evidence": _decode_json(row["evidence_json"], {}),
+        "updated_at": row["updated_at"],
+    }
+
+
+def update_graph_drift_status(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    snapshot_id: str,
+    path: str,
+    drift_type: str,
+    target_symbol: str = "",
+    status: str,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Update one drift row status while preserving/augmenting its evidence."""
+    row = get_graph_drift(
+        conn,
+        project_id,
+        snapshot_id=snapshot_id,
+        path=path,
+        drift_type=drift_type,
+        target_symbol=target_symbol,
+    )
+    merged_evidence = dict(row.get("evidence") or {})
+    merged_evidence.update(evidence or {})
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE graph_drift_ledger
+        SET status = ?,
+            evidence_json = ?,
+            updated_at = ?
+        WHERE project_id = ?
+          AND snapshot_id = ?
+          AND path = ?
+          AND drift_type = ?
+          AND target_symbol = ?
+        """,
+        (
+            status,
+            _json(merged_evidence),
+            now,
+            project_id,
+            snapshot_id,
+            path,
+            drift_type,
+            target_symbol,
+        ),
+    )
+    row["status"] = status
+    row["evidence"] = merged_evidence
+    row["updated_at"] = now
+    return row
+
+
 def queue_pending_scope_reconcile(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1242,12 +1428,14 @@ __all__ = [
     "ensure_schema",
     "finalize_graph_snapshot",
     "get_active_graph_snapshot",
+    "get_graph_drift",
     "get_graph_snapshot",
     "get_latest_scan_baseline",
     "graph_governance_status",
     "graph_payload_edges",
     "index_graph_snapshot",
     "list_graph_snapshot_edges",
+    "list_graph_snapshot_files",
     "list_graph_snapshot_nodes",
     "list_graph_snapshots",
     "list_graph_drift",
@@ -1262,6 +1450,8 @@ __all__ = [
     "snapshot_graph_path",
     "snapshot_id_for",
     "strict_graph_ready",
+    "summarize_file_inventory_rows",
+    "update_graph_drift_status",
     "waive_pending_scope_reconcile",
     "write_companion_files",
 ]
