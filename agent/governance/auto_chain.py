@@ -877,6 +877,127 @@ def _get_graph_related_nodes(project_id, target_files, metadata=None):
         return []
 
 
+def _graph_gate_mode(metadata):
+    raw = ""
+    if isinstance(metadata, dict):
+        raw = (
+            metadata.get("graph_gate_mode")
+            or metadata.get("graph_governance_mode")
+            or metadata.get("graph_context_mode")
+            or ""
+        )
+    mode = str(raw or "").strip().lower().replace("-", "_")
+    if mode in {"strict", "advisory", "raw"}:
+        return mode
+    return "advisory"
+
+
+def _target_commit_for_graph_dispatch(conn, project_id, metadata):
+    if isinstance(metadata, dict):
+        for key in (
+            "target_commit_sha",
+            "target_commit",
+            "expected_head_sha",
+            "head_sha",
+            "commit_sha",
+        ):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+    try:
+        row = conn.execute(
+            "SELECT git_head, chain_version FROM project_version WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+    except Exception:
+        row = None
+    if not row:
+        return ""
+    try:
+        git_head = row["git_head"]
+        chain_version = row["chain_version"]
+    except Exception:
+        git_head = row[0] if len(row) > 0 else ""
+        chain_version = row[1] if len(row) > 1 else ""
+    return str(git_head or chain_version or "").strip()
+
+
+def _dispatch_graph_divergence_hook(
+    conn,
+    project_id,
+    task_id,
+    task_type,
+    metadata,
+    *,
+    graph_governance_bypassed=False,
+):
+    """Queue scope reconcile when active graph snapshot is stale at dispatch.
+
+    Strict mode blocks dispatch unless an explicit graph-governance bypass is in
+    force. Advisory/raw modes record the stale state and continue.
+    """
+    if not isinstance(metadata, dict):
+        metadata = {}
+    mode = _graph_gate_mode(metadata)
+    target_commit = _target_commit_for_graph_dispatch(conn, project_id, metadata)
+    info = {
+        "mode": mode,
+        "target_commit": target_commit,
+        "active_snapshot_id": "",
+        "active_graph_commit": "",
+        "diverged": False,
+        "queued": False,
+        "blocked": False,
+        "reason": "",
+    }
+    if not target_commit:
+        info["reason"] = "missing_target_commit"
+        metadata["graph_divergence"] = info
+        return info
+    try:
+        from .graph_snapshot_store import (
+            get_active_graph_snapshot,
+            queue_pending_scope_reconcile,
+        )
+        active = get_active_graph_snapshot(conn, project_id) or {}
+        active_commit = str(active.get("commit_sha") or "")
+        info["active_snapshot_id"] = str(active.get("snapshot_id") or "")
+        info["active_graph_commit"] = active_commit
+        diverged = active_commit != target_commit
+        info["diverged"] = diverged
+        if diverged:
+            pending = queue_pending_scope_reconcile(
+                conn,
+                project_id,
+                commit_sha=target_commit,
+                parent_commit_sha=active_commit,
+                evidence={
+                    "source": "dispatch_graph_divergence_hook",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "mode": mode,
+                    "active_snapshot_id": info["active_snapshot_id"],
+                    "active_graph_commit": active_commit,
+                    "graph_governance_bypassed": bool(graph_governance_bypassed),
+                },
+            )
+            info["queued"] = True
+            info["pending_status"] = pending.get("status")
+            if mode == "strict" and not graph_governance_bypassed:
+                info["blocked"] = True
+                info["reason"] = "active_graph_snapshot_stale"
+            elif mode == "raw":
+                info["reason"] = "active_graph_snapshot_stale_raw"
+            else:
+                info["reason"] = "active_graph_snapshot_stale_advisory"
+    except Exception as exc:
+        info["reason"] = f"graph_divergence_hook_failed: {exc}"
+        log.warning("auto_chain: graph divergence hook failed for %s: %s", task_id, exc)
+    metadata["graph_divergence"] = info
+    metadata["graph_stale"] = bool(info.get("diverged"))
+    return info
+
+
 def _build_reconcile_graph_preflight(project_id, metadata, proposed_nodes=None):
     """Build session-local graph preflight context for reconcile-cluster tasks."""
     if not isinstance(metadata, dict) or metadata.get("operation_type") != "reconcile-cluster":
@@ -4013,6 +4134,34 @@ def _do_chain(conn, project_id, task_id, task_type, result, metadata):
             pass  # never block chain on preflight failure
 
     graph_governance_bypassed = backlog_runtime.is_graph_governance_bypassed(metadata)
+    graph_divergence = _dispatch_graph_divergence_hook(
+        conn,
+        project_id,
+        task_id,
+        task_type,
+        metadata,
+        graph_governance_bypassed=graph_governance_bypassed,
+    )
+    if graph_divergence.get("blocked"):
+        reason = graph_divergence.get("reason") or "active_graph_snapshot_stale"
+        _record_gate_event(conn, project_id, task_id, "graph_divergence", False, reason, _trace_id)
+        return {
+            "gate_blocked": True,
+            "dispatched": False,
+            "stage": "graph_divergence",
+            "reason": reason,
+        }
+    elif graph_divergence.get("diverged"):
+        _record_gate_event(
+            conn,
+            project_id,
+            task_id,
+            "graph_divergence",
+            True,
+            graph_divergence.get("reason") or "graph stale queued",
+            _trace_id,
+        )
+        _persist_task_metadata_context(conn, project_id, task_id, metadata, _trace_id, _chain_id)
 
     # Auto-enrich: derive related_nodes from changed_files via impact API
     if graph_governance_bypassed:
