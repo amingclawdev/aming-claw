@@ -258,6 +258,71 @@ def test_graph_governance_queue_finalize_and_abandon_api(conn):
     assert abandoned["status"] == store.SNAPSHOT_STATUS_ABANDONED
 
 
+def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
+    project = tmp_path / "project"
+    primary = project / "agent" / "governance" / "server.py"
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    primary.write_text("def handle_graph_governance():\n    return 'ok'\n", encoding="utf-8")
+    docs = project / "docs" / "dev" / "proposal.md"
+    docs.parent.mkdir(parents=True, exist_ok=True)
+    docs.write_text("# Proposal\n", encoding="utf-8")
+    tests = project / "agent" / "tests" / "test_graph_governance_api.py"
+    tests.parent.mkdir(parents=True, exist_ok=True)
+    tests.write_text("def test_api():\n    assert True\n", encoding="utf-8")
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    feedback = server.handle_graph_governance_snapshot_semantic_feedback(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "full-semantic-api"},
+            method="POST",
+            body={
+                "actor": "observer",
+                "feedback_items": {
+                    "feedback_id": "fb-api-1",
+                    "target_type": "node",
+                    "target_id": "L7.1",
+                    "issue": "Name should mention API governance.",
+                },
+            },
+        )
+    )
+    assert feedback["ok"] is True
+    assert feedback["feedback_count"] == 1
+
+    enriched = server.handle_graph_governance_snapshot_semantic_enrich(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "full-semantic-api"},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "actor": "observer",
+                "use_ai": False,
+            },
+        )
+    )
+
+    assert enriched["ok"] is True
+    assert enriched["summary"]["feature_count"] == 1
+    assert enriched["semantic_index"]["features"][0]["feedback_count"] == 1
+    assert enriched["semantic_index"]["features"][0]["enrichment_status"] == "heuristic"
+    assert Path(enriched["semantic_index_path"]).exists()
+
+
 def test_graph_governance_drift_api_records_and_lists_rows(conn):
     snapshot = store.create_graph_snapshot(
         conn,

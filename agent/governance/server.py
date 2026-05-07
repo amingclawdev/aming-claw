@@ -2465,6 +2465,80 @@ def handle_graph_governance_snapshot_abandon(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic-feedback")
+def handle_graph_governance_snapshot_semantic_feedback(ctx: RequestContext):
+    """Append review feedback for the next snapshot semantic-enrichment round."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_semantic_enrichment as semantic
+    from .db import sqlite_write_lock
+
+    feedback_items = body.get("feedback_items", body.get("feedback", []))
+    if isinstance(feedback_items, dict):
+        feedback_items = [feedback_items]
+    if not isinstance(feedback_items, list) or not feedback_items:
+        from .errors import ValidationError
+        raise ValidationError("feedback_items must be a non-empty object or list")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic-feedback")
+        with sqlite_write_lock():
+            try:
+                result = semantic.append_review_feedback(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    feedback_items,
+                    created_by=str(body.get("actor") or "observer"),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic-enrich")
+def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
+    """Build/rebuild semantic companion artifacts for a graph snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from . import reconcile_semantic_enrichment as semantic
+    from .db import sqlite_write_lock
+
+    feedback_items = body.get("feedback_items")
+    if feedback_items is not None and not isinstance(feedback_items, (list, dict)):
+        from .errors import ValidationError
+        raise ValidationError("feedback_items must be an object or list when provided")
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic-enrich")
+        with sqlite_write_lock():
+            try:
+                result = semantic.run_semantic_enrichment(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    root,
+                    feedback_items=feedback_items,
+                    feedback_round=body.get("feedback_round"),
+                    use_ai=bool(body.get("use_ai", False)),
+                    created_by=str(body.get("actor") or "observer"),
+                    max_excerpt_chars=int(body.get("max_excerpt_chars") or 12000),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}")
 def handle_reconcile_deferred_cluster_get(ctx: RequestContext):
     """Get a single deferred-cluster row by fingerprint."""
