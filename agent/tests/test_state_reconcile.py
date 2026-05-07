@@ -103,6 +103,9 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
     assert result["governance_index"]["index_scope"] == "candidate_snapshot"
     assert result["governance_index"]["feature_count"] > 0
+    assert result["semantic_enrichment"]["feature_count"] == result["governance_index"]["feature_count"]
+    assert Path(result["semantic_enrichment"]["semantic_index_path"]).exists()
+    assert Path(result["semantic_enrichment"]["review_report_path"]).exists()
     assert Path(result["governance_index"]["artifacts"]["symbol_index_path"]).exists()
     assert Path(result["governance_index"]["artifacts"]["doc_index_path"]).exists()
     assert Path(result["governance_index"]["artifacts"]["feature_index_path"]).exists()
@@ -124,6 +127,7 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert notes["state_only"] is True
     assert notes["feature_cluster_count"] >= 1
     assert notes["governance_index"]["feature_count"] == result["governance_index"]["feature_count"]
+    assert notes["semantic_enrichment"]["feature_count"] == result["semantic_enrichment"]["feature_count"]
 
 
 def test_state_only_full_reconcile_can_activate_with_explicit_signoff(conn, tmp_path):
@@ -206,6 +210,8 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     assert result["graph_stats"]["nodes"] > 0
     assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
     assert result["governance_index"]["feature_count"] > 0
+    assert result["semantic_enrichment"]["feature_count"] == result["governance_index"]["feature_count"]
+    assert Path(result["semantic_enrichment"]["semantic_index_path"]).exists()
     assert result["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
     assert "impacted_file_count" in result["scope_file_delta"]
     assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == "imported-old-pending"

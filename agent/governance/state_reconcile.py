@@ -33,6 +33,7 @@ from agent.governance.graph_snapshot_store import (
     waive_pending_scope_reconcile,
 )
 from agent.governance.governance_index import build_and_persist_governance_index
+from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
@@ -198,6 +199,26 @@ def _build_scope_file_delta(
     }
 
 
+def _semantic_enrichment_summary(result: dict[str, Any] | None) -> dict[str, Any]:
+    if not result:
+        return {}
+    summary = dict(result.get("summary") or {})
+    return {
+        "ok": bool(result.get("ok")),
+        "feedback_round": result.get("feedback_round", 0),
+        "semantic_index_path": result.get("semantic_index_path", ""),
+        "review_report_path": result.get("review_report_path", ""),
+        "round_semantic_index_path": result.get("round_semantic_index_path", ""),
+        "round_review_report_path": result.get("round_review_report_path", ""),
+        "feature_count": summary.get("feature_count", 0),
+        "ai_complete_count": summary.get("ai_complete_count", 0),
+        "ai_unavailable_count": summary.get("ai_unavailable_count", 0),
+        "feedback_count": summary.get("feedback_count", 0),
+        "unresolved_feedback_count": summary.get("unresolved_feedback_count", 0),
+        "quality_flag_counts": summary.get("quality_flag_counts") or {},
+    }
+
+
 def run_state_only_full_reconcile(
     conn: sqlite3.Connection,
     project_id: str,
@@ -211,6 +232,12 @@ def run_state_only_full_reconcile(
     activate: bool = False,
     expected_old_snapshot_id: str | None = None,
     notes_extra: dict[str, Any] | None = None,
+    semantic_enrich: bool = True,
+    semantic_use_ai: bool = False,
+    semantic_feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
+    semantic_feedback_round: int | None = None,
+    semantic_max_excerpt_chars: int = 12000,
+    semantic_ai_call: Any = None,
 ) -> dict[str, Any]:
     """Create a candidate full-reconcile graph snapshot from current files.
 
@@ -306,6 +333,21 @@ def run_state_only_full_reconcile(
         "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
         (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
     )
+    semantic_enrichment: dict[str, Any] = {}
+    if semantic_enrich:
+        semantic_result = run_semantic_enrichment(
+            conn,
+            project_id,
+            sid,
+            root,
+            feedback_items=semantic_feedback_items,
+            feedback_round=semantic_feedback_round,
+            use_ai=semantic_use_ai,
+            ai_call=semantic_ai_call,
+            created_by=created_by,
+            max_excerpt_chars=semantic_max_excerpt_chars,
+        )
+        semantic_enrichment = _semantic_enrichment_summary(semantic_result)
     activation = None
     if activate:
         activation = activate_graph_snapshot(
@@ -326,6 +368,7 @@ def run_state_only_full_reconcile(
         "graph_stats": graph_payload_stats(candidate_graph),
         "index_counts": index_counts,
         "governance_index": governance_index_summary,
+        "semantic_enrichment": semantic_enrichment,
         "file_inventory_count": len(file_inventory),
         "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
@@ -401,6 +444,12 @@ def run_pending_scope_reconcile_candidate(
     run_id: str = "",
     snapshot_id: str | None = None,
     created_by: str = "observer",
+    semantic_enrich: bool = True,
+    semantic_use_ai: bool = False,
+    semantic_feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
+    semantic_feedback_round: int | None = None,
+    semantic_max_excerpt_chars: int = 12000,
+    semantic_ai_call: Any = None,
 ) -> dict[str, Any]:
     """Materialize pending scope rows as a reviewable candidate snapshot.
 
@@ -459,6 +508,12 @@ def run_pending_scope_reconcile_candidate(
         snapshot_kind="scope",
         created_by=created_by,
         activate=False,
+        semantic_enrich=semantic_enrich,
+        semantic_use_ai=semantic_use_ai,
+        semantic_feedback_items=semantic_feedback_items,
+        semantic_feedback_round=semantic_feedback_round,
+        semantic_max_excerpt_chars=semantic_max_excerpt_chars,
+        semantic_ai_call=semantic_ai_call,
         notes_extra={
             "pending_scope_reconcile": {
                 "covered_commit_shas": covered,

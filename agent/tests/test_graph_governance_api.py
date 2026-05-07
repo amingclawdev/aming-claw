@@ -509,11 +509,14 @@ def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_pa
         assert conn_arg is not None
         assert project_id == PID
         assert Path(project_root) == project
+        assert kwargs["semantic_enrich"] is True
+        assert kwargs["semantic_use_ai"] is False
         return {
             "ok": True,
             "snapshot_id": "full-head",
             "commit_sha": kwargs["commit_sha"],
             "graph_stats": {"nodes": 1, "edges": 0},
+            "semantic_enrichment": {"feature_count": 1},
         }
 
     def fake_backfill(conn_arg, project_id, project_root, **kwargs):

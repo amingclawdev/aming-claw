@@ -2331,8 +2331,13 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 activate=bool(body.get("activate", False)),
                 expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
                 notes_extra=body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else None,
+                semantic_enrich=bool(body.get("semantic_enrich", True)),
+                semantic_use_ai=bool(body.get("semantic_use_ai", body.get("use_ai", False))),
+                semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
+                semantic_feedback_round=body.get("semantic_feedback_round"),
+                semantic_max_excerpt_chars=int(body.get("semantic_max_excerpt_chars") or 12000),
             )
-        except ValueError as exc:
+        except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
         conn.commit()
         return 201, result
@@ -2360,8 +2365,13 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 run_id=str(body.get("run_id") or ""),
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
+                semantic_enrich=bool(body.get("semantic_enrich", True)),
+                semantic_use_ai=bool(body.get("semantic_use_ai", body.get("use_ai", False))),
+                semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
+                semantic_feedback_round=body.get("semantic_feedback_round"),
+                semantic_max_excerpt_chars=int(body.get("semantic_max_excerpt_chars") or 12000),
             )
-        except ValueError as exc:
+        except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
         conn.commit()
         return 201, result
