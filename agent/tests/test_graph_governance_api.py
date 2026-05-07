@@ -238,6 +238,17 @@ def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_pa
             "graph_stats": {"nodes": 1, "edges": 0},
         }
 
+    def fake_backfill(conn_arg, project_id, project_root, **kwargs):
+        assert conn_arg is not None
+        assert project_id == PID
+        assert Path(project_root) == project
+        assert kwargs["reason"] == "scope blocked"
+        return {
+            "ok": True,
+            "snapshot_id": "full-head-escape",
+            "pending_scope_waiver": {"waived_count": 2},
+        }
+
     monkeypatch.setattr(
         "agent.governance.governance_index.build_and_persist_governance_index",
         fake_index,
@@ -245,6 +256,10 @@ def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_pa
     monkeypatch.setattr(
         "agent.governance.state_reconcile.run_state_only_full_reconcile",
         fake_full,
+    )
+    monkeypatch.setattr(
+        "agent.governance.state_reconcile.run_backfill_escape_hatch",
+        fake_backfill,
     )
 
     index = server.handle_graph_governance_index_build(
@@ -268,3 +283,14 @@ def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_pa
     assert code == 201
     assert full["ok"] is True
     assert full["snapshot_id"] == "full-head"
+
+    code2, backfill = server.handle_graph_governance_backfill_escape(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"project_root": str(project), "reason": "scope blocked"},
+        )
+    )
+    assert code2 == 201
+    assert backfill["ok"] is True
+    assert backfill["pending_scope_waiver"]["waived_count"] == 2

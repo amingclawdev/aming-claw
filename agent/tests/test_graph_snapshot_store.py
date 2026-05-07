@@ -221,6 +221,52 @@ def test_pending_scope_reconcile_queue_is_idempotent(conn):
     assert count == 1
 
 
+def test_waive_pending_scope_reconcile_preserves_materialized_rows(conn):
+    _ensure_schema(conn)
+    for commit, status in [
+        ("queued", store.PENDING_STATUS_QUEUED),
+        ("running", store.PENDING_STATUS_RUNNING),
+        ("failed", store.PENDING_STATUS_FAILED),
+        ("done", store.PENDING_STATUS_MATERIALIZED),
+    ]:
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=commit,
+            parent_commit_sha="old",
+            status=status,
+            evidence={"source": "test"},
+        )
+
+    result = store.waive_pending_scope_reconcile(
+        conn,
+        PID,
+        snapshot_id="full-head",
+        actor="test",
+        reason="scope materializer bug",
+    )
+
+    assert result["waived_count"] == 3
+    rows = conn.execute(
+        """
+        SELECT commit_sha, status, snapshot_id, evidence_json
+        FROM pending_scope_reconcile
+        WHERE project_id=? ORDER BY commit_sha
+        """,
+        (PID,),
+    ).fetchall()
+    statuses = {row["commit_sha"]: row["status"] for row in rows}
+    assert statuses == {
+        "done": store.PENDING_STATUS_MATERIALIZED,
+        "failed": store.PENDING_STATUS_WAIVED,
+        "queued": store.PENDING_STATUS_WAIVED,
+        "running": store.PENDING_STATUS_WAIVED,
+    }
+    waived = next(row for row in rows if row["commit_sha"] == "queued")
+    assert waived["snapshot_id"] == "full-head"
+    assert json.loads(waived["evidence_json"])["reason"] == "scope materializer bug"
+
+
 def test_finalize_graph_snapshot_activates_and_materializes_matching_pending(conn):
     _ensure_schema(conn)
     old = store.create_graph_snapshot(

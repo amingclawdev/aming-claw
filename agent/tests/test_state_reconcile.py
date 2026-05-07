@@ -10,6 +10,7 @@ import pytest
 from agent.governance import graph_snapshot_store as store
 from agent.governance.db import _ensure_schema
 from agent.governance.state_reconcile import (
+    run_backfill_escape_hatch,
     run_pending_scope_reconcile_candidate,
     run_state_only_full_reconcile,
 )
@@ -222,3 +223,62 @@ def test_pending_scope_materializer_requires_current_head(conn, tmp_path, monkey
             target_commit_sha="target",
             run_id="scope-reconcile-target-test",
         )
+
+
+def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    files = _write_project(project)
+    before = {str(path): _file_sha(path) for path in files}
+
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-backfill",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    for commit in ("a1", "head"):
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=commit,
+            parent_commit_sha="old",
+            evidence={"source": "test"},
+        )
+    monkeypatch.setattr("agent.governance.state_reconcile._git_commit", lambda *_a, **_k: "head")
+
+    result = run_backfill_escape_hatch(
+        conn,
+        PID,
+        project,
+        target_commit_sha="head",
+        run_id="backfill-escape-head-test",
+        snapshot_id="full-head-backfill",
+        created_by="test",
+        reason="scope materializer bug",
+        expected_old_snapshot_id=old["snapshot_id"],
+    )
+
+    assert result["ok"] is True
+    assert result["snapshot_id"] == "full-head-backfill"
+    assert result["activation"]["activation"]["previous_snapshot_id"] == old["snapshot_id"]
+    assert result["pending_scope_waiver"]["waived_count"] == 2
+    active = store.get_active_graph_snapshot(conn, PID)
+    assert active["snapshot_id"] == "full-head-backfill"
+    rows = conn.execute(
+        """
+        SELECT status, snapshot_id FROM pending_scope_reconcile
+        WHERE project_id=? ORDER BY commit_sha
+        """,
+        (PID,),
+    ).fetchall()
+    assert [row["status"] for row in rows] == [store.PENDING_STATUS_WAIVED] * 2
+    assert {row["snapshot_id"] for row in rows} == {"full-head-backfill"}
+
+    after = {str(path): _file_sha(path) for path in files}
+    assert after == before

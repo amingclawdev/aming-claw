@@ -1966,6 +1966,34 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/reconcile/backfill-escape")
+def handle_graph_governance_backfill_escape(ctx: RequestContext):
+    """Activate a HEAD full snapshot and waive stuck pending scope rows."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .state_reconcile import run_backfill_escape_hatch
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.backfill-escape")
+        result = run_backfill_escape_hatch(
+            conn,
+            project_id,
+            root,
+            target_commit_sha=str(body.get("target_commit_sha") or ""),
+            run_id=str(body.get("run_id") or ""),
+            snapshot_id=body.get("snapshot_id"),
+            created_by=str(body.get("actor") or "observer"),
+            reason=str(body.get("reason") or ""),
+            expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+        )
+        conn.commit()
+        return 201, result
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/finalize")
 def handle_graph_governance_snapshot_finalize(ctx: RequestContext):
     """Activate a candidate graph snapshot with compare-and-swap signoff."""

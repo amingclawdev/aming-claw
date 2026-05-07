@@ -21,12 +21,14 @@ from agent.governance.graph_snapshot_store import (
     activate_graph_snapshot,
     create_graph_snapshot,
     ensure_schema as ensure_graph_snapshot_schema,
+    finalize_graph_snapshot,
     get_active_graph_snapshot,
     graph_payload_stats,
     index_graph_snapshot,
     list_pending_scope_reconcile,
     snapshot_graph_path,
     snapshot_id_for,
+    waive_pending_scope_reconcile,
 )
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
@@ -360,7 +362,106 @@ def run_pending_scope_reconcile_candidate(
     }
 
 
+def run_backfill_escape_hatch(
+    conn: sqlite3.Connection,
+    project_id: str,
+    project_root: str | Path,
+    *,
+    target_commit_sha: str = "",
+    run_id: str = "",
+    snapshot_id: str | None = None,
+    created_by: str = "observer",
+    reason: str = "",
+    expected_old_snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """Activate a HEAD full snapshot and waive stuck pending scope rows.
+
+    This is the explicit observer escape hatch for early scope-reconcile bugs:
+    it rebuilds graph state from the current commit, activates that state with
+    normal snapshot CAS semantics, and preserves queued/running/failed pending
+    rows as waived audit records instead of deleting them.
+    """
+    ensure_graph_snapshot_schema(conn)
+    root = Path(project_root).resolve()
+    head = _git_commit(root) or "unknown"
+    target = target_commit_sha or head
+    if head != "unknown" and target != head:
+        raise ValueError(
+            "backfill escape hatch scans the current worktree; "
+            f"target_commit_sha must equal HEAD ({head}), got {target}"
+        )
+    pending = list_pending_scope_reconcile(
+        conn,
+        project_id,
+        statuses=[PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED],
+    )
+    pending_commits = [
+        str(row.get("commit_sha") or "").strip()
+        for row in pending
+        if str(row.get("commit_sha") or "").strip()
+    ]
+    active = get_active_graph_snapshot(conn, project_id) or {}
+    rid = run_id or f"backfill-escape-{_short_commit(target)}"
+    sid = snapshot_id or snapshot_id_for("full", target)
+    result = run_state_only_full_reconcile(
+        conn,
+        project_id,
+        root,
+        run_id=rid,
+        commit_sha=target,
+        snapshot_id=sid,
+        snapshot_kind="full",
+        created_by=created_by,
+        activate=False,
+        notes_extra={
+            "backfill_escape_hatch": {
+                "reason": reason,
+                "pending_scope_commits": pending_commits,
+                "pending_scope_count": len(pending_commits),
+                "active_snapshot_id": active.get("snapshot_id", ""),
+                "active_graph_commit": active.get("commit_sha", ""),
+            }
+        },
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "pending_scope_commits": pending_commits,
+            "pending_scope_count": len(pending_commits),
+        }
+    finalize = finalize_graph_snapshot(
+        conn,
+        project_id,
+        result["snapshot_id"],
+        target_commit_sha=target,
+        expected_old_snapshot_id=expected_old_snapshot_id,
+        actor=created_by,
+        materialize_pending=False,
+        evidence={"source": "backfill_escape_hatch", "reason": reason},
+    )
+    waiver = waive_pending_scope_reconcile(
+        conn,
+        project_id,
+        commit_shas=pending_commits,
+        snapshot_id=result["snapshot_id"],
+        actor=created_by,
+        reason=reason,
+        evidence={"source": "backfill_escape_hatch"},
+    )
+    return {
+        **result,
+        "snapshot_status": "active",
+        "activation": finalize,
+        "pending_scope_commits": pending_commits,
+        "pending_scope_count": len(pending_commits),
+        "pending_scope_waiver": waiver,
+        "active_snapshot_id": active.get("snapshot_id", ""),
+        "active_graph_commit": active.get("commit_sha", ""),
+    }
+
+
 __all__ = [
+    "run_backfill_escape_hatch",
     "run_pending_scope_reconcile_candidate",
     "run_state_only_full_reconcile",
 ]

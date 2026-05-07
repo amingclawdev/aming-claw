@@ -1064,6 +1064,84 @@ def queue_pending_scope_reconcile(
     return dict(row)
 
 
+def waive_pending_scope_reconcile(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    commit_shas: Iterable[str] | None = None,
+    snapshot_id: str = "",
+    actor: str = "observer",
+    reason: str = "",
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Mark retryable pending scope rows as waived with explicit evidence."""
+    ensure_schema(conn)
+    selected = [
+        str(commit or "").strip()
+        for commit in (commit_shas or [])
+        if str(commit or "").strip()
+    ]
+    params: list[Any] = [project_id]
+    sql = """
+        SELECT commit_sha FROM pending_scope_reconcile
+        WHERE project_id = ?
+          AND status IN (?, ?, ?)
+    """
+    params.extend([PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED])
+    if selected:
+        placeholders = ",".join("?" for _ in selected)
+        sql += f" AND commit_sha IN ({placeholders})"
+        params.extend(selected)
+    sql += " ORDER BY queued_at, commit_sha"
+    rows = conn.execute(sql, params).fetchall()
+    targets = [row["commit_sha"] for row in rows]
+    if not targets:
+        return {
+            "project_id": project_id,
+            "waived_count": 0,
+            "commit_shas": [],
+            "snapshot_id": snapshot_id,
+        }
+
+    waiver_evidence = {
+        "source": "pending_scope_waiver",
+        "actor": actor,
+        "reason": reason,
+        "snapshot_id": snapshot_id,
+        "commit_shas": targets,
+        **(evidence or {}),
+    }
+    placeholders = ",".join("?" for _ in targets)
+    cur = conn.execute(
+        f"""
+        UPDATE pending_scope_reconcile
+        SET status = ?,
+            snapshot_id = CASE WHEN ? != '' THEN ? ELSE snapshot_id END,
+            evidence_json = ?
+        WHERE project_id = ?
+          AND commit_sha IN ({placeholders})
+          AND status IN (?, ?, ?)
+        """,
+        (
+            PENDING_STATUS_WAIVED,
+            snapshot_id,
+            snapshot_id,
+            _json(waiver_evidence),
+            project_id,
+            *targets,
+            PENDING_STATUS_QUEUED,
+            PENDING_STATUS_RUNNING,
+            PENDING_STATUS_FAILED,
+        ),
+    )
+    return {
+        "project_id": project_id,
+        "waived_count": int(cur.rowcount or 0),
+        "commit_shas": targets,
+        "snapshot_id": snapshot_id,
+    }
+
+
 __all__ = [
     "ALLOWED_PENDING_STATUSES",
     "ALLOWED_SNAPSHOT_STATUSES",
@@ -1092,5 +1170,6 @@ __all__ = [
     "snapshot_graph_path",
     "snapshot_id_for",
     "strict_graph_ready",
+    "waive_pending_scope_reconcile",
     "write_companion_files",
 ]
