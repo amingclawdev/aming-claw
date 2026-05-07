@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from agent.governance import graph_snapshot_store as store
+from agent.governance.baseline_service import create_baseline
 from agent.governance.db import _ensure_schema
 
 
@@ -218,3 +219,93 @@ def test_pending_scope_reconcile_queue_is_idempotent(conn):
         (PID, "d444444"),
     ).fetchone()["count"]
     assert count == 1
+
+
+def _small_graph(node_id="L7.1"):
+    return {
+        "version": 1,
+        "deps_graph": {
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": [
+                {
+                    "id": node_id,
+                    "layer": "L7",
+                    "title": "Imported Node",
+                    "primary": ["agent/governance/imported.py"],
+                    "metadata": {"kind": "imported"},
+                }
+            ],
+            "edges": [
+                {
+                    "source": node_id,
+                    "target": "L7.2",
+                    "edge_type": "depends_on",
+                    "direction": "dependency",
+                }
+            ],
+        },
+    }
+
+
+def test_import_existing_graph_skips_empty_baseline_and_uses_shared_current(conn, tmp_path):
+    _ensure_schema(conn)
+    create_baseline(
+        conn,
+        PID,
+        chain_version="scan-only",
+        trigger="reconcile-task",
+        triggered_by="auto-chain",
+        graph_json={},
+    )
+    conn.execute(
+        """
+        INSERT INTO project_version(project_id, chain_version, updated_at, updated_by, git_head)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (PID, "governed-commit", "2026-05-07T00:00:00Z", "test", "newer-mf-head"),
+    )
+    graph_path = tmp_path / PID / "graph.json"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text(json.dumps(_small_graph("L7.imported")), encoding="utf-8")
+
+    result = store.import_existing_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-governed-test",
+        activate=True,
+        created_by="test",
+    )
+
+    assert result["source"]["source_kind"] == "shared_volume_current"
+    assert result["commit_sha"] == "governed-commit"
+    assert result["index_counts"] == {"nodes": 1, "edges": 1}
+    assert result["activation"]["snapshot_id"] == "imported-governed-test"
+
+    active = store.get_active_graph_snapshot(conn, PID)
+    assert active["snapshot_id"] == "imported-governed-test"
+    assert active["commit_sha"] == "governed-commit"
+
+    node = conn.execute(
+        "SELECT node_id FROM graph_nodes_index WHERE project_id=? AND snapshot_id=?",
+        (PID, "imported-governed-test"),
+    ).fetchone()
+    assert node["node_id"] == "L7.imported"
+
+
+def test_import_existing_graph_prefers_non_empty_baseline_companion(conn):
+    _ensure_schema(conn)
+    create_baseline(
+        conn,
+        PID,
+        chain_version="baseline-commit",
+        trigger="reconcile-task",
+        triggered_by="auto-chain",
+        graph_json=_small_graph("L7.baseline"),
+    )
+
+    source = store.select_existing_graph_source(conn, PID)
+    assert source["source_kind"] == "baseline_companion"
+    assert source["source_ref"] == "1"
+    assert source["stats"] == {"nodes": 1, "edges": 1}

@@ -221,6 +221,147 @@ def write_companion_files(
     }
 
 
+def _graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
+    deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
+    if isinstance(deps, dict) and isinstance(deps.get("nodes"), list):
+        return [n for n in deps.get("nodes", []) if isinstance(n, dict)]
+    nodes = graph_json.get("nodes") if isinstance(graph_json, dict) else []
+    if isinstance(nodes, list):
+        return [n for n in nodes if isinstance(n, dict)]
+    if isinstance(nodes, dict):
+        result = []
+        for node_id, node in nodes.items():
+            item = dict(node) if isinstance(node, dict) else {}
+            item.setdefault("id", str(node_id))
+            result.append(item)
+        return result
+    return []
+
+
+def _graph_edges(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
+    deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
+    if isinstance(deps, dict):
+        edges = deps.get("edges") if "edges" in deps else deps.get("links")
+        if isinstance(edges, list):
+            return [e for e in edges if isinstance(e, dict)]
+    edges = graph_json.get("edges") if isinstance(graph_json, dict) else []
+    if isinstance(edges, list):
+        return [e for e in edges if isinstance(e, dict)]
+    return []
+
+
+def graph_payload_stats(graph_json: dict[str, Any]) -> dict[str, int]:
+    return {"nodes": len(_graph_nodes(graph_json)), "edges": len(_graph_edges(graph_json))}
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _current_graph_path(project_id: str) -> Path:
+    from .db import _governance_root
+
+    return _governance_root() / project_id / "graph.json"
+
+
+def _baseline_graph_path(project_id: str, baseline_id: int) -> Path:
+    from .db import _governance_root
+
+    return _governance_root() / project_id / "baselines" / str(baseline_id) / "graph.json"
+
+
+def _resolve_import_commit(conn: sqlite3.Connection, project_id: str, explicit: str = "") -> str:
+    if explicit:
+        return explicit
+    try:
+        row = conn.execute(
+            "SELECT chain_version, git_head FROM project_version WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row:
+        # chain_version is the last governed/service version; git_head may include
+        # advisory MF commits that the graph has not materialized yet.
+        if hasattr(row, "keys"):
+            chain_version = row["chain_version"] if "chain_version" in row.keys() else ""
+            git_head = row["git_head"] if "git_head" in row.keys() else ""
+        else:
+            chain_version = row[0] if len(row) > 0 else ""
+            git_head = row[1] if len(row) > 1 else ""
+        return chain_version or git_head or "unknown"
+    return "unknown"
+
+
+def select_existing_graph_source(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    extra_graph_paths: Iterable[str | Path] | None = None,
+) -> dict[str, Any] | None:
+    """Select the best existing graph payload to import.
+
+    Empty baseline companion graphs are skipped because older scan-only
+    baselines often wrote `{}` while the active graph still lived at the
+    shared-volume graph path.
+    """
+    ensure_schema(conn)
+    try:
+        rows = conn.execute(
+            """
+            SELECT baseline_id FROM version_baselines
+            WHERE project_id = ?
+            ORDER BY baseline_id DESC
+            """,
+            (project_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    if rows:
+        from .baseline_service import read_companion_file
+
+        for row in rows:
+            baseline_id = row["baseline_id"] if hasattr(row, "keys") else row[0]
+            try:
+                graph_json = read_companion_file(project_id, int(baseline_id), "graph.json")
+            except Exception:
+                continue
+            stats = graph_payload_stats(graph_json)
+            if stats["nodes"] > 0:
+                path = _baseline_graph_path(project_id, int(baseline_id))
+                return {
+                    "source_kind": "baseline_companion",
+                    "source_path": str(path),
+                    "source_ref": str(baseline_id),
+                    "graph_json": graph_json,
+                    "stats": stats,
+                }
+
+    candidates: list[tuple[str, Path]] = [("shared_volume_current", _current_graph_path(project_id))]
+    for path in extra_graph_paths or []:
+        candidates.append(("explicit_path", Path(path)))
+
+    for source_kind, path in candidates:
+        if not path.exists():
+            continue
+        graph_json = _read_json_file(path)
+        stats = graph_payload_stats(graph_json)
+        if stats["nodes"] > 0:
+            return {
+                "source_kind": source_kind,
+                "source_path": str(path),
+                "source_ref": "",
+                "graph_json": graph_json,
+                "stats": stats,
+            }
+    return None
+
+
 def create_graph_snapshot(
     conn: sqlite3.Connection,
     project_id: str,
@@ -424,6 +565,69 @@ def get_active_graph_snapshot(
     return dict(row) if row else None
 
 
+def import_existing_graph_snapshot(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    commit_sha: str = "",
+    snapshot_id: str | None = None,
+    created_by: str = "observer",
+    activate: bool = False,
+    expected_old_snapshot_id: str | None = None,
+    extra_graph_paths: Iterable[str | Path] | None = None,
+) -> dict[str, Any]:
+    source = select_existing_graph_source(
+        conn,
+        project_id,
+        extra_graph_paths=extra_graph_paths,
+    )
+    if not source:
+        raise FileNotFoundError(f"no non-empty graph source found for project {project_id}")
+
+    selected_commit = _resolve_import_commit(conn, project_id, commit_sha)
+    sid = snapshot_id or snapshot_id_for("imported", selected_commit)
+    source_notes = {
+        "source_kind": source["source_kind"],
+        "source_path": source["source_path"],
+        "source_ref": source.get("source_ref", ""),
+        "source_stats": source["stats"],
+        "selected_commit": selected_commit,
+    }
+    snapshot = create_graph_snapshot(
+        conn,
+        project_id,
+        snapshot_id=sid,
+        commit_sha=selected_commit,
+        snapshot_kind="imported",
+        graph_json=source["graph_json"],
+        file_inventory=[],
+        drift_ledger=[],
+        created_by=created_by,
+        notes=_json(source_notes),
+    )
+    counts = index_graph_snapshot(
+        conn,
+        project_id,
+        sid,
+        nodes=_graph_nodes(source["graph_json"]),
+        edges=_graph_edges(source["graph_json"]),
+    )
+    result = {
+        **snapshot,
+        "source": {k: v for k, v in source.items() if k != "graph_json"},
+        "index_counts": counts,
+        "activation": None,
+    }
+    if activate:
+        result["activation"] = activate_graph_snapshot(
+            conn,
+            project_id,
+            sid,
+            expected_old_snapshot_id=expected_old_snapshot_id,
+        )
+    return result
+
+
 def record_drift(
     conn: sqlite3.Connection,
     project_id: str,
@@ -523,8 +727,11 @@ __all__ = [
     "ensure_schema",
     "get_active_graph_snapshot",
     "index_graph_snapshot",
+    "graph_payload_stats",
+    "import_existing_graph_snapshot",
     "queue_pending_scope_reconcile",
     "record_drift",
+    "select_existing_graph_source",
     "snapshot_id_for",
     "write_companion_files",
 ]
