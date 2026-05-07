@@ -53,6 +53,8 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
             {
                 "node_id": "agent.service",
                 "primary_file": str(project / "agent" / "service.py"),
+                "secondary": ["docs/service.md"],
+                "test": ["tests/test_service.py"],
             }
         ],
         feature_clusters=[
@@ -62,6 +64,7 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
                 "secondary_files": ["tests/test_service.py", "docs/service.md"],
             }
         ],
+        last_scanned_commit="commit-1",
     )
     rows_by_path = _by_path(rows)
 
@@ -70,9 +73,14 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert ".observer-cache/scratch.json" not in rows_by_path
     assert rows_by_path["agent/service.py"]["scan_status"] == "clustered"
     assert rows_by_path["agent/service.py"]["candidate_node_id"] == "agent.service"
+    assert rows_by_path["agent/service.py"]["graph_status"] == "mapped"
+    assert rows_by_path["agent/service.py"]["mapped_node_ids"] == ["agent.service"]
     assert rows_by_path["tests/test_service.py"]["scan_status"] == "secondary_attached"
+    assert rows_by_path["tests/test_service.py"]["graph_status"] == "attached"
+    assert rows_by_path["tests/test_service.py"]["mapped_node_ids"] == ["agent.service"]
     assert rows_by_path["docs/service.md"]["scan_status"] == "secondary_attached"
     assert rows_by_path["agent/orphan_source.py"]["scan_status"] == "orphan"
+    assert rows_by_path["agent/orphan_source.py"]["graph_status"] == "unmapped"
     assert rows_by_path["tests/test_orphan.py"]["scan_status"] == "orphan"
     assert rows_by_path["tests/conftest.py"]["scan_status"] == "support"
     assert rows_by_path["tests/fixtures/replay_data.py"]["scan_status"] == "support"
@@ -91,6 +99,9 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert rows_by_path["docs/dev/scratch/backlog.json"]["file_kind"] == "generated"
     assert rows_by_path["docs/dev/scratch/backlog.json"]["scan_status"] == "ignored"
     assert rows_by_path["agent/service.py"]["sha256"]
+    assert rows_by_path["agent/service.py"]["file_hash"] == f"sha256:{rows_by_path['agent/service.py']['sha256']}"
+    assert rows_by_path["agent/service.py"]["size_bytes"] > 0
+    assert rows_by_path["agent/service.py"]["last_scanned_commit"] == "commit-1"
 
     summary = summarize_file_inventory(rows)
     assert summary["by_status"]["clustered"] == 1
@@ -121,14 +132,20 @@ def test_inventory_persists_to_governance_table(tmp_path):
     assert count == len(rows)
     persisted = conn.execute(
         """
-        SELECT project_id, run_id, path, file_kind, scan_status
+        SELECT project_id, run_id, path, file_kind, scan_status,
+               file_hash, size_bytes, graph_status, mapped_node_ids
         FROM reconcile_file_inventory
         WHERE project_id = ? AND run_id = ?
         """,
         ("aming-claw-test", "run-db"),
     ).fetchall()
     assert len(persisted) == len(rows)
-    assert dict(persisted[0])["path"] == "agent/service.py"
+    persisted_row = dict(persisted[0])
+    assert persisted_row["path"] == "agent/service.py"
+    assert persisted_row["file_hash"].startswith("sha256:")
+    assert persisted_row["size_bytes"] > 0
+    assert persisted_row["graph_status"] == "unmapped"
+    assert json.loads(persisted_row["mapped_node_ids"]) == []
 
 
 def test_inventory_upsert_replaces_stale_rows_for_same_run(tmp_path):
@@ -211,6 +228,8 @@ def test_inventory_query_returns_latest_summary_and_filters(tmp_path):
     assert result["summary"]["total"] == len(rows)
     assert result["rows"]
     assert {row["scan_status"] for row in result["rows"]} == {"orphan"}
+    assert all(isinstance(row["mapped_node_ids"], list) for row in result["rows"])
+    assert all(row["file_hash"].startswith("sha256:") for row in result["rows"])
 
 
 def test_phase_z_artifact_contains_file_inventory(tmp_path):
@@ -243,3 +262,7 @@ def test_phase_z_artifact_contains_file_inventory(tmp_path):
         "phase-z-explicit-run"
     }
     assert payload["file_inventory_summary"]["total"] >= 3
+    service_row = next(row for row in payload["file_inventory"] if row["path"] == "agent/service.py")
+    assert service_row["file_hash"].startswith("sha256:")
+    assert service_row["size_bytes"] > 0
+    assert "confidence" not in json.dumps(service_row)

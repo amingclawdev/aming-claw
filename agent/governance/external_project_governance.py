@@ -192,7 +192,18 @@ def build_coverage_state(
         "referenced_file_count": len(referenced_files),
         "file_inventory_summary": summarize_file_inventory(file_inventory),
         "file_hashes": {
-            str(row.get("path") or ""): str(row.get("sha256") or "")
+            str(row.get("path") or ""): str(row.get("file_hash") or row.get("sha256") or "")
+            for row in file_inventory
+            if row.get("path")
+        },
+        "file_states": {
+            str(row.get("path") or ""): {
+                "file_hash": str(row.get("file_hash") or row.get("sha256") or ""),
+                "size_bytes": int(row.get("size_bytes") or 0),
+                "graph_status": str(row.get("graph_status") or ""),
+                "mapped_node_ids": list(row.get("mapped_node_ids") or []),
+                "last_scanned_commit": str(row.get("last_scanned_commit") or ""),
+            }
             for row in file_inventory
             if row.get("path")
         },
@@ -460,6 +471,11 @@ def scan_external_project(
         row for row in (phase_result.get("file_inventory") or [])
         if isinstance(row, dict)
     ]
+    for row in file_inventory:
+        if not row.get("last_scanned_commit"):
+            row["last_scanned_commit"] = base_commit
+        if row.get("sha256") and not row.get("file_hash"):
+            row["file_hash"] = f"sha256:{row['sha256']}"
     coverage_state = build_coverage_state(
         candidate_graph=candidate_graph,
         file_inventory=file_inventory,
