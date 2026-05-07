@@ -281,6 +281,62 @@ def test_finalize_graph_snapshot_activates_and_materializes_matching_pending(con
     assert other["status"] == store.PENDING_STATUS_QUEUED
 
 
+def test_finalize_graph_snapshot_materializes_explicit_covered_commits(conn):
+    _ensure_schema(conn)
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-covered",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    new = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-new-covered",
+        commit_sha="new",
+        snapshot_kind="scope",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    for commit in ("a1", "a2", "new", "future"):
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=commit,
+            parent_commit_sha="old",
+            evidence={"source": "test"},
+        )
+
+    result = store.finalize_graph_snapshot(
+        conn,
+        PID,
+        new["snapshot_id"],
+        target_commit_sha="new",
+        expected_old_snapshot_id=old["snapshot_id"],
+        covered_commit_shas=["a1", "a2", "new"],
+    )
+
+    assert result["pending_materialized_count"] == 3
+    rows = conn.execute(
+        """
+        SELECT commit_sha, status, snapshot_id FROM pending_scope_reconcile
+        WHERE project_id=? ORDER BY commit_sha
+        """,
+        (PID,),
+    ).fetchall()
+    statuses = {row["commit_sha"]: row["status"] for row in rows}
+    assert statuses == {
+        "a1": store.PENDING_STATUS_MATERIALIZED,
+        "a2": store.PENDING_STATUS_MATERIALIZED,
+        "future": store.PENDING_STATUS_QUEUED,
+        "new": store.PENDING_STATUS_MATERIALIZED,
+    }
+    assert {
+        row["snapshot_id"] for row in rows
+        if row["status"] == store.PENDING_STATUS_MATERIALIZED
+    } == {new["snapshot_id"]}
+
+
 def test_finalize_graph_snapshot_rejects_commit_mismatch_and_stale_active(conn):
     _ensure_schema(conn)
     old = store.create_graph_snapshot(

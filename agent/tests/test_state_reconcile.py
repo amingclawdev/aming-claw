@@ -9,7 +9,10 @@ import pytest
 
 from agent.governance import graph_snapshot_store as store
 from agent.governance.db import _ensure_schema
-from agent.governance.state_reconcile import run_state_only_full_reconcile
+from agent.governance.state_reconcile import (
+    run_pending_scope_reconcile_candidate,
+    run_state_only_full_reconcile,
+)
 
 
 PID = "state-reconcile-test"
@@ -131,3 +134,91 @@ def test_state_only_full_reconcile_can_activate_with_explicit_signoff(conn, tmp_
         (PID, "imported-old-test"),
     ).fetchone()
     assert old_status["status"] == store.SNAPSHOT_STATUS_SUPERSEDED
+
+
+def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    files = _write_project(project)
+    before = {str(path): _file_sha(path) for path in files}
+
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-pending",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    for commit in ("a1", "a2", "head"):
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=commit,
+            parent_commit_sha="old",
+            evidence={"source": "test"},
+        )
+    monkeypatch.setattr("agent.governance.state_reconcile._git_commit", lambda *_a, **_k: "head")
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        run_id="scope-reconcile-head-test",
+        snapshot_id="scope-head-test",
+    )
+
+    assert result["ok"] is True
+    assert result["snapshot_id"] == "scope-head-test"
+    assert result["snapshot_status"] == store.SNAPSHOT_STATUS_CANDIDATE
+    assert result["covered_commit_shas"] == ["a1", "a2", "head"]
+    assert result["pending_rows_bound"] == 3
+    assert result["active_snapshot_id"] == "imported-old-pending"
+    assert result["graph_stats"]["nodes"] > 0
+    assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
+    assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == "imported-old-pending"
+
+    rows = conn.execute(
+        """
+        SELECT commit_sha, status, snapshot_id FROM pending_scope_reconcile
+        WHERE project_id=? ORDER BY queued_at, commit_sha
+        """,
+        (PID,),
+    ).fetchall()
+    assert [row["status"] for row in rows] == [store.PENDING_STATUS_RUNNING] * 3
+    assert {row["snapshot_id"] for row in rows} == {"scope-head-test"}
+
+    notes = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, "scope-head-test"),
+    ).fetchone()["notes"]
+    pending_notes = json.loads(notes)["pending_scope_reconcile"]
+    assert pending_notes["covered_commit_count"] == 3
+
+    after = {str(path): _file_sha(path) for path in files}
+    assert after == before
+
+
+def test_pending_scope_materializer_requires_current_head(conn, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    _write_project(project)
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="target",
+        parent_commit_sha="old",
+        evidence={"source": "test"},
+    )
+    monkeypatch.setattr("agent.governance.state_reconcile._git_commit", lambda *_a, **_k: "head")
+
+    with pytest.raises(ValueError):
+        run_pending_scope_reconcile_candidate(
+            conn,
+            PID,
+            project,
+            target_commit_sha="target",
+            run_id="scope-reconcile-target-test",
+        )

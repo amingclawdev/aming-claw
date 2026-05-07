@@ -563,6 +563,7 @@ def finalize_graph_snapshot(
     ref_name: str = "active",
     actor: str = "observer",
     materialize_pending: bool = True,
+    covered_commit_shas: Iterable[str] | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Activate a candidate graph snapshot and settle matching pending scope rows.
@@ -602,21 +603,30 @@ def finalize_graph_snapshot(
     )
     materialized_count = 0
     if materialize_pending:
+        commit_targets = sorted({
+            str(item or "").strip()
+            for item in (covered_commit_shas or [commit_sha])
+            if str(item or "").strip()
+        })
+        if not commit_targets:
+            commit_targets = [commit_sha]
         pending_evidence = {
             "source": "graph_snapshot_finalizer",
             "actor": actor,
             "snapshot_id": snapshot_id,
             "ref_name": ref_name,
+            "covered_commit_shas": commit_targets,
             **(evidence or {}),
         }
+        placeholders = ",".join("?" for _ in commit_targets)
         cur = conn.execute(
-            """
+            f"""
             UPDATE pending_scope_reconcile
             SET status = ?,
                 snapshot_id = ?,
                 evidence_json = ?
             WHERE project_id = ?
-              AND commit_sha = ?
+              AND commit_sha IN ({placeholders})
               AND status IN (?, ?, ?)
             """,
             (
@@ -624,7 +634,7 @@ def finalize_graph_snapshot(
                 snapshot_id,
                 _json(pending_evidence),
                 project_id,
-                commit_sha,
+                *commit_targets,
                 PENDING_STATUS_QUEUED,
                 PENDING_STATUS_RUNNING,
                 PENDING_STATUS_FAILED,
