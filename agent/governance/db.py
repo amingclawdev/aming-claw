@@ -19,7 +19,7 @@ if _agent_dir not in sys.path:
 from utils import tasks_root
 
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 _SQLITE_WRITE_LOCK = threading.RLock()
 
@@ -1192,7 +1192,13 @@ def _run_migrations(conn: sqlite3.Connection, from_version: int, to_version: int
         except sqlite3.OperationalError:
             pass
 
-    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23, 24: _migrate_v23_to_v24, 25: _migrate_v24_to_v25, 26: _migrate_v25_to_v26, 27: _migrate_v26_to_v27, 28: _migrate_v27_to_v28, 29: _migrate_v28_to_v29, 30: _migrate_v29_to_v30, 31: _migrate_v30_to_v31, 32: _migrate_v31_to_v32, 33: _migrate_v32_to_v33}
+    def _migrate_v33_to_v34(c):
+        """Add commit-indexed graph snapshot state tables."""
+        from .graph_snapshot_store import GRAPH_SNAPSHOT_SCHEMA_SQL
+
+        c.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
+
+    MIGRATIONS = {2: _migrate_v1_to_v2, 3: _migrate_v2_to_v3, 4: _migrate_v3_to_v4, 5: _migrate_v4_to_v5, 6: _migrate_v5_to_v6, 7: _migrate_v6_to_v7, 8: _migrate_v7_to_v8, 9: _migrate_v8_to_v9, 10: _migrate_v9_to_v10, 11: _migrate_v10_to_v11, 12: _migrate_v11_to_v12, 13: _migrate_v12_to_v13, 14: _migrate_v13_to_v14, 15: _migrate_v14_to_v15, 16: _migrate_v15_to_v16, 17: _migrate_v16_to_v17, 18: _migrate_v17_to_v18, 19: _migrate_v18_to_v19, 20: _migrate_v19_to_v20, 21: _migrate_v20_to_v21, 22: _migrate_v21_to_v22, 23: _migrate_v22_to_v23, 24: _migrate_v23_to_v24, 25: _migrate_v24_to_v25, 26: _migrate_v25_to_v26, 27: _migrate_v26_to_v27, 28: _migrate_v27_to_v28, 29: _migrate_v28_to_v29, 30: _migrate_v29_to_v30, 31: _migrate_v30_to_v31, 32: _migrate_v31_to_v32, 33: _migrate_v32_to_v33, 34: _migrate_v33_to_v34}
     for version in range(from_version + 1, to_version + 1):
         if version in MIGRATIONS:
             MIGRATIONS[version](conn)
