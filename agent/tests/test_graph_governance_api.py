@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -286,6 +287,40 @@ def test_graph_governance_snapshot_files_api_reads_companion_inventory(conn):
     assert files["summary"]["by_scan_status"]["orphan"] == 1
     assert files["filtered_count"] == 1
     assert files["files"][0]["path"] == "docs/missing.md"
+
+
+def test_graph_governance_snapshot_export_cache_writes_non_authoritative_files(conn, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-export-cache",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+
+    code, result = server.handle_graph_governance_snapshot_export_cache(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"project_root": str(project)},
+        )
+    )
+
+    assert code == 201
+    assert result["ok"] is True
+    graph_path = Path(result["graph_path"])
+    manifest_path = Path(result["manifest_path"])
+    assert graph_path.exists()
+    assert manifest_path.exists()
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert graph["deps_graph"]["nodes"][0]["id"] == "L7.1"
+    assert manifest["snapshot_id"] == snapshot["snapshot_id"]
+    assert manifest["non_authoritative"] is True
 
 
 def test_graph_governance_drift_file_backlog_files_bug_and_updates_drift(conn):

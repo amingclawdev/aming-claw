@@ -1878,6 +1878,34 @@ def handle_graph_governance_snapshot_files(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/export-cache")
+def handle_graph_governance_snapshot_export_cache(ctx: RequestContext):
+    """Export a non-authoritative .aming-claw/cache graph.current.json."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.export-cache")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        try:
+            result = store.export_graph_snapshot_cache(
+                conn,
+                project_id,
+                snapshot_id,
+                project_root=root,
+                cache_dir=body.get("cache_dir") or None,
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        return 201, {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/drift")
 def handle_graph_governance_drift_list(ctx: RequestContext):
     """List graph drift ledger rows for dashboard/operator review."""

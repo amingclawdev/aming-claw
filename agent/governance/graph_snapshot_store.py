@@ -926,6 +926,62 @@ def list_graph_snapshot_files(
     }
 
 
+def export_graph_snapshot_cache(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    project_root: str | Path,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Export a non-authoritative graph cache into a project's .aming-claw/cache."""
+    ensure_schema(conn)
+    snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+    graph_path = snapshot_graph_path(project_id, snapshot_id)
+    graph_json = _read_json_artifact(graph_path, {})
+    if not isinstance(graph_json, dict) or not graph_json:
+        raise ValueError(f"snapshot graph companion is empty or unreadable: {graph_path}")
+
+    root = Path(project_root).resolve()
+    base = Path(cache_dir).resolve() if cache_dir else root / ".aming-claw" / "cache"
+    base.mkdir(parents=True, exist_ok=True)
+    out_graph = base / "graph.current.json"
+    out_manifest = base / "graph.current.manifest.json"
+    graph_bytes = (
+        json.dumps(graph_json, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        + "\n"
+    ).encode("utf-8")
+    graph_sha = _sha256_bytes(graph_bytes)
+    out_graph.write_bytes(graph_bytes)
+    manifest = {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "commit_sha": snapshot["commit_sha"],
+        "snapshot_kind": snapshot["snapshot_kind"],
+        "exported_at": utc_now(),
+        "non_authoritative": True,
+        "source_graph_sha256": snapshot["graph_sha256"],
+        "export_graph_sha256": graph_sha,
+        "graph_path": str(out_graph),
+    }
+    out_manifest.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "commit_sha": snapshot["commit_sha"],
+        "cache_dir": str(base),
+        "graph_path": str(out_graph),
+        "manifest_path": str(out_manifest),
+        "manifest": manifest,
+    }
+
+
 def abandon_graph_snapshot(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1426,6 +1482,7 @@ __all__ = [
     "activate_graph_snapshot",
     "create_graph_snapshot",
     "ensure_schema",
+    "export_graph_snapshot_cache",
     "finalize_graph_snapshot",
     "get_active_graph_snapshot",
     "get_graph_drift",
