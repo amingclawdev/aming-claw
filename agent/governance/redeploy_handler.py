@@ -214,15 +214,9 @@ def _db_write_chain_version(expected_head: str, task_id: str, target: str) -> bo
     Uses updated_by='redeploy-orchestrator' and includes task_id.
     """
     try:
-        from . import dbservice
-        db_path = dbservice._db_path_for_project("aming-claw")
-        if not db_path:
-            log.warning("_db_write_chain_version: no DB path found")
-            return False
+        from .db import get_connection
 
-        import sqlite3
-        conn = sqlite3.connect(str(db_path), timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = get_connection("aming-claw")
         try:
             now = _utc_now()
             conn.execute(
@@ -236,20 +230,16 @@ def _db_write_chain_version(expected_head: str, task_id: str, target: str) -> bo
             )
             # Also write audit record linking to task_id
             try:
-                conn.execute(
-                    "INSERT INTO audit_log (project_id, event_type, actor, details, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        "aming-claw",
-                        "redeploy.version_write",
-                        "redeploy-orchestrator",
-                        json.dumps({
-                            "task_id": task_id,
-                            "target": target,
-                            "chain_version": expected_head,
-                        }),
-                        now,
-                    ),
+                from . import audit_service
+
+                audit_service.record(
+                    conn,
+                    "aming-claw",
+                    "redeploy.version_write",
+                    actor="redeploy-orchestrator",
+                    task_id=task_id,
+                    target=target,
+                    chain_version=expected_head,
                 )
             except Exception:
                 pass  # Audit failure should not block
