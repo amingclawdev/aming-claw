@@ -317,6 +317,13 @@ def build_file_inventory(
             decision = "govern"
             graph_status = "mapped"
             reason = "source covered by candidate graph fallback node"
+        elif kind in {"test", "doc", "index_doc"} and mapped_node_ids:
+            scan_status = "secondary_attached"
+            candidate_node_id = mapped_node_ids[0]
+            attached_to = candidate_node_id
+            decision = "attach_to_node"
+            graph_status = "attached"
+            reason = f"{kind} file attached by graph node evidence"
         elif kind == "test" and is_test_support_path(rel):
             scan_status = "support"
             decision = "keep"
