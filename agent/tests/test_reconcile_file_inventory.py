@@ -113,6 +113,31 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert summary["by_status"]["ignored"] == 3
 
 
+def test_inventory_maps_candidate_fallback_source_nodes(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "agent" / "fallback.py"), "VALUE = 1\n")
+
+    rows = build_file_inventory(
+        project_root=str(project),
+        run_id="run-fallback",
+        nodes=[
+            {
+                "node_id": "agent.fallback",
+                "primary": ["agent/fallback.py"],
+            }
+        ],
+        feature_clusters=[],
+    )
+    row = _by_path(rows)["agent/fallback.py"]
+
+    assert row["scan_status"] == "clustered"
+    assert row["graph_status"] == "mapped"
+    assert row["candidate_node_id"] == "agent.fallback"
+    assert row["mapped_node_ids"] == ["agent.fallback"]
+    assert row["decision"] == "govern"
+
+
 def test_inventory_persists_to_governance_table(tmp_path):
     project = tmp_path / "project"
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")

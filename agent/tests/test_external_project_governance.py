@@ -114,6 +114,9 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
     assert rows["src/demo_app/service.py"]["file_hash"].startswith("sha256:")
     assert rows["src/demo_app/service.py"]["size_bytes"] > 0
     assert rows["src/demo_app/service.py"]["last_scanned_commit"] == result["base_commit"]
+    assert rows["src/demo_app/__init__.py"]["scan_status"] == "clustered"
+    assert rows["src/demo_app/__init__.py"]["graph_status"] == "mapped"
+    assert rows["src/demo_app/__init__.py"]["mapped_node_ids"]
     assert all(not row["path"].startswith(".aming-claw/") for row in inventory)
 
     coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
@@ -123,6 +126,7 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
     assert coverage["file_hashes"]["src/demo_app/service.py"] == rows["src/demo_app/service.py"]["file_hash"]
     assert coverage["file_states"]["src/demo_app/service.py"]["file_hash"] == rows["src/demo_app/service.py"]["file_hash"]
     assert coverage["file_states"]["src/demo_app/service.py"]["last_scanned_commit"] == result["base_commit"]
+    assert coverage["file_states"]["src/demo_app/__init__.py"]["graph_status"] == "mapped"
     assert "confidence" not in json.dumps(coverage)
     assert "confidence" not in json.dumps(symbol_index)
     assert "confidence" not in json.dumps(doc_index)
