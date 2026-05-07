@@ -23,6 +23,7 @@ from agent.governance.graph_snapshot_store import (
     ensure_schema as ensure_graph_snapshot_schema,
     finalize_graph_snapshot,
     get_active_graph_snapshot,
+    graph_payload_edges,
     graph_payload_stats,
     index_graph_snapshot,
     list_pending_scope_reconcile,
@@ -69,11 +70,7 @@ def _deps_graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _deps_graph_edges(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
-    deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
-    edges = []
-    if isinstance(deps, dict):
-        edges = deps.get("edges") if "edges" in deps else deps.get("links")
-    return [edge for edge in edges or [] if isinstance(edge, dict)]
+    return graph_payload_edges(graph_json)
 
 
 def _normalize_inventory_commit(

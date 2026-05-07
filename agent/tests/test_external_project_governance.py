@@ -82,6 +82,7 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
 
     candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
     nodes = candidate["deps_graph"]["nodes"]
+    assert candidate["hierarchy_graph"]["links"]
     source_nodes = [node for node in nodes if node.get("primary")]
     primary_paths = {
         path

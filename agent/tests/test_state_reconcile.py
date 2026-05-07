@@ -80,6 +80,7 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert result["snapshot_id"] == "full-abc1234-test"
     assert result["snapshot_status"] == store.SNAPSHOT_STATUS_CANDIDATE
     assert result["graph_stats"]["nodes"] > 0
+    assert result["graph_stats"]["edges"] > 0
     assert result["index_counts"]["nodes"] == result["graph_stats"]["nodes"]
     assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
     assert result["file_inventory_count"] > 0

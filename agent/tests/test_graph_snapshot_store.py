@@ -193,6 +193,30 @@ def test_drift_ledger_allows_multiple_target_symbols(conn):
     ]
 
 
+def test_graph_payload_edges_include_hierarchy_and_dependency_sections():
+    graph = {
+        "hierarchy_graph": {
+            "nodes": [{"id": "L1.1"}, {"id": "L2.1"}],
+            "links": [{"source": "L1.1", "target": "L2.1", "type": "contains"}],
+        },
+        "deps_graph": {
+            "nodes": [{"id": "L1.1"}, {"id": "L2.1"}],
+            "links": [{"source": "L2.1", "target": "L1.1", "type": "depends_on"}],
+        },
+    }
+
+    edges = store.graph_payload_edges(graph)
+
+    assert store.graph_payload_stats(graph) == {"nodes": 2, "edges": 2}
+    assert {
+        (edge["src"], edge["dst"], edge["edge_type"], edge["direction"])
+        for edge in edges
+    } == {
+        ("L1.1", "L2.1", "contains", "hierarchy"),
+        ("L2.1", "L1.1", "depends_on", "dependency"),
+    }
+
+
 def test_pending_scope_reconcile_queue_is_idempotent(conn):
     _ensure_schema(conn)
     first = store.queue_pending_scope_reconcile(

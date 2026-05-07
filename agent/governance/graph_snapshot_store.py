@@ -246,16 +246,59 @@ def _graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def _graph_edges(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
-    deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
-    if isinstance(deps, dict):
-        edges = deps.get("edges") if "edges" in deps else deps.get("links")
-        if isinstance(edges, list):
-            return [e for e in edges if isinstance(e, dict)]
+def graph_payload_edges(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return normalized hierarchy/evidence/dependency edges from a graph payload."""
+    if not isinstance(graph_json, dict):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    sections = [
+        ("hierarchy_graph", "hierarchy"),
+        ("evidence_graph", "evidence"),
+        ("deps_graph", "dependency"),
+        ("gates_graph", "gate"),
+    ]
+    for section_name, default_direction in sections:
+        section = graph_json.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        raw_edges = section.get("edges") if "edges" in section else section.get("links")
+        for edge in raw_edges or []:
+            if not isinstance(edge, dict):
+                continue
+            src = str(edge.get("src") or edge.get("source") or "")
+            dst = str(edge.get("dst") or edge.get("target") or "")
+            edge_type = str(edge.get("edge_type") or edge.get("type") or "depends_on")
+            direction = str(edge.get("direction") or default_direction)
+            if not src or not dst:
+                continue
+            key = (src, dst, edge_type, direction)
+            if key in seen:
+                continue
+            item = dict(edge)
+            item["src"] = src
+            item["dst"] = dst
+            item["edge_type"] = edge_type
+            item["direction"] = direction
+            evidence = item.get("evidence")
+            metadata = item.get("metadata")
+            if metadata and "evidence" not in item:
+                item["evidence"] = metadata
+            elif evidence and "metadata" not in item:
+                item.setdefault("metadata", {"evidence": evidence})
+            item.setdefault("section", section_name)
+            result.append(item)
+            seen.add(key)
+    if result:
+        return result
     edges = graph_json.get("edges") if isinstance(graph_json, dict) else []
     if isinstance(edges, list):
         return [e for e in edges if isinstance(e, dict)]
     return []
+
+
+def _graph_edges(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
+    return graph_payload_edges(graph_json)
 
 
 def graph_payload_stats(graph_json: dict[str, Any]) -> dict[str, int]:
@@ -1155,6 +1198,7 @@ __all__ = [
     "get_graph_snapshot",
     "get_latest_scan_baseline",
     "graph_governance_status",
+    "graph_payload_edges",
     "index_graph_snapshot",
     "list_graph_snapshot_edges",
     "list_graph_snapshot_nodes",
