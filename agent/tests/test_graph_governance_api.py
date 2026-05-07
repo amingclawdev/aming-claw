@@ -294,3 +294,28 @@ def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_pa
     assert code2 == 201
     assert backfill["ok"] is True
     assert backfill["pending_scope_waiver"]["waived_count"] == 2
+
+
+def test_graph_governance_backfill_input_errors_are_validation_errors(conn, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def fake_backfill(*_args, **_kwargs):
+        raise ValueError("target_commit_sha must equal HEAD")
+
+    monkeypatch.setattr(
+        "agent.governance.state_reconcile.run_backfill_escape_hatch",
+        fake_backfill,
+    )
+
+    from agent.governance.errors import ValidationError
+
+    with pytest.raises(ValidationError) as exc:
+        server.handle_graph_governance_backfill_escape(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={"project_root": str(project), "target_commit_sha": "not-head"},
+            )
+        )
+    assert "target_commit_sha must equal HEAD" in str(exc.value)

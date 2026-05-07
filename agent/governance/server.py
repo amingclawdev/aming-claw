@@ -1726,6 +1726,15 @@ def _require_graph_governance_operator(ctx: RequestContext, conn, action: str) -
     return session
 
 
+def _raise_graph_api_validation(exc: Exception):
+    from .errors import ValidationError
+    raise ValidationError(str(exc)) from exc
+
+
+def _raise_graph_api_conflict(exc: Exception):
+    raise GovernanceError("graph_snapshot_conflict", str(exc), 409) from exc
+
+
 @route("GET", "/api/graph-governance/{project_id}/status")
 def handle_graph_governance_status(ctx: RequestContext):
     """Return active graph snapshot, scan baseline, and pending scope status."""
@@ -1827,18 +1836,21 @@ def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.pending-scope")
         with sqlite_write_lock():
-            row = store.queue_pending_scope_reconcile(
-                conn,
-                project_id,
-                commit_sha=commit_sha,
-                parent_commit_sha=str(body.get("parent_commit_sha") or ""),
-                status=str(body.get("status") or store.PENDING_STATUS_QUEUED),
-                snapshot_id=str(body.get("snapshot_id") or ""),
-                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {
-                    "source": "graph_governance_api",
-                    "actor": body.get("actor", "api"),
-                },
-            )
+            try:
+                row = store.queue_pending_scope_reconcile(
+                    conn,
+                    project_id,
+                    commit_sha=commit_sha,
+                    parent_commit_sha=str(body.get("parent_commit_sha") or ""),
+                    status=str(body.get("status") or store.PENDING_STATUS_QUEUED),
+                    snapshot_id=str(body.get("snapshot_id") or ""),
+                    evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {
+                        "source": "graph_governance_api",
+                        "actor": body.get("actor", "api"),
+                    },
+                )
+            except ValueError as exc:
+                _raise_graph_api_validation(exc)
             conn.commit()
         return 201, {"ok": True, "project_id": project_id, "pending_scope_reconcile": row}
     finally:
@@ -1894,16 +1906,21 @@ def handle_graph_governance_import_existing(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.import-existing")
         with sqlite_write_lock():
-            result = store.import_existing_graph_snapshot(
-                conn,
-                project_id,
-                commit_sha=str(body.get("commit_sha") or ""),
-                snapshot_id=body.get("snapshot_id"),
-                created_by=str(body.get("actor") or "observer"),
-                activate=bool(body.get("activate", False)),
-                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-                extra_graph_paths=body.get("extra_graph_paths") or [],
-            )
+            try:
+                result = store.import_existing_graph_snapshot(
+                    conn,
+                    project_id,
+                    commit_sha=str(body.get("commit_sha") or ""),
+                    snapshot_id=body.get("snapshot_id"),
+                    created_by=str(body.get("actor") or "observer"),
+                    activate=bool(body.get("activate", False)),
+                    expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                    extra_graph_paths=body.get("extra_graph_paths") or [],
+                )
+            except store.GraphSnapshotConflictError as exc:
+                _raise_graph_api_conflict(exc)
+            except (FileNotFoundError, KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
             conn.commit()
         return 201, {"ok": True, **result}
     finally:
@@ -1921,19 +1938,22 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.full")
-        result = run_state_only_full_reconcile(
-            conn,
-            project_id,
-            root,
-            run_id=str(body.get("run_id") or ""),
-            commit_sha=str(body.get("commit_sha") or ""),
-            snapshot_id=body.get("snapshot_id"),
-            snapshot_kind=str(body.get("snapshot_kind") or "full"),
-            created_by=str(body.get("actor") or "observer"),
-            activate=bool(body.get("activate", False)),
-            expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-            notes_extra=body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else None,
-        )
+        try:
+            result = run_state_only_full_reconcile(
+                conn,
+                project_id,
+                root,
+                run_id=str(body.get("run_id") or ""),
+                commit_sha=str(body.get("commit_sha") or ""),
+                snapshot_id=body.get("snapshot_id"),
+                snapshot_kind=str(body.get("snapshot_kind") or "full"),
+                created_by=str(body.get("actor") or "observer"),
+                activate=bool(body.get("activate", False)),
+                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                notes_extra=body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else None,
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
         conn.commit()
         return 201, result
     finally:
@@ -1951,15 +1971,18 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope")
-        result = run_pending_scope_reconcile_candidate(
-            conn,
-            project_id,
-            root,
-            target_commit_sha=str(body.get("target_commit_sha") or ""),
-            run_id=str(body.get("run_id") or ""),
-            snapshot_id=body.get("snapshot_id"),
-            created_by=str(body.get("actor") or "observer"),
-        )
+        try:
+            result = run_pending_scope_reconcile_candidate(
+                conn,
+                project_id,
+                root,
+                target_commit_sha=str(body.get("target_commit_sha") or ""),
+                run_id=str(body.get("run_id") or ""),
+                snapshot_id=body.get("snapshot_id"),
+                created_by=str(body.get("actor") or "observer"),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
         conn.commit()
         return 201, result
     finally:
@@ -1977,17 +2000,20 @@ def handle_graph_governance_backfill_escape(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.backfill-escape")
-        result = run_backfill_escape_hatch(
-            conn,
-            project_id,
-            root,
-            target_commit_sha=str(body.get("target_commit_sha") or ""),
-            run_id=str(body.get("run_id") or ""),
-            snapshot_id=body.get("snapshot_id"),
-            created_by=str(body.get("actor") or "observer"),
-            reason=str(body.get("reason") or ""),
-            expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-        )
+        try:
+            result = run_backfill_escape_hatch(
+                conn,
+                project_id,
+                root,
+                target_commit_sha=str(body.get("target_commit_sha") or ""),
+                run_id=str(body.get("run_id") or ""),
+                snapshot_id=body.get("snapshot_id"),
+                created_by=str(body.get("actor") or "observer"),
+                reason=str(body.get("reason") or ""),
+                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
         conn.commit()
         return 201, result
     finally:
@@ -2007,18 +2033,23 @@ def handle_graph_governance_snapshot_finalize(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.finalize")
         with sqlite_write_lock():
-            result = store.finalize_graph_snapshot(
-                conn,
-                project_id,
-                snapshot_id,
-                target_commit_sha=str(body.get("target_commit_sha") or ""),
-                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-                ref_name=str(body.get("ref_name") or "active"),
-                actor=str(body.get("actor") or "observer"),
-                materialize_pending=bool(body.get("materialize_pending", True)),
-                covered_commit_shas=body.get("covered_commit_shas") or None,
-                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else None,
-            )
+            try:
+                result = store.finalize_graph_snapshot(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    target_commit_sha=str(body.get("target_commit_sha") or ""),
+                    expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                    ref_name=str(body.get("ref_name") or "active"),
+                    actor=str(body.get("actor") or "observer"),
+                    materialize_pending=bool(body.get("materialize_pending", True)),
+                    covered_commit_shas=body.get("covered_commit_shas") or None,
+                    evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else None,
+                )
+            except store.GraphSnapshotConflictError as exc:
+                _raise_graph_api_conflict(exc)
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
             conn.commit()
         return {"ok": True, **result}
     finally:
@@ -2038,13 +2069,16 @@ def handle_graph_governance_snapshot_abandon(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.abandon")
         with sqlite_write_lock():
-            result = store.abandon_graph_snapshot(
-                conn,
-                project_id,
-                snapshot_id,
-                actor=str(body.get("actor") or "observer"),
-                reason=str(body.get("reason") or ""),
-            )
+            try:
+                result = store.abandon_graph_snapshot(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    actor=str(body.get("actor") or "observer"),
+                    reason=str(body.get("reason") or ""),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
             conn.commit()
         return {"ok": True, **result}
     finally:
