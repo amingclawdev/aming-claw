@@ -553,6 +553,94 @@ def activate_graph_snapshot(
     }
 
 
+def finalize_graph_snapshot(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    target_commit_sha: str = "",
+    expected_old_snapshot_id: str | None = None,
+    ref_name: str = "active",
+    actor: str = "observer",
+    materialize_pending: bool = True,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Activate a candidate graph snapshot and settle matching pending scope rows.
+
+    This is the explicit signoff bridge from a state-only reconcile candidate to
+    the active graph ref. It performs the same compare-and-swap check as
+    ``activate_graph_snapshot`` and only marks pending rows for the exact
+    snapshot commit as materialized.
+    """
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, snapshot_id),
+    ).fetchone()
+    if not row:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+    snapshot = dict(row)
+    status = str(snapshot.get("status") or "")
+    if status not in {
+        SNAPSHOT_STATUS_CANDIDATE,
+        SNAPSHOT_STATUS_FINALIZING,
+        SNAPSHOT_STATUS_ACTIVE,
+    }:
+        raise ValueError(f"cannot finalize graph snapshot in status {status!r}")
+    commit_sha = str(snapshot.get("commit_sha") or "")
+    if target_commit_sha and commit_sha != target_commit_sha:
+        raise ValueError(
+            f"snapshot commit mismatch: expected {target_commit_sha}, got {commit_sha}"
+        )
+
+    activation = activate_graph_snapshot(
+        conn,
+        project_id,
+        snapshot_id,
+        expected_old_snapshot_id=expected_old_snapshot_id,
+        ref_name=ref_name,
+    )
+    materialized_count = 0
+    if materialize_pending:
+        pending_evidence = {
+            "source": "graph_snapshot_finalizer",
+            "actor": actor,
+            "snapshot_id": snapshot_id,
+            "ref_name": ref_name,
+            **(evidence or {}),
+        }
+        cur = conn.execute(
+            """
+            UPDATE pending_scope_reconcile
+            SET status = ?,
+                snapshot_id = ?,
+                evidence_json = ?
+            WHERE project_id = ?
+              AND commit_sha = ?
+              AND status IN (?, ?, ?)
+            """,
+            (
+                PENDING_STATUS_MATERIALIZED,
+                snapshot_id,
+                _json(pending_evidence),
+                project_id,
+                commit_sha,
+                PENDING_STATUS_QUEUED,
+                PENDING_STATUS_RUNNING,
+                PENDING_STATUS_FAILED,
+            ),
+        )
+        materialized_count = int(cur.rowcount or 0)
+    return {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "commit_sha": commit_sha,
+        "activation": activation,
+        "pending_materialized_count": materialized_count,
+        "ref_name": ref_name,
+    }
+
+
 def get_active_graph_snapshot(
     conn: sqlite3.Connection,
     project_id: str,
@@ -816,6 +904,7 @@ __all__ = [
     "activate_graph_snapshot",
     "create_graph_snapshot",
     "ensure_schema",
+    "finalize_graph_snapshot",
     "get_active_graph_snapshot",
     "get_latest_scan_baseline",
     "graph_governance_status",

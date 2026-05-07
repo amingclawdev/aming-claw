@@ -221,6 +221,105 @@ def test_pending_scope_reconcile_queue_is_idempotent(conn):
     assert count == 1
 
 
+def test_finalize_graph_snapshot_activates_and_materializes_matching_pending(conn):
+    _ensure_schema(conn)
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-finalize",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    new = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-new-finalize",
+        commit_sha="new",
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="new",
+        parent_commit_sha="old",
+        evidence={"source": "test"},
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="other",
+        parent_commit_sha="old",
+        evidence={"source": "test"},
+    )
+
+    result = store.finalize_graph_snapshot(
+        conn,
+        PID,
+        new["snapshot_id"],
+        target_commit_sha="new",
+        expected_old_snapshot_id=old["snapshot_id"],
+        actor="test",
+        evidence={"signoff": "unit-test"},
+    )
+
+    assert result["pending_materialized_count"] == 1
+    assert result["activation"]["previous_snapshot_id"] == old["snapshot_id"]
+    active = store.get_active_graph_snapshot(conn, PID)
+    assert active["snapshot_id"] == new["snapshot_id"]
+    pending = conn.execute(
+        "SELECT status, snapshot_id, evidence_json FROM pending_scope_reconcile WHERE project_id=? AND commit_sha=?",
+        (PID, "new"),
+    ).fetchone()
+    assert pending["status"] == store.PENDING_STATUS_MATERIALIZED
+    assert pending["snapshot_id"] == new["snapshot_id"]
+    assert json.loads(pending["evidence_json"])["signoff"] == "unit-test"
+    other = conn.execute(
+        "SELECT status FROM pending_scope_reconcile WHERE project_id=? AND commit_sha=?",
+        (PID, "other"),
+    ).fetchone()
+    assert other["status"] == store.PENDING_STATUS_QUEUED
+
+
+def test_finalize_graph_snapshot_rejects_commit_mismatch_and_stale_active(conn):
+    _ensure_schema(conn)
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-stale",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    new = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-new-stale",
+        commit_sha="new",
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+
+    with pytest.raises(ValueError):
+        store.finalize_graph_snapshot(
+            conn,
+            PID,
+            new["snapshot_id"],
+            target_commit_sha="different",
+        )
+
+    with pytest.raises(store.GraphSnapshotConflictError):
+        store.finalize_graph_snapshot(
+            conn,
+            PID,
+            new["snapshot_id"],
+            target_commit_sha="new",
+            expected_old_snapshot_id="not-active",
+        )
+
+    active = store.get_active_graph_snapshot(conn, PID)
+    assert active["snapshot_id"] == old["snapshot_id"]
+
+
 def _small_graph(node_id="L7.1"):
     return {
         "version": 1,
