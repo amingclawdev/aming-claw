@@ -138,6 +138,56 @@ def test_graph_governance_status_and_snapshot_query_api(conn):
     assert edges["edges"][0]["edge_type"] == "contains"
 
 
+def test_graph_governance_dashboard_api_summarizes_active_state(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-dashboard",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+        file_inventory=[
+            {
+                "path": "agent/service.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+                "decision": "govern",
+            },
+            {
+                "path": "README.md",
+                "file_kind": "index_doc",
+                "scan_status": "index_asset",
+                "graph_status": "index_asset",
+                "decision": "attach_to_index_wrapper",
+            },
+        ],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    store.record_drift(
+        conn,
+        PID,
+        snapshot_id=snapshot["snapshot_id"],
+        commit_sha="head",
+        path="README.md",
+        drift_type="missing_test",
+        target_symbol="doc:index",
+    )
+    conn.commit()
+
+    dashboard = server.handle_graph_governance_dashboard(
+        _ctx({"project_id": PID}, query={"file_sample_limit": "1"})
+    )
+
+    assert dashboard["ok"] is True
+    assert dashboard["snapshot_id"] == snapshot["snapshot_id"]
+    assert dashboard["status"]["active_snapshot_id"] == snapshot["snapshot_id"]
+    assert dashboard["file_state"]["summary"]["by_kind"]["source"] == 1
+    assert dashboard["file_state"]["total_count"] == 2
+    assert dashboard["drift_summary"]["by_status"]["open"] == 1
+    assert dashboard["drift_summary"]["by_type"]["missing_test"] == 1
+
+
 def test_graph_governance_queue_finalize_and_abandon_api(conn):
     old = store.create_graph_snapshot(
         conn,

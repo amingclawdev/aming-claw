@@ -1755,6 +1755,32 @@ def _graph_drift_backlog_id(snapshot_id: str, path: str, drift_type: str, target
     return f"GRAPH-DRIFT-{safe_type}-{digest}"
 
 
+def _summarize_graph_drift_rows(rows: list[dict]) -> dict:
+    by_status: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    open_sample: list[dict] = []
+    for row in rows:
+        status = str(row.get("status") or "")
+        drift_type = str(row.get("drift_type") or "")
+        if status:
+            by_status[status] = by_status.get(status, 0) + 1
+        if drift_type:
+            by_type[drift_type] = by_type.get(drift_type, 0) + 1
+        if status == "open" and len(open_sample) < 20:
+            open_sample.append({
+                "path": row.get("path", ""),
+                "drift_type": drift_type,
+                "node_id": row.get("node_id", ""),
+                "target_symbol": row.get("target_symbol", ""),
+            })
+    return {
+        "total": len(rows),
+        "by_status": dict(sorted(by_status.items())),
+        "by_type": dict(sorted(by_type.items())),
+        "open_sample": open_sample,
+    }
+
+
 @route("GET", "/api/graph-governance/{project_id}/status")
 def handle_graph_governance_status(ctx: RequestContext):
     """Return active graph snapshot, scan baseline, and pending scope status."""
@@ -1772,6 +1798,59 @@ def handle_graph_governance_status(ctx: RequestContext):
                 target_commit=target_commit,
             )
         return {"ok": True, **status}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/dashboard")
+def handle_graph_governance_dashboard(ctx: RequestContext):
+    """Return a compact dashboard projection over graph, drift, and file state."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        status = store.graph_governance_status(conn, project_id)
+        snapshot_id = str(ctx.query.get("snapshot_id") or status.get("active_snapshot_id") or "")
+        snapshots = store.list_graph_snapshots(conn, project_id, limit=_query_int(ctx.query, "snapshot_limit", 10))
+        file_state: dict = {
+            "summary": {},
+            "total_count": 0,
+            "sample": [],
+        }
+        if snapshot_id:
+            try:
+                files = store.list_graph_snapshot_files(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    limit=_query_int(ctx.query, "file_sample_limit", 10),
+                    scan_status=str(ctx.query.get("scan_status") or ""),
+                )
+                file_state = {
+                    "summary": files["summary"],
+                    "total_count": files["total_count"],
+                    "filtered_count": files["filtered_count"],
+                    "sample": files["files"],
+                }
+            except KeyError:
+                file_state["error"] = "snapshot_file_inventory_not_found"
+        drift_rows = store.list_graph_drift(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            limit=_query_int(ctx.query, "drift_limit", 1000),
+        ) if snapshot_id else []
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "status": status,
+            "recent_snapshots": snapshots,
+            "file_state": file_state,
+            "drift_summary": _summarize_graph_drift_rows(drift_rows),
+            "drift_sample": drift_rows[:_query_int(ctx.query, "drift_sample_limit", 20)],
+        }
     finally:
         conn.close()
 
