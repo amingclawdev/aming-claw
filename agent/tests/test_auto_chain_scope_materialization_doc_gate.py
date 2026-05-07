@@ -133,6 +133,91 @@ def test_scope_materialization_graph_delta_only_checkpoint_can_advance():
     assert reason == "scope-materialization graph_delta-only accepted"
 
 
+def test_scope_materialization_checkpoint_accepts_existing_docs_attached_by_graph_delta():
+    from governance.auto_chain import _gate_checkpoint
+
+    expected_docs = [
+        "docs/governance/audit-process.md",
+        "examples/external-governance-demo/README.md",
+        "examples/external-governance-demo/docs/usage.md",
+    ]
+    result = {
+        "summary": "Mapped scope drift to graph nodes and fixed fixture test import.",
+        "changed_files": ["examples/external-governance-demo/tests/test_service.py"],
+        "test_results": {
+            "ran": True,
+            "passed": 17,
+            "failed": 0,
+            "command": "python -m pytest agent/tests/test_batch_jobs.py",
+        },
+        "graph_delta": {
+            "creates": [
+                {
+                    "title": "External project governance scanner fixture",
+                    "primary": [
+                        "agent/governance/external_project_governance.py",
+                        "examples/external-governance-demo/src/demo_app/service.py",
+                    ],
+                    "secondary": expected_docs[1:],
+                    "test": ["examples/external-governance-demo/tests/test_service.py"],
+                }
+            ],
+            "updates": [
+                {
+                    "node_id": "L7.6",
+                    "fields": {
+                        "secondary": [expected_docs[0]],
+                        "test": ["agent/tests/test_cli.py"],
+                    },
+                }
+            ],
+            "links": [],
+        },
+    }
+    metadata = {
+        "operation_type": "scope-materialization",
+        "target_files": [
+            "examples/external-governance-demo/tests/test_service.py",
+            *expected_docs,
+        ],
+        "doc_impact": {"files": list(expected_docs), "changes": ["Attach existing docs to graph nodes"]},
+    }
+
+    passed, reason = _gate_checkpoint(None, "aming-claw", result, metadata)
+
+    assert passed is True, reason
+
+
+def test_regular_checkpoint_still_requires_doc_edits_even_if_graph_delta_mentions_docs():
+    from governance.auto_chain import _gate_checkpoint
+
+    result = {
+        "summary": "Regular code fix.",
+        "changed_files": ["src/app.py"],
+        "test_results": {"ran": True, "passed": 1, "failed": 0},
+        "graph_delta": {
+            "creates": [],
+            "updates": [
+                {
+                    "node_id": "L7.1",
+                    "fields": {"secondary": ["docs/app.md"]},
+                }
+            ],
+            "links": [],
+        },
+    }
+    metadata = {
+        "operation_type": "feature",
+        "target_files": ["src/app.py"],
+        "doc_impact": {"files": ["docs/app.md"]},
+    }
+
+    passed, reason = _gate_checkpoint(None, "aming-claw", result, metadata)
+
+    assert passed is False
+    assert "Related docs not updated" in reason
+
+
 def test_scope_materialization_graph_delta_only_failed_tests_block():
     from governance.auto_chain import _gate_checkpoint
 

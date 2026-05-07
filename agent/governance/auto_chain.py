@@ -229,6 +229,51 @@ def _scope_materialization_waived_doc_debt_paths(metadata, proposed_graph_delta=
     return allowed
 
 
+_GRAPH_DELTA_PATH_FIELDS = (
+    "primary",
+    "secondary",
+    "test",
+    "tests",
+    "test_files",
+    "target_files",
+)
+
+
+def _iter_graph_delta_path_values(value):
+    if isinstance(value, str) and value.strip():
+        yield value.strip().replace("\\", "/")
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_graph_delta_path_values(item)
+
+
+def _scope_materialization_graph_delta_paths(metadata, proposed_graph_delta=None):
+    """Return paths explicitly materialized by a scope-materialization graph delta."""
+    if not _is_scope_materialization_task(metadata):
+        return set()
+    if not isinstance(proposed_graph_delta, dict):
+        return set()
+    graph_delta = proposed_graph_delta.get("graph_delta", proposed_graph_delta)
+    if not isinstance(graph_delta, dict):
+        return set()
+
+    paths = set()
+    for section in ("creates", "updates"):
+        entries = graph_delta.get(section)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            fields = entry.get("fields")
+            if isinstance(fields, dict):
+                for key in _GRAPH_DELTA_PATH_FIELDS:
+                    paths.update(_iter_graph_delta_path_values(fields.get(key)))
+            for key in _GRAPH_DELTA_PATH_FIELDS:
+                paths.update(_iter_graph_delta_path_values(entry.get(key)))
+    return paths
+
+
 def _project_workspace_root(project_id, metadata=None):
     cwd = Path.cwd()
     if (cwd / "agent" / "governance" / "auto_chain.py").exists():
@@ -5496,22 +5541,44 @@ def _gate_checkpoint(conn, project_id, result, metadata):
     if expected_docs:
         missing_docs = expected_docs - doc_files_changed
         if missing_docs:
-            if _should_defer_doc_gate_to_lane_c(conn, project_id, metadata):
-                log.warning(
-                    "checkpoint_gate: deferring doc updates to Lane C for governed reconciliation lane; missing docs=%s",
-                    sorted(missing_docs),
+            if _is_scope_materialization_task(metadata):
+                graph_delta = result.get("graph_delta") if isinstance(result.get("graph_delta"), dict) else {}
+                materialized_paths = (
+                    _scope_materialization_graph_delta_paths(metadata, graph_delta)
+                    | _scope_materialization_waived_doc_debt_paths(metadata, graph_delta)
                 )
-                return True, "doc updates deferred to Lane C"
-            # Block by default — skip_doc_check only allowed with bootstrap_reason
-            if metadata.get("skip_doc_check", False):
-                bootstrap_reason = metadata.get("bootstrap_reason", "")
-                if not bootstrap_reason:
-                    return False, (f"skip_doc_check=true requires bootstrap_reason in metadata. "
-                                   f"Missing docs: {sorted(missing_docs)}")
-                log.warning("checkpoint_gate: docs skipped (bootstrap: %s): %s",
-                            bootstrap_reason, sorted(missing_docs))
-            else:
-                return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files."
+                covered_docs = missing_docs & materialized_paths
+                if covered_docs:
+                    log.info(
+                        "checkpoint_gate: scope-materialization docs covered by graph_delta/doc_debt: %s",
+                        sorted(covered_docs),
+                    )
+                    missing_docs = missing_docs - covered_docs
+                    if not missing_docs:
+                        missing_docs = set()
+            if missing_docs:
+                if _should_defer_doc_gate_to_lane_c(conn, project_id, metadata):
+                    log.warning(
+                        "checkpoint_gate: deferring doc updates to Lane C for governed reconciliation lane; missing docs=%s",
+                        sorted(missing_docs),
+                    )
+                    return True, "doc updates deferred to Lane C"
+                # Block by default — skip_doc_check only allowed with bootstrap_reason
+                if metadata.get("skip_doc_check", False):
+                    bootstrap_reason = metadata.get("bootstrap_reason", "")
+                    if not bootstrap_reason:
+                        return False, (f"skip_doc_check=true requires bootstrap_reason in metadata. "
+                                       f"Missing docs: {sorted(missing_docs)}")
+                    log.warning("checkpoint_gate: docs skipped (bootstrap: %s): %s",
+                                bootstrap_reason, sorted(missing_docs))
+                else:
+                    if _is_scope_materialization_task(metadata):
+                        return False, (
+                            "Scope-materialization docs not materialized in graph_delta: "
+                            f"{sorted(missing_docs)}. Attach existing docs via graph_delta "
+                            "secondary/test fields or record an explicit doc_debt waiver."
+                        )
+                    return False, f"Related docs not updated: {sorted(missing_docs)}. Add them to changed_files."
     # 5c: Observation-mode graph doc check
     if graph_docs and _GRAPH_DOC_OBSERVATION_MODE:
         doc_files_in_changed = set(f for f in changed if f.startswith("docs/") or f.endswith(".md"))
