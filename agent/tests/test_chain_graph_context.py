@@ -4,6 +4,7 @@ from agent.governance.chain_graph_context import (
     build_reconcile_graph_preflight,
     get_graph_doc_associations,
     get_related_nodes,
+    resolve_context,
 )
 
 
@@ -99,3 +100,89 @@ def test_reconcile_context_ignores_none_sentinel_test_values(tmp_path):
 
     assert preflight["related_tests"] == []
     assert preflight["coverage"][0]["test_status"] == "missing"
+
+
+def test_active_context_prefers_graph_snapshot_store(tmp_path, monkeypatch):
+    from agent.governance.db import get_connection
+    from agent.governance.graph_snapshot_store import (
+        activate_graph_snapshot,
+        create_graph_snapshot,
+    )
+
+    project_id = "dual-read-project"
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "foo.md").write_text("# Foo\n", encoding="utf-8")
+
+    conn = get_connection(project_id)
+    try:
+        snapshot = create_graph_snapshot(
+            conn,
+            project_id,
+            snapshot_id="imported-abc1234-dual",
+            commit_sha="abc1234",
+            snapshot_kind="imported",
+            graph_json={
+                "deps_graph": _graph([
+                    {
+                        "id": "L7.1",
+                        "title": "Foo",
+                        "primary": ["agent/foo.py"],
+                        "secondary": ["docs/foo.md"],
+                    }
+                ])
+            },
+        )
+        activate_graph_snapshot(conn, project_id, snapshot["snapshot_id"])
+        conn.commit()
+    finally:
+        conn.close()
+
+    context = resolve_context(project_id)
+    assert context.mode == "active_snapshot"
+    assert context.source == "graph_snapshot_store"
+    assert context.snapshot_id == "imported-abc1234-dual"
+    assert context.commit_sha == "abc1234"
+
+    assert get_related_nodes(project_id, ["agent/foo.py"]) == ["L7.1"]
+    docs = get_graph_doc_associations(
+        project_id,
+        ["agent/foo.py"],
+        workspace_root=tmp_path,
+    )
+    assert docs == ["docs/foo.md"]
+
+
+def test_active_context_falls_back_to_legacy_graph_json(tmp_path, monkeypatch):
+    project_id = "legacy-project"
+    shared = tmp_path / "shared"
+    graph_dir = shared / "codex-tasks" / "state" / "governance" / project_id
+    graph_dir.mkdir(parents=True)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "bar.md").write_text("# Bar\n", encoding="utf-8")
+    (graph_dir / "graph.json").write_text(json.dumps({
+        "deps_graph": _graph([
+            {
+                "id": "L7.2",
+                "title": "Bar",
+                "primary": ["agent/bar.py"],
+                "secondary": ["docs/bar.md"],
+            }
+        ])
+    }), encoding="utf-8")
+    monkeypatch.setenv("SHARED_VOLUME_PATH", str(shared))
+    monkeypatch.setattr(
+        "agent.governance.chain_graph_context._active_snapshot_context",
+        lambda _project_id: None,
+    )
+
+    context = resolve_context(project_id)
+    assert context.mode == "active_legacy"
+    assert context.source == "legacy_graph_json"
+    assert get_related_nodes(project_id, ["agent/bar.py"]) == ["L7.2"]
+    docs = get_graph_doc_associations(
+        project_id,
+        ["agent/bar.py"],
+        workspace_root=tmp_path,
+    )
+    assert docs == ["docs/bar.md"]

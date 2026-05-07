@@ -23,6 +23,9 @@ class GraphContext:
     mode: str
     candidate_graph_path: str = ""
     overlay_path: str = ""
+    source: str = ""
+    snapshot_id: str = ""
+    commit_sha: str = ""
 
 
 def _workspace_root() -> Path:
@@ -205,6 +208,32 @@ def _has_explicit_overlay_path(metadata: dict[str, Any]) -> bool:
     return any(metadata.get(key) for key in ("overlay_path", "reconcile_overlay_path"))
 
 
+def _active_snapshot_context(project_id: str) -> GraphContext | None:
+    try:
+        from .db import get_connection
+        from .graph_snapshot_store import get_active_graph_snapshot, snapshot_graph_path
+
+        conn = get_connection(project_id)
+        try:
+            snapshot = get_active_graph_snapshot(conn, project_id)
+        finally:
+            conn.close()
+        if not snapshot:
+            return None
+        graph_path = snapshot_graph_path(project_id, snapshot["snapshot_id"])
+        if not graph_path.exists():
+            return None
+        return GraphContext(
+            mode="active_snapshot",
+            candidate_graph_path=str(graph_path),
+            source="graph_snapshot_store",
+            snapshot_id=str(snapshot["snapshot_id"]),
+            commit_sha=str(snapshot["commit_sha"]),
+        )
+    except Exception:
+        return None
+
+
 def _payload_candidate_nodes(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
     payload = metadata.get("cluster_payload") if isinstance(metadata.get("cluster_payload"), dict) else {}
     raw_nodes = payload.get("candidate_nodes") or payload.get("proposed_nodes") or []
@@ -228,8 +257,16 @@ def resolve_context(project_id: str, metadata: dict[str, Any] | None = None) -> 
             mode="reconcile_session",
             candidate_graph_path=_candidate_graph_path(metadata),
             overlay_path=_overlay_path(metadata),
+            source="reconcile_session",
         )
-    return GraphContext(mode="active", candidate_graph_path=str(_state_root(project_id) / "graph.json"))
+    active_snapshot = _active_snapshot_context(project_id)
+    if active_snapshot:
+        return active_snapshot
+    return GraphContext(
+        mode="active_legacy",
+        candidate_graph_path=str(_state_root(project_id) / "graph.json"),
+        source="legacy_graph_json",
+    )
 
 
 def load_reconcile_context_nodes(
@@ -275,6 +312,17 @@ def load_reconcile_context_nodes(
     return merged, candidate_doc, context
 
 
+def load_active_context_nodes(
+    project_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], GraphContext]:
+    context = resolve_context(project_id, metadata)
+    if context.mode == "reconcile_session":
+        return load_reconcile_context_nodes(project_id, metadata)
+    graph_doc = _load_json(context.candidate_graph_path) if context.candidate_graph_path else {}
+    return _graph_nodes(graph_doc), graph_doc, context
+
+
 def _path_exists(path: str, workspace_root: str | Path | None = None) -> bool:
     p = Path(path)
     if p.is_absolute():
@@ -295,9 +343,10 @@ def get_graph_doc_associations(
     workspace_root: str | Path | None = None,
 ) -> list[str]:
     """Return graph-linked docs for target files in the active graph context."""
-    if not is_reconcile_graph_context(metadata):
-        return []
-    nodes, _candidate_doc, _context = load_reconcile_context_nodes(project_id, metadata)
+    if is_reconcile_graph_context(metadata):
+        nodes, _candidate_doc, _context = load_reconcile_context_nodes(project_id, metadata)
+    else:
+        nodes, _candidate_doc, _context = load_active_context_nodes(project_id, metadata)
     target_set = {_normalize_path(path) for path in target_files or []}
     docs: set[str] = set()
     for node in nodes.values():
@@ -317,9 +366,10 @@ def get_related_nodes(
     metadata: dict[str, Any] | None = None,
 ) -> list[str]:
     """Return node ids whose primary files match the target files."""
-    if not is_reconcile_graph_context(metadata):
-        return []
-    nodes, _candidate_doc, _context = load_reconcile_context_nodes(project_id, metadata)
+    if is_reconcile_graph_context(metadata):
+        nodes, _candidate_doc, _context = load_reconcile_context_nodes(project_id, metadata)
+    else:
+        nodes, _candidate_doc, _context = load_active_context_nodes(project_id, metadata)
     target_set = {_normalize_path(path) for path in target_files or []}
     related = [
         nid for nid, node in nodes.items()

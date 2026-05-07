@@ -181,6 +181,14 @@ def _snapshot_root(project_id: str, snapshot_id: str) -> Path:
     return _governance_root() / project_id / "graph-snapshots" / snapshot_id
 
 
+def snapshot_companion_dir(project_id: str, snapshot_id: str) -> Path:
+    return _snapshot_root(project_id, snapshot_id)
+
+
+def snapshot_graph_path(project_id: str, snapshot_id: str) -> Path:
+    return snapshot_companion_dir(project_id, snapshot_id) / "graph.json"
+
+
 def write_companion_files(
     project_id: str,
     snapshot_id: str,
@@ -732,6 +740,8 @@ __all__ = [
     "queue_pending_scope_reconcile",
     "record_drift",
     "select_existing_graph_source",
+    "snapshot_companion_dir",
+    "snapshot_graph_path",
     "snapshot_id_for",
     "write_companion_files",
 ]
