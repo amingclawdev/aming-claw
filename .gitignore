@@ -159,6 +159,7 @@ phase_z_llm_cache/
 .recent-tasks.json
 .governance-cache/
 .observer-cache/
+.aming-claw/cache/
 
 # Generated dev docs (provenance tracked in backlog_bugs.provenance_paths)
 docs/dev/

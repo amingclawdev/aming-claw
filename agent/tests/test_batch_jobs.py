@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 
@@ -28,6 +29,38 @@ def _git_repo(tmp_path):
     subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
     return repo
+
+
+def _write_project_graph(repo, project_id="proj", files=None):
+    files = files or ["README.md"]
+    graph_dir = repo / "shared-volume" / "codex-tasks" / "state" / "governance" / project_id
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    graph = {
+        "version": "test",
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.1",
+                    "primary": [files[0]],
+                    "secondary": files[1:],
+                    "test": [],
+                }
+            ],
+            "links": [],
+        },
+    }
+    path = graph_dir / "graph.json"
+    path.write_text(json.dumps(graph), encoding="utf-8")
+    return path
+
+
+def _write_overlay_coverage(branch_graph: dict, files):
+    overlay_path = branch_graph["overlay_path"]
+    overlay = json.loads(open(overlay_path, encoding="utf-8").read())
+    overlay["covered_files"] = list(files)
+    with open(overlay_path, "w", encoding="utf-8") as f:
+        json.dump(overlay, f, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 def _metadata(conn, task_id: str) -> dict:
@@ -85,6 +118,7 @@ def test_batch_migration_strategy_uses_codex_batch_branch(tmp_path):
     assert strategy.work_branch == "codex/batch-batch-001"
     assert strategy.worktree_relpath == ".worktrees/batch-batch-001"
     assert strategy.direct is False
+    assert strategy.project_id == "proj"
 
 
 def test_manual_fix_strategy_is_direct_main(tmp_path):
@@ -126,6 +160,9 @@ def test_batch_metadata_round_trips_through_task_metadata(tmp_path):
     assert meta["batch_id"] == "batch-002"
     assert meta["batch_status"] == "created"
     assert meta["work_branch"] == "codex/batch-batch-002"
+    assert meta["branch_graph_required"] is True
+    assert meta["branch_graph"]["status"] == "planned"
+    assert meta["branch_graph"]["work_branch"] == "codex/batch-batch-002"
     assert meta["batch_state_history"][0]["status"] == "created"
 
 
@@ -208,6 +245,11 @@ def test_worktree_create_abandon_and_stale_report(tmp_path):
     out = batch_jobs.create_worktree(strategy, repo_root_path=repo)
     assert out["created"] is True
     assert (repo / ".worktrees" / "batch-batch-007").exists()
+    assert out["branch_graph"]["status"] == "ready"
+    assert out["branch_graph"]["base_graph_sha256"]
+    assert batch_jobs.branch_graph_plan(strategy)["overlay_path"] == out["branch_graph"]["overlay_path"]
+    assert os.path.exists(out["branch_graph"]["snapshot_path"])
+    assert os.path.exists(out["branch_graph"]["overlay_path"])
 
     stale = batch_jobs.report_stale_worktrees(conn, "proj", repo_root_path=repo)
     assert stale["stale_count"] == 0
@@ -223,6 +265,7 @@ def test_worktree_create_abandon_and_stale_report(tmp_path):
 
 def test_batch_merge_dry_run_records_ready_for_review(tmp_path):
     repo = _git_repo(tmp_path)
+    _write_project_graph(repo)
     conn = _conn()
     created = batch_jobs.create_batch_task(
         conn,
@@ -231,6 +274,14 @@ def test_batch_merge_dry_run_records_ready_for_review(tmp_path):
         repo_root_path=repo,
         batch_id="batch-008",
         base_commit=batch_jobs.git_commit(repo),
+    )
+    strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
+    worktree = batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    batch_jobs.record_task_batch_state(
+        conn,
+        created["task_id"],
+        "worktree_ready",
+        evidence={"worktree": worktree},
     )
 
     result = batch_jobs.merge_batch_branch(
@@ -242,9 +293,96 @@ def test_batch_merge_dry_run_records_ready_for_review(tmp_path):
 
     assert result["dry_run"] is True
     assert result["merge_plan"]["work_branch"] == "codex/batch-batch-008"
+    assert result["merge_plan"]["graph_gate"]["status"] == "pass"
     meta = _metadata(conn, created["task_id"])
     assert meta["batch_status"] == "ready_for_review"
     assert "merge_commit" not in meta
+
+
+def test_batch_merge_requires_branch_graph_metadata(tmp_path):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    created = batch_jobs.create_batch_task(
+        conn,
+        "proj",
+        "merge dry run",
+        repo_root_path=repo,
+        batch_id="batch-no-graph",
+        base_commit=batch_jobs.git_commit(repo),
+    )
+
+    with pytest.raises(batch_jobs.BatchJobError, match="branch graph gate failed"):
+        batch_jobs.merge_batch_branch(
+            conn,
+            created["task_id"],
+            repo_root_path=repo,
+            dry_run=True,
+        )
+
+
+def test_branch_graph_gate_rejects_uncovered_branch_files(tmp_path):
+    repo = _git_repo(tmp_path)
+    _write_project_graph(repo, files=["README.md"])
+    conn = _conn()
+    created = batch_jobs.create_batch_task(
+        conn,
+        "proj",
+        "merge real",
+        repo_root_path=repo,
+        batch_id="batch-uncovered",
+        base_commit=batch_jobs.git_commit(repo),
+    )
+    strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
+    worktree = batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    batch_jobs.record_task_batch_state(
+        conn,
+        created["task_id"],
+        "worktree_ready",
+        evidence={"worktree": worktree},
+    )
+    wt = repo / ".worktrees" / "batch-batch-uncovered"
+    (wt / "feature.txt").write_text("batch change\n", encoding="utf-8")
+    subprocess.run(["git", "add", "feature.txt"], cwd=wt, check=True)
+    subprocess.run(["git", "commit", "-m", "batch change"], cwd=wt, check=True, capture_output=True, text=True)
+
+    with pytest.raises(batch_jobs.BatchJobError, match="branch graph gate failed"):
+        batch_jobs.merge_batch_branch(
+            conn,
+            created["task_id"],
+            repo_root_path=repo,
+            dry_run=True,
+        )
+
+
+def test_branch_graph_gate_preserves_hidden_file_paths(tmp_path):
+    repo = _git_repo(tmp_path)
+    conn = _conn()
+    created = batch_jobs.create_batch_task(
+        conn,
+        "proj",
+        "merge hidden file",
+        repo_root_path=repo,
+        batch_id="batch-hidden-file",
+        base_commit=batch_jobs.git_commit(repo),
+    )
+    strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
+    worktree = batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    batch_jobs.record_task_batch_state(
+        conn,
+        created["task_id"],
+        "worktree_ready",
+        evidence={"worktree": worktree},
+    )
+    _write_overlay_coverage(worktree["branch_graph"], [".env.example"])
+    wt = repo / ".worktrees" / "batch-batch-hidden-file"
+    (wt / ".env.example").write_text("KEY=value\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".env.example"], cwd=wt, check=True)
+    subprocess.run(["git", "commit", "-m", "hidden file"], cwd=wt, check=True, capture_output=True, text=True)
+
+    plan = batch_jobs.batch_merge_plan(conn, created["task_id"], repo_root_path=repo)
+
+    assert ".env.example" in plan["graph_gate"]["changed_files"]
+    assert ".env.example" in plan["graph_gate"]["overlay_covered_files"]
 
 
 def test_batch_merge_uses_chain_trailer_helper(tmp_path):
@@ -260,7 +398,14 @@ def test_batch_merge_uses_chain_trailer_helper(tmp_path):
         metadata={"bug_id": "OPT-BATCH-009"},
     )
     strategy = batch_jobs.BranchStrategy(**created["branch_strategy"])
-    batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    worktree = batch_jobs.create_worktree(strategy, repo_root_path=repo)
+    batch_jobs.record_task_batch_state(
+        conn,
+        created["task_id"],
+        "worktree_ready",
+        evidence={"worktree": worktree},
+    )
+    _write_overlay_coverage(worktree["branch_graph"], ["feature.txt"])
 
     wt = repo / ".worktrees" / "batch-batch-009"
     (wt / "feature.txt").write_text("batch change\n", encoding="utf-8")
