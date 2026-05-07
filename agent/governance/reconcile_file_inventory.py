@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
@@ -60,6 +61,11 @@ class FileInventoryRow:
     language: str
     sha256: str
     scan_status: str
+    file_hash: str = ""
+    size_bytes: int = 0
+    last_scanned_commit: str = ""
+    graph_status: str = ""
+    mapped_node_ids: list[str] = field(default_factory=list)
     cluster_id: str = ""
     candidate_node_id: str = ""
     attached_to: str = ""
@@ -96,6 +102,19 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _file_hash(sha256: str) -> str:
+    return f"sha256:{sha256}" if sha256 else ""
+
+
+def _file_facts(path: Path) -> tuple[str, str, int]:
+    digest = _sha256(path)
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        size_bytes = 0
+    return digest, _file_hash(digest), size_bytes
 
 
 def _language_for(path: str, kind: str) -> str:
@@ -204,16 +223,27 @@ def _cluster_indexes(
     project_root: str,
     nodes: List[dict[str, Any]],
     feature_clusters: List[dict[str, Any]],
-) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, str], dict[str, list[str]]]:
     primary_to_cluster: dict[str, str] = {}
     secondary_to_cluster: dict[str, str] = {}
-    primary_to_node: dict[str, str] = {}
+    path_to_nodes: dict[str, set[str]] = {}
 
     for node in nodes or []:
-        rel = normalize_relpath(project_root, node.get("primary_file"))
         node_id = str(node.get("node_id") or node.get("id") or "")
-        if rel and node_id:
-            primary_to_node[rel] = node_id
+        if not node_id:
+            continue
+        raw_paths: list[Any] = []
+        if node.get("primary_file"):
+            raw_paths.append(node.get("primary_file"))
+        for key in ("primary", "secondary", "test", "tests", "test_files"):
+            value = node.get(key) or []
+            if isinstance(value, str):
+                value = [value]
+            raw_paths.extend(value)
+        for raw_path in raw_paths:
+            rel = normalize_relpath(project_root, raw_path)
+            if rel:
+                path_to_nodes.setdefault(rel, set()).add(node_id)
 
     for cluster in feature_clusters or []:
         cluster_id = str(cluster.get("cluster_fingerprint") or cluster.get("cluster_id") or "")
@@ -225,7 +255,11 @@ def _cluster_indexes(
             rel = normalize_relpath(project_root, path)
             if rel:
                 secondary_to_cluster.setdefault(rel, cluster_id)
-    return primary_to_cluster, secondary_to_cluster, primary_to_node
+    return (
+        primary_to_cluster,
+        secondary_to_cluster,
+        {path: sorted(node_ids) for path, node_ids in path_to_nodes.items()},
+    )
 
 
 def build_file_inventory(
@@ -235,13 +269,14 @@ def build_file_inventory(
     nodes: Optional[List[dict[str, Any]]] = None,
     feature_clusters: Optional[List[dict[str, Any]]] = None,
     profile: Optional[ProjectProfile] = None,
+    last_scanned_commit: str = "",
 ) -> List[dict[str, Any]]:
     """Build an auditable inventory for every non-excluded project file."""
     if profile is None:
         profile = discover_project_profile(project_root)
     nodes = nodes or []
     feature_clusters = feature_clusters or []
-    primary_to_cluster, secondary_to_cluster, primary_to_node = _cluster_indexes(
+    primary_to_cluster, secondary_to_cluster, path_to_nodes = _cluster_indexes(
         project_root,
         nodes,
         feature_clusters,
@@ -256,38 +291,48 @@ def build_file_inventory(
         attached_to = ""
         reason = ""
         decision = "pending"
+        graph_status = "pending_decision"
+        mapped_node_ids = path_to_nodes.get(rel, [])
 
         if rel in primary_to_cluster:
             scan_status = "clustered"
             cluster_id = primary_to_cluster[rel]
-            candidate_node_id = primary_to_node.get(rel, "")
+            candidate_node_id = mapped_node_ids[0] if mapped_node_ids else ""
             attached_to = candidate_node_id or cluster_id
             decision = "govern"
+            graph_status = "mapped"
             reason = "primary source covered by symbol cluster"
         elif rel in secondary_to_cluster:
             scan_status = "secondary_attached"
             cluster_id = secondary_to_cluster[rel]
-            attached_to = cluster_id
+            candidate_node_id = mapped_node_ids[0] if mapped_node_ids else ""
+            attached_to = candidate_node_id or cluster_id
             decision = "attach_to_node"
+            graph_status = "attached"
             reason = "attached as test/doc consumer evidence"
         elif kind == "test" and is_test_support_path(rel):
             scan_status = "support"
             decision = "keep"
+            graph_status = "support"
             reason = "test support file; audited as non-feature-specific support"
         elif kind in {"doc", "index_doc"} and is_archive_doc_path(rel):
             scan_status = "archive"
             decision = "keep"
+            graph_status = "archive"
             reason = "historical or operator archive doc; audited as nonblocking"
         elif kind == "index_doc":
             scan_status = "index_asset"
             decision = "attach_to_index_wrapper"
+            graph_status = "index_asset"
             reason = "index/navigation documentation; attach to project feature index"
         elif kind in {"source", "test", "doc"}:
             scan_status = "orphan"
+            graph_status = "unmapped"
             reason = f"{kind} file not attached to any feature cluster"
         elif kind == "generated":
             scan_status = "ignored"
             decision = "ignore"
+            graph_status = "ignored"
             reason = "generated or lock artifact"
         else:
             scan_status = "pending_decision"
@@ -295,10 +340,13 @@ def build_file_inventory(
 
         abs_path = Path(project_root) / rel
         try:
-            digest = _sha256(abs_path)
+            digest, file_hash, size_bytes = _file_facts(abs_path)
         except OSError:
             digest = ""
+            file_hash = ""
+            size_bytes = 0
             scan_status = "error"
+            graph_status = "error"
             reason = "file could not be read"
 
         rows.append(FileInventoryRow(
@@ -307,6 +355,11 @@ def build_file_inventory(
             file_kind=kind,
             language=_language_for(rel, kind),
             sha256=digest,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            last_scanned_commit=last_scanned_commit,
+            graph_status=graph_status,
+            mapped_node_ids=mapped_node_ids,
             scan_status=scan_status,
             cluster_id=cluster_id,
             candidate_node_id=candidate_node_id,
@@ -384,17 +437,28 @@ def upsert_file_inventory(
                 )
     count = 0
     for row in materialized_rows:
+        mapped_node_ids = row.get("mapped_node_ids", [])
+        if isinstance(mapped_node_ids, str):
+            mapped_node_ids_raw = mapped_node_ids
+        else:
+            mapped_node_ids_raw = json.dumps(mapped_node_ids or [], ensure_ascii=False)
         conn.execute(
             """
             INSERT INTO reconcile_file_inventory
               (project_id, run_id, path, file_kind, language, sha256,
+               file_hash, size_bytes, last_scanned_commit, graph_status, mapped_node_ids,
                scan_status, cluster_id, candidate_node_id, attached_to,
                reason, decision, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, run_id, path) DO UPDATE SET
               file_kind = excluded.file_kind,
               language = excluded.language,
               sha256 = excluded.sha256,
+              file_hash = excluded.file_hash,
+              size_bytes = excluded.size_bytes,
+              last_scanned_commit = excluded.last_scanned_commit,
+              graph_status = excluded.graph_status,
+              mapped_node_ids = excluded.mapped_node_ids,
               scan_status = excluded.scan_status,
               cluster_id = excluded.cluster_id,
               candidate_node_id = excluded.candidate_node_id,
@@ -410,6 +474,11 @@ def upsert_file_inventory(
                 row.get("file_kind", ""),
                 row.get("language", ""),
                 row.get("sha256", ""),
+                row.get("file_hash") or _file_hash(str(row.get("sha256") or "")),
+                int(row.get("size_bytes") or 0),
+                row.get("last_scanned_commit", ""),
+                row.get("graph_status", ""),
+                mapped_node_ids_raw,
                 row.get("scan_status", ""),
                 row.get("cluster_id", ""),
                 row.get("candidate_node_id", ""),
@@ -461,8 +530,9 @@ def query_file_inventory(
     rows = conn.execute(
         f"""
         SELECT run_id, path, file_kind, language, sha256, scan_status,
-               cluster_id, candidate_node_id, attached_to, reason, decision,
-               updated_at
+               file_hash, size_bytes, last_scanned_commit, graph_status,
+               mapped_node_ids, cluster_id, candidate_node_id, attached_to,
+               reason, decision, updated_at
         FROM reconcile_file_inventory
         WHERE {' AND '.join(where)}
         ORDER BY scan_status, file_kind, path
@@ -473,8 +543,9 @@ def query_file_inventory(
     all_rows = conn.execute(
         """
         SELECT run_id, path, file_kind, language, sha256, scan_status,
-               cluster_id, candidate_node_id, attached_to, reason, decision,
-               updated_at
+               file_hash, size_bytes, last_scanned_commit, graph_status,
+               mapped_node_ids, cluster_id, candidate_node_id, attached_to,
+               reason, decision, updated_at
         FROM reconcile_file_inventory
         WHERE project_id = ? AND run_id = ?
         """,
@@ -482,10 +553,21 @@ def query_file_inventory(
     ).fetchall()
     return {
         "run_id": run_id,
-        "rows": [dict(row) for row in rows],
-        "summary": summarize_file_inventory(dict(row) for row in all_rows),
+        "rows": [_decode_inventory_row(dict(row)) for row in rows],
+        "summary": summarize_file_inventory(_decode_inventory_row(dict(row)) for row in all_rows),
         "limit": safe_limit,
     }
+
+
+def _decode_inventory_row(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("mapped_node_ids")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            row["mapped_node_ids"] = parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            row["mapped_node_ids"] = []
+    return row
 
 
 __all__ = [
