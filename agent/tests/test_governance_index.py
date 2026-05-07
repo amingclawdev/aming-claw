@@ -139,7 +139,14 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     doc_index = index["doc_index"]
     readme = next(item for item in doc_index["documents"] if item["path"] == "README.md")
     assert readme["headings"][0]["title"] == "Demo App"
+    feature_index = index["feature_index"]
+    feature = next(item for item in feature_index["features"] if item["node_id"] == "L7.service")
+    assert feature["feature_hash"].startswith("sha256:")
+    assert feature["symbol_refs"][0]["id"].endswith("::calculate_total")
+    assert feature["symbol_refs"][0]["line_start"] == 1
+    assert feature["doc_refs"][0]["path"] in {"README.md", "docs/usage.md"}
     assert index["coverage_state"]["active_snapshot_id"] == "imported-abc1234-index"
+    assert index["coverage_state"]["feature_count"] == 1
     assert index["coverage_state"]["file_states"]["src/demo_app/service.py"]["file_hash"]
     assert "confidence" not in json.dumps(index, ensure_ascii=False)
 
@@ -151,6 +158,7 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     )
 
     assert summary["inventory_rows_persisted"] == len(index["file_inventory"])
+    assert summary["feature_count"] == 1
     for path in summary["artifacts"].values():
         assert Path(path).exists()
 
@@ -163,3 +171,44 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     ).fetchone()
     assert persisted["scan_status"] == "secondary_attached"
     assert persisted["file_hash"].startswith("sha256:")
+
+
+def test_build_governance_index_can_use_candidate_graph_before_activation(conn, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_project(project)
+    candidate_graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.candidate",
+                    "layer": "L7",
+                    "title": "Candidate Service",
+                    "kind": "feature",
+                    "primary": ["src/demo_app/service.py"],
+                    "secondary": ["README.md"],
+                    "test": ["tests/test_service.py"],
+                    "metadata": {"subsystem": "candidate"},
+                }
+            ],
+            "edges": [],
+        }
+    }
+
+    index = build_governance_index(
+        conn,
+        PID,
+        project,
+        run_id="index-candidate-test",
+        commit_sha="def5678",
+        candidate_graph=candidate_graph,
+        snapshot_id="full-def5678-candidate",
+        snapshot_kind="full",
+    )
+
+    assert index["index_scope"] == "candidate_snapshot"
+    assert index["active_snapshot"]["snapshot_id"] == "full-def5678-candidate"
+    assert index["coverage_state"]["active_snapshot_id"] == "full-def5678-candidate"
+    rows = {row["path"]: row for row in index["file_inventory"]}
+    assert rows["src/demo_app/service.py"]["mapped_node_ids"] == ["L7.candidate"]
+    assert index["feature_index"]["features"][0]["node_id"] == "L7.candidate"

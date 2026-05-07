@@ -26,11 +26,13 @@ from agent.governance.graph_snapshot_store import (
     graph_payload_edges,
     graph_payload_stats,
     index_graph_snapshot,
+    list_graph_snapshot_files,
     list_pending_scope_reconcile,
     snapshot_graph_path,
     snapshot_id_for,
     waive_pending_scope_reconcile,
 )
+from agent.governance.governance_index import build_and_persist_governance_index
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
@@ -63,6 +65,29 @@ def _governance_state_dir(project_id: str, run_id: str) -> Path:
     return _governance_root() / project_id / "state-reconcile" / run_id
 
 
+def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str) -> list[str]:
+    base = str(base_ref or "").strip()
+    target = str(target_ref or "").strip()
+    if not base or not target or base == target:
+        return []
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "diff", "--name-only", f"{base}..{target}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return []
+    return sorted({
+        line.replace("\\", "/").strip("/")
+        for line in (result.stdout or "").splitlines()
+        if line.strip()
+    })
+
+
 def _deps_graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
     deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
     nodes = deps.get("nodes") if isinstance(deps, dict) else []
@@ -87,6 +112,90 @@ def _normalize_inventory_commit(
             item["file_hash"] = f"sha256:{item['sha256']}"
         out.append(item)
     return out
+
+
+def _rows_by_path(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        path = str(row.get("path") or "").replace("\\", "/").strip("/")
+        if path:
+            out[path] = row
+    return out
+
+
+def _snapshot_inventory_rows(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> list[dict[str, Any]]:
+    if not snapshot_id:
+        return []
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    page_size = 1000
+    while True:
+        try:
+            payload = list_graph_snapshot_files(
+                conn,
+                project_id,
+                snapshot_id,
+                limit=page_size,
+                offset=offset,
+            )
+        except Exception:
+            return rows
+        page = [dict(row) for row in payload.get("files") or [] if isinstance(row, dict)]
+        rows.extend(page)
+        filtered_count = int(payload.get("filtered_count") or payload.get("total_count") or 0)
+        offset += len(page)
+        if not page or offset >= filtered_count:
+            return rows
+
+
+def _row_file_hash(row: dict[str, Any]) -> str:
+    value = str(row.get("file_hash") or "").strip()
+    if value:
+        return value
+    sha = str(row.get("sha256") or "").strip()
+    return f"sha256:{sha}" if sha else ""
+
+
+def _build_scope_file_delta(
+    *,
+    old_rows: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+    changed_files: list[str],
+) -> dict[str, Any]:
+    old_by_path = _rows_by_path(old_rows)
+    new_by_path = _rows_by_path(new_rows)
+    old_paths = set(old_by_path)
+    new_paths = set(new_by_path)
+    added = sorted(new_paths - old_paths)
+    removed = sorted(old_paths - new_paths)
+    hash_changed = sorted(
+        path for path in (old_paths & new_paths)
+        if _row_file_hash(old_by_path[path]) != _row_file_hash(new_by_path[path])
+    )
+    status_changed = sorted(
+        path for path in (old_paths & new_paths)
+        if str(old_by_path[path].get("graph_status") or "")
+        != str(new_by_path[path].get("graph_status") or "")
+        or str(old_by_path[path].get("scan_status") or "")
+        != str(new_by_path[path].get("scan_status") or "")
+    )
+    changed = sorted({path.replace("\\", "/").strip("/") for path in changed_files if path})
+    impacted = sorted(set(changed) | set(added) | set(removed) | set(hash_changed) | set(status_changed))
+    return {
+        "strategy": "full_scan_with_incremental_file_delta",
+        "changed_files": changed,
+        "added_files": added,
+        "removed_files": removed,
+        "hash_changed_files": hash_changed,
+        "status_changed_files": status_changed,
+        "impacted_files": impacted,
+        "changed_file_count": len(changed),
+        "impacted_file_count": len(impacted),
+    }
 
 
 def run_state_only_full_reconcile(
@@ -179,6 +288,24 @@ def run_state_only_full_reconcile(
         nodes=nodes,
         edges=edges,
     )
+    governance_index = build_and_persist_governance_index(
+        conn,
+        project_id,
+        root,
+        run_id=rid,
+        commit_sha=commit,
+        candidate_graph=candidate_graph,
+        snapshot_id=sid,
+        snapshot_kind=snapshot_kind,
+        file_inventory=file_inventory,
+        persist_inventory=True,
+    )
+    governance_index_summary = governance_index.get("persist_summary") or {}
+    notes["governance_index"] = governance_index_summary
+    conn.execute(
+        "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+        (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+    )
     activation = None
     if activate:
         activation = activate_graph_snapshot(
@@ -198,6 +325,7 @@ def run_state_only_full_reconcile(
         "phase_report_path": phase_result.get("report_path") or "",
         "graph_stats": graph_payload_stats(candidate_graph),
         "index_counts": index_counts,
+        "governance_index": governance_index_summary,
         "file_inventory_count": len(file_inventory),
         "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
@@ -313,6 +441,12 @@ def run_pending_scope_reconcile_candidate(
         }
 
     active = get_active_graph_snapshot(conn, project_id) or {}
+    active_inventory = _snapshot_inventory_rows(conn, project_id, active.get("snapshot_id", ""))
+    changed_files = _git_changed_files(
+        root,
+        str(active.get("commit_sha") or ""),
+        target,
+    )
     rid = run_id or f"scope-reconcile-{_short_commit(target)}-pending"
     sid = snapshot_id or snapshot_id_for("scope", target)
     result = run_state_only_full_reconcile(
@@ -348,12 +482,39 @@ def run_pending_scope_reconcile_candidate(
         target_commit_sha=target,
         run_id=rid,
     )
+    scope_file_delta = _build_scope_file_delta(
+        old_rows=active_inventory,
+        new_rows=_snapshot_inventory_rows(conn, project_id, sid),
+        changed_files=changed_files,
+    )
+    pending_notes = {
+        "covered_commit_shas": covered,
+        "covered_commit_count": len(covered),
+        "active_snapshot_id": active.get("snapshot_id", ""),
+        "active_graph_commit": active.get("commit_sha", ""),
+        "scope_file_delta": scope_file_delta,
+    }
+    row = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, sid),
+    ).fetchone()
+    if row:
+        try:
+            notes = json.loads(row["notes"] if hasattr(row, "keys") else row[0])
+        except Exception:
+            notes = {}
+        notes["pending_scope_reconcile"] = pending_notes
+        conn.execute(
+            "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+            (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+        )
     return {
         **result,
         "pending_count": len(pending),
         "covered_commit_shas": covered,
         "covered_pending_count": len(covered),
         "pending_rows_bound": updated,
+        "scope_file_delta": scope_file_delta,
         "active_snapshot_id": active.get("snapshot_id", ""),
         "active_graph_commit": active.get("commit_sha", ""),
     }

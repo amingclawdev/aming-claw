@@ -1069,6 +1069,19 @@ def _cluster_fingerprint(entries: List[str], primary_files: List[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _cluster_feature_hash(cluster_payload: Dict[str, Any]) -> str:
+    payload = {
+        "entries": sorted(cluster_payload.get("entries") or []),
+        "primary_files": sorted(cluster_payload.get("primary_files") or []),
+        "secondary_files": sorted(cluster_payload.get("secondary_files") or []),
+        "functions": sorted(cluster_payload.get("functions") or []),
+        "modules": sorted(cluster_payload.get("modules") or []),
+        "synthesis": cluster_payload.get("synthesis") or {},
+    }
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
+
+
 def _cluster_file_cap() -> int:
     try:
         from agent.governance.reconcile_config import RECONCILE_FEATURE_CLUSTER_FILE_CAP
@@ -1563,7 +1576,7 @@ def _fallback_feature_clusters(fallback_nodes: List[Dict[str, Any]]) -> List[Dic
 def _fallback_cluster_from_nodes(package_key: str, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
     primary_files = sorted({str(node.get("primary_file") or "") for node in nodes if node.get("primary_file")})
     entries = [f"filetree::{path}" for path in primary_files]
-    return {
+    cluster = {
         "cluster_fingerprint": _cluster_fingerprint(entries, primary_files),
         "entries": entries,
         "primary_files": primary_files,
@@ -1585,6 +1598,8 @@ def _fallback_cluster_from_nodes(package_key: str, nodes: List[Dict[str, Any]]) 
             "file_cap": _cluster_file_cap(),
         },
     }
+    cluster["feature_hash"] = _cluster_feature_hash(cluster)
+    return cluster
 
 
 def _area_key(module_name: str) -> str:
@@ -1975,7 +1990,7 @@ def synthesize_feature_clusters(
         functions = sorted({fn for branch in chunk for fn in branch.get("functions", [])})
         modules_in_cluster = sorted({mod for branch in chunk for mod in branch.get("modules", [])})
         decorators = sorted({dec for branch in chunk for dec in branch.get("decorators", [])})
-        clusters.append({
+        cluster = {
             "cluster_fingerprint": _cluster_fingerprint(entries, primary_files),
             "entries": entries,
             "primary_files": primary_files,
@@ -1992,7 +2007,9 @@ def synthesize_feature_clusters(
                 "module_count": len(modules_in_cluster),
                 "file_cap": cap,
             },
-        })
+        }
+        cluster["feature_hash"] = _cluster_feature_hash(cluster)
+        clusters.append(cluster)
 
     for package_key, package_branches in sorted(buckets.items()):
         current: List[Dict[str, Any]] = []

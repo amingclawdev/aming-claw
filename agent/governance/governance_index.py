@@ -8,6 +8,7 @@ optionally persists those artifacts as governance state.
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import subprocess
 import uuid
@@ -43,6 +44,11 @@ def _utc_now() -> str:
 
 def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _hash_payload(payload: Any) -> str:
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -158,6 +164,127 @@ def _candidate_graph_from_nodes(nodes: Iterable[dict[str, Any]]) -> dict[str, An
     return {"deps_graph": {"nodes": list(nodes), "edges": []}}
 
 
+def _nodes_from_candidate_graph(candidate_graph: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(candidate_graph, dict):
+        return []
+    deps = candidate_graph.get("deps_graph")
+    if not isinstance(deps, dict):
+        return []
+    nodes = deps.get("nodes") or []
+    return [dict(node) for node in nodes if isinstance(node, dict)]
+
+
+def _path_list(node: dict[str, Any], *keys: str) -> list[str]:
+    values: list[str] = []
+    for key in keys:
+        raw = node.get(key)
+        if isinstance(raw, list):
+            values.extend(str(item or "") for item in raw)
+        elif isinstance(raw, str) and raw:
+            values.append(raw)
+    out = []
+    for value in values:
+        norm = value.replace("\\", "/").strip("/")
+        if norm:
+            out.append(norm)
+    return sorted(set(out))
+
+
+def build_feature_index(
+    *,
+    nodes: Iterable[dict[str, Any]],
+    file_inventory: list[dict[str, Any]],
+    symbol_index: dict[str, Any],
+    doc_index: dict[str, Any],
+    commit_sha: str,
+    snapshot_id: str = "",
+) -> dict[str, Any]:
+    """Build stable feature-to-file/symbol/doc/test bindings.
+
+    This is a derived governance index.  It does not assert that semantic
+    ownership is perfect; it records the graph's current feature bindings plus
+    hashes/locations so drift and prompt context can be computed cheaply.
+    """
+    file_hashes = {
+        str(row.get("path") or "").replace("\\", "/").strip("/"): str(
+            row.get("file_hash") or (f"sha256:{row.get('sha256')}" if row.get("sha256") else "")
+        )
+        for row in file_inventory
+        if row.get("path")
+    }
+    symbols_by_path: dict[str, list[dict[str, Any]]] = {}
+    for symbol in (symbol_index.get("symbols") or []):
+        if not isinstance(symbol, dict):
+            continue
+        path = str(symbol.get("path") or "").replace("\\", "/").strip("/")
+        if path:
+            symbols_by_path.setdefault(path, []).append(symbol)
+    docs_by_path: dict[str, dict[str, Any]] = {}
+    for doc in (doc_index.get("documents") or []):
+        if not isinstance(doc, dict):
+            continue
+        path = str(doc.get("path") or "").replace("\\", "/").strip("/")
+        if path:
+            docs_by_path[path] = doc
+
+    features: list[dict[str, Any]] = []
+    for node in nodes:
+        node_id = str(node.get("id") or node.get("node_id") or "")
+        if not node_id:
+            continue
+        primary = _path_list(node, "primary", "primary_files")
+        secondary = _path_list(node, "secondary", "secondary_files")
+        tests = _path_list(node, "test", "test_files")
+        if not (primary or secondary or tests):
+            continue
+        symbol_refs = []
+        for path in primary:
+            for symbol in symbols_by_path.get(path, []):
+                symbol_refs.append({
+                    "id": symbol.get("id") or "",
+                    "kind": symbol.get("kind") or "",
+                    "path": path,
+                    "line_start": symbol.get("line_start", 0),
+                    "line_end": symbol.get("line_end", 0),
+                })
+        doc_refs = []
+        for path in secondary:
+            doc = docs_by_path.get(path)
+            if not doc:
+                continue
+            doc_refs.append({
+                "path": path,
+                "heading_count": len(doc.get("headings") or []),
+                "headings": doc.get("headings") or [],
+            })
+        payload = {
+            "node_id": node_id,
+            "title": node.get("title") or "",
+            "layer": node.get("layer") or "",
+            "primary": primary,
+            "secondary": secondary,
+            "test": tests,
+            "file_hashes": {path: file_hashes.get(path, "") for path in primary + secondary + tests},
+            "symbol_ids": [ref["id"] for ref in symbol_refs],
+            "doc_paths": [ref["path"] for ref in doc_refs],
+        }
+        features.append({
+            **payload,
+            "feature_hash": _hash_payload(payload),
+            "symbol_refs": symbol_refs,
+            "doc_refs": doc_refs,
+        })
+
+    return {
+        "generated_at": _utc_now(),
+        "schema_version": GOVERNANCE_INDEX_SCHEMA_VERSION,
+        "snapshot_id": snapshot_id,
+        "commit_sha": commit_sha,
+        "feature_count": len(features),
+        "features": sorted(features, key=lambda item: str(item.get("node_id") or "")),
+    }
+
+
 def build_governance_index(
     conn: sqlite3.Connection,
     project_id: str,
@@ -167,6 +294,10 @@ def build_governance_index(
     commit_sha: str = "",
     profile: ProjectProfile | None = None,
     include_active_graph: bool = True,
+    candidate_graph: dict[str, Any] | None = None,
+    snapshot_id: str = "",
+    snapshot_kind: str = "",
+    file_inventory: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a governance index without mutating project source files."""
     ensure_graph_snapshot_schema(conn)
@@ -175,18 +306,33 @@ def build_governance_index(
     rid = run_id or _make_run_id(commit)
     profile = profile or discover_project_profile(str(root))
 
-    active_snapshot: dict[str, Any] | None = None
-    active_nodes: list[dict[str, Any]] = []
-    if include_active_graph:
-        active_snapshot, active_nodes = load_active_snapshot_nodes(conn, project_id)
+    source_snapshot: dict[str, Any] | None = None
+    source_nodes: list[dict[str, Any]] = []
+    index_scope = "no_graph"
+    candidate_nodes = _nodes_from_candidate_graph(candidate_graph)
+    if candidate_nodes:
+        source_nodes = candidate_nodes
+        source_snapshot = {
+            "snapshot_id": snapshot_id,
+            "commit_sha": commit,
+            "snapshot_kind": snapshot_kind or "candidate",
+            "candidate": True,
+        }
+        index_scope = "candidate_snapshot"
+    elif include_active_graph:
+        source_snapshot, source_nodes = load_active_snapshot_nodes(conn, project_id)
+        index_scope = "active_snapshot" if source_snapshot else "no_graph"
 
-    file_inventory = build_file_inventory(
-        project_root=str(root),
-        run_id=rid,
-        nodes=active_nodes,
-        profile=profile,
-        last_scanned_commit=commit,
-    )
+    if file_inventory is None:
+        file_inventory = build_file_inventory(
+            project_root=str(root),
+            run_id=rid,
+            nodes=source_nodes,
+            profile=profile,
+            last_scanned_commit=commit,
+        )
+    else:
+        file_inventory = [dict(row) for row in file_inventory if isinstance(row, dict)]
     symbol_index = build_symbol_index(
         project_root=root,
         file_inventory=file_inventory,
@@ -194,17 +340,27 @@ def build_governance_index(
     )
     doc_index = build_doc_index(project_root=root, file_inventory=file_inventory)
     coverage_state = build_coverage_state(
-        candidate_graph=_candidate_graph_from_nodes(active_nodes),
+        candidate_graph=candidate_graph or _candidate_graph_from_nodes(source_nodes),
         file_inventory=file_inventory,
     )
+    feature_index = build_feature_index(
+        nodes=source_nodes,
+        file_inventory=file_inventory,
+        symbol_index=symbol_index,
+        doc_index=doc_index,
+        commit_sha=commit,
+        snapshot_id=snapshot_id or (source_snapshot or {}).get("snapshot_id", ""),
+    )
     coverage_state.update({
-        "active_snapshot_id": active_snapshot.get("snapshot_id") if active_snapshot else "",
-        "active_graph_commit": active_snapshot.get("commit_sha") if active_snapshot else "",
+        "active_snapshot_id": source_snapshot.get("snapshot_id") if source_snapshot else "",
+        "active_graph_commit": source_snapshot.get("commit_sha") if source_snapshot else "",
+        "index_scope": index_scope,
         "commit_sha": commit,
         "run_id": rid,
         "schema_version": GOVERNANCE_INDEX_SCHEMA_VERSION,
         "symbol_count": symbol_index.get("symbol_count", 0),
         "doc_heading_count": doc_index.get("heading_count", 0),
+        "feature_count": feature_index.get("feature_count", 0),
     })
 
     return {
@@ -214,13 +370,15 @@ def build_governance_index(
         "commit_sha": commit,
         "generated_at": _utc_now(),
         "project_root": str(root),
-        "active_snapshot": dict(active_snapshot) if active_snapshot else {},
-        "active_node_count": len(active_nodes),
+        "active_snapshot": dict(source_snapshot) if source_snapshot else {},
+        "active_node_count": len(source_nodes),
+        "index_scope": index_scope,
         "profile": asdict(profile),
         "file_inventory": file_inventory,
         "file_inventory_summary": summarize_file_inventory(file_inventory),
         "symbol_index": symbol_index,
         "doc_index": doc_index,
+        "feature_index": feature_index,
         "coverage_state": coverage_state,
     }
 
@@ -256,6 +414,7 @@ def persist_governance_index(
         "file_inventory_path": base / "file-inventory.json",
         "symbol_index_path": base / "symbol-index.json",
         "doc_index_path": base / "doc-index.json",
+        "feature_index_path": base / "feature-index.json",
         "coverage_state_path": base / "coverage-state.json",
         "summary_path": base / "summary.json",
     }
@@ -263,6 +422,7 @@ def persist_governance_index(
     _write_json(artifacts["file_inventory_path"], index.get("file_inventory") or [])
     _write_json(artifacts["symbol_index_path"], index.get("symbol_index") or {})
     _write_json(artifacts["doc_index_path"], index.get("doc_index") or {})
+    _write_json(artifacts["feature_index_path"], index.get("feature_index") or {})
     _write_json(artifacts["coverage_state_path"], index.get("coverage_state") or {})
 
     inventory_count = 0
@@ -282,9 +442,11 @@ def persist_governance_index(
         "active_snapshot_id": (index.get("active_snapshot") or {}).get("snapshot_id", ""),
         "active_graph_commit": (index.get("active_snapshot") or {}).get("commit_sha", ""),
         "active_node_count": index.get("active_node_count", 0),
+        "index_scope": index.get("index_scope", ""),
         "file_inventory_summary": index.get("file_inventory_summary") or {},
         "symbol_count": (index.get("symbol_index") or {}).get("symbol_count", 0),
         "doc_heading_count": (index.get("doc_index") or {}).get("heading_count", 0),
+        "feature_count": (index.get("feature_index") or {}).get("feature_count", 0),
         "inventory_rows_persisted": inventory_count,
         "artifacts": {name: str(path) for name, path in artifacts.items()},
         "generated_at": _utc_now(),
@@ -315,6 +477,7 @@ def build_and_persist_governance_index(
 
 __all__ = [
     "GOVERNANCE_INDEX_SCHEMA_VERSION",
+    "build_feature_index",
     "build_and_persist_governance_index",
     "build_governance_index",
     "governance_index_artifact_dir",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,23 @@ def _write(path: Path, text: str) -> None:
 
 def _file_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return (result.stdout or "").strip()
+
+
+def _init_git(repo: Path) -> None:
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test User")
 
 
 def _write_project(root: Path) -> list[Path]:
@@ -83,6 +101,11 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert result["graph_stats"]["edges"] > 0
     assert result["index_counts"]["nodes"] == result["graph_stats"]["nodes"]
     assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
+    assert result["governance_index"]["index_scope"] == "candidate_snapshot"
+    assert result["governance_index"]["feature_count"] > 0
+    assert Path(result["governance_index"]["artifacts"]["symbol_index_path"]).exists()
+    assert Path(result["governance_index"]["artifacts"]["doc_index_path"]).exists()
+    assert Path(result["governance_index"]["artifacts"]["feature_index_path"]).exists()
     assert result["file_inventory_count"] > 0
     assert Path(result["snapshot_path"]).exists()
     assert Path(result["phase_report_path"]).exists()
@@ -100,6 +123,7 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     notes = json.loads(snapshot_row["notes"])
     assert notes["state_only"] is True
     assert notes["feature_cluster_count"] >= 1
+    assert notes["governance_index"]["feature_count"] == result["governance_index"]["feature_count"]
 
 
 def test_state_only_full_reconcile_can_activate_with_explicit_signoff(conn, tmp_path):
@@ -181,6 +205,9 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     assert result["active_snapshot_id"] == "imported-old-pending"
     assert result["graph_stats"]["nodes"] > 0
     assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
+    assert result["governance_index"]["feature_count"] > 0
+    assert result["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
+    assert "impacted_file_count" in result["scope_file_delta"]
     assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == "imported-old-pending"
 
     rows = conn.execute(
@@ -199,6 +226,7 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     ).fetchone()["notes"]
     pending_notes = json.loads(notes)["pending_scope_reconcile"]
     assert pending_notes["covered_commit_count"] == 3
+    assert pending_notes["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
 
     after = {str(path): _file_sha(path) for path in files}
     assert after == before
@@ -224,6 +252,62 @@ def test_pending_scope_materializer_requires_current_head(conn, tmp_path, monkey
             target_commit_sha="target",
             run_id="scope-reconcile-target-test",
         )
+
+
+def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-delta-test",
+        commit_sha=base_commit,
+        snapshot_id="full-base-delta-test",
+        created_by="test",
+        activate=True,
+    )
+    assert base["ok"] is True
+
+    service = project / "agent" / "service.py"
+    service.write_text(
+        "def service_entry():\n"
+        "    return helper()\n\n"
+        "def helper():\n"
+        "    return 'changed'\n",
+        encoding="utf-8",
+    )
+    _git(project, "add", "agent/service.py")
+    _git(project, "commit", "-m", "change service")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-delta-test",
+        snapshot_id="scope-delta-test",
+    )
+
+    assert result["ok"] is True
+    delta = result["scope_file_delta"]
+    assert delta["strategy"] == "full_scan_with_incremental_file_delta"
+    assert delta["changed_files"] == ["agent/service.py"]
+    assert "agent/service.py" in delta["hash_changed_files"]
+    assert "agent/service.py" in delta["impacted_files"]
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(
