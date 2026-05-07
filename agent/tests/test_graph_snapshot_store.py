@@ -191,6 +191,18 @@ def test_drift_ledger_allows_multiple_target_symbols(conn):
         "agent.service.create",
         "agent.service.delete",
     ]
+    listed = store.list_graph_drift(
+        conn,
+        PID,
+        snapshot_id=snapshot["snapshot_id"],
+        drift_type="missing_test",
+    )
+    assert len(listed) == 2
+    assert {row["target_symbol"] for row in listed} == {
+        "agent.service.create",
+        "agent.service.delete",
+    }
+    assert all(row["evidence"]["reason"] == "no direct test" for row in listed)
 
 
 def test_graph_payload_edges_include_hierarchy_and_dependency_sections():

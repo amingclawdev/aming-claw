@@ -1820,6 +1820,74 @@ def handle_graph_governance_snapshot_edges(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/drift")
+def handle_graph_governance_drift_list(ctx: RequestContext):
+    """List graph drift ledger rows for dashboard/operator review."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        rows = store.list_graph_drift(
+            conn,
+            project_id,
+            snapshot_id=str(ctx.query.get("snapshot_id") or ""),
+            status=str(ctx.query.get("status") or ""),
+            drift_type=str(ctx.query.get("drift_type") or ""),
+            limit=_query_int(ctx.query, "limit", 200),
+            offset=_query_int(ctx.query, "offset", 0),
+        )
+        return {"ok": True, "project_id": project_id, "drift": rows, "count": len(rows)}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/drift")
+def handle_graph_governance_drift_record(ctx: RequestContext):
+    """Record one graph drift row with evidence."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    required = ["snapshot_id", "commit_sha", "path", "drift_type"]
+    missing = [key for key in required if not str(body.get(key) or "").strip()]
+    if missing:
+        from .errors import ValidationError
+        raise ValidationError(f"missing required drift field(s): {', '.join(missing)}")
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.drift.record")
+        with sqlite_write_lock():
+            store.record_drift(
+                conn,
+                project_id,
+                snapshot_id=str(body.get("snapshot_id") or ""),
+                commit_sha=str(body.get("commit_sha") or ""),
+                path=str(body.get("path") or ""),
+                drift_type=str(body.get("drift_type") or ""),
+                target_symbol=str(body.get("target_symbol") or ""),
+                node_id=str(body.get("node_id") or ""),
+                status=str(body.get("status") or "open"),
+                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {
+                    "source": "graph_governance_api",
+                    "actor": body.get("actor", "api"),
+                },
+            )
+            conn.commit()
+        row = store.list_graph_drift(
+            conn,
+            project_id,
+            snapshot_id=str(body.get("snapshot_id") or ""),
+            drift_type=str(body.get("drift_type") or ""),
+            status=str(body.get("status") or "open"),
+            limit=20,
+        )
+        return 201, {"ok": True, "project_id": project_id, "drift": row}
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/pending-scope")
 def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
     """Queue or update one pending scope-reconcile row."""

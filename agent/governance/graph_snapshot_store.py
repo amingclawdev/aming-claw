@@ -1054,6 +1054,53 @@ def record_drift(
     )
 
 
+def list_graph_drift(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    snapshot_id: str = "",
+    status: str = "",
+    drift_type: str = "",
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id]
+    sql = """
+        SELECT project_id, snapshot_id, commit_sha, path, node_id,
+               target_symbol, drift_type, status, evidence_json, updated_at
+        FROM graph_drift_ledger
+        WHERE project_id = ?
+    """
+    if snapshot_id:
+        sql += " AND snapshot_id = ?"
+        params.append(snapshot_id)
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    if drift_type:
+        sql += " AND drift_type = ?"
+        params.append(drift_type)
+    sql += " ORDER BY updated_at DESC, path, drift_type, target_symbol LIMIT ? OFFSET ?"
+    params.extend([max(1, min(int(limit or 200), 1000)), max(0, int(offset or 0))])
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "project_id": row["project_id"],
+            "snapshot_id": row["snapshot_id"],
+            "commit_sha": row["commit_sha"],
+            "path": row["path"],
+            "node_id": row["node_id"],
+            "target_symbol": row["target_symbol"],
+            "drift_type": row["drift_type"],
+            "status": row["status"],
+            "evidence": _decode_json(row["evidence_json"], {}),
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
 def queue_pending_scope_reconcile(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1203,6 +1250,7 @@ __all__ = [
     "list_graph_snapshot_edges",
     "list_graph_snapshot_nodes",
     "list_graph_snapshots",
+    "list_graph_drift",
     "graph_payload_stats",
     "import_existing_graph_snapshot",
     "abandon_graph_snapshot",

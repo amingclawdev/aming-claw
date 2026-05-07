@@ -207,6 +207,46 @@ def test_graph_governance_queue_finalize_and_abandon_api(conn):
     assert abandoned["status"] == store.SNAPSHOT_STATUS_ABANDONED
 
 
+def test_graph_governance_drift_api_records_and_lists_rows(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-drift-api",
+        commit_sha="head",
+        snapshot_kind="full",
+    )
+    conn.commit()
+
+    code, recorded = server.handle_graph_governance_drift_record(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": snapshot["snapshot_id"],
+                "commit_sha": "head",
+                "path": "agent/service.py",
+                "drift_type": "missing_doc",
+                "target_symbol": "agent.service.create",
+                "evidence": {"source": "unit-test"},
+            },
+        )
+    )
+    assert code == 201
+    assert recorded["ok"] is True
+
+    listed = server.handle_graph_governance_drift_list(
+        _ctx(
+            {"project_id": PID},
+            query={"snapshot_id": snapshot["snapshot_id"], "drift_type": "missing_doc"},
+        )
+    )
+
+    assert listed["ok"] is True
+    assert listed["count"] == 1
+    assert listed["drift"][0]["target_symbol"] == "agent.service.create"
+    assert listed["drift"][0]["evidence"]["source"] == "unit-test"
+
+
 def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()
