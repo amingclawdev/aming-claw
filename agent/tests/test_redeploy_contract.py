@@ -9,6 +9,7 @@ Parametrized tests covering:
 """
 import json
 import logging
+import sqlite3
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -57,7 +58,7 @@ class TestMutualExclusion:
             })
             mock_db.assert_not_called()
 
-    @pytest.mark.parametrize("target", ["executor", "gateway", "coordinator", "service_manager"])
+    @pytest.mark.parametrize("target", ["executor", "gateway", "coordinator"])
     def test_valid_targets_accepted(self, target):
         """Valid targets should not return 400 for mutual-exclusion."""
         from agent.governance.redeploy_handler import handle_redeploy
@@ -72,6 +73,17 @@ class TestMutualExclusion:
             })
             assert status == 200
             assert result["ok"] is True
+
+    def test_service_manager_target_returns_400(self):
+        from agent.governance.redeploy_handler import handle_redeploy
+
+        result, status = handle_redeploy("service_manager", {
+            "task_id": "test-task",
+            "expected_head": "abc1234",
+        })
+        assert status == 400
+        assert result["ok"] is False
+        assert "supervisor" in result["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +145,53 @@ class TestSuccessfulRedeploy:
             assert args[1] == "my-task-123"  # task_id
             assert args[2] == "executor"  # target
 
+    def test_db_write_chain_version_uses_governance_db_helper(self, tmp_path, monkeypatch):
+        """Regression: DB write must not import the removed dbservice module."""
+        from agent.governance.redeploy_handler import _db_write_chain_version
+
+        monkeypatch.setenv("SHARED_VOLUME_PATH", str(tmp_path))
+
+        assert _db_write_chain_version("feed123", "deploy-task-1", "executor") is True
+
+        db_path = (
+            tmp_path
+            / "codex-tasks"
+            / "state"
+            / "governance"
+            / "aming-claw"
+            / "governance.db"
+        )
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT chain_version, updated_by FROM project_version WHERE project_id=?",
+                ("aming-claw",),
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT event, actor FROM audit_index WHERE project_id=?",
+                ("aming-claw",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row["chain_version"] == "feed123"
+        assert row["updated_by"] == "redeploy-orchestrator"
+        assert audit["event"] == "redeploy.version_write"
+        assert audit["actor"] == "redeploy-orchestrator"
+
+        audit_files = list((tmp_path / "codex-tasks" / "state" / "governance" / "aming-claw").glob("audit-*.jsonl"))
+        assert audit_files
+        raw_events = [
+            json.loads(line)
+            for path in audit_files
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        version_events = [event for event in raw_events if event["event"] == "redeploy.version_write"]
+        assert version_events[-1]["task_id"] == "deploy-task-1"
+        assert version_events[-1]["target"] == "executor"
+
 
 # ---------------------------------------------------------------------------
 # (d) Failed restart does NOT write chain_version
@@ -140,11 +199,12 @@ class TestSuccessfulRedeploy:
 
 class TestFailedRedeploy:
 
-    def test_spawn_failure_no_db_write(self):
+    def test_executor_signal_write_failure_no_db_write(self, tmp_path):
         from agent.governance.redeploy_handler import handle_redeploy
 
-        with patch("agent.governance.redeploy_handler._find_pid_for_target", return_value=None), \
-             patch("agent.governance.redeploy_handler._spawn_target", return_value=None), \
+        signal_path = tmp_path / "codex-tasks" / "state" / "manager_signal.json"
+        with patch("agent.governance.redeploy_handler._manager_signal_path", return_value=signal_path), \
+             patch("pathlib.Path.write_text", side_effect=OSError("disk full")), \
              patch("agent.governance.redeploy_handler._db_write_chain_version") as mock_db:
             result, status = handle_redeploy("executor", {
                 "task_id": "t1",
@@ -153,40 +213,7 @@ class TestFailedRedeploy:
             })
             assert status == 500
             assert result["ok"] is False
-            assert result["step"] == "spawn"
-            mock_db.assert_not_called()
-
-    def test_health_check_failure_no_db_write(self):
-        from agent.governance.redeploy_handler import handle_redeploy
-
-        with patch("agent.governance.redeploy_handler._find_pid_for_target", return_value=None), \
-             patch("agent.governance.redeploy_handler._spawn_target", return_value=12345), \
-             patch("agent.governance.redeploy_handler._health_check", return_value=False), \
-             patch("agent.governance.redeploy_handler._db_write_chain_version") as mock_db:
-            result, status = handle_redeploy("executor", {
-                "task_id": "t1",
-                "expected_head": "abc",
-                "drain_grace_seconds": 0,
-            })
-            assert status == 500
-            assert result["ok"] is False
-            assert result["step"] == "wait"
-            mock_db.assert_not_called()
-
-    def test_stop_failure_no_db_write(self):
-        from agent.governance.redeploy_handler import handle_redeploy
-
-        with patch("agent.governance.redeploy_handler._find_pid_for_target", return_value=54321), \
-             patch("agent.governance.redeploy_handler._stop_process", return_value=False), \
-             patch("agent.governance.redeploy_handler._db_write_chain_version") as mock_db:
-            result, status = handle_redeploy("executor", {
-                "task_id": "t1",
-                "expected_head": "abc",
-                "drain_grace_seconds": 0,
-            })
-            assert status == 500
-            assert result["ok"] is False
-            assert result["step"] == "stop"
+            assert result["step"] == "signal_write"
             mock_db.assert_not_called()
 
 
@@ -213,9 +240,8 @@ class TestVersionUpdateDeprecation:
             except Exception:
                 pass  # Expected — no real DB connection
 
-        # Check that DEPRECATED was logged
-        deprecated_logged = any("DEPRECATED" in record.message for record in caplog.records)
-        assert deprecated_logged, f"Expected DEPRECATED in log, got: {[r.message for r in caplog.records]}"
+        deprecated_logged = any("deprecated_write_ignored" in record.message for record in caplog.records)
+        assert deprecated_logged, f"Expected deprecated_write_ignored in log, got: {[r.message for r in caplog.records]}"
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +260,11 @@ class TestPipelineSteps:
         assert status == 400
         assert "expected_head" in result["error"]
 
-    def test_successful_pipeline_returns_all_fields(self):
+    def test_executor_signal_pipeline_returns_expected_fields(self, tmp_path):
         from agent.governance.redeploy_handler import handle_redeploy
 
-        with patch("agent.governance.redeploy_handler._find_pid_for_target", return_value=111), \
-             patch("agent.governance.redeploy_handler._stop_process", return_value=True), \
-             patch("agent.governance.redeploy_handler._spawn_target", return_value=222), \
-             patch("agent.governance.redeploy_handler._health_check", return_value=True), \
+        signal_path = tmp_path / "codex-tasks" / "state" / "manager_signal.json"
+        with patch("agent.governance.redeploy_handler._manager_signal_path", return_value=signal_path), \
              patch("agent.governance.redeploy_handler._db_write_chain_version", return_value=True):
             result, status = handle_redeploy("executor", {
                 "task_id": "t1",
@@ -250,7 +274,8 @@ class TestPipelineSteps:
             assert status == 200
             assert result["ok"] is True
             assert result["target"] == "executor"
-            assert result["old_pid"] == 111
-            assert result["new_pid"] == 222
+            assert result["mechanism"] == "manager_signal.json"
+            assert result["signal_path"] == str(signal_path)
             assert result["new_chain_version"] == "abc123"
+            assert result["db_write"] is True
             assert "updated_at" in result
