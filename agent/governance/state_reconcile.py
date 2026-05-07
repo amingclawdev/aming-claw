@@ -233,11 +233,12 @@ def run_state_only_full_reconcile(
     expected_old_snapshot_id: str | None = None,
     notes_extra: dict[str, Any] | None = None,
     semantic_enrich: bool = True,
-    semantic_use_ai: bool = False,
+    semantic_use_ai: bool | None = None,
     semantic_feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
     semantic_feedback_round: int | None = None,
-    semantic_max_excerpt_chars: int = 12000,
+    semantic_max_excerpt_chars: int | None = None,
     semantic_ai_call: Any = None,
+    semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Create a candidate full-reconcile graph snapshot from current files.
 
@@ -346,6 +347,7 @@ def run_state_only_full_reconcile(
             ai_call=semantic_ai_call,
             created_by=created_by,
             max_excerpt_chars=semantic_max_excerpt_chars,
+            semantic_config_path=semantic_config_path,
         )
         semantic_enrichment = _semantic_enrichment_summary(semantic_result)
     activation = None
@@ -445,11 +447,12 @@ def run_pending_scope_reconcile_candidate(
     snapshot_id: str | None = None,
     created_by: str = "observer",
     semantic_enrich: bool = True,
-    semantic_use_ai: bool = False,
+    semantic_use_ai: bool | None = None,
     semantic_feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
     semantic_feedback_round: int | None = None,
-    semantic_max_excerpt_chars: int = 12000,
+    semantic_max_excerpt_chars: int | None = None,
     semantic_ai_call: Any = None,
+    semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Materialize pending scope rows as a reviewable candidate snapshot.
 
@@ -514,6 +517,7 @@ def run_pending_scope_reconcile_candidate(
         semantic_feedback_round=semantic_feedback_round,
         semantic_max_excerpt_chars=semantic_max_excerpt_chars,
         semantic_ai_call=semantic_ai_call,
+        semantic_config_path=semantic_config_path,
         notes_extra={
             "pending_scope_reconcile": {
                 "covered_commit_shas": covered,

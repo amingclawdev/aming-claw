@@ -21,6 +21,7 @@ from .graph_snapshot_store import (
     snapshot_graph_path,
     utc_now,
 )
+from .reconcile_semantic_config import load_semantic_enrichment_config
 
 
 SEMANTIC_ENRICHMENT_SCHEMA_VERSION = 1
@@ -444,10 +445,11 @@ def run_semantic_enrichment(
     *,
     feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
     feedback_round: int | None = None,
-    use_ai: bool = True,
+    use_ai: bool | None = None,
     ai_call: FeedbackAiCall | None = None,
     created_by: str = "observer",
-    max_excerpt_chars: int = 12000,
+    max_excerpt_chars: int | None = None,
+    semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Create semantic companion artifacts for a graph snapshot.
 
@@ -458,6 +460,19 @@ def run_semantic_enrichment(
     snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
     if not snapshot:
         raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+    root = Path(project_root).resolve() if project_root else None
+    semantic_config = load_semantic_enrichment_config(
+        project_root=root,
+        config_path=semantic_config_path,
+    )
+    effective_use_ai = semantic_config.use_ai_default if use_ai is None else bool(use_ai)
+    effective_excerpt_chars = (
+        semantic_config.input_policy.max_excerpt_chars
+        if max_excerpt_chars is None
+        else int(max_excerpt_chars)
+    )
+    if not semantic_config.input_policy.include_source_excerpt:
+        effective_excerpt_chars = 0
     if feedback_items:
         append_review_feedback(
             conn,
@@ -475,7 +490,6 @@ def run_semantic_enrichment(
         if _node_id(node) and (_path_list(node.get("primary") or node.get("primary_files")))
     ]
     feature_index = _load_feature_index(snapshot)
-    root = Path(project_root).resolve() if project_root else None
     existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
     round_number = int(feedback_round) if feedback_round is not None else len(existing_rounds)
     generated_at = utc_now()
@@ -487,11 +501,19 @@ def run_semantic_enrichment(
             node,
             feature_index=feature_index,
             project_root=root,
-            max_excerpt_chars=max_excerpt_chars,
+            max_excerpt_chars=effective_excerpt_chars,
         )
         relevant_feedback = [
             item for item in feedback if _feedback_matches_feature(item, feature)
         ]
+        payload_feature = dict(feature)
+        if not semantic_config.input_policy.include_symbol_refs:
+            payload_feature["symbol_refs"] = []
+        if not semantic_config.input_policy.include_doc_refs:
+            payload_feature["doc_refs"] = []
+        if not semantic_config.input_policy.include_file_hashes:
+            payload_feature["file_hashes"] = {}
+        payload_feedback = relevant_feedback if semantic_config.input_policy.include_review_feedback else []
         payload = {
             "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
             "project_id": project_id,
@@ -499,22 +521,17 @@ def run_semantic_enrichment(
             "snapshot_kind": snapshot.get("snapshot_kind") or "",
             "commit_sha": snapshot.get("commit_sha") or "",
             "feedback_round": round_number,
-            "feature": feature,
-            "review_feedback": relevant_feedback,
-            "instructions": {
-                "mode": "state_only_semantic_enrichment",
-                "mutate_project_files": False,
-                "mutate_graph_topology": False,
-                "return_semantic_fields_and_suggestions_only": True,
-            },
+            "feature": payload_feature,
+            "review_feedback": payload_feedback,
+            "instructions": semantic_config.to_instruction_payload(),
         }
-        ai_response = _call_ai(ai_call, stage="reconcile_semantic_feature", payload=payload) if use_ai else None
+        ai_response = _call_ai(ai_call, stage="reconcile_semantic_feature", payload=payload) if effective_use_ai else None
         if ai_response is not None:
             status = "ai_complete"
             ai_complete_count += 1
         else:
-            status = "ai_unavailable" if use_ai else "heuristic"
-            if use_ai:
+            status = "ai_unavailable" if effective_use_ai else "heuristic"
+            if effective_use_ai:
                 ai_unavailable_count += 1
         semantic_features.append(
             _heuristic_semantic_entry(
@@ -534,7 +551,8 @@ def run_semantic_enrichment(
         "feedback_round": round_number,
         "generated_at": generated_at,
         "created_by": created_by,
-        "ai_requested": bool(use_ai),
+        "ai_requested": bool(effective_use_ai),
+        "semantic_config": semantic_config.summary(),
         "feature_count": len(semantic_features),
         "features": sorted(semantic_features, key=lambda item: str(item.get("node_id") or "")),
     }
@@ -553,6 +571,7 @@ def run_semantic_enrichment(
         "ai_complete_count": ai_complete_count,
         "ai_unavailable_count": ai_unavailable_count,
         "feedback_count": len(feedback),
+        "semantic_config": semantic_config.summary(),
         "unresolved_feedback_count": len(unresolved_feedback),
         "unresolved_feedback_ids": unresolved_feedback,
         "quality_flag_counts": _count_quality_flags(semantic_features),

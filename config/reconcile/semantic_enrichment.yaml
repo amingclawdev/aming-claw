@@ -1,0 +1,67 @@
+version: "1.0"
+analyzer: reconcile_semantic
+provider: injected
+model: ""
+use_ai_default: false
+temperature: 0
+max_tokens: 4000
+
+permissions:
+  can:
+    - read_graph_snapshot
+    - read_governance_index
+    - read_feature_context
+    - read_review_feedback
+    - emit_semantic_index
+    - emit_review_suggestions
+  cannot:
+    - modify_code
+    - modify_docs
+    - modify_tests
+    - mutate_graph_topology
+    - run_command
+    - execute_script
+    - create_chain_task
+    - finalize_snapshot
+
+input_policy:
+  include_source_excerpt: true
+  max_excerpt_chars: 12000
+  include_symbol_refs: true
+  include_doc_refs: true
+  include_review_feedback: true
+  include_file_hashes: true
+
+output_schema:
+  required:
+    - feature_name
+    - semantic_summary
+    - intent
+    - domain_label
+    - doc_coverage_review
+    - test_coverage_review
+    - dependency_patch_suggestions
+    - applied_feedback_ids
+  optional:
+    - merge_suggestions
+    - split_suggestions
+    - dead_code_candidates
+    - rejected_feedback_ids
+
+prompt_template: |-
+  You are the reconcile semantic analyzer.
+
+  Your job is to enrich a graph snapshot with semantic labels and review
+  suggestions. You are not part of the PM -> Dev -> QA mutation chain.
+
+  Hard constraints:
+  - Do not modify source, documentation, tests, database rows, or graph topology.
+  - Do not create PM/Dev/QA tasks.
+  - Use only the supplied graph snapshot, governance index, feature context,
+    source excerpts, and review feedback.
+  - Return structured JSON fields only.
+
+  For each feature, identify the user-facing or governance-facing capability,
+  summarize intent, review doc/test bindings, and suggest dependency/doc/test
+  corrections as proposals. The caller will store your output as companion
+  semantic artifacts for human or observer review.

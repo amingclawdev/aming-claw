@@ -2332,10 +2332,19 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
                 notes_extra=body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else None,
                 semantic_enrich=bool(body.get("semantic_enrich", True)),
-                semantic_use_ai=bool(body.get("semantic_use_ai", body.get("use_ai", False))),
+                semantic_use_ai=(
+                    bool(body["semantic_use_ai"])
+                    if body.get("semantic_use_ai") is not None
+                    else (bool(body["use_ai"]) if body.get("use_ai") is not None else None)
+                ),
                 semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
                 semantic_feedback_round=body.get("semantic_feedback_round"),
-                semantic_max_excerpt_chars=int(body.get("semantic_max_excerpt_chars") or 12000),
+                semantic_max_excerpt_chars=(
+                    int(body["semantic_max_excerpt_chars"])
+                    if body.get("semantic_max_excerpt_chars") is not None
+                    else None
+                ),
+                semantic_config_path=body.get("semantic_config_path"),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
@@ -2366,10 +2375,19 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
                 semantic_enrich=bool(body.get("semantic_enrich", True)),
-                semantic_use_ai=bool(body.get("semantic_use_ai", body.get("use_ai", False))),
+                semantic_use_ai=(
+                    bool(body["semantic_use_ai"])
+                    if body.get("semantic_use_ai") is not None
+                    else (bool(body["use_ai"]) if body.get("use_ai") is not None else None)
+                ),
                 semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
                 semantic_feedback_round=body.get("semantic_feedback_round"),
-                semantic_max_excerpt_chars=int(body.get("semantic_max_excerpt_chars") or 12000),
+                semantic_max_excerpt_chars=(
+                    int(body["semantic_max_excerpt_chars"])
+                    if body.get("semantic_max_excerpt_chars") is not None
+                    else None
+                ),
+                semantic_config_path=body.get("semantic_config_path"),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
@@ -2537,9 +2555,14 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                     root,
                     feedback_items=feedback_items,
                     feedback_round=body.get("feedback_round"),
-                    use_ai=bool(body.get("use_ai", False)),
+                    use_ai=bool(body["use_ai"]) if body.get("use_ai") is not None else None,
                     created_by=str(body.get("actor") or "observer"),
-                    max_excerpt_chars=int(body.get("max_excerpt_chars") or 12000),
+                    max_excerpt_chars=(
+                        int(body["max_excerpt_chars"])
+                        if body.get("max_excerpt_chars") is not None
+                        else None
+                    ),
+                    semantic_config_path=body.get("semantic_config_path"),
                 )
             except (KeyError, ValueError) as exc:
                 _raise_graph_api_validation(exc)

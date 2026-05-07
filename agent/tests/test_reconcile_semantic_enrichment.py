@@ -115,6 +115,8 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
     assert Path(first["semantic_index_path"]).exists()
     assert seen_payloads[0]["stage"] == "reconcile_semantic_feature"
     assert seen_payloads[0]["payload"]["instructions"]["mutate_project_files"] is False
+    assert seen_payloads[0]["payload"]["instructions"]["analyzer"] == "reconcile_semantic"
+    assert seen_payloads[0]["payload"]["instructions"]["prompt_template"]
     assert seen_payloads[0]["payload"]["feature"]["source_excerpt"]
 
     second = run_semantic_enrichment(
@@ -190,3 +192,46 @@ def test_append_review_feedback_normalizes_append_only_items(conn, tmp_path):
     assert len(feedback) == 1
     assert feedback[0]["target_id"] == "agent/governance/backlog_runtime.py"
     assert feedback[0]["created_by"] == "observer"
+
+
+def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    override_path = project / ".aming-claw" / "reconcile" / "semantic_enrichment.yaml"
+    override_path.parent.mkdir(parents=True)
+    override_path.write_text(
+        "\n".join(
+            [
+                'model: "gpt-test-semantic"',
+                "use_ai_default: true",
+                "input_policy:",
+                "  max_excerpt_chars: 8",
+                "prompt_template: |-",
+                "  Project-specific semantic analyzer prompt.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    seen_payloads: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_payloads.append(payload)
+        return {"feature_name": "Configured Semantic Feature"}
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=None,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+
+    feature = result["semantic_index"]["features"][0]
+    assert feature["feature_name"] == "Configured Semantic Feature"
+    assert result["semantic_index"]["semantic_config"]["model"] == "gpt-test-semantic"
+    assert seen_payloads[0]["instructions"]["model"] == "gpt-test-semantic"
+    assert seen_payloads[0]["instructions"]["prompt_template"] == "Project-specific semantic analyzer prompt."
+    excerpt = seen_payloads[0]["feature"]["source_excerpt"]["agent/governance/backlog_runtime.py"]
+    assert len(excerpt) <= 8

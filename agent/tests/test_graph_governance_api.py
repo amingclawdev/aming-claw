@@ -510,7 +510,7 @@ def test_graph_governance_index_and_full_reconcile_api_call_helpers(conn, tmp_pa
         assert project_id == PID
         assert Path(project_root) == project
         assert kwargs["semantic_enrich"] is True
-        assert kwargs["semantic_use_ai"] is False
+        assert kwargs["semantic_use_ai"] is None
         return {
             "ok": True,
             "snapshot_id": "full-head",
