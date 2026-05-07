@@ -1682,6 +1682,347 @@ def handle_reconcile_file_inventory_list(ctx: RequestContext):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Graph Governance State API (proposal-graph-governance-unified-v3)
+# ---------------------------------------------------------------------------
+
+def _graph_governance_project_root(project_id: str, body: dict) -> Path:
+    raw = (
+        body.get("project_root")
+        or body.get("workspace_path")
+        or body.get("repo_root")
+        or ""
+    )
+    if raw:
+        return Path(str(raw)).resolve()
+    for project in project_service.list_projects():
+        if project.get("project_id") == project_id and project.get("workspace_path"):
+            return Path(project["workspace_path"]).resolve()
+    if project_id == "aming-claw":
+        return Path(__file__).resolve().parents[2]
+    from .errors import ValidationError
+    raise ValidationError("project_root or workspace_path is required")
+
+
+def _query_int(query: dict, key: str, default: int) -> int:
+    try:
+        return int(query.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _query_statuses(query: dict, key: str = "status") -> list[str]:
+    raw = query.get(key, "")
+    values = raw if isinstance(raw, list) else str(raw or "").split(",")
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _require_graph_governance_operator(ctx: RequestContext, conn, action: str) -> dict:
+    session = ctx.require_auth(conn)
+    role = session.get("role", "")
+    if role not in ("observer", "coordinator"):
+        from .errors import PermissionDeniedError
+        raise PermissionDeniedError(role, action, {"detail": "Graph governance state operations are observer/coordinator only"})
+    return session
+
+
+@route("GET", "/api/graph-governance/{project_id}/status")
+def handle_graph_governance_status(ctx: RequestContext):
+    """Return active graph snapshot, scan baseline, and pending scope status."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        status = store.graph_governance_status(conn, project_id)
+        target_commit = str(ctx.query.get("target_commit") or "")
+        if target_commit:
+            status["strict_ready"] = store.strict_graph_ready(
+                conn,
+                project_id,
+                target_commit=target_commit,
+            )
+        return {"ok": True, **status}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots")
+def handle_graph_governance_snapshot_list(ctx: RequestContext):
+    """List graph snapshots for operator/dashboard review."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        snapshots = store.list_graph_snapshots(
+            conn,
+            project_id,
+            statuses=_query_statuses(ctx.query),
+            limit=_query_int(ctx.query, "limit", 50),
+        )
+        return {"ok": True, "project_id": project_id, "snapshots": snapshots, "count": len(snapshots)}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes")
+def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
+    """List indexed graph nodes for one snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        nodes = store.list_graph_snapshot_nodes(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=_query_int(ctx.query, "limit", 200),
+            offset=_query_int(ctx.query, "offset", 0),
+            layer=str(ctx.query.get("layer") or ""),
+            kind=str(ctx.query.get("kind") or ""),
+        )
+        return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "nodes": nodes, "count": len(nodes)}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/edges")
+def handle_graph_governance_snapshot_edges(ctx: RequestContext):
+    """List indexed graph edges for one snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        edges = store.list_graph_snapshot_edges(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=_query_int(ctx.query, "limit", 500),
+            offset=_query_int(ctx.query, "offset", 0),
+            edge_type=str(ctx.query.get("edge_type") or ""),
+        )
+        return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "edges": edges, "count": len(edges)}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/pending-scope")
+def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
+    """Queue or update one pending scope-reconcile row."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    commit_sha = str(body.get("commit_sha") or body.get("target_commit_sha") or "").strip()
+    if not commit_sha:
+        from .errors import ValidationError
+        raise ValidationError("commit_sha is required")
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.pending-scope")
+        with sqlite_write_lock():
+            row = store.queue_pending_scope_reconcile(
+                conn,
+                project_id,
+                commit_sha=commit_sha,
+                parent_commit_sha=str(body.get("parent_commit_sha") or ""),
+                status=str(body.get("status") or store.PENDING_STATUS_QUEUED),
+                snapshot_id=str(body.get("snapshot_id") or ""),
+                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {
+                    "source": "graph_governance_api",
+                    "actor": body.get("actor", "api"),
+                },
+            )
+            conn.commit()
+        return 201, {"ok": True, "project_id": project_id, "pending_scope_reconcile": row}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/index")
+def handle_graph_governance_index_build(ctx: RequestContext):
+    """Build and persist governance index artifacts without source mutation."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .governance_index import build_and_persist_governance_index
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.index")
+        result = build_and_persist_governance_index(
+            conn,
+            project_id,
+            root,
+            run_id=str(body.get("run_id") or ""),
+            commit_sha=str(body.get("commit_sha") or ""),
+            include_active_graph=bool(body.get("include_active_graph", True)),
+            persist_inventory=bool(body.get("persist_inventory", True)),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "run_id": result.get("run_id"),
+            "commit_sha": result.get("commit_sha"),
+            "active_snapshot": result.get("active_snapshot") or {},
+            "file_inventory_summary": result.get("file_inventory_summary") or {},
+            "symbol_count": (result.get("symbol_index") or {}).get("symbol_count", 0),
+            "doc_heading_count": (result.get("doc_index") or {}).get("heading_count", 0),
+            "coverage_state": result.get("coverage_state") or {},
+            "persist_summary": result.get("persist_summary") or {},
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/import-existing")
+def handle_graph_governance_import_existing(ctx: RequestContext):
+    """Import the latest non-empty legacy/baseline graph as a graph snapshot."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.import-existing")
+        with sqlite_write_lock():
+            result = store.import_existing_graph_snapshot(
+                conn,
+                project_id,
+                commit_sha=str(body.get("commit_sha") or ""),
+                snapshot_id=body.get("snapshot_id"),
+                created_by=str(body.get("actor") or "observer"),
+                activate=bool(body.get("activate", False)),
+                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                extra_graph_paths=body.get("extra_graph_paths") or [],
+            )
+            conn.commit()
+        return 201, {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/reconcile/full")
+def handle_graph_governance_full_reconcile(ctx: RequestContext):
+    """Create a state-only full-reconcile candidate snapshot at current HEAD."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .state_reconcile import run_state_only_full_reconcile
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.full")
+        result = run_state_only_full_reconcile(
+            conn,
+            project_id,
+            root,
+            run_id=str(body.get("run_id") or ""),
+            commit_sha=str(body.get("commit_sha") or ""),
+            snapshot_id=body.get("snapshot_id"),
+            snapshot_kind=str(body.get("snapshot_kind") or "full"),
+            created_by=str(body.get("actor") or "observer"),
+            activate=bool(body.get("activate", False)),
+            expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+            notes_extra=body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else None,
+        )
+        conn.commit()
+        return 201, result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope")
+def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
+    """Create a state-only scope candidate from queued pending scope rows."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .state_reconcile import run_pending_scope_reconcile_candidate
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope")
+        result = run_pending_scope_reconcile_candidate(
+            conn,
+            project_id,
+            root,
+            target_commit_sha=str(body.get("target_commit_sha") or ""),
+            run_id=str(body.get("run_id") or ""),
+            snapshot_id=body.get("snapshot_id"),
+            created_by=str(body.get("actor") or "observer"),
+        )
+        conn.commit()
+        return 201, result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/finalize")
+def handle_graph_governance_snapshot_finalize(ctx: RequestContext):
+    """Activate a candidate graph snapshot with compare-and-swap signoff."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.finalize")
+        with sqlite_write_lock():
+            result = store.finalize_graph_snapshot(
+                conn,
+                project_id,
+                snapshot_id,
+                target_commit_sha=str(body.get("target_commit_sha") or ""),
+                expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
+                ref_name=str(body.get("ref_name") or "active"),
+                actor=str(body.get("actor") or "observer"),
+                materialize_pending=bool(body.get("materialize_pending", True)),
+                covered_commit_shas=body.get("covered_commit_shas") or None,
+                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else None,
+            )
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/abandon")
+def handle_graph_governance_snapshot_abandon(ctx: RequestContext):
+    """Abandon a non-active candidate/finalizing graph snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.abandon")
+        with sqlite_write_lock():
+            result = store.abandon_graph_snapshot(
+                conn,
+                project_id,
+                snapshot_id,
+                actor=str(body.get("actor") or "observer"),
+                reason=str(body.get("reason") or ""),
+            )
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/reconcile/{project_id}/deferred-clusters/{cluster_fingerprint}")
 def handle_reconcile_deferred_cluster_get(ctx: RequestContext):
     """Get a single deferred-cluster row by fingerprint."""

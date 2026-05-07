@@ -262,6 +262,19 @@ def graph_payload_stats(graph_json: dict[str, Any]) -> dict[str, int]:
     return {"nodes": len(_graph_nodes(graph_json)), "edges": len(_graph_edges(graph_json))}
 
 
+def _decode_json(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    if isinstance(raw, (list, dict)):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return default
+    return default
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -671,6 +684,151 @@ def get_active_graph_snapshot(
     return dict(row) if row else None
 
 
+def get_graph_snapshot(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, Any] | None:
+    ensure_schema(conn)
+    row = conn.execute(
+        "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, snapshot_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_graph_snapshots(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    statuses: Iterable[str] | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id]
+    sql = "SELECT * FROM graph_snapshots WHERE project_id = ?"
+    status_values = [str(s) for s in statuses or [] if s]
+    if status_values:
+        placeholders = ",".join("?" for _ in status_values)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(status_values)
+    sql += " ORDER BY created_at DESC, snapshot_id DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 50), 500)))
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def list_graph_snapshot_nodes(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    layer: str = "",
+    kind: str = "",
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id, snapshot_id]
+    sql = """
+        SELECT node_id, layer, title, kind, primary_files_json,
+               secondary_files_json, test_files_json, metadata_json
+        FROM graph_nodes_index
+        WHERE project_id = ? AND snapshot_id = ?
+    """
+    if layer:
+        sql += " AND layer = ?"
+        params.append(layer)
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " ORDER BY node_id LIMIT ? OFFSET ?"
+    params.extend([max(1, min(int(limit or 200), 1000)), max(0, int(offset or 0))])
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "node_id": row["node_id"],
+            "layer": row["layer"],
+            "title": row["title"],
+            "kind": row["kind"],
+            "primary_files": _decode_json(row["primary_files_json"], []),
+            "secondary_files": _decode_json(row["secondary_files_json"], []),
+            "test_files": _decode_json(row["test_files_json"], []),
+            "metadata": _decode_json(row["metadata_json"], {}),
+        }
+        for row in rows
+    ]
+
+
+def list_graph_snapshot_edges(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    limit: int = 500,
+    offset: int = 0,
+    edge_type: str = "",
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id, snapshot_id]
+    sql = """
+        SELECT src, dst, edge_type, direction, evidence_json
+        FROM graph_edges_index
+        WHERE project_id = ? AND snapshot_id = ?
+    """
+    if edge_type:
+        sql += " AND edge_type = ?"
+        params.append(edge_type)
+    sql += " ORDER BY src, dst, edge_type LIMIT ? OFFSET ?"
+    params.extend([max(1, min(int(limit or 500), 2000)), max(0, int(offset or 0))])
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "src": row["src"],
+            "dst": row["dst"],
+            "edge_type": row["edge_type"],
+            "direction": row["direction"],
+            "evidence": _decode_json(row["evidence_json"], {}),
+        }
+        for row in rows
+    ]
+
+
+def abandon_graph_snapshot(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    actor: str = "observer",
+    reason: str = "",
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    row = get_graph_snapshot(conn, project_id, snapshot_id)
+    if not row:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+    if row["status"] == SNAPSHOT_STATUS_ACTIVE:
+        raise ValueError("active graph snapshot cannot be abandoned")
+    if row["status"] == SNAPSHOT_STATUS_SUPERSEDED:
+        raise ValueError("superseded graph snapshot cannot be abandoned")
+    notes = _decode_json(row.get("notes"), {})
+    if not isinstance(notes, dict):
+        notes = {"previous_notes": row.get("notes") or ""}
+    notes["abandoned"] = {
+        "actor": actor,
+        "reason": reason,
+        "ts": utc_now(),
+    }
+    conn.execute(
+        "UPDATE graph_snapshots SET status = ?, notes = ? WHERE project_id = ? AND snapshot_id = ?",
+        (SNAPSHOT_STATUS_ABANDONED, _json(notes), project_id, snapshot_id),
+    )
+    return {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "previous_status": row["status"],
+        "status": SNAPSHOT_STATUS_ABANDONED,
+    }
+
+
 def get_latest_scan_baseline(conn: sqlite3.Connection, project_id: str) -> dict[str, Any] | None:
     try:
         row = conn.execute(
@@ -916,11 +1074,16 @@ __all__ = [
     "ensure_schema",
     "finalize_graph_snapshot",
     "get_active_graph_snapshot",
+    "get_graph_snapshot",
     "get_latest_scan_baseline",
     "graph_governance_status",
     "index_graph_snapshot",
+    "list_graph_snapshot_edges",
+    "list_graph_snapshot_nodes",
+    "list_graph_snapshots",
     "graph_payload_stats",
     "import_existing_graph_snapshot",
+    "abandon_graph_snapshot",
     "list_pending_scope_reconcile",
     "queue_pending_scope_reconcile",
     "record_drift",
