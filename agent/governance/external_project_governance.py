@@ -29,6 +29,7 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
 GOVERNANCE_DIR = ".aming-claw"
 TRACKED_PROJECT_FILE = "project.yaml"
 FEATURE_INDEX_FILE = "feature-index.md"
+COVERAGE_STATE_FILE = "coverage-state.json"
 IGNORED_RUNTIME_DIRS = ("cache", "sessions", "baselines", "logs")
 ROOT_GITIGNORE_MARKER = "# aming-claw runtime artifacts"
 
@@ -486,7 +487,8 @@ def scan_external_project(
     candidate_path = session_dir / "graph.rebase.candidate.json"
     symbol_index_path = session_dir / "symbol-index.json"
     doc_index_path = session_dir / "doc-index.json"
-    coverage_path = gov_root / "cache" / "coverage-state.live.json"
+    coverage_path = gov_root / COVERAGE_STATE_FILE
+    coverage_cache_path = gov_root / "cache" / "coverage-state.live.json"
     inventory_cache_path = gov_root / "cache" / "file-inventory.json"
     symbol_index_cache_path = gov_root / "cache" / "symbol-index.json"
     doc_index_cache_path = gov_root / "cache" / "doc-index.json"
@@ -510,6 +512,7 @@ def scan_external_project(
     _write_json(doc_index_path, doc_index)
     _write_json(doc_index_cache_path, doc_index)
     _write_json(coverage_path, coverage_state)
+    _write_json(coverage_cache_path, coverage_state)
     _write_text(
         feature_index_path,
         render_candidate_feature_index(
@@ -534,6 +537,7 @@ def scan_external_project(
         "doc_index_path": str(doc_index_path),
         "file_inventory_path": str(inventory_path),
         "coverage_state_path": str(coverage_path),
+        "coverage_state_cache_path": str(coverage_cache_path),
         "feature_index_path": str(feature_index_path),
         "phase_report_path": str(phase_result.get("report_path") or ""),
         "candidate_node_count": coverage_state.get("candidate_node_count", 0),
@@ -548,6 +552,7 @@ def scan_external_project(
 
 
 __all__ = [
+    "COVERAGE_STATE_FILE",
     "FEATURE_INDEX_FILE",
     "GOVERNANCE_DIR",
     "build_coverage_state",

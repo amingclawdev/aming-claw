@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from agent.governance.external_project_governance import (
+    COVERAGE_STATE_FILE,
     FEATURE_INDEX_FILE,
     GOVERNANCE_DIR,
     scan_external_project,
@@ -68,6 +69,7 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
     doc_index_path = Path(result["doc_index_path"])
     inventory_path = Path(result["file_inventory_path"])
     coverage_path = Path(result["coverage_state_path"])
+    coverage_cache_path = Path(result["coverage_state_cache_path"])
     feature_index_path = gov_root / FEATURE_INDEX_FILE
 
     assert result["status"] == "ok"
@@ -77,6 +79,8 @@ def test_scan_external_project_writes_governance_artifacts(tmp_path):
     assert doc_index_path.exists()
     assert inventory_path.exists()
     assert coverage_path.exists()
+    assert coverage_path == gov_root / COVERAGE_STATE_FILE
+    assert coverage_cache_path.exists()
     assert feature_index_path.exists()
     assert ".aming-claw/cache/" in (project / ".gitignore").read_text(encoding="utf-8")
 
