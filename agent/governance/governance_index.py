@@ -135,7 +135,7 @@ def load_snapshot_nodes_for_inventory(
         get = row.__getitem__ if hasattr(row, "keys") else lambda key: row[key]
         metadata = _decode_json_object(get("metadata_json"))
         kind = str(get("kind") or metadata.get("kind") or "")
-        nodes.append({
+        node = {
             "id": str(get("node_id") or ""),
             "node_id": str(get("node_id") or ""),
             "layer": str(get("layer") or ""),
@@ -145,7 +145,11 @@ def load_snapshot_nodes_for_inventory(
             "secondary": _decode_json_list(get("secondary_files_json")),
             "test": _decode_json_list(get("test_files_json")),
             "metadata": metadata,
-        })
+        }
+        config_files = _decode_json_list(metadata.get("config_files"))
+        if config_files:
+            node["config"] = config_files
+        nodes.append(node)
     return [node for node in nodes if node.get("id")]
 
 
@@ -235,7 +239,11 @@ def build_feature_index(
         primary = _path_list(node, "primary", "primary_files")
         secondary = _path_list(node, "secondary", "secondary_files")
         tests = _path_list(node, "test", "test_files")
-        if not (primary or secondary or tests):
+        config = _path_list(node, "config", "config_files")
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        if not config:
+            config = _path_list(metadata, "config_files")
+        if not (primary or secondary or tests or config):
             continue
         symbol_refs = []
         for path in primary:
@@ -257,6 +265,13 @@ def build_feature_index(
                 "heading_count": len(doc.get("headings") or []),
                 "headings": doc.get("headings") or [],
             })
+        config_refs = [
+            {
+                "path": path,
+                "file_hash": file_hashes.get(path, ""),
+            }
+            for path in config
+        ]
         payload = {
             "node_id": node_id,
             "title": node.get("title") or "",
@@ -264,7 +279,8 @@ def build_feature_index(
             "primary": primary,
             "secondary": secondary,
             "test": tests,
-            "file_hashes": {path: file_hashes.get(path, "") for path in primary + secondary + tests},
+            "config": config,
+            "file_hashes": {path: file_hashes.get(path, "") for path in primary + secondary + tests + config},
             "symbol_ids": [ref["id"] for ref in symbol_refs],
             "doc_paths": [ref["path"] for ref in doc_refs],
         }
@@ -273,6 +289,7 @@ def build_feature_index(
             "feature_hash": _hash_payload(payload),
             "symbol_refs": symbol_refs,
             "doc_refs": doc_refs,
+            "config_refs": config_refs,
         })
 
     return {

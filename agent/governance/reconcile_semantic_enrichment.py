@@ -191,11 +191,12 @@ def _feature_context_from_node(
     primary = _path_list(node.get("primary") or node.get("primary_files"))
     secondary = _path_list(node.get("secondary") or node.get("secondary_files"))
     tests = _path_list(node.get("test") or node.get("test_files"))
+    config = _path_list(node.get("config") or node.get("config_files") or metadata.get("config_files"))
     indexed = feature_index.get(node_id, {})
     source_excerpt: dict[str, str] = {}
     if project_root is not None and max_excerpt_chars > 0:
         budget = max_excerpt_chars
-        for rel in primary + tests + secondary:
+        for rel in primary + tests + secondary + config:
             if budget <= 0:
                 break
             path = project_root / rel
@@ -212,6 +213,7 @@ def _feature_context_from_node(
         "primary": primary,
         "secondary": secondary,
         "test": tests,
+        "config": config,
         "functions": metadata.get("functions") or [],
     }
     return {
@@ -222,11 +224,15 @@ def _feature_context_from_node(
         "primary": primary,
         "secondary": secondary,
         "test": tests,
+        "config": config,
         "metadata": metadata,
         "file_hashes": indexed.get("file_hashes") or {},
         "feature_hash": indexed.get("feature_hash") or _hash_payload(fallback_hash_payload),
         "symbol_refs": indexed.get("symbol_refs") or [],
         "doc_refs": indexed.get("doc_refs") or [],
+        "config_refs": indexed.get("config_refs") or [
+            {"path": path, "kind": "config"} for path in config
+        ],
         "source_excerpt": source_excerpt,
     }
 
@@ -345,6 +351,7 @@ def _feedback_matches_feature(feedback: dict[str, Any], feature: dict[str, Any])
     paths = set(feature.get("primary") or [])
     paths.update(feature.get("secondary") or [])
     paths.update(feature.get("test") or [])
+    paths.update(feature.get("config") or [])
     if target_type == "path":
         target = str(feedback.get("target_id") or feedback.get("path") or "").replace("\\", "/").strip("/")
         return target in paths
@@ -408,6 +415,10 @@ def _heuristic_semantic_entry(
             "bound": bool(feature.get("test")),
             "files": feature.get("test") or [],
         },
+        "config_coverage_review": ai_response.get("config_coverage_review") or {
+            "bound": bool(feature.get("config")),
+            "files": feature.get("config") or [],
+        },
         "dead_code_candidates": ai_response.get("dead_code_candidates") or [],
         "quality_flags": _quality_flags(feature, feedback),
         "applied_feedback_ids": applied,
@@ -419,8 +430,10 @@ def _heuristic_semantic_entry(
         "primary": feature.get("primary") or [],
         "secondary": feature.get("secondary") or [],
         "test": feature.get("test") or [],
+        "config": feature.get("config") or [],
         "symbol_refs": feature.get("symbol_refs") or [],
         "doc_refs": feature.get("doc_refs") or [],
+        "config_refs": feature.get("config_refs") or [],
         "enrichment_status": enrichment_status,
     }
 
@@ -511,6 +524,9 @@ def run_semantic_enrichment(
             payload_feature["symbol_refs"] = []
         if not semantic_config.input_policy.include_doc_refs:
             payload_feature["doc_refs"] = []
+        if not semantic_config.input_policy.include_config_refs:
+            payload_feature["config_refs"] = []
+            payload_feature["config"] = []
         if not semantic_config.input_policy.include_file_hashes:
             payload_feature["file_hashes"] = {}
         payload_feedback = relevant_feedback if semantic_config.input_policy.include_review_feedback else []

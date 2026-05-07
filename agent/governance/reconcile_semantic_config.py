@@ -40,6 +40,7 @@ class SemanticInputPolicy:
     max_excerpt_chars: int = 12000
     include_symbol_refs: bool = True
     include_doc_refs: bool = True
+    include_config_refs: bool = True
     include_review_feedback: bool = True
     include_file_hashes: bool = True
 
@@ -105,6 +106,7 @@ class SemanticAnalyzerConfig:
             max_excerpt_chars=max_excerpt,
             include_symbol_refs=bool(input_policy_raw.get("include_symbol_refs", True)),
             include_doc_refs=bool(input_policy_raw.get("include_doc_refs", True)),
+            include_config_refs=bool(input_policy_raw.get("include_config_refs", True)),
             include_review_feedback=bool(input_policy_raw.get("include_review_feedback", True)),
             include_file_hashes=bool(input_policy_raw.get("include_file_hashes", True)),
         )
@@ -195,6 +197,7 @@ def _default_config_dict() -> dict[str, Any]:
                 "domain_label",
                 "doc_coverage_review",
                 "test_coverage_review",
+                "config_coverage_review",
                 "dependency_patch_suggestions",
                 "applied_feedback_ids",
             ]

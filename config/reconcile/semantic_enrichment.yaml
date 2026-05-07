@@ -29,6 +29,7 @@ input_policy:
   max_excerpt_chars: 12000
   include_symbol_refs: true
   include_doc_refs: true
+  include_config_refs: true
   include_review_feedback: true
   include_file_hashes: true
 
@@ -41,6 +42,7 @@ output_schema:
     - doc_coverage_review
     - test_coverage_review
     - dependency_patch_suggestions
+    - config_coverage_review
     - applied_feedback_ids
   optional:
     - merge_suggestions
@@ -62,6 +64,6 @@ prompt_template: |-
   - Return structured JSON fields only.
 
   For each feature, identify the user-facing or governance-facing capability,
-  summarize intent, review doc/test bindings, and suggest dependency/doc/test
+  summarize intent, review doc/test/config bindings, and suggest dependency/doc/test/config
   corrections as proposals. The caller will store your output as companion
   semantic artifacts for human or observer review.

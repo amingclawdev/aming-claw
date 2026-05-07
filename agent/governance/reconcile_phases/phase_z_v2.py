@@ -1121,6 +1121,7 @@ _CONTRACT_NAME_TOKENS = (
     "api", "route", "schema", "contract", "interface", "adapter", "plugin",
     "profile", "validator", "output_schemas",
 )
+_CONFIG_NAME_TOKENS = ("config", "settings", "permission", "role")
 _VALIDATION_NAME_TOKENS = (
     "validator", "validation", "preflight", "check", "policy", "rules",
     "gate", "gatekeeper", "permission",
@@ -1355,6 +1356,113 @@ def _relations_by_module(typed_relations: List[Dict[str, Any]]) -> Dict[str, Lis
     return out
 
 
+def _config_relation_owner(path: str, known_modules: Set[str]) -> Tuple[str, str, str]:
+    """Return deterministic config ownership as (module, relation, evidence)."""
+    rel = str(path or "").replace("\\", "/").strip("/")
+    lower = rel.lower()
+    name = lower.rsplit("/", 1)[-1]
+
+    def has(module_name: str) -> bool:
+        return module_name in known_modules
+
+    if lower.startswith("config/roles/") and lower.endswith((".yaml", ".yml")):
+        if has("agent.governance.role_config"):
+            role = Path(rel).stem
+            return (
+                "agent.governance.role_config",
+                "configures_role",
+                f"role config role={role}",
+            )
+    if lower in {
+        "config/reconcile/semantic_enrichment.yaml",
+        "config/reconcile/semantic_enrichment.yml",
+    }:
+        if has("agent.governance.reconcile_semantic_config"):
+            return (
+                "agent.governance.reconcile_semantic_config",
+                "configures_analyzer",
+                "reconcile semantic analyzer config",
+            )
+    if name in {"pipeline_config.yaml", "pipeline_config.yml", "pipeline_config.json", "pipeline_config.yaml.example"}:
+        if has("agent.pipeline_config"):
+            return (
+                "agent.pipeline_config",
+                "configures_model_routing",
+                "pipeline provider/model routing config",
+            )
+    if name in {"agent_config.json", ".aming-claw.yaml", ".aming-claw.yml"}:
+        for module_name in ("agent.project_config", "agent.governance.external_project_governance"):
+            if has(module_name):
+                return (
+                    module_name,
+                    "configures_runtime",
+                    "project runtime governance config",
+                )
+    if name == ".mcp.json" and has("agent.governance.mcp_server"):
+        return (
+            "agent.governance.mcp_server",
+            "configures_runtime",
+            "MCP server config",
+        )
+    return "", "", ""
+
+
+def materialize_config_file_relations(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+    file_inventory: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach deterministic config files to owning modules and typed relations.
+
+    Config is a first-class governance input like docs/tests: it should not
+    drive DFS traversal, but graph readers need to know which runtime behavior
+    a config file controls and which code loads it.
+    """
+    known_modules = {
+        str(node.get("module") or node.get("node_id") or "")
+        for node in nodes or []
+        if str(node.get("module") or node.get("node_id") or "")
+    }
+    nodes_by_module = {
+        str(node.get("module") or node.get("node_id") or ""): node
+        for node in nodes or []
+        if str(node.get("module") or node.get("node_id") or "")
+    }
+    relations: List[Dict[str, Any]] = []
+    for row in file_inventory or []:
+        path = _repo_relpath(project_root, str(row.get("path") or ""))
+        if not path:
+            continue
+        kind = str(row.get("file_kind") or "")
+        owner, relation_type, evidence = _config_relation_owner(path, known_modules)
+        if not owner and kind != "config":
+            continue
+        if not owner:
+            continue
+        node = nodes_by_module.get(owner)
+        if node is not None:
+            config_files = node.setdefault("config_files", [])
+            if path not in config_files:
+                config_files.append(path)
+                config_files.sort()
+        row["scan_status"] = "config_attached"
+        row["graph_status"] = "attached"
+        row["decision"] = "attach_to_node"
+        row["candidate_node_id"] = owner
+        row["attached_to"] = owner
+        row["mapped_node_ids"] = [owner]
+        row["reason"] = "deterministically attached as config governance input"
+        relations.append(TypedRelation(
+            source_module=owner,
+            relation_type=relation_type,
+            target=path,
+            target_kind="config",
+            evidence=evidence,
+            source_file=path,
+        ).__dict__)
+    return relations
+
+
 def build_module_dependency_edges(
     modules: Dict[str, ModuleInfo],
     call_graph: CallGraph,
@@ -1442,6 +1550,8 @@ def _score_architecture_signals(module_name: str, rels: List[Dict[str, Any]]) ->
 
     if rel_types & {"http_route", "uses_task_metadata"}:
         domain_contract += 1.5
+    if rel_types & {"configures_role", "configures_analyzer", "configures_model_routing", "configures_runtime"}:
+        domain_contract += 1.25
     if tokens & set(_CONTRACT_NAME_TOKENS):
         domain_contract += 1.0
 
@@ -1468,6 +1578,8 @@ def _score_architecture_signals(module_name: str, rels: List[Dict[str, Any]]) ->
         roles.append("audit_evidence")
     if target_kinds & {"task", "task_metadata", "event"} and "orchestration" not in roles:
         roles.append("orchestration")
+    if rel_types & {"configures_role", "configures_analyzer", "configures_model_routing", "configures_runtime"} or tokens & set(_CONFIG_NAME_TOKENS):
+        roles.append("configuration")
     if not roles:
         roles.append("implementation")
 
@@ -1700,6 +1812,7 @@ def build_architecture_graph(
         group_map = {
             "db_table": ("state_assets", "State Assets"),
             "artifact": ("artifact_assets", "Artifact Assets"),
+            "config": ("config_assets", "Config Assets"),
             "event": ("contract_assets", "Contract Assets"),
             "interface": ("contract_assets", "Contract Assets"),
             "task": ("contract_assets", "Contract Assets"),
@@ -1736,6 +1849,8 @@ def build_architecture_graph(
             if important:
                 return f"artifact:{target}", target, False
             return "artifact:__artifact_assets", "Other Artifact Files", True
+        if target_kind == "config":
+            return f"config:{target}", target, False
         if target_kind == "event":
             return "event:__event_contracts", "Event Contracts", True
         if target_kind == "interface":
@@ -1795,7 +1910,7 @@ def build_architecture_graph(
         target_kind = str(rel.get("target_kind") or "")
         target = str(rel.get("target") or "")
         relation_type = str(rel.get("relation_type") or "")
-        if target_kind in {"db_table", "artifact", "event", "task", "task_metadata", "interface"} and target:
+        if target_kind in {"db_table", "artifact", "config", "event", "task", "task_metadata", "interface"} and target:
             asset_key, asset_title, aggregate_asset = asset_identity(target_kind, target)
             if asset_key not in asset_ids:
                 asset_id = f"L4.{len(asset_ids) + 1}"
@@ -2311,6 +2426,7 @@ def build_rebase_candidate_graph(
             "primary": [],
             "secondary": [],
             "test": [],
+            "config": [],
             "artifacts": [],
             "_deps": [],
             "verify_level": 1,
@@ -2344,6 +2460,11 @@ def build_rebase_candidate_graph(
             for f in (node.get("doc_coverage") or {}).get("doc_files", [])
             if f
         ]
+        config_files = [
+            _repo_relpath(project_root, f)
+            for f in (node.get("config_files") or [])
+            if f
+        ]
         out_nodes.append({
             "id": node_id,
             "title": module_name or str(node.get("node_id") or node_id),
@@ -2351,6 +2472,7 @@ def build_rebase_candidate_graph(
             "primary": sorted({p for p in primary if p}),
             "secondary": sorted({p for p in doc_files if p}),
             "test": sorted({p for p in test_files if p}),
+            "config": sorted({p for p in config_files if p}),
             "artifacts": [],
             "_deps": [],
             "verify_level": 1,
@@ -2360,6 +2482,7 @@ def build_rebase_candidate_graph(
                 "module": module_name,
                 "function_count": node.get("function_count", 0),
                 "functions": node.get("functions") or [],
+                "config_files": sorted({p for p in config_files if p}),
                 "architecture_signals": node.get("architecture_signals") or {},
                 "typed_relations": node.get("typed_relations") or [],
             },
@@ -2498,6 +2621,10 @@ def build_rebase_candidate_graph(
             "uses_task_metadata",
             "http_route",
             "creates_task",
+            "configures_role",
+            "configures_analyzer",
+            "configures_model_routing",
+            "configures_runtime",
         }
         if relation_type in producer_to_asset:
             return source, target
@@ -2932,7 +3059,18 @@ def _dependency_patch_direction_ok(
     target_layer = str(target_node.get("layer") or "")
     if edge_type == "depends_on":
         return source_layer == target_layer or {source_layer, target_layer} <= {"L4", "L7"}
-    if edge_type in {"reads_state", "reads_artifact", "consumes_event", "uses_task_metadata", "http_route", "creates_task"}:
+    if edge_type in {
+        "reads_state",
+        "reads_artifact",
+        "consumes_event",
+        "uses_task_metadata",
+        "http_route",
+        "creates_task",
+        "configures_role",
+        "configures_analyzer",
+        "configures_model_routing",
+        "configures_runtime",
+    }:
         return source_layer == "L4" and target_layer == "L7"
     if edge_type in {"owns_state", "writes_state", "writes_artifact", "emits_event"}:
         return source_layer == "L7" and target_layer == "L4"
@@ -3048,6 +3186,8 @@ def build_candidate_coverage_ledger(
     ]
     primary_owners: Dict[str, List[str]] = {}
     primary_modules: Dict[str, List[str]] = {}
+    config_owners: Dict[str, List[str]] = {}
+    config_modules: Dict[str, List[str]] = {}
     module_signals: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
         node_id = str(node.get("id") or "")
@@ -3062,6 +3202,13 @@ def build_candidate_coverage_ledger(
             primary_owners.setdefault(path, []).append(node_id)
             if module_name:
                 primary_modules.setdefault(path, []).append(module_name)
+        for config_path in node.get("config") or []:
+            path = _repo_relpath(project_root, str(config_path or ""))
+            if not path:
+                continue
+            config_owners.setdefault(path, []).append(node_id)
+            if module_name:
+                config_modules.setdefault(path, []).append(module_name)
 
     relation_types_by_file: Dict[str, List[str]] = {}
     for rel in phase_result.get("typed_relations") or []:
@@ -3077,8 +3224,8 @@ def build_candidate_coverage_ledger(
             continue
         file_kind = str(row.get("file_kind") or "unknown")
         scan_status = str(row.get("scan_status") or "")
-        graph_nodes = sorted(set(primary_owners.get(path, [])))
-        modules = sorted(set(primary_modules.get(path, [])))
+        graph_nodes = sorted(set(primary_owners.get(path, []) + config_owners.get(path, [])))
+        modules = sorted(set(primary_modules.get(path, []) + config_modules.get(path, [])))
         relation_counts = _count_values(relation_types_by_file.get(path, []))
         relation_total = sum(relation_counts.values())
         roles = sorted({
@@ -3106,6 +3253,12 @@ def build_candidate_coverage_ledger(
             else:
                 coverage_status = f"{file_kind}_consumer_orphan_audit"
                 audit_reasons.append(f"{file_kind}_not_attached_to_candidate")
+        elif file_kind == "config":
+            if scan_status == "config_attached" or graph_nodes:
+                coverage_status = "config_attached"
+            else:
+                coverage_status = "config_pending_semantic_classification"
+                audit_reasons.append("config_requires_ai_semantic_classification")
         elif scan_status == "ignored" or str(row.get("decision") or "") == "ignore":
             coverage_status = "ignored_or_generated"
         elif str(row.get("decision") or "") == "pending" or scan_status in {"pending_decision", "orphan"}:
@@ -3119,6 +3272,8 @@ def build_candidate_coverage_ledger(
                 recommended_action = "pm_relation_audit"
             elif file_kind in {"test", "doc"}:
                 recommended_action = "pm_consumer_attachment_audit"
+            elif file_kind == "config":
+                recommended_action = "semantic_config_classification"
             else:
                 recommended_action = "pm_file_classification"
 
@@ -3411,12 +3566,6 @@ def build_graph_v2_from_symbols(
         node["test_coverage"] = test_cov
         node["doc_coverage"] = doc_cov
 
-    fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes)
-    typed_relations = extract_typed_relations(project_root, modules)
-    enrich_nodes_with_architecture_signals(nodes, typed_relations)
-    architecture_graph = build_architecture_graph(nodes, typed_relations)
-    module_dependency_edges = build_module_dependency_edges(modules, call_graph)
-
     feature_clusters = synthesize_feature_clusters(
         project_root=project_root,
         modules=modules,
@@ -3424,12 +3573,10 @@ def build_graph_v2_from_symbols(
         sccs=sccs,
         nodes=nodes,
     )
+    fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes)
     if fallback_nodes:
         feature_clusters.extend(_fallback_feature_clusters(fallback_nodes))
         feature_clusters.sort(key=lambda c: c.get("cluster_fingerprint", ""))
-
-    # Step 4: Diff against existing
-    diff_report = diff_against_existing_graph(project_root, nodes)
 
     run_id = run_id or datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")
     try:
@@ -3453,6 +3600,27 @@ def build_graph_v2_from_symbols(
             "pending_decision_count": 0,
             "pending_decision_sample": [],
         }
+
+    typed_relations = extract_typed_relations(project_root, modules)
+    typed_relations.extend(materialize_config_file_relations(
+        project_root,
+        nodes,
+        file_inventory,
+    ))
+    try:
+        file_inventory_summary = summarize_file_inventory(file_inventory)  # type: ignore[name-defined]
+    except Exception:
+        pass
+    typed_relations = [r.__dict__ for r in _dedupe_typed_relations([
+        TypedRelation(**rel) if isinstance(rel, dict) else rel
+        for rel in typed_relations
+    ])]
+    enrich_nodes_with_architecture_signals(nodes, typed_relations)
+    architecture_graph = build_architecture_graph(nodes, typed_relations)
+    module_dependency_edges = build_module_dependency_edges(modules, call_graph)
+
+    # Step 4: Diff against existing
+    diff_report = diff_against_existing_graph(project_root, nodes)
 
     if dry_run:
         # R3: Write dry-run artifact

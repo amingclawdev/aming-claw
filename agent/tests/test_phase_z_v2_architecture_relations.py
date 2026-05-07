@@ -200,6 +200,102 @@ def test_filetree_fallback_covers_non_python_and_root_sources(tmp_path):
     assert any("dbservice/index.js" in cluster["primary_files"] for cluster in fallback_clusters)
 
 
+def test_config_files_materialize_as_first_class_graph_relations(tmp_path):
+    project = tmp_path / "project"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    _write(
+        str(project / "agent" / "governance" / "role_config.py"),
+        "def load_role_config():\n    return 'ok'\n",
+    )
+    _write(
+        str(project / "agent" / "governance" / "reconcile_semantic_config.py"),
+        "def load_semantic_enrichment_config():\n    return 'ok'\n",
+    )
+    _write(
+        str(project / "agent" / "pipeline_config.py"),
+        "def resolve_role_config():\n    return 'ok'\n",
+    )
+    _write(str(project / "config" / "roles" / "default" / "pm.yaml"), "role: pm\n")
+    _write(
+        str(project / "config" / "reconcile" / "semantic_enrichment.yaml"),
+        "analyzer: reconcile_semantic\n",
+    )
+    _write(str(project / "agent" / "pipeline_config.yaml.example"), "pipeline: {}\n")
+    _write(str(project / ".env.example"), "TOKEN=\n")
+
+    result = build_graph_v2_from_symbols(
+        str(project),
+        dry_run=True,
+        scratch_dir=str(scratch),
+    )
+
+    config_rows = {
+        row["path"]: row
+        for row in result["file_inventory"]
+        if row["path"].endswith((".yaml", ".example"))
+    }
+    assert config_rows["config/roles/default/pm.yaml"]["scan_status"] == "config_attached"
+    assert config_rows["config/reconcile/semantic_enrichment.yaml"]["scan_status"] == "config_attached"
+    assert config_rows["agent/pipeline_config.yaml.example"]["scan_status"] == "config_attached"
+    assert config_rows[".env.example"]["scan_status"] == "pending_decision"
+
+    triples = {
+        (rel["source_module"], rel["relation_type"], rel["target"], rel["target_kind"])
+        for rel in result["typed_relations"]
+    }
+    assert (
+        "agent.governance.role_config",
+        "configures_role",
+        "config/roles/default/pm.yaml",
+        "config",
+    ) in triples
+    assert (
+        "agent.governance.reconcile_semantic_config",
+        "configures_analyzer",
+        "config/reconcile/semantic_enrichment.yaml",
+        "config",
+    ) in triples
+    assert (
+        "agent.pipeline_config",
+        "configures_model_routing",
+        "agent/pipeline_config.yaml.example",
+        "config",
+    ) in triples
+
+    candidate = build_rebase_candidate_graph(
+        str(project),
+        result,
+        session_id="session-config-test",
+        run_id=result["run_id"],
+    )
+    graph = candidate["deps_graph"]
+    by_title = {node["title"]: node for node in graph["nodes"]}
+    role_config_node = by_title["agent.governance.role_config"]
+    assert "config/roles/default/pm.yaml" in role_config_node["config"]
+    assert "config/roles/default/pm.yaml" in role_config_node["metadata"]["config_files"]
+    config_assets = [
+        node for node in graph["nodes"]
+        if node["layer"] == "L4" and node["metadata"].get("asset_key", "").startswith("config:")
+    ]
+    assert any(node["title"] == "config/roles/default/pm.yaml" for node in config_assets)
+    config_asset_id = next(
+        node["id"] for node in config_assets
+        if node["title"] == "config/roles/default/pm.yaml"
+    )
+    assert any(
+        link["source"] == config_asset_id
+        and link["target"] == role_config_node["id"]
+        and link["type"] == "configures_role"
+        for link in graph["links"]
+    )
+    ledger = build_candidate_coverage_ledger(str(project), result, candidate)
+    by_path = {row["path"]: row for row in ledger["rows"]}
+    assert by_path["config/roles/default/pm.yaml"]["coverage_status"] == "config_attached"
+    assert by_path[".env.example"]["coverage_status"] == "config_pending_semantic_classification"
+    assert by_path[".env.example"]["recommended_chain_action"] == "semantic_config_classification"
+
+
 def test_root_python_source_gets_symbol_profile_without_fallback(tmp_path):
     project = tmp_path / "project"
     scratch = tmp_path / "scratch"

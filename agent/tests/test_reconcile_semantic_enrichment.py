@@ -46,8 +46,10 @@ def _graph(node_id: str = "L7.1") -> dict:
                     "primary": ["agent/governance/backlog_runtime.py"],
                     "secondary": ["docs/dev/backlog-runtime.md"],
                     "test": ["agent/tests/test_backlog_runtime.py"],
+                    "config": ["config/roles/default/pm.yaml"],
                     "metadata": {
                         "subsystem": "backlog",
+                        "config_files": ["config/roles/default/pm.yaml"],
                         "functions": [
                             {
                                 "name": "claim_next",
@@ -70,6 +72,7 @@ def _create_snapshot(conn: sqlite3.Connection, project: Path, *, snapshot_kind: 
     )
     _write(project / "docs" / "dev" / "backlog-runtime.md", "# Backlog Runtime\n")
     _write(project / "agent" / "tests" / "test_backlog_runtime.py", "def test_claim_next():\n    assert True\n")
+    _write(project / "config" / "roles" / "default" / "pm.yaml", "role: pm\n")
     store.create_graph_snapshot(
         conn,
         PID,
@@ -98,6 +101,7 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
             "applied_feedback_ids": feedback_ids,
             "doc_coverage_review": {"bound": True, "action": "keep"},
             "test_coverage_review": {"bound": True, "action": "keep"},
+            "config_coverage_review": {"bound": True, "action": "keep"},
         }
 
     first = run_semantic_enrichment(
@@ -118,6 +122,8 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
     assert seen_payloads[0]["payload"]["instructions"]["analyzer"] == "reconcile_semantic"
     assert seen_payloads[0]["payload"]["instructions"]["prompt_template"]
     assert seen_payloads[0]["payload"]["feature"]["source_excerpt"]
+    assert seen_payloads[0]["payload"]["feature"]["config"] == ["config/roles/default/pm.yaml"]
+    assert seen_payloads[0]["payload"]["feature"]["config_refs"][0]["path"] == "config/roles/default/pm.yaml"
 
     second = run_semantic_enrichment(
         conn,
@@ -140,6 +146,8 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
     assert second["feedback_round"] == 1
     feature = second["semantic_index"]["features"][0]
     assert feature["applied_feedback_ids"] == ["fb-doc-1"]
+    assert feature["config_coverage_review"]["bound"] is True
+    assert feature["config"] == ["config/roles/default/pm.yaml"]
     assert feature["unresolved_feedback_ids"] == []
     assert load_review_feedback(PID, "full-semantic-test")[0]["feedback_id"] == "fb-doc-1"
     assert seen_payloads[-1]["payload"]["review_feedback"][0]["expected_change"] == "Mention persisted backlog state."
