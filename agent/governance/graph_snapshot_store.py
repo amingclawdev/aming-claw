@@ -573,6 +573,89 @@ def get_active_graph_snapshot(
     return dict(row) if row else None
 
 
+def get_latest_scan_baseline(conn: sqlite3.Connection, project_id: str) -> dict[str, Any] | None:
+    try:
+        row = conn.execute(
+            """
+            SELECT baseline_id, chain_version, scope_value, created_at
+            FROM version_baselines
+            WHERE project_id = ? AND scope_kind = 'commit_sweep'
+            ORDER BY baseline_id DESC LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return dict(row) if row else None
+
+
+def list_pending_scope_reconcile(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    statuses: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id]
+    sql = "SELECT * FROM pending_scope_reconcile WHERE project_id = ?"
+    status_values = [str(s) for s in statuses or [] if s]
+    if status_values:
+        placeholders = ",".join("?" for _ in status_values)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(status_values)
+    sql += " ORDER BY queued_at, commit_sha"
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def graph_governance_status(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
+    active = get_active_graph_snapshot(conn, project_id)
+    scan = get_latest_scan_baseline(conn, project_id)
+    pending = list_pending_scope_reconcile(
+        conn,
+        project_id,
+        statuses=[
+            PENDING_STATUS_QUEUED,
+            PENDING_STATUS_RUNNING,
+            PENDING_STATUS_FAILED,
+        ],
+    )
+    return {
+        "project_id": project_id,
+        "active_snapshot_id": active.get("snapshot_id") if active else "",
+        "graph_snapshot_commit": active.get("commit_sha") if active else "",
+        "materialized_graph_baseline_commit": active.get("commit_sha") if active else "",
+        "scan_baseline_commit": scan.get("chain_version") if scan else "",
+        "scan_baseline_id": scan.get("baseline_id") if scan else None,
+        "pending_scope_reconcile_count": len(pending),
+        "pending_scope_reconcile": pending,
+    }
+
+
+def strict_graph_ready(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    target_commit: str,
+) -> dict[str, Any]:
+    status = graph_governance_status(conn, project_id)
+    graph_commit = status.get("materialized_graph_baseline_commit") or ""
+    ok = bool(target_commit and graph_commit == target_commit)
+    reason = ""
+    if not graph_commit:
+        reason = "no_active_graph_snapshot"
+    elif not target_commit:
+        reason = "missing_target_commit"
+    elif graph_commit != target_commit:
+        reason = "graph_snapshot_commit_mismatch"
+    return {
+        "ok": ok,
+        "reason": reason,
+        "target_commit": target_commit,
+        **status,
+    }
+
+
 def import_existing_graph_snapshot(
     conn: sqlite3.Connection,
     project_id: str,
@@ -734,14 +817,18 @@ __all__ = [
     "create_graph_snapshot",
     "ensure_schema",
     "get_active_graph_snapshot",
+    "get_latest_scan_baseline",
+    "graph_governance_status",
     "index_graph_snapshot",
     "graph_payload_stats",
     "import_existing_graph_snapshot",
+    "list_pending_scope_reconcile",
     "queue_pending_scope_reconcile",
     "record_drift",
     "select_existing_graph_source",
     "snapshot_companion_dir",
     "snapshot_graph_path",
     "snapshot_id_for",
+    "strict_graph_ready",
     "write_companion_files",
 ]

@@ -309,3 +309,45 @@ def test_import_existing_graph_prefers_non_empty_baseline_companion(conn):
     assert source["source_kind"] == "baseline_companion"
     assert source["source_ref"] == "1"
     assert source["stats"] == {"nodes": 1, "edges": 1}
+
+
+def test_strict_graph_ready_ignores_scan_baseline_when_active_graph_is_stale(conn):
+    _ensure_schema(conn)
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-active-old",
+        commit_sha="old-graph",
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    create_baseline(
+        conn,
+        PID,
+        chain_version="new-scan",
+        trigger="reconcile-task",
+        triggered_by="auto-chain",
+        scope_kind="commit_sweep",
+        scope_value="old-graph..new-scan",
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="new-scan",
+        parent_commit_sha="old-graph",
+        evidence={"source": "test"},
+    )
+
+    status = store.graph_governance_status(conn, PID)
+    assert status["materialized_graph_baseline_commit"] == "old-graph"
+    assert status["scan_baseline_commit"] == "new-scan"
+    assert status["pending_scope_reconcile_count"] == 1
+
+    readiness = store.strict_graph_ready(conn, PID, target_commit="new-scan")
+    assert readiness["ok"] is False
+    assert readiness["reason"] == "graph_snapshot_commit_mismatch"
+    assert readiness["scan_baseline_commit"] == "new-scan"
+
+    ready = store.strict_graph_ready(conn, PID, target_commit="old-graph")
+    assert ready["ok"] is True
+    assert ready["reason"] == ""
