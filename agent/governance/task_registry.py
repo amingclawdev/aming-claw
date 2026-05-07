@@ -266,6 +266,13 @@ def create_task(
     # recovery.  Auto-chain historically carried chain_id mostly in dedicated
     # columns; graph event consumers read metadata_json, so mirror it here.
     metadata = dict(metadata or {})
+    try:
+        from .batch_jobs import normalize_job_metadata
+
+        metadata = normalize_job_metadata(metadata, task_type=task_type)
+    except Exception:
+        # job_type is advisory metadata; never break legacy task creation.
+        metadata = dict(metadata or {})
     metadata.setdefault("project_id", project_id)
     if parent_task_id:
         metadata.setdefault("parent_task_id", parent_task_id)

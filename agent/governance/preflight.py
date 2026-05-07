@@ -393,7 +393,24 @@ def check_queue(conn, project_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 6. Bootstrap check — graph has nodes, node_state populated, version exists
+# 6. Batch worktree check — stale batch worktrees are reported, never deleted
+# ---------------------------------------------------------------------------
+
+def check_batch_worktrees(conn, project_id: str) -> dict:
+    """Report stale .worktrees entries not referenced by active batch metadata."""
+    try:
+        from .batch_jobs import report_stale_worktrees
+
+        details = report_stale_worktrees(conn, project_id, repo_root_path=".")
+        if details.get("stale_count"):
+            return _warn(details)
+        return _pass(details)
+    except Exception as e:
+        return _fail({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 7. Bootstrap check — graph has nodes, node_state populated, version exists
 # ---------------------------------------------------------------------------
 
 def check_bootstrap(conn, project_id: str) -> dict:
@@ -517,6 +534,7 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
     checks["graph"] = check_graph(conn, project_id)
     checks["coverage"] = check_coverage(project_id)
     checks["queue"] = check_queue(conn, project_id)
+    checks["batch_worktrees"] = check_batch_worktrees(conn, project_id)
 
     # Collect warnings and blockers
     for name, result in checks.items():
@@ -528,6 +546,8 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
                 warnings.append(f"{len(details['unmapped_files'])} unmapped file(s) in CODE_DOC_MAP")
             elif name == "queue" and details.get("stuck_tasks"):
                 warnings.append(f"{len(details['stuck_tasks'])} stuck task(s)")
+            elif name == "batch_worktrees" and details.get("stale_worktrees"):
+                warnings.append(f"{len(details['stale_worktrees'])} stale batch worktree(s)")
             elif name == "version":
                 if details.get("sync_stale_seconds"):
                     warnings.append(f"version sync stale ({details['sync_stale_seconds']}s)")

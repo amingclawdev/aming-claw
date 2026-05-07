@@ -10,6 +10,7 @@ Usage:
 import os
 import sys
 import logging
+import json
 
 try:
     import click
@@ -59,6 +60,22 @@ def bootstrap(path, name):
     from agent.governance.project_service import bootstrap_project
     result = bootstrap_project(workspace_path=path, project_name=name)
     click.echo(f"Bootstrap result: {result}")
+
+
+@main.command("scan")
+@click.option("--path", default=".", help="External project path to scan")
+@click.option("--project-id", default="", help="Governance project id")
+@click.option("--session-id", default="", help="Optional deterministic scan session id")
+def scan(path, project_id, session_id):
+    """Scan an external project into a local .aming-claw candidate workspace."""
+    from agent.governance.external_project_governance import scan_external_project
+
+    result = scan_external_project(
+        path,
+        project_id=project_id or None,
+        session_id=session_id or None,
+    )
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
 @main.command()

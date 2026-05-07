@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # ---------------------------------------------------------------------------
 EXCLUDE_DIRS: frozenset[str] = frozenset({
     "__pycache__", ".git", "node_modules", ".venv", "venv",
-    ".claude", ".worktrees", "shared-volume", "runtime",
+    ".aming-claw", ".claude", ".worktrees", "shared-volume", "runtime",
     ".mypy_cache", ".pytest_cache", "build", "dist",
 })
 

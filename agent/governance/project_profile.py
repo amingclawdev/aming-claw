@@ -21,7 +21,7 @@ TEST_DIR_NAMES = {"test", "tests", "__tests__"}
 DOC_DIR_NAMES = {"doc", "docs", "documentation"}
 DEFAULT_EXCLUDE_ROOTS = {
     "__pycache__", ".git", "node_modules", ".venv", "venv", ".tox",
-    ".claude", ".worktrees", "shared-volume", "runtime", ".mypy_cache",
+    ".aming-claw", ".claude", ".worktrees", "shared-volume", "runtime", ".mypy_cache",
     ".pytest_cache", ".observer-cache", ".governance-cache", "build", "dist",
     "target", "coverage", ".next", ".nuxt", ".eggs", "search-workspace",
 }

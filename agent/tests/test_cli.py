@@ -20,7 +20,7 @@ class TestCliHelp:
         runner = CliRunner()
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("init", "bootstrap", "status", "run-executor"):
+        for cmd in ("init", "bootstrap", "scan", "status", "run-executor"):
             assert cmd in result.output
 
 

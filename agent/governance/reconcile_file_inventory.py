@@ -20,6 +20,12 @@ CONFIG_FILENAMES = {
 CONFIG_EXTENSIONS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
 SCRIPT_EXTENSIONS = {".sh", ".bash", ".ps1", ".bat", ".cmd"}
 DOC_EXTENSIONS = {".md", ".rst", ".txt", ".adoc"}
+INDEX_DOC_FILENAMES = {
+    "README.md",
+    "WORKFLOW.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+}
 GENERATED_FILENAMES = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
     "Cargo.lock", ".coverage", "governance.db",
@@ -116,7 +122,7 @@ def _language_for(path: str, kind: str) -> str:
         return "json"
     if suffix in {".toml"}:
         return "toml"
-    if kind == "doc":
+    if kind in {"doc", "index_doc"}:
         return "markdown" if suffix == ".md" else "text"
     return ""
 
@@ -140,6 +146,8 @@ def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
         return "config"
     if profile.is_test_path(rel):
         return "test"
+    if is_index_doc_path(rel):
+        return "index_doc"
     if profile.is_doc_path(rel) or suffix in DOC_EXTENSIONS:
         return "doc"
     if profile.is_production_source_path(rel):
@@ -165,6 +173,15 @@ def is_archive_doc_path(rel_path: str) -> bool:
         return True
     if rel.startswith("docs/dev/") and name.lower().endswith((".md", ".rst", ".txt", ".adoc")):
         return name.lower().startswith(DOC_ARCHIVE_NAME_PREFIXES)
+    return False
+
+
+def is_index_doc_path(rel_path: str) -> bool:
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    name = Path(rel).name
+    lower_name = name.lower()
+    if name in INDEX_DOC_FILENAMES or lower_name in {"readme.md", "index.md"}:
+        return True
     return False
 
 
@@ -257,10 +274,14 @@ def build_file_inventory(
             scan_status = "support"
             decision = "keep"
             reason = "test support file; audited as non-feature-specific support"
-        elif kind == "doc" and is_archive_doc_path(rel):
+        elif kind in {"doc", "index_doc"} and is_archive_doc_path(rel):
             scan_status = "archive"
             decision = "keep"
             reason = "historical or operator archive doc; audited as nonblocking"
+        elif kind == "index_doc":
+            scan_status = "index_asset"
+            decision = "attach_to_index_wrapper"
+            reason = "index/navigation documentation; attach to project feature index"
         elif kind in {"source", "test", "doc"}:
             scan_status = "orphan"
             reason = f"{kind} file not attached to any feature cluster"
