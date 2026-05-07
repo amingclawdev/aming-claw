@@ -6,6 +6,7 @@ describes the broader work container and branch strategy.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -23,6 +24,9 @@ JOB_SCOPE_RECONCILE = "scope_reconcile"
 JOB_MANUAL_FIX = "manual_fix"
 JOB_BATCH_MIGRATION = "batch_migration"
 JOB_WORKFLOW_IMPROVEMENT = "workflow_improvement"
+BRANCH_GRAPH_SCHEMA_VERSION = 1
+BRANCH_GRAPH_CACHE_REL = ".aming-claw/cache/branches"
+GRAPH_JSON_FILENAME = "graph.json"
 
 VALID_JOB_TYPES = {
     JOB_FEATURE_WORK,
@@ -70,6 +74,7 @@ class BranchStrategy:
     worktree_relpath: str
     direct: bool = False
     merge_policy: str = "merge_gatekeeper"
+    project_id: str = ""
 
     def to_metadata(self) -> dict[str, Any]:
         return asdict(self)
@@ -100,9 +105,24 @@ def _normalize_token(value: Any, fallback: str) -> str:
     return text or fallback
 
 
+def _path_token(value: Any, fallback: str) -> str:
+    return _normalize_token(value, fallback).replace("/", "-")
+
+
 def _short_commit(value: str) -> str:
     text = str(value or "").strip()
     return text[:7] if text else "unknown"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _json_load(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return default
 
 
 def _git_output(args: list[str], *, cwd: Path, check: bool = True) -> str:
@@ -231,7 +251,133 @@ def resolve_branch_strategy(
         worktree_relpath=worktree_rel,
         direct=direct,
         merge_policy=merge_policy,
+        project_id=project_id,
     )
+
+
+def branch_graph_plan(strategy: BranchStrategy, *, status: str = "planned") -> dict[str, Any]:
+    """Return deterministic branch-local graph paths for a worktree strategy."""
+    if strategy.direct or not strategy.worktree_path:
+        return {"required": False, "status": "not_applicable"}
+    token = _path_token(strategy.work_branch, "branch")
+    graph_dir = Path(strategy.worktree_path) / BRANCH_GRAPH_CACHE_REL / token
+    return {
+        "required": True,
+        "status": status,
+        "schema_version": BRANCH_GRAPH_SCHEMA_VERSION,
+        "project_id": strategy.project_id,
+        "work_branch": strategy.work_branch,
+        "target_branch": strategy.target_branch,
+        "base_commit": strategy.base_commit,
+        "graph_dir": str(graph_dir),
+        "snapshot_path": str(graph_dir / "graph.base.json"),
+        "overlay_path": str(graph_dir / "graph.branch.overlay.json"),
+        "manifest_path": str(graph_dir / "manifest.json"),
+    }
+
+
+def _resolve_graph_source_path(
+    *,
+    repo_root_path: str | Path,
+    project_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> Path | None:
+    metadata = metadata or {}
+    root = repo_root(repo_root_path)
+    override = str(metadata.get("graph_path") or metadata.get("graph_json_path") or "").strip()
+    if override:
+        p = Path(override)
+        return p if p.is_absolute() else root / p
+    if project_id:
+        try:
+            from .db import _resolve_project_dir
+            resolved = _resolve_project_dir(project_id) / GRAPH_JSON_FILENAME
+            if resolved.exists():
+                return resolved
+        except Exception:
+            pass
+        return (
+            root
+            / "shared-volume"
+            / "codex-tasks"
+            / "state"
+            / "governance"
+            / project_id
+            / GRAPH_JSON_FILENAME
+        )
+    return None
+
+
+def _read_graph_source(path: Path | None) -> tuple[bytes, bool]:
+    if path and path.exists():
+        return path.read_bytes(), True
+    return b"{}\n", False
+
+
+def initialize_branch_graph(
+    strategy: BranchStrategy,
+    *,
+    repo_root_path: str | Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create branch-local graph snapshot and overlay artifacts.
+
+    The artifacts live under ``.aming-claw/cache`` in the worktree. They are
+    runtime governance state for the branch and are read by the batch merge gate.
+    """
+    if strategy.direct:
+        return branch_graph_plan(strategy, status="not_applicable")
+    worktree = ensure_worktree_path_safe(repo_root_path, strategy.worktree_path)
+    if not worktree.exists():
+        raise BatchJobError(f"worktree does not exist for branch graph init: {worktree}")
+
+    plan = branch_graph_plan(strategy, status="ready")
+    graph_dir = Path(plan["graph_dir"])
+    graph_dir.mkdir(parents=True, exist_ok=True)
+
+    source_path = _resolve_graph_source_path(
+        repo_root_path=repo_root_path,
+        project_id=strategy.project_id,
+        metadata=metadata,
+    )
+    graph_bytes, source_exists = _read_graph_source(source_path)
+    base_graph_sha = _sha256_bytes(graph_bytes)
+
+    snapshot_path = Path(plan["snapshot_path"])
+    snapshot_path.write_bytes(graph_bytes)
+
+    overlay_path = Path(plan["overlay_path"])
+    if not overlay_path.exists():
+        overlay_doc = {
+            "schema_version": BRANCH_GRAPH_SCHEMA_VERSION,
+            "project_id": strategy.project_id,
+            "work_branch": strategy.work_branch,
+            "target_branch": strategy.target_branch,
+            "base_commit": strategy.base_commit,
+            "base_graph_sha256": base_graph_sha,
+            "covered_files": [],
+            "file_states": {},
+            "graph_delta": {},
+            "created_at": utc_now(),
+        }
+        overlay_path.write_text(
+            json.dumps(overlay_doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    manifest = {
+        **plan,
+        "status": "ready",
+        "source_graph_path": str(source_path or ""),
+        "source_graph_exists": source_exists,
+        "base_graph_sha256": base_graph_sha,
+        "created_at": utc_now(),
+    }
+    Path(plan["manifest_path"]).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def _metadata_from_row(row: sqlite3.Row | tuple) -> dict[str, Any]:
@@ -307,13 +453,20 @@ def record_task_batch_state(
         raise BatchJobError(f"task not found: {task_id}")
     meta = parse_metadata(row["metadata_json"] if hasattr(row, "keys") else row[0])
     meta["batch_status"] = batch_status
+    evidence = dict(evidence or {})
+    branch_graph = evidence.get("branch_graph")
+    worktree_evidence = evidence.get("worktree")
+    if not branch_graph and isinstance(worktree_evidence, dict):
+        branch_graph = worktree_evidence.get("branch_graph")
+    if isinstance(branch_graph, dict):
+        meta["branch_graph"] = dict(branch_graph)
     history = meta.get("batch_state_history")
     if not isinstance(history, list):
         history = []
     history.append({
         "status": batch_status,
         "ts": utc_now(),
-        "evidence": dict(evidence or {}),
+        "evidence": evidence,
     })
     meta["batch_state_history"] = history
     conn.execute(
@@ -369,6 +522,9 @@ def create_batch_task(
         "worktree_relpath": strategy.worktree_relpath,
         "engine_version": meta.get("engine_version", ""),
         "observer_override": bool(observer_override),
+        "project_id": project_id,
+        "branch_graph_required": bool(meta.get("branch_graph_required", True)),
+        "branch_graph": branch_graph_plan(strategy, status="planned"),
     })
     from . import task_registry
 
@@ -419,11 +575,13 @@ def create_worktree(strategy: BranchStrategy, *, repo_root_path: str | Path) -> 
     worktree = ensure_worktree_path_safe(root, strategy.worktree_path)
 
     if worktree.exists() and (worktree / ".git").exists():
+        branch_graph = initialize_branch_graph(strategy, repo_root_path=repo_root_path)
         return {
             "created": False,
             "branch": strategy.work_branch,
             "worktree_path": str(worktree),
             "reason": "already_exists",
+            "branch_graph": branch_graph,
         }
 
     if not branch_exists(root, strategy.work_branch):
@@ -431,10 +589,12 @@ def create_worktree(strategy: BranchStrategy, *, repo_root_path: str | Path) -> 
 
     worktree.parent.mkdir(parents=True, exist_ok=True)
     _git_output(["worktree", "add", str(worktree), strategy.work_branch], cwd=root)
+    branch_graph = initialize_branch_graph(strategy, repo_root_path=repo_root_path)
     return {
         "created": True,
         "branch": strategy.work_branch,
         "worktree_path": str(worktree),
+        "branch_graph": branch_graph,
     }
 
 
@@ -478,8 +638,161 @@ def _strategy_from_metadata(meta: dict[str, Any]) -> BranchStrategy:
         "worktree_relpath": meta.get("worktree_relpath", ""),
         "direct": bool(meta.get("direct", False)),
         "merge_policy": meta.get("merge_policy", "merge_gatekeeper"),
+        "project_id": meta.get("project_id", ""),
     }
     return BranchStrategy(**required)
+
+
+def _normalize_relpath(path: str) -> str:
+    rel = str(path or "").replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel
+
+
+def _graph_referenced_files(graph_doc: Any) -> set[str]:
+    files: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            rel = _normalize_relpath(value)
+            if rel:
+                files.add(rel)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+
+    nodes: list[Any] = []
+    if isinstance(graph_doc, dict):
+        raw_nodes = graph_doc.get("nodes")
+        if isinstance(raw_nodes, dict):
+            nodes.extend(raw_nodes.values())
+        elif isinstance(raw_nodes, list):
+            nodes.extend(raw_nodes)
+        deps_graph = graph_doc.get("deps_graph")
+        deps_nodes = deps_graph.get("nodes") if isinstance(deps_graph, dict) else []
+        if isinstance(deps_nodes, dict):
+            nodes.extend(deps_nodes.values())
+        elif isinstance(deps_nodes, list):
+            nodes.extend(deps_nodes)
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for key in ("primary", "primary_file", "secondary", "test", "tests", "test_files"):
+            add(node.get(key))
+    return files
+
+
+def _overlay_covered_files(overlay_doc: Any) -> set[str]:
+    files: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            rel = _normalize_relpath(value)
+            if rel:
+                files.add(rel)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                add(key)
+                add(item)
+
+    if isinstance(overlay_doc, dict):
+        for key in ("covered_files", "changed_files", "target_files"):
+            add(overlay_doc.get(key))
+        add(overlay_doc.get("file_states"))
+        graph_delta = overlay_doc.get("graph_delta")
+        if isinstance(graph_delta, dict):
+            for key in ("covered_files", "changed_files", "target_files"):
+                add(graph_delta.get(key))
+    return files
+
+
+def _changed_files_since_base(root: Path, base_commit: str, work_branch: str) -> list[str]:
+    if not base_commit or not work_branch:
+        return []
+    out = _git_output(["diff", "--name-only", f"{base_commit}..{work_branch}"], cwd=root)
+    return [
+        rel for rel in (_normalize_relpath(line.strip()) for line in out.splitlines())
+        if rel and not rel.startswith(".aming-claw/cache/")
+    ]
+
+
+def validate_branch_graph_gate(
+    *,
+    repo_root_path: str | Path,
+    strategy: BranchStrategy,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate branch-local graph state before a batch merge."""
+    required = bool(metadata.get("branch_graph_required", True))
+    if not required:
+        return {"status": "skipped", "required": False, "reason": "branch_graph_required=false"}
+
+    root = repo_root(repo_root_path)
+    branch_graph = metadata.get("branch_graph")
+    if not isinstance(branch_graph, dict) or branch_graph.get("status") != "ready":
+        return {"status": "fail", "required": True, "reason": "branch graph snapshot is not ready"}
+
+    snapshot_path = Path(str(branch_graph.get("snapshot_path") or ""))
+    overlay_path = Path(str(branch_graph.get("overlay_path") or ""))
+    manifest_path = Path(str(branch_graph.get("manifest_path") or ""))
+    missing = [str(p) for p in (snapshot_path, overlay_path, manifest_path) if not p.exists()]
+    if missing:
+        return {"status": "fail", "required": True, "reason": "branch graph artifact missing", "missing": missing}
+
+    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot_sha = _sha256_bytes(snapshot_bytes)
+    expected_sha = str(branch_graph.get("base_graph_sha256") or "")
+    if expected_sha and snapshot_sha != expected_sha:
+        return {
+            "status": "fail",
+            "required": True,
+            "reason": "branch graph snapshot hash mismatch",
+            "expected": expected_sha,
+            "actual": snapshot_sha,
+        }
+
+    source_path_raw = str(branch_graph.get("source_graph_path") or "")
+    source_path = Path(source_path_raw) if source_path_raw else None
+    if branch_graph.get("source_graph_exists") and source_path and source_path.exists():
+        current_source_sha = _sha256_bytes(source_path.read_bytes())
+        if expected_sha and current_source_sha != expected_sha:
+            return {
+                "status": "fail",
+                "required": True,
+                "reason": "target graph changed since branch snapshot",
+                "expected": expected_sha,
+                "actual": current_source_sha,
+                "source_graph_path": str(source_path),
+            }
+
+    changed_files = _changed_files_since_base(root, strategy.base_commit, strategy.work_branch)
+    graph_doc = _json_load(snapshot_path, {})
+    overlay_doc = _json_load(overlay_path, {})
+    known_files = _graph_referenced_files(graph_doc)
+    overlay_files = _overlay_covered_files(overlay_doc)
+    uncovered = [
+        path for path in changed_files
+        if path not in known_files and path not in overlay_files
+    ]
+    return {
+        "status": "pass" if not uncovered else "fail",
+        "required": True,
+        "base_graph_sha256": expected_sha or snapshot_sha,
+        "snapshot_path": str(snapshot_path),
+        "overlay_path": str(overlay_path),
+        "manifest_path": str(manifest_path),
+        "source_graph_path": str(source_path or ""),
+        "changed_files": changed_files,
+        "known_changed_files": [path for path in changed_files if path in known_files],
+        "overlay_covered_files": [path for path in changed_files if path in overlay_files],
+        "uncovered_changed_files": uncovered,
+        "coverage_status": "covered" if not uncovered else "uncovered",
+    }
 
 
 def batch_merge_plan(conn: sqlite3.Connection, task_id: str, *, repo_root_path: str | Path) -> dict[str, Any]:
@@ -491,6 +804,15 @@ def batch_merge_plan(conn: sqlite3.Connection, task_id: str, *, repo_root_path: 
     root = repo_root(repo_root_path)
     if strategy.direct:
         raise BatchJobError("batch merge requires a branch/worktree strategy")
+    graph_gate = validate_branch_graph_gate(
+        repo_root_path=root,
+        strategy=strategy,
+        metadata=meta,
+    )
+    if graph_gate.get("status") == "fail":
+        raise BatchJobError(
+            f"branch graph gate failed: {graph_gate.get('reason') or graph_gate.get('coverage_status')}"
+        )
     return {
         "task_id": task_id,
         "job_type": meta.get("job_type"),
@@ -499,6 +821,7 @@ def batch_merge_plan(conn: sqlite3.Connection, task_id: str, *, repo_root_path: 
         "worktree_path": strategy.worktree_path,
         "merge_policy": strategy.merge_policy,
         "repo_root": str(root),
+        "graph_gate": graph_gate,
     }
 
 
