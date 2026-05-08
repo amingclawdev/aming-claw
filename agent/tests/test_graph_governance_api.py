@@ -661,6 +661,66 @@ def test_graph_governance_feedback_queue_claim_lease_blocks_duplicate_workers(co
     assert item["review_claim"]["worker_id"] == "reviewer-a"
 
 
+def test_feedback_review_state_carries_forward_by_fingerprint(conn):
+    base = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-base-feedback",
+        commit_sha="base",
+        snapshot_kind="scope",
+        graph_json=_graph(),
+    )
+    current = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-current-feedback",
+        commit_sha="head",
+        snapshot_kind="scope",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    issue = {
+        "node_id": "L7.1",
+        "reason": "dependency_patch_suggestions",
+        "summary": "Add typed relation to feedback router.",
+        "target": "agent.governance.reconcile_feedback",
+        "type": "add_typed_relation",
+    }
+    base_classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        base["snapshot_id"],
+        source_round="round-001",
+        created_by="observer",
+        issues=[issue],
+    )
+    base_item = base_classified["items"][0]
+    reconcile_feedback.review_feedback_item(
+        PID,
+        base["snapshot_id"],
+        base_item["feedback_id"],
+        decision="graph_correction",
+        rationale="Reviewed on base snapshot.",
+        confidence=0.82,
+        actor="reviewer-a",
+    )
+
+    current_classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        current["snapshot_id"],
+        source_round="round-001",
+        created_by="observer",
+        issues=[issue],
+        base_snapshot_id=base["snapshot_id"],
+    )
+
+    carried = current_classified["items"][0]
+    assert current_classified["carry_forward"]["carried_forward_count"] == 1
+    assert carried["status"] == "reviewed"
+    assert carried["reviewer_decision"] == "graph_correction"
+    assert carried["reviewer_rationale"] == "Reviewed on base snapshot."
+    assert carried["carried_from_snapshot_id"] == base["snapshot_id"]
+
+
 def test_graph_governance_status_observation_detector_classifies_graph_candidates(conn):
     graph = {
         "deps_graph": {

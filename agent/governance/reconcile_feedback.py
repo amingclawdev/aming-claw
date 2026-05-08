@@ -67,6 +67,22 @@ MAX_GREP_PATTERN_CHARS = 200
 MAX_GREP_FILE_BYTES = 2_000_000
 DEFAULT_REVIEW_LEASE_SECONDS = 1800
 
+_REVIEW_CARRY_FORWARD_KEYS = {
+    "status",
+    "final_feedback_kind",
+    "reviewed_status_observation_category",
+    "reviewer_decision",
+    "reviewer_rationale",
+    "reviewer_model",
+    "reviewer_confidence",
+    "reviewed_by",
+    "reviewed_at",
+    "requires_human_signoff",
+    "accepted_by",
+    "accepted_at",
+    "backlog_bug_id",
+}
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1068,6 +1084,18 @@ def _short_hash(payload: Any, length: int = 10) -> str:
     return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()[:length]
 
 
+def _feedback_fingerprint(item: dict[str, Any]) -> str:
+    return _short_hash({
+        "source_node_ids": sorted(_source_nodes(item)),
+        "feedback_kind": str(item.get("feedback_kind") or ""),
+        "target_type": str(item.get("target_type") or ""),
+        "target_id": str(item.get("target_id") or ""),
+        "issue_type": str(item.get("issue_type") or ""),
+        "issue": str(item.get("issue") or ""),
+        "status_observation_category": str(item.get("status_observation_category") or ""),
+    }, 16)
+
+
 def _as_text(value: Any) -> str:
     if value is None:
         return ""
@@ -1385,7 +1413,7 @@ def normalize_open_issue(
     feedback_id = str(issue.get("feedback_id") or issue.get("id") or f"rf-{_short_hash(seed)}")
     target_id = str(issue.get("target") or issue.get("target_id") or (nodes[0] if nodes else "")).strip()
     now = _utc_now()
-    return {
+    normalized = {
         "feedback_id": feedback_id,
         "project_id": project_id,
         "snapshot_id": snapshot_id,
@@ -1429,6 +1457,8 @@ def normalize_open_issue(
         "accepted_at": "",
         "backlog_bug_id": "",
     }
+    normalized["feedback_fingerprint"] = _feedback_fingerprint(normalized)
+    return normalized
 
 
 def _upsert_items(
@@ -1486,6 +1516,79 @@ def _upsert_items(
     }
 
 
+def carry_forward_feedback_review_state(
+    project_id: str,
+    snapshot_id: str,
+    base_snapshot_id: str,
+    *,
+    actor: str = "system",
+    feedback_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Carry reviewer decisions from a base snapshot when feedback fingerprints match."""
+    if not base_snapshot_id or base_snapshot_id == snapshot_id:
+        return {"ok": True, "carried_forward_count": 0, "base_snapshot_id": base_snapshot_id}
+    state = load_feedback_state(project_id, snapshot_id)
+    base_state = load_feedback_state(project_id, base_snapshot_id)
+    current_items = state.setdefault("items", {})
+    base_items = (base_state.get("items") or {})
+    base_by_fingerprint: dict[str, dict[str, Any]] = {}
+    for base_item in base_items.values():
+        if not isinstance(base_item, dict):
+            continue
+        fingerprint = str(base_item.get("feedback_fingerprint") or _feedback_fingerprint(base_item))
+        if not fingerprint:
+            continue
+        if (
+            str(base_item.get("status") or "") != STATUS_CLASSIFIED
+            or str(base_item.get("reviewer_decision") or "")
+            or str(base_item.get("backlog_bug_id") or "")
+        ):
+            base_by_fingerprint.setdefault(fingerprint, dict(base_item))
+
+    requested = set(str(fid) for fid in (feedback_ids or []) if str(fid or ""))
+    now = _utc_now()
+    carried: list[dict[str, Any]] = []
+    for feedback_id, item in list(current_items.items()):
+        if requested and feedback_id not in requested:
+            continue
+        if str(item.get("status") or "") != STATUS_CLASSIFIED:
+            continue
+        fingerprint = str(item.get("feedback_fingerprint") or _feedback_fingerprint(item))
+        base_item = base_by_fingerprint.get(fingerprint)
+        if not base_item:
+            continue
+        patched = dict(item)
+        for key in _REVIEW_CARRY_FORWARD_KEYS:
+            if key in base_item:
+                patched[key] = base_item[key]
+        patched["feedback_fingerprint"] = fingerprint
+        patched["carried_from_snapshot_id"] = base_snapshot_id
+        patched["carried_from_feedback_id"] = base_item.get("feedback_id", "")
+        patched["carried_forward_at"] = now
+        carried.append(patched)
+
+    if not carried:
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "base_snapshot_id": base_snapshot_id,
+            "carried_forward_count": 0,
+        }
+    result = _upsert_items(
+        project_id,
+        snapshot_id,
+        carried,
+        event_type="feedback.review_carry_forward",
+        actor=actor,
+    )
+    return {
+        **result,
+        "base_snapshot_id": base_snapshot_id,
+        "carried_forward_count": len(carried),
+    }
+
+
 def classify_semantic_open_issues(
     project_id: str,
     snapshot_id: str,
@@ -1496,6 +1599,7 @@ def classify_semantic_open_issues(
     feedback_kind: str = "",
     limit: int | None = None,
     node_ids: list[str] | None = None,
+    base_snapshot_id: str = "",
 ) -> dict[str, Any]:
     raw_issues = issues
     if raw_issues is None:
@@ -1538,6 +1642,26 @@ def classify_semantic_open_issues(
         event_type="feedback.classified",
         actor=created_by,
     )
+    if base_snapshot_id:
+        carry = carry_forward_feedback_review_state(
+            project_id,
+            snapshot_id,
+            base_snapshot_id,
+            actor=created_by,
+            feedback_ids=[str(item.get("feedback_id") or "") for item in items],
+        )
+        result["carry_forward"] = {
+            "base_snapshot_id": base_snapshot_id,
+            "carried_forward_count": carry.get("carried_forward_count", 0),
+        }
+        if carry.get("carried_forward_count"):
+            result["items"] = [
+                (load_feedback_state(project_id, snapshot_id).get("items") or {}).get(
+                    str(item.get("feedback_id") or ""),
+                    item,
+                )
+                for item in items
+            ]
     result["summary"] = feedback_summary(project_id, snapshot_id)
     return result
 
@@ -1549,6 +1673,7 @@ def classify_semantic_state_rounds(
     created_by: str = "system",
     source_rounds: list[str | int] | None = None,
     limit_per_round: int | None = None,
+    base_snapshot_id: str = "",
 ) -> dict[str, Any]:
     """Classify all round-scoped semantic graph-state issues for a snapshot."""
     semantic_state = _read_json(semantic_graph_state_path(project_id, snapshot_id), {})
@@ -1573,6 +1698,7 @@ def classify_semantic_state_rounds(
             source_round=round_label,
             created_by=created_by,
             limit=limit_per_round,
+            base_snapshot_id=base_snapshot_id,
         )
         results.append({
             "source_round": round_label,
@@ -1603,6 +1729,13 @@ def classify_semantic_state_rounds(
             "count": total,
             "by_kind": dict(sorted(by_kind.items())),
             "by_status": dict(sorted(by_status.items())),
+        },
+        "carry_forward": {
+            "base_snapshot_id": base_snapshot_id,
+            "carried_forward_count": sum(
+                int((result.get("carry_forward") or {}).get("carried_forward_count") or 0)
+                for result in results
+            ),
         },
         "results": results,
         "state_path": str(feedback_state_path(project_id, snapshot_id)),

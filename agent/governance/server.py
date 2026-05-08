@@ -3484,6 +3484,7 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                         if body.get("feedback_classify_limit") is not None
                         else None
                     ),
+                    base_snapshot_id=str(body.get("semantic_base_snapshot_id") or body.get("base_snapshot_id") or ""),
                 )
                 result["feedback_queue"] = {
                     "mode": feedback_review_mode,

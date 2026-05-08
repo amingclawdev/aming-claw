@@ -549,6 +549,7 @@ def run_state_only_full_reconcile(
                 project_id,
                 sid,
                 created_by=created_by,
+                base_snapshot_id=semantic_base_snapshot_id or "",
             )
     trace.step(
         "semantic-enrichment",
