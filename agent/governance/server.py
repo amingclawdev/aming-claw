@@ -2129,6 +2129,32 @@ def handle_graph_governance_snapshot_files(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/dashboard-review")
+def handle_graph_governance_snapshot_dashboard_review(ctx: RequestContext):
+    """Return a dashboard-ready bundle with two graph views and review state."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    from . import reconcile_dashboard_review
+
+    conn = get_connection(project_id)
+    try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        try:
+            return reconcile_dashboard_review.build_dashboard_review_bundle(
+                conn,
+                project_id,
+                snapshot_id,
+                node_limit=_query_int(ctx.query, "node_limit", 120),
+                edge_limit=_query_int(ctx.query, "edge_limit", 240),
+                queue_group_limit=_query_int(ctx.query, "queue_group_limit", 20),
+                persist=_query_bool(ctx.query, "persist", True),
+            )
+        except KeyError as exc:
+            _raise_graph_api_validation(exc)
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/export-cache")
 def handle_graph_governance_snapshot_export_cache(ctx: RequestContext):
     """Export a non-authoritative .aming-claw/cache graph.current.json."""
@@ -3096,6 +3122,76 @@ def handle_graph_governance_snapshot_feedback_queue_claim(ctx: RequestContext):
                     "claimed_count": result.get("claimed_count", 0),
                     "lane": body.get("lane", ""),
                     "group_by": body.get("group_by", "feature"),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/decision")
+def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
+    """Apply explicit user/observer decisions to feedback items."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    raw_ids = body.get("feedback_ids")
+    if raw_ids is None:
+        raw_ids = [body.get("feedback_id")]
+    if isinstance(raw_ids, str):
+        feedback_ids = [raw_ids]
+    elif isinstance(raw_ids, list):
+        feedback_ids = [str(item or "").strip() for item in raw_ids]
+    else:
+        raise ValidationError("feedback_ids must be a string or list")
+    action = str(body.get("action") or body.get("decision_action") or "").strip()
+    if not action:
+        raise ValidationError("action is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.decision")
+        try:
+            result = reconcile_feedback.decide_feedback_items(
+                project_id,
+                snapshot_id,
+                feedback_ids,
+                action=action,
+                actor=str(body.get("actor") or "observer"),
+                rationale=str(body.get("rationale") or body.get("reviewer_rationale") or ""),
+                decision=str(body.get("decision") or body.get("reviewer_decision") or ""),
+                status_observation_category=str(
+                    body.get("status_observation_category")
+                    or body.get("observation_category")
+                    or body.get("category")
+                    or ""
+                ),
+                accept=(
+                    bool(body.get("accept") or body.get("accepted"))
+                    if body.get("accept") is not None or body.get("accepted") is not None
+                    else None
+                ),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_decision",
+                actor=str(body.get("actor") or "observer"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "feedback_ids": feedback_ids,
+                    "action": action,
+                    "decided_count": result.get("decided_count", 0),
+                    "error_count": result.get("error_count", 0),
                 }, ensure_ascii=False, sort_keys=True),
             )
             conn.commit()

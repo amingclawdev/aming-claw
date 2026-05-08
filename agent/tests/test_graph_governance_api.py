@@ -721,6 +721,115 @@ def test_feedback_review_state_carries_forward_by_fingerprint(conn):
     assert carried["carried_from_snapshot_id"] == base["snapshot_id"]
 
 
+def test_graph_governance_feedback_decision_marks_user_state(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-feedback-decision",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[{
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add typed relation to the feedback router.",
+            "target": "agent.governance.reconcile_feedback",
+            "type": "add_typed_relation",
+        }],
+    )
+    item = classified["items"][0]
+
+    decided = server.handle_graph_governance_snapshot_feedback_decision(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "feedback_id": item["feedback_id"],
+                "action": "accept_graph_correction",
+                "actor": "dashboard-user",
+                "rationale": "User accepts graph-only correction.",
+            },
+        )
+    )
+
+    assert decided["ok"] is True
+    assert decided["decided_count"] == 1
+    decided_item = decided["items"][0]
+    assert decided_item["status"] == "accepted"
+    assert decided_item["final_feedback_kind"] == "graph_correction"
+    assert decided_item["accepted_by"] == "dashboard-user"
+
+
+def test_graph_governance_dashboard_review_bundle_exposes_two_graphs(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {"id": "L1.1", "layer": "L1", "title": "Project", "kind": "system", "primary": []},
+                {"id": "L2.1", "layer": "L2", "title": "Governance", "kind": "subsystem", "primary": []},
+                {"id": "L7.1", "layer": "L7", "title": "Feedback Router", "kind": "service_runtime", "primary": ["agent/governance/reconcile_feedback.py"]},
+                {"id": "L7.2", "layer": "L7", "title": "Server API", "kind": "service_runtime", "primary": ["agent/governance/server.py"]},
+            ],
+            "edges": [
+                {"source": "L1.1", "target": "L2.1", "edge_type": "contains", "direction": "hierarchy"},
+                {"source": "L2.1", "target": "L7.1", "edge_type": "contains", "direction": "hierarchy"},
+                {"source": "L7.2", "target": "L7.1", "edge_type": "calls", "direction": "dependency"},
+            ],
+        }
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-dashboard-review",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+        file_inventory=[
+            {"path": "agent/governance/reconcile_feedback.py", "file_kind": "source", "scan_status": "clustered", "graph_status": "mapped"},
+            {"path": "docs/reconcile.md", "file_kind": "doc", "scan_status": "orphan", "graph_status": "unmapped"},
+        ],
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+    reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[{
+            "node_id": "L7.1",
+            "reason": "coverage_review",
+            "summary": "missing_doc_binding flag: this node has no direct doc binding.",
+        }],
+    )
+
+    bundle = server.handle_graph_governance_snapshot_dashboard_review(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"persist": "true", "node_limit": "20", "edge_limit": "20"},
+        )
+    )
+
+    assert bundle["ok"] is True
+    assert bundle["status"]["node_count"] == 4
+    assert bundle["graphs"]["architecture_hierarchy"]["node_count"] == 2
+    assert "graph TD" in bundle["graphs"]["architecture_hierarchy"]["mermaid"]
+    assert bundle["graphs"]["feature_dependency"]["edge_count"] == 1
+    assert bundle["ai_review"]["feedback_summary"]["count"] == 1
+    assert Path(bundle["artifact_path"]).exists()
+
+
 def test_graph_governance_status_observation_detector_classifies_graph_candidates(conn):
     graph = {
         "deps_graph": {

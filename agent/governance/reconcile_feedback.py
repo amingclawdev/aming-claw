@@ -52,6 +52,15 @@ STATUS_REJECTED = "rejected"
 STATUS_BACKLOG_FILED = "backlog_filed"
 STATUS_NEEDS_HUMAN_SIGNOFF = "needs_human_signoff"
 
+FEEDBACK_DECISION_ACTIONS = {
+    "accept_graph_correction",
+    "accept_project_improvement",
+    "keep_status_observation",
+    "reject_false_positive",
+    "needs_human_signoff",
+    "reclassify",
+}
+
 REVIEW_DECISIONS = {
     KIND_GRAPH_CORRECTION,
     KIND_PROJECT_IMPROVEMENT,
@@ -2012,6 +2021,84 @@ def mark_feedback_backlog_filed(
     )
 
 
+def decide_feedback_items(
+    project_id: str,
+    snapshot_id: str,
+    feedback_ids: list[str],
+    *,
+    action: str,
+    actor: str = "observer",
+    rationale: str = "",
+    decision: str = "",
+    status_observation_category: str = "",
+    accept: bool | None = None,
+) -> dict[str, Any]:
+    """Apply explicit observer/user decisions to feedback items.
+
+    This is a state-only operation. It does not mutate project files, graph
+    topology, or backlog rows.
+    """
+    normalized_action = str(action or "").strip()
+    if normalized_action not in FEEDBACK_DECISION_ACTIONS:
+        raise ValueError(f"invalid feedback decision action: {action}")
+    ids = [str(item or "").strip() for item in feedback_ids if str(item or "").strip()]
+    if not ids:
+        raise ValueError("at least one feedback_id is required")
+
+    mapped_decision = str(decision or "").strip()
+    mapped_accept = bool(accept) if accept is not None else False
+    if normalized_action == "accept_graph_correction":
+        mapped_decision = KIND_GRAPH_CORRECTION
+        mapped_accept = True
+    elif normalized_action == "accept_project_improvement":
+        mapped_decision = KIND_PROJECT_IMPROVEMENT
+        mapped_accept = True
+    elif normalized_action == "keep_status_observation":
+        mapped_decision = KIND_STATUS_OBSERVATION
+        mapped_accept = True
+    elif normalized_action == "reject_false_positive":
+        mapped_decision = KIND_FALSE_POSITIVE
+        mapped_accept = False
+    elif normalized_action == "needs_human_signoff":
+        mapped_decision = "needs_human_signoff"
+        mapped_accept = False
+    elif normalized_action == "reclassify" and not mapped_decision:
+        raise ValueError("decision is required for reclassify")
+
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for feedback_id in ids:
+        try:
+            reviewed = review_feedback_item(
+                project_id,
+                snapshot_id,
+                feedback_id,
+                decision=mapped_decision,
+                rationale=rationale,
+                status_observation_category=status_observation_category,
+                actor=actor,
+                accept=mapped_accept,
+            )
+            item = dict((reviewed.get("items") or [{}])[0])
+            item["decision_action"] = normalized_action
+            results.append(item)
+        except Exception as exc:
+            errors.append({"feedback_id": feedback_id, "error": str(exc)})
+
+    return {
+        "ok": not errors,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "action": normalized_action,
+        "requested_count": len(ids),
+        "decided_count": len(results),
+        "error_count": len(errors),
+        "items": results,
+        "errors": errors,
+        "summary": feedback_summary(project_id, snapshot_id),
+    }
+
+
 __all__ = [
     "FEEDBACK_EVENTS_NAME",
     "FEEDBACK_STATE_NAME",
@@ -2020,6 +2107,7 @@ __all__ = [
     "KIND_STATUS_OBSERVATION",
     "KIND_NEEDS_OBSERVER_DECISION",
     "KIND_FALSE_POSITIVE",
+    "FEEDBACK_DECISION_ACTIONS",
     "STATUS_OBSERVATION_CATEGORIES",
     "STATUS_CATEGORY_STALE_TEST",
     "STATUS_CATEGORY_DOC_DRIFT",
@@ -2043,6 +2131,7 @@ __all__ = [
     "review_feedback_item",
     "build_project_improvement_backlog",
     "mark_feedback_backlog_filed",
+    "decide_feedback_items",
     "feedback_summary",
     "feedback_state_path",
     "feedback_events_path",
