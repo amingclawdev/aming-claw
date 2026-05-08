@@ -415,7 +415,11 @@ def test_graph_governance_feedback_review_use_reviewer_ai_enables_ai(conn, tmp_p
         assert kwargs["semantic_config"].model == "claude-opus-4-7"
 
         def fake_call(stage, payload):
-            calls.append({"stage": stage, "feedback_id": payload["feedback"]["feedback_id"]})
+            calls.append({
+                "stage": stage,
+                "feedback_id": payload["feedback"]["feedback_id"],
+                "has_review_context": bool(payload.get("review_context")),
+            })
             return {
                 "decision": "graph_correction",
                 "rationale": "AI reviewer confirms this is graph metadata only.",
@@ -444,11 +448,100 @@ def test_graph_governance_feedback_review_use_reviewer_ai_enables_ai(conn, tmp_p
         )
     )
 
-    assert calls == [{"stage": "reconcile_feedback_review", "feedback_id": item["feedback_id"]}]
+    assert calls == [{
+        "stage": "reconcile_feedback_review",
+        "feedback_id": item["feedback_id"],
+        "has_review_context": True,
+    }]
     reviewed_item = reviewed["items"][0]
     assert reviewed_item["reviewer_decision"] == "graph_correction"
     assert reviewed_item["reviewer_rationale"] == "AI reviewer confirms this is graph metadata only."
     assert reviewed_item["reviewer_confidence"] == 0.91
+
+
+def test_graph_governance_feedback_review_queue_uses_reviewer_ai(conn, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir(parents=True, exist_ok=True)
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-reviewer-ai-queue-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        source_round="round-001",
+        created_by="observer",
+        issues=[
+            {
+                "node_id": "L7.1",
+                "reason": "dependency_patch_suggestions",
+                "summary": "Add typed relation to the feedback router.",
+                "target": "agent.governance.reconcile_feedback",
+                "type": "add_typed_relation",
+            },
+            {
+                "node_id": "L7.2",
+                "reason": "dependency_patch_suggestions",
+                "summary": "Add typed relation to the event service.",
+                "target": "agent.governance.event_service",
+                "type": "add_typed_relation",
+            },
+        ],
+    )
+    assert classified["count"] == 2
+    calls = []
+
+    def fake_builder(**kwargs):
+        def fake_call(stage, payload):
+            calls.append({
+                "stage": stage,
+                "feedback_id": payload["feedback"]["feedback_id"],
+                "has_review_context": bool(payload.get("review_context")),
+            })
+            return {
+                "decision": "graph_correction",
+                "rationale": "AI reviewer confirms graph-only correction.",
+                "confidence": 0.88,
+                "_ai_route": {"provider": "anthropic", "model": "claude-opus-4-7"},
+            }
+
+        return fake_call
+
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        fake_builder,
+    )
+
+    reviewed = server.handle_graph_governance_snapshot_feedback_review_queue(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "use_reviewer_ai": True,
+                "source_round": "round-001",
+                "lane": "graph_patch_candidate",
+                "group_by": "feature",
+                "limit_groups": 10,
+                "max_items": 2,
+                "semantic_ai_provider": "anthropic",
+                "semantic_ai_model": "claude-opus-4-7",
+            },
+        )
+    )
+
+    assert reviewed["ok"] is True
+    assert reviewed["selected_count"] == 2
+    assert reviewed["reviewed_count"] == 2
+    assert [call["stage"] for call in calls] == ["reconcile_feedback_review", "reconcile_feedback_review"]
+    assert all(call["has_review_context"] for call in calls)
+    assert {item["reviewer_decision"] for item in reviewed["reviewed"]} == {"graph_correction"}
+    assert reviewed["summary"]["by_status"] == {"reviewed": 2}
 
 
 def test_graph_governance_status_observation_detector_classifies_graph_candidates(conn):

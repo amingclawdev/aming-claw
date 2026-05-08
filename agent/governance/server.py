@@ -2868,9 +2868,10 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
             or body.get("use_ai")
         )
         ai_call = None
+        review_project_root = None
         if use_reviewer_ai and not body.get("decision") and not body.get("reviewer_decision"):
-            root = _graph_governance_project_root(project_id, body)
-            ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+            review_project_root = _graph_governance_project_root(project_id, body)
+            ai_call = _semantic_ai_call_from_body(project_id, review_project_root, {**body, "snapshot_id": snapshot_id})
         try:
             result = reconcile_feedback.review_feedback_item(
                 project_id,
@@ -2888,6 +2889,8 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
                 actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
                 accept=bool(body.get("accept") or body.get("accepted")),
                 ai_call=ai_call,
+                project_root=review_project_root,
+                max_context_chars=int(body.get("review_context_chars") or 6000),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
@@ -2910,6 +2913,152 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
         except Exception:
             pass
         return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/review-queue")
+def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
+    """Review feedback items selected from the grouped feedback queue."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    limit_groups = int(body.get("limit_groups") or body.get("group_limit") or body.get("limit") or 10)
+    max_items = int(body.get("max_items") or body.get("item_limit") or 25)
+    if limit_groups < 0 or max_items < 0:
+        raise ValidationError("limit_groups and max_items must be non-negative")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.review-queue")
+        queue = reconcile_feedback.build_feedback_review_queue(
+            project_id,
+            snapshot_id,
+            feedback_kind=str(body.get("feedback_kind") or body.get("kind") or ""),
+            status=str(body.get("status") or "classified"),
+            node_id=str(body.get("node_id") or ""),
+            source_round=str(body.get("source_round") or body.get("feedback_round") or ""),
+            lane=str(body.get("lane") or ""),
+            group_by=str(body.get("group_by") or "feature"),
+            include_status_observations=bool(body.get("include_status_observations")),
+            include_resolved=bool(body.get("include_resolved")),
+            limit=limit_groups,
+        )
+        feedback_ids: list[str] = []
+        for group in queue.get("groups") or []:
+            for feedback_id in group.get("feedback_ids") or []:
+                feedback_id = str(feedback_id or "").strip()
+                if not feedback_id or feedback_id in feedback_ids:
+                    continue
+                feedback_ids.append(feedback_id)
+                if max_items and len(feedback_ids) >= max_items:
+                    break
+            if max_items and len(feedback_ids) >= max_items:
+                break
+
+        if bool(body.get("dry_run")):
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "dry_run": True,
+                "queue_summary": queue.get("summary", {}),
+                "group_count": len(queue.get("groups") or []),
+                "selected_count": len(feedback_ids),
+                "feedback_ids": feedback_ids,
+            }
+
+        use_reviewer_ai = bool(
+            body.get("reviewer_use_ai")
+            or body.get("use_reviewer_ai")
+            or body.get("semantic_use_ai")
+            or body.get("use_ai")
+        )
+        decision = str(body.get("decision") or body.get("reviewer_decision") or "")
+        ai_call = None
+        review_project_root = None
+        if use_reviewer_ai and not decision:
+            review_project_root = _graph_governance_project_root(project_id, body)
+            ai_call = _semantic_ai_call_from_body(project_id, review_project_root, {**body, "snapshot_id": snapshot_id})
+            if ai_call is None and not bool(body.get("allow_rule_fallback")):
+                raise ValidationError("reviewer_use_ai=true but reviewer AI call could not be built")
+
+        reviewed: list[dict] = []
+        errors: list[dict] = []
+        for feedback_id in feedback_ids:
+            try:
+                result = reconcile_feedback.review_feedback_item(
+                    project_id,
+                    snapshot_id,
+                    feedback_id,
+                    decision=decision,
+                    rationale=str(body.get("rationale") or body.get("reviewer_rationale") or ""),
+                    confidence=float(body["confidence"]) if body.get("confidence") is not None else None,
+                    status_observation_category=str(
+                        body.get("status_observation_category")
+                        or body.get("observation_category")
+                        or body.get("category")
+                        or ""
+                    ),
+                    actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
+                    accept=bool(body.get("accept") or body.get("accepted")),
+                    ai_call=ai_call,
+                    project_root=review_project_root,
+                    max_context_chars=int(body.get("review_context_chars") or 6000),
+                )
+                item = (result.get("items") or [{}])[0]
+                reviewed.append({
+                    "feedback_id": feedback_id,
+                    "status": item.get("status", ""),
+                    "reviewer_decision": item.get("reviewer_decision", ""),
+                    "final_feedback_kind": item.get("final_feedback_kind", ""),
+                    "requires_human_signoff": bool(item.get("requires_human_signoff")),
+                    "reviewer_confidence": item.get("reviewer_confidence", 0.0),
+                    "source_node_ids": item.get("source_node_ids") or [],
+                    "target_type": item.get("target_type", ""),
+                    "target_id": item.get("target_id", ""),
+                })
+            except Exception as exc:
+                errors.append({"feedback_id": feedback_id, "error": str(exc)})
+                if not bool(body.get("continue_on_error")):
+                    break
+
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_queue_reviewed",
+                actor=str(body.get("actor") or "observer"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "selected_count": len(feedback_ids),
+                    "reviewed_count": len(reviewed),
+                    "error_count": len(errors),
+                    "lane": body.get("lane", ""),
+                    "group_by": body.get("group_by", "feature"),
+                    "use_reviewer_ai": use_reviewer_ai,
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+        return {
+            "ok": not errors,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "queue_summary": queue.get("summary", {}),
+            "group_count": len(queue.get("groups") or []),
+            "selected_count": len(feedback_ids),
+            "reviewed_count": len(reviewed),
+            "error_count": len(errors),
+            "reviewed": reviewed,
+            "errors": errors,
+            "summary": reconcile_feedback.feedback_summary(project_id, snapshot_id),
+        }
     finally:
         conn.close()
 

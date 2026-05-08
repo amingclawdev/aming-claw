@@ -110,6 +110,223 @@ def semantic_graph_state_path(project_id: str, snapshot_id: str) -> Path:
     return feedback_base_dir(project_id, snapshot_id) / "semantic-graph-state.json"
 
 
+def _snapshot_graph_path(project_id: str, snapshot_id: str) -> Path:
+    return store.snapshot_companion_dir(project_id, snapshot_id) / "graph.json"
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def _safe_project_file(project_root: str | Path | None, rel_path: str) -> Path | None:
+    if not project_root or not rel_path:
+        return None
+    root = Path(project_root).resolve()
+    try:
+        candidate = (root / rel_path).resolve()
+        candidate.relative_to(root)
+    except Exception:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def _file_excerpt(project_root: str | Path | None, rel_path: str, *, max_chars: int) -> dict[str, Any] | None:
+    path = _safe_project_file(project_root, rel_path)
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return {
+        "path": rel_path,
+        "size_bytes": path.stat().st_size,
+        "excerpt": _truncate_text(text, max_chars),
+    }
+
+
+def _line_excerpt(
+    project_root: str | Path | None,
+    rel_path: str,
+    *,
+    line_start: int,
+    line_end: int,
+    context_lines: int = 8,
+    max_chars: int = 4000,
+) -> dict[str, Any] | None:
+    path = _safe_project_file(project_root, rel_path)
+    if path is None:
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    start = max(1, int(line_start or 1) - context_lines)
+    end = min(len(lines), int(line_end or line_start or 1) + context_lines)
+    numbered = [
+        f"{line_no}: {lines[line_no - 1]}"
+        for line_no in range(start, end + 1)
+    ]
+    return {
+        "path": rel_path,
+        "line_start": start,
+        "line_end": end,
+        "excerpt": _truncate_text("\n".join(numbered), max_chars),
+    }
+
+
+def _graph_nodes_by_id(project_id: str, snapshot_id: str) -> dict[str, dict[str, Any]]:
+    graph = _read_json(_snapshot_graph_path(project_id, snapshot_id), {})
+    nodes = (((graph or {}).get("deps_graph") or {}).get("nodes") or [])
+    return {
+        str(node.get("id")): node
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("id") or "")
+    }
+
+
+def _semantic_features_by_id(project_id: str, snapshot_id: str) -> dict[str, dict[str, Any]]:
+    index = _read_json(feedback_base_dir(project_id, snapshot_id) / "semantic-index.json", {})
+    features = index.get("features") if isinstance(index, dict) else []
+    return {
+        str(feature.get("node_id")): feature
+        for feature in (features or [])
+        if isinstance(feature, dict) and str(feature.get("node_id") or "")
+    }
+
+
+def _compact_graph_node(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    return {
+        "id": node.get("id", ""),
+        "title": node.get("title", ""),
+        "layer": node.get("layer", ""),
+        "kind": node.get("kind", ""),
+        "primary": node.get("primary") or [],
+        "secondary": node.get("secondary") or [],
+        "test": node.get("test") or [],
+        "config": node.get("config") or metadata.get("config_files") or [],
+        "metadata": {
+            "module": metadata.get("module", ""),
+            "hierarchy_parent": metadata.get("hierarchy_parent", ""),
+            "roles": (((metadata.get("architecture_signals") or {}).get("roles")) or []),
+            "typed_relations": (metadata.get("typed_relations") or [])[:20],
+        },
+    }
+
+
+def _build_review_context(
+    project_id: str,
+    snapshot_id: str,
+    item: dict[str, Any],
+    *,
+    project_root: str | Path | None = None,
+    max_excerpt_chars: int = 6000,
+) -> dict[str, Any]:
+    semantic_state = _read_json(semantic_graph_state_path(project_id, snapshot_id), {})
+    node_semantics = semantic_state.get("node_semantics") if isinstance(semantic_state, dict) else {}
+    if not isinstance(node_semantics, dict):
+        node_semantics = {}
+    graph_nodes = _graph_nodes_by_id(project_id, snapshot_id)
+    semantic_features = _semantic_features_by_id(project_id, snapshot_id)
+    source_node_ids = _source_nodes(item)
+
+    source_nodes: list[dict[str, Any]] = []
+    candidate_paths: list[str] = []
+    candidate_symbol_refs: list[dict[str, Any]] = []
+    issue_text = " ".join([
+        str(item.get("issue") or ""),
+        str(item.get("suggested_action") or ""),
+        str(item.get("target_id") or ""),
+        str(((item.get("evidence") or {}).get("raw_issue") or {}).get("summary") or ""),
+    ]).lower()
+    for node_id in source_node_ids:
+        graph_node = graph_nodes.get(node_id) or {}
+        state_semantic = node_semantics.get(node_id) if isinstance(node_semantics.get(node_id), dict) else {}
+        index_semantic = semantic_features.get(node_id) or {}
+        semantic_node = {**index_semantic, **state_semantic}
+        compact = _compact_graph_node(graph_node) if graph_node else {"id": node_id}
+        source_nodes.append({
+            "node_id": node_id,
+            "graph_node": compact,
+            "semantic": {
+                "feature_name": semantic_node.get("feature_name", ""),
+                "semantic_summary": semantic_node.get("semantic_summary", ""),
+                "intent": semantic_node.get("intent", ""),
+                "domain_label": semantic_node.get("domain_label", ""),
+                "feedback_round": semantic_node.get("feedback_round", ""),
+                "quality_flags": semantic_node.get("quality_flags") or [],
+                "symbol_refs": (semantic_node.get("symbol_refs") or [])[:40],
+                "test_symbol_refs": (semantic_node.get("test_symbol_refs") or [])[:40],
+            },
+        })
+        for key in ("primary", "secondary", "test", "config"):
+            candidate_paths.extend(_string_list(compact.get(key)))
+        for ref in (semantic_node.get("symbol_refs") or []) + (semantic_node.get("test_symbol_refs") or []):
+            if not isinstance(ref, dict):
+                continue
+            symbol_id = str(ref.get("id") or "")
+            symbol_name = symbol_id.rsplit("::", 1)[-1].lower()
+            if symbol_name and (symbol_name in issue_text or symbol_id.lower() in issue_text):
+                candidate_symbol_refs.append(ref)
+
+    target_id = str(item.get("target_id") or "")
+    if "/" in target_id or "\\" in target_id or "." in Path(target_id).name:
+        candidate_paths.insert(0, target_id.replace("\\", "/"))
+
+    excerpts: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    per_file = max(1000, int(max_excerpt_chars / max(1, min(6, len(candidate_paths) or 1))))
+    for rel_path in candidate_paths:
+        rel_path = str(rel_path or "").replace("\\", "/")
+        if not rel_path or rel_path in seen_paths:
+            continue
+        excerpt = _file_excerpt(project_root, rel_path, max_chars=per_file)
+        if excerpt:
+            excerpts.append(excerpt)
+            seen_paths.add(rel_path)
+        if len(excerpts) >= 6:
+            break
+
+    symbol_excerpts: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    for ref in candidate_symbol_refs:
+        symbol_id = str(ref.get("id") or "")
+        if not symbol_id or symbol_id in seen_symbols:
+            continue
+        excerpt = _line_excerpt(
+            project_root,
+            str(ref.get("path") or ""),
+            line_start=int(ref.get("line_start") or 1),
+            line_end=int(ref.get("line_end") or ref.get("line_start") or 1),
+            max_chars=max(1200, int(max_excerpt_chars / max(1, min(4, len(candidate_symbol_refs) or 1)))),
+        )
+        if excerpt:
+            excerpt["symbol_id"] = symbol_id
+            excerpt["kind"] = ref.get("kind", "")
+            symbol_excerpts.append(excerpt)
+            seen_symbols.add(symbol_id)
+        if len(symbol_excerpts) >= 4:
+            break
+
+    return {
+        "snapshot_id": snapshot_id,
+        "source_node_ids": source_node_ids,
+        "source_nodes": source_nodes,
+        "target": {
+            "target_type": item.get("target_type", ""),
+            "target_id": target_id,
+            "issue_type": item.get("issue_type", ""),
+        },
+        "file_excerpts": excerpts,
+        "symbol_excerpts": symbol_excerpts,
+    }
+
+
 def _new_state(project_id: str, snapshot_id: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -988,6 +1205,8 @@ def review_feedback_item(
     actor: str = "observer",
     accept: bool = False,
     ai_call: ReviewerAiCall | None = None,
+    project_root: str | Path | None = None,
+    max_context_chars: int = 6000,
 ) -> dict[str, Any]:
     state = load_feedback_state(project_id, snapshot_id)
     item = dict((state.get("items") or {}).get(feedback_id) or {})
@@ -1024,6 +1243,13 @@ def review_feedback_item(
                 ),
             },
             "feedback": item,
+            "review_context": _build_review_context(
+                project_id,
+                snapshot_id,
+                item,
+                project_root=project_root,
+                max_excerpt_chars=max_context_chars,
+            ),
         }
         ai_review = _parse_ai_review(ai_call("reconcile_feedback_review", payload) or {})
         decision = ai_review["decision"]
