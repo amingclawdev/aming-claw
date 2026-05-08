@@ -382,6 +382,122 @@ def test_graph_governance_status_observation_requires_explicit_backlog_action(co
     assert trigger["feedback_kind"] == "status_observation"
 
 
+def test_graph_governance_status_observation_detector_classifies_graph_candidates(conn):
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.1",
+                    "layer": "L7",
+                    "title": "Service Feature",
+                    "kind": "service_runtime",
+                    "primary": ["agent/service.py"],
+                    "secondary": ["docs/service.md"],
+                    "test": ["tests/test_service.py"],
+                    "metadata": {"subsystem": "service"},
+                },
+                {
+                    "id": "L7.2",
+                    "layer": "L7",
+                    "title": "Uncovered Feature",
+                    "kind": "service_runtime",
+                    "primary": ["agent/uncovered.py"],
+                    "secondary": [],
+                    "test": [],
+                    "metadata": {"subsystem": "service"},
+                },
+            ],
+            "edges": [],
+        }
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-status-detector",
+        commit_sha="head",
+        snapshot_kind="scope",
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "agent/service.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+                "decision": "govern",
+                "attached_node_ids": ["L7.1"],
+                "mapped_node_ids": ["L7.1"],
+            },
+            {
+                "path": "docs/service.md",
+                "file_kind": "doc",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+                "decision": "attach_to_node",
+                "attached_node_ids": ["L7.1"],
+            },
+            {
+                "path": "tests/test_service.py",
+                "file_kind": "test",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+                "decision": "attach_to_node",
+                "attached_node_ids": ["L7.1"],
+            },
+            {
+                "path": "docs/legacy.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "decision": "pending",
+            },
+        ],
+        notes=json.dumps({
+            "pending_scope_reconcile": {
+                "scope_file_delta": {
+                    "changed_files": ["agent/service.py"],
+                    "impacted_files": ["agent/service.py"],
+                }
+            }
+        }),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_snapshot_feedback_status_observations(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "actor": "observer",
+                "test_failures": [
+                    {
+                        "path": "tests/test_service.py",
+                        "nodeid": "tests/test_service.py::test_service_contract",
+                        "message": "expected old status",
+                    }
+                ],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["detector"]["classified_count"] >= 5
+    items = reconcile_feedback.list_feedback_items(PID, snapshot["snapshot_id"])
+    by_type = {item["issue_type"]: item for item in items}
+    assert by_type["missing_doc_binding"]["feedback_kind"] == "status_observation"
+    assert by_type["missing_test_binding"]["feedback_kind"] == "status_observation"
+    assert by_type["orphan_file"]["paths"] == ["docs/legacy.md"]
+    assert by_type["doc_drift_candidate"]["source_node_ids"] == ["L7.1"]
+    assert by_type["stale_test_expectation_candidate"]["source_node_ids"] == ["L7.1"]
+    assert by_type["failed_test_candidate"]["target_id"] == "tests/test_service.py"
+
+
 def test_graph_governance_drift_api_records_and_lists_rows(conn):
     snapshot = store.create_graph_snapshot(
         conn,

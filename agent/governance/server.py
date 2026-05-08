@@ -2737,6 +2737,54 @@ def handle_graph_governance_snapshot_feedback_classify(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/status-observations")
+def handle_graph_governance_snapshot_feedback_status_observations(ctx: RequestContext):
+    """Classify deterministic graph/index drift candidates as status observations."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_status_observations
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.status-observations")
+        try:
+            result = reconcile_status_observations.classify_status_observations(
+                conn,
+                project_id,
+                snapshot_id,
+                test_failures=body.get("test_failures") if isinstance(body.get("test_failures"), list) else [],
+                actor=str(body.get("actor") or "status-observation-detector"),
+                limit=(
+                    int(body["limit"])
+                    if body.get("limit") is not None
+                    else reconcile_status_observations.DEFAULT_LIMIT
+                ),
+                include_missing_bindings=bool(body.get("include_missing_bindings", True)),
+                include_file_state=bool(body.get("include_file_state", True)),
+                include_scope_delta=bool(body.get("include_scope_delta", True)),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_status_observations_classified",
+                actor=str(body.get("actor") or "status-observation-detector"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "classified_count": result.get("detector", {}).get("classified_count", 0),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception:
+            pass
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/review")
 def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
     """Review one feedback item and route it toward graph correction or backlog."""
