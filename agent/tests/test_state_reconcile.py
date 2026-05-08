@@ -208,6 +208,9 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
         project,
         run_id="scope-reconcile-head-test",
         snapshot_id="scope-head-test",
+        semantic_ai_batch_size=10,
+        semantic_ai_input_mode="feature",
+        semantic_dynamic_graph_state=True,
     )
 
     assert result["ok"] is True
@@ -220,6 +223,9 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     assert result["index_counts"]["edges"] == result["graph_stats"]["edges"]
     assert result["governance_index"]["feature_count"] > 0
     assert result["semantic_enrichment"]["feature_count"] == result["governance_index"]["feature_count"]
+    assert result["semantic_enrichment"]["ai_input_mode"] == "feature"
+    assert result["semantic_enrichment"]["dynamic_semantic_graph_state"] is True
+    assert result["semantic_enrichment"]["requested_ai_batch_size"] == 10
     assert Path(result["semantic_enrichment"]["semantic_index_path"]).exists()
     assert result["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
     assert "impacted_file_count" in result["scope_file_delta"]
