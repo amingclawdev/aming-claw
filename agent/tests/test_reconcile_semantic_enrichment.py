@@ -736,6 +736,66 @@ def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     assert status_backlog["payload"]["title"].startswith("User-requested backlog")
 
 
+def test_reconcile_feedback_filters_semantic_state_by_round_and_nodes(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    state_path = store.snapshot_companion_dir(PID, "full-semantic-test") / "semantic-enrichment" / "semantic-graph-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    old_issue = {
+        "node_id": "L7.old",
+        "reason": "dependency_patch_suggestions",
+        "summary": "Historical issue from an older semantic round.",
+        "type": "typed_relation",
+    }
+    new_issue = {
+        "node_id": "L7.new",
+        "reason": "dependency_patch_suggestions",
+        "summary": "missing_doc_binding flag for the new canary node.",
+        "type": "",
+    }
+    sibling_issue = {
+        "node_id": "L7.sibling",
+        "reason": "merge_suggestions",
+        "summary": "Confirm whether this sibling should merge with the canary feature.",
+        "type": "",
+    }
+    state_path.write_text(json.dumps({
+        "node_semantics": {
+            "L7.old": {"feedback_round": 0, "open_issues": [old_issue]},
+            "L7.new": {"feedback_round": 1, "open_issues": [new_issue]},
+            "L7.sibling": {"feedback_round": 1, "open_issues": [sibling_issue]},
+        },
+        "open_issues": [old_issue, new_issue, sibling_issue],
+    }), encoding="utf-8")
+
+    node_scoped = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        "full-semantic-test",
+        source_round="round-001",
+        node_ids=["L7.new"],
+        created_by="observer",
+    )
+    assert node_scoped["count"] == 1
+    assert node_scoped["items"][0]["source_node_ids"] == ["L7.new"]
+    assert "L7.old" not in {
+        item["source_node_ids"][0]
+        for item in reconcile_feedback.list_feedback_items(PID, "full-semantic-test")
+    }
+
+    round_scoped = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        "full-semantic-test",
+        source_round="round-001",
+        created_by="observer",
+    )
+    assert round_scoped["count"] == 2
+    items = {
+        item["source_node_ids"][0]
+        for item in reconcile_feedback.list_feedback_items(PID, "full-semantic-test")
+    }
+    assert items == {"L7.new", "L7.sibling"}
+
+
 def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)

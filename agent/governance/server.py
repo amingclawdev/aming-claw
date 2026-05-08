@@ -2730,6 +2730,7 @@ def handle_graph_governance_snapshot_feedback_classify(ctx: RequestContext):
             created_by=str(body.get("actor") or body.get("created_by") or "observer"),
             issues=body.get("issues") if isinstance(body.get("issues"), list) else None,
             limit=int(body["limit"]) if body.get("limit") is not None else None,
+            node_ids=body.get("node_ids") if isinstance(body.get("node_ids"), list) else None,
         )
         try:
             audit_service.record(

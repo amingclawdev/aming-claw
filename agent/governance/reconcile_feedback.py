@@ -200,6 +200,79 @@ def _source_nodes(issue: dict[str, Any]) -> list[str]:
     return nodes
 
 
+def _round_number(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text.startswith("round-"):
+        text = text.split("round-", 1)[1]
+    match = re.search(r"\d+", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def _issue_round(issue: dict[str, Any]) -> int | None:
+    for key in ("feedback_round", "source_round", "round"):
+        number = _round_number(issue.get(key))
+        if number is not None:
+            return number
+    return None
+
+
+def _select_semantic_state_issues(
+    semantic_state: dict[str, Any],
+    *,
+    source_round: str | int = "",
+    node_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    requested_round = _round_number(source_round)
+    requested_nodes = {str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()}
+    node_semantics = semantic_state.get("node_semantics")
+    if isinstance(node_semantics, dict) and (requested_round is not None or requested_nodes):
+        selected: list[dict[str, Any]] = []
+        for node_id, raw_entry in sorted(node_semantics.items()):
+            if not isinstance(raw_entry, dict):
+                continue
+            node_id = str(node_id)
+            if requested_nodes and node_id not in requested_nodes:
+                continue
+            entry_round = _round_number(raw_entry.get("feedback_round"))
+            if requested_round is not None and entry_round != requested_round:
+                continue
+            for raw_issue in raw_entry.get("open_issues") or []:
+                if not isinstance(raw_issue, dict):
+                    continue
+                issue = dict(raw_issue)
+                if not _source_nodes(issue):
+                    issue["node_id"] = node_id
+                selected.append(issue)
+        return selected
+
+    raw_issues = semantic_state.get("open_issues")
+    if not isinstance(raw_issues, list):
+        return []
+    selected = []
+    for raw_issue in raw_issues:
+        if not isinstance(raw_issue, dict):
+            continue
+        issue_nodes = set(_source_nodes(raw_issue))
+        if requested_nodes and not issue_nodes.intersection(requested_nodes):
+            continue
+        issue_round = _issue_round(raw_issue)
+        if requested_round is not None and issue_round is not None and issue_round != requested_round:
+            continue
+        selected.append(raw_issue)
+    return selected
+
+
 def _target_type(issue_type: str, summary: str, reason: str) -> str:
     text = f"{issue_type} {reason} {summary}".lower()
     if "relation" in text or "edge" in text or "dependency" in text:
@@ -489,14 +562,29 @@ def classify_semantic_open_issues(
     issues: list[dict[str, Any]] | None = None,
     feedback_kind: str = "",
     limit: int | None = None,
+    node_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     raw_issues = issues
     if raw_issues is None:
         semantic_state = _read_json(semantic_graph_state_path(project_id, snapshot_id), {})
-        raw_issues = semantic_state.get("open_issues") if isinstance(semantic_state, dict) else []
+        raw_issues = (
+            _select_semantic_state_issues(
+                semantic_state,
+                source_round=source_round,
+                node_ids=node_ids,
+            )
+            if isinstance(semantic_state, dict)
+            else []
+        )
     if not isinstance(raw_issues, list):
         raw_issues = []
     selected = [item for item in raw_issues if isinstance(item, dict)]
+    if node_ids:
+        requested_nodes = {str(node_id).strip() for node_id in node_ids if str(node_id).strip()}
+        selected = [
+            item for item in selected
+            if not requested_nodes or set(_source_nodes(item)).intersection(requested_nodes)
+        ]
     if limit is not None and limit >= 0:
         selected = selected[: int(limit)]
     items = [
