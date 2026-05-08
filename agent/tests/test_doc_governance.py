@@ -1,5 +1,7 @@
 """Tests for doc governance: Steps 3a + 5 (graph-driven doc governance)."""
 
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
@@ -138,24 +140,16 @@ class TestAuditDocGap:
         _audit_doc_gap(conn, "test-proj", "task-123", "post_pm", set(), [])
 
 
-class TestStoreProposedNodes:
-    """5g: _store_proposed_nodes inserts into pending_nodes."""
+class TestGraphDeltaProposedNodes:
+    """5g: proposed nodes now flow through graph.delta.proposed events."""
 
-    def test_store_proposed_nodes_empty(self):
-        from agent.governance.auto_chain import _store_proposed_nodes
-        conn = MagicMock()
-        count = _store_proposed_nodes(conn, "test-proj", [])
-        assert count == 0
+    def test_legacy_store_proposed_nodes_removed(self):
+        from agent.governance import auto_chain
+        assert not hasattr(auto_chain, "_store_proposed_nodes")
 
-    def test_store_proposed_nodes_inserts(self):
-        from agent.governance.auto_chain import _store_proposed_nodes
-        conn = MagicMock()
-        proposed = [
-            {"node_id": "L1.1", "docs": ["docs/foo.md"], "confidence": 0.9, "reason": "test"},
-        ]
-        count = _store_proposed_nodes(conn, "test-proj", proposed)
-        assert count == 1
-        conn.execute.assert_called_once()
+    def test_graph_delta_event_emitter_exists(self):
+        from agent.governance import auto_chain
+        assert callable(auto_chain._emit_graph_delta_event)
 
 
 class TestGetGraphDocAssociations:
