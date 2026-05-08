@@ -34,6 +34,25 @@ REVIEW_FEEDBACK_NAME = "review-feedback.jsonl"
 FeedbackAiCall = Callable[[str, dict[str, Any]], Any]
 
 
+def _string_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = [raw]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        value = str(item or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
 def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
@@ -127,17 +146,9 @@ def _round_dir(project_id: str, snapshot_id: str, feedback_round: int) -> Path:
 
 
 def _path_list(raw: Any) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        values = [raw]
-    elif isinstance(raw, (list, tuple, set)):
-        values = list(raw)
-    else:
-        values = [raw]
     out: list[str] = []
     seen: set[str] = set()
-    for item in values:
+    for item in _string_list(raw):
         path = str(item or "").replace("\\", "/").strip("/")
         if path and path not in seen:
             seen.add(path)
@@ -178,6 +189,83 @@ def _hash_payload(payload: Any) -> str:
 
 def _node_id(node: dict[str, Any]) -> str:
     return str(node.get("id") or node.get("node_id") or "")
+
+
+def _semantic_selector(raw: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(raw or {})
+    scope = str(payload.get("scope") or payload.get("semantic_ai_scope") or "all").strip().lower() or "all"
+    if scope in {"full", "*"}:
+        scope = "all"
+    if scope in {"off", "disabled"}:
+        scope = "none"
+    node_ids = _string_list(payload.get("node_ids") or payload.get("semantic_node_ids"))
+    layers = [item.upper() for item in _string_list(payload.get("layers") or payload.get("semantic_layers"))]
+    quality_flags = _string_list(payload.get("quality_flags") or payload.get("semantic_quality_flags"))
+    missing = [
+        item.lower().replace("-", "_")
+        for item in _string_list(payload.get("missing") or payload.get("semantic_missing"))
+    ]
+    changed_paths = _path_list(payload.get("changed_paths") or payload.get("semantic_changed_paths"))
+    path_prefixes = _path_list(payload.get("path_prefixes") or payload.get("semantic_path_prefixes"))
+    match_mode = str(payload.get("match_mode") or payload.get("semantic_selector_match") or "all").strip().lower()
+    if match_mode not in {"all", "any"}:
+        match_mode = "all"
+    include_structural = bool(payload.get("include_structural") or payload.get("semantic_include_structural"))
+    if layers and any(layer in {"L1", "L2", "L3", "L4", "L5", "L6"} for layer in layers):
+        include_structural = True
+    if node_ids and any(str(item).upper().startswith(("L1.", "L2.", "L3.", "L4.", "L5.", "L6.")) for item in node_ids):
+        include_structural = True
+    return {
+        "scope": scope,
+        "node_ids": node_ids,
+        "layers": layers,
+        "quality_flags": quality_flags,
+        "missing": missing,
+        "changed_paths": changed_paths,
+        "path_prefixes": path_prefixes,
+        "match_mode": match_mode,
+        "include_structural": include_structural,
+    }
+
+
+def _selector_from_kwargs(
+    *,
+    semantic_ai_scope: str | None = None,
+    semantic_node_ids: Any = None,
+    semantic_layers: Any = None,
+    semantic_quality_flags: Any = None,
+    semantic_missing: Any = None,
+    semantic_changed_paths: Any = None,
+    semantic_path_prefixes: Any = None,
+    semantic_selector_match: str | None = None,
+    semantic_include_structural: bool = False,
+) -> dict[str, Any]:
+    return _semantic_selector({
+        "semantic_ai_scope": semantic_ai_scope,
+        "semantic_node_ids": semantic_node_ids,
+        "semantic_layers": semantic_layers,
+        "semantic_quality_flags": semantic_quality_flags,
+        "semantic_missing": semantic_missing,
+        "semantic_changed_paths": semantic_changed_paths,
+        "semantic_path_prefixes": semantic_path_prefixes,
+        "semantic_selector_match": semantic_selector_match,
+        "semantic_include_structural": semantic_include_structural,
+    })
+
+
+def _node_has_primary(node: dict[str, Any]) -> bool:
+    return bool(_path_list(node.get("primary") or node.get("primary_files")))
+
+
+def _semantic_candidate_nodes(graph_json: dict[str, Any], selector: dict[str, Any]) -> list[dict[str, Any]]:
+    include_structural = bool(selector.get("include_structural"))
+    out: list[dict[str, Any]] = []
+    for node in _graph_nodes(graph_json):
+        if not _node_id(node):
+            continue
+        if _node_has_primary(node) or include_structural:
+            out.append(node)
+    return out
 
 
 def _feature_context_from_node(
@@ -366,15 +454,95 @@ def _feedback_matches_feature(feedback: dict[str, Any], feature: dict[str, Any])
 
 def _quality_flags(feature: dict[str, Any], feedback: list[dict[str, Any]]) -> list[str]:
     flags: list[str] = []
+    layer = str(feature.get("layer") or "")
     if not feature.get("secondary"):
         flags.append("missing_doc_binding")
-    if not feature.get("test"):
+    if layer == "L7" and not feature.get("test"):
         flags.append("missing_test_binding")
     if feedback:
         flags.append("has_review_feedback")
-    if not feature.get("symbol_refs"):
+    if layer == "L7" and not feature.get("symbol_refs"):
         flags.append("missing_symbol_refs")
     return flags
+
+
+def _feature_paths(feature: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("primary", "secondary", "test", "config"):
+        paths.extend(_path_list(feature.get(key)))
+    return paths
+
+
+def _missing_matches(feature: dict[str, Any], missing: list[str]) -> bool:
+    if not missing:
+        return True
+    checks = {
+        "doc": not feature.get("secondary"),
+        "docs": not feature.get("secondary"),
+        "document": not feature.get("secondary"),
+        "test": not feature.get("test"),
+        "tests": not feature.get("test"),
+        "config": not feature.get("config"),
+        "symbol": not feature.get("symbol_refs"),
+        "symbols": not feature.get("symbol_refs"),
+    }
+    return any(checks.get(item, False) for item in missing)
+
+
+def _path_matches(feature: dict[str, Any], paths: list[str], prefixes: list[str]) -> bool:
+    feature_paths = _feature_paths(feature)
+    if paths:
+        requested = {path.replace("\\", "/").strip("/") for path in paths}
+        if not requested.intersection(feature_paths):
+            return False
+    if prefixes:
+        if not any(
+            path == prefix or path.startswith(prefix.rstrip("/") + "/")
+            for path in feature_paths
+            for prefix in prefixes
+        ):
+            return False
+    return True
+
+
+def _selector_decision(
+    feature: dict[str, Any],
+    flags: list[str],
+    selector: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    scope = str(selector.get("scope") or "all").lower()
+    if scope == "none":
+        return False, ["scope_none"]
+    node_ids = set(selector.get("node_ids") or [])
+    layers = set(selector.get("layers") or [])
+    quality_flags = set(selector.get("quality_flags") or [])
+    missing = list(selector.get("missing") or [])
+    changed_paths = list(selector.get("changed_paths") or [])
+    path_prefixes = list(selector.get("path_prefixes") or [])
+    has_filters = bool(node_ids or layers or quality_flags or missing or changed_paths or path_prefixes)
+    if scope == "all" and not has_filters:
+        return True, ["scope_all"]
+    if scope in {"selected", "partial", "issues", "changed"} and not has_filters:
+        return False, [f"scope_{scope}_requires_filter"]
+
+    checks: list[tuple[str, bool]] = []
+    if node_ids:
+        checks.append(("node_id", str(feature.get("node_id") or "") in node_ids))
+    if layers:
+        checks.append(("layer", str(feature.get("layer") or "").upper() in layers))
+    if quality_flags:
+        checks.append(("quality_flags", bool(set(flags).intersection(quality_flags))))
+    if missing:
+        checks.append(("missing", _missing_matches(feature, missing)))
+    if changed_paths or path_prefixes:
+        checks.append(("paths", _path_matches(feature, changed_paths, path_prefixes)))
+    if not checks:
+        return scope == "all", ["scope_all"] if scope == "all" else ["not_selected"]
+
+    match_mode = str(selector.get("match_mode") or "all")
+    matched = all(ok for _, ok in checks) if match_mode == "all" else any(ok for _, ok in checks)
+    reasons = [name for name, ok in checks if ok] or ["selector_no_match"]
+    return matched, reasons
 
 
 def _heuristic_semantic_entry(
@@ -396,7 +564,13 @@ def _heuristic_semantic_entry(
     summary = str(ai_response.get("semantic_summary") or ai_response.get("purpose") or "")
     if not summary:
         primary = ", ".join(feature.get("primary") or []) or "no primary files"
-        summary = f"{feature.get('title') or feature.get('node_id')} covers {primary}."
+        if feature.get("primary"):
+            summary = f"{feature.get('title') or feature.get('node_id')} covers {primary}."
+        else:
+            summary = (
+                f"{feature.get('title') or feature.get('node_id')} is a "
+                f"{feature.get('layer') or 'graph'} structural governance node."
+            )
     return {
         "node_id": feature.get("node_id") or "",
         "source_title": feature.get("title") or "",
@@ -436,6 +610,8 @@ def _heuristic_semantic_entry(
         "doc_refs": feature.get("doc_refs") or [],
         "config_refs": feature.get("config_refs") or [],
         "enrichment_status": enrichment_status,
+        "layer": feature.get("layer") or "",
+        "kind": feature.get("kind") or "",
     }
 
 
@@ -472,7 +648,19 @@ def run_semantic_enrichment(
     created_by: str = "observer",
     max_excerpt_chars: int | None = None,
     semantic_config_path: str | Path | None = None,
+    semantic_ai_provider: str | None = None,
+    semantic_ai_model: str | None = None,
+    semantic_ai_role: str | None = None,
     ai_feature_limit: int | None = None,
+    semantic_ai_scope: str | None = None,
+    semantic_node_ids: Any = None,
+    semantic_layers: Any = None,
+    semantic_quality_flags: Any = None,
+    semantic_missing: Any = None,
+    semantic_changed_paths: Any = None,
+    semantic_path_prefixes: Any = None,
+    semantic_selector_match: str | None = None,
+    semantic_include_structural: bool = False,
     trace_dir: str | Path | None = None,
     persist_feature_payloads: bool = True,
 ) -> dict[str, Any]:
@@ -490,6 +678,12 @@ def run_semantic_enrichment(
         project_root=root,
         config_path=semantic_config_path,
     )
+    if semantic_ai_provider is not None:
+        semantic_config.provider = str(semantic_ai_provider or "")
+    if semantic_ai_model is not None:
+        semantic_config.model = str(semantic_ai_model or "")
+    if semantic_ai_role is not None:
+        semantic_config.role = str(semantic_ai_role or "")
     effective_use_ai = semantic_config.use_ai_default if use_ai is None else bool(use_ai)
     effective_excerpt_chars = (
         semantic_config.input_policy.max_excerpt_chars
@@ -509,11 +703,18 @@ def run_semantic_enrichment(
     feedback = load_review_feedback(project_id, snapshot_id)
     graph_path = snapshot_graph_path(project_id, snapshot_id)
     graph_json = _read_json(graph_path, {})
-    nodes = [
-        node
-        for node in _graph_nodes(graph_json)
-        if _node_id(node) and (_path_list(node.get("primary") or node.get("primary_files")))
-    ]
+    selector = _selector_from_kwargs(
+        semantic_ai_scope=semantic_ai_scope,
+        semantic_node_ids=semantic_node_ids,
+        semantic_layers=semantic_layers,
+        semantic_quality_flags=semantic_quality_flags,
+        semantic_missing=semantic_missing,
+        semantic_changed_paths=semantic_changed_paths,
+        semantic_path_prefixes=semantic_path_prefixes,
+        semantic_selector_match=semantic_selector_match,
+        semantic_include_structural=semantic_include_structural,
+    )
+    nodes = _semantic_candidate_nodes(graph_json, selector)
     feature_index = _load_feature_index(snapshot)
     existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
     round_number = int(feedback_round) if feedback_round is not None else len(existing_rounds)
@@ -523,6 +724,8 @@ def run_semantic_enrichment(
     ai_unavailable_count = 0
     ai_error_count = 0
     ai_skipped_count = 0
+    ai_selected_count = 0
+    ai_skipped_selector_count = 0
     payload_input_paths: list[str] = []
     payload_output_paths: list[str] = []
     payload_trace_base = Path(trace_dir) if trace_dir else _round_dir(project_id, snapshot_id, round_number)
@@ -536,6 +739,10 @@ def run_semantic_enrichment(
         relevant_feedback = [
             item for item in feedback if _feedback_matches_feature(item, feature)
         ]
+        flags = _quality_flags(feature, relevant_feedback)
+        selected_for_ai, selection_reasons = _selector_decision(feature, flags, selector)
+        if selected_for_ai:
+            ai_selected_count += 1
         payload_feature = dict(feature)
         if not semantic_config.input_policy.include_symbol_refs:
             payload_feature["symbol_refs"] = []
@@ -557,6 +764,11 @@ def run_semantic_enrichment(
             "feature": payload_feature,
             "review_feedback": payload_feedback,
             "instructions": semantic_config.to_instruction_payload(),
+            "semantic_selector": selector,
+            "semantic_selection": {
+                "status": "selected" if selected_for_ai else "not_selected",
+                "reasons": selection_reasons,
+            },
         }
         node_name = _safe_node_filename(str(feature.get("node_id") or "feature"))
         if persist_feature_payloads:
@@ -564,7 +776,7 @@ def run_semantic_enrichment(
                 payload_trace_base / "feature-inputs" / f"{node_name}.json",
                 payload,
             ))
-        ai_allowed = bool(effective_use_ai)
+        ai_allowed = bool(effective_use_ai) and selected_for_ai
         if ai_feature_limit is not None and ai_feature_limit >= 0:
             ai_allowed = ai_allowed and ai_complete_count + ai_unavailable_count < ai_feature_limit
         ai_response = _call_ai(ai_call, stage="reconcile_semantic_feature", payload=payload) if ai_allowed else None
@@ -575,6 +787,10 @@ def run_semantic_enrichment(
             status = "ai_unavailable"
             ai_unavailable_count += 1
             ai_error_count += 1
+        elif effective_use_ai and not selected_for_ai:
+            status = "ai_skipped_selector"
+            ai_skipped_count += 1
+            ai_skipped_selector_count += 1
         elif effective_use_ai and not ai_allowed:
             status = "ai_skipped_limit"
             ai_skipped_count += 1
@@ -596,6 +812,8 @@ def run_semantic_enrichment(
                 semantic_entry["semantic_ai_route"] = ai_response.get("_ai_route")
             if ai_response.get("_ai_elapsed_ms") is not None:
                 semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
+        semantic_entry["semantic_selection_status"] = "selected" if selected_for_ai else "not_selected"
+        semantic_entry["semantic_selection_reasons"] = selection_reasons
         if persist_feature_payloads:
             payload_output_paths.append(write_json(
                 payload_trace_base / "feature-outputs" / f"{node_name}.json",
@@ -605,6 +823,9 @@ def run_semantic_enrichment(
                     "ai_response_present": bool(ai_response and not ai_response.get("_ai_error")),
                     "ai_error": ai_response.get("_ai_error") if isinstance(ai_response, dict) else "",
                     "ai_response": ai_response if isinstance(ai_response, dict) else None,
+                    "semantic_selector": selector,
+                    "semantic_selection_status": semantic_entry["semantic_selection_status"],
+                    "semantic_selection_reasons": selection_reasons,
                     "semantic_entry": semantic_entry,
                 },
             ))
@@ -620,6 +841,7 @@ def run_semantic_enrichment(
         "generated_at": generated_at,
         "created_by": created_by,
         "ai_requested": bool(effective_use_ai),
+        "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
         "feature_count": len(semantic_features),
         "features": sorted(semantic_features, key=lambda item: str(item.get("node_id") or "")),
@@ -640,7 +862,10 @@ def run_semantic_enrichment(
         "ai_unavailable_count": ai_unavailable_count,
         "ai_error_count": ai_error_count,
         "ai_skipped_count": ai_skipped_count,
+        "ai_selected_count": ai_selected_count,
+        "ai_skipped_selector_count": ai_skipped_selector_count,
         "feedback_count": len(feedback),
+        "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
         "unresolved_feedback_count": len(unresolved_feedback),
         "unresolved_feedback_ids": unresolved_feedback,
@@ -671,6 +896,8 @@ def run_semantic_enrichment(
             "latest_round_review_report_path": str(review_report_path),
             "feature_count": len(semantic_features),
             "ai_complete_count": ai_complete_count,
+            "ai_selected_count": ai_selected_count,
+            "ai_skipped_selector_count": ai_skipped_selector_count,
             "feedback_count": len(feedback),
             "unresolved_feedback_count": len(unresolved_feedback),
             "updated_at": generated_at,

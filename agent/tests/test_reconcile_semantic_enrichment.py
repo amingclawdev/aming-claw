@@ -34,38 +34,68 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _graph(node_id: str = "L7.1") -> dict:
+def _graph(node_id: str = "L7.1", *, include_extra: bool = False) -> dict:
+    nodes = [
+        {
+            "id": node_id,
+            "layer": "L7",
+            "title": "Backlog Runtime",
+            "kind": "service_runtime",
+            "primary": ["agent/governance/backlog_runtime.py"],
+            "secondary": ["docs/dev/backlog-runtime.md"],
+            "test": ["agent/tests/test_backlog_runtime.py"],
+            "config": ["config/roles/default/pm.yaml"],
+            "metadata": {
+                "subsystem": "backlog",
+                "config_files": ["config/roles/default/pm.yaml"],
+                "functions": [
+                    {
+                        "name": "claim_next",
+                        "path": "agent/governance/backlog_runtime.py",
+                        "lineno": 12,
+                    }
+                ],
+            },
+        }
+    ]
+    if include_extra:
+        nodes.extend([
+            {
+                "id": "L3.1",
+                "layer": "L3",
+                "title": "Backlog State Management",
+                "kind": "subsystem",
+                "primary": [],
+                "secondary": [],
+                "test": [],
+                "metadata": {"subsystem": "backlog"},
+            },
+            {
+                "id": "L7.2",
+                "layer": "L7",
+                "title": "Trace Writer",
+                "kind": "service_runtime",
+                "primary": ["agent/governance/reconcile_trace.py"],
+                "secondary": [],
+                "test": [],
+                "metadata": {"subsystem": "reconcile"},
+            },
+        ])
     return {
         "deps_graph": {
-            "nodes": [
-                {
-                    "id": node_id,
-                    "layer": "L7",
-                    "title": "Backlog Runtime",
-                    "kind": "service_runtime",
-                    "primary": ["agent/governance/backlog_runtime.py"],
-                    "secondary": ["docs/dev/backlog-runtime.md"],
-                    "test": ["agent/tests/test_backlog_runtime.py"],
-                    "config": ["config/roles/default/pm.yaml"],
-                    "metadata": {
-                        "subsystem": "backlog",
-                        "config_files": ["config/roles/default/pm.yaml"],
-                        "functions": [
-                            {
-                                "name": "claim_next",
-                                "path": "agent/governance/backlog_runtime.py",
-                                "lineno": 12,
-                            }
-                        ],
-                    },
-                }
-            ],
+            "nodes": nodes,
             "edges": [],
         }
     }
 
 
-def _create_snapshot(conn: sqlite3.Connection, project: Path, *, snapshot_kind: str = "full") -> None:
+def _create_snapshot(
+    conn: sqlite3.Connection,
+    project: Path,
+    *,
+    snapshot_kind: str = "full",
+    include_extra: bool = False,
+) -> None:
     _write(
         project / "agent" / "governance" / "backlog_runtime.py",
         "def claim_next():\n    return 'task'\n",
@@ -73,13 +103,15 @@ def _create_snapshot(conn: sqlite3.Connection, project: Path, *, snapshot_kind: 
     _write(project / "docs" / "dev" / "backlog-runtime.md", "# Backlog Runtime\n")
     _write(project / "agent" / "tests" / "test_backlog_runtime.py", "def test_claim_next():\n    assert True\n")
     _write(project / "config" / "roles" / "default" / "pm.yaml", "role: pm\n")
+    if include_extra:
+        _write(project / "agent" / "governance" / "reconcile_trace.py", "def write_json():\n    return None\n")
     store.create_graph_snapshot(
         conn,
         PID,
         snapshot_id=f"{snapshot_kind}-semantic-test",
         commit_sha="abc1234",
         snapshot_kind=snapshot_kind,
-        graph_json=_graph(),
+        graph_json=_graph(include_extra=include_extra),
         notes=json.dumps({"state_only": True}),
     )
     conn.commit()
@@ -182,6 +214,96 @@ def test_semantic_enrichment_is_snapshot_kind_agnostic(conn, tmp_path):
     assert result["semantic_index"]["snapshot_kind"] == "scope"
     assert result["semantic_index"]["features"][0]["enrichment_status"] == "heuristic"
     assert result["summary"]["quality_flag_counts"]["missing_symbol_refs"] == 1
+
+
+def test_semantic_enrichment_can_select_explicit_node_for_ai(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    seen_nodes: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_nodes.append(payload["feature"]["node_id"])
+        return {"feature_name": f"AI {payload['feature']['node_id']}"}
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.2"],
+        created_by="test",
+    )
+
+    assert seen_nodes == ["L7.2"]
+    assert result["summary"]["ai_selected_count"] == 1
+    assert result["summary"]["ai_complete_count"] == 1
+    assert result["summary"]["ai_skipped_selector_count"] == 1
+    by_id = {item["node_id"]: item for item in result["semantic_index"]["features"]}
+    assert by_id["L7.2"]["enrichment_status"] == "ai_complete"
+    assert by_id["L7.1"]["enrichment_status"] == "ai_skipped_selector"
+    assert by_id["L7.2"]["semantic_selection_reasons"] == ["node_id"]
+
+
+def test_semantic_enrichment_can_select_structural_layer(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    seen_nodes: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_nodes.append(payload["feature"]["node_id"])
+        return {
+            "feature_name": "Backlog State Architecture",
+            "semantic_summary": "Groups backlog state-management nodes.",
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_layers=["L3"],
+        created_by="test",
+    )
+
+    assert seen_nodes == ["L3.1"]
+    assert result["summary"]["ai_selected_count"] == 1
+    by_id = {item["node_id"]: item for item in result["semantic_index"]["features"]}
+    assert by_id["L3.1"]["enrichment_status"] == "ai_complete"
+    assert by_id["L3.1"]["feature_name"] == "Backlog State Architecture"
+    assert by_id["L7.1"]["enrichment_status"] == "ai_skipped_selector"
+
+
+def test_semantic_enrichment_can_select_missing_doc_nodes(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    seen_nodes: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_nodes.append(payload["feature"]["node_id"])
+        return {"feature_name": f"Needs docs {payload['feature']['node_id']}"}
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="issues",
+        semantic_missing=["doc"],
+        semantic_layers=["L7"],
+        created_by="test",
+    )
+
+    assert seen_nodes == ["L7.2"]
+    assert result["summary"]["semantic_selector"]["missing"] == ["doc"]
+    assert result["summary"]["semantic_selector"]["layers"] == ["L7"]
 
 
 def test_append_review_feedback_normalizes_append_only_items(conn, tmp_path):

@@ -49,9 +49,10 @@ class SemanticInputPolicy:
 class SemanticAnalyzerConfig:
     version: str
     analyzer: str
-    provider: str = "pipeline"
-    model: str = ""
+    provider: str = "anthropic"
+    model: str = "claude-opus-4-7"
     role: str = "pm"
+    executables: dict[str, str] = field(default_factory=dict)
     use_ai_default: bool = False
     temperature: float = 0.0
     max_tokens: int = 4000
@@ -119,12 +120,25 @@ class SemanticAnalyzerConfig:
             temperature = float(data.get("temperature", 0.0))
         except (TypeError, ValueError) as exc:
             raise SemanticConfigValidationError("'temperature' must be numeric") from exc
+        raw_executables = data.get("executables") or {}
+        if not isinstance(raw_executables, dict):
+            raise SemanticConfigValidationError("'executables' must be a mapping")
+        executables = {
+            str(provider).strip(): str(command).strip()
+            for provider, command in raw_executables.items()
+            if str(provider).strip() and str(command).strip()
+        }
+        if data.get("claude_bin"):
+            executables["anthropic"] = str(data.get("claude_bin")).strip()
+        if data.get("codex_bin"):
+            executables["openai"] = str(data.get("codex_bin")).strip()
         return cls(
             version=str(data.get("version") or ""),
             analyzer=analyzer,
-            provider=str(data.get("provider") or "pipeline"),
+            provider=str(data.get("provider") or "anthropic"),
             model=str(data.get("model") or ""),
             role=str(data.get("role") or "pm"),
+            executables=executables,
             use_ai_default=bool(data.get("use_ai_default", False)),
             temperature=temperature,
             max_tokens=max_tokens,
@@ -144,6 +158,7 @@ class SemanticAnalyzerConfig:
             "provider": self.provider,
             "model": self.model,
             "role": self.role,
+            "executables": dict(self.executables),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "mutate_project_files": False,
@@ -165,6 +180,7 @@ class SemanticAnalyzerConfig:
             "provider": self.provider,
             "model": self.model,
             "role": self.role,
+            "executables": dict(self.executables),
             "use_ai_default": self.use_ai_default,
             "source_path": self.source_path,
             "override_path": self.override_path,
@@ -176,9 +192,13 @@ def _default_config_dict() -> dict[str, Any]:
     return {
         "version": "1.0",
         "analyzer": "reconcile_semantic",
-        "provider": "pipeline",
-        "model": "",
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
         "role": "pm",
+        "executables": {
+            "anthropic": "claude",
+            "openai": "codex",
+        },
         "use_ai_default": False,
         "temperature": 0,
         "max_tokens": 4000,

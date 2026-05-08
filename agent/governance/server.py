@@ -1724,6 +1724,12 @@ def _semantic_ai_call_from_body(project_id: str, root: Path, body: dict):
             project_root=root,
             config_path=body.get("semantic_config_path"),
         )
+        if body.get("semantic_ai_provider") is not None:
+            semantic_config.provider = str(body.get("semantic_ai_provider") or "")
+        if body.get("semantic_ai_model") is not None:
+            semantic_config.model = str(body.get("semantic_ai_model") or "")
+        if body.get("semantic_ai_role") is not None:
+            semantic_config.role = str(body.get("semantic_ai_role") or "")
         effective_use_ai = semantic_config.use_ai_default if use_ai is None else use_ai
         if not effective_use_ai:
             return None
@@ -1735,6 +1741,52 @@ def _semantic_ai_call_from_body(project_id: str, root: Path, body: dict):
         )
     except Exception:
         return None
+
+
+def _semantic_ai_feature_limit_from_body(body: dict) -> int | None:
+    value = body.get("semantic_ai_feature_limit")
+    if value is None:
+        value = body.get("ai_feature_limit")
+    if value is None:
+        return None
+    return int(value)
+
+
+def _semantic_selector_kwargs_from_body(body: dict) -> dict:
+    return {
+        "semantic_ai_scope": body.get("semantic_ai_scope") or body.get("ai_scope"),
+        "semantic_node_ids": body.get("semantic_node_ids") or body.get("node_ids"),
+        "semantic_layers": body.get("semantic_layers") or body.get("layers"),
+        "semantic_quality_flags": body.get("semantic_quality_flags") or body.get("quality_flags"),
+        "semantic_missing": body.get("semantic_missing") or body.get("missing"),
+        "semantic_changed_paths": body.get("semantic_changed_paths") or body.get("changed_paths"),
+        "semantic_path_prefixes": body.get("semantic_path_prefixes") or body.get("path_prefixes"),
+        "semantic_selector_match": body.get("semantic_selector_match") or body.get("selector_match"),
+        "semantic_include_structural": bool(
+            body.get("semantic_include_structural")
+            or body.get("include_structural")
+        ),
+    }
+
+
+def _semantic_ai_config_kwargs_from_body(body: dict) -> dict:
+    return {
+        "semantic_ai_provider": (
+            str(body.get("semantic_ai_provider"))
+            if body.get("semantic_ai_provider") is not None
+            else None
+        ),
+        "semantic_ai_model": (
+            str(body.get("semantic_ai_model"))
+            if body.get("semantic_ai_model") is not None
+            else None
+        ),
+        "semantic_ai_role": (
+            str(body.get("semantic_ai_role"))
+            if body.get("semantic_ai_role") is not None
+            else None
+        ),
+    }
 
 
 def _query_int(query: dict, key: str, default: int) -> int:
@@ -2375,11 +2427,9 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                     else None
                 ),
                 semantic_ai_call=semantic_ai_call,
-                semantic_ai_feature_limit=(
-                    int(body["semantic_ai_feature_limit"])
-                    if body.get("semantic_ai_feature_limit") is not None
-                    else None
-                ),
+                semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_config_kwargs_from_body(body),
+                **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
             )
         except (KeyError, ValueError) as exc:
@@ -2422,11 +2472,9 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                     else None
                 ),
                 semantic_ai_call=semantic_ai_call,
-                semantic_ai_feature_limit=(
-                    int(body["semantic_ai_feature_limit"])
-                    if body.get("semantic_ai_feature_limit") is not None
-                    else None
-                ),
+                semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_config_kwargs_from_body(body),
+                **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
             )
         except (KeyError, ValueError) as exc:
@@ -2605,15 +2653,9 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                         if body.get("max_excerpt_chars") is not None
                         else None
                     ),
-                    ai_feature_limit=(
-                        int(body["semantic_ai_feature_limit"])
-                        if body.get("semantic_ai_feature_limit") is not None
-                        else (
-                            int(body["ai_feature_limit"])
-                            if body.get("ai_feature_limit") is not None
-                            else None
-                        )
-                    ),
+                    ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                    **_semantic_ai_config_kwargs_from_body(body),
+                    **_semantic_selector_kwargs_from_body(body),
                     semantic_config_path=body.get("semantic_config_path"),
                 )
             except (KeyError, ValueError) as exc:

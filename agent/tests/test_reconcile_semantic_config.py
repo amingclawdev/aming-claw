@@ -19,8 +19,11 @@ def test_default_semantic_config_loads_state_only_profile():
     config = load_semantic_enrichment_config()
 
     assert config.analyzer == "reconcile_semantic"
-    assert config.provider == "pipeline"
+    assert config.provider == "anthropic"
+    assert config.model == "claude-opus-4-7"
     assert config.role == "pm"
+    assert config.executables["anthropic"] == "claude"
+    assert config.executables["openai"] == "codex"
     assert config.use_ai_default is False
     assert "modify_code" not in config.permissions_can
     assert "mutate_graph_topology" in config.permissions_cannot
@@ -55,6 +58,7 @@ def test_project_override_merges_with_default(tmp_path):
     assert config.use_ai_default is True
     assert config.input_policy.max_excerpt_chars == 77
     assert config.prompt_template == "Custom project semantic analyzer prompt."
+    assert config.executables["anthropic"] == "claude"
     assert "read_graph_snapshot" in config.permissions_can
     assert config.override_path == str(override_path)
 
@@ -69,6 +73,88 @@ def test_semantic_ai_route_can_be_enabled_by_env(monkeypatch):
     assert route["provider"] == "openai"
     assert route["model"] == "gpt-test-semantic"
     assert route["source"] == "env"
+
+
+def test_semantic_ai_claude_call_resolves_path_binary(monkeypatch, tmp_path):
+    config = load_semantic_enrichment_config()
+    config.executables["anthropic"] = r"C:\Users\tester\.local\bin\claude.exe"
+    monkeypatch.delenv("CLAUDE_BIN", raising=False)
+    monkeypatch.setattr(reconcile_semantic_ai.shutil, "which", lambda name: None)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"feature_name":"Governance Trace","semantic_summary":"Trace is auditable."}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(reconcile_semantic_ai.subprocess, "run", fake_run)
+    ai_call = build_semantic_ai_call(
+        semantic_config=config,
+        project_id="aming-claw",
+        snapshot_id="full-test",
+        project_root=tmp_path,
+    )
+
+    result = ai_call("reconcile_semantic_feature", {"feature": {"node_id": "L7.1"}})
+
+    assert calls
+    assert calls[0][0].endswith("claude.exe")
+    assert "--model" in calls[0]
+    assert "claude-opus-4-7" in calls[0]
+    assert result["feature_name"] == "Governance Trace"
+    assert result["_ai_route"]["executable_source"] == "config"
+
+
+def test_semantic_ai_claude_call_extracts_wrapped_result(monkeypatch, tmp_path):
+    config = load_semantic_enrichment_config()
+    config.executables["anthropic"] = "claude-test"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"type":"result","is_error":false,'
+                '"result":"{\\"feature_name\\":\\"Trace\\",'
+                '\\"semantic_summary\\":\\"Wrapped JSON is parsed.\\"}"}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(reconcile_semantic_ai.subprocess, "run", fake_run)
+    ai_call = build_semantic_ai_call(
+        semantic_config=config,
+        project_id="aming-claw",
+        snapshot_id="full-test",
+        project_root=tmp_path,
+    )
+
+    result = ai_call("reconcile_semantic_feature", {"feature": {"node_id": "L7.1"}})
+
+    assert calls
+    assert result["feature_name"] == "Trace"
+    assert result["semantic_summary"] == "Wrapped JSON is parsed."
+    assert result["_ai_cli_result"]["type"] == "result"
+
+
+def test_semantic_ai_normalizes_opus_dot_alias(monkeypatch):
+    config = load_semantic_enrichment_config()
+    config.model = "claude-opus-4.7"
+    monkeypatch.delenv("RECONCILE_SEMANTIC_AI_PROVIDER", raising=False)
+    monkeypatch.delenv("RECONCILE_SEMANTIC_AI_MODEL", raising=False)
+
+    route = resolve_semantic_ai_route(config)
+
+    assert route["provider"] == "anthropic"
+    assert route["model"] == "claude-opus-4-7"
 
 
 def test_semantic_ai_openai_call_streams_prompt_on_stdin(monkeypatch, tmp_path):

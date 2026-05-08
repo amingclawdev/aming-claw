@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import subprocess
 import time
@@ -34,13 +35,59 @@ def _infer_provider(model: str, provider: str = "") -> str:
     return ""
 
 
+def _normalize_model_id(provider: str, model: str) -> str:
+    value = (model or "").strip()
+    if not value:
+        return value
+    if _normalize_provider(provider) == "anthropic":
+        key = re.sub(r"[\s_.]+", "-", value.lower())
+        if key in {
+            "opus4-7",
+            "opus-4-7",
+            "claude-opus4-7",
+            "claude-opus-4-7",
+        }:
+            return "claude-opus-4-7"
+    return value
+
+
+def _resolve_cli_binary(
+    env_var: str,
+    configured: str,
+    candidates: list[str],
+    fallback: str,
+) -> tuple[str, str]:
+    configured = (configured or "").strip()
+    if configured:
+        return configured, "config"
+    configured = os.getenv(env_var, "").strip()
+    if configured:
+        return configured, "env"
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved, "path"
+    return fallback, "fallback"
+
+
 def _extract_json_dict(text: str) -> dict[str, Any] | None:
     if not text or not text.strip():
         return None
     raw = text.strip()
     try:
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
+        if not isinstance(parsed, dict):
+            return None
+        inner_result = parsed.get("result")
+        if isinstance(inner_result, str) and inner_result.strip():
+            inner = _extract_json_dict(inner_result)
+            if inner:
+                inner["_ai_cli_result"] = {
+                    key: value for key, value in parsed.items()
+                    if key != "result"
+                }
+                return inner
+        return parsed
     except json.JSONDecodeError:
         pass
     blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", raw, re.DOTALL)
@@ -73,6 +120,8 @@ def _extract_json_dict(text: str) -> dict[str, Any] | None:
 def _semantic_error_message(parsed: dict[str, Any], config: SemanticAnalyzerConfig) -> str:
     """Return an error message when the model returned an error-only JSON object."""
     error = parsed.get("error") or parsed.get("message")
+    if not error and parsed.get("is_error") is True:
+        error = parsed.get("result") or "semantic AI returned error result"
     if not error:
         return ""
     required = config.output_schema.get("required") if isinstance(config.output_schema, dict) else []
@@ -94,10 +143,11 @@ def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
     if env_provider or env_model:
         model = env_model or config.model
         provider = _infer_provider(model, env_provider or config.provider)
+        model = _normalize_model_id(provider, model)
         return {"provider": provider, "model": model, "source": "env"}
 
     provider = _normalize_provider(config.provider)
-    model = (config.model or "").strip()
+    model = _normalize_model_id(provider, (config.model or "").strip())
     if provider in {"", "injected", "none", "off"}:
         return {"provider": "", "model": model, "source": "disabled"}
     if provider in {"pipeline", "role"}:
@@ -115,6 +165,7 @@ def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
                 resolved = resolve_role_config(config.role or "pm", pipeline)
                 model = model or (resolved.get("model") or "")
                 provider = _infer_provider(model, resolved.get("provider") or "")
+                model = _normalize_model_id(provider, model)
             except Exception:
                 provider = ""
         if not model:
@@ -122,6 +173,7 @@ def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
                 from config import get_claude_model, get_model_provider
                 model = (get_claude_model() or "").strip()
                 provider = _infer_provider(model, get_model_provider())
+                model = _normalize_model_id(provider, model)
             except Exception:
                 pass
         return {"provider": provider, "model": model, "source": "pipeline"}
@@ -177,7 +229,12 @@ def build_semantic_ai_call(
         before = git_changed()
         t0 = time.perf_counter()
         if provider == "openai":
-            codex_bin = os.getenv("CODEX_BIN", "").strip() or ("codex.cmd" if os.name == "nt" else "codex")
+            codex_bin, executable_source = _resolve_cli_binary(
+                "CODEX_BIN",
+                semantic_config.executables.get("openai", ""),
+                ["codex", "codex.cmd", "codex.ps1"] if os.name == "nt" else ["codex"],
+                "codex",
+            )
             output_last = log_dir / f"reconcile-semantic-{attempt_tag}.last_message.txt"
             prompt_file = log_dir / f"reconcile-semantic-{attempt_tag}.prompt.md"
             prompt_file.write_text(prompt, encoding="utf-8")
@@ -205,7 +262,12 @@ def build_semantic_ai_call(
             raw = output_last.read_text(encoding="utf-8") if output_last.exists() else (proc.stdout or "")
             stderr = proc.stderr or ""
         else:
-            claude_bin = os.getenv("CLAUDE_BIN", "").strip() or ("claude.cmd" if os.name == "nt" else "claude")
+            claude_bin, executable_source = _resolve_cli_binary(
+                "CLAUDE_BIN",
+                semantic_config.executables.get("anthropic", ""),
+                ["claude", "claude.exe", "claude.cmd"] if os.name == "nt" else ["claude"],
+                "claude",
+            )
             cmd = [claude_bin, "-p", "--output-format", "json"]
             if model:
                 cmd.extend(["--model", model])
@@ -253,7 +315,11 @@ def build_semantic_ai_call(
         error_message = _semantic_error_message(parsed, semantic_config)
         if error_message:
             raise RuntimeError(f"semantic AI returned error response: {error_message}")
-        parsed["_ai_route"] = route
+        parsed["_ai_route"] = {
+            **route,
+            "executable": str(cmd[0]) if cmd else "",
+            "executable_source": executable_source,
+        }
         parsed["_ai_elapsed_ms"] = elapsed_ms
         return parsed
 
