@@ -7,6 +7,7 @@ source files or graph topology.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sqlite3
@@ -29,6 +30,8 @@ SEMANTIC_ENRICHMENT_SCHEMA_VERSION = 1
 SEMANTIC_ARTIFACT_DIR = "semantic-enrichment"
 SEMANTIC_INDEX_NAME = "semantic-index.json"
 SEMANTIC_REVIEW_REPORT_NAME = "semantic-review-report.json"
+SEMANTIC_GRAPH_STATE_NAME = "semantic-graph-state.json"
+SEMANTIC_GRAPH_NAME = "semantic-graph.json"
 REVIEW_FEEDBACK_NAME = "review-feedback.jsonl"
 
 FeedbackAiCall = Callable[[str, dict[str, Any]], Any]
@@ -798,6 +801,46 @@ def _refresh_semantic_batch_memory(
         return {}
 
 
+def _shorten_text(value: Any, limit: int = 300) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _compact_memory_conflict(conflict: Any) -> dict[str, Any]:
+    if not isinstance(conflict, dict):
+        return {"reason": _shorten_text(conflict, 160)}
+    out = {
+        "reason": _shorten_text(conflict.get("reason"), 160),
+        "cluster_fingerprint": _shorten_text(conflict.get("cluster_fingerprint"), 120),
+        "file": _shorten_text(conflict.get("file"), 200),
+        "owner_feature": _shorten_text(conflict.get("owner_feature"), 160),
+        "claimant_feature": _shorten_text(conflict.get("claimant_feature"), 160),
+    }
+    items = conflict.get("items")
+    if isinstance(items, list) and items:
+        compact_items: list[dict[str, Any]] = []
+        for item in items[:5]:
+            if isinstance(item, dict):
+                compact_items.append({
+                    "type": _shorten_text(item.get("type") or item.get("kind"), 120),
+                    "target": _shorten_text(item.get("target") or item.get("suggested_target"), 200),
+                    "reason": _shorten_text(item.get("reason") or item.get("rationale"), 300),
+                    "proposed_action": _shorten_text(item.get("proposed_action"), 300),
+                })
+            else:
+                compact_items.append({"reason": _shorten_text(item, 300)})
+        out["items"] = compact_items
+        if len(items) > len(compact_items):
+            out["omitted_item_count"] = len(items) - len(compact_items)
+    return {
+        key: value
+        for key, value in out.items()
+        if value != "" and value != [] and value != {}
+    }
+
+
 def _semantic_batch_memory_summary(batch: dict[str, Any]) -> dict[str, Any]:
     memory = batch.get("memory") if isinstance(batch, dict) else {}
     memory = memory if isinstance(memory, dict) else {}
@@ -807,7 +850,7 @@ def _semantic_batch_memory_summary(batch: dict[str, Any]) -> dict[str, Any]:
         item = accepted.get(name) if isinstance(accepted.get(name), dict) else {}
         features.append({
             "feature_name": name,
-            "purpose": str(item.get("purpose") or "")[:600],
+            "purpose": _shorten_text(item.get("purpose"), 360),
             "clusters": _path_list(item.get("clusters")),
             "owned_files": _path_list(item.get("owned_files"))[:20],
             "shared_files": _path_list(item.get("shared_files"))[:20],
@@ -824,8 +867,325 @@ def _semantic_batch_memory_summary(batch: dict[str, Any]) -> dict[str, Any]:
         "open_conflict_count": len(conflicts),
         "reserved_names": _path_list(memory.get("reserved_names"))[:200],
         "accepted_features": features,
-        "open_conflicts": conflicts[-50:],
+        "open_conflicts": [_compact_memory_conflict(item) for item in conflicts[-20:]],
     }
+
+
+def _empty_semantic_graph_state(
+    project_id: str,
+    snapshot_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "snapshot_kind": snapshot.get("snapshot_kind") or "",
+        "commit_sha": snapshot.get("commit_sha") or "",
+        "node_semantics": {},
+        "accepted_features": {},
+        "file_ownership": {},
+        "open_issues": [],
+        "completed_node_ids": [],
+        "updated_at": "",
+    }
+
+
+def _load_semantic_graph_state(
+    project_id: str,
+    snapshot_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    path = _semantic_base_dir(project_id, snapshot_id) / SEMANTIC_GRAPH_STATE_NAME
+    payload = _read_json(path, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    state = _empty_semantic_graph_state(project_id, snapshot_id, snapshot)
+    state.update(payload)
+    if not isinstance(state.get("node_semantics"), dict):
+        state["node_semantics"] = {}
+    _rebuild_semantic_graph_state_indexes(state)
+    return state
+
+
+def _semantic_review_status(review: Any) -> str:
+    if not isinstance(review, dict):
+        return ""
+    status = str(review.get("status") or "").strip()
+    if status:
+        return status
+    if review.get("bound") is True:
+        return "bound"
+    if review.get("bound") is False:
+        return "missing"
+    return ""
+
+
+def _semantic_open_issues(node_id: str, ai_response: dict[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for key in (
+        "merge_suggestions",
+        "split_suggestions",
+        "dependency_patch_suggestions",
+        "dead_code_candidates",
+    ):
+        value = ai_response.get(key)
+        if not value:
+            continue
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if isinstance(item, dict):
+                issues.append({
+                    "node_id": node_id,
+                    "reason": key,
+                    "type": str(item.get("type") or item.get("kind") or ""),
+                    "target": str(item.get("target") or item.get("suggested_target") or ""),
+                    "summary": _shorten_text(
+                        item.get("reason")
+                        or item.get("rationale")
+                        or item.get("proposed_action")
+                        or item,
+                        500,
+                    ),
+                })
+            else:
+                issues.append({
+                    "node_id": node_id,
+                    "reason": key,
+                    "summary": _shorten_text(item, 500),
+                })
+    return issues
+
+
+def _semantic_state_entry(
+    feature: dict[str, Any],
+    semantic_entry: dict[str, Any],
+    *,
+    feedback_round: int,
+    batch_index: int | None,
+    updated_at: str,
+) -> dict[str, Any]:
+    node_id = str(feature.get("node_id") or semantic_entry.get("node_id") or "")
+    ai_route = semantic_entry.get("semantic_ai_route")
+    return {
+        "node_id": node_id,
+        "source_title": semantic_entry.get("source_title") or feature.get("title") or "",
+        "feature_name": semantic_entry.get("feature_name") or feature.get("title") or node_id,
+        "semantic_summary": _shorten_text(semantic_entry.get("semantic_summary"), 1200),
+        "intent": _shorten_text(semantic_entry.get("intent"), 1200),
+        "domain_label": semantic_entry.get("domain_label") or "",
+        "status": semantic_entry.get("enrichment_status") or "",
+        "quality_flags": _path_list(semantic_entry.get("quality_flags")),
+        "primary": _path_list(feature.get("primary")),
+        "secondary": _path_list(feature.get("secondary")),
+        "test": _path_list(feature.get("test")),
+        "config": _path_list(feature.get("config")),
+        "feature_hash": feature.get("feature_hash") or semantic_entry.get("feature_hash") or "",
+        "file_hashes": feature.get("file_hashes") or semantic_entry.get("file_hashes") or {},
+        "doc_status": _semantic_review_status(semantic_entry.get("doc_coverage_review")),
+        "test_status": _semantic_review_status(semantic_entry.get("test_coverage_review")),
+        "config_status": _semantic_review_status(semantic_entry.get("config_coverage_review")),
+        "open_issues": _semantic_open_issues(node_id, semantic_entry),
+        "feedback_round": feedback_round,
+        "batch_index": batch_index,
+        "updated_at": updated_at,
+        "ai_route": ai_route if isinstance(ai_route, dict) else {},
+    }
+
+
+def _rebuild_semantic_graph_state_indexes(state: dict[str, Any]) -> None:
+    nodes = state.get("node_semantics") if isinstance(state.get("node_semantics"), dict) else {}
+    accepted: dict[str, dict[str, Any]] = {}
+    file_ownership: dict[str, str] = {}
+    open_issues: list[dict[str, Any]] = []
+    completed: list[str] = []
+    for node_id, raw in nodes.items():
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status") or "")
+        if status == "ai_complete":
+            completed.append(str(node_id))
+        feature_name = str(raw.get("feature_name") or raw.get("source_title") or node_id)
+        feature = accepted.setdefault(
+            feature_name,
+            {
+                "feature_name": feature_name,
+                "node_ids": [],
+                "owned_files": [],
+                "candidate_docs": [],
+                "candidate_tests": [],
+                "candidate_configs": [],
+                "purpose": raw.get("intent") or raw.get("semantic_summary") or "",
+            },
+        )
+        if str(node_id) not in feature["node_ids"]:
+            feature["node_ids"].append(str(node_id))
+        for path in _path_list(raw.get("primary")):
+            file_ownership.setdefault(path, feature_name)
+            feature["owned_files"].append(path)
+        feature["candidate_docs"].extend(_path_list(raw.get("secondary")))
+        feature["candidate_tests"].extend(_path_list(raw.get("test")))
+        feature["candidate_configs"].extend(_path_list(raw.get("config")))
+        for issue in raw.get("open_issues") or []:
+            if isinstance(issue, dict):
+                open_issues.append(issue)
+    for feature in accepted.values():
+        for key in ("node_ids", "owned_files", "candidate_docs", "candidate_tests", "candidate_configs"):
+            feature[key] = sorted(set(_path_list(feature.get(key))))
+        feature["purpose"] = _shorten_text(feature.get("purpose"), 600)
+    state["accepted_features"] = dict(sorted(accepted.items()))
+    state["file_ownership"] = dict(sorted(file_ownership.items()))
+    state["open_issues"] = open_issues[-200:]
+    state["completed_node_ids"] = sorted(set(completed))
+
+
+def _upsert_semantic_graph_state_entry(
+    state: dict[str, Any],
+    feature: dict[str, Any],
+    semantic_entry: dict[str, Any],
+    *,
+    feedback_round: int,
+    batch_index: int | None,
+    updated_at: str,
+) -> None:
+    node_id = str(feature.get("node_id") or semantic_entry.get("node_id") or "")
+    if not node_id:
+        return
+    node_semantics = state.setdefault("node_semantics", {})
+    node_semantics[node_id] = _semantic_state_entry(
+        feature,
+        semantic_entry,
+        feedback_round=feedback_round,
+        batch_index=batch_index,
+        updated_at=updated_at,
+    )
+    state["updated_at"] = updated_at
+    _rebuild_semantic_graph_state_indexes(state)
+
+
+def _semantic_graph_state_summary(state: dict[str, Any]) -> dict[str, Any]:
+    accepted = state.get("accepted_features") if isinstance(state.get("accepted_features"), dict) else {}
+    features: list[dict[str, Any]] = []
+    for name in sorted(accepted):
+        item = accepted.get(name) if isinstance(accepted.get(name), dict) else {}
+        features.append({
+            "feature_name": name,
+            "node_ids": _path_list(item.get("node_ids"))[:20],
+            "purpose": _shorten_text(item.get("purpose"), 360),
+            "owned_files": _path_list(item.get("owned_files"))[:20],
+            "candidate_docs": _path_list(item.get("candidate_docs"))[:20],
+            "candidate_tests": _path_list(item.get("candidate_tests"))[:20],
+            "candidate_configs": _path_list(item.get("candidate_configs"))[:20],
+        })
+    return {
+        "schema_version": state.get("schema_version") or SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+        "snapshot_id": state.get("snapshot_id") or "",
+        "commit_sha": state.get("commit_sha") or "",
+        "semanticized_node_count": len(state.get("node_semantics") or {}),
+        "completed_node_count": len(state.get("completed_node_ids") or []),
+        "accepted_feature_count": len(features),
+        "file_ownership_count": len(state.get("file_ownership") or {}),
+        "open_issue_count": len(state.get("open_issues") or []),
+        "completed_node_ids": _path_list(state.get("completed_node_ids"))[:300],
+        "accepted_features": features,
+        "open_issues": [_compact_memory_conflict(item) for item in (state.get("open_issues") or [])[-30:]],
+    }
+
+
+def _semantic_graph_related_features(state: dict[str, Any], feature: dict[str, Any]) -> list[dict[str, Any]]:
+    accepted = state.get("accepted_features") if isinstance(state.get("accepted_features"), dict) else {}
+    current_paths = set(_feature_paths(feature))
+    if not current_paths:
+        return []
+    related: list[dict[str, Any]] = []
+    for name, item in accepted.items():
+        if not isinstance(item, dict):
+            continue
+        paths = set(
+            _path_list(item.get("owned_files"))
+            + _path_list(item.get("candidate_docs"))
+            + _path_list(item.get("candidate_tests"))
+            + _path_list(item.get("candidate_configs"))
+        )
+        overlap = sorted(current_paths.intersection(paths))
+        if overlap:
+            related.append({
+                "feature_name": str(name),
+                "matching_files": overlap[:30],
+                "node_ids": _path_list(item.get("node_ids"))[:20],
+                "reason": "semantic_graph_file_overlap",
+            })
+    return related[:20]
+
+
+def _semantic_entry_from_state(feature: dict[str, Any], state_entry: dict[str, Any]) -> dict[str, Any]:
+    entry = _heuristic_semantic_entry(
+        feature,
+        [],
+        enrichment_status="semantic_graph_state",
+        ai_response={
+            "feature_name": state_entry.get("feature_name"),
+            "semantic_summary": state_entry.get("semantic_summary"),
+            "intent": state_entry.get("intent"),
+            "domain_label": state_entry.get("domain_label"),
+            "doc_coverage_review": {"status": state_entry.get("doc_status")},
+            "test_coverage_review": {"status": state_entry.get("test_status")},
+            "config_coverage_review": {"status": state_entry.get("config_status")},
+        },
+    )
+    entry["quality_flags"] = _path_list(state_entry.get("quality_flags"))
+    entry["semantic_graph_state_status"] = state_entry.get("status") or ""
+    entry["semantic_graph_state_updated_at"] = state_entry.get("updated_at") or ""
+    return entry
+
+
+def _materialize_semantic_graph(graph_json: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    graph = copy.deepcopy(graph_json if isinstance(graph_json, dict) else {})
+    deps = graph.get("deps_graph") if isinstance(graph.get("deps_graph"), dict) else {}
+    nodes = deps.get("nodes") if isinstance(deps.get("nodes"), list) else []
+    semantics = state.get("node_semantics") if isinstance(state.get("node_semantics"), dict) else {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = _node_id(node)
+        if not node_id or node_id not in semantics:
+            continue
+        metadata = node.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+            node["metadata"] = metadata
+        metadata["semantic"] = semantics[node_id]
+    graph.setdefault("metadata", {})
+    if isinstance(graph["metadata"], dict):
+        graph["metadata"]["semantic_graph_state"] = {
+            "snapshot_id": state.get("snapshot_id") or "",
+            "updated_at": state.get("updated_at") or "",
+            "completed_node_count": len(state.get("completed_node_ids") or []),
+            "accepted_feature_count": len(state.get("accepted_features") or {}),
+        }
+    return graph
+
+
+def _write_semantic_graph_state_artifacts(
+    project_id: str,
+    snapshot_id: str,
+    graph_json: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    round_number: int,
+) -> tuple[Path, Path, Path, Path]:
+    base = _semantic_base_dir(project_id, snapshot_id)
+    rdir = _round_dir(project_id, snapshot_id, round_number)
+    latest_state_path = base / SEMANTIC_GRAPH_STATE_NAME
+    latest_graph_path = base / SEMANTIC_GRAPH_NAME
+    round_state_path = rdir / SEMANTIC_GRAPH_STATE_NAME
+    round_graph_path = rdir / SEMANTIC_GRAPH_NAME
+    semantic_graph = _materialize_semantic_graph(graph_json, state)
+    _write_json(latest_state_path, state)
+    _write_json(round_state_path, state)
+    _write_json(latest_graph_path, semantic_graph)
+    _write_json(round_graph_path, semantic_graph)
+    return latest_state_path, latest_graph_path, round_state_path, round_graph_path
 
 
 def _semantic_memory_related_features(batch: dict[str, Any], feature: dict[str, Any]) -> list[dict[str, Any]]:
@@ -942,6 +1302,8 @@ def run_semantic_enrichment(
     semantic_include_structural: bool = False,
     semantic_ai_batch_size: int | None = None,
     semantic_ai_batch_by: str = "subsystem",
+    semantic_graph_state: bool = True,
+    semantic_skip_completed: bool = True,
     semantic_batch_memory: bool | None = None,
     semantic_batch_memory_id: str | None = None,
     trace_dir: str | Path | None = None,
@@ -1002,6 +1364,12 @@ def run_semantic_enrichment(
     existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
     round_number = int(feedback_round) if feedback_round is not None else len(existing_rounds)
     generated_at = utc_now()
+    semantic_state_enabled = bool(semantic_graph_state)
+    semantic_state = (
+        _load_semantic_graph_state(project_id, snapshot_id, snapshot)
+        if semantic_state_enabled
+        else _empty_semantic_graph_state(project_id, snapshot_id, snapshot)
+    )
     semantic_features: list[dict[str, Any]] = []
     ai_complete_count = 0
     ai_unavailable_count = 0
@@ -1013,6 +1381,7 @@ def run_semantic_enrichment(
     ai_batch_count = 0
     ai_batch_complete_count = 0
     ai_batch_error_count = 0
+    semantic_graph_state_hit_count = 0
     payload_input_paths: list[str] = []
     payload_output_paths: list[str] = []
     payload_trace_base = Path(trace_dir) if trace_dir else _round_dir(project_id, snapshot_id, round_number)
@@ -1024,11 +1393,27 @@ def run_semantic_enrichment(
             project_root=root,
             max_excerpt_chars=effective_excerpt_chars,
         )
+        node_id = str(feature.get("node_id") or "")
         relevant_feedback = [
             item for item in feedback if _feedback_matches_feature(item, feature)
         ]
         flags = _quality_flags(feature, relevant_feedback)
         selected_for_ai, selection_reasons = _selector_decision(feature, flags, selector)
+        existing_semantic = (
+            semantic_state.get("node_semantics", {}).get(node_id)
+            if semantic_state_enabled
+            else None
+        )
+        existing_semantic = existing_semantic if isinstance(existing_semantic, dict) else {}
+        skipped_completed = bool(
+            semantic_state_enabled
+            and semantic_skip_completed
+            and existing_semantic.get("status") == "ai_complete"
+            and not relevant_feedback
+        )
+        if skipped_completed:
+            selected_for_ai = False
+            selection_reasons = list(selection_reasons) + ["semantic_graph_state_complete"]
         if selected_for_ai:
             ai_selected_count += 1
         payload_feature = dict(feature)
@@ -1057,6 +1442,8 @@ def run_semantic_enrichment(
                 "status": "selected" if selected_for_ai else "not_selected",
                 "reasons": selection_reasons,
             },
+            "semantic_graph_state": _semantic_graph_state_summary(semantic_state) if semantic_state_enabled else {},
+            "existing_semantic": existing_semantic,
         }
         node_name = _safe_node_filename(str(feature.get("node_id") or "feature"))
         if persist_feature_payloads:
@@ -1072,6 +1459,8 @@ def run_semantic_enrichment(
             "node_name": node_name,
             "selected_for_ai": selected_for_ai,
             "selection_reasons": selection_reasons,
+            "existing_semantic": existing_semantic,
+            "skipped_completed": skipped_completed,
         })
 
     selected_records = [
@@ -1087,11 +1476,7 @@ def run_semantic_enrichment(
         for record in allowed_records
     }
     ai_responses: dict[str, dict[str, Any]] = {}
-    memory_enabled = (
-        bool(effective_use_ai and allowed_records and ai_batch_size > 1)
-        if semantic_batch_memory is None
-        else bool(semantic_batch_memory)
-    )
+    memory_enabled = bool(semantic_batch_memory)
     memory_batch: dict[str, Any] = {}
     memory_batch_id = ""
     memory_error = ""
@@ -1117,6 +1502,17 @@ def run_semantic_enrichment(
         if ai_batch_size <= 1:
             for record in allowed_records:
                 node_id = str(record["feature"].get("node_id") or "")
+                if semantic_state_enabled:
+                    record["payload"]["semantic_graph_state"] = _semantic_graph_state_summary(semantic_state)
+                    record["payload"]["related_graph_features"] = _semantic_graph_related_features(
+                        semantic_state,
+                        record["feature"],
+                    )
+                    if persist_feature_payloads:
+                        write_json(
+                            payload_trace_base / "feature-inputs" / f"{record['node_name']}.json",
+                            record["payload"],
+                        )
                 if memory_enabled:
                     memory_batch = _refresh_semantic_batch_memory(conn, project_id, memory_batch_id) or memory_batch
                     record["payload"]["batch_memory"] = _semantic_batch_memory_summary(memory_batch)
@@ -1133,9 +1529,26 @@ def run_semantic_enrichment(
                     ai_call,
                     stage="reconcile_semantic_feature",
                     payload=record["payload"],
-                )
+                    )
                 if response is not None:
                     ai_responses[node_id] = response
+                if semantic_state_enabled and response is not None and not response.get("_ai_error"):
+                    state_entry = _heuristic_semantic_entry(
+                        record["feature"],
+                        record["feedback"],
+                        enrichment_status="ai_complete",
+                        ai_response=response,
+                    )
+                    if response.get("_ai_route"):
+                        state_entry["semantic_ai_route"] = response.get("_ai_route")
+                    _upsert_semantic_graph_state_entry(
+                        semantic_state,
+                        record["feature"],
+                        state_entry,
+                        feedback_round=round_number,
+                        batch_index=None,
+                        updated_at=utc_now(),
+                    )
                 if memory_enabled and response is not None and not response.get("_ai_error"):
                     updated_batch, update_error = _record_semantic_memory_decision(
                         conn,
@@ -1150,6 +1563,14 @@ def run_semantic_enrichment(
                     else:
                         memory_decision_count += 1
                         memory_batch = updated_batch or memory_batch
+                if semantic_state_enabled:
+                    _write_semantic_graph_state_artifacts(
+                        project_id,
+                        snapshot_id,
+                        graph_json,
+                        semantic_state,
+                        round_number=round_number,
+                    )
         else:
             for batch_index, batch in enumerate(
                 _batch_records(
@@ -1163,6 +1584,11 @@ def run_semantic_enrichment(
                 if memory_enabled:
                     memory_batch = _refresh_semantic_batch_memory(conn, project_id, memory_batch_id) or memory_batch
                 memory_summary = _semantic_batch_memory_summary(memory_batch) if memory_enabled else {}
+                graph_state_summary = (
+                    _semantic_graph_state_summary(semantic_state)
+                    if semantic_state_enabled
+                    else {}
+                )
                 batch_payload = {
                     "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
                     "project_id": project_id,
@@ -1185,13 +1611,20 @@ def run_semantic_enrichment(
                                 if memory_enabled
                                 else []
                             ),
+                            "related_graph_features": (
+                                _semantic_graph_related_features(semantic_state, record["feature"])
+                                if semantic_state_enabled
+                                else []
+                            ),
                         }
                         for record in batch
                     ],
+                    "semantic_graph_state": graph_state_summary,
                     "batch_memory": memory_summary,
                     "instructions": {
                         **semantic_config.to_instruction_payload(),
                         "batch_mode": True,
+                        "use_semantic_graph_state": bool(semantic_state_enabled),
                         "use_batch_memory": bool(memory_enabled),
                         "output_contract": (
                             "Return one JSON object with a features array. Each item must include "
@@ -1238,6 +1671,23 @@ def run_semantic_enrichment(
                 for record in batch:
                     node_id = str(record["feature"].get("node_id") or "")
                     response = ai_responses.get(node_id)
+                    if semantic_state_enabled and response is not None and not response.get("_ai_error"):
+                        state_entry = _heuristic_semantic_entry(
+                            record["feature"],
+                            record["feedback"],
+                            enrichment_status="ai_complete",
+                            ai_response=response,
+                        )
+                        if response.get("_ai_route"):
+                            state_entry["semantic_ai_route"] = response.get("_ai_route")
+                        _upsert_semantic_graph_state_entry(
+                            semantic_state,
+                            record["feature"],
+                            state_entry,
+                            feedback_round=round_number,
+                            batch_index=batch_index,
+                            updated_at=utc_now(),
+                        )
                     if not (memory_enabled and response is not None and not response.get("_ai_error")):
                         continue
                     updated_batch, update_error = _record_semantic_memory_decision(
@@ -1253,6 +1703,14 @@ def run_semantic_enrichment(
                     else:
                         memory_decision_count += 1
                         memory_batch = updated_batch or memory_batch
+                if semantic_state_enabled:
+                    _write_semantic_graph_state_artifacts(
+                        project_id,
+                        snapshot_id,
+                        graph_json,
+                        semantic_state,
+                        round_number=round_number,
+                    )
 
     for record in records:
         feature = record["feature"]
@@ -1263,38 +1721,43 @@ def run_semantic_enrichment(
         node_name = record["node_name"]
         ai_allowed = node_id in allowed_node_ids
         ai_response = ai_responses.get(node_id)
-        if ai_response is not None and not ai_response.get("_ai_error"):
-            status = "ai_complete"
-            ai_complete_count += 1
-        elif ai_response is not None and ai_response.get("_ai_error"):
-            status = "ai_unavailable"
-            ai_unavailable_count += 1
-            ai_error_count += 1
-        elif effective_use_ai and not selected_for_ai:
-            status = "ai_skipped_selector"
-            ai_skipped_count += 1
-            ai_skipped_selector_count += 1
-        elif effective_use_ai and not ai_allowed:
-            status = "ai_skipped_limit"
-            ai_skipped_count += 1
+        if record.get("skipped_completed") and record.get("existing_semantic"):
+            status = "semantic_graph_state"
+            semantic_graph_state_hit_count += 1
+            semantic_entry = _semantic_entry_from_state(feature, record["existing_semantic"])
         else:
-            status = "ai_unavailable" if effective_use_ai else "heuristic"
-            if effective_use_ai:
+            if ai_response is not None and not ai_response.get("_ai_error"):
+                status = "ai_complete"
+                ai_complete_count += 1
+            elif ai_response is not None and ai_response.get("_ai_error"):
+                status = "ai_unavailable"
                 ai_unavailable_count += 1
-        semantic_entry = _heuristic_semantic_entry(
-            feature,
-            relevant_feedback,
-            enrichment_status=status,
-            ai_response=ai_response if ai_response and not ai_response.get("_ai_error") else None,
-        )
-        if ai_response and ai_response.get("_ai_error"):
-            semantic_entry.setdefault("quality_flags", []).append("semantic_ai_error")
-            semantic_entry["semantic_ai_error"] = ai_response.get("_ai_error")
-        elif ai_response:
-            if ai_response.get("_ai_route"):
-                semantic_entry["semantic_ai_route"] = ai_response.get("_ai_route")
-            if ai_response.get("_ai_elapsed_ms") is not None:
-                semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
+                ai_error_count += 1
+            elif effective_use_ai and not selected_for_ai:
+                status = "ai_skipped_selector"
+                ai_skipped_count += 1
+                ai_skipped_selector_count += 1
+            elif effective_use_ai and not ai_allowed:
+                status = "ai_skipped_limit"
+                ai_skipped_count += 1
+            else:
+                status = "ai_unavailable" if effective_use_ai else "heuristic"
+                if effective_use_ai:
+                    ai_unavailable_count += 1
+            semantic_entry = _heuristic_semantic_entry(
+                feature,
+                relevant_feedback,
+                enrichment_status=status,
+                ai_response=ai_response if ai_response and not ai_response.get("_ai_error") else None,
+            )
+            if ai_response and ai_response.get("_ai_error"):
+                semantic_entry.setdefault("quality_flags", []).append("semantic_ai_error")
+                semantic_entry["semantic_ai_error"] = ai_response.get("_ai_error")
+            elif ai_response:
+                if ai_response.get("_ai_route"):
+                    semantic_entry["semantic_ai_route"] = ai_response.get("_ai_route")
+                if ai_response.get("_ai_elapsed_ms") is not None:
+                    semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
         semantic_entry["semantic_selection_status"] = "selected" if selected_for_ai else "not_selected"
         semantic_entry["semantic_selection_reasons"] = selection_reasons
         if persist_feature_payloads:
@@ -1327,6 +1790,38 @@ def run_semantic_enrichment(
         "file_ownership_count": memory_summary.get("file_ownership_count", 0),
         "open_conflict_count": memory_summary.get("open_conflict_count", 0),
     }
+    semantic_graph_state_report = {
+        "enabled": bool(semantic_state_enabled),
+        "hit_count": semantic_graph_state_hit_count,
+        "skip_completed": bool(semantic_skip_completed),
+        "completed_node_count": len(semantic_state.get("completed_node_ids") or []),
+        "accepted_feature_count": len(semantic_state.get("accepted_features") or {}),
+        "file_ownership_count": len(semantic_state.get("file_ownership") or {}),
+        "open_issue_count": len(semantic_state.get("open_issues") or []),
+        "state_path": "",
+        "semantic_graph_path": "",
+        "round_state_path": "",
+        "round_semantic_graph_path": "",
+    }
+    if semantic_state_enabled:
+        (
+            latest_state_path,
+            latest_graph_path,
+            round_state_path,
+            round_graph_path,
+        ) = _write_semantic_graph_state_artifacts(
+            project_id,
+            snapshot_id,
+            graph_json,
+            semantic_state,
+            round_number=round_number,
+        )
+        semantic_graph_state_report.update({
+            "state_path": str(latest_state_path),
+            "semantic_graph_path": str(latest_graph_path),
+            "round_state_path": str(round_state_path),
+            "round_semantic_graph_path": str(round_graph_path),
+        })
 
     semantic_index = {
         "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
@@ -1345,6 +1840,7 @@ def run_semantic_enrichment(
             "batch_by": semantic_ai_batch_by,
             "batch_count": ai_batch_count,
         },
+        "semantic_graph_state": semantic_graph_state_report,
         "semantic_batch_memory": memory_report,
         "feature_count": len(semantic_features),
         "features": sorted(semantic_features, key=lambda item: str(item.get("node_id") or "")),
@@ -1372,6 +1868,7 @@ def run_semantic_enrichment(
         "ai_batch_count": ai_batch_count,
         "ai_batch_complete_count": ai_batch_complete_count,
         "ai_batch_error_count": ai_batch_error_count,
+        "semantic_graph_state": semantic_graph_state_report,
         "semantic_batch_memory": memory_report,
         "feedback_count": len(feedback),
         "semantic_selector": selector,
@@ -1412,6 +1909,7 @@ def run_semantic_enrichment(
             "ai_batch_size": ai_batch_size,
             "ai_batch_by": semantic_ai_batch_by,
             "ai_batch_count": ai_batch_count,
+            "semantic_graph_state": semantic_graph_state_report,
             "semantic_batch_memory": memory_report,
             "feedback_count": len(feedback),
             "unresolved_feedback_count": len(unresolved_feedback),

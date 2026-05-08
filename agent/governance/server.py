@@ -1766,6 +1766,37 @@ def _semantic_ai_batch_kwargs_from_body(body: dict) -> dict:
     }
 
 
+def _semantic_bool_from_body(body: dict, *keys: str, default: bool | None = None) -> bool | None:
+    for key in keys:
+        if body.get(key) is None:
+            continue
+        value = body.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", ""}
+        return bool(value)
+    return default
+
+
+def _semantic_state_kwargs_from_body(body: dict) -> dict:
+    return {
+        "semantic_graph_state": bool(
+            _semantic_bool_from_body(body, "semantic_graph_state", "graph_state", default=True)
+        ),
+        "semantic_skip_completed": bool(
+            _semantic_bool_from_body(body, "semantic_skip_completed", "skip_completed", default=True)
+        ),
+        "semantic_batch_memory": _semantic_bool_from_body(
+            body,
+            "semantic_batch_memory",
+            "batch_memory",
+            default=False,
+        ),
+        "semantic_batch_memory_id": body.get("semantic_batch_memory_id") or body.get("batch_memory_id"),
+    }
+
+
 def _semantic_selector_kwargs_from_body(body: dict) -> dict:
     return {
         "semantic_ai_scope": body.get("semantic_ai_scope") or body.get("ai_scope"),
@@ -2443,6 +2474,7 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 semantic_ai_call=semantic_ai_call,
                 semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
                 **_semantic_ai_batch_kwargs_from_body(body),
+                **_semantic_state_kwargs_from_body(body),
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2489,6 +2521,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 semantic_ai_call=semantic_ai_call,
                 semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
                 **_semantic_ai_batch_kwargs_from_body(body),
+                **_semantic_state_kwargs_from_body(body),
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2671,6 +2704,7 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                     ),
                     ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
                     **_semantic_ai_batch_kwargs_from_body(body),
+                    **_semantic_state_kwargs_from_body(body),
                     **_semantic_ai_config_kwargs_from_body(body),
                     **_semantic_selector_kwargs_from_body(body),
                     semantic_config_path=body.get("semantic_config_path"),

@@ -10,6 +10,7 @@ from agent.governance import reconcile_batch_memory as bm
 from agent.governance import graph_snapshot_store as store
 from agent.governance.reconcile_semantic_enrichment import (
     _batch_key,
+    _semantic_batch_memory_summary,
     append_review_feedback,
     load_review_feedback,
     run_semantic_enrichment,
@@ -354,34 +355,39 @@ def test_semantic_enrichment_can_batch_ai_features(conn, tmp_path):
     assert [call["stage"] for call in calls] == ["reconcile_semantic_feature_batch"]
     assert len(calls[0]["payload"]["features"]) == 2
     assert calls[0]["payload"]["instructions"]["batch_mode"] is True
-    assert calls[0]["payload"]["instructions"]["use_batch_memory"] is True
-    assert calls[0]["payload"]["batch_memory"]["accepted_feature_count"] == 0
+    assert calls[0]["payload"]["instructions"]["use_semantic_graph_state"] is True
+    assert calls[0]["payload"]["instructions"]["use_batch_memory"] is False
+    assert calls[0]["payload"]["semantic_graph_state"]["completed_node_count"] == 0
+    assert calls[0]["payload"]["batch_memory"] == {}
     assert calls[0]["payload"]["features"][0]["related_batch_features"] == []
+    assert calls[0]["payload"]["features"][0]["related_graph_features"] == []
     assert result["summary"]["ai_batch_count"] == 1
     assert result["summary"]["ai_batch_complete_count"] == 1
     assert result["summary"]["ai_complete_count"] == 2
-    assert result["summary"]["semantic_batch_memory"]["enabled"] is True
-    assert result["summary"]["semantic_batch_memory"]["decision_count"] == 2
-    assert result["summary"]["semantic_batch_memory"]["accepted_feature_count"] == 2
+    assert result["summary"]["semantic_graph_state"]["enabled"] is True
+    assert result["summary"]["semantic_graph_state"]["completed_node_count"] == 2
+    assert result["summary"]["semantic_graph_state"]["accepted_feature_count"] == 2
+    assert result["summary"]["semantic_batch_memory"]["enabled"] is False
     by_id = {item["node_id"]: item for item in result["semantic_index"]["features"]}
     assert by_id["L7.1"]["feature_name"] == "Batch L7.1"
     assert by_id["L7.2"]["feature_name"] == "Batch L7.2"
     assert by_id["L7.1"]["semantic_ai_route"]["model"] == "batch-model"
-    batch = bm.get_batch(conn, PID, "semantic-full-semantic-test-round-000")
-    assert sorted(batch["memory"]["accepted_features"]) == ["Batch L7.1", "Batch L7.2"]
-    assert batch["memory"]["file_ownership"]["agent/governance/backlog_runtime.py"] == "Batch L7.1"
+    assert Path(result["summary"]["semantic_graph_state"]["state_path"]).exists()
+    semantic_graph = json.loads(Path(result["summary"]["semantic_graph_state"]["semantic_graph_path"]).read_text())
+    graph_nodes = {node["id"]: node for node in semantic_graph["deps_graph"]["nodes"]}
+    assert graph_nodes["L7.1"]["metadata"]["semantic"]["feature_name"] == "Batch L7.1"
     assert Path(result["summary"]["batch_payload_input_dir"]).exists()
     assert Path(result["summary"]["batch_payload_output_dir"]).exists()
 
 
-def test_semantic_batch_memory_accumulates_across_single_ai_calls(conn, tmp_path):
+def test_semantic_graph_state_accumulates_and_skips_completed(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project, include_extra=True)
-    memory_counts: list[int] = []
+    completed_counts: list[int] = []
 
     def fake_ai(stage: str, payload: dict) -> dict:
         assert stage == "reconcile_semantic_feature"
-        memory_counts.append(payload["batch_memory"]["accepted_feature_count"])
+        completed_counts.append(payload["semantic_graph_state"]["completed_node_count"])
         return {
             "feature_name": f"Feature {payload['feature']['node_id']}",
             "semantic_summary": f"Summary {payload['feature']['node_id']}",
@@ -395,14 +401,94 @@ def test_semantic_batch_memory_accumulates_across_single_ai_calls(conn, tmp_path
         use_ai=True,
         ai_call=fake_ai,
         semantic_ai_scope="all",
+        created_by="test",
+    )
+
+    assert completed_counts == [0, 1]
+    assert result["summary"]["semantic_graph_state"]["completed_node_count"] == 2
+
+    calls_after_first = len(completed_counts)
+    second = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="all",
+        created_by="test",
+    )
+    assert len(completed_counts) == calls_after_first
+    assert second["summary"]["semantic_graph_state"]["hit_count"] == 2
+    by_id = {item["node_id"]: item for item in second["semantic_index"]["features"]}
+    assert by_id["L7.1"]["enrichment_status"] == "semantic_graph_state"
+    assert by_id["L7.1"]["feature_name"] == "Feature L7.1"
+
+
+def test_semantic_batch_memory_remains_explicit_advisory(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    memory_counts: list[int] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        assert stage == "reconcile_semantic_feature"
+        memory_counts.append(payload["batch_memory"]["accepted_feature_count"])
+        return {
+            "feature_name": f"Memory {payload['feature']['node_id']}",
+            "semantic_summary": f"Summary {payload['feature']['node_id']}",
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="all",
         semantic_batch_memory=True,
+        semantic_skip_completed=False,
         created_by="test",
     )
 
     assert memory_counts == [0, 1]
     assert result["summary"]["semantic_batch_memory"]["decision_count"] == 2
     batch = bm.get_batch(conn, PID, "semantic-full-semantic-test-round-000")
-    assert sorted(batch["memory"]["accepted_features"]) == ["Feature L7.1", "Feature L7.2"]
+    assert sorted(batch["memory"]["accepted_features"]) == ["Memory L7.1", "Memory L7.2"]
+
+
+def test_semantic_batch_memory_summary_compacts_large_conflicts():
+    summary = _semantic_batch_memory_summary({
+        "batch_id": "batch-1",
+        "session_id": "session-1",
+        "memory": {
+            "accepted_features": {
+                "Feature A": {
+                    "purpose": "x" * 500,
+                    "owned_files": ["a.py"],
+                }
+            },
+            "file_ownership": {"a.py": "Feature A"},
+            "open_conflicts": [
+                {
+                    "reason": "dependency_patch_suggestions",
+                    "items": [
+                        {
+                            "type": "document_gate_taxonomy",
+                            "reason": "r" * 600,
+                            "proposed_action": "p" * 600,
+                        }
+                    ],
+                }
+            ],
+        },
+    })
+
+    assert summary["accepted_features"][0]["purpose"].endswith("...")
+    item = summary["open_conflicts"][0]["items"][0]
+    assert item["reason"].endswith("...")
+    assert item["proposed_action"].endswith("...")
+    assert len(json.dumps(summary)) < 1600
 
 
 def test_append_review_feedback_normalizes_append_only_items(conn, tmp_path):
