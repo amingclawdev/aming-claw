@@ -796,6 +796,58 @@ def test_reconcile_feedback_filters_semantic_state_by_round_and_nodes(conn, tmp_
     assert items == {"L7.new", "L7.sibling"}
 
 
+def test_reconcile_feedback_classifies_all_semantic_state_rounds(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    state_path = reconcile_feedback.semantic_graph_state_path(PID, "full-semantic-test")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "node_semantics": {
+            "L7.1": {
+                "feedback_round": 1,
+                "open_issues": [
+                    {
+                        "reason": "dependency_patch_suggestions",
+                        "summary": "Add typed relation to the task registry.",
+                        "target": "agent.governance.task_registry",
+                        "type": "add_typed_relation",
+                    },
+                ],
+            },
+            "L7.2": {
+                "feedback_round": 2,
+                "open_issues": [
+                    {
+                        "reason": "split_suggestions",
+                        "summary": "Observer should decide whether this node should split.",
+                        "type": "split",
+                    },
+                ],
+            },
+        },
+    }), encoding="utf-8")
+
+    result = reconcile_feedback.classify_semantic_state_rounds(
+        PID,
+        "full-semantic-test",
+        created_by="observer",
+    )
+    assert result["rounds"] == ["round-001", "round-002"]
+    assert result["created"] == 2
+    assert result["summary"]["by_kind"] == {
+        "graph_correction": 1,
+        "needs_observer_decision": 1,
+    }
+
+    again = reconcile_feedback.classify_semantic_state_rounds(
+        PID,
+        "full-semantic-test",
+        created_by="observer",
+    )
+    assert again["created"] == 0
+    assert again["updated"] == 2
+
+
 def test_reconcile_feedback_review_queue_groups_and_hides_status_noise(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)

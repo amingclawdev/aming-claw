@@ -496,6 +496,31 @@ def _select_semantic_state_issues(
     return selected
 
 
+def _semantic_state_feedback_rounds(semantic_state: dict[str, Any]) -> list[int]:
+    rounds: set[int] = set()
+    node_semantics = semantic_state.get("node_semantics")
+    if isinstance(node_semantics, dict):
+        for raw_entry in node_semantics.values():
+            if not isinstance(raw_entry, dict) or not raw_entry.get("open_issues"):
+                continue
+            entry_round = _round_number(raw_entry.get("feedback_round"))
+            if entry_round is not None:
+                rounds.add(entry_round)
+    raw_issues = semantic_state.get("open_issues")
+    if isinstance(raw_issues, list):
+        for raw_issue in raw_issues:
+            if not isinstance(raw_issue, dict):
+                continue
+            issue_round = _issue_round(raw_issue)
+            if issue_round is not None:
+                rounds.add(issue_round)
+    return sorted(rounds)
+
+
+def _round_label(round_number: int) -> str:
+    return f"round-{round_number:03d}"
+
+
 def _target_type(issue_type: str, summary: str, reason: str) -> str:
     text = f"{issue_type} {reason} {summary}".lower()
     if "relation" in text or "edge" in text or "dependency" in text:
@@ -832,6 +857,74 @@ def classify_semantic_open_issues(
     return result
 
 
+def classify_semantic_state_rounds(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    created_by: str = "system",
+    source_rounds: list[str | int] | None = None,
+    limit_per_round: int | None = None,
+) -> dict[str, Any]:
+    """Classify all round-scoped semantic graph-state issues for a snapshot."""
+    semantic_state = _read_json(semantic_graph_state_path(project_id, snapshot_id), {})
+    if not isinstance(semantic_state, dict):
+        semantic_state = {}
+    rounds = [_round_number(raw_round) for raw_round in (source_rounds or [])]
+    if not source_rounds:
+        rounds = _semantic_state_feedback_rounds(semantic_state)
+    normalized_rounds = sorted({round_number for round_number in rounds if round_number is not None})
+
+    results: list[dict[str, Any]] = []
+    created = 0
+    updated = 0
+    total = 0
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for round_number in normalized_rounds:
+        round_label = _round_label(round_number)
+        result = classify_semantic_open_issues(
+            project_id,
+            snapshot_id,
+            source_round=round_label,
+            created_by=created_by,
+            limit=limit_per_round,
+        )
+        results.append({
+            "source_round": round_label,
+            "created": result.get("created", 0),
+            "updated": result.get("updated", 0),
+            "count": result.get("count", 0),
+            "summary": result.get("summary", {}),
+        })
+        created += int(result.get("created") or 0)
+        updated += int(result.get("updated") or 0)
+        total += int(result.get("count") or 0)
+        for item in result.get("items") or []:
+            kind = str(item.get("feedback_kind") or "")
+            status = str(item.get("status") or "")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            by_status[status] = by_status.get(status, 0) + 1
+
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "rounds": [_round_label(round_number) for round_number in normalized_rounds],
+        "round_count": len(normalized_rounds),
+        "created": created,
+        "updated": updated,
+        "count": total,
+        "summary": {
+            "count": total,
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_status": dict(sorted(by_status.items())),
+        },
+        "results": results,
+        "state_path": str(feedback_state_path(project_id, snapshot_id)),
+        "events_path": str(feedback_events_path(project_id, snapshot_id)),
+    }
+
+
 def feedback_summary(project_id: str, snapshot_id: str) -> dict[str, Any]:
     items = list_feedback_items(project_id, snapshot_id)
     by_kind: dict[str, int] = {}
@@ -1101,6 +1194,7 @@ __all__ = [
     "STATUS_CATEGORY_NEEDS_HUMAN",
     "classify_open_issue",
     "classify_semantic_open_issues",
+    "classify_semantic_state_rounds",
     "build_feedback_review_queue",
     "infer_status_observation_category",
     "list_feedback_items",

@@ -2500,6 +2500,9 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
                 **_semantic_ai_batch_kwargs_from_body(body),
                 **_semantic_state_kwargs_from_body(body),
+                semantic_classify_feedback=bool(
+                    _semantic_bool_from_body(body, "semantic_classify_feedback", "classify_feedback", default=True)
+                ),
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2547,6 +2550,9 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
                 **_semantic_ai_batch_kwargs_from_body(body),
                 **_semantic_state_kwargs_from_body(body),
+                semantic_classify_feedback=bool(
+                    _semantic_bool_from_body(body, "semantic_classify_feedback", "classify_feedback", default=True)
+                ),
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),

@@ -279,6 +279,7 @@ def run_state_only_full_reconcile(
     semantic_dynamic_graph_state: bool | None = None,
     semantic_graph_state: bool = True,
     semantic_skip_completed: bool = True,
+    semantic_classify_feedback: bool = True,
     semantic_batch_memory: bool | None = False,
     semantic_batch_memory_id: str | None = None,
     semantic_base_snapshot_id: str | None = None,
@@ -541,6 +542,14 @@ def run_state_only_full_reconcile(
             trace_dir=trace.trace_dir / "semantic-enrichment",
         )
         semantic_enrichment = _semantic_enrichment_summary(semantic_result)
+        if semantic_classify_feedback:
+            from agent.governance import reconcile_feedback
+
+            semantic_enrichment["feedback_queue"] = reconcile_feedback.classify_semantic_state_rounds(
+                project_id,
+                sid,
+                created_by=created_by,
+            )
     trace.step(
         "semantic-enrichment",
         input_payload={
@@ -554,6 +563,7 @@ def run_state_only_full_reconcile(
             "semantic_dynamic_graph_state": semantic_dynamic_graph_state,
             "semantic_graph_state": semantic_graph_state,
             "semantic_skip_completed": semantic_skip_completed,
+            "semantic_classify_feedback": semantic_classify_feedback,
             "semantic_batch_memory": semantic_batch_memory,
             "semantic_base_snapshot_id": semantic_base_snapshot_id,
             "semantic_ai_provider": semantic_ai_provider,
@@ -710,6 +720,7 @@ def run_pending_scope_reconcile_candidate(
     semantic_dynamic_graph_state: bool | None = None,
     semantic_graph_state: bool = True,
     semantic_skip_completed: bool = True,
+    semantic_classify_feedback: bool = True,
     semantic_batch_memory: bool | None = False,
     semantic_batch_memory_id: str | None = None,
     semantic_base_snapshot_id: str | None = None,
@@ -785,6 +796,7 @@ def run_pending_scope_reconcile_candidate(
         semantic_dynamic_graph_state=semantic_dynamic_graph_state,
         semantic_graph_state=semantic_graph_state,
         semantic_skip_completed=semantic_skip_completed,
+        semantic_classify_feedback=semantic_classify_feedback,
         semantic_batch_memory=semantic_batch_memory,
         semantic_batch_memory_id=semantic_batch_memory_id,
         semantic_base_snapshot_id=semantic_base_snapshot_id or active.get("snapshot_id", ""),
