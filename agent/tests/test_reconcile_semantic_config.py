@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,8 @@ from agent.governance.reconcile_semantic_config import (
     SemanticConfigValidationError,
     load_semantic_enrichment_config,
 )
-from agent.governance.reconcile_semantic_ai import resolve_semantic_ai_route
+from agent.governance import reconcile_semantic_ai
+from agent.governance.reconcile_semantic_ai import build_semantic_ai_call, resolve_semantic_ai_route
 
 
 def test_default_semantic_config_loads_state_only_profile():
@@ -67,6 +69,68 @@ def test_semantic_ai_route_can_be_enabled_by_env(monkeypatch):
     assert route["provider"] == "openai"
     assert route["model"] == "gpt-test-semantic"
     assert route["source"] == "env"
+
+
+def test_semantic_ai_openai_call_streams_prompt_on_stdin(monkeypatch, tmp_path):
+    config = load_semantic_enrichment_config()
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_PROVIDER", "openai")
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_MODEL", "gpt-test-semantic")
+    monkeypatch.setenv("CODEX_BIN", "codex-test")
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        calls.append({"cmd": cmd, "input": kwargs.get("input")})
+        output_path = Path(cmd[cmd.index("-o") + 1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            '{"feature_name":"Governance Trace","semantic_summary":"Trace is auditable."}',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(reconcile_semantic_ai.subprocess, "run", fake_run)
+    ai_call = build_semantic_ai_call(
+        semantic_config=config,
+        project_id="aming-claw",
+        snapshot_id="full-test",
+        project_root=tmp_path,
+    )
+
+    result = ai_call("reconcile_semantic_feature", {"feature": {"node_id": "L7.1"}})
+
+    assert calls
+    assert calls[0]["cmd"][-1] == "-"
+    assert "Payload:" in calls[0]["input"]
+    assert result["feature_name"] == "Governance Trace"
+    assert result["_ai_route"]["provider"] == "openai"
+
+
+def test_semantic_ai_rejects_error_only_json(monkeypatch, tmp_path):
+    config = load_semantic_enrichment_config()
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_PROVIDER", "openai")
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_MODEL", "gpt-test-semantic")
+    monkeypatch.setenv("CODEX_BIN", "codex-test")
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        output_path = Path(cmd[cmd.index("-o") + 1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text('{"error":"Cannot read supplied payload."}', encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(reconcile_semantic_ai.subprocess, "run", fake_run)
+    ai_call = build_semantic_ai_call(
+        semantic_config=config,
+        project_id="aming-claw",
+        snapshot_id="full-test",
+        project_root=tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="error response"):
+        ai_call("reconcile_semantic_feature", {"feature": {"node_id": "L7.1"}})
 
 
 def test_semantic_config_rejects_mutation_permissions(tmp_path):

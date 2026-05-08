@@ -70,6 +70,23 @@ def _extract_json_dict(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _semantic_error_message(parsed: dict[str, Any], config: SemanticAnalyzerConfig) -> str:
+    """Return an error message when the model returned an error-only JSON object."""
+    error = parsed.get("error") or parsed.get("message")
+    if not error:
+        return ""
+    required = config.output_schema.get("required") if isinstance(config.output_schema, dict) else []
+    semantic_keys = {
+        "feature_name",
+        "semantic_summary",
+        "intent",
+        "domain_label",
+        *(str(item) for item in (required or []) if str(item)),
+    }
+    has_semantic_payload = any(parsed.get(key) not in (None, "", [], {}) for key in semantic_keys)
+    return "" if has_semantic_payload else str(error)
+
+
 def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
     """Resolve provider/model for semantic AI from config/env/pipeline."""
     env_provider = os.getenv("RECONCILE_SEMANTIC_AI_PROVIDER", "").strip()
@@ -150,7 +167,7 @@ def build_semantic_ai_call(
         prompt = (
             f"{semantic_config.prompt_template}\n\n"
             "Return exactly one JSON object matching the requested semantic fields. "
-            "Do not modify files, run commands, or create tasks.\n\n"
+            "Do not modify files, create tasks, or inspect project files outside the supplied payload.\n\n"
             "Payload:\n"
             f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
         )
@@ -164,16 +181,6 @@ def build_semantic_ai_call(
             output_last = log_dir / f"reconcile-semantic-{attempt_tag}.last_message.txt"
             prompt_file = log_dir / f"reconcile-semantic-{attempt_tag}.prompt.md"
             prompt_file.write_text(prompt, encoding="utf-8")
-            rel_prompt_file = prompt_file
-            try:
-                rel_prompt_file = prompt_file.relative_to(root)
-            except ValueError:
-                pass
-            short_prompt = (
-                "Read the reconcile semantic prompt/payload file at "
-                f"{rel_prompt_file}. Return exactly one JSON object on stdout. "
-                "Do not modify files, run commands, or create tasks."
-            )
             cmd = [
                 codex_bin,
                 "exec",
@@ -186,8 +193,15 @@ def build_semantic_ai_call(
             ]
             if model:
                 cmd.extend(["--model", model])
-            cmd.append(short_prompt)
-            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout_sec, check=False)
+            cmd.append("-")
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                timeout=timeout_sec,
+                check=False,
+            )
             raw = output_last.read_text(encoding="utf-8") if output_last.exists() else (proc.stdout or "")
             stderr = proc.stderr or ""
         else:
@@ -236,6 +250,9 @@ def build_semantic_ai_call(
         parsed = _extract_json_dict(raw)
         if not parsed:
             raise RuntimeError("semantic AI returned no JSON object")
+        error_message = _semantic_error_message(parsed, semantic_config)
+        if error_message:
+            raise RuntimeError(f"semantic AI returned error response: {error_message}")
         parsed["_ai_route"] = route
         parsed["_ai_elapsed_ms"] = elapsed_ms
         return parsed
