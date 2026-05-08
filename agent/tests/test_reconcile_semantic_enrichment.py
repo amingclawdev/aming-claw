@@ -8,6 +8,7 @@ import pytest
 
 from agent.governance import graph_snapshot_store as store
 from agent.governance.reconcile_semantic_enrichment import (
+    _batch_key,
     append_review_feedback,
     load_review_feedback,
     run_semantic_enrichment,
@@ -16,6 +17,16 @@ from agent.governance.db import _ensure_schema
 
 
 PID = "semantic-enrichment-test"
+
+
+def test_semantic_batch_key_prefers_hierarchy_parent_for_feature_groups():
+    feature = {
+        "layer": "L7",
+        "kind": "",
+        "metadata": {"hierarchy_parent": "L3.19"},
+    }
+
+    assert _batch_key(feature, "subsystem") == "L3.19"
 
 
 @pytest.fixture()
@@ -304,6 +315,53 @@ def test_semantic_enrichment_can_select_missing_doc_nodes(conn, tmp_path):
     assert seen_nodes == ["L7.2"]
     assert result["summary"]["semantic_selector"]["missing"] == ["doc"]
     assert result["summary"]["semantic_selector"]["layers"] == ["L7"]
+
+
+def test_semantic_enrichment_can_batch_ai_features(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    calls: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append({"stage": stage, "payload": payload})
+        return {
+            "features": [
+                {
+                    "node_id": item["feature"]["node_id"],
+                    "feature_name": f"Batch {item['feature']['node_id']}",
+                    "semantic_summary": f"Batch summary {item['feature']['node_id']}",
+                }
+                for item in payload["features"]
+            ],
+            "_ai_route": {"provider": "test", "model": "batch-model"},
+            "_ai_elapsed_ms": 42,
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="all",
+        semantic_ai_batch_size=10,
+        semantic_ai_batch_by="none",
+        created_by="test",
+    )
+
+    assert [call["stage"] for call in calls] == ["reconcile_semantic_feature_batch"]
+    assert len(calls[0]["payload"]["features"]) == 2
+    assert calls[0]["payload"]["instructions"]["batch_mode"] is True
+    assert result["summary"]["ai_batch_count"] == 1
+    assert result["summary"]["ai_batch_complete_count"] == 1
+    assert result["summary"]["ai_complete_count"] == 2
+    by_id = {item["node_id"]: item for item in result["semantic_index"]["features"]}
+    assert by_id["L7.1"]["feature_name"] == "Batch L7.1"
+    assert by_id["L7.2"]["feature_name"] == "Batch L7.2"
+    assert by_id["L7.1"]["semantic_ai_route"]["model"] == "batch-model"
+    assert Path(result["summary"]["batch_payload_input_dir"]).exists()
+    assert Path(result["summary"]["batch_payload_output_dir"]).exists()
 
 
 def test_append_review_feedback_normalizes_append_only_items(conn, tmp_path):

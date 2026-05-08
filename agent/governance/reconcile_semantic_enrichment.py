@@ -630,6 +630,116 @@ def _call_ai(
     return response if isinstance(response, dict) else None
 
 
+def _normal_batch_size(raw: int | None) -> int:
+    if raw is None:
+        return 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, value)
+
+
+def _batch_key(feature: dict[str, Any], batch_by: str) -> str:
+    mode = (batch_by or "subsystem").strip().lower()
+    metadata = feature.get("metadata") if isinstance(feature.get("metadata"), dict) else {}
+    if mode in {"none", "order", "flat"}:
+        return "all"
+    if mode in {"layer", "layers"}:
+        return str(feature.get("layer") or "unknown")
+    if mode in {"kind", "role"}:
+        return str(feature.get("kind") or metadata.get("kind") or "unknown")
+    if mode in {"subsystem", "feature", "feature_group", "group"}:
+        return str(
+            metadata.get("subsystem")
+            or metadata.get("hierarchy_parent")
+            or metadata.get("parent")
+            or metadata.get("cluster_parent")
+            or metadata.get("feature_cluster")
+            or metadata.get("cluster")
+            or feature.get("kind")
+            or feature.get("layer")
+            or "unknown"
+        )
+    return str(metadata.get(mode) or "unknown")
+
+
+def _batch_records(
+    records: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    batch_by: str,
+) -> list[list[dict[str, Any]]]:
+    if batch_size <= 1:
+        return [[record] for record in records]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for record in records:
+        key = _batch_key(record["feature"], batch_by)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(record)
+    batches: list[list[dict[str, Any]]] = []
+    for key in order:
+        group = groups[key]
+        for idx in range(0, len(group), batch_size):
+            batches.append(group[idx: idx + batch_size])
+    return batches
+
+
+def _extract_batch_ai_responses(
+    response: dict[str, Any] | None,
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    node_ids = [str(record["feature"].get("node_id") or "") for record in records]
+    if not response:
+        return {}
+    if response.get("_ai_error"):
+        return {node_id: {"_ai_error": response.get("_ai_error")} for node_id in node_ids}
+
+    raw_items: Any = (
+        response.get("features")
+        or response.get("semantic_features")
+        or response.get("nodes")
+        or response.get("results")
+    )
+    if isinstance(raw_items, dict):
+        items = []
+        for node_id, payload in raw_items.items():
+            if isinstance(payload, dict):
+                item = dict(payload)
+                item.setdefault("node_id", str(node_id))
+                items.append(item)
+        raw_items = items
+    if not isinstance(raw_items, list):
+        if len(node_ids) == 1:
+            return {node_ids[0]: dict(response)}
+        return {
+            node_id: {"_ai_error": "semantic AI batch returned no features array"}
+            for node_id in node_ids
+        }
+
+    route = response.get("_ai_route")
+    elapsed = response.get("_ai_elapsed_ms")
+    out: dict[str, dict[str, Any]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        node_id = str(item.get("node_id") or item.get("id") or "")
+        if not node_id:
+            continue
+        payload = dict(item)
+        if route and not payload.get("_ai_route"):
+            payload["_ai_route"] = route
+        if elapsed is not None and payload.get("_ai_elapsed_ms") is None:
+            payload["_ai_elapsed_ms"] = elapsed
+        out[node_id] = payload
+    for node_id in node_ids:
+        out.setdefault(node_id, {"_ai_error": "semantic AI batch omitted node_id"})
+    return out
+
+
 def _safe_node_filename(node_id: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in node_id)
     return safe or "feature"
@@ -661,6 +771,8 @@ def run_semantic_enrichment(
     semantic_path_prefixes: Any = None,
     semantic_selector_match: str | None = None,
     semantic_include_structural: bool = False,
+    semantic_ai_batch_size: int | None = None,
+    semantic_ai_batch_by: str = "subsystem",
     trace_dir: str | Path | None = None,
     persist_feature_payloads: bool = True,
 ) -> dict[str, Any]:
@@ -726,9 +838,14 @@ def run_semantic_enrichment(
     ai_skipped_count = 0
     ai_selected_count = 0
     ai_skipped_selector_count = 0
+    ai_batch_size = _normal_batch_size(semantic_ai_batch_size)
+    ai_batch_count = 0
+    ai_batch_complete_count = 0
+    ai_batch_error_count = 0
     payload_input_paths: list[str] = []
     payload_output_paths: list[str] = []
     payload_trace_base = Path(trace_dir) if trace_dir else _round_dir(project_id, snapshot_id, round_number)
+    records: list[dict[str, Any]] = []
     for node in nodes:
         feature = _feature_context_from_node(
             node,
@@ -776,10 +893,125 @@ def run_semantic_enrichment(
                 payload_trace_base / "feature-inputs" / f"{node_name}.json",
                 payload,
             ))
-        ai_allowed = bool(effective_use_ai) and selected_for_ai
-        if ai_feature_limit is not None and ai_feature_limit >= 0:
-            ai_allowed = ai_allowed and ai_complete_count + ai_unavailable_count < ai_feature_limit
-        ai_response = _call_ai(ai_call, stage="reconcile_semantic_feature", payload=payload) if ai_allowed else None
+        records.append({
+            "feature": feature,
+            "feedback": relevant_feedback,
+            "flags": flags,
+            "payload": payload,
+            "node_name": node_name,
+            "selected_for_ai": selected_for_ai,
+            "selection_reasons": selection_reasons,
+        })
+
+    selected_records = [
+        record for record in records
+        if bool(effective_use_ai) and record["selected_for_ai"]
+    ]
+    if ai_feature_limit is not None and ai_feature_limit >= 0:
+        allowed_records = selected_records[: int(ai_feature_limit)]
+    else:
+        allowed_records = selected_records
+    allowed_node_ids = {
+        str(record["feature"].get("node_id") or "")
+        for record in allowed_records
+    }
+    ai_responses: dict[str, dict[str, Any]] = {}
+    if allowed_records:
+        if ai_batch_size <= 1:
+            for record in allowed_records:
+                node_id = str(record["feature"].get("node_id") or "")
+                response = _call_ai(
+                    ai_call,
+                    stage="reconcile_semantic_feature",
+                    payload=record["payload"],
+                )
+                if response is not None:
+                    ai_responses[node_id] = response
+        else:
+            for batch_index, batch in enumerate(
+                _batch_records(
+                    allowed_records,
+                    batch_size=ai_batch_size,
+                    batch_by=semantic_ai_batch_by,
+                )
+            ):
+                ai_batch_count += 1
+                batch_key = _batch_key(batch[0]["feature"], semantic_ai_batch_by) if batch else "all"
+                batch_payload = {
+                    "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+                    "project_id": project_id,
+                    "snapshot_id": snapshot_id,
+                    "snapshot_kind": snapshot.get("snapshot_kind") or "",
+                    "commit_sha": snapshot.get("commit_sha") or "",
+                    "feedback_round": round_number,
+                    "batch_index": batch_index,
+                    "batch_key": batch_key,
+                    "batch_by": semantic_ai_batch_by,
+                    "feature_count": len(batch),
+                    "features": [
+                        {
+                            "feature": record["payload"]["feature"],
+                            "review_feedback": record["payload"]["review_feedback"],
+                            "semantic_selection": record["payload"]["semantic_selection"],
+                            "quality_flags": record["flags"],
+                        }
+                        for record in batch
+                    ],
+                    "instructions": {
+                        **semantic_config.to_instruction_payload(),
+                        "batch_mode": True,
+                        "output_contract": (
+                            "Return one JSON object with a features array. Each item must include "
+                            "node_id and the same semantic fields used for single-feature enrichment."
+                        ),
+                    },
+                    "semantic_selector": selector,
+                }
+                batch_name = f"batch-{batch_index:03d}-{_safe_node_filename(batch_key)}"
+                if persist_feature_payloads:
+                    write_json(
+                        payload_trace_base / "batch-inputs" / f"{batch_name}.json",
+                        batch_payload,
+                    )
+                batch_response = _call_ai(
+                    ai_call,
+                    stage="reconcile_semantic_feature_batch",
+                    payload=batch_payload,
+                )
+                if batch_response and not batch_response.get("_ai_error"):
+                    ai_batch_complete_count += 1
+                else:
+                    ai_batch_error_count += 1
+                if persist_feature_payloads:
+                    write_json(
+                        payload_trace_base / "batch-outputs" / f"{batch_name}.json",
+                        {
+                            "batch_index": batch_index,
+                            "batch_key": batch_key,
+                            "node_ids": [
+                                record["feature"].get("node_id") or ""
+                                for record in batch
+                            ],
+                            "ai_response_present": bool(batch_response and not batch_response.get("_ai_error")),
+                            "ai_error": (
+                                batch_response.get("_ai_error")
+                                if isinstance(batch_response, dict)
+                                else ""
+                            ),
+                            "ai_response": batch_response if isinstance(batch_response, dict) else None,
+                        },
+                    )
+                ai_responses.update(_extract_batch_ai_responses(batch_response, batch))
+
+    for record in records:
+        feature = record["feature"]
+        relevant_feedback = record["feedback"]
+        selected_for_ai = bool(record["selected_for_ai"])
+        selection_reasons = record["selection_reasons"]
+        node_id = str(feature.get("node_id") or "")
+        node_name = record["node_name"]
+        ai_allowed = node_id in allowed_node_ids
+        ai_response = ai_responses.get(node_id)
         if ai_response is not None and not ai_response.get("_ai_error"):
             status = "ai_complete"
             ai_complete_count += 1
@@ -843,6 +1075,11 @@ def run_semantic_enrichment(
         "ai_requested": bool(effective_use_ai),
         "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
+        "semantic_batching": {
+            "batch_size": ai_batch_size,
+            "batch_by": semantic_ai_batch_by,
+            "batch_count": ai_batch_count,
+        },
         "feature_count": len(semantic_features),
         "features": sorted(semantic_features, key=lambda item: str(item.get("node_id") or "")),
     }
@@ -864,6 +1101,11 @@ def run_semantic_enrichment(
         "ai_skipped_count": ai_skipped_count,
         "ai_selected_count": ai_selected_count,
         "ai_skipped_selector_count": ai_skipped_selector_count,
+        "ai_batch_size": ai_batch_size,
+        "ai_batch_by": semantic_ai_batch_by,
+        "ai_batch_count": ai_batch_count,
+        "ai_batch_complete_count": ai_batch_complete_count,
+        "ai_batch_error_count": ai_batch_error_count,
         "feedback_count": len(feedback),
         "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
@@ -874,6 +1116,8 @@ def run_semantic_enrichment(
         "feature_payload_output_count": len(payload_output_paths),
         "feature_payload_input_dir": str(payload_trace_base / "feature-inputs") if persist_feature_payloads else "",
         "feature_payload_output_dir": str(payload_trace_base / "feature-outputs") if persist_feature_payloads else "",
+        "batch_payload_input_dir": str(payload_trace_base / "batch-inputs") if persist_feature_payloads else "",
+        "batch_payload_output_dir": str(payload_trace_base / "batch-outputs") if persist_feature_payloads else "",
     }
 
     base = _semantic_base_dir(project_id, snapshot_id)
@@ -898,6 +1142,9 @@ def run_semantic_enrichment(
             "ai_complete_count": ai_complete_count,
             "ai_selected_count": ai_selected_count,
             "ai_skipped_selector_count": ai_skipped_selector_count,
+            "ai_batch_size": ai_batch_size,
+            "ai_batch_by": semantic_ai_batch_by,
+            "ai_batch_count": ai_batch_count,
             "feedback_count": len(feedback),
             "unresolved_feedback_count": len(unresolved_feedback),
             "updated_at": generated_at,

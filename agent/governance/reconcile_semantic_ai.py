@@ -216,9 +216,17 @@ def build_semantic_ai_call(
         return changed
 
     def call(stage: str, payload: dict[str, Any]) -> dict[str, Any]:
+        batch_hint = ""
+        if isinstance(payload.get("features"), list):
+            batch_hint = (
+                "The payload is a batch. Return exactly one JSON object with a "
+                "'features' array. Include one object for every input "
+                "feature.node_id, and include node_id on each output object. "
+            )
         prompt = (
             f"{semantic_config.prompt_template}\n\n"
             "Return exactly one JSON object matching the requested semantic fields. "
+            f"{batch_hint}"
             "Do not modify files, create tasks, or inspect project files outside the supplied payload.\n\n"
             "Payload:\n"
             f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"

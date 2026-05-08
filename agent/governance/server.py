@@ -1752,6 +1752,20 @@ def _semantic_ai_feature_limit_from_body(body: dict) -> int | None:
     return int(value)
 
 
+def _semantic_ai_batch_kwargs_from_body(body: dict) -> dict:
+    size = body.get("semantic_ai_batch_size")
+    if size is None:
+        size = body.get("ai_batch_size")
+    return {
+        "semantic_ai_batch_size": int(size) if size is not None else None,
+        "semantic_ai_batch_by": str(
+            body.get("semantic_ai_batch_by")
+            or body.get("ai_batch_by")
+            or "subsystem"
+        ),
+    }
+
+
 def _semantic_selector_kwargs_from_body(body: dict) -> dict:
     return {
         "semantic_ai_scope": body.get("semantic_ai_scope") or body.get("ai_scope"),
@@ -2428,6 +2442,7 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 ),
                 semantic_ai_call=semantic_ai_call,
                 semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_batch_kwargs_from_body(body),
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2473,6 +2488,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 ),
                 semantic_ai_call=semantic_ai_call,
                 semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_batch_kwargs_from_body(body),
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2654,6 +2670,7 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                         else None
                     ),
                     ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                    **_semantic_ai_batch_kwargs_from_body(body),
                     **_semantic_ai_config_kwargs_from_body(body),
                     **_semantic_selector_kwargs_from_body(body),
                     semantic_config_path=body.get("semantic_config_path"),
