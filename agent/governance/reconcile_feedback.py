@@ -1803,6 +1803,132 @@ def _parse_ai_review(ai_result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reviewer_instructions() -> dict[str, Any]:
+    return {
+        "reviewer": "reconcile_feedback_reviewer",
+        "mutate_project_files": False,
+        "allowed_decisions": sorted(REVIEW_DECISIONS),
+        "status_observation_categories": sorted(STATUS_OBSERVATION_CATEGORIES),
+        "decision_meaning": {
+            KIND_GRAPH_CORRECTION: "Only graph/semantic state should change.",
+            KIND_PROJECT_IMPROVEMENT: "Project code/docs/tests likely need a backlog item.",
+            KIND_STATUS_OBSERVATION: "Keep this as visible graph/file status until a user chooses an action.",
+            KIND_FALSE_POSITIVE: "Close the feedback without action.",
+            "needs_human_signoff": "Evidence is insufficient; user or observer must decide.",
+        },
+        "status_observation_category_meaning": {
+            STATUS_CATEGORY_STALE_TEST: "A test likely asserts an old contract and may need update after user approval.",
+            STATUS_CATEGORY_DOC_DRIFT: "A linked document may be stale relative to changed graph/code state.",
+            STATUS_CATEGORY_COVERAGE_GAP: "A node/file is missing doc/test/config coverage or graph attachment.",
+            STATUS_CATEGORY_PROJECT_REGRESSION: "The observation may indicate a product/code behavior regression.",
+            STATUS_CATEGORY_ORPHAN_REVIEW: "An orphan or pending file needs keep/attach/delete review.",
+            STATUS_CATEGORY_FALSE_POSITIVE: "The observation should be closed without action.",
+            STATUS_CATEGORY_NEEDS_HUMAN: "Evidence is insufficient for automatic routing.",
+        },
+        "output_contract": (
+            "Return JSON with decision, optional status_observation_category, "
+            "rationale, confidence, and model. Do not mutate project files."
+        ),
+    }
+
+
+def _normalize_reviewed_item(
+    item: dict[str, Any],
+    *,
+    decision: str,
+    rationale: str,
+    confidence: float | None,
+    status_observation_category: str,
+    actor: str,
+    accept: bool,
+    ai_review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ai_review = ai_review or {}
+    if not decision:
+        if item.get("feedback_kind") == KIND_NEEDS_OBSERVER_DECISION:
+            decision = "needs_human_signoff"
+        else:
+            decision = item.get("feedback_kind") or "needs_human_signoff"
+    if decision not in REVIEW_DECISIONS:
+        raise ValueError(f"invalid reviewer decision: {decision}")
+    if status_observation_category and status_observation_category not in STATUS_OBSERVATION_CATEGORIES:
+        raise ValueError(f"invalid status_observation_category: {status_observation_category}")
+    if decision == KIND_FALSE_POSITIVE:
+        status_observation_category = STATUS_CATEGORY_FALSE_POSITIVE
+    if item.get("feedback_kind") == KIND_STATUS_OBSERVATION and not status_observation_category:
+        status_observation_category = infer_status_observation_category(item)
+    now = _utc_now()
+    reviewed = dict(item)
+    reviewed.update({
+        "reviewer_decision": decision,
+        "reviewed_status_observation_category": status_observation_category,
+        "reviewer_rationale": rationale,
+        "reviewer_confidence": float(confidence if confidence is not None else item.get("confidence") or 0.0),
+        "reviewer_model": ai_review.get("model") or item.get("reviewer_model") or "",
+        "reviewed_by": actor,
+        "reviewed_at": now,
+        "updated_at": now,
+    })
+    if decision == KIND_FALSE_POSITIVE:
+        reviewed["status"] = STATUS_REJECTED
+        reviewed["final_feedback_kind"] = KIND_FALSE_POSITIVE
+        reviewed["requires_human_signoff"] = False
+    elif decision == "needs_human_signoff":
+        reviewed["status"] = STATUS_NEEDS_HUMAN_SIGNOFF
+        reviewed["requires_human_signoff"] = True
+    else:
+        reviewed["final_feedback_kind"] = decision
+        reviewed["requires_human_signoff"] = False
+        reviewed["status"] = STATUS_ACCEPTED if accept else STATUS_REVIEWED
+        if accept:
+            reviewed["accepted_by"] = actor
+            reviewed["accepted_at"] = now
+    claim = reviewed.get("review_claim") if isinstance(reviewed.get("review_claim"), dict) else {}
+    if claim:
+        claim["completed_at"] = now
+        claim["completed_by"] = actor
+        reviewed["review_claim"] = claim
+    return reviewed
+
+
+def _parse_ai_review_batch(
+    ai_result: dict[str, Any],
+    feedback_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    raw_items = (
+        ai_result.get("items")
+        or ai_result.get("reviews")
+        or ai_result.get("decisions")
+        or []
+    )
+    if isinstance(raw_items, dict):
+        raw_items = [
+            {**(value if isinstance(value, dict) else {}), "feedback_id": key}
+            for key, value in raw_items.items()
+        ]
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    reviews: dict[str, dict[str, Any]] = {}
+    route = ai_result.get("_ai_route") or ai_result.get("model") or ""
+    for index, raw in enumerate(raw_items):
+        if not isinstance(raw, dict):
+            continue
+        feedback_id = str(
+            raw.get("feedback_id")
+            or raw.get("id")
+            or raw.get("feedbackId")
+            or (feedback_ids[index] if index < len(feedback_ids) else "")
+        ).strip()
+        if not feedback_id:
+            continue
+        parsed_raw = dict(raw)
+        if "_ai_route" not in parsed_raw and route:
+            parsed_raw["_ai_route"] = route
+        reviews[feedback_id] = _parse_ai_review(parsed_raw)
+    return reviews
+
+
 def review_feedback_item(
     project_id: str,
     snapshot_id: str,
@@ -1828,32 +1954,7 @@ def review_feedback_item(
     ai_review: dict[str, Any] = {}
     if not decision and ai_call is not None:
         payload = {
-            "instructions": {
-                "reviewer": "reconcile_feedback_reviewer",
-                "mutate_project_files": False,
-                "allowed_decisions": sorted(REVIEW_DECISIONS),
-                "status_observation_categories": sorted(STATUS_OBSERVATION_CATEGORIES),
-                "decision_meaning": {
-                    KIND_GRAPH_CORRECTION: "Only graph/semantic state should change.",
-                    KIND_PROJECT_IMPROVEMENT: "Project code/docs/tests likely need a backlog item.",
-                    KIND_STATUS_OBSERVATION: "Keep this as visible graph/file status until a user chooses an action.",
-                    KIND_FALSE_POSITIVE: "Close the feedback without action.",
-                    "needs_human_signoff": "Evidence is insufficient; user or observer must decide.",
-                },
-                "status_observation_category_meaning": {
-                    STATUS_CATEGORY_STALE_TEST: "A test likely asserts an old contract and may need update after user approval.",
-                    STATUS_CATEGORY_DOC_DRIFT: "A linked document may be stale relative to changed graph/code state.",
-                    STATUS_CATEGORY_COVERAGE_GAP: "A node/file is missing doc/test/config coverage or graph attachment.",
-                    STATUS_CATEGORY_PROJECT_REGRESSION: "The observation may indicate a product/code behavior regression.",
-                    STATUS_CATEGORY_ORPHAN_REVIEW: "An orphan or pending file needs keep/attach/delete review.",
-                    STATUS_CATEGORY_FALSE_POSITIVE: "The observation should be closed without action.",
-                    STATUS_CATEGORY_NEEDS_HUMAN: "Evidence is insufficient for automatic routing.",
-                },
-                "output_contract": (
-                    "Return JSON with decision, optional status_observation_category, "
-                    "rationale, confidence, and model. Do not mutate project files."
-                ),
-            },
+            "instructions": _reviewer_instructions(),
             "feedback": item,
             "review_context": _build_review_context(
                 project_id,
@@ -1874,49 +1975,16 @@ def review_feedback_item(
         rationale = rationale or ai_review["rationale"]
         confidence = confidence if confidence is not None else ai_review["confidence"]
 
-    if not decision:
-        if item.get("feedback_kind") == KIND_NEEDS_OBSERVER_DECISION:
-            decision = "needs_human_signoff"
-        else:
-            decision = item.get("feedback_kind") or "needs_human_signoff"
-    if decision not in REVIEW_DECISIONS:
-        raise ValueError(f"invalid reviewer decision: {decision}")
-    if status_observation_category and status_observation_category not in STATUS_OBSERVATION_CATEGORIES:
-        raise ValueError(f"invalid status_observation_category: {status_observation_category}")
-    if decision == KIND_FALSE_POSITIVE:
-        status_observation_category = STATUS_CATEGORY_FALSE_POSITIVE
-    if item.get("feedback_kind") == KIND_STATUS_OBSERVATION and not status_observation_category:
-        status_observation_category = infer_status_observation_category(item)
-    now = _utc_now()
-    item.update({
-        "reviewer_decision": decision,
-        "reviewed_status_observation_category": status_observation_category,
-        "reviewer_rationale": rationale,
-        "reviewer_confidence": float(confidence if confidence is not None else item.get("confidence") or 0.0),
-        "reviewer_model": ai_review.get("model") or item.get("reviewer_model") or "",
-        "reviewed_by": actor,
-        "reviewed_at": now,
-        "updated_at": now,
-    })
-    if decision == KIND_FALSE_POSITIVE:
-        item["status"] = STATUS_REJECTED
-        item["final_feedback_kind"] = KIND_FALSE_POSITIVE
-        item["requires_human_signoff"] = False
-    elif decision == "needs_human_signoff":
-        item["status"] = STATUS_NEEDS_HUMAN_SIGNOFF
-        item["requires_human_signoff"] = True
-    else:
-        item["final_feedback_kind"] = decision
-        item["requires_human_signoff"] = False
-        item["status"] = STATUS_ACCEPTED if accept else STATUS_REVIEWED
-        if accept:
-            item["accepted_by"] = actor
-            item["accepted_at"] = now
-    claim = item.get("review_claim") if isinstance(item.get("review_claim"), dict) else {}
-    if claim:
-        claim["completed_at"] = now
-        claim["completed_by"] = actor
-        item["review_claim"] = claim
+    item = _normalize_reviewed_item(
+        item,
+        decision=decision,
+        rationale=rationale,
+        confidence=confidence,
+        status_observation_category=status_observation_category,
+        actor=actor,
+        accept=accept,
+        ai_review=ai_review,
+    )
 
     return _upsert_items(
         project_id,
@@ -1925,6 +1993,124 @@ def review_feedback_item(
         event_type="feedback.reviewed",
         actor=actor,
     )
+
+
+def review_feedback_items_batch(
+    project_id: str,
+    snapshot_id: str,
+    feedback_ids: list[str],
+    *,
+    ai_call: ReviewerAiCall,
+    project_root: str | Path | None = None,
+    max_context_chars: int = 6000,
+    enable_read_tools: bool = True,
+    grep_patterns: list[str] | None = None,
+    actor: str = "observer",
+    accept: bool = False,
+) -> dict[str, Any]:
+    """Review several feedback items with one AI call and one state update."""
+    ids = [str(item or "").strip() for item in feedback_ids if str(item or "").strip()]
+    if not ids:
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "count": 0,
+            "items": [],
+            "errors": [],
+            "error_count": 0,
+        }
+    state = load_feedback_state(project_id, snapshot_id)
+    existing = state.get("items") or {}
+    items: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for feedback_id in ids:
+        item = dict(existing.get(feedback_id) or {})
+        if not item:
+            errors.append({"feedback_id": feedback_id, "error": "feedback item not found"})
+            continue
+        items.append(item)
+    if not items:
+        return {
+            "ok": False,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "count": 0,
+            "items": [],
+            "errors": errors,
+            "error_count": len(errors),
+        }
+
+    payload = {
+        "instructions": {
+            **_reviewer_instructions(),
+            "output_contract": (
+                "Return JSON with an items array. Each item must include feedback_id, "
+                "decision, optional status_observation_category, rationale, confidence, and model. "
+                "Do not mutate project files."
+            ),
+        },
+        "feedback_items": items,
+        "review_contexts": {
+            str(item.get("feedback_id") or ""): _build_review_context(
+                project_id,
+                snapshot_id,
+                item,
+                project_root=project_root,
+                max_excerpt_chars=max_context_chars,
+                enable_read_tools=enable_read_tools,
+                grep_patterns=grep_patterns,
+            )
+            for item in items
+        },
+    }
+    ai_result = ai_call("reconcile_feedback_review_batch", payload) or {}
+    ai_reviews = _parse_ai_review_batch(ai_result, [str(item.get("feedback_id") or "") for item in items])
+
+    reviewed_items: list[dict[str, Any]] = []
+    for item in items:
+        feedback_id = str(item.get("feedback_id") or "")
+        ai_review = ai_reviews.get(feedback_id)
+        if not ai_review:
+            ai_review = {
+                "decision": "needs_human_signoff",
+                "status_observation_category": STATUS_CATEGORY_NEEDS_HUMAN,
+                "rationale": "Batch reviewer did not return a decision for this feedback item.",
+                "confidence": 0.0,
+                "model": _as_text(ai_result.get("_ai_route") or ai_result.get("model") or ""),
+                "raw": ai_result,
+            }
+        try:
+            reviewed_items.append(
+                _normalize_reviewed_item(
+                    item,
+                    decision=str(ai_review.get("decision") or ""),
+                    rationale=str(ai_review.get("rationale") or ""),
+                    confidence=(
+                        float(ai_review["confidence"])
+                        if ai_review.get("confidence") is not None
+                        else None
+                    ),
+                    status_observation_category=str(ai_review.get("status_observation_category") or ""),
+                    actor=actor,
+                    accept=accept,
+                    ai_review=ai_review,
+                )
+            )
+        except Exception as exc:
+            errors.append({"feedback_id": feedback_id, "error": str(exc)})
+
+    result = _upsert_items(
+        project_id,
+        snapshot_id,
+        reviewed_items,
+        event_type="feedback.reviewed",
+        actor=actor,
+    )
+    result["errors"] = errors
+    result["error_count"] = len(errors)
+    result["ok"] = not errors
+    return result
 
 
 def build_project_improvement_backlog(
@@ -2129,6 +2315,7 @@ __all__ = [
     "list_feedback_items",
     "load_feedback_state",
     "review_feedback_item",
+    "review_feedback_items_batch",
     "build_project_improvement_backlog",
     "mark_feedback_backlog_filed",
     "decide_feedback_items",

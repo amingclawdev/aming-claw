@@ -3323,36 +3323,27 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
 
         reviewed: list[dict] = []
         errors: list[dict] = []
-        for feedback_id in feedback_ids:
-            try:
-                result = reconcile_feedback.review_feedback_item(
-                    project_id,
-                    snapshot_id,
-                    feedback_id,
-                    decision=decision,
-                    rationale=str(body.get("rationale") or body.get("reviewer_rationale") or ""),
-                    confidence=float(body["confidence"]) if body.get("confidence") is not None else None,
-                    status_observation_category=str(
-                        body.get("status_observation_category")
-                        or body.get("observation_category")
-                        or body.get("category")
-                        or ""
-                    ),
-                    actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
-                    accept=bool(body.get("accept") or body.get("accepted")),
-                    ai_call=ai_call,
-                    project_root=review_project_root,
-                    max_context_chars=int(body.get("review_context_chars") or 6000),
-                    enable_read_tools=not bool(body.get("disable_read_tools")),
-                    grep_patterns=(
-                        body.get("grep_patterns")
-                        if isinstance(body.get("grep_patterns"), list)
-                        else None
-                    ),
-                )
-                item = (result.get("items") or [{}])[0]
+        batch_review = bool(body.get("batch_review") or body.get("batch_ai_review") or body.get("use_batch_reviewer_ai"))
+        if use_reviewer_ai and batch_review and not decision:
+            batch_result = reconcile_feedback.review_feedback_items_batch(
+                project_id,
+                snapshot_id,
+                feedback_ids,
+                ai_call=ai_call,
+                project_root=review_project_root,
+                max_context_chars=int(body.get("review_context_chars") or 6000),
+                enable_read_tools=not bool(body.get("disable_read_tools")),
+                grep_patterns=(
+                    body.get("grep_patterns")
+                    if isinstance(body.get("grep_patterns"), list)
+                    else None
+                ),
+                actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
+                accept=bool(body.get("accept") or body.get("accepted")),
+            )
+            for item in batch_result.get("items") or []:
                 reviewed.append({
-                    "feedback_id": feedback_id,
+                    "feedback_id": item.get("feedback_id", ""),
                     "status": item.get("status", ""),
                     "reviewer_decision": item.get("reviewer_decision", ""),
                     "final_feedback_kind": item.get("final_feedback_kind", ""),
@@ -3362,10 +3353,51 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
                     "target_type": item.get("target_type", ""),
                     "target_id": item.get("target_id", ""),
                 })
-            except Exception as exc:
-                errors.append({"feedback_id": feedback_id, "error": str(exc)})
-                if not bool(body.get("continue_on_error")):
-                    break
+            errors.extend(batch_result.get("errors") or [])
+        else:
+            for feedback_id in feedback_ids:
+                try:
+                    result = reconcile_feedback.review_feedback_item(
+                        project_id,
+                        snapshot_id,
+                        feedback_id,
+                        decision=decision,
+                        rationale=str(body.get("rationale") or body.get("reviewer_rationale") or ""),
+                        confidence=float(body["confidence"]) if body.get("confidence") is not None else None,
+                        status_observation_category=str(
+                            body.get("status_observation_category")
+                            or body.get("observation_category")
+                            or body.get("category")
+                            or ""
+                        ),
+                        actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
+                        accept=bool(body.get("accept") or body.get("accepted")),
+                        ai_call=ai_call,
+                        project_root=review_project_root,
+                        max_context_chars=int(body.get("review_context_chars") or 6000),
+                        enable_read_tools=not bool(body.get("disable_read_tools")),
+                        grep_patterns=(
+                            body.get("grep_patterns")
+                            if isinstance(body.get("grep_patterns"), list)
+                            else None
+                        ),
+                    )
+                    item = (result.get("items") or [{}])[0]
+                    reviewed.append({
+                        "feedback_id": feedback_id,
+                        "status": item.get("status", ""),
+                        "reviewer_decision": item.get("reviewer_decision", ""),
+                        "final_feedback_kind": item.get("final_feedback_kind", ""),
+                        "requires_human_signoff": bool(item.get("requires_human_signoff")),
+                        "reviewer_confidence": item.get("reviewer_confidence", 0.0),
+                        "source_node_ids": item.get("source_node_ids") or [],
+                        "target_type": item.get("target_type", ""),
+                        "target_id": item.get("target_id", ""),
+                    })
+                except Exception as exc:
+                    errors.append({"feedback_id": feedback_id, "error": str(exc)})
+                    if not bool(body.get("continue_on_error")):
+                        break
 
         try:
             audit_service.record(
