@@ -276,6 +276,7 @@ def run_state_only_full_reconcile(
     semantic_skip_completed: bool = True,
     semantic_batch_memory: bool | None = False,
     semantic_batch_memory_id: str | None = None,
+    semantic_base_snapshot_id: str | None = None,
     semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Create a candidate full-reconcile graph snapshot from current files.
@@ -319,6 +320,7 @@ def run_state_only_full_reconcile(
             "semantic_graph_state": semantic_graph_state,
             "semantic_skip_completed": semantic_skip_completed,
             "semantic_batch_memory": semantic_batch_memory,
+            "semantic_base_snapshot_id": semantic_base_snapshot_id,
             "semantic_ai_provider": semantic_ai_provider,
             "semantic_ai_model": semantic_ai_model,
             "semantic_ai_role": semantic_ai_role,
@@ -516,6 +518,7 @@ def run_state_only_full_reconcile(
             semantic_skip_completed=semantic_skip_completed,
             semantic_batch_memory=semantic_batch_memory,
             semantic_batch_memory_id=semantic_batch_memory_id,
+            semantic_base_snapshot_id=semantic_base_snapshot_id,
             semantic_ai_scope=semantic_ai_scope,
             semantic_node_ids=semantic_node_ids,
             semantic_layers=semantic_layers,
@@ -541,6 +544,7 @@ def run_state_only_full_reconcile(
             "semantic_graph_state": semantic_graph_state,
             "semantic_skip_completed": semantic_skip_completed,
             "semantic_batch_memory": semantic_batch_memory,
+            "semantic_base_snapshot_id": semantic_base_snapshot_id,
             "semantic_ai_provider": semantic_ai_provider,
             "semantic_ai_model": semantic_ai_model,
             "semantic_ai_role": semantic_ai_role,
@@ -695,6 +699,7 @@ def run_pending_scope_reconcile_candidate(
     semantic_skip_completed: bool = True,
     semantic_batch_memory: bool | None = False,
     semantic_batch_memory_id: str | None = None,
+    semantic_base_snapshot_id: str | None = None,
     semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Materialize pending scope rows as a reviewable candidate snapshot.
@@ -767,6 +772,7 @@ def run_pending_scope_reconcile_candidate(
         semantic_skip_completed=semantic_skip_completed,
         semantic_batch_memory=semantic_batch_memory,
         semantic_batch_memory_id=semantic_batch_memory_id,
+        semantic_base_snapshot_id=semantic_base_snapshot_id or active.get("snapshot_id", ""),
         semantic_ai_provider=semantic_ai_provider,
         semantic_ai_model=semantic_ai_model,
         semantic_ai_role=semantic_ai_role,

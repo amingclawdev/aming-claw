@@ -426,6 +426,56 @@ def test_semantic_graph_state_accumulates_and_skips_completed(conn, tmp_path):
     assert by_id["L7.1"]["feature_name"] == "Feature L7.1"
 
 
+def test_semantic_graph_state_carries_forward_unchanged_snapshot_entries(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, snapshot_kind="full")
+    _create_snapshot(conn, project, snapshot_kind="scope")
+    calls: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append(stage)
+        return {
+            "feature_name": "Backlog Runtime Flow",
+            "semantic_summary": "Owns backlog task state transitions.",
+            "intent": "Govern backlog runtime state.",
+            "doc_coverage_review": {"bound": True, "status": "bound"},
+            "test_coverage_review": {"bound": True, "status": "bound"},
+            "config_coverage_review": {"bound": True, "status": "bound"},
+        }
+
+    first = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+    assert first["summary"]["ai_complete_count"] == 1
+    assert calls == ["reconcile_semantic_feature"]
+
+    second = run_semantic_enrichment(
+        conn,
+        PID,
+        "scope-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_base_snapshot_id="full-semantic-test",
+        created_by="test",
+    )
+
+    assert calls == ["reconcile_semantic_feature"]
+    state_report = second["summary"]["semantic_graph_state"]
+    assert state_report["base_snapshot_id"] == "full-semantic-test"
+    assert state_report["carried_forward_count"] == 1
+    assert state_report["hit_count"] == 1
+    feature = second["semantic_index"]["features"][0]
+    assert feature["enrichment_status"] == "semantic_graph_state"
+    assert feature["feature_name"] == "Backlog Runtime Flow"
+
+
 def test_semantic_batch_memory_remains_explicit_advisory(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project, include_extra=True)

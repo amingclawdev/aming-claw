@@ -1794,6 +1794,7 @@ def _semantic_state_kwargs_from_body(body: dict) -> dict:
             default=False,
         ),
         "semantic_batch_memory_id": body.get("semantic_batch_memory_id") or body.get("batch_memory_id"),
+        "semantic_base_snapshot_id": body.get("semantic_base_snapshot_id") or body.get("base_snapshot_id"),
     }
 
 

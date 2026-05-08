@@ -908,6 +908,72 @@ def _load_semantic_graph_state(
     return state
 
 
+def _carry_forward_semantic_graph_state(
+    state: dict[str, Any],
+    base_state: dict[str, Any],
+    feature_index: dict[str, dict[str, Any]],
+    *,
+    base_snapshot_id: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    """Reuse semantic entries whose structural feature hash is unchanged."""
+    current = state.setdefault("node_semantics", {})
+    if not isinstance(current, dict):
+        current = {}
+        state["node_semantics"] = current
+    base_nodes = base_state.get("node_semantics")
+    if not isinstance(base_nodes, dict):
+        return {
+            "base_snapshot_id": base_snapshot_id,
+            "carried_forward_count": 0,
+            "skipped_existing_count": 0,
+            "skipped_missing_node_count": 0,
+            "skipped_hash_mismatch_count": 0,
+        }
+
+    carried = 0
+    skipped_existing = 0
+    skipped_missing = 0
+    skipped_hash = 0
+    for node_id, raw_entry in sorted(base_nodes.items()):
+        node_id = str(node_id or "")
+        if not node_id or not isinstance(raw_entry, dict):
+            continue
+        if node_id in current:
+            skipped_existing += 1
+            continue
+        feature = feature_index.get(node_id)
+        if not feature:
+            skipped_missing += 1
+            continue
+        base_hash = str(raw_entry.get("feature_hash") or "")
+        current_hash = str(feature.get("feature_hash") or "")
+        if not base_hash or not current_hash or base_hash != current_hash:
+            skipped_hash += 1
+            continue
+        entry = dict(raw_entry)
+        entry["carried_forward_from_snapshot_id"] = base_snapshot_id
+        entry["carried_forward_at"] = updated_at
+        entry["feature_hash"] = current_hash
+        entry["primary"] = _path_list(feature.get("primary"))
+        entry["secondary"] = _path_list(feature.get("secondary"))
+        entry["test"] = _path_list(feature.get("test"))
+        entry["config"] = _path_list(feature.get("config"))
+        entry["file_hashes"] = feature.get("file_hashes") or entry.get("file_hashes") or {}
+        current[node_id] = entry
+        carried += 1
+    if carried:
+        state["updated_at"] = updated_at
+    _rebuild_semantic_graph_state_indexes(state)
+    return {
+        "base_snapshot_id": base_snapshot_id,
+        "carried_forward_count": carried,
+        "skipped_existing_count": skipped_existing,
+        "skipped_missing_node_count": skipped_missing,
+        "skipped_hash_mismatch_count": skipped_hash,
+    }
+
+
 def _semantic_review_status(review: Any) -> str:
     if not isinstance(review, dict):
         return ""
@@ -1306,6 +1372,7 @@ def run_semantic_enrichment(
     semantic_skip_completed: bool = True,
     semantic_batch_memory: bool | None = None,
     semantic_batch_memory_id: str | None = None,
+    semantic_base_snapshot_id: str | None = None,
     trace_dir: str | Path | None = None,
     persist_feature_payloads: bool = True,
 ) -> dict[str, Any]:
@@ -1361,6 +1428,16 @@ def run_semantic_enrichment(
     )
     nodes = _semantic_candidate_nodes(graph_json, selector)
     feature_index = _load_feature_index(snapshot)
+    carry_forward_features = {
+        _node_id(node): _feature_context_from_node(
+            node,
+            feature_index=feature_index,
+            project_root=root,
+            max_excerpt_chars=0,
+        )
+        for node in nodes
+        if _node_id(node)
+    }
     existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
     round_number = int(feedback_round) if feedback_round is not None else len(existing_rounds)
     generated_at = utc_now()
@@ -1370,6 +1447,34 @@ def run_semantic_enrichment(
         if semantic_state_enabled
         else _empty_semantic_graph_state(project_id, snapshot_id, snapshot)
     )
+    carry_forward_report = {
+        "base_snapshot_id": str(semantic_base_snapshot_id or ""),
+        "carried_forward_count": 0,
+        "skipped_existing_count": 0,
+        "skipped_missing_node_count": 0,
+        "skipped_hash_mismatch_count": 0,
+        "error": "",
+    }
+    if semantic_state_enabled and semantic_base_snapshot_id:
+        try:
+            base_snapshot = get_graph_snapshot(conn, project_id, str(semantic_base_snapshot_id))
+            if base_snapshot:
+                base_state = _load_semantic_graph_state(
+                    project_id,
+                    str(semantic_base_snapshot_id),
+                    base_snapshot,
+                )
+                carry_forward_report.update(_carry_forward_semantic_graph_state(
+                    semantic_state,
+                    base_state,
+                    carry_forward_features,
+                    base_snapshot_id=str(semantic_base_snapshot_id),
+                    updated_at=generated_at,
+                ))
+            else:
+                carry_forward_report["error"] = "base_snapshot_not_found"
+        except Exception as exc:  # noqa: BLE001 - semantic carry-forward is advisory
+            carry_forward_report["error"] = str(exc)
     semantic_features: list[dict[str, Any]] = []
     ai_complete_count = 0
     ai_unavailable_count = 0
@@ -1798,6 +1903,9 @@ def run_semantic_enrichment(
         "accepted_feature_count": len(semantic_state.get("accepted_features") or {}),
         "file_ownership_count": len(semantic_state.get("file_ownership") or {}),
         "open_issue_count": len(semantic_state.get("open_issues") or []),
+        "base_snapshot_id": carry_forward_report.get("base_snapshot_id", ""),
+        "carried_forward_count": carry_forward_report.get("carried_forward_count", 0),
+        "carry_forward": carry_forward_report,
         "state_path": "",
         "semantic_graph_path": "",
         "round_state_path": "",
