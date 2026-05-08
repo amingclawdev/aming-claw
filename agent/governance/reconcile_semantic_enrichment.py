@@ -745,6 +745,175 @@ def _safe_node_filename(node_id: str) -> str:
     return safe or "feature"
 
 
+def _semantic_batch_memory_id(snapshot_id: str, round_number: int, explicit: str | None = None) -> str:
+    if explicit:
+        return _safe_node_filename(str(explicit))
+    return f"semantic-{_safe_node_filename(snapshot_id)}-round-{int(round_number):03d}"
+
+
+def _create_semantic_batch_memory(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    round_number: int,
+    *,
+    created_by: str,
+    batch_id: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    try:
+        from . import reconcile_batch_memory as bm
+
+        bid = _semantic_batch_memory_id(snapshot_id, round_number, batch_id)
+        batch = bm.create_or_get_batch(
+            conn,
+            project_id,
+            session_id=snapshot_id,
+            batch_id=bid,
+            created_by=created_by,
+            initial_memory={
+                "semantic_enrichment": {
+                    "snapshot_id": snapshot_id,
+                    "round": round_number,
+                    "created_by": created_by,
+                }
+            },
+        )
+        return batch, ""
+    except Exception as exc:  # noqa: BLE001 - semantic memory is advisory
+        return {}, str(exc)
+
+
+def _refresh_semantic_batch_memory(
+    conn: sqlite3.Connection,
+    project_id: str,
+    batch_id: str,
+) -> dict[str, Any]:
+    if not batch_id:
+        return {}
+    try:
+        from . import reconcile_batch_memory as bm
+
+        return bm.get_batch(conn, project_id, batch_id)
+    except Exception:  # noqa: BLE001 - keep semantic enrichment retryable
+        return {}
+
+
+def _semantic_batch_memory_summary(batch: dict[str, Any]) -> dict[str, Any]:
+    memory = batch.get("memory") if isinstance(batch, dict) else {}
+    memory = memory if isinstance(memory, dict) else {}
+    accepted = memory.get("accepted_features") if isinstance(memory.get("accepted_features"), dict) else {}
+    features: list[dict[str, Any]] = []
+    for name in sorted(accepted):
+        item = accepted.get(name) if isinstance(accepted.get(name), dict) else {}
+        features.append({
+            "feature_name": name,
+            "purpose": str(item.get("purpose") or "")[:600],
+            "clusters": _path_list(item.get("clusters")),
+            "owned_files": _path_list(item.get("owned_files"))[:20],
+            "shared_files": _path_list(item.get("shared_files"))[:20],
+            "candidate_tests": _path_list(item.get("candidate_tests"))[:20],
+            "candidate_docs": _path_list(item.get("candidate_docs"))[:20],
+        })
+    conflicts = memory.get("open_conflicts") if isinstance(memory.get("open_conflicts"), list) else []
+    return {
+        "schema_version": memory.get("schema_version") or 1,
+        "batch_id": batch.get("batch_id") or memory.get("batch_id") or "",
+        "session_id": batch.get("session_id") or memory.get("session_id") or "",
+        "accepted_feature_count": len(features),
+        "file_ownership_count": len(memory.get("file_ownership") or {}),
+        "open_conflict_count": len(conflicts),
+        "reserved_names": _path_list(memory.get("reserved_names"))[:200],
+        "accepted_features": features,
+        "open_conflicts": conflicts[-50:],
+    }
+
+
+def _semantic_memory_related_features(batch: dict[str, Any], feature: dict[str, Any]) -> list[dict[str, Any]]:
+    if not batch:
+        return []
+    try:
+        from . import reconcile_batch_memory as bm
+
+        return bm.find_related_features(batch, {
+            "primary_files": feature.get("primary") or [],
+            "candidate_tests": feature.get("test") or [],
+            "candidate_docs": feature.get("secondary") or [],
+        })[:20]
+    except Exception:  # noqa: BLE001 - advisory context only
+        return []
+
+
+def _semantic_memory_conflicts(ai_response: dict[str, Any]) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for key in (
+        "merge_suggestions",
+        "split_suggestions",
+        "dependency_patch_suggestions",
+        "dead_code_candidates",
+    ):
+        value = ai_response.get(key)
+        if not value:
+            continue
+        conflicts.append({
+            "reason": key,
+            "items": value if isinstance(value, list) else [value],
+        })
+    return conflicts
+
+
+def _semantic_memory_decision_payload(
+    feature: dict[str, Any],
+    ai_response: dict[str, Any],
+) -> dict[str, Any]:
+    feature_name = str(ai_response.get("feature_name") or feature.get("title") or feature.get("node_id") or "")
+    target_feature = str(ai_response.get("target_feature") or ai_response.get("merge_into") or "")
+    return {
+        "decision": "merge_into_existing_feature" if target_feature else "new_feature",
+        "feature_name": feature_name,
+        "target_feature": target_feature,
+        "owned_files": feature.get("primary") or [],
+        "candidate_tests": feature.get("test") or [],
+        "candidate_docs": feature.get("secondary") or [],
+        "reserved_names": [feature_name] if feature_name else [],
+        "purpose": ai_response.get("intent")
+        or ai_response.get("semantic_summary")
+        or ai_response.get("purpose")
+        or "",
+        "reason": ai_response.get("semantic_summary") or ai_response.get("reason") or "",
+        "conflicts": _semantic_memory_conflicts(ai_response),
+        "decided_by": "semantic_ai",
+        "actor": "reconcile_semantic_enrichment",
+    }
+
+
+def _record_semantic_memory_decision(
+    conn: sqlite3.Connection,
+    project_id: str,
+    batch_id: str,
+    snapshot_id: str,
+    feature: dict[str, Any],
+    ai_response: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    if not batch_id:
+        return {}, ""
+    try:
+        from . import reconcile_batch_memory as bm
+
+        node_id = str(feature.get("node_id") or "")
+        feature_hash = str(feature.get("feature_hash") or "")
+        fingerprint = f"semantic:{snapshot_id}:{node_id}:{feature_hash[:16]}"
+        batch = bm.record_pm_decision(
+            conn,
+            project_id,
+            batch_id,
+            fingerprint,
+            _semantic_memory_decision_payload(feature, ai_response),
+        )
+        return batch, ""
+    except Exception as exc:  # noqa: BLE001 - report but keep enrichment alive
+        return {}, str(exc)
+
+
 def run_semantic_enrichment(
     conn: sqlite3.Connection,
     project_id: str,
@@ -773,6 +942,8 @@ def run_semantic_enrichment(
     semantic_include_structural: bool = False,
     semantic_ai_batch_size: int | None = None,
     semantic_ai_batch_by: str = "subsystem",
+    semantic_batch_memory: bool | None = None,
+    semantic_batch_memory_id: str | None = None,
     trace_dir: str | Path | None = None,
     persist_feature_payloads: bool = True,
 ) -> dict[str, Any]:
@@ -916,10 +1087,48 @@ def run_semantic_enrichment(
         for record in allowed_records
     }
     ai_responses: dict[str, dict[str, Any]] = {}
+    memory_enabled = (
+        bool(effective_use_ai and allowed_records and ai_batch_size > 1)
+        if semantic_batch_memory is None
+        else bool(semantic_batch_memory)
+    )
+    memory_batch: dict[str, Any] = {}
+    memory_batch_id = ""
+    memory_error = ""
+    memory_decision_count = 0
+    memory_update_error_count = 0
+    if memory_enabled:
+        memory_batch, memory_error = _create_semantic_batch_memory(
+            conn,
+            project_id,
+            snapshot_id,
+            round_number,
+            created_by=created_by,
+            batch_id=semantic_batch_memory_id,
+        )
+        memory_batch_id = str(memory_batch.get("batch_id") or _semantic_batch_memory_id(
+            snapshot_id,
+            round_number,
+            semantic_batch_memory_id,
+        ))
+        if memory_error:
+            memory_enabled = False
     if allowed_records:
         if ai_batch_size <= 1:
             for record in allowed_records:
                 node_id = str(record["feature"].get("node_id") or "")
+                if memory_enabled:
+                    memory_batch = _refresh_semantic_batch_memory(conn, project_id, memory_batch_id) or memory_batch
+                    record["payload"]["batch_memory"] = _semantic_batch_memory_summary(memory_batch)
+                    record["payload"]["related_batch_features"] = _semantic_memory_related_features(
+                        memory_batch,
+                        record["feature"],
+                    )
+                    if persist_feature_payloads:
+                        write_json(
+                            payload_trace_base / "feature-inputs" / f"{record['node_name']}.json",
+                            record["payload"],
+                        )
                 response = _call_ai(
                     ai_call,
                     stage="reconcile_semantic_feature",
@@ -927,6 +1136,20 @@ def run_semantic_enrichment(
                 )
                 if response is not None:
                     ai_responses[node_id] = response
+                if memory_enabled and response is not None and not response.get("_ai_error"):
+                    updated_batch, update_error = _record_semantic_memory_decision(
+                        conn,
+                        project_id,
+                        memory_batch_id,
+                        snapshot_id,
+                        record["feature"],
+                        response,
+                    )
+                    if update_error:
+                        memory_update_error_count += 1
+                    else:
+                        memory_decision_count += 1
+                        memory_batch = updated_batch or memory_batch
         else:
             for batch_index, batch in enumerate(
                 _batch_records(
@@ -937,6 +1160,9 @@ def run_semantic_enrichment(
             ):
                 ai_batch_count += 1
                 batch_key = _batch_key(batch[0]["feature"], semantic_ai_batch_by) if batch else "all"
+                if memory_enabled:
+                    memory_batch = _refresh_semantic_batch_memory(conn, project_id, memory_batch_id) or memory_batch
+                memory_summary = _semantic_batch_memory_summary(memory_batch) if memory_enabled else {}
                 batch_payload = {
                     "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
                     "project_id": project_id,
@@ -954,12 +1180,19 @@ def run_semantic_enrichment(
                             "review_feedback": record["payload"]["review_feedback"],
                             "semantic_selection": record["payload"]["semantic_selection"],
                             "quality_flags": record["flags"],
+                            "related_batch_features": (
+                                _semantic_memory_related_features(memory_batch, record["feature"])
+                                if memory_enabled
+                                else []
+                            ),
                         }
                         for record in batch
                     ],
+                    "batch_memory": memory_summary,
                     "instructions": {
                         **semantic_config.to_instruction_payload(),
                         "batch_mode": True,
+                        "use_batch_memory": bool(memory_enabled),
                         "output_contract": (
                             "Return one JSON object with a features array. Each item must include "
                             "node_id and the same semantic fields used for single-feature enrichment."
@@ -1002,6 +1235,24 @@ def run_semantic_enrichment(
                         },
                     )
                 ai_responses.update(_extract_batch_ai_responses(batch_response, batch))
+                for record in batch:
+                    node_id = str(record["feature"].get("node_id") or "")
+                    response = ai_responses.get(node_id)
+                    if not (memory_enabled and response is not None and not response.get("_ai_error")):
+                        continue
+                    updated_batch, update_error = _record_semantic_memory_decision(
+                        conn,
+                        project_id,
+                        memory_batch_id,
+                        snapshot_id,
+                        record["feature"],
+                        response,
+                    )
+                    if update_error:
+                        memory_update_error_count += 1
+                    else:
+                        memory_decision_count += 1
+                        memory_batch = updated_batch or memory_batch
 
     for record in records:
         feature = record["feature"]
@@ -1063,6 +1314,20 @@ def run_semantic_enrichment(
             ))
         semantic_features.append(semantic_entry)
 
+    if memory_enabled and memory_batch_id:
+        memory_batch = _refresh_semantic_batch_memory(conn, project_id, memory_batch_id) or memory_batch
+    memory_summary = _semantic_batch_memory_summary(memory_batch) if memory_enabled else {}
+    memory_report = {
+        "enabled": bool(memory_enabled),
+        "batch_id": memory_batch_id,
+        "error": memory_error,
+        "decision_count": memory_decision_count,
+        "update_error_count": memory_update_error_count,
+        "accepted_feature_count": memory_summary.get("accepted_feature_count", 0),
+        "file_ownership_count": memory_summary.get("file_ownership_count", 0),
+        "open_conflict_count": memory_summary.get("open_conflict_count", 0),
+    }
+
     semantic_index = {
         "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
         "project_id": project_id,
@@ -1080,6 +1345,7 @@ def run_semantic_enrichment(
             "batch_by": semantic_ai_batch_by,
             "batch_count": ai_batch_count,
         },
+        "semantic_batch_memory": memory_report,
         "feature_count": len(semantic_features),
         "features": sorted(semantic_features, key=lambda item: str(item.get("node_id") or "")),
     }
@@ -1106,6 +1372,7 @@ def run_semantic_enrichment(
         "ai_batch_count": ai_batch_count,
         "ai_batch_complete_count": ai_batch_complete_count,
         "ai_batch_error_count": ai_batch_error_count,
+        "semantic_batch_memory": memory_report,
         "feedback_count": len(feedback),
         "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
@@ -1145,6 +1412,7 @@ def run_semantic_enrichment(
             "ai_batch_size": ai_batch_size,
             "ai_batch_by": semantic_ai_batch_by,
             "ai_batch_count": ai_batch_count,
+            "semantic_batch_memory": memory_report,
             "feedback_count": len(feedback),
             "unresolved_feedback_count": len(unresolved_feedback),
             "updated_at": generated_at,
