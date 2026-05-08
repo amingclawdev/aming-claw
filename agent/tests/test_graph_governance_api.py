@@ -744,10 +744,20 @@ def test_graph_governance_feedback_decision_marks_user_state(conn):
         }],
     )
     item = classified["items"][0]
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    queue = server.handle_graph_governance_snapshot_feedback_queue(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "active"},
+            query={"lane": "graph_patch_candidate"},
+        )
+    )
+    assert queue["summary"]["raw_count"] == 1
 
     decided = server.handle_graph_governance_snapshot_feedback_decision(
         _ctx(
-            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            {"project_id": PID, "snapshot_id": "active"},
             method="POST",
             body={
                 "feedback_id": item["feedback_id"],

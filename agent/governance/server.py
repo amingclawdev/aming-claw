@@ -2724,6 +2724,7 @@ def handle_graph_governance_snapshot_semantic_feedback(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic-feedback")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         with sqlite_write_lock():
             try:
                 result = semantic.append_review_feedback(
@@ -2751,6 +2752,7 @@ def handle_graph_governance_snapshot_feedback_list(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.list")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         items = reconcile_feedback.list_feedback_items(
             project_id,
             snapshot_id,
@@ -2781,6 +2783,7 @@ def handle_graph_governance_snapshot_feedback_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.queue")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         return {
             "ok": True,
             **reconcile_feedback.build_feedback_review_queue(
@@ -2815,6 +2818,7 @@ def handle_graph_governance_snapshot_feedback_classify(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.classify")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         result = reconcile_feedback.classify_semantic_open_issues(
             project_id,
             snapshot_id,
@@ -2858,6 +2862,7 @@ def handle_graph_governance_snapshot_feedback_retrieval(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.retrieval")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         feedback_id = str(body.get("feedback_id") or "").strip()
         item = {}
         if feedback_id:
@@ -2955,6 +2960,7 @@ def handle_graph_governance_snapshot_feedback_status_observations(ctx: RequestCo
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.status-observations")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         try:
             result = reconcile_status_observations.classify_status_observations(
                 conn,
@@ -3007,6 +3013,7 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.review")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         use_reviewer_ai = bool(
             body.get("reviewer_use_ai")
             or body.get("use_reviewer_ai")
@@ -3089,6 +3096,7 @@ def handle_graph_governance_snapshot_feedback_queue_claim(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.queue.claim")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         try:
             result = reconcile_feedback.claim_feedback_review_queue(
                 project_id,
@@ -3157,6 +3165,7 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.decision")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         try:
             result = reconcile_feedback.decide_feedback_items(
                 project_id,
@@ -3226,6 +3235,7 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.review-queue")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         worker_id = str(body.get("worker_id") or body.get("reviewer_worker_id") or "").strip()
         claim_before_review = bool(body.get("claim_before_review") or worker_id)
         claim_result: dict = {}
@@ -3414,6 +3424,7 @@ def handle_graph_governance_snapshot_feedback_file_backlog(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.file-backlog")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         try:
             backlog = reconcile_feedback.build_project_improvement_backlog(
                 project_id,
@@ -3537,6 +3548,7 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic-enrich")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         with sqlite_write_lock():
             try:
                 result = semantic.run_semantic_enrichment(
