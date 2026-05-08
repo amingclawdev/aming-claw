@@ -297,8 +297,8 @@ def build_dashboard_review_bundle(
             / DASHBOARD_REVIEW_DIR
             / DASHBOARD_REVIEW_BUNDLE_NAME
         )
-        _write_json(out, bundle)
         bundle["artifact_path"] = str(out)
+        _write_json(out, bundle)
     return bundle
 
 
