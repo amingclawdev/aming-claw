@@ -2666,6 +2666,236 @@ def handle_graph_governance_snapshot_semantic_feedback(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback")
+def handle_graph_governance_snapshot_feedback_list(ctx: RequestContext):
+    """List classified reconcile feedback items for a graph snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.list")
+        items = reconcile_feedback.list_feedback_items(
+            project_id,
+            snapshot_id,
+            feedback_kind=str(ctx.query.get("feedback_kind") or ctx.query.get("kind") or ""),
+            status=str(ctx.query.get("status") or ""),
+            node_id=str(ctx.query.get("node_id") or ""),
+            limit=_query_int(ctx.query, "limit", 200),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "summary": reconcile_feedback.feedback_summary(project_id, snapshot_id),
+            "items": items,
+            "count": len(items),
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/classify")
+def handle_graph_governance_snapshot_feedback_classify(ctx: RequestContext):
+    """Classify semantic open issues into graph/project/reviewer feedback lanes."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.classify")
+        result = reconcile_feedback.classify_semantic_open_issues(
+            project_id,
+            snapshot_id,
+            source_round=body.get("source_round") or body.get("feedback_round") or "",
+            created_by=str(body.get("actor") or body.get("created_by") or "observer"),
+            issues=body.get("issues") if isinstance(body.get("issues"), list) else None,
+            limit=int(body["limit"]) if body.get("limit") is not None else None,
+        )
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_classified",
+                actor=str(body.get("actor") or "observer"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "created": result.get("created", 0),
+                    "updated": result.get("updated", 0),
+                    "summary": result.get("summary", {}),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/review")
+def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
+    """Review one feedback item and route it toward graph correction or backlog."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    feedback_id = str(body.get("feedback_id") or "").strip()
+    if not feedback_id:
+        from .errors import ValidationError
+        raise ValidationError("feedback_id is required")
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.review")
+        root = _graph_governance_project_root(project_id, body)
+        use_reviewer_ai = bool(
+            body.get("reviewer_use_ai")
+            or body.get("use_reviewer_ai")
+            or body.get("semantic_use_ai")
+            or body.get("use_ai")
+        )
+        ai_call = None
+        if use_reviewer_ai and not body.get("decision") and not body.get("reviewer_decision"):
+            ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+        try:
+            result = reconcile_feedback.review_feedback_item(
+                project_id,
+                snapshot_id,
+                feedback_id,
+                decision=str(body.get("decision") or body.get("reviewer_decision") or ""),
+                rationale=str(body.get("rationale") or body.get("reviewer_rationale") or ""),
+                confidence=float(body["confidence"]) if body.get("confidence") is not None else None,
+                actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
+                accept=bool(body.get("accept") or body.get("accepted")),
+                ai_call=ai_call,
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_reviewed",
+                actor=str(body.get("actor") or "observer"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "feedback_id": feedback_id,
+                    "decision": (result.get("items") or [{}])[0].get("reviewer_decision", ""),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/file-backlog")
+def handle_graph_governance_snapshot_feedback_file_backlog(ctx: RequestContext):
+    """File an accepted project-improvement feedback item into backlog."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    feedback_id = str(body.get("feedback_id") or "").strip()
+    if not feedback_id:
+        from .errors import ValidationError
+        raise ValidationError("feedback_id is required")
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.file-backlog")
+        try:
+            backlog = reconcile_feedback.build_project_improvement_backlog(
+                project_id,
+                snapshot_id,
+                feedback_id,
+                bug_id=str(body.get("bug_id") or ""),
+                actor=str(body.get("actor") or "observer"),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        bug_id = backlog["bug_id"]
+        payload = backlog["payload"]
+        now = _utc_now()
+        conn.execute(
+            """INSERT INTO backlog_bugs
+               (bug_id, title, status, priority, target_files, test_files,
+                acceptance_criteria, chain_task_id, "commit", discovered_at,
+                fixed_at, details_md, chain_trigger_json, required_docs,
+                provenance_paths, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, '', ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(bug_id) DO UPDATE SET
+                 title = excluded.title,
+                 status = excluded.status,
+                 priority = excluded.priority,
+                 target_files = excluded.target_files,
+                 test_files = excluded.test_files,
+                 acceptance_criteria = excluded.acceptance_criteria,
+                 details_md = excluded.details_md,
+                 chain_trigger_json = excluded.chain_trigger_json,
+                 required_docs = excluded.required_docs,
+                 provenance_paths = excluded.provenance_paths,
+                 updated_at = excluded.updated_at
+            """,
+            (
+                bug_id,
+                payload.get("title", ""),
+                payload.get("status", "OPEN"),
+                payload.get("priority", "P2"),
+                json.dumps(payload.get("target_files", []), ensure_ascii=False),
+                json.dumps(payload.get("test_files", []), ensure_ascii=False),
+                json.dumps(payload.get("acceptance_criteria", []), ensure_ascii=False),
+                now,
+                payload.get("details_md", ""),
+                json.dumps(payload.get("chain_trigger_json", {}), ensure_ascii=False, sort_keys=True),
+                json.dumps(payload.get("required_docs", []), ensure_ascii=False),
+                json.dumps(payload.get("provenance_paths", []), ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        mark = reconcile_feedback.mark_feedback_backlog_filed(
+            project_id,
+            snapshot_id,
+            feedback_id,
+            bug_id=bug_id,
+            actor=str(body.get("actor") or "observer"),
+        )
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_backlog_filed",
+                actor=str(body.get("actor") or "observer"),
+                bug_id=bug_id,
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "feedback_id": feedback_id,
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "feedback_id": feedback_id,
+            "bug_id": bug_id,
+            "payload": payload,
+            "feedback": (mark.get("items") or [{}])[0],
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic-enrich")
 def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     """Build/rebuild semantic companion artifacts for a graph snapshot."""

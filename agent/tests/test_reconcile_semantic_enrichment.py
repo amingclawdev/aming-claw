@@ -8,6 +8,7 @@ import pytest
 
 from agent.governance import reconcile_batch_memory as bm
 from agent.governance import graph_snapshot_store as store
+from agent.governance import reconcile_feedback
 from agent.governance.reconcile_semantic_enrichment import (
     _batch_key,
     _semantic_batch_memory_summary,
@@ -512,6 +513,91 @@ def test_append_review_feedback_normalizes_append_only_items(conn, tmp_path):
     assert len(feedback) == 1
     assert feedback[0]["target_id"] == "agent/governance/backlog_runtime.py"
     assert feedback[0]["created_by"] == "observer"
+
+
+def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    state_path = store.snapshot_companion_dir(PID, "full-semantic-test") / "semantic-enrichment" / "semantic-graph-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "open_issues": [
+            {
+                "node_id": "L7.7",
+                "reason": "merge_suggestions",
+                "summary": "L7.7 and L7.136 both claim .aming-claw.yaml; confirm whether to merge or split responsibilities.",
+                "type": "",
+            },
+            {
+                "node_id": "L7.51",
+                "reason": "dependency_patch_suggestions",
+                "summary": "Mis-extraction: .aming-claw.yaml is read, not written by this module.",
+                "type": "typed_relation",
+            },
+            {
+                "node_id": "L7.5",
+                "reason": "dependency_patch_suggestions",
+                "summary": "missing_test_binding flag — primary file has many functions and zero direct tests.",
+                "type": "",
+            },
+        ]
+    }), encoding="utf-8")
+
+    result = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        "full-semantic-test",
+        source_round="round-017",
+        created_by="observer",
+    )
+
+    summary = result["summary"]
+    assert summary["by_kind"]["needs_observer_decision"] == 1
+    assert summary["by_kind"]["graph_correction"] == 1
+    assert summary["by_kind"]["project_improvement"] == 1
+    items = {item["source_node_ids"][0]: item for item in reconcile_feedback.list_feedback_items(PID, "full-semantic-test")}
+    assert items["L7.7"]["requires_human_signoff"] is True
+    assert items["L7.51"]["target_type"] == "edge"
+
+    def fake_reviewer(stage: str, payload: dict) -> dict:
+        assert stage == "reconcile_feedback_review"
+        assert payload["instructions"]["mutate_project_files"] is False
+        return {
+            "decision": "project_improvement",
+            "rationale": "The issue describes real duplicate configuration ownership.",
+            "confidence": 0.72,
+        }
+
+    review = reconcile_feedback.review_feedback_item(
+        PID,
+        "full-semantic-test",
+        items["L7.7"]["feedback_id"],
+        actor="observer",
+        accept=True,
+        ai_call=fake_reviewer,
+    )
+    reviewed = review["items"][0]
+    assert reviewed["status"] == "accepted"
+    assert reviewed["final_feedback_kind"] == "project_improvement"
+
+    backlog = reconcile_feedback.build_project_improvement_backlog(
+        PID,
+        "full-semantic-test",
+        items["L7.7"]["feedback_id"],
+        bug_id="OPT-BACKLOG-FEEDBACK-CONFIG-BOUNDARY",
+        actor="observer",
+    )
+    assert backlog["bug_id"] == "OPT-BACKLOG-FEEDBACK-CONFIG-BOUNDARY"
+    assert "reconcile_feedback" in backlog["payload"]["chain_trigger_json"]["source"]
+
+    filed = reconcile_feedback.mark_feedback_backlog_filed(
+        PID,
+        "full-semantic-test",
+        items["L7.7"]["feedback_id"],
+        bug_id=backlog["bug_id"],
+        actor="observer",
+    )
+    assert filed["items"][0]["status"] == "backlog_filed"
+    assert filed["items"][0]["backlog_bug_id"] == "OPT-BACKLOG-FEEDBACK-CONFIG-BOUNDARY"
 
 
 def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):
