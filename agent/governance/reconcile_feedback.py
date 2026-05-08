@@ -189,7 +189,7 @@ def _lane_rank(lane: str) -> int:
     }.get(lane, 5)
 
 
-def _queue_group_key(item: dict[str, Any], lane: str) -> str:
+def _queue_group_key(item: dict[str, Any], lane: str, *, group_by: str = "target") -> str:
     nodes = _source_nodes(item)
     node_key = ",".join(nodes) if nodes else ""
     category = str(
@@ -197,6 +197,8 @@ def _queue_group_key(item: dict[str, Any], lane: str) -> str:
         or item.get("status_observation_category")
         or ""
     )
+    if group_by in {"feature", "node", "source_node"} and node_key:
+        return "|".join([lane, node_key, category])
     parts = [
         lane,
         node_key,
@@ -229,6 +231,7 @@ def build_feedback_review_queue(
     node_id: str = "",
     source_round: str = "",
     lane: str = "",
+    group_by: str = "target",
     include_status_observations: bool = False,
     include_resolved: bool = False,
     limit: int | None = None,
@@ -253,6 +256,9 @@ def build_feedback_review_queue(
             item for item in raw_items
             if str(item.get("source_round") or "") == str(source_round)
         ]
+    group_by = str(group_by or "target").strip().lower()
+    if group_by not in {"target", "feature", "node", "source_node"}:
+        group_by = "target"
 
     by_kind: dict[str, int] = {}
     by_status: dict[str, int] = {}
@@ -277,10 +283,13 @@ def build_feedback_review_queue(
             hidden_resolved += 1
             continue
 
-        key = _queue_group_key(item, item_lane)
+        key = _queue_group_key(item, item_lane, group_by=group_by)
         group = groups.get(key)
         nodes = _source_nodes(item)
         priority = str(item.get("priority") or "P3").upper()
+        target_id = str(item.get("target_id") or "")
+        target_type = str(item.get("target_type") or "")
+        issue_type = str(item.get("issue_type") or "")
         if group is None:
             group = {
                 "queue_id": f"fq-{_short_hash({'snapshot_id': snapshot_id, 'key': key})}",
@@ -288,9 +297,13 @@ def build_feedback_review_queue(
                 "action_hint": _queue_action_hint(item_lane),
                 "priority": priority,
                 "source_node_ids": nodes,
-                "target_type": str(item.get("target_type") or ""),
-                "target_id": str(item.get("target_id") or ""),
-                "issue_type": str(item.get("issue_type") or ""),
+                "target_type": target_type,
+                "target_id": target_id,
+                "issue_type": issue_type,
+                "target_ids": [],
+                "target_count": 0,
+                "target_type_counts": {},
+                "issue_type_counts": {},
                 "status_observation_category": str(
                     item.get("reviewed_status_observation_category")
                     or item.get("status_observation_category")
@@ -315,6 +328,15 @@ def build_feedback_review_queue(
                 group["representative_issue"] = str(item.get("issue") or "")
                 group["confidence"] = float(item.get("confidence") or 0.0)
         group["feedback_ids"].append(str(item.get("feedback_id") or ""))
+        if target_id and target_id not in group["target_ids"]:
+            group["target_ids"].append(target_id)
+        group["target_count"] = len(group["target_ids"])
+        if target_type:
+            counts = group["target_type_counts"]
+            counts[target_type] = int(counts.get(target_type) or 0) + 1
+        if issue_type:
+            counts = group["issue_type_counts"]
+            counts[issue_type] = int(counts.get(issue_type) or 0) + 1
         group["item_count"] = int(group.get("item_count") or 0) + 1
         group["suppressed_count"] = max(0, int(group["item_count"]) - 1)
         group["requires_human_signoff"] = bool(group.get("requires_human_signoff") or item.get("requires_human_signoff"))
@@ -340,6 +362,7 @@ def build_feedback_review_queue(
     return {
         "project_id": project_id,
         "snapshot_id": snapshot_id,
+        "group_by": group_by,
         "summary": {
             "raw_count": len(raw_items),
             "visible_group_count": len(grouped),

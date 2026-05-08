@@ -861,6 +861,68 @@ def test_reconcile_feedback_review_queue_groups_and_hides_status_noise(conn, tmp
     assert "status_only" in {group["lane"] for group in with_status["groups"]}
 
 
+def test_reconcile_feedback_review_queue_can_group_by_feature(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    issues = [
+        {
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add relation from this feature to the task registry.",
+            "target": "agent.governance.task_registry",
+            "type": "add_typed_relation",
+        },
+        {
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add relation from this feature to the event module.",
+            "target": "agent.governance.events",
+            "type": "add_typed_relation",
+        },
+        {
+            "node_id": "L7.2",
+            "reason": "split_suggestions",
+            "summary": "Observer must decide whether this feature should split.",
+            "type": "split",
+        },
+    ]
+    classify = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        "full-semantic-test",
+        source_round="round-003",
+        created_by="observer",
+        issues=issues,
+    )
+    assert classify["count"] == 3
+
+    target_queue = reconcile_feedback.build_feedback_review_queue(
+        PID,
+        "full-semantic-test",
+        source_round="round-003",
+    )
+    assert target_queue["group_by"] == "target"
+    assert target_queue["summary"]["visible_group_count"] == 3
+
+    feature_queue = reconcile_feedback.build_feedback_review_queue(
+        PID,
+        "full-semantic-test",
+        source_round="round-003",
+        group_by="feature",
+    )
+    assert feature_queue["group_by"] == "feature"
+    assert feature_queue["summary"]["visible_group_count"] == 2
+    by_node = {
+        tuple(group["source_node_ids"]): group
+        for group in feature_queue["groups"]
+    }
+    assert by_node[("L7.1",)]["item_count"] == 2
+    assert by_node[("L7.1",)]["target_count"] == 2
+    assert by_node[("L7.1",)]["issue_type_counts"] == {
+        "add_typed_relation": 2,
+    }
+    assert by_node[("L7.2",)]["lane"] == "review_required"
+
+
 def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)

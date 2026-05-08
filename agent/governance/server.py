@@ -2741,6 +2741,7 @@ def handle_graph_governance_snapshot_feedback_queue(ctx: RequestContext):
                 node_id=str(ctx.query.get("node_id") or ""),
                 source_round=str(ctx.query.get("source_round") or ctx.query.get("feedback_round") or ""),
                 lane=str(ctx.query.get("lane") or ""),
+                group_by=str(ctx.query.get("group_by") or "target"),
                 include_status_observations=_query_bool(ctx.query, "include_status_observations", False),
                 include_resolved=_query_bool(ctx.query, "include_resolved", False),
                 limit=_query_int(ctx.query, "limit", 100),
