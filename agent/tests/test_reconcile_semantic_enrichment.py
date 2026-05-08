@@ -350,12 +350,14 @@ def test_semantic_enrichment_can_batch_ai_features(conn, tmp_path):
         semantic_ai_scope="all",
         semantic_ai_batch_size=10,
         semantic_ai_batch_by="none",
+        semantic_ai_input_mode="batch",
         created_by="test",
     )
 
     assert [call["stage"] for call in calls] == ["reconcile_semantic_feature_batch"]
     assert len(calls[0]["payload"]["features"]) == 2
     assert calls[0]["payload"]["instructions"]["batch_mode"] is True
+    assert calls[0]["payload"]["instructions"]["semantic_ai_input_mode"] == "batch"
     assert calls[0]["payload"]["instructions"]["use_semantic_graph_state"] is True
     assert calls[0]["payload"]["instructions"]["use_batch_memory"] is False
     assert calls[0]["payload"]["semantic_graph_state"]["completed_node_count"] == 0
@@ -379,6 +381,51 @@ def test_semantic_enrichment_can_batch_ai_features(conn, tmp_path):
     assert graph_nodes["L7.1"]["metadata"]["semantic"]["feature_name"] == "Batch L7.1"
     assert Path(result["summary"]["batch_payload_input_dir"]).exists()
     assert Path(result["summary"]["batch_payload_output_dir"]).exists()
+
+
+def test_semantic_enrichment_defaults_to_dynamic_feature_input(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    calls: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append({
+            "stage": stage,
+            "node_id": payload["feature"]["node_id"],
+            "completed": payload["semantic_graph_state"]["completed_node_count"],
+            "related": payload["related_graph_features"],
+            "input_mode": payload["semantic_ai_input_mode"],
+            "dynamic": payload["dynamic_semantic_graph_state"],
+        })
+        return {
+            "feature_name": f"Dynamic {payload['feature']['node_id']}",
+            "semantic_summary": f"Dynamic summary {payload['feature']['node_id']}",
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="all",
+        semantic_ai_batch_size=10,
+        semantic_ai_batch_by="none",
+        created_by="test",
+    )
+
+    assert [call["stage"] for call in calls] == [
+        "reconcile_semantic_feature",
+        "reconcile_semantic_feature",
+    ]
+    assert [call["completed"] for call in calls] == [0, 1]
+    assert [call["input_mode"] for call in calls] == ["feature", "feature"]
+    assert all(call["dynamic"] is True for call in calls)
+    assert result["summary"]["ai_input_mode"] == "feature"
+    assert result["summary"]["requested_ai_batch_size"] == 10
+    assert result["summary"]["ai_batch_size"] == 1
+    assert result["semantic_index"]["semantic_batching"]["input_mode"] == "feature"
 
 
 def test_semantic_graph_state_accumulates_and_skips_completed(conn, tmp_path):

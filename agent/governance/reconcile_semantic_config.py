@@ -46,6 +46,12 @@ class SemanticInputPolicy:
 
 
 @dataclass
+class SemanticExecutionPolicy:
+    ai_input_mode: str = "feature"
+    dynamic_semantic_graph_state: bool = True
+
+
+@dataclass
 class SemanticAnalyzerConfig:
     version: str
     analyzer: str
@@ -59,6 +65,7 @@ class SemanticAnalyzerConfig:
     permissions_can: list[str] = field(default_factory=list)
     permissions_cannot: list[str] = field(default_factory=list)
     input_policy: SemanticInputPolicy = field(default_factory=SemanticInputPolicy)
+    execution_policy: SemanticExecutionPolicy = field(default_factory=SemanticExecutionPolicy)
     output_schema: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     source_path: str = ""
@@ -112,6 +119,17 @@ class SemanticAnalyzerConfig:
             include_review_feedback=bool(input_policy_raw.get("include_review_feedback", True)),
             include_file_hashes=bool(input_policy_raw.get("include_file_hashes", True)),
         )
+        execution_policy_raw = data.get("execution_policy") or {}
+        if not isinstance(execution_policy_raw, dict):
+            raise SemanticConfigValidationError("'execution_policy' must be a mapping")
+        execution_policy = SemanticExecutionPolicy(
+            ai_input_mode=_normalize_ai_input_mode(
+                execution_policy_raw.get("ai_input_mode", "feature")
+            ),
+            dynamic_semantic_graph_state=bool(
+                execution_policy_raw.get("dynamic_semantic_graph_state", True)
+            ),
+        )
         try:
             max_tokens = int(data.get("max_tokens", 4000))
         except (TypeError, ValueError) as exc:
@@ -145,6 +163,7 @@ class SemanticAnalyzerConfig:
             permissions_can=can,
             permissions_cannot=cannot,
             input_policy=input_policy,
+            execution_policy=execution_policy,
             output_schema=data.get("output_schema") if isinstance(data.get("output_schema"), dict) else {},
             prompt_template=prompt_template,
             source_path=source_path,
@@ -169,6 +188,7 @@ class SemanticAnalyzerConfig:
                 "cannot": sorted(set(self.permissions_cannot)),
             },
             "input_policy": asdict(self.input_policy),
+            "execution_policy": asdict(self.execution_policy),
             "output_schema": self.output_schema,
             "prompt_template": self.prompt_template,
         }
@@ -185,7 +205,19 @@ class SemanticAnalyzerConfig:
             "source_path": self.source_path,
             "override_path": self.override_path,
             "input_policy": asdict(self.input_policy),
+            "execution_policy": asdict(self.execution_policy),
         }
+
+
+def _normalize_ai_input_mode(value: Any) -> str:
+    mode = str(value or "feature").strip().lower().replace("-", "_")
+    if mode in {"feature", "single", "single_feature", "per_feature", "dynamic_feature"}:
+        return "feature"
+    if mode in {"batch", "batched", "batch_features"}:
+        return "batch"
+    raise SemanticConfigValidationError(
+        "execution_policy.ai_input_mode must be 'feature' or 'batch'"
+    )
 
 
 def _default_config_dict() -> dict[str, Any]:
@@ -214,6 +246,7 @@ def _default_config_dict() -> dict[str, Any]:
             "cannot": sorted(_FORBIDDEN_ALLOWED),
         },
         "input_policy": asdict(SemanticInputPolicy()),
+        "execution_policy": asdict(SemanticExecutionPolicy()),
         "output_schema": {
             "required": [
                 "feature_name",
@@ -287,6 +320,7 @@ __all__ = [
     "SemanticAnalyzerConfig",
     "SemanticConfigError",
     "SemanticConfigValidationError",
+    "SemanticExecutionPolicy",
     "SemanticInputPolicy",
     "load_semantic_enrichment_config",
 ]

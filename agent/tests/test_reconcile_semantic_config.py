@@ -25,11 +25,14 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.executables["anthropic"] == "claude"
     assert config.executables["openai"] == "codex"
     assert config.use_ai_default is False
+    assert config.execution_policy.ai_input_mode == "feature"
+    assert config.execution_policy.dynamic_semantic_graph_state is True
     assert "modify_code" not in config.permissions_can
     assert "mutate_graph_topology" in config.permissions_cannot
     payload = config.to_instruction_payload()
     assert payload["mutate_project_files"] is False
     assert payload["mutate_graph_topology"] is False
+    assert payload["execution_policy"]["ai_input_mode"] == "feature"
     assert payload["prompt_template"]
     assert Path(DEFAULT_CONFIG_PATH).exists()
 
@@ -45,6 +48,8 @@ def test_project_override_merges_with_default(tmp_path):
                 "use_ai_default: true",
                 "input_policy:",
                 "  max_excerpt_chars: 77",
+                "execution_policy:",
+                "  ai_input_mode: batch",
                 "prompt_template: |-",
                 "  Custom project semantic analyzer prompt.",
             ]
@@ -57,6 +62,7 @@ def test_project_override_merges_with_default(tmp_path):
     assert config.model == "gpt-test-semantic"
     assert config.use_ai_default is True
     assert config.input_policy.max_excerpt_chars == 77
+    assert config.execution_policy.ai_input_mode == "batch"
     assert config.prompt_template == "Custom project semantic analyzer prompt."
     assert config.executables["anthropic"] == "claude"
     assert "read_graph_snapshot" in config.permissions_can

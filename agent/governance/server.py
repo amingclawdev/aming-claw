@@ -1767,6 +1767,17 @@ def _semantic_ai_batch_kwargs_from_body(body: dict) -> dict:
             or body.get("ai_batch_by")
             or "subsystem"
         ),
+        "semantic_ai_input_mode": (
+            body.get("semantic_ai_input_mode")
+            or body.get("semantic_input_mode")
+            or body.get("ai_input_mode")
+        ),
+        "semantic_dynamic_graph_state": _semantic_bool_from_body(
+            body,
+            "semantic_dynamic_graph_state",
+            "dynamic_semantic_graph_state",
+            default=None,
+        ),
     }
 
 

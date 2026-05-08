@@ -643,6 +643,15 @@ def _normal_batch_size(raw: int | None) -> int:
     return max(1, value)
 
 
+def _normal_ai_input_mode(raw: str | None, *, default: str = "feature") -> str:
+    mode = str(raw or default or "feature").strip().lower().replace("-", "_")
+    if mode in {"feature", "single", "single_feature", "per_feature", "dynamic_feature"}:
+        return "feature"
+    if mode in {"batch", "batched", "batch_features"}:
+        return "batch"
+    return "feature"
+
+
 def _batch_key(feature: dict[str, Any], batch_by: str) -> str:
     mode = (batch_by or "subsystem").strip().lower()
     metadata = feature.get("metadata") if isinstance(feature.get("metadata"), dict) else {}
@@ -1368,6 +1377,8 @@ def run_semantic_enrichment(
     semantic_include_structural: bool = False,
     semantic_ai_batch_size: int | None = None,
     semantic_ai_batch_by: str = "subsystem",
+    semantic_ai_input_mode: str | None = None,
+    semantic_dynamic_graph_state: bool | None = None,
     semantic_graph_state: bool = True,
     semantic_skip_completed: bool = True,
     semantic_batch_memory: bool | None = None,
@@ -1482,7 +1493,17 @@ def run_semantic_enrichment(
     ai_skipped_count = 0
     ai_selected_count = 0
     ai_skipped_selector_count = 0
-    ai_batch_size = _normal_batch_size(semantic_ai_batch_size)
+    requested_ai_batch_size = _normal_batch_size(semantic_ai_batch_size)
+    ai_input_mode = _normal_ai_input_mode(
+        semantic_ai_input_mode,
+        default=semantic_config.execution_policy.ai_input_mode,
+    )
+    dynamic_graph_state = (
+        semantic_config.execution_policy.dynamic_semantic_graph_state
+        if semantic_dynamic_graph_state is None
+        else bool(semantic_dynamic_graph_state)
+    )
+    ai_batch_size = 1 if ai_input_mode == "feature" else requested_ai_batch_size
     ai_batch_count = 0
     ai_batch_complete_count = 0
     ai_batch_error_count = 0
@@ -1543,6 +1564,8 @@ def run_semantic_enrichment(
             "review_feedback": payload_feedback,
             "instructions": semantic_config.to_instruction_payload(),
             "semantic_selector": selector,
+            "semantic_ai_input_mode": ai_input_mode,
+            "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
             "semantic_selection": {
                 "status": "selected" if selected_for_ai else "not_selected",
                 "reasons": selection_reasons,
@@ -1604,10 +1627,24 @@ def run_semantic_enrichment(
         if memory_error:
             memory_enabled = False
     if allowed_records:
+        if semantic_state_enabled:
+            _write_semantic_graph_state_artifacts(
+                project_id,
+                snapshot_id,
+                graph_json,
+                semantic_state,
+                round_number=round_number,
+            )
         if ai_batch_size <= 1:
             for record in allowed_records:
                 node_id = str(record["feature"].get("node_id") or "")
                 if semantic_state_enabled:
+                    if dynamic_graph_state:
+                        semantic_state = _load_semantic_graph_state(
+                            project_id,
+                            snapshot_id,
+                            snapshot,
+                        )
                     record["payload"]["semantic_graph_state"] = _semantic_graph_state_summary(semantic_state)
                     record["payload"]["related_graph_features"] = _semantic_graph_related_features(
                         semantic_state,
@@ -1686,6 +1723,12 @@ def run_semantic_enrichment(
             ):
                 ai_batch_count += 1
                 batch_key = _batch_key(batch[0]["feature"], semantic_ai_batch_by) if batch else "all"
+                if semantic_state_enabled and dynamic_graph_state:
+                    semantic_state = _load_semantic_graph_state(
+                        project_id,
+                        snapshot_id,
+                        snapshot,
+                    )
                 if memory_enabled:
                     memory_batch = _refresh_semantic_batch_memory(conn, project_id, memory_batch_id) or memory_batch
                 memory_summary = _semantic_batch_memory_summary(memory_batch) if memory_enabled else {}
@@ -1705,6 +1748,8 @@ def run_semantic_enrichment(
                     "batch_key": batch_key,
                     "batch_by": semantic_ai_batch_by,
                     "feature_count": len(batch),
+                    "semantic_ai_input_mode": ai_input_mode,
+                    "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
                     "features": [
                         {
                             "feature": record["payload"]["feature"],
@@ -1729,6 +1774,7 @@ def run_semantic_enrichment(
                     "instructions": {
                         **semantic_config.to_instruction_payload(),
                         "batch_mode": True,
+                        "semantic_ai_input_mode": ai_input_mode,
                         "use_semantic_graph_state": bool(semantic_state_enabled),
                         "use_batch_memory": bool(memory_enabled),
                         "output_contract": (
@@ -1944,6 +1990,9 @@ def run_semantic_enrichment(
         "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
         "semantic_batching": {
+            "input_mode": ai_input_mode,
+            "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
+            "requested_batch_size": requested_ai_batch_size,
             "batch_size": ai_batch_size,
             "batch_by": semantic_ai_batch_by,
             "batch_count": ai_batch_count,
@@ -1971,6 +2020,9 @@ def run_semantic_enrichment(
         "ai_skipped_count": ai_skipped_count,
         "ai_selected_count": ai_selected_count,
         "ai_skipped_selector_count": ai_skipped_selector_count,
+        "ai_input_mode": ai_input_mode,
+        "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
+        "requested_ai_batch_size": requested_ai_batch_size,
         "ai_batch_size": ai_batch_size,
         "ai_batch_by": semantic_ai_batch_by,
         "ai_batch_count": ai_batch_count,
@@ -2014,6 +2066,9 @@ def run_semantic_enrichment(
             "ai_complete_count": ai_complete_count,
             "ai_selected_count": ai_selected_count,
             "ai_skipped_selector_count": ai_skipped_selector_count,
+            "ai_input_mode": ai_input_mode,
+            "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
+            "requested_ai_batch_size": requested_ai_batch_size,
             "ai_batch_size": ai_batch_size,
             "ai_batch_by": semantic_ai_batch_by,
             "ai_batch_count": ai_batch_count,

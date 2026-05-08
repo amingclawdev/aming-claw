@@ -39,6 +39,12 @@ input_policy:
   include_review_feedback: true
   include_file_hashes: true
 
+execution_policy:
+  # The default full/scope semantic path is one feature per AI call. Batch mode
+  # is available only when callers explicitly set semantic_ai_input_mode=batch.
+  ai_input_mode: feature
+  dynamic_semantic_graph_state: true
+
 output_schema:
   required:
     - feature_name
