@@ -6,6 +6,7 @@ materializes scan artifacts there without mutating the canonical graph.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -203,6 +204,13 @@ def build_coverage_state(
                 "size_bytes": int(row.get("size_bytes") or 0),
                 "graph_status": str(row.get("graph_status") or ""),
                 "mapped_node_ids": list(row.get("mapped_node_ids") or []),
+                "attached_node_ids": list(row.get("attached_node_ids") or []),
+                "attachment_role": str(row.get("attachment_role") or ""),
+                "attachment_source": str(row.get("attachment_source") or ""),
+                "file_kind": str(row.get("file_kind") or ""),
+                "scan_status": str(row.get("scan_status") or ""),
+                "candidate_node_id": str(row.get("candidate_node_id") or ""),
+                "attached_to": str(row.get("attached_to") or ""),
                 "last_scanned_commit": str(row.get("last_scanned_commit") or ""),
             }
             for row in file_inventory
@@ -222,6 +230,7 @@ def build_symbol_index(
     profile = profile or discover_project_profile(str(root))
     symbols: list[dict[str, Any]] = []
     covered_files: set[str] = set()
+    seen_symbol_ids: set[str] = set()
     try:
         modules = parse_production_modules(str(root), profile=profile)
     except Exception:
@@ -230,7 +239,7 @@ def build_symbol_index(
         rel = _relpath(root, module.path)
         covered_files.add(rel)
         for func in module.functions:
-            symbols.append({
+            symbol = {
                 "id": func.qualified_name,
                 "kind": "function",
                 "language": "python",
@@ -240,7 +249,22 @@ def build_symbol_index(
                 "line_end": func.end_lineno,
                 "decorators": list(func.decorators or []),
                 "calls": list(func.calls or []),
-            })
+            }
+            symbols.append(symbol)
+            seen_symbol_ids.add(str(symbol["id"]))
+
+    for row in sorted(file_inventory, key=lambda r: str(r.get("path") or "")):
+        rel = str(row.get("path") or "").replace("\\", "/").strip("/")
+        if not rel.endswith(".py"):
+            continue
+        if row.get("file_kind") not in {"source", "test"} and row.get("language") != "python":
+            continue
+        for symbol in _parse_python_file_symbols(root, rel, str(row.get("file_kind") or "")):
+            symbol_id = str(symbol.get("id") or "")
+            if not symbol_id or symbol_id in seen_symbol_ids:
+                continue
+            symbols.append(symbol)
+            seen_symbol_ids.add(symbol_id)
 
     file_symbols: list[dict[str, Any]] = []
     for row in sorted(file_inventory, key=lambda r: str(r.get("path") or "")):
@@ -322,6 +346,122 @@ def _count_lines(path: Path) -> int:
     except OSError:
         return 0
     return max(1, count)
+
+
+def _module_name_from_rel(rel_path: str) -> str:
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    if rel.endswith(".py"):
+        rel = rel[:-3]
+    parts = [part for part in rel.split("/") if part]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts) or "module"
+
+
+def _decorator_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _decorator_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return ""
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _call_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def _function_calls(node: ast.AST) -> list[str]:
+    calls: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            name = _call_name(child.func)
+            if name:
+                calls.add(name)
+    return sorted(calls)
+
+
+def _assigned_names(node: ast.AST) -> list[str]:
+    targets: list[ast.AST] = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    names: list[str] = []
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names.extend(elt.id for elt in target.elts if isinstance(elt, ast.Name))
+    return sorted(set(names))
+
+
+def _parse_python_file_symbols(root: Path, rel_path: str, file_kind: str) -> list[dict[str, Any]]:
+    path = root / rel_path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="latin-1")
+    except OSError:
+        return []
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return []
+
+    module = _module_name_from_rel(rel_path)
+    symbols: list[dict[str, Any]] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kind = "test_function" if node.name.startswith("test_") else "function"
+            symbols.append({
+                "id": f"{module}::{node.name}",
+                "kind": kind,
+                "language": "python",
+                "module": module,
+                "path": rel_path,
+                "line_start": int(getattr(node, "lineno", 1) or 1),
+                "line_end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
+                "decorators": [
+                    name for name in (_decorator_name(item) for item in node.decorator_list) if name
+                ],
+                "calls": _function_calls(node),
+            })
+        elif isinstance(node, ast.ClassDef):
+            symbols.append({
+                "id": f"{module}::{node.name}",
+                "kind": "class",
+                "language": "python",
+                "module": module,
+                "path": rel_path,
+                "line_start": int(getattr(node, "lineno", 1) or 1),
+                "line_end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
+                "decorators": [
+                    name for name in (_decorator_name(item) for item in node.decorator_list) if name
+                ],
+                "calls": _function_calls(node),
+            })
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for name in _assigned_names(node):
+                if not name.isupper():
+                    continue
+                symbols.append({
+                    "id": f"{module}::{name}",
+                    "kind": "constant",
+                    "language": "python",
+                    "module": module,
+                    "path": rel_path,
+                    "line_start": int(getattr(node, "lineno", 1) or 1),
+                    "line_end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1),
+                })
+    return symbols
 
 
 def _extract_doc_headings(text: str) -> list[dict[str, Any]]:

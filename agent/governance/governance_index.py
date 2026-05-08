@@ -194,6 +194,74 @@ def _path_list(node: dict[str, Any], *keys: str) -> list[str]:
     return sorted(set(out))
 
 
+def _node_attachment_index(nodes: Iterable[dict[str, Any]]) -> dict[str, dict[str, set[str]]]:
+    index: dict[str, dict[str, set[str]]] = {}
+
+    def add(node_id: str, role: str, paths: Iterable[str]) -> None:
+        for path in paths:
+            norm = str(path or "").replace("\\", "/").strip("/")
+            if not norm:
+                continue
+            index.setdefault(norm, {}).setdefault(node_id, set()).add(role)
+
+    for node in nodes:
+        node_id = str(node.get("id") or node.get("node_id") or "")
+        if not node_id:
+            continue
+        add(node_id, "primary", _path_list(node, "primary", "primary_files", "primary_file"))
+        add(node_id, "doc", _path_list(node, "secondary", "secondary_files", "docs", "doc_files"))
+        add(node_id, "test", _path_list(node, "test", "tests", "test_files"))
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        config_paths = _path_list(node, "config", "config_files")
+        config_paths.extend(_path_list(metadata, "config_files"))
+        add(node_id, "config", config_paths)
+    return index
+
+
+def _choose_attachment_role(file_kind: str, roles_by_node: dict[str, set[str]]) -> str:
+    roles: set[str] = set()
+    for values in roles_by_node.values():
+        roles.update(values)
+    if "primary" in roles:
+        return "primary"
+    if file_kind == "test" or "test" in roles:
+        return "test"
+    if file_kind in {"doc", "index_doc"} or "doc" in roles:
+        return "doc"
+    if file_kind == "config" or "config" in roles:
+        return "config"
+    return sorted(roles)[0] if roles else ""
+
+
+def _enrich_file_inventory_attachments(
+    file_inventory: list[dict[str, Any]],
+    nodes: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach inventory rows to current graph nodes using explicit file roles."""
+    attachment_index = _node_attachment_index(nodes)
+    enriched: list[dict[str, Any]] = []
+    for row in file_inventory:
+        item = dict(row)
+        path = str(item.get("path") or "").replace("\\", "/").strip("/")
+        roles_by_node = attachment_index.get(path) or {}
+        if roles_by_node:
+            node_ids = sorted(roles_by_node)
+            item["attached_node_ids"] = node_ids
+            item["attachment_role"] = _choose_attachment_role(str(item.get("file_kind") or ""), roles_by_node)
+            item["attachment_source"] = "graph_node"
+            item["mapped_node_ids"] = node_ids
+            if not item.get("candidate_node_id"):
+                item["candidate_node_id"] = node_ids[0]
+            if not item.get("attached_to"):
+                item["attached_to"] = node_ids[0]
+        else:
+            item.setdefault("attached_node_ids", [])
+            item.setdefault("attachment_role", "")
+            item.setdefault("attachment_source", "")
+        enriched.append(item)
+    return enriched
+
+
 def build_feature_index(
     *,
     nodes: Iterable[dict[str, Any]],
@@ -265,6 +333,16 @@ def build_feature_index(
                 "heading_count": len(doc.get("headings") or []),
                 "headings": doc.get("headings") or [],
             })
+        test_symbol_refs = []
+        for path in tests:
+            for symbol in symbols_by_path.get(path, []):
+                test_symbol_refs.append({
+                    "id": symbol.get("id") or "",
+                    "kind": symbol.get("kind") or "",
+                    "path": path,
+                    "line_start": symbol.get("line_start", 0),
+                    "line_end": symbol.get("line_end", 0),
+                })
         config_refs = [
             {
                 "path": path,
@@ -282,12 +360,14 @@ def build_feature_index(
             "config": config,
             "file_hashes": {path: file_hashes.get(path, "") for path in primary + secondary + tests + config},
             "symbol_ids": [ref["id"] for ref in symbol_refs],
+            "test_symbol_ids": [ref["id"] for ref in test_symbol_refs],
             "doc_paths": [ref["path"] for ref in doc_refs],
         }
         features.append({
             **payload,
             "feature_hash": _hash_payload(payload),
             "symbol_refs": symbol_refs,
+            "test_symbol_refs": test_symbol_refs,
             "doc_refs": doc_refs,
             "config_refs": config_refs,
         })
@@ -350,6 +430,7 @@ def build_governance_index(
         )
     else:
         file_inventory = [dict(row) for row in file_inventory if isinstance(row, dict)]
+    file_inventory = _enrich_file_inventory_attachments(file_inventory, source_nodes)
     symbol_index = build_symbol_index(
         project_root=root,
         file_inventory=file_inventory,

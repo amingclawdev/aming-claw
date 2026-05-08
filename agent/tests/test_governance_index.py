@@ -42,7 +42,8 @@ def _write_project(root: Path) -> None:
     )
     (root / "src" / "demo_app" / "service.py").write_text(
         "def calculate_total(items):\n"
-        "    return sum(items)\n",
+        "    return sum(items)\n\n"
+        "STATUS_READY = 'ready'\n",
         encoding="utf-8",
     )
     (root / "tests" / "test_service.py").write_text(
@@ -120,10 +121,17 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     assert rows["src/demo_app/service.py"]["scan_status"] == "clustered"
     assert rows["src/demo_app/service.py"]["graph_status"] == "mapped"
     assert rows["src/demo_app/service.py"]["mapped_node_ids"] == ["L7.service"]
+    assert rows["src/demo_app/service.py"]["attached_node_ids"] == ["L7.service"]
+    assert rows["src/demo_app/service.py"]["attachment_role"] == "primary"
+    assert rows["src/demo_app/service.py"]["attachment_source"] == "graph_node"
     assert rows["README.md"]["scan_status"] == "secondary_attached"
     assert rows["README.md"]["graph_status"] == "attached"
+    assert rows["README.md"]["attached_node_ids"] == ["L7.service"]
+    assert rows["README.md"]["attachment_role"] == "doc"
     assert rows["docs/usage.md"]["scan_status"] == "secondary_attached"
     assert rows["tests/test_service.py"]["scan_status"] == "secondary_attached"
+    assert rows["tests/test_service.py"]["attached_node_ids"] == ["L7.service"]
+    assert rows["tests/test_service.py"]["attachment_role"] == "test"
     assert rows["src/demo_app/service.py"]["file_hash"].startswith("sha256:")
     assert rows["src/demo_app/service.py"]["last_scanned_commit"] == "abc1234"
 
@@ -135,6 +143,15 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     assert symbol["path"] == "src/demo_app/service.py"
     assert symbol["line_start"] == 1
     assert symbol["line_end"] >= symbol["line_start"]
+    assert any(
+        item["id"] == "src.demo_app.service::STATUS_READY" and item["kind"] == "constant"
+        for item in symbol_index["symbols"]
+    )
+    assert any(
+        item["id"] == "tests.test_service::test_calculate_total"
+        and item["kind"] == "test_function"
+        for item in symbol_index["symbols"]
+    )
 
     doc_index = index["doc_index"]
     readme = next(item for item in doc_index["documents"] if item["path"] == "README.md")
@@ -144,10 +161,15 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     assert feature["feature_hash"].startswith("sha256:")
     assert feature["symbol_refs"][0]["id"].endswith("::calculate_total")
     assert feature["symbol_refs"][0]["line_start"] == 1
+    assert feature["test_symbol_refs"][0]["id"] == "tests.test_service::test_calculate_total"
     assert feature["doc_refs"][0]["path"] in {"README.md", "docs/usage.md"}
     assert index["coverage_state"]["active_snapshot_id"] == "imported-abc1234-index"
     assert index["coverage_state"]["feature_count"] == 1
     assert index["coverage_state"]["file_states"]["src/demo_app/service.py"]["file_hash"]
+    assert (
+        index["coverage_state"]["file_states"]["tests/test_service.py"]["attached_node_ids"]
+        == ["L7.service"]
+    )
     assert "confidence" not in json.dumps(index, ensure_ascii=False)
 
     summary = persist_governance_index(
@@ -164,13 +186,16 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
 
     persisted = conn.execute(
         """
-        SELECT scan_status, file_hash FROM reconcile_file_inventory
+        SELECT scan_status, file_hash, attached_node_ids, attachment_role
+        FROM reconcile_file_inventory
         WHERE project_id=? AND run_id=? AND path=?
         """,
         (PID, "index-abc1234-test", "README.md"),
     ).fetchone()
     assert persisted["scan_status"] == "secondary_attached"
     assert persisted["file_hash"].startswith("sha256:")
+    assert json.loads(persisted["attached_node_ids"]) == ["L7.service"]
+    assert persisted["attachment_role"] == "doc"
 
 
 def test_build_governance_index_can_use_candidate_graph_before_activation(conn, tmp_path):
@@ -211,4 +236,6 @@ def test_build_governance_index_can_use_candidate_graph_before_activation(conn, 
     assert index["coverage_state"]["active_snapshot_id"] == "full-def5678-candidate"
     rows = {row["path"]: row for row in index["file_inventory"]}
     assert rows["src/demo_app/service.py"]["mapped_node_ids"] == ["L7.candidate"]
+    assert rows["tests/test_service.py"]["attached_node_ids"] == ["L7.candidate"]
+    assert rows["tests/test_service.py"]["attachment_role"] == "test"
     assert index["feature_index"]["features"][0]["node_id"] == "L7.candidate"

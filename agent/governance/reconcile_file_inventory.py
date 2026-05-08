@@ -66,6 +66,9 @@ class FileInventoryRow:
     last_scanned_commit: str = ""
     graph_status: str = ""
     mapped_node_ids: list[str] = field(default_factory=list)
+    attached_node_ids: list[str] = field(default_factory=list)
+    attachment_role: str = ""
+    attachment_source: str = ""
     cluster_id: str = ""
     candidate_node_id: str = ""
     attached_to: str = ""
@@ -223,27 +226,58 @@ def _cluster_indexes(
     project_root: str,
     nodes: List[dict[str, Any]],
     feature_clusters: List[dict[str, Any]],
-) -> tuple[dict[str, str], dict[str, str], dict[str, list[str]]]:
+) -> tuple[
+    dict[str, str],
+    dict[str, str],
+    dict[str, list[str]],
+    dict[str, dict[str, list[str]]],
+]:
     primary_to_cluster: dict[str, str] = {}
     secondary_to_cluster: dict[str, str] = {}
     path_to_nodes: dict[str, set[str]] = {}
+    path_to_roles: dict[str, dict[str, set[str]]] = {}
+
+    def add_node_path(node_id: str, raw_path: Any, role: str) -> None:
+        rel = normalize_relpath(project_root, raw_path)
+        if not rel:
+            return
+        path_to_nodes.setdefault(rel, set()).add(node_id)
+        path_to_roles.setdefault(rel, {}).setdefault(node_id, set()).add(role)
+
+    def iter_paths(value: Any) -> list[Any]:
+        if not value:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        return []
 
     for node in nodes or []:
         node_id = str(node.get("node_id") or node.get("id") or "")
         if not node_id:
             continue
-        raw_paths: list[Any] = []
         if node.get("primary_file"):
-            raw_paths.append(node.get("primary_file"))
-        for key in ("primary", "secondary", "test", "tests", "test_files"):
-            value = node.get(key) or []
-            if isinstance(value, str):
-                value = [value]
-            raw_paths.extend(value)
-        for raw_path in raw_paths:
-            rel = normalize_relpath(project_root, raw_path)
-            if rel:
-                path_to_nodes.setdefault(rel, set()).add(node_id)
+            add_node_path(node_id, node.get("primary_file"), "primary")
+        role_keys = {
+            "primary": "primary",
+            "primary_files": "primary",
+            "secondary": "doc",
+            "secondary_files": "doc",
+            "docs": "doc",
+            "doc_files": "doc",
+            "test": "test",
+            "tests": "test",
+            "test_files": "test",
+            "config": "config",
+            "config_files": "config",
+        }
+        for key, role in role_keys.items():
+            for raw_path in iter_paths(node.get(key)):
+                add_node_path(node_id, raw_path, role)
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        for raw_path in iter_paths(metadata.get("config_files")):
+            add_node_path(node_id, raw_path, "config")
 
     for cluster in feature_clusters or []:
         cluster_id = str(cluster.get("cluster_fingerprint") or cluster.get("cluster_id") or "")
@@ -259,7 +293,28 @@ def _cluster_indexes(
         primary_to_cluster,
         secondary_to_cluster,
         {path: sorted(node_ids) for path, node_ids in path_to_nodes.items()},
+        {
+            path: {node_id: sorted(roles) for node_id, roles in sorted(node_roles.items())}
+            for path, node_roles in path_to_roles.items()
+        },
     )
+
+
+def _attachment_role(kind: str, node_roles: dict[str, list[str]] | None) -> str:
+    roles: set[str] = set()
+    for values in (node_roles or {}).values():
+        roles.update(str(value or "") for value in values)
+    if "primary" in roles:
+        return "primary"
+    if kind == "test" or "test" in roles:
+        return "test"
+    if kind in {"doc", "index_doc"} or "doc" in roles:
+        return "doc"
+    if kind == "config" or "config" in roles:
+        return "config"
+    if roles:
+        return sorted(roles)[0]
+    return ""
 
 
 def build_file_inventory(
@@ -276,7 +331,7 @@ def build_file_inventory(
         profile = discover_project_profile(project_root)
     nodes = nodes or []
     feature_clusters = feature_clusters or []
-    primary_to_cluster, secondary_to_cluster, path_to_nodes = _cluster_indexes(
+    primary_to_cluster, secondary_to_cluster, path_to_nodes, path_to_roles = _cluster_indexes(
         project_root,
         nodes,
         feature_clusters,
@@ -293,12 +348,17 @@ def build_file_inventory(
         decision = "pending"
         graph_status = "pending_decision"
         mapped_node_ids = path_to_nodes.get(rel, [])
+        attached_node_ids = list(mapped_node_ids)
+        attachment_role = _attachment_role(kind, path_to_roles.get(rel))
+        attachment_source = "graph_node" if attached_node_ids else ""
 
         if rel in primary_to_cluster:
             scan_status = "clustered"
             cluster_id = primary_to_cluster[rel]
             candidate_node_id = mapped_node_ids[0] if mapped_node_ids else ""
             attached_to = candidate_node_id or cluster_id
+            attachment_role = attachment_role or "primary"
+            attachment_source = attachment_source or "feature_cluster"
             decision = "govern"
             graph_status = "mapped"
             reason = "primary source covered by symbol cluster"
@@ -307,6 +367,8 @@ def build_file_inventory(
             cluster_id = secondary_to_cluster[rel]
             candidate_node_id = mapped_node_ids[0] if mapped_node_ids else ""
             attached_to = candidate_node_id or cluster_id
+            attachment_role = attachment_role or _attachment_role(kind, None) or "secondary"
+            attachment_source = attachment_source or "feature_cluster"
             decision = "attach_to_node"
             graph_status = "attached"
             reason = "attached as test/doc consumer evidence"
@@ -374,6 +436,9 @@ def build_file_inventory(
             last_scanned_commit=last_scanned_commit,
             graph_status=graph_status,
             mapped_node_ids=mapped_node_ids,
+            attached_node_ids=attached_node_ids,
+            attachment_role=attachment_role,
+            attachment_source=attachment_source,
             scan_status=scan_status,
             cluster_id=cluster_id,
             candidate_node_id=candidate_node_id,
@@ -456,14 +521,20 @@ def upsert_file_inventory(
             mapped_node_ids_raw = mapped_node_ids
         else:
             mapped_node_ids_raw = json.dumps(mapped_node_ids or [], ensure_ascii=False)
+        attached_node_ids = row.get("attached_node_ids", [])
+        if isinstance(attached_node_ids, str):
+            attached_node_ids_raw = attached_node_ids
+        else:
+            attached_node_ids_raw = json.dumps(attached_node_ids or [], ensure_ascii=False)
         conn.execute(
             """
             INSERT INTO reconcile_file_inventory
               (project_id, run_id, path, file_kind, language, sha256,
                file_hash, size_bytes, last_scanned_commit, graph_status, mapped_node_ids,
+               attached_node_ids, attachment_role, attachment_source,
                scan_status, cluster_id, candidate_node_id, attached_to,
                reason, decision, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, run_id, path) DO UPDATE SET
               file_kind = excluded.file_kind,
               language = excluded.language,
@@ -473,6 +544,9 @@ def upsert_file_inventory(
               last_scanned_commit = excluded.last_scanned_commit,
               graph_status = excluded.graph_status,
               mapped_node_ids = excluded.mapped_node_ids,
+              attached_node_ids = excluded.attached_node_ids,
+              attachment_role = excluded.attachment_role,
+              attachment_source = excluded.attachment_source,
               scan_status = excluded.scan_status,
               cluster_id = excluded.cluster_id,
               candidate_node_id = excluded.candidate_node_id,
@@ -493,6 +567,9 @@ def upsert_file_inventory(
                 row.get("last_scanned_commit", ""),
                 row.get("graph_status", ""),
                 mapped_node_ids_raw,
+                attached_node_ids_raw,
+                row.get("attachment_role", ""),
+                row.get("attachment_source", ""),
                 row.get("scan_status", ""),
                 row.get("cluster_id", ""),
                 row.get("candidate_node_id", ""),
@@ -545,7 +622,8 @@ def query_file_inventory(
         f"""
         SELECT run_id, path, file_kind, language, sha256, scan_status,
                file_hash, size_bytes, last_scanned_commit, graph_status,
-               mapped_node_ids, cluster_id, candidate_node_id, attached_to,
+               mapped_node_ids, attached_node_ids, attachment_role,
+               attachment_source, cluster_id, candidate_node_id, attached_to,
                reason, decision, updated_at
         FROM reconcile_file_inventory
         WHERE {' AND '.join(where)}
@@ -558,7 +636,8 @@ def query_file_inventory(
         """
         SELECT run_id, path, file_kind, language, sha256, scan_status,
                file_hash, size_bytes, last_scanned_commit, graph_status,
-               mapped_node_ids, cluster_id, candidate_node_id, attached_to,
+               mapped_node_ids, attached_node_ids, attachment_role,
+               attachment_source, cluster_id, candidate_node_id, attached_to,
                reason, decision, updated_at
         FROM reconcile_file_inventory
         WHERE project_id = ? AND run_id = ?
@@ -574,13 +653,16 @@ def query_file_inventory(
 
 
 def _decode_inventory_row(row: dict[str, Any]) -> dict[str, Any]:
-    raw = row.get("mapped_node_ids")
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            row["mapped_node_ids"] = parsed if isinstance(parsed, list) else []
-        except json.JSONDecodeError:
-            row["mapped_node_ids"] = []
+    for key in ("mapped_node_ids", "attached_node_ids"):
+        raw = row.get(key)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                row[key] = parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                row[key] = []
+        elif not isinstance(raw, list):
+            row[key] = []
     return row
 
 
