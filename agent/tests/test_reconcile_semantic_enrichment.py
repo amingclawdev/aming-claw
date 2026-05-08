@@ -796,6 +796,71 @@ def test_reconcile_feedback_filters_semantic_state_by_round_and_nodes(conn, tmp_
     assert items == {"L7.new", "L7.sibling"}
 
 
+def test_reconcile_feedback_review_queue_groups_and_hides_status_noise(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    issues = [
+        {
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add relation from this feature to the task registry.",
+            "target": "agent.governance.task_registry",
+            "type": "add_relation",
+        },
+        {
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add a second edge note for the same task registry relation.",
+            "target": "agent.governance.task_registry",
+            "type": "add_relation",
+        },
+        {
+            "node_id": "L7.2",
+            "reason": "merge_suggestions",
+            "summary": "Confirm whether two features should merge before changing graph state.",
+            "type": "",
+        },
+        {
+            "node_id": "L7.3",
+            "reason": "dependency_patch_suggestions",
+            "summary": "missing_test_binding flag should stay visible until a user asks for a backlog.",
+            "type": "",
+        },
+    ]
+    classify = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        "full-semantic-test",
+        source_round="round-002",
+        created_by="observer",
+        issues=issues,
+    )
+    assert classify["count"] == 4
+
+    queue = reconcile_feedback.build_feedback_review_queue(
+        PID,
+        "full-semantic-test",
+        source_round="round-002",
+    )
+    assert queue["summary"]["raw_count"] == 4
+    assert queue["summary"]["hidden_status_observation_count"] == 1
+    assert queue["summary"]["visible_group_count"] == 2
+    lanes = {group["lane"]: group for group in queue["groups"]}
+    assert lanes["review_required"]["requires_human_signoff"] is True
+    assert lanes["review_required"]["source_node_ids"] == ["L7.2"]
+    assert lanes["graph_patch_candidate"]["item_count"] == 2
+    assert lanes["graph_patch_candidate"]["suppressed_count"] == 1
+    assert lanes["graph_patch_candidate"]["source_node_ids"] == ["L7.1"]
+
+    with_status = reconcile_feedback.build_feedback_review_queue(
+        PID,
+        "full-semantic-test",
+        source_round="round-002",
+        include_status_observations=True,
+    )
+    assert with_status["summary"]["visible_group_count"] == 3
+    assert "status_only" in {group["lane"] for group in with_status["groups"]}
+
+
 def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)

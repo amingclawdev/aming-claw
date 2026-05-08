@@ -159,6 +159,203 @@ def list_feedback_items(
     return items
 
 
+def _priority_rank(priority: Any) -> int:
+    return {"P0": 0, "P1": 1, "P2": 2, "P3": 3}.get(str(priority or "P3").upper(), 4)
+
+
+def _feedback_lane(item: dict[str, Any]) -> str:
+    status = str(item.get("status") or "").strip()
+    kind = str(item.get("final_feedback_kind") or item.get("feedback_kind") or "").strip()
+    if status in {STATUS_REVIEWED, STATUS_ACCEPTED, STATUS_REJECTED, STATUS_BACKLOG_FILED}:
+        return "resolved"
+    if status == STATUS_NEEDS_HUMAN_SIGNOFF or item.get("requires_human_signoff") or kind == KIND_NEEDS_OBSERVER_DECISION:
+        return "review_required"
+    if kind == KIND_PROJECT_IMPROVEMENT:
+        return "candidate_backlog"
+    if kind == KIND_STATUS_OBSERVATION:
+        return "status_only"
+    if kind == KIND_FALSE_POSITIVE:
+        return "resolved"
+    return "graph_patch_candidate"
+
+
+def _lane_rank(lane: str) -> int:
+    return {
+        "review_required": 0,
+        "candidate_backlog": 1,
+        "graph_patch_candidate": 2,
+        "status_only": 3,
+        "resolved": 4,
+    }.get(lane, 5)
+
+
+def _queue_group_key(item: dict[str, Any], lane: str) -> str:
+    nodes = _source_nodes(item)
+    node_key = ",".join(nodes) if nodes else ""
+    category = str(
+        item.get("reviewed_status_observation_category")
+        or item.get("status_observation_category")
+        or ""
+    )
+    parts = [
+        lane,
+        node_key,
+        str(item.get("target_type") or ""),
+        str(item.get("target_id") or ""),
+        str(item.get("issue_type") or ""),
+        category,
+    ]
+    return "|".join(parts)
+
+
+def _queue_action_hint(lane: str) -> str:
+    if lane == "review_required":
+        return "review_required_before_action"
+    if lane == "candidate_backlog":
+        return "review_then_file_backlog"
+    if lane == "graph_patch_candidate":
+        return "review_then_apply_graph_correction"
+    if lane == "status_only":
+        return "display_until_user_requests_action"
+    return "no_action"
+
+
+def build_feedback_review_queue(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    feedback_kind: str = "",
+    status: str = "",
+    node_id: str = "",
+    source_round: str = "",
+    lane: str = "",
+    include_status_observations: bool = False,
+    include_resolved: bool = False,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return a dashboard-safe, grouped projection over raw feedback items.
+
+    Raw feedback remains append-only in ``reconcile-feedback-state.json``.  This
+    view collapses repeated suggestions by node/target/type and hides
+    status-only observations by default so semantic expansion can be reviewed in
+    human-sized chunks.
+    """
+    raw_items = list_feedback_items(
+        project_id,
+        snapshot_id,
+        feedback_kind=feedback_kind,
+        status=status,
+        node_id=node_id,
+        limit=None,
+    )
+    if source_round:
+        raw_items = [
+            item for item in raw_items
+            if str(item.get("source_round") or "") == str(source_round)
+        ]
+
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    by_lane_all: dict[str, int] = {}
+    hidden_status = 0
+    hidden_resolved = 0
+    groups: dict[str, dict[str, Any]] = {}
+
+    for item in raw_items:
+        kind = str(item.get("feedback_kind") or "")
+        item_status = str(item.get("status") or "")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        by_status[item_status] = by_status.get(item_status, 0) + 1
+        item_lane = _feedback_lane(item)
+        by_lane_all[item_lane] = by_lane_all.get(item_lane, 0) + 1
+        if lane and item_lane != lane:
+            continue
+        if item_lane == "status_only" and not include_status_observations:
+            hidden_status += 1
+            continue
+        if item_lane == "resolved" and not include_resolved:
+            hidden_resolved += 1
+            continue
+
+        key = _queue_group_key(item, item_lane)
+        group = groups.get(key)
+        nodes = _source_nodes(item)
+        priority = str(item.get("priority") or "P3").upper()
+        if group is None:
+            group = {
+                "queue_id": f"fq-{_short_hash({'snapshot_id': snapshot_id, 'key': key})}",
+                "lane": item_lane,
+                "action_hint": _queue_action_hint(item_lane),
+                "priority": priority,
+                "source_node_ids": nodes,
+                "target_type": str(item.get("target_type") or ""),
+                "target_id": str(item.get("target_id") or ""),
+                "issue_type": str(item.get("issue_type") or ""),
+                "status_observation_category": str(
+                    item.get("reviewed_status_observation_category")
+                    or item.get("status_observation_category")
+                    or ""
+                ),
+                "representative_feedback_id": str(item.get("feedback_id") or ""),
+                "representative_issue": str(item.get("issue") or ""),
+                "feedback_ids": [],
+                "item_count": 0,
+                "suppressed_count": 0,
+                "requires_human_signoff": bool(item.get("requires_human_signoff")),
+                "confidence": float(item.get("confidence") or 0.0),
+                "created_at": str(item.get("created_at") or ""),
+                "updated_at": str(item.get("updated_at") or ""),
+            }
+            groups[key] = group
+        else:
+            group["source_node_ids"] = sorted(set(_string_list(group.get("source_node_ids")) + nodes))
+            if _priority_rank(priority) < _priority_rank(group.get("priority")):
+                group["priority"] = priority
+                group["representative_feedback_id"] = str(item.get("feedback_id") or "")
+                group["representative_issue"] = str(item.get("issue") or "")
+                group["confidence"] = float(item.get("confidence") or 0.0)
+        group["feedback_ids"].append(str(item.get("feedback_id") or ""))
+        group["item_count"] = int(group.get("item_count") or 0) + 1
+        group["suppressed_count"] = max(0, int(group["item_count"]) - 1)
+        group["requires_human_signoff"] = bool(group.get("requires_human_signoff") or item.get("requires_human_signoff"))
+        group["updated_at"] = max(str(group.get("updated_at") or ""), str(item.get("updated_at") or ""))
+
+    grouped = list(groups.values())
+    grouped.sort(
+        key=lambda group: (
+            _lane_rank(str(group.get("lane") or "")),
+            _priority_rank(group.get("priority")),
+            -int(group.get("item_count") or 0),
+            str(group.get("queue_id") or ""),
+        )
+    )
+    if limit is not None and limit >= 0:
+        grouped = grouped[: int(limit)]
+
+    by_lane_visible: dict[str, int] = {}
+    for group in grouped:
+        group_lane = str(group.get("lane") or "")
+        by_lane_visible[group_lane] = by_lane_visible.get(group_lane, 0) + 1
+
+    return {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "summary": {
+            "raw_count": len(raw_items),
+            "visible_group_count": len(grouped),
+            "visible_item_count": sum(int(group.get("item_count") or 0) for group in grouped),
+            "hidden_status_observation_count": hidden_status,
+            "hidden_resolved_count": hidden_resolved,
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_status": dict(sorted(by_status.items())),
+            "by_lane_all_items": dict(sorted(by_lane_all.items())),
+            "by_lane_visible_groups": dict(sorted(by_lane_visible.items())),
+        },
+        "groups": grouped,
+        "count": len(grouped),
+    }
+
+
 def _short_hash(payload: Any, length: int = 10) -> str:
     return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()[:length]
 
@@ -193,7 +390,10 @@ def _issue_summary(issue: dict[str, Any]) -> str:
 
 
 def _source_nodes(issue: dict[str, Any]) -> list[str]:
-    nodes = _string_list(issue.get("node_ids") or issue.get("nodes"))
+    nodes = _string_list(issue.get("source_node_ids") or issue.get("node_ids") or issue.get("nodes"))
+    source_node_id = str(issue.get("source_node_id") or "").strip()
+    if source_node_id and source_node_id not in nodes:
+        nodes.insert(0, source_node_id)
     node_id = str(issue.get("node_id") or "").strip()
     if node_id and node_id not in nodes:
         nodes.insert(0, node_id)
@@ -878,6 +1078,7 @@ __all__ = [
     "STATUS_CATEGORY_NEEDS_HUMAN",
     "classify_open_issue",
     "classify_semantic_open_issues",
+    "build_feedback_review_queue",
     "infer_status_observation_category",
     "list_feedback_items",
     "load_feedback_state",

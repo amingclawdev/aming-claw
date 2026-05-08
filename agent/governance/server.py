@@ -1857,6 +1857,15 @@ def _query_int(query: dict, key: str, default: int) -> int:
         return default
 
 
+def _query_bool(query: dict, key: str, default: bool = False) -> bool:
+    value = query.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def _query_statuses(query: dict, key: str = "status") -> list[str]:
     raw = query.get(key, "")
     values = raw if isinstance(raw, list) else str(raw or "").split(",")
@@ -2707,6 +2716,35 @@ def handle_graph_governance_snapshot_feedback_list(ctx: RequestContext):
             "summary": reconcile_feedback.feedback_summary(project_id, snapshot_id),
             "items": items,
             "count": len(items),
+        }
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/queue")
+def handle_graph_governance_snapshot_feedback_queue(ctx: RequestContext):
+    """Return grouped, dashboard-safe reconcile feedback review lanes."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.queue")
+        return {
+            "ok": True,
+            **reconcile_feedback.build_feedback_review_queue(
+                project_id,
+                snapshot_id,
+                feedback_kind=str(ctx.query.get("feedback_kind") or ctx.query.get("kind") or ""),
+                status=str(ctx.query.get("status") or ""),
+                node_id=str(ctx.query.get("node_id") or ""),
+                source_round=str(ctx.query.get("source_round") or ctx.query.get("feedback_round") or ""),
+                lane=str(ctx.query.get("lane") or ""),
+                include_status_observations=_query_bool(ctx.query, "include_status_observations", False),
+                include_resolved=_query_bool(ctx.query, "include_resolved", False),
+                limit=_query_int(ctx.query, "limit", 100),
+            ),
         }
     finally:
         conn.close()
