@@ -497,6 +497,21 @@ def test_graph_governance_status_observation_detector_classifies_graph_candidate
     assert by_type["doc_drift_candidate"]["source_node_ids"] == ["L7.1"]
     assert by_type["stale_test_expectation_candidate"]["source_node_ids"] == ["L7.1"]
     assert by_type["failed_test_candidate"]["target_id"] == "tests/test_service.py"
+    assert by_type["stale_test_expectation_candidate"]["status_observation_category"] == "stale_test_expectation"
+
+    reviewed = server.handle_graph_governance_snapshot_feedback_review(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "feedback_id": by_type["stale_test_expectation_candidate"]["feedback_id"],
+                "decision": "status_observation",
+                "status_observation_category": "stale_test_expectation",
+                "rationale": "Keep visible for user approval before filing backlog.",
+            },
+        )
+    )
+    assert reviewed["items"][0]["reviewed_status_observation_category"] == "stale_test_expectation"
 
 
 def test_graph_governance_drift_api_records_and_lists_rows(conn):

@@ -608,6 +608,7 @@ def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     assert items["L7.7"]["requires_human_signoff"] is True
     assert items["L7.51"]["target_type"] == "edge"
     assert items["L7.5"]["feedback_kind"] == "status_observation"
+    assert items["L7.5"]["status_observation_category"] == "coverage_gap"
 
     def fake_reviewer(stage: str, payload: dict) -> dict:
         assert stage == "reconcile_feedback_review"
@@ -629,6 +630,19 @@ def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     reviewed = review["items"][0]
     assert reviewed["status"] == "accepted"
     assert reviewed["final_feedback_kind"] == "project_improvement"
+
+    status_review = reconcile_feedback.review_feedback_item(
+        PID,
+        "full-semantic-test",
+        items["L7.5"]["feedback_id"],
+        actor="observer",
+        decision="status_observation",
+        status_observation_category="stale_test_expectation",
+        rationale="The test binding may be stale, but this stays visible until user action.",
+    )
+    status_item = status_review["items"][0]
+    assert status_item["status"] == "reviewed"
+    assert status_item["reviewed_status_observation_category"] == "stale_test_expectation"
 
     backlog = reconcile_feedback.build_project_improvement_backlog(
         PID,
@@ -668,6 +682,10 @@ def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     )
     assert status_backlog["bug_id"] == "OPT-BACKLOG-FEEDBACK-MISSING-TEST"
     assert status_backlog["payload"]["chain_trigger_json"]["feedback_kind"] == "status_observation"
+    assert (
+        status_backlog["payload"]["chain_trigger_json"]["status_observation_category"]
+        == "stale_test_expectation"
+    )
     assert status_backlog["payload"]["title"].startswith("User-requested backlog")
 
 

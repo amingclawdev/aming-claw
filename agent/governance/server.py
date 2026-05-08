@@ -2800,7 +2800,6 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.review")
-        root = _graph_governance_project_root(project_id, body)
         use_reviewer_ai = bool(
             body.get("reviewer_use_ai")
             or body.get("use_reviewer_ai")
@@ -2809,6 +2808,7 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
         )
         ai_call = None
         if use_reviewer_ai and not body.get("decision") and not body.get("reviewer_decision"):
+            root = _graph_governance_project_root(project_id, body)
             ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
         try:
             result = reconcile_feedback.review_feedback_item(
@@ -2818,6 +2818,12 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
                 decision=str(body.get("decision") or body.get("reviewer_decision") or ""),
                 rationale=str(body.get("rationale") or body.get("reviewer_rationale") or ""),
                 confidence=float(body["confidence"]) if body.get("confidence") is not None else None,
+                status_observation_category=str(
+                    body.get("status_observation_category")
+                    or body.get("observation_category")
+                    or body.get("category")
+                    or ""
+                ),
                 actor=str(body.get("actor") or body.get("reviewed_by") or "observer"),
                 accept=bool(body.get("accept") or body.get("accepted")),
                 ai_call=ai_call,
@@ -2834,6 +2840,9 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
                     "snapshot_id": snapshot_id,
                     "feedback_id": feedback_id,
                     "decision": (result.get("items") or [{}])[0].get("reviewer_decision", ""),
+                    "status_observation_category": (
+                        (result.get("items") or [{}])[0].get("reviewed_status_observation_category", "")
+                    ),
                 }, ensure_ascii=False, sort_keys=True),
             )
             conn.commit()

@@ -27,6 +27,24 @@ KIND_STATUS_OBSERVATION = "status_observation"
 KIND_NEEDS_OBSERVER_DECISION = "needs_observer_decision"
 KIND_FALSE_POSITIVE = "false_positive"
 
+STATUS_CATEGORY_STALE_TEST = "stale_test_expectation"
+STATUS_CATEGORY_DOC_DRIFT = "doc_drift"
+STATUS_CATEGORY_COVERAGE_GAP = "coverage_gap"
+STATUS_CATEGORY_PROJECT_REGRESSION = "project_regression"
+STATUS_CATEGORY_ORPHAN_REVIEW = "orphan_review"
+STATUS_CATEGORY_FALSE_POSITIVE = "false_positive"
+STATUS_CATEGORY_NEEDS_HUMAN = "needs_human_signoff"
+
+STATUS_OBSERVATION_CATEGORIES = {
+    STATUS_CATEGORY_STALE_TEST,
+    STATUS_CATEGORY_DOC_DRIFT,
+    STATUS_CATEGORY_COVERAGE_GAP,
+    STATUS_CATEGORY_PROJECT_REGRESSION,
+    STATUS_CATEGORY_ORPHAN_REVIEW,
+    STATUS_CATEGORY_FALSE_POSITIVE,
+    STATUS_CATEGORY_NEEDS_HUMAN,
+}
+
 STATUS_CLASSIFIED = "classified"
 STATUS_REVIEWED = "reviewed"
 STATUS_ACCEPTED = "accepted"
@@ -228,6 +246,33 @@ def _priority(feedback_kind: str, issue_type: str, summary: str) -> str:
     return "P2" if feedback_kind == KIND_PROJECT_IMPROVEMENT else "P3"
 
 
+def infer_status_observation_category(item: dict[str, Any]) -> str:
+    """Suggest a review category for a status-only graph/file observation."""
+    issue_type = str(item.get("issue_type") or item.get("type") or "").lower()
+    text = " ".join([
+        issue_type,
+        str(item.get("issue") or item.get("summary") or ""),
+        str((item.get("evidence") or {}).get("reason") or ""),
+    ]).lower()
+    if "failed_test" in issue_type or "regression" in text or "test failure" in text:
+        return STATUS_CATEGORY_PROJECT_REGRESSION
+    if "stale_test" in issue_type or "test_expectation" in issue_type:
+        return STATUS_CATEGORY_STALE_TEST
+    if "doc_drift" in issue_type or "stale_doc" in issue_type:
+        return STATUS_CATEGORY_DOC_DRIFT
+    if (
+        "missing_doc" in text
+        or "missing_test" in text
+        or "coverage" in text
+    ):
+        return STATUS_CATEGORY_COVERAGE_GAP
+    if "orphan" in issue_type or "pending_file_decision" in issue_type or "unmapped" in issue_type:
+        return STATUS_CATEGORY_ORPHAN_REVIEW
+    if "false" in text or "ignore" in text:
+        return STATUS_CATEGORY_FALSE_POSITIVE
+    return STATUS_CATEGORY_NEEDS_HUMAN
+
+
 def classify_open_issue(issue: dict[str, Any]) -> str:
     """Route one semantic open issue into a feedback lane.
 
@@ -349,6 +394,16 @@ def normalize_open_issue(
         "paths": _string_list(issue.get("paths") or issue.get("path")),
         "issue_type": issue_type,
         "issue": summary,
+        "status_observation_category": (
+            infer_status_observation_category({
+                "issue_type": issue_type,
+                "issue": summary,
+                "evidence": {"reason": reason},
+            })
+            if kind == KIND_STATUS_OBSERVATION
+            else ""
+        ),
+        "reviewed_status_observation_category": "",
         "evidence": {
             "reason": reason,
             "raw_issue": issue,
@@ -470,13 +525,23 @@ def feedback_summary(project_id: str, snapshot_id: str) -> dict[str, Any]:
     items = list_feedback_items(project_id, snapshot_id)
     by_kind: dict[str, int] = {}
     by_status: dict[str, int] = {}
+    by_status_category: dict[str, int] = {}
     for item in items:
         by_kind[str(item.get("feedback_kind") or "")] = by_kind.get(str(item.get("feedback_kind") or ""), 0) + 1
         by_status[str(item.get("status") or "")] = by_status.get(str(item.get("status") or ""), 0) + 1
+        if item.get("feedback_kind") == KIND_STATUS_OBSERVATION:
+            category = str(
+                item.get("reviewed_status_observation_category")
+                or item.get("status_observation_category")
+                or ""
+            )
+            if category:
+                by_status_category[category] = by_status_category.get(category, 0) + 1
     return {
         "count": len(items),
         "by_kind": by_kind,
         "by_status": by_status,
+        "by_status_observation_category": by_status_category,
     }
 
 
@@ -489,8 +554,17 @@ def _parse_ai_review(ai_result: dict[str, Any]) -> dict[str, Any]:
     ).strip()
     if decision not in REVIEW_DECISIONS:
         decision = "needs_human_signoff"
+    category = str(
+        ai_result.get("status_observation_category")
+        or ai_result.get("observation_category")
+        or ai_result.get("category")
+        or ""
+    ).strip()
+    if category and category not in STATUS_OBSERVATION_CATEGORIES:
+        category = STATUS_CATEGORY_NEEDS_HUMAN
     return {
         "decision": decision,
+        "status_observation_category": category,
         "rationale": str(ai_result.get("rationale") or ai_result.get("reviewer_rationale") or ""),
         "confidence": float(ai_result.get("confidence") or ai_result.get("reviewer_confidence") or 0.0),
         "model": _as_text(ai_result.get("_ai_route") or ai_result.get("model") or ""),
@@ -506,6 +580,7 @@ def review_feedback_item(
     decision: str = "",
     rationale: str = "",
     confidence: float | None = None,
+    status_observation_category: str = "",
     actor: str = "observer",
     accept: bool = False,
     ai_call: ReviewerAiCall | None = None,
@@ -522,6 +597,7 @@ def review_feedback_item(
                 "reviewer": "reconcile_feedback_reviewer",
                 "mutate_project_files": False,
                 "allowed_decisions": sorted(REVIEW_DECISIONS),
+                "status_observation_categories": sorted(STATUS_OBSERVATION_CATEGORIES),
                 "decision_meaning": {
                     KIND_GRAPH_CORRECTION: "Only graph/semantic state should change.",
                     KIND_PROJECT_IMPROVEMENT: "Project code/docs/tests likely need a backlog item.",
@@ -529,11 +605,28 @@ def review_feedback_item(
                     KIND_FALSE_POSITIVE: "Close the feedback without action.",
                     "needs_human_signoff": "Evidence is insufficient; user or observer must decide.",
                 },
+                "status_observation_category_meaning": {
+                    STATUS_CATEGORY_STALE_TEST: "A test likely asserts an old contract and may need update after user approval.",
+                    STATUS_CATEGORY_DOC_DRIFT: "A linked document may be stale relative to changed graph/code state.",
+                    STATUS_CATEGORY_COVERAGE_GAP: "A node/file is missing doc/test/config coverage or graph attachment.",
+                    STATUS_CATEGORY_PROJECT_REGRESSION: "The observation may indicate a product/code behavior regression.",
+                    STATUS_CATEGORY_ORPHAN_REVIEW: "An orphan or pending file needs keep/attach/delete review.",
+                    STATUS_CATEGORY_FALSE_POSITIVE: "The observation should be closed without action.",
+                    STATUS_CATEGORY_NEEDS_HUMAN: "Evidence is insufficient for automatic routing.",
+                },
+                "output_contract": (
+                    "Return JSON with decision, optional status_observation_category, "
+                    "rationale, confidence, and model. Do not mutate project files."
+                ),
             },
             "feedback": item,
         }
         ai_review = _parse_ai_review(ai_call("reconcile_feedback_review", payload) or {})
         decision = ai_review["decision"]
+        status_observation_category = (
+            status_observation_category
+            or ai_review.get("status_observation_category", "")
+        )
         rationale = rationale or ai_review["rationale"]
         confidence = confidence if confidence is not None else ai_review["confidence"]
 
@@ -544,9 +637,16 @@ def review_feedback_item(
             decision = item.get("feedback_kind") or "needs_human_signoff"
     if decision not in REVIEW_DECISIONS:
         raise ValueError(f"invalid reviewer decision: {decision}")
+    if status_observation_category and status_observation_category not in STATUS_OBSERVATION_CATEGORIES:
+        raise ValueError(f"invalid status_observation_category: {status_observation_category}")
+    if decision == KIND_FALSE_POSITIVE:
+        status_observation_category = STATUS_CATEGORY_FALSE_POSITIVE
+    if item.get("feedback_kind") == KIND_STATUS_OBSERVATION and not status_observation_category:
+        status_observation_category = infer_status_observation_category(item)
     now = _utc_now()
     item.update({
         "reviewer_decision": decision,
+        "reviewed_status_observation_category": status_observation_category,
         "reviewer_rationale": rationale,
         "reviewer_confidence": float(confidence if confidence is not None else item.get("confidence") or 0.0),
         "reviewer_model": ai_review.get("model") or item.get("reviewer_model") or "",
@@ -623,6 +723,7 @@ def build_project_improvement_backlog(
             f"nodes: {', '.join(nodes)}\n"
             f"issue: {item.get('issue') or ''}\n\n"
             f"reviewer_decision: {item.get('reviewer_decision') or item.get('feedback_kind')}\n"
+            f"status_observation_category: {item.get('reviewed_status_observation_category') or item.get('status_observation_category') or ''}\n"
             f"reviewer_rationale: {item.get('reviewer_rationale') or ''}\n"
         ),
         "provenance_paths": [
@@ -635,6 +736,11 @@ def build_project_improvement_backlog(
             "snapshot_id": snapshot_id,
             "feedback_id": feedback_id,
             "feedback_kind": final_kind,
+            "status_observation_category": (
+                item.get("reviewed_status_observation_category")
+                or item.get("status_observation_category")
+                or ""
+            ),
             "source_node_ids": nodes,
         },
         "force_admit": True,
@@ -674,8 +780,17 @@ __all__ = [
     "KIND_STATUS_OBSERVATION",
     "KIND_NEEDS_OBSERVER_DECISION",
     "KIND_FALSE_POSITIVE",
+    "STATUS_OBSERVATION_CATEGORIES",
+    "STATUS_CATEGORY_STALE_TEST",
+    "STATUS_CATEGORY_DOC_DRIFT",
+    "STATUS_CATEGORY_COVERAGE_GAP",
+    "STATUS_CATEGORY_PROJECT_REGRESSION",
+    "STATUS_CATEGORY_ORPHAN_REVIEW",
+    "STATUS_CATEGORY_FALSE_POSITIVE",
+    "STATUS_CATEGORY_NEEDS_HUMAN",
     "classify_open_issue",
     "classify_semantic_open_issues",
+    "infer_status_observation_category",
     "list_feedback_items",
     "load_feedback_state",
     "review_feedback_item",
