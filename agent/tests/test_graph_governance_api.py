@@ -489,6 +489,7 @@ def test_graph_governance_status_observation_detector_classifies_graph_candidate
     assert result["ok"] is True
     assert result["detector"]["classified_count"] >= 5
     items = reconcile_feedback.list_feedback_items(PID, snapshot["snapshot_id"])
+    assert {item["feedback_kind"] for item in items} == {"status_observation"}
     by_type = {item["issue_type"]: item for item in items}
     assert by_type["missing_doc_binding"]["feedback_kind"] == "status_observation"
     assert by_type["missing_test_binding"]["feedback_kind"] == "status_observation"

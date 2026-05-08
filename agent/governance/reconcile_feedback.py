@@ -432,6 +432,7 @@ def classify_semantic_open_issues(
     source_round: str | int = "",
     created_by: str = "system",
     issues: list[dict[str, Any]] | None = None,
+    feedback_kind: str = "",
     limit: int | None = None,
 ) -> dict[str, Any]:
     raw_issues = issues
@@ -450,6 +451,7 @@ def classify_semantic_open_issues(
             snapshot_id=snapshot_id,
             source_round=source_round,
             created_by=created_by,
+            feedback_kind=feedback_kind,
         )
         for issue in selected
     ]

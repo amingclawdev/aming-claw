@@ -442,6 +442,7 @@ def classify_status_observations(
         source_round=STATUS_OBSERVATION_SOURCE,
         created_by=actor,
         issues=issues,
+        feedback_kind=reconcile_feedback.KIND_STATUS_OBSERVATION,
     )
     result["detector"] = {
         **{key: value for key, value in built.items() if key != "issues"},
