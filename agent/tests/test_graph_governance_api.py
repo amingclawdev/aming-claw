@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from agent.governance import graph_snapshot_store as store
+from agent.governance import reconcile_feedback
 from agent.governance import server
 from agent.governance.db import _ensure_schema
+from agent.governance.errors import ValidationError
 
 
 PID = "graph-api-test"
@@ -321,6 +323,63 @@ def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
     assert enriched["semantic_index"]["features"][0]["feedback_count"] == 1
     assert enriched["semantic_index"]["features"][0]["enrichment_status"] == "heuristic"
     assert Path(enriched["semantic_index_path"]).exists()
+
+
+def test_graph_governance_status_observation_requires_explicit_backlog_action(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-status-observation-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[
+            {
+                "node_id": "L7.1",
+                "reason": "coverage_review",
+                "summary": "missing_test_binding flag: this node has no direct test binding.",
+                "type": "",
+            }
+        ],
+    )
+    item = classified["items"][0]
+    assert item["feedback_kind"] == "status_observation"
+
+    with pytest.raises(ValidationError):
+        server.handle_graph_governance_snapshot_feedback_file_backlog(
+            _ctx(
+                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+                method="POST",
+                body={"feedback_id": item["feedback_id"], "bug_id": "OPT-STATUS-NO-AUTO"},
+            )
+        )
+
+    filed = server.handle_graph_governance_snapshot_feedback_file_backlog(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "feedback_id": item["feedback_id"],
+                "bug_id": "OPT-STATUS-USER-FILED",
+                "allow_status_observation": True,
+            },
+        )
+    )
+
+    assert filed["bug_id"] == "OPT-STATUS-USER-FILED"
+    assert filed["feedback"]["status"] == "backlog_filed"
+    row = conn.execute(
+        "SELECT chain_trigger_json FROM backlog_bugs WHERE bug_id=?",
+        ("OPT-STATUS-USER-FILED",),
+    ).fetchone()
+    trigger = json.loads(row["chain_trigger_json"])
+    assert trigger["feedback_kind"] == "status_observation"
 
 
 def test_graph_governance_drift_api_records_and_lists_rows(conn):

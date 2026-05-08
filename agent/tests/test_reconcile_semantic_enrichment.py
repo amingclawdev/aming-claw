@@ -553,10 +553,11 @@ def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     summary = result["summary"]
     assert summary["by_kind"]["needs_observer_decision"] == 1
     assert summary["by_kind"]["graph_correction"] == 1
-    assert summary["by_kind"]["project_improvement"] == 1
+    assert summary["by_kind"]["status_observation"] == 1
     items = {item["source_node_ids"][0]: item for item in reconcile_feedback.list_feedback_items(PID, "full-semantic-test")}
     assert items["L7.7"]["requires_human_signoff"] is True
     assert items["L7.51"]["target_type"] == "edge"
+    assert items["L7.5"]["feedback_kind"] == "status_observation"
 
     def fake_reviewer(stage: str, payload: dict) -> dict:
         assert stage == "reconcile_feedback_review"
@@ -598,6 +599,26 @@ def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     )
     assert filed["items"][0]["status"] == "backlog_filed"
     assert filed["items"][0]["backlog_bug_id"] == "OPT-BACKLOG-FEEDBACK-CONFIG-BOUNDARY"
+
+    with pytest.raises(ValueError):
+        reconcile_feedback.build_project_improvement_backlog(
+            PID,
+            "full-semantic-test",
+            items["L7.5"]["feedback_id"],
+            bug_id="OPT-BACKLOG-FEEDBACK-MISSING-TEST",
+            actor="observer",
+        )
+    status_backlog = reconcile_feedback.build_project_improvement_backlog(
+        PID,
+        "full-semantic-test",
+        items["L7.5"]["feedback_id"],
+        bug_id="OPT-BACKLOG-FEEDBACK-MISSING-TEST",
+        actor="observer",
+        allow_status_observation=True,
+    )
+    assert status_backlog["bug_id"] == "OPT-BACKLOG-FEEDBACK-MISSING-TEST"
+    assert status_backlog["payload"]["chain_trigger_json"]["feedback_kind"] == "status_observation"
+    assert status_backlog["payload"]["title"].startswith("User-requested backlog")
 
 
 def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):

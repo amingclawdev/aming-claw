@@ -23,6 +23,7 @@ FEEDBACK_STATE_NAME = "reconcile-feedback-state.json"
 
 KIND_GRAPH_CORRECTION = "graph_correction"
 KIND_PROJECT_IMPROVEMENT = "project_improvement"
+KIND_STATUS_OBSERVATION = "status_observation"
 KIND_NEEDS_OBSERVER_DECISION = "needs_observer_decision"
 KIND_FALSE_POSITIVE = "false_positive"
 
@@ -36,6 +37,7 @@ STATUS_NEEDS_HUMAN_SIGNOFF = "needs_human_signoff"
 REVIEW_DECISIONS = {
     KIND_GRAPH_CORRECTION,
     KIND_PROJECT_IMPROVEMENT,
+    KIND_STATUS_OBSERVATION,
     KIND_FALSE_POSITIVE,
     "needs_human_signoff",
 }
@@ -221,6 +223,8 @@ def _priority(feedback_kind: str, issue_type: str, summary: str) -> str:
         return "P1"
     if "missing_test_binding" in text or "missing_doc_binding" in text:
         return "P2"
+    if feedback_kind == KIND_STATUS_OBSERVATION:
+        return "P3"
     return "P2" if feedback_kind == KIND_PROJECT_IMPROVEMENT else "P3"
 
 
@@ -277,11 +281,26 @@ def classify_open_issue(issue: dict[str, Any]) -> str:
     if (
         "missing_test_binding" in text
         or "missing_doc_binding" in text
+        or "missing_config_binding" in text
+        or "coverage" in text
+        or "drift" in text
+        or "orphan" in text
+        or "pending_decision" in text
+        or "low confidence" in text
+        or "low-confidence" in text
+        or "weak test" in text
+        or "weak doc" in text
         or "missing doc" in text
         or "missing test" in text
-        or "add explicit" in text
+    ):
+        return KIND_STATUS_OBSERVATION
+
+    if (
+        "add explicit" in text
         or "document " in text
         or "unit test" in text
+        or "implement " in text
+        or "refactor " in text
     ):
         return KIND_PROJECT_IMPROVEMENT
 
@@ -504,6 +523,7 @@ def review_feedback_item(
                 "decision_meaning": {
                     KIND_GRAPH_CORRECTION: "Only graph/semantic state should change.",
                     KIND_PROJECT_IMPROVEMENT: "Project code/docs/tests likely need a backlog item.",
+                    KIND_STATUS_OBSERVATION: "Keep this as visible graph/file status until a user chooses an action.",
                     KIND_FALSE_POSITIVE: "Close the feedback without action.",
                     "needs_human_signoff": "Evidence is insufficient; user or observer must decide.",
                 },
@@ -563,6 +583,7 @@ def build_project_improvement_backlog(
     *,
     bug_id: str = "",
     actor: str = "observer",
+    allow_status_observation: bool = False,
 ) -> dict[str, Any]:
     state = load_feedback_state(project_id, snapshot_id)
     item = dict((state.get("items") or {}).get(feedback_id) or {})
@@ -570,7 +591,8 @@ def build_project_improvement_backlog(
         raise KeyError(f"feedback item not found: {feedback_id}")
     final_kind = item.get("final_feedback_kind") or item.get("feedback_kind")
     if final_kind != KIND_PROJECT_IMPROVEMENT:
-        raise ValueError(f"feedback item is not project_improvement: {feedback_id}")
+        if not (allow_status_observation and final_kind == KIND_STATUS_OBSERVATION):
+            raise ValueError(f"feedback item is not project_improvement: {feedback_id}")
     nodes = item.get("source_node_ids") or []
     suffix = _short_hash({"snapshot_id": snapshot_id, "feedback_id": feedback_id}, 8)
     bug = bug_id or f"OPT-BACKLOG-FEEDBACK-{snapshot_id[:12]}-{suffix}"
@@ -578,7 +600,11 @@ def build_project_improvement_backlog(
     title_node = f" {nodes[0]}" if nodes else ""
     payload = {
         "actor": actor,
-        "title": f"Project improvement from reconcile feedback{title_node}",
+        "title": (
+            f"Project improvement from reconcile feedback{title_node}"
+            if final_kind == KIND_PROJECT_IMPROVEMENT
+            else f"User-requested backlog from reconcile status{title_node}"
+        ),
         "status": "OPEN",
         "priority": item.get("priority") or "P2",
         "target_files": paths,
@@ -606,6 +632,7 @@ def build_project_improvement_backlog(
             "source": "reconcile_feedback",
             "snapshot_id": snapshot_id,
             "feedback_id": feedback_id,
+            "feedback_kind": final_kind,
             "source_node_ids": nodes,
         },
         "force_admit": True,
@@ -642,6 +669,7 @@ __all__ = [
     "FEEDBACK_STATE_NAME",
     "KIND_GRAPH_CORRECTION",
     "KIND_PROJECT_IMPROVEMENT",
+    "KIND_STATUS_OBSERVATION",
     "KIND_NEEDS_OBSERVER_DECISION",
     "KIND_FALSE_POSITIVE",
     "classify_open_issue",

@@ -2817,6 +2817,7 @@ def handle_graph_governance_snapshot_feedback_file_backlog(ctx: RequestContext):
                 feedback_id,
                 bug_id=str(body.get("bug_id") or ""),
                 actor=str(body.get("actor") or "observer"),
+                allow_status_observation=bool(body.get("allow_status_observation")),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
