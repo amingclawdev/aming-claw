@@ -1,0 +1,249 @@
+"""Service-side AI caller for reconcile semantic enrichment."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from .reconcile_semantic_config import SemanticAnalyzerConfig
+
+
+def _normalize_provider(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if value in {"codex", "openai", "gpt"}:
+        return "openai"
+    if value in {"claude", "anthropic", "opus"}:
+        return "anthropic"
+    return value
+
+
+def _infer_provider(model: str, provider: str = "") -> str:
+    p = _normalize_provider(provider)
+    if p in {"openai", "anthropic"}:
+        return p
+    m = (model or "").strip().lower()
+    if m.startswith(("gpt-", "o1", "o3", "o4", "gpt-5")):
+        return "openai"
+    if m.startswith("claude"):
+        return "anthropic"
+    return ""
+
+
+def _extract_json_dict(text: str) -> dict[str, Any] | None:
+    if not text or not text.strip():
+        return None
+    raw = text.strip()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", raw, re.DOTALL)
+    for block in reversed(blocks):
+        try:
+            parsed = json.loads(block.strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    for end in range(len(raw) - 1, -1, -1):
+        if raw[end] != "}":
+            continue
+        depth = 0
+        for start in range(end, -1, -1):
+            if raw[start] == "}":
+                depth += 1
+            elif raw[start] == "{":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(raw[start:end + 1])
+                    except json.JSONDecodeError:
+                        break
+                    return parsed if isinstance(parsed, dict) else None
+        break
+    return None
+
+
+def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
+    """Resolve provider/model for semantic AI from config/env/pipeline."""
+    env_provider = os.getenv("RECONCILE_SEMANTIC_AI_PROVIDER", "").strip()
+    env_model = os.getenv("RECONCILE_SEMANTIC_AI_MODEL", "").strip()
+    if env_provider or env_model:
+        model = env_model or config.model
+        provider = _infer_provider(model, env_provider or config.provider)
+        return {"provider": provider, "model": model, "source": "env"}
+
+    provider = _normalize_provider(config.provider)
+    model = (config.model or "").strip()
+    if provider in {"", "injected", "none", "off"}:
+        return {"provider": "", "model": model, "source": "disabled"}
+    if provider in {"pipeline", "role"}:
+        agent_dir = Path(__file__).resolve().parents[1]
+        if str(agent_dir) not in sys.path:
+            sys.path.insert(0, str(agent_dir))
+        try:
+            from pipeline_config import get_effective_pipeline_config, resolve_role_config  # type: ignore
+        except Exception:
+            get_effective_pipeline_config = None  # type: ignore
+            resolve_role_config = None  # type: ignore
+        if get_effective_pipeline_config and resolve_role_config:
+            try:
+                pipeline = get_effective_pipeline_config()
+                resolved = resolve_role_config(config.role or "pm", pipeline)
+                model = model or (resolved.get("model") or "")
+                provider = _infer_provider(model, resolved.get("provider") or "")
+            except Exception:
+                provider = ""
+        if not model:
+            try:
+                from config import get_claude_model, get_model_provider
+                model = (get_claude_model() or "").strip()
+                provider = _infer_provider(model, get_model_provider())
+            except Exception:
+                pass
+        return {"provider": provider, "model": model, "source": "pipeline"}
+    return {"provider": _infer_provider(model, provider), "model": model, "source": "config"}
+
+
+def build_semantic_ai_call(
+    *,
+    semantic_config: SemanticAnalyzerConfig,
+    project_id: str,
+    snapshot_id: str,
+    project_root: str | Path | None = None,
+) -> Any:
+    """Return an ai_call(stage, payload) callable, or None when not configured."""
+    route = resolve_semantic_ai_route(semantic_config)
+    provider = route.get("provider", "")
+    model = route.get("model", "")
+    if provider not in {"openai", "anthropic"}:
+        return None
+
+    root = Path(project_root or os.getenv("CODEX_WORKSPACE", os.getcwd())).resolve()
+    log_dir = root / "shared-volume" / "codex-tasks" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    def git_changed() -> set[str]:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return set()
+        changed = set()
+        for line in (proc.stdout or "").splitlines():
+            if len(line) > 3:
+                changed.add(line[3:].strip().replace("\\", "/"))
+        return changed
+
+    def call(stage: str, payload: dict[str, Any]) -> dict[str, Any]:
+        prompt = (
+            f"{semantic_config.prompt_template}\n\n"
+            "Return exactly one JSON object matching the requested semantic fields. "
+            "Do not modify files, run commands, or create tasks.\n\n"
+            "Payload:\n"
+            f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+        )
+        node_id = str(payload.get("feature", {}).get("node_id") or "feature")
+        attempt_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{snapshot_id}-{node_id}-{stage}")
+        timeout_sec = int(os.getenv("RECONCILE_SEMANTIC_AI_TIMEOUT_SEC", os.getenv("CODEX_TIMEOUT_SEC", "900")))
+        before = git_changed()
+        t0 = time.perf_counter()
+        if provider == "openai":
+            codex_bin = os.getenv("CODEX_BIN", "").strip() or ("codex.cmd" if os.name == "nt" else "codex")
+            output_last = log_dir / f"reconcile-semantic-{attempt_tag}.last_message.txt"
+            prompt_file = log_dir / f"reconcile-semantic-{attempt_tag}.prompt.md"
+            prompt_file.write_text(prompt, encoding="utf-8")
+            rel_prompt_file = prompt_file
+            try:
+                rel_prompt_file = prompt_file.relative_to(root)
+            except ValueError:
+                pass
+            short_prompt = (
+                "Read the reconcile semantic prompt/payload file at "
+                f"{rel_prompt_file}. Return exactly one JSON object on stdout. "
+                "Do not modify files, run commands, or create tasks."
+            )
+            cmd = [
+                codex_bin,
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "-C",
+                str(root),
+                "-o",
+                str(output_last),
+            ]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.append(short_prompt)
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout_sec, check=False)
+            raw = output_last.read_text(encoding="utf-8") if output_last.exists() else (proc.stdout or "")
+            stderr = proc.stderr or ""
+        else:
+            claude_bin = os.getenv("CLAUDE_BIN", "").strip() or ("claude.cmd" if os.name == "nt" else "claude")
+            cmd = [claude_bin, "-p", "--output-format", "json"]
+            if model:
+                cmd.extend(["--model", model])
+            if os.getenv("CLAUDE_DANGEROUS", "1").strip().lower() not in {"0", "false", "no"}:
+                cmd.append("--dangerously-skip-permissions")
+            env = {
+                k: v for k, v in os.environ.items()
+                if k not in {
+                    "CLAUDECODE",
+                    "CLAUDE_CODE_ENTRYPOINT",
+                    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+                    "CLAUDE_CODE_EXECPATH",
+                    "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
+                    "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
+                    "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                }
+            }
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                timeout=timeout_sec,
+                check=False,
+                cwd=str(root),
+                env=env,
+            )
+            raw = proc.stdout or ""
+            stderr = proc.stderr or ""
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        after = git_changed()
+        new_changes = sorted(after - before)
+        if new_changes:
+            raise RuntimeError(
+                "semantic AI attempted project mutation: "
+                + ", ".join(new_changes)
+            )
+        if int(proc.returncode or 0) != 0:
+            raise RuntimeError(str(stderr or raw or "semantic AI failed"))
+        parsed = _extract_json_dict(raw)
+        if not parsed:
+            raise RuntimeError("semantic AI returned no JSON object")
+        parsed["_ai_route"] = route
+        parsed["_ai_elapsed_ms"] = elapsed_ms
+        return parsed
+
+    return call
+
+
+__all__ = [
+    "build_semantic_ai_call",
+    "resolve_semantic_ai_route",
+]

@@ -104,6 +104,14 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert result["governance_index"]["index_scope"] == "candidate_snapshot"
     assert result["governance_index"]["feature_count"] > 0
     assert result["semantic_enrichment"]["feature_count"] == result["governance_index"]["feature_count"]
+    assert result["trace"]["status"] == "ok"
+    assert result["trace"]["step_count"] >= 7
+    trace_dir = Path(result["trace"]["steps"][0]["input"]["path"]).parents[2]
+    assert (trace_dir / "summary.json").exists()
+    assert (trace_dir / "steps" / "001-run-input" / "input.json").exists()
+    assert (trace_dir / "steps" / "002-build-graph-v2" / "output.json").exists()
+    assert result["semantic_enrichment"]["feature_payload_input_count"] > 0
+    assert Path(result["semantic_enrichment"]["feature_payload_input_dir"]).exists()
     assert Path(result["semantic_enrichment"]["semantic_index_path"]).exists()
     assert Path(result["semantic_enrichment"]["review_report_path"]).exists()
     assert Path(result["governance_index"]["artifacts"]["symbol_index_path"]).exists()
@@ -126,6 +134,7 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     notes = json.loads(snapshot_row["notes"])
     assert notes["state_only"] is True
     assert notes["feature_cluster_count"] >= 1
+    assert Path(notes["trace"]["summary_path"]).exists()
     assert notes["governance_index"]["feature_count"] == result["governance_index"]["feature_count"]
     assert notes["semantic_enrichment"]["feature_count"] == result["semantic_enrichment"]["feature_count"]
 

@@ -1,7 +1,8 @@
 version: "1.0"
 analyzer: reconcile_semantic
-provider: injected
+provider: pipeline
 model: ""
+role: pm
 use_ai_default: false
 temperature: 0
 max_tokens: 4000

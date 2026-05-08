@@ -1705,6 +1705,38 @@ def _graph_governance_project_root(project_id: str, body: dict) -> Path:
     raise ValidationError("project_root or workspace_path is required")
 
 
+def _semantic_use_ai_from_body(body: dict) -> bool | None:
+    if body.get("semantic_use_ai") is not None:
+        return bool(body["semantic_use_ai"])
+    if body.get("use_ai") is not None:
+        return bool(body["use_ai"])
+    return None
+
+
+def _semantic_ai_call_from_body(project_id: str, root: Path, body: dict):
+    use_ai = _semantic_use_ai_from_body(body)
+    if use_ai is False:
+        return None
+    try:
+        from .reconcile_semantic_ai import build_semantic_ai_call
+        from .reconcile_semantic_config import load_semantic_enrichment_config
+        semantic_config = load_semantic_enrichment_config(
+            project_root=root,
+            config_path=body.get("semantic_config_path"),
+        )
+        effective_use_ai = semantic_config.use_ai_default if use_ai is None else use_ai
+        if not effective_use_ai:
+            return None
+        return build_semantic_ai_call(
+            semantic_config=semantic_config,
+            project_id=project_id,
+            snapshot_id=str(body.get("snapshot_id") or body.get("run_id") or "candidate"),
+            project_root=root,
+        )
+    except Exception:
+        return None
+
+
 def _query_int(query: dict, key: str, default: int) -> int:
     try:
         return int(query.get(key, default))
@@ -2314,6 +2346,8 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
     from .state_reconcile import run_state_only_full_reconcile
+    semantic_use_ai = _semantic_use_ai_from_body(body)
+    semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
 
     conn = get_connection(project_id)
     try:
@@ -2332,16 +2366,18 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
                 notes_extra=body.get("notes_extra") if isinstance(body.get("notes_extra"), dict) else None,
                 semantic_enrich=bool(body.get("semantic_enrich", True)),
-                semantic_use_ai=(
-                    bool(body["semantic_use_ai"])
-                    if body.get("semantic_use_ai") is not None
-                    else (bool(body["use_ai"]) if body.get("use_ai") is not None else None)
-                ),
+                semantic_use_ai=semantic_use_ai,
                 semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
                 semantic_feedback_round=body.get("semantic_feedback_round"),
                 semantic_max_excerpt_chars=(
                     int(body["semantic_max_excerpt_chars"])
                     if body.get("semantic_max_excerpt_chars") is not None
+                    else None
+                ),
+                semantic_ai_call=semantic_ai_call,
+                semantic_ai_feature_limit=(
+                    int(body["semantic_ai_feature_limit"])
+                    if body.get("semantic_ai_feature_limit") is not None
                     else None
                 ),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2361,6 +2397,8 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
     from .state_reconcile import run_pending_scope_reconcile_candidate
+    semantic_use_ai = _semantic_use_ai_from_body(body)
+    semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
 
     conn = get_connection(project_id)
     try:
@@ -2375,16 +2413,18 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
                 semantic_enrich=bool(body.get("semantic_enrich", True)),
-                semantic_use_ai=(
-                    bool(body["semantic_use_ai"])
-                    if body.get("semantic_use_ai") is not None
-                    else (bool(body["use_ai"]) if body.get("use_ai") is not None else None)
-                ),
+                semantic_use_ai=semantic_use_ai,
                 semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),
                 semantic_feedback_round=body.get("semantic_feedback_round"),
                 semantic_max_excerpt_chars=(
                     int(body["semantic_max_excerpt_chars"])
                     if body.get("semantic_max_excerpt_chars") is not None
+                    else None
+                ),
+                semantic_ai_call=semantic_ai_call,
+                semantic_ai_feature_limit=(
+                    int(body["semantic_ai_feature_limit"])
+                    if body.get("semantic_ai_feature_limit") is not None
                     else None
                 ),
                 semantic_config_path=body.get("semantic_config_path"),
@@ -2538,6 +2578,8 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     root = _graph_governance_project_root(project_id, body)
     from . import reconcile_semantic_enrichment as semantic
     from .db import sqlite_write_lock
+    semantic_use_ai = _semantic_use_ai_from_body(body)
+    semantic_ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
 
     feedback_items = body.get("feedback_items")
     if feedback_items is not None and not isinstance(feedback_items, (list, dict)):
@@ -2555,12 +2597,22 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                     root,
                     feedback_items=feedback_items,
                     feedback_round=body.get("feedback_round"),
-                    use_ai=bool(body["use_ai"]) if body.get("use_ai") is not None else None,
+                    use_ai=semantic_use_ai,
+                    ai_call=semantic_ai_call,
                     created_by=str(body.get("actor") or "observer"),
                     max_excerpt_chars=(
                         int(body["max_excerpt_chars"])
                         if body.get("max_excerpt_chars") is not None
                         else None
+                    ),
+                    ai_feature_limit=(
+                        int(body["semantic_ai_feature_limit"])
+                        if body.get("semantic_ai_feature_limit") is not None
+                        else (
+                            int(body["ai_feature_limit"])
+                            if body.get("ai_feature_limit") is not None
+                            else None
+                        )
                     ),
                     semantic_config_path=body.get("semantic_config_path"),
                 )

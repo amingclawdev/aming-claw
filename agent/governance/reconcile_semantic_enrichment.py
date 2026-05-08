@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .reconcile_trace import write_json
 from .graph_snapshot_store import (
     ensure_schema,
     get_graph_snapshot,
@@ -446,8 +447,16 @@ def _call_ai(
 ) -> dict[str, Any] | None:
     if ai_call is None:
         return None
-    response = ai_call(stage, payload)
+    try:
+        response = ai_call(stage, payload)
+    except Exception as exc:  # noqa: BLE001 - caller records unavailable AI evidence
+        return {"_ai_error": str(exc)}
     return response if isinstance(response, dict) else None
+
+
+def _safe_node_filename(node_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in node_id)
+    return safe or "feature"
 
 
 def run_semantic_enrichment(
@@ -463,6 +472,9 @@ def run_semantic_enrichment(
     created_by: str = "observer",
     max_excerpt_chars: int | None = None,
     semantic_config_path: str | Path | None = None,
+    ai_feature_limit: int | None = None,
+    trace_dir: str | Path | None = None,
+    persist_feature_payloads: bool = True,
 ) -> dict[str, Any]:
     """Create semantic companion artifacts for a graph snapshot.
 
@@ -509,6 +521,11 @@ def run_semantic_enrichment(
     semantic_features: list[dict[str, Any]] = []
     ai_complete_count = 0
     ai_unavailable_count = 0
+    ai_error_count = 0
+    ai_skipped_count = 0
+    payload_input_paths: list[str] = []
+    payload_output_paths: list[str] = []
+    payload_trace_base = Path(trace_dir) if trace_dir else _round_dir(project_id, snapshot_id, round_number)
     for node in nodes:
         feature = _feature_context_from_node(
             node,
@@ -541,22 +558,57 @@ def run_semantic_enrichment(
             "review_feedback": payload_feedback,
             "instructions": semantic_config.to_instruction_payload(),
         }
-        ai_response = _call_ai(ai_call, stage="reconcile_semantic_feature", payload=payload) if effective_use_ai else None
-        if ai_response is not None:
+        node_name = _safe_node_filename(str(feature.get("node_id") or "feature"))
+        if persist_feature_payloads:
+            payload_input_paths.append(write_json(
+                payload_trace_base / "feature-inputs" / f"{node_name}.json",
+                payload,
+            ))
+        ai_allowed = bool(effective_use_ai)
+        if ai_feature_limit is not None and ai_feature_limit >= 0:
+            ai_allowed = ai_allowed and ai_complete_count + ai_unavailable_count < ai_feature_limit
+        ai_response = _call_ai(ai_call, stage="reconcile_semantic_feature", payload=payload) if ai_allowed else None
+        if ai_response is not None and not ai_response.get("_ai_error"):
             status = "ai_complete"
             ai_complete_count += 1
+        elif ai_response is not None and ai_response.get("_ai_error"):
+            status = "ai_unavailable"
+            ai_unavailable_count += 1
+            ai_error_count += 1
+        elif effective_use_ai and not ai_allowed:
+            status = "ai_skipped_limit"
+            ai_skipped_count += 1
         else:
             status = "ai_unavailable" if effective_use_ai else "heuristic"
             if effective_use_ai:
                 ai_unavailable_count += 1
-        semantic_features.append(
-            _heuristic_semantic_entry(
-                feature,
-                relevant_feedback,
-                enrichment_status=status,
-                ai_response=ai_response,
-            )
+        semantic_entry = _heuristic_semantic_entry(
+            feature,
+            relevant_feedback,
+            enrichment_status=status,
+            ai_response=ai_response if ai_response and not ai_response.get("_ai_error") else None,
         )
+        if ai_response and ai_response.get("_ai_error"):
+            semantic_entry.setdefault("quality_flags", []).append("semantic_ai_error")
+            semantic_entry["semantic_ai_error"] = ai_response.get("_ai_error")
+        elif ai_response:
+            if ai_response.get("_ai_route"):
+                semantic_entry["semantic_ai_route"] = ai_response.get("_ai_route")
+            if ai_response.get("_ai_elapsed_ms") is not None:
+                semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
+        if persist_feature_payloads:
+            payload_output_paths.append(write_json(
+                payload_trace_base / "feature-outputs" / f"{node_name}.json",
+                {
+                    "node_id": feature.get("node_id"),
+                    "enrichment_status": status,
+                    "ai_response_present": bool(ai_response and not ai_response.get("_ai_error")),
+                    "ai_error": ai_response.get("_ai_error") if isinstance(ai_response, dict) else "",
+                    "ai_response": ai_response if isinstance(ai_response, dict) else None,
+                    "semantic_entry": semantic_entry,
+                },
+            ))
+        semantic_features.append(semantic_entry)
 
     semantic_index = {
         "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
@@ -586,11 +638,17 @@ def run_semantic_enrichment(
         "feature_count": len(semantic_features),
         "ai_complete_count": ai_complete_count,
         "ai_unavailable_count": ai_unavailable_count,
+        "ai_error_count": ai_error_count,
+        "ai_skipped_count": ai_skipped_count,
         "feedback_count": len(feedback),
         "semantic_config": semantic_config.summary(),
         "unresolved_feedback_count": len(unresolved_feedback),
         "unresolved_feedback_ids": unresolved_feedback,
         "quality_flag_counts": _count_quality_flags(semantic_features),
+        "feature_payload_input_count": len(payload_input_paths),
+        "feature_payload_output_count": len(payload_output_paths),
+        "feature_payload_input_dir": str(payload_trace_base / "feature-inputs") if persist_feature_payloads else "",
+        "feature_payload_output_dir": str(payload_trace_base / "feature-outputs") if persist_feature_payloads else "",
     }
 
     base = _semantic_base_dir(project_id, snapshot_id)

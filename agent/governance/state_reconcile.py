@@ -34,6 +34,7 @@ from agent.governance.graph_snapshot_store import (
 )
 from agent.governance.governance_index import build_and_persist_governance_index
 from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
+from agent.governance.reconcile_trace import ReconcileTrace, artifact_ref
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
@@ -213,9 +214,15 @@ def _semantic_enrichment_summary(result: dict[str, Any] | None) -> dict[str, Any
         "feature_count": summary.get("feature_count", 0),
         "ai_complete_count": summary.get("ai_complete_count", 0),
         "ai_unavailable_count": summary.get("ai_unavailable_count", 0),
+        "ai_error_count": summary.get("ai_error_count", 0),
+        "ai_skipped_count": summary.get("ai_skipped_count", 0),
         "feedback_count": summary.get("feedback_count", 0),
         "unresolved_feedback_count": summary.get("unresolved_feedback_count", 0),
         "quality_flag_counts": summary.get("quality_flag_counts") or {},
+        "feature_payload_input_count": summary.get("feature_payload_input_count", 0),
+        "feature_payload_output_count": summary.get("feature_payload_output_count", 0),
+        "feature_payload_input_dir": summary.get("feature_payload_input_dir", ""),
+        "feature_payload_output_dir": summary.get("feature_payload_output_dir", ""),
     }
 
 
@@ -238,6 +245,7 @@ def run_state_only_full_reconcile(
     semantic_feedback_round: int | None = None,
     semantic_max_excerpt_chars: int | None = None,
     semantic_ai_call: Any = None,
+    semantic_ai_feature_limit: int | None = None,
     semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Create a candidate full-reconcile graph snapshot from current files.
@@ -253,6 +261,31 @@ def run_state_only_full_reconcile(
     state_dir = _governance_state_dir(project_id, rid)
     scratch_dir = state_dir / "scratch"
     scratch_dir.mkdir(parents=True, exist_ok=True)
+    trace = ReconcileTrace(
+        project_id=project_id,
+        run_id=rid,
+        snapshot_id=sid,
+        trace_dir=state_dir / "trace",
+    )
+    trace.step(
+        "run-input",
+        input_payload={
+            "project_id": project_id,
+            "project_root": str(root),
+            "run_id": rid,
+            "snapshot_id": sid,
+            "snapshot_kind": snapshot_kind,
+            "commit_sha": commit,
+            "created_by": created_by,
+        },
+        output_payload={
+            "state_dir": str(state_dir),
+            "scratch_dir": str(scratch_dir),
+            "semantic_enrich": semantic_enrich,
+            "semantic_use_ai": semantic_use_ai,
+            "semantic_ai_feature_limit": semantic_ai_feature_limit,
+        },
+    )
 
     phase_result = build_graph_v2_from_symbols(
         str(root),
@@ -260,7 +293,27 @@ def run_state_only_full_reconcile(
         scratch_dir=str(scratch_dir),
         run_id=rid,
     )
+    trace.step(
+        "build-graph-v2",
+        input_payload={
+            "project_root": str(root),
+            "dry_run": True,
+            "scratch_dir": str(scratch_dir),
+            "run_id": rid,
+        },
+        output_payload={
+            "status": phase_result.get("status", ""),
+            "report_path": phase_result.get("report_path") or "",
+            "report": artifact_ref(phase_result.get("report_path") or ""),
+            "node_count": phase_result.get("node_count", 0),
+            "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
+            "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
+            "typed_relation_count": len(phase_result.get("typed_relations") or []),
+        },
+        status="ok" if phase_result.get("status") == "ok" else "failed",
+    )
     if phase_result.get("status") != "ok":
+        trace_summary = trace.finalize(status="failed", extra={"abort_reason": phase_result.get("abort_reason", "")})
         return {
             "ok": False,
             "project_id": project_id,
@@ -269,6 +322,7 @@ def run_state_only_full_reconcile(
             "status": phase_result.get("status", "unknown"),
             "abort_reason": phase_result.get("abort_reason", ""),
             "phase_result": phase_result,
+            "trace": trace_summary,
         }
 
     candidate_graph = build_rebase_candidate_graph(
@@ -277,12 +331,33 @@ def run_state_only_full_reconcile(
         session_id=rid,
         run_id=rid,
     )
+    trace.step(
+        "build-candidate-graph",
+        input_payload={
+            "phase_report_path": phase_result.get("report_path") or "",
+            "session_id": rid,
+        },
+        output_payload={
+            "graph_stats": graph_payload_stats(candidate_graph),
+        },
+    )
     file_inventory = _normalize_inventory_commit(
         [
             row for row in (phase_result.get("file_inventory") or [])
             if isinstance(row, dict)
         ],
         commit_sha=commit,
+    )
+    trace.step(
+        "normalize-file-inventory",
+        input_payload={
+            "raw_file_inventory_count": len(phase_result.get("file_inventory") or []),
+            "commit_sha": commit,
+        },
+        output_payload={
+            "file_inventory_count": len(file_inventory),
+            "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
+        },
     )
     nodes = _deps_graph_nodes(candidate_graph)
     edges = _deps_graph_edges(candidate_graph)
@@ -295,6 +370,10 @@ def run_state_only_full_reconcile(
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
         "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
         **(notes_extra or {}),
+    }
+    notes["trace"] = {
+        "trace_dir": str(trace.trace_dir),
+        "summary_path": str(trace.trace_dir / "summary.json"),
     }
     snapshot = create_graph_snapshot(
         conn,
@@ -309,12 +388,37 @@ def run_state_only_full_reconcile(
         created_by=created_by,
         notes=json.dumps(notes, ensure_ascii=False, sort_keys=True),
     )
+    trace.step(
+        "create-graph-snapshot",
+        input_payload={
+            "snapshot_id": sid,
+            "snapshot_kind": snapshot_kind,
+            "commit_sha": commit,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "file_inventory_count": len(file_inventory),
+        },
+        output_payload={
+            "snapshot": snapshot,
+            "snapshot_path": str(snapshot_graph_path(project_id, sid)),
+            "snapshot_artifact": artifact_ref(snapshot_graph_path(project_id, sid)),
+        },
+    )
     index_counts = index_graph_snapshot(
         conn,
         project_id,
         sid,
         nodes=nodes,
         edges=edges,
+    )
+    trace.step(
+        "index-graph-snapshot",
+        input_payload={
+            "snapshot_id": sid,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        },
+        output_payload={"index_counts": index_counts},
     )
     governance_index = build_and_persist_governance_index(
         conn,
@@ -329,6 +433,18 @@ def run_state_only_full_reconcile(
         persist_inventory=True,
     )
     governance_index_summary = governance_index.get("persist_summary") or {}
+    trace.step(
+        "build-governance-index",
+        input_payload={
+            "snapshot_id": sid,
+            "run_id": rid,
+            "commit_sha": commit,
+        },
+        output_payload={
+            "summary": governance_index_summary,
+            "artifacts": governance_index_summary.get("artifacts") or {},
+        },
+    )
     notes["governance_index"] = governance_index_summary
     conn.execute(
         "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
@@ -347,9 +463,22 @@ def run_state_only_full_reconcile(
             ai_call=semantic_ai_call,
             created_by=created_by,
             max_excerpt_chars=semantic_max_excerpt_chars,
+            ai_feature_limit=semantic_ai_feature_limit,
             semantic_config_path=semantic_config_path,
+            trace_dir=trace.trace_dir / "semantic-enrichment",
         )
         semantic_enrichment = _semantic_enrichment_summary(semantic_result)
+    trace.step(
+        "semantic-enrichment",
+        input_payload={
+            "enabled": semantic_enrich,
+            "snapshot_id": sid,
+            "semantic_use_ai": semantic_use_ai,
+            "semantic_ai_feature_limit": semantic_ai_feature_limit,
+            "semantic_config_path": str(semantic_config_path or ""),
+        },
+        output_payload=semantic_enrichment,
+    )
     activation = None
     if activate:
         activation = activate_graph_snapshot(
@@ -358,6 +487,22 @@ def run_state_only_full_reconcile(
             sid,
             expected_old_snapshot_id=expected_old_snapshot_id,
         )
+        trace.step(
+            "activate-snapshot",
+            input_payload={
+                "snapshot_id": sid,
+                "expected_old_snapshot_id": expected_old_snapshot_id,
+            },
+            output_payload={"activation": activation},
+        )
+    else:
+        trace.step(
+            "activate-snapshot",
+            input_payload={"snapshot_id": sid, "activate": False},
+            output_payload={"activation": None, "status": "skipped"},
+            status="skipped",
+        )
+    trace_summary = trace.finalize(status="ok")
     return {
         "ok": True,
         "project_id": project_id,
@@ -371,6 +516,7 @@ def run_state_only_full_reconcile(
         "index_counts": index_counts,
         "governance_index": governance_index_summary,
         "semantic_enrichment": semantic_enrichment,
+        "trace": trace_summary,
         "file_inventory_count": len(file_inventory),
         "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
@@ -452,6 +598,7 @@ def run_pending_scope_reconcile_candidate(
     semantic_feedback_round: int | None = None,
     semantic_max_excerpt_chars: int | None = None,
     semantic_ai_call: Any = None,
+    semantic_ai_feature_limit: int | None = None,
     semantic_config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Materialize pending scope rows as a reviewable candidate snapshot.
@@ -517,6 +664,7 @@ def run_pending_scope_reconcile_candidate(
         semantic_feedback_round=semantic_feedback_round,
         semantic_max_excerpt_chars=semantic_max_excerpt_chars,
         semantic_ai_call=semantic_ai_call,
+        semantic_ai_feature_limit=semantic_ai_feature_limit,
         semantic_config_path=semantic_config_path,
         notes_extra={
             "pending_scope_reconcile": {

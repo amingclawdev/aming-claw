@@ -112,6 +112,7 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
         use_ai=True,
         ai_call=fake_ai,
         created_by="test",
+        trace_dir=project / "semantic-trace",
     )
 
     assert first["summary"]["ai_complete_count"] == 1
@@ -124,6 +125,10 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
     assert seen_payloads[0]["payload"]["feature"]["source_excerpt"]
     assert seen_payloads[0]["payload"]["feature"]["config"] == ["config/roles/default/pm.yaml"]
     assert seen_payloads[0]["payload"]["feature"]["config_refs"][0]["path"] == "config/roles/default/pm.yaml"
+    assert first["summary"]["feature_payload_input_count"] == 1
+    assert Path(first["summary"]["feature_payload_input_dir"]).exists()
+    assert (project / "semantic-trace" / "feature-inputs" / "L7.1.json").exists()
+    assert (project / "semantic-trace" / "feature-outputs" / "L7.1.json").exists()
 
     second = run_semantic_enrichment(
         conn,

@@ -10,13 +10,15 @@ from agent.governance.reconcile_semantic_config import (
     SemanticConfigValidationError,
     load_semantic_enrichment_config,
 )
+from agent.governance.reconcile_semantic_ai import resolve_semantic_ai_route
 
 
 def test_default_semantic_config_loads_state_only_profile():
     config = load_semantic_enrichment_config()
 
     assert config.analyzer == "reconcile_semantic"
-    assert config.provider == "injected"
+    assert config.provider == "pipeline"
+    assert config.role == "pm"
     assert config.use_ai_default is False
     assert "modify_code" not in config.permissions_can
     assert "mutate_graph_topology" in config.permissions_cannot
@@ -53,6 +55,18 @@ def test_project_override_merges_with_default(tmp_path):
     assert config.prompt_template == "Custom project semantic analyzer prompt."
     assert "read_graph_snapshot" in config.permissions_can
     assert config.override_path == str(override_path)
+
+
+def test_semantic_ai_route_can_be_enabled_by_env(monkeypatch):
+    config = load_semantic_enrichment_config()
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_PROVIDER", "openai")
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_MODEL", "gpt-test-semantic")
+
+    route = resolve_semantic_ai_route(config)
+
+    assert route["provider"] == "openai"
+    assert route["model"] == "gpt-test-semantic"
+    assert route["source"] == "env"
 
 
 def test_semantic_config_rejects_mutation_permissions(tmp_path):
