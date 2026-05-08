@@ -382,6 +382,75 @@ def test_graph_governance_status_observation_requires_explicit_backlog_action(co
     assert trigger["feedback_kind"] == "status_observation"
 
 
+def test_graph_governance_feedback_review_use_reviewer_ai_enables_ai(conn, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir(parents=True, exist_ok=True)
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-reviewer-ai-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[
+            {
+                "node_id": "L7.1",
+                "reason": "dependency_patch_suggestions",
+                "summary": "Doc binding should be attached to the feedback router.",
+                "target": "docs/governance/reconcile-workflow.md",
+                "type": "add_doc_binding",
+            }
+        ],
+    )
+    item = classified["items"][0]
+    calls = []
+
+    def fake_builder(**kwargs):
+        assert kwargs["semantic_config"].model == "claude-opus-4-7"
+
+        def fake_call(stage, payload):
+            calls.append({"stage": stage, "feedback_id": payload["feedback"]["feedback_id"]})
+            return {
+                "decision": "graph_correction",
+                "rationale": "AI reviewer confirms this is graph metadata only.",
+                "confidence": 0.91,
+                "_ai_route": {"provider": "anthropic", "model": "claude-opus-4-7"},
+            }
+
+        return fake_call
+
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        fake_builder,
+    )
+
+    reviewed = server.handle_graph_governance_snapshot_feedback_review(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "feedback_id": item["feedback_id"],
+                "use_reviewer_ai": True,
+                "semantic_ai_provider": "anthropic",
+                "semantic_ai_model": "claude-opus-4-7",
+            },
+        )
+    )
+
+    assert calls == [{"stage": "reconcile_feedback_review", "feedback_id": item["feedback_id"]}]
+    reviewed_item = reviewed["items"][0]
+    assert reviewed_item["reviewer_decision"] == "graph_correction"
+    assert reviewed_item["reviewer_rationale"] == "AI reviewer confirms this is graph metadata only."
+    assert reviewed_item["reviewer_confidence"] == 0.91
+
+
 def test_graph_governance_status_observation_detector_classifies_graph_candidates(conn):
     graph = {
         "deps_graph": {

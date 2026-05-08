@@ -1710,6 +1710,10 @@ def _semantic_use_ai_from_body(body: dict) -> bool | None:
         return bool(body["semantic_use_ai"])
     if body.get("use_ai") is not None:
         return bool(body["use_ai"])
+    if body.get("reviewer_use_ai") is not None:
+        return bool(body["reviewer_use_ai"])
+    if body.get("use_reviewer_ai") is not None:
+        return bool(body["use_reviewer_ai"])
     return None
 
 
