@@ -419,6 +419,7 @@ def test_graph_governance_feedback_review_use_reviewer_ai_enables_ai(conn, tmp_p
                 "stage": stage,
                 "feedback_id": payload["feedback"]["feedback_id"],
                 "has_review_context": bool(payload.get("review_context")),
+                "has_read_tools": bool((payload.get("review_context") or {}).get("read_tools")),
             })
             return {
                 "decision": "graph_correction",
@@ -452,6 +453,7 @@ def test_graph_governance_feedback_review_use_reviewer_ai_enables_ai(conn, tmp_p
         "stage": "reconcile_feedback_review",
         "feedback_id": item["feedback_id"],
         "has_review_context": True,
+        "has_read_tools": True,
     }]
     reviewed_item = reviewed["items"][0]
     assert reviewed_item["reviewer_decision"] == "graph_correction"
@@ -542,6 +544,121 @@ def test_graph_governance_feedback_review_queue_uses_reviewer_ai(conn, tmp_path,
     assert all(call["has_review_context"] for call in calls)
     assert {item["reviewer_decision"] for item in reviewed["reviewed"]} == {"graph_correction"}
     assert reviewed["summary"]["by_status"] == {"reviewed": 2}
+
+
+def test_graph_governance_feedback_retrieval_tools_are_project_scoped(conn, tmp_path):
+    project = tmp_path / "project"
+    source = project / "agent" / "governance" / "server.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "def feedback_router():\n    return 'graph retrieval evidence'\n",
+        encoding="utf-8",
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-retrieval-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[{
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "feedback_router should be linked to graph retrieval.",
+            "type": "add_relation",
+        }],
+    )
+    item = classified["items"][0]
+
+    result = server.handle_graph_governance_snapshot_feedback_retrieval(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "feedback_id": item["feedback_id"],
+                "operations": [
+                    {"tool": "graph_query", "node_ids": ["L7.1"], "depth": 1},
+                    {"tool": "grep_in_scope", "pattern": "feedback_router", "node_ids": ["L7.1"]},
+                    {"tool": "read_excerpt", "path": "agent/governance/server.py", "line_start": 1, "line_end": 1},
+                    {"tool": "read_excerpt", "path": "../outside.txt", "line_start": 1},
+                ],
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["count"] == 4
+    assert result["results"][0]["result"]["nodes"][0]["id"] == "L7.1"
+    assert result["results"][1]["result"]["matches"][0]["line_no"] == 1
+    assert "feedback_router" in result["results"][2]["result"]["excerpt"]
+    assert result["results"][3]["result"]["ok"] is False
+    assert result["results"][3]["result"]["error"] == "invalid_path"
+
+
+def test_graph_governance_feedback_queue_claim_lease_blocks_duplicate_workers(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-claim-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        source_round="round-001",
+        created_by="observer",
+        issues=[{
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add typed relation to review queue.",
+            "target": "agent.governance.reconcile_feedback",
+            "type": "add_typed_relation",
+        }],
+    )
+    assert classified["count"] == 1
+
+    first = server.handle_graph_governance_snapshot_feedback_queue_claim(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "worker_id": "reviewer-a",
+                "source_round": "round-001",
+                "lane": "graph_patch_candidate",
+                "limit_groups": 1,
+                "max_items": 1,
+            },
+        )
+    )
+    second = server.handle_graph_governance_snapshot_feedback_queue_claim(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "worker_id": "reviewer-b",
+                "source_round": "round-001",
+                "lane": "graph_patch_candidate",
+                "limit_groups": 1,
+                "max_items": 1,
+            },
+        )
+    )
+
+    assert first["claimed_count"] == 1
+    assert second["claimed_count"] == 0
+    state = reconcile_feedback.load_feedback_state(PID, snapshot["snapshot_id"])
+    item = next(iter(state["items"].values()))
+    assert item["review_claim"]["worker_id"] == "reviewer-a"
 
 
 def test_graph_governance_status_observation_detector_classifies_graph_candidates(conn):

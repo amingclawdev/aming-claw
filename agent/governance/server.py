@@ -1717,6 +1717,24 @@ def _semantic_use_ai_from_body(body: dict) -> bool | None:
     return None
 
 
+def _automation_mode_from_body(body: dict, *keys: str, default: str = "manual") -> str:
+    for key in keys:
+        if body.get(key) is None:
+            continue
+        mode = str(body.get(key) or "").strip().lower().replace("-", "_")
+        break
+    else:
+        mode = default
+    if mode in {"off", "disabled", "false"}:
+        mode = "manual"
+    if mode not in {"manual", "enqueue_only", "auto"}:
+        from .errors import ValidationError
+        raise ValidationError(
+            f"automation mode must be one of manual, enqueue_only, auto; got {mode}"
+        )
+    return mode
+
+
 def _semantic_ai_call_from_body(project_id: str, root: Path, body: dict):
     use_ai = _semantic_use_ai_from_body(body)
     if use_ai is False:
@@ -2750,6 +2768,9 @@ def handle_graph_governance_snapshot_feedback_queue(ctx: RequestContext):
                 group_by=str(ctx.query.get("group_by") or "target"),
                 include_status_observations=_query_bool(ctx.query, "include_status_observations", False),
                 include_resolved=_query_bool(ctx.query, "include_resolved", False),
+                include_claimed=_query_bool(ctx.query, "include_claimed", True),
+                claimable_only=_query_bool(ctx.query, "claimable_only", False),
+                worker_id=str(ctx.query.get("worker_id") or ""),
                 limit=_query_int(ctx.query, "limit", 100),
             ),
         }
@@ -2794,6 +2815,105 @@ def handle_graph_governance_snapshot_feedback_classify(ctx: RequestContext):
         except Exception:
             pass
         return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/retrieval")
+def handle_graph_governance_snapshot_feedback_retrieval(ctx: RequestContext):
+    """Run bounded read-only graph/grep/excerpt retrieval for a feedback item."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    root = _graph_governance_project_root(project_id, body)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.retrieval")
+        feedback_id = str(body.get("feedback_id") or "").strip()
+        item = {}
+        if feedback_id:
+            state = reconcile_feedback.load_feedback_state(project_id, snapshot_id)
+            item = dict((state.get("items") or {}).get(feedback_id) or {})
+            if not item:
+                raise ValidationError(f"feedback item not found: {feedback_id}")
+        node_ids = body.get("node_ids") if isinstance(body.get("node_ids"), list) else None
+        if not node_ids and item:
+            node_ids = item.get("source_node_ids") or item.get("node_ids") or []
+        operations = body.get("operations") if isinstance(body.get("operations"), list) else []
+        results: list[dict] = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            op = str(operation.get("tool") or operation.get("type") or "").strip()
+            if op == "graph_query":
+                results.append({
+                    "tool": op,
+                    "result": reconcile_feedback.graph_query_context(
+                        project_id,
+                        snapshot_id,
+                        node_ids=operation.get("node_ids") or node_ids or [],
+                        depth=int(operation.get("depth") or 1),
+                    ),
+                })
+            elif op == "grep_in_scope":
+                results.append({
+                    "tool": op,
+                    "result": reconcile_feedback.grep_in_scope(
+                        project_id,
+                        snapshot_id,
+                        project_root=root,
+                        pattern=str(operation.get("pattern") or ""),
+                        node_ids=operation.get("node_ids") or node_ids or [],
+                        paths=operation.get("paths") if isinstance(operation.get("paths"), list) else None,
+                        case_sensitive=bool(operation.get("case_sensitive")),
+                        regex=bool(operation.get("regex")),
+                        max_matches=int(operation.get("max_matches") or 20),
+                    ),
+                })
+            elif op == "read_excerpt":
+                results.append({
+                    "tool": op,
+                    "result": reconcile_feedback.read_project_excerpt(
+                        root,
+                        str(operation.get("path") or ""),
+                        line_start=int(operation.get("line_start") or 1),
+                        line_end=(
+                            int(operation["line_end"])
+                            if operation.get("line_end") is not None
+                            else None
+                        ),
+                    ),
+                })
+            else:
+                raise ValidationError(f"unsupported retrieval tool: {op}")
+        if not operations and item:
+            results.append({
+                "tool": "feedback_retrieval_context",
+                "result": reconcile_feedback.build_feedback_retrieval_context(
+                    project_id,
+                    snapshot_id,
+                    item,
+                    project_root=root,
+                    grep_patterns=(
+                        body.get("grep_patterns")
+                        if isinstance(body.get("grep_patterns"), list)
+                        else None
+                    ),
+                    max_grep_matches=int(body.get("max_grep_matches") or 12),
+                    max_chars=int(body.get("max_context_chars") or 12000),
+                ),
+            })
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "feedback_id": feedback_id,
+            "results": results,
+            "count": len(results),
+        }
     finally:
         conn.close()
 
@@ -2891,6 +3011,12 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
                 ai_call=ai_call,
                 project_root=review_project_root,
                 max_context_chars=int(body.get("review_context_chars") or 6000),
+                enable_read_tools=not bool(body.get("disable_read_tools")),
+                grep_patterns=(
+                    body.get("grep_patterns")
+                    if isinstance(body.get("grep_patterns"), list)
+                    else None
+                ),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
@@ -2917,6 +3043,69 @@ def handle_graph_governance_snapshot_feedback_review(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/queue/claim")
+def handle_graph_governance_snapshot_feedback_queue_claim(ctx: RequestContext):
+    """Claim grouped feedback queue items for one reviewer worker."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    worker_id = str(body.get("worker_id") or body.get("reviewer_worker_id") or "").strip()
+    if not worker_id:
+        raise ValidationError("worker_id is required")
+    limit_groups = int(body.get("limit_groups") or body.get("group_limit") or body.get("limit") or 1)
+    max_items = int(body.get("max_items") or body.get("item_limit") or 25)
+    if limit_groups < 0 or max_items < 0:
+        raise ValidationError("limit_groups and max_items must be non-negative")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.queue.claim")
+        try:
+            result = reconcile_feedback.claim_feedback_review_queue(
+                project_id,
+                snapshot_id,
+                worker_id=worker_id,
+                feedback_kind=str(body.get("feedback_kind") or body.get("kind") or ""),
+                status=str(body.get("status") or "classified"),
+                node_id=str(body.get("node_id") or ""),
+                source_round=str(body.get("source_round") or body.get("feedback_round") or ""),
+                lane=str(body.get("lane") or ""),
+                group_by=str(body.get("group_by") or "feature"),
+                include_status_observations=bool(body.get("include_status_observations")),
+                include_resolved=bool(body.get("include_resolved")),
+                limit_groups=limit_groups,
+                max_items=max_items,
+                lease_seconds=int(body.get("lease_seconds") or body.get("claim_lease_seconds") or 1800),
+                actor=str(body.get("actor") or worker_id),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_queue_claimed",
+                actor=str(body.get("actor") or worker_id),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "worker_id": worker_id,
+                    "claim_id": result.get("claim_id", ""),
+                    "claimed_count": result.get("claimed_count", 0),
+                    "lane": body.get("lane", ""),
+                    "group_by": body.get("group_by", "feature"),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return result
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/review-queue")
 def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
     """Review feedback items selected from the grouped feedback queue."""
@@ -2930,34 +3119,73 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
     max_items = int(body.get("max_items") or body.get("item_limit") or 25)
     if limit_groups < 0 or max_items < 0:
         raise ValidationError("limit_groups and max_items must be non-negative")
+    review_automation_mode = _automation_mode_from_body(
+        body,
+        "feedback_review_mode",
+        "review_automation_mode",
+        "automation_mode",
+        default="manual",
+    )
 
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.review-queue")
-        queue = reconcile_feedback.build_feedback_review_queue(
-            project_id,
-            snapshot_id,
-            feedback_kind=str(body.get("feedback_kind") or body.get("kind") or ""),
-            status=str(body.get("status") or "classified"),
-            node_id=str(body.get("node_id") or ""),
-            source_round=str(body.get("source_round") or body.get("feedback_round") or ""),
-            lane=str(body.get("lane") or ""),
-            group_by=str(body.get("group_by") or "feature"),
-            include_status_observations=bool(body.get("include_status_observations")),
-            include_resolved=bool(body.get("include_resolved")),
-            limit=limit_groups,
-        )
-        feedback_ids: list[str] = []
-        for group in queue.get("groups") or []:
-            for feedback_id in group.get("feedback_ids") or []:
-                feedback_id = str(feedback_id or "").strip()
-                if not feedback_id or feedback_id in feedback_ids:
-                    continue
-                feedback_ids.append(feedback_id)
+        worker_id = str(body.get("worker_id") or body.get("reviewer_worker_id") or "").strip()
+        claim_before_review = bool(body.get("claim_before_review") or worker_id)
+        claim_result: dict = {}
+        if claim_before_review and not bool(body.get("dry_run")):
+            if not worker_id:
+                raise ValidationError("worker_id is required when claim_before_review=true")
+            claim_result = reconcile_feedback.claim_feedback_review_queue(
+                project_id,
+                snapshot_id,
+                worker_id=worker_id,
+                feedback_kind=str(body.get("feedback_kind") or body.get("kind") or ""),
+                status=str(body.get("status") or "classified"),
+                node_id=str(body.get("node_id") or ""),
+                source_round=str(body.get("source_round") or body.get("feedback_round") or ""),
+                lane=str(body.get("lane") or ""),
+                group_by=str(body.get("group_by") or "feature"),
+                include_status_observations=bool(body.get("include_status_observations")),
+                include_resolved=bool(body.get("include_resolved")),
+                limit_groups=limit_groups,
+                max_items=max_items,
+                lease_seconds=int(body.get("lease_seconds") or body.get("claim_lease_seconds") or 1800),
+                actor=str(body.get("actor") or worker_id),
+            )
+            queue = {
+                "summary": claim_result.get("queue_summary", {}),
+                "groups": claim_result.get("selected_groups", []),
+            }
+            feedback_ids = [str(item) for item in (claim_result.get("feedback_ids") or []) if str(item or "")]
+        else:
+            queue = reconcile_feedback.build_feedback_review_queue(
+                project_id,
+                snapshot_id,
+                feedback_kind=str(body.get("feedback_kind") or body.get("kind") or ""),
+                status=str(body.get("status") or "classified"),
+                node_id=str(body.get("node_id") or ""),
+                source_round=str(body.get("source_round") or body.get("feedback_round") or ""),
+                lane=str(body.get("lane") or ""),
+                group_by=str(body.get("group_by") or "feature"),
+                include_status_observations=bool(body.get("include_status_observations")),
+                include_resolved=bool(body.get("include_resolved")),
+                include_claimed=bool(body.get("include_claimed", True)),
+                claimable_only=bool(body.get("claimable_only")),
+                worker_id=worker_id,
+                limit=limit_groups,
+            )
+            feedback_ids: list[str] = []
+            for group in queue.get("groups") or []:
+                for feedback_id in group.get("feedback_ids") or []:
+                    feedback_id = str(feedback_id or "").strip()
+                    if not feedback_id or feedback_id in feedback_ids:
+                        continue
+                    feedback_ids.append(feedback_id)
+                    if max_items and len(feedback_ids) >= max_items:
+                        break
                 if max_items and len(feedback_ids) >= max_items:
                     break
-            if max_items and len(feedback_ids) >= max_items:
-                break
 
         if bool(body.get("dry_run")):
             return {
@@ -2965,6 +3193,7 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
                 "project_id": project_id,
                 "snapshot_id": snapshot_id,
                 "dry_run": True,
+                "automation": {"feedback_review_mode": review_automation_mode},
                 "queue_summary": queue.get("summary", {}),
                 "group_count": len(queue.get("groups") or []),
                 "selected_count": len(feedback_ids),
@@ -3008,6 +3237,12 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
                     ai_call=ai_call,
                     project_root=review_project_root,
                     max_context_chars=int(body.get("review_context_chars") or 6000),
+                    enable_read_tools=not bool(body.get("disable_read_tools")),
+                    grep_patterns=(
+                        body.get("grep_patterns")
+                        if isinstance(body.get("grep_patterns"), list)
+                        else None
+                    ),
                 )
                 item = (result.get("items") or [{}])[0]
                 reviewed.append({
@@ -3040,6 +3275,9 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
                     "lane": body.get("lane", ""),
                     "group_by": body.get("group_by", "feature"),
                     "use_reviewer_ai": use_reviewer_ai,
+                    "claim_before_review": claim_before_review,
+                    "claim_id": claim_result.get("claim_id", ""),
+                    "feedback_review_mode": review_automation_mode,
                 }, ensure_ascii=False, sort_keys=True),
             )
             conn.commit()
@@ -3050,6 +3288,8 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
             "ok": not errors,
             "project_id": project_id,
             "snapshot_id": snapshot_id,
+            "automation": {"feedback_review_mode": review_automation_mode},
+            "claim": claim_result,
             "queue_summary": queue.get("summary", {}),
             "group_count": len(queue.get("groups") or []),
             "selected_count": len(feedback_ids),
@@ -3173,8 +3413,25 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
     from . import reconcile_semantic_enrichment as semantic
+    from . import reconcile_feedback
     from .db import sqlite_write_lock
     semantic_use_ai = _semantic_use_ai_from_body(body)
+    semantic_mode = _automation_mode_from_body(
+        body,
+        "semantic_mode",
+        "semantic_automation_mode",
+        default=("auto" if semantic_use_ai else "manual"),
+    )
+    feedback_review_mode = _automation_mode_from_body(
+        body,
+        "feedback_review_mode",
+        "review_automation_mode",
+        default="manual",
+    )
+    if semantic_mode in {"manual", "enqueue_only"}:
+        semantic_use_ai = False
+    elif semantic_mode == "auto" and semantic_use_ai is None:
+        semantic_use_ai = True
     semantic_ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
 
     feedback_items = body.get("feedback_items")
@@ -3210,6 +3467,29 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                 )
             except (KeyError, ValueError) as exc:
                 _raise_graph_api_validation(exc)
+            result.setdefault("automation", {})
+            result["automation"].update({
+                "semantic_mode": semantic_mode,
+                "feedback_review_mode": feedback_review_mode,
+            })
+            if feedback_review_mode in {"enqueue_only", "auto"}:
+                round_label = f"round-{int(result.get('feedback_round') or 0):03d}"
+                classified = reconcile_feedback.classify_semantic_open_issues(
+                    project_id,
+                    snapshot_id,
+                    source_round=round_label,
+                    created_by=str(body.get("actor") or "observer"),
+                    limit=(
+                        int(body["feedback_classify_limit"])
+                        if body.get("feedback_classify_limit") is not None
+                        else None
+                    ),
+                )
+                result["feedback_queue"] = {
+                    "mode": feedback_review_mode,
+                    "source_round": round_label,
+                    "classification": classified,
+                }
             conn.commit()
         return {"ok": True, **result}
     finally:

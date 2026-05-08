@@ -27,12 +27,16 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.use_ai_default is False
     assert config.execution_policy.ai_input_mode == "feature"
     assert config.execution_policy.dynamic_semantic_graph_state is True
+    assert config.automation_policy.semantic_mode == "manual"
+    assert config.automation_policy.feedback_review_mode == "enqueue_only"
+    assert config.automation_policy.graph_apply_mode == "manual"
     assert "modify_code" not in config.permissions_can
     assert "mutate_graph_topology" in config.permissions_cannot
     payload = config.to_instruction_payload()
     assert payload["mutate_project_files"] is False
     assert payload["mutate_graph_topology"] is False
     assert payload["execution_policy"]["ai_input_mode"] == "feature"
+    assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"
     assert payload["prompt_template"]
     assert Path(DEFAULT_CONFIG_PATH).exists()
 
@@ -50,6 +54,11 @@ def test_project_override_merges_with_default(tmp_path):
                 "  max_excerpt_chars: 77",
                 "execution_policy:",
                 "  ai_input_mode: batch",
+                "automation_policy:",
+                "  semantic_mode: auto",
+                "  feedback_review_mode: auto",
+                "  graph_apply_mode: manual",
+                "  review_workers: 2",
                 "prompt_template: |-",
                 "  Custom project semantic analyzer prompt.",
             ]
@@ -63,6 +72,9 @@ def test_project_override_merges_with_default(tmp_path):
     assert config.use_ai_default is True
     assert config.input_policy.max_excerpt_chars == 77
     assert config.execution_policy.ai_input_mode == "batch"
+    assert config.automation_policy.semantic_mode == "auto"
+    assert config.automation_policy.feedback_review_mode == "auto"
+    assert config.automation_policy.review_workers == 2
     assert config.prompt_template == "Custom project semantic analyzer prompt."
     assert config.executables["anthropic"] == "claude"
     assert "read_graph_snapshot" in config.permissions_can

@@ -45,6 +45,17 @@ execution_policy:
   ai_input_mode: feature
   dynamic_semantic_graph_state: true
 
+automation_policy:
+  # External projects start safe: structure graph and queues can be generated
+  # without automatically spending model quota or mutating graph state.
+  semantic_mode: manual       # manual | enqueue_only | auto
+  feedback_review_mode: enqueue_only  # manual | enqueue_only | auto
+  graph_apply_mode: manual    # manual | auto_low_risk
+  review_workers: 1
+  review_lanes:
+    - graph_patch_candidate
+    - review_required
+
 output_schema:
   required:
     - feature_name

@@ -52,6 +52,15 @@ class SemanticExecutionPolicy:
 
 
 @dataclass
+class SemanticAutomationPolicy:
+    semantic_mode: str = "manual"
+    feedback_review_mode: str = "enqueue_only"
+    graph_apply_mode: str = "manual"
+    review_workers: int = 1
+    review_lanes: list[str] = field(default_factory=lambda: ["graph_patch_candidate", "review_required"])
+
+
+@dataclass
 class SemanticAnalyzerConfig:
     version: str
     analyzer: str
@@ -66,6 +75,7 @@ class SemanticAnalyzerConfig:
     permissions_cannot: list[str] = field(default_factory=list)
     input_policy: SemanticInputPolicy = field(default_factory=SemanticInputPolicy)
     execution_policy: SemanticExecutionPolicy = field(default_factory=SemanticExecutionPolicy)
+    automation_policy: SemanticAutomationPolicy = field(default_factory=SemanticAutomationPolicy)
     output_schema: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     source_path: str = ""
@@ -130,6 +140,33 @@ class SemanticAnalyzerConfig:
                 execution_policy_raw.get("dynamic_semantic_graph_state", True)
             ),
         )
+        automation_raw = data.get("automation_policy") or data.get("automation") or {}
+        if not isinstance(automation_raw, dict):
+            raise SemanticConfigValidationError("'automation_policy' must be a mapping")
+        try:
+            review_workers = int(automation_raw.get("review_workers", 1))
+        except (TypeError, ValueError) as exc:
+            raise SemanticConfigValidationError("automation_policy.review_workers must be an integer") from exc
+        if review_workers < 0:
+            raise SemanticConfigValidationError("automation_policy.review_workers must be >= 0")
+        raw_review_lanes = automation_raw.get("review_lanes") or ["graph_patch_candidate", "review_required"]
+        if isinstance(raw_review_lanes, str):
+            raw_review_lanes = [item.strip() for item in raw_review_lanes.split(",")]
+        automation_policy = SemanticAutomationPolicy(
+            semantic_mode=_normalize_automation_mode(automation_raw.get("semantic_mode", "manual")),
+            feedback_review_mode=_normalize_automation_mode(
+                automation_raw.get("feedback_review_mode", "enqueue_only")
+            ),
+            graph_apply_mode=_normalize_graph_apply_mode(
+                automation_raw.get("graph_apply_mode", "manual")
+            ),
+            review_workers=review_workers,
+            review_lanes=[
+                str(item).strip()
+                for item in raw_review_lanes
+                if str(item).strip()
+            ],
+        )
         try:
             max_tokens = int(data.get("max_tokens", 4000))
         except (TypeError, ValueError) as exc:
@@ -164,6 +201,7 @@ class SemanticAnalyzerConfig:
             permissions_cannot=cannot,
             input_policy=input_policy,
             execution_policy=execution_policy,
+            automation_policy=automation_policy,
             output_schema=data.get("output_schema") if isinstance(data.get("output_schema"), dict) else {},
             prompt_template=prompt_template,
             source_path=source_path,
@@ -189,6 +227,7 @@ class SemanticAnalyzerConfig:
             },
             "input_policy": asdict(self.input_policy),
             "execution_policy": asdict(self.execution_policy),
+            "automation_policy": asdict(self.automation_policy),
             "output_schema": self.output_schema,
             "prompt_template": self.prompt_template,
         }
@@ -206,6 +245,7 @@ class SemanticAnalyzerConfig:
             "override_path": self.override_path,
             "input_policy": asdict(self.input_policy),
             "execution_policy": asdict(self.execution_policy),
+            "automation_policy": asdict(self.automation_policy),
         }
 
 
@@ -218,6 +258,28 @@ def _normalize_ai_input_mode(value: Any) -> str:
     raise SemanticConfigValidationError(
         "execution_policy.ai_input_mode must be 'feature' or 'batch'"
     )
+
+
+def _normalize_automation_mode(value: Any) -> str:
+    mode = str(value or "manual").strip().lower().replace("-", "_")
+    if mode in {"off", "disabled", "false"}:
+        mode = "manual"
+    if mode not in {"manual", "enqueue_only", "auto"}:
+        raise SemanticConfigValidationError(
+            "automation mode must be 'manual', 'enqueue_only', or 'auto'"
+        )
+    return mode
+
+
+def _normalize_graph_apply_mode(value: Any) -> str:
+    mode = str(value or "manual").strip().lower().replace("-", "_")
+    if mode in {"off", "disabled", "false"}:
+        mode = "manual"
+    if mode not in {"manual", "auto_low_risk"}:
+        raise SemanticConfigValidationError(
+            "automation_policy.graph_apply_mode must be 'manual' or 'auto_low_risk'"
+        )
+    return mode
 
 
 def _default_config_dict() -> dict[str, Any]:
@@ -247,6 +309,7 @@ def _default_config_dict() -> dict[str, Any]:
         },
         "input_policy": asdict(SemanticInputPolicy()),
         "execution_policy": asdict(SemanticExecutionPolicy()),
+        "automation_policy": asdict(SemanticAutomationPolicy()),
         "output_schema": {
             "required": [
                 "feature_name",
@@ -321,6 +384,7 @@ __all__ = [
     "SemanticConfigError",
     "SemanticConfigValidationError",
     "SemanticExecutionPolicy",
+    "SemanticAutomationPolicy",
     "SemanticInputPolicy",
     "load_semantic_enrichment_config",
 ]

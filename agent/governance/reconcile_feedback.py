@@ -62,9 +62,29 @@ REVIEW_DECISIONS = {
 
 ReviewerAiCall = Callable[[str, dict[str, Any]], dict[str, Any]]
 
+MAX_READ_EXCERPT_LINES = 200
+MAX_GREP_PATTERN_CHARS = 200
+MAX_GREP_FILE_BYTES = 2_000_000
+DEFAULT_REVIEW_LEASE_SECONDS = 1800
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def _json(data: Any) -> str:
@@ -134,7 +154,18 @@ def _safe_project_file(project_root: str | Path | None, rel_path: str) -> Path |
     return candidate
 
 
+def _safe_relative_path(rel_path: str) -> str:
+    text = str(rel_path or "").replace("\\", "/").strip()
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return ""
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
 def _file_excerpt(project_root: str | Path | None, rel_path: str, *, max_chars: int) -> dict[str, Any] | None:
+    rel_path = _safe_relative_path(rel_path)
     path = _safe_project_file(project_root, rel_path)
     if path is None:
         return None
@@ -158,6 +189,7 @@ def _line_excerpt(
     context_lines: int = 8,
     max_chars: int = 4000,
 ) -> dict[str, Any] | None:
+    rel_path = _safe_relative_path(rel_path)
     path = _safe_project_file(project_root, rel_path)
     if path is None:
         return None
@@ -219,6 +251,281 @@ def _compact_graph_node(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _graph_edges(project_id: str, snapshot_id: str) -> list[dict[str, Any]]:
+    graph = _read_json(_snapshot_graph_path(project_id, snapshot_id), {})
+    edges = (((graph or {}).get("deps_graph") or {}).get("edges") or [])
+    return [dict(edge) for edge in edges if isinstance(edge, dict)]
+
+
+def _node_scope_paths(nodes: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for node in nodes:
+        compact = _compact_graph_node(node)
+        for key in ("primary", "secondary", "test", "config"):
+            for raw_path in _string_list(compact.get(key)):
+                rel_path = _safe_relative_path(raw_path)
+                if rel_path and rel_path not in seen:
+                    seen.add(rel_path)
+                    paths.append(rel_path)
+    return paths
+
+
+def graph_query_context(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    node_ids: list[str] | None = None,
+    depth: int = 1,
+    max_nodes: int = 24,
+    max_edges: int = 80,
+) -> dict[str, Any]:
+    """Return a compact, read-only graph slice for reviewer/AI context."""
+    requested = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
+    nodes_by_id = _graph_nodes_by_id(project_id, snapshot_id)
+    edges = _graph_edges(project_id, snapshot_id)
+    depth = max(0, min(int(depth), 3))
+    selected: set[str] = set(requested)
+    frontier: set[str] = set(requested)
+    for _ in range(depth):
+        if not frontier:
+            break
+        next_frontier: set[str] = set()
+        for edge in edges:
+            source = str(edge.get("source") or edge.get("from") or "")
+            target = str(edge.get("target") or edge.get("to") or "")
+            if source in frontier and target:
+                next_frontier.add(target)
+            if target in frontier and source:
+                next_frontier.add(source)
+        next_frontier -= selected
+        selected.update(next_frontier)
+        frontier = next_frontier
+    all_selected_count = len(selected)
+    ordered_node_ids = [node_id for node_id in requested if node_id in selected]
+    ordered_node_ids.extend(sorted(node_id for node_id in selected if node_id not in ordered_node_ids))
+    ordered_node_ids = ordered_node_ids[: max(0, int(max_nodes))]
+    selected = set(ordered_node_ids)
+    selected_edges = []
+    for edge in edges:
+        source = str(edge.get("source") or edge.get("from") or "")
+        target = str(edge.get("target") or edge.get("to") or "")
+        if source in selected or target in selected:
+            selected_edges.append({
+                "source": source,
+                "target": target,
+                "edge_type": edge.get("edge_type") or edge.get("type") or "",
+                "direction": edge.get("direction", ""),
+                "evidence": edge.get("evidence", {}),
+            })
+        if len(selected_edges) >= max(0, int(max_edges)):
+            break
+    selected_nodes = [
+        _compact_graph_node(nodes_by_id[node_id])
+        for node_id in ordered_node_ids
+        if node_id in nodes_by_id
+    ]
+    return {
+        "node_ids": ordered_node_ids,
+        "nodes": selected_nodes,
+        "edges": selected_edges,
+        "truncated": len(ordered_node_ids) < all_selected_count,
+    }
+
+
+def read_project_excerpt(
+    project_root: str | Path | None,
+    rel_path: str,
+    *,
+    line_start: int = 1,
+    line_end: int | None = None,
+    max_lines: int = MAX_READ_EXCERPT_LINES,
+    max_chars: int = 8000,
+) -> dict[str, Any]:
+    """Read a bounded project-root-relative excerpt."""
+    rel_path = _safe_relative_path(rel_path)
+    if not rel_path:
+        return {"ok": False, "error": "invalid_path", "path": str(rel_path or "")}
+    path = _safe_project_file(project_root, rel_path)
+    if path is None:
+        return {"ok": False, "error": "path_not_found_or_out_of_scope", "path": rel_path}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "path": rel_path}
+    start = max(1, int(line_start or 1))
+    if line_end is None:
+        end = min(len(lines), start + max(1, int(max_lines)) - 1)
+    else:
+        end = min(len(lines), max(start, int(line_end)))
+    if end - start + 1 > max_lines:
+        end = start + max(1, int(max_lines)) - 1
+    numbered = [f"{line_no}: {lines[line_no - 1]}" for line_no in range(start, end + 1)]
+    return {
+        "ok": True,
+        "path": rel_path,
+        "line_start": start,
+        "line_end": end,
+        "excerpt": _truncate_text("\n".join(numbered), max_chars),
+        "line_count": len(lines),
+    }
+
+
+def grep_in_scope(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    project_root: str | Path | None,
+    pattern: str,
+    node_ids: list[str] | None = None,
+    paths: list[str] | None = None,
+    case_sensitive: bool = False,
+    regex: bool = False,
+    max_matches: int = 20,
+    max_chars: int = 8000,
+) -> dict[str, Any]:
+    """Run bounded read-only grep over graph-scoped files."""
+    pattern = str(pattern or "")
+    if not pattern.strip():
+        return {"ok": False, "error": "empty_pattern", "matches": []}
+    if len(pattern) > MAX_GREP_PATTERN_CHARS:
+        return {"ok": False, "error": "pattern_too_long", "matches": []}
+    scoped_paths = [_safe_relative_path(path) for path in (paths or [])]
+    scoped_paths = [path for path in scoped_paths if path]
+    if not scoped_paths:
+        nodes_by_id = _graph_nodes_by_id(project_id, snapshot_id)
+        selected_nodes = [
+            nodes_by_id[node_id]
+            for node_id in (node_ids or [])
+            if node_id in nodes_by_id
+        ]
+        scoped_paths = _node_scope_paths(selected_nodes)
+    if not scoped_paths:
+        return {"ok": False, "error": "empty_scope", "matches": []}
+
+    matcher = None
+    needle = pattern if case_sensitive else pattern.lower()
+    if regex:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            matcher = re.compile(pattern, flags)
+        except re.error as exc:
+            return {"ok": False, "error": f"invalid_regex: {exc}", "matches": []}
+
+    matches: list[dict[str, Any]] = []
+    scanned_paths: list[str] = []
+    for rel_path in scoped_paths:
+        if len(matches) >= max_matches:
+            break
+        path = _safe_project_file(project_root, rel_path)
+        if path is None:
+            continue
+        try:
+            if path.stat().st_size > MAX_GREP_FILE_BYTES:
+                continue
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        scanned_paths.append(rel_path)
+        for line_no, line in enumerate(lines, start=1):
+            haystack = line if case_sensitive else line.lower()
+            found = bool(matcher.search(line)) if matcher else needle in haystack
+            if not found:
+                continue
+            matches.append({
+                "path": rel_path,
+                "line_no": line_no,
+                "line": _truncate_text(line.strip(), 600),
+            })
+            if len(matches) >= max_matches:
+                break
+    payload = {
+        "ok": True,
+        "pattern": pattern,
+        "regex": bool(regex),
+        "case_sensitive": bool(case_sensitive),
+        "scanned_paths": scanned_paths,
+        "matches": matches,
+        "match_count": len(matches),
+        "truncated": len(matches) >= max_matches,
+    }
+    payload["matches_excerpt"] = _truncate_text(_json(matches), max_chars)
+    return payload
+
+
+def _feedback_keyword_patterns(item: dict[str, Any], *, limit: int = 4) -> list[str]:
+    text = " ".join([
+        str(item.get("issue") or ""),
+        str(item.get("suggested_action") or ""),
+        str(item.get("target_id") or ""),
+        str(((item.get("evidence") or {}).get("raw_issue") or {}).get("summary") or ""),
+    ])
+    candidates: list[str] = []
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{4,}", text):
+        if token.lower() in {"false", "true", "none", "graph", "node", "feature", "should"}:
+            continue
+        if token not in candidates:
+            candidates.append(token)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def build_feedback_retrieval_context(
+    project_id: str,
+    snapshot_id: str,
+    item: dict[str, Any],
+    *,
+    project_root: str | Path | None = None,
+    grep_patterns: list[str] | None = None,
+    max_grep_matches: int = 12,
+    max_chars: int = 12000,
+) -> dict[str, Any]:
+    """Precompute safe graph/grep/read results for an AI reviewer."""
+    source_node_ids = _source_nodes(item)
+    graph_context = graph_query_context(
+        project_id,
+        snapshot_id,
+        node_ids=source_node_ids,
+        depth=1,
+    )
+    scoped_paths = _node_scope_paths([
+        node
+        for node in _graph_nodes_by_id(project_id, snapshot_id).values()
+        if str(node.get("id") or "") in set(source_node_ids)
+    ])
+    patterns = [str(pattern) for pattern in (grep_patterns or []) if str(pattern or "").strip()]
+    if not patterns:
+        patterns = _feedback_keyword_patterns(item)
+    grep_results = [
+        grep_in_scope(
+            project_id,
+            snapshot_id,
+            project_root=project_root,
+            pattern=pattern,
+            paths=scoped_paths,
+            max_matches=max_grep_matches,
+            max_chars=max(1000, int(max_chars / max(1, len(patterns) or 1))),
+        )
+        for pattern in patterns[:6]
+    ]
+    return {
+        "tool_contract": {
+            "mode": "read_only",
+            "allowed_tools": ["graph_query", "grep_in_scope", "read_excerpt"],
+            "root_scope": "project_root_only",
+            "limits": {
+                "max_grep_pattern_chars": MAX_GREP_PATTERN_CHARS,
+                "max_grep_file_bytes": MAX_GREP_FILE_BYTES,
+                "max_read_excerpt_lines": MAX_READ_EXCERPT_LINES,
+            },
+        },
+        "graph_query": graph_context,
+        "grep_results": grep_results,
+        "scoped_paths": scoped_paths,
+    }
+
+
 def _build_review_context(
     project_id: str,
     snapshot_id: str,
@@ -226,6 +533,8 @@ def _build_review_context(
     *,
     project_root: str | Path | None = None,
     max_excerpt_chars: int = 6000,
+    enable_read_tools: bool = True,
+    grep_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     semantic_state = _read_json(semantic_graph_state_path(project_id, snapshot_id), {})
     node_semantics = semantic_state.get("node_semantics") if isinstance(semantic_state, dict) else {}
@@ -313,7 +622,7 @@ def _build_review_context(
         if len(symbol_excerpts) >= 4:
             break
 
-    return {
+    context = {
         "snapshot_id": snapshot_id,
         "source_node_ids": source_node_ids,
         "source_nodes": source_nodes,
@@ -325,6 +634,16 @@ def _build_review_context(
         "file_excerpts": excerpts,
         "symbol_excerpts": symbol_excerpts,
     }
+    if enable_read_tools:
+        context["read_tools"] = build_feedback_retrieval_context(
+            project_id,
+            snapshot_id,
+            item,
+            project_root=project_root,
+            grep_patterns=grep_patterns,
+            max_chars=max_excerpt_chars,
+        )
+    return context
 
 
 def _new_state(project_id: str, snapshot_id: str) -> dict[str, Any]:
@@ -439,6 +758,26 @@ def _queue_action_hint(lane: str) -> str:
     return "no_action"
 
 
+def _active_review_claim(item: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    claim = item.get("review_claim") if isinstance(item.get("review_claim"), dict) else {}
+    if not claim:
+        return {}
+    if str(item.get("status") or "") != STATUS_CLASSIFIED:
+        return {}
+    expires = _parse_utc(claim.get("lease_expires_at"))
+    now = now or datetime.now(timezone.utc)
+    if expires is None or expires <= now:
+        return {}
+    return dict(claim)
+
+
+def _claim_visible_to_worker(item: dict[str, Any], worker_id: str = "") -> bool:
+    claim = _active_review_claim(item)
+    if not claim:
+        return True
+    return bool(worker_id and str(claim.get("worker_id") or "") == worker_id)
+
+
 def build_feedback_review_queue(
     project_id: str,
     snapshot_id: str,
@@ -451,6 +790,9 @@ def build_feedback_review_queue(
     group_by: str = "target",
     include_status_observations: bool = False,
     include_resolved: bool = False,
+    include_claimed: bool = True,
+    claimable_only: bool = False,
+    worker_id: str = "",
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Return a dashboard-safe, grouped projection over raw feedback items.
@@ -482,6 +824,7 @@ def build_feedback_review_queue(
     by_lane_all: dict[str, int] = {}
     hidden_status = 0
     hidden_resolved = 0
+    hidden_claimed = 0
     groups: dict[str, dict[str, Any]] = {}
 
     for item in raw_items:
@@ -498,6 +841,13 @@ def build_feedback_review_queue(
             continue
         if item_lane == "resolved" and not include_resolved:
             hidden_resolved += 1
+            continue
+        active_claim = _active_review_claim(item)
+        if active_claim and claimable_only and not _claim_visible_to_worker(item, worker_id):
+            hidden_claimed += 1
+            continue
+        if active_claim and not include_claimed and not _claim_visible_to_worker(item, worker_id):
+            hidden_claimed += 1
             continue
 
         key = _queue_group_key(item, item_lane, group_by=group_by)
@@ -531,6 +881,8 @@ def build_feedback_review_queue(
                 "feedback_ids": [],
                 "item_count": 0,
                 "suppressed_count": 0,
+                "active_claim_count": 0,
+                "claim": {},
                 "requires_human_signoff": bool(item.get("requires_human_signoff")),
                 "confidence": float(item.get("confidence") or 0.0),
                 "created_at": str(item.get("created_at") or ""),
@@ -556,6 +908,9 @@ def build_feedback_review_queue(
             counts[issue_type] = int(counts.get(issue_type) or 0) + 1
         group["item_count"] = int(group.get("item_count") or 0) + 1
         group["suppressed_count"] = max(0, int(group["item_count"]) - 1)
+        if active_claim:
+            group["active_claim_count"] = int(group.get("active_claim_count") or 0) + 1
+            group["claim"] = active_claim
         group["requires_human_signoff"] = bool(group.get("requires_human_signoff") or item.get("requires_human_signoff"))
         group["updated_at"] = max(str(group.get("updated_at") or ""), str(item.get("updated_at") or ""))
 
@@ -586,6 +941,7 @@ def build_feedback_review_queue(
             "visible_item_count": sum(int(group.get("item_count") or 0) for group in grouped),
             "hidden_status_observation_count": hidden_status,
             "hidden_resolved_count": hidden_resolved,
+            "hidden_claimed_count": hidden_claimed,
             "by_kind": dict(sorted(by_kind.items())),
             "by_status": dict(sorted(by_status.items())),
             "by_lane_all_items": dict(sorted(by_lane_all.items())),
@@ -593,6 +949,118 @@ def build_feedback_review_queue(
         },
         "groups": grouped,
         "count": len(grouped),
+    }
+
+
+def claim_feedback_review_queue(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    worker_id: str,
+    feedback_kind: str = "",
+    status: str = STATUS_CLASSIFIED,
+    node_id: str = "",
+    source_round: str = "",
+    lane: str = "",
+    group_by: str = "feature",
+    include_status_observations: bool = False,
+    include_resolved: bool = False,
+    limit_groups: int = 1,
+    max_items: int = 25,
+    lease_seconds: int = DEFAULT_REVIEW_LEASE_SECONDS,
+    actor: str = "observer",
+) -> dict[str, Any]:
+    """Claim queue items for a worker using per-item lease metadata."""
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        raise ValueError("worker_id is required")
+    lease_seconds = max(30, min(int(lease_seconds or DEFAULT_REVIEW_LEASE_SECONDS), 24 * 60 * 60))
+    queue = build_feedback_review_queue(
+        project_id,
+        snapshot_id,
+        feedback_kind=feedback_kind,
+        status=status,
+        node_id=node_id,
+        source_round=source_round,
+        lane=lane,
+        group_by=group_by,
+        include_status_observations=include_status_observations,
+        include_resolved=include_resolved,
+        include_claimed=False,
+        claimable_only=True,
+        worker_id=worker_id,
+        limit=limit_groups,
+    )
+    feedback_ids: list[str] = []
+    selected_groups: list[dict[str, Any]] = []
+    for group in queue.get("groups") or []:
+        group_ids: list[str] = []
+        for feedback_id in group.get("feedback_ids") or []:
+            feedback_id = str(feedback_id or "").strip()
+            if not feedback_id or feedback_id in feedback_ids:
+                continue
+            feedback_ids.append(feedback_id)
+            group_ids.append(feedback_id)
+            if max_items and len(feedback_ids) >= max_items:
+                break
+        if group_ids:
+            selected = dict(group)
+            selected["claimed_feedback_ids"] = group_ids
+            selected_groups.append(selected)
+        if max_items and len(feedback_ids) >= max_items:
+            break
+
+    state = load_feedback_state(project_id, snapshot_id)
+    existing = state.setdefault("items", {})
+    now = _utc_now()
+    now_dt = _parse_utc(now) or datetime.now(timezone.utc)
+    lease_expires = (
+        now_dt.timestamp() + lease_seconds
+    )
+    lease_expires_at = datetime.fromtimestamp(lease_expires, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    claim_id = f"fqc-{uuid.uuid4().hex[:10]}"
+    claimed_items: list[dict[str, Any]] = []
+    for feedback_id in feedback_ids:
+        item = dict(existing.get(feedback_id) or {})
+        if not item or not _claim_visible_to_worker(item, worker_id):
+            continue
+        item["review_claim"] = {
+            "claim_id": claim_id,
+            "worker_id": worker_id,
+            "claimed_by": actor,
+            "claimed_at": now,
+            "lease_expires_at": lease_expires_at,
+            "lease_seconds": lease_seconds,
+        }
+        claimed_items.append(item)
+    result = _upsert_items(
+        project_id,
+        snapshot_id,
+        claimed_items,
+        event_type="feedback.review_claimed",
+        actor=actor,
+    ) if claimed_items else {
+        "ok": True,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "created": 0,
+        "updated": 0,
+        "count": 0,
+        "items": [],
+    }
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "claim_id": claim_id,
+        "worker_id": worker_id,
+        "lease_expires_at": lease_expires_at,
+        "queue_summary": queue.get("summary", {}),
+        "group_count": len(selected_groups),
+        "selected_groups": selected_groups,
+        "feedback_ids": [item.get("feedback_id") for item in claimed_items],
+        "claimed_count": len(claimed_items),
+        "claim_result": result,
     }
 
 
@@ -1207,6 +1675,8 @@ def review_feedback_item(
     ai_call: ReviewerAiCall | None = None,
     project_root: str | Path | None = None,
     max_context_chars: int = 6000,
+    enable_read_tools: bool = True,
+    grep_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     state = load_feedback_state(project_id, snapshot_id)
     item = dict((state.get("items") or {}).get(feedback_id) or {})
@@ -1249,6 +1719,8 @@ def review_feedback_item(
                 item,
                 project_root=project_root,
                 max_excerpt_chars=max_context_chars,
+                enable_read_tools=enable_read_tools,
+                grep_patterns=grep_patterns,
             ),
         }
         ai_review = _parse_ai_review(ai_call("reconcile_feedback_review", payload) or {})
@@ -1298,6 +1770,11 @@ def review_feedback_item(
         if accept:
             item["accepted_by"] = actor
             item["accepted_at"] = now
+    claim = item.get("review_claim") if isinstance(item.get("review_claim"), dict) else {}
+    if claim:
+        claim["completed_at"] = now
+        claim["completed_by"] = actor
+        item["review_claim"] = claim
 
     return _upsert_items(
         project_id,
@@ -1422,6 +1899,11 @@ __all__ = [
     "classify_semantic_open_issues",
     "classify_semantic_state_rounds",
     "build_feedback_review_queue",
+    "claim_feedback_review_queue",
+    "build_feedback_retrieval_context",
+    "graph_query_context",
+    "grep_in_scope",
+    "read_project_excerpt",
     "infer_status_observation_category",
     "list_feedback_items",
     "load_feedback_state",
