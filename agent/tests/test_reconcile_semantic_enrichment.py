@@ -13,6 +13,7 @@ from agent.governance.reconcile_semantic_enrichment import (
     _batch_key,
     _semantic_batch_memory_summary,
     append_review_feedback,
+    claim_semantic_jobs,
     load_review_feedback,
     run_semantic_enrichment,
 )
@@ -30,6 +31,55 @@ def test_semantic_batch_key_prefers_hierarchy_parent_for_feature_groups():
     }
 
     assert _batch_key(feature, "subsystem") == "L3.19"
+
+
+def test_semantic_jobs_can_be_claimed_with_worker_lease(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+
+    run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=False,
+    )
+
+    first = claim_semantic_jobs(
+        conn,
+        PID,
+        "full-semantic-test",
+        worker_id="semantic-worker-1",
+        limit=1,
+        lease_seconds=300,
+    )
+    assert first["claimed_count"] == 1
+    assert first["jobs"][0]["status"] == "running"
+    assert first["jobs"][0]["worker_id"] == "semantic-worker-1"
+    assert first["jobs"][0]["lease_expires_at"]
+
+    second = claim_semantic_jobs(
+        conn,
+        PID,
+        "full-semantic-test",
+        worker_id="semantic-worker-2",
+        limit=1,
+        lease_seconds=300,
+    )
+    assert second["claimed_count"] == 0
+
+    row = conn.execute(
+        """
+        SELECT status, worker_id, claim_id, lease_expires_at, attempt_count
+        FROM graph_semantic_jobs
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-test", "L7.1"),
+    ).fetchone()
+    assert row["status"] == "running"
+    assert row["worker_id"] == "semantic-worker-1"
+    assert row["claim_id"] == first["claim_id"]
+    assert row["attempt_count"] == 1
 
 
 @pytest.fixture()

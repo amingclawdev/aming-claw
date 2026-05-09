@@ -12,6 +12,8 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -64,6 +66,11 @@ CREATE TABLE IF NOT EXISTS graph_semantic_jobs (
   feedback_round INTEGER NOT NULL DEFAULT 0,
   batch_index INTEGER,
   attempt_count INTEGER NOT NULL DEFAULT 0,
+  worker_id TEXT NOT NULL DEFAULT '',
+  claim_id TEXT NOT NULL DEFAULT '',
+  claimed_at TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT NOT NULL DEFAULT '',
+  claimed_by TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT '',
@@ -77,6 +84,43 @@ CREATE INDEX IF NOT EXISTS idx_graph_semantic_jobs_status
 
 def _ensure_semantic_state_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SEMANTIC_STATE_SCHEMA_SQL)
+    _ensure_semantic_jobs_claim_columns(conn)
+
+
+def _semantic_write_lock():
+    try:
+        from .db import sqlite_write_lock
+
+        return sqlite_write_lock()
+    except Exception:
+        return nullcontext()
+
+
+def _commit_semantic_write(conn: sqlite3.Connection) -> None:
+    try:
+        conn.commit()
+    except sqlite3.ProgrammingError:
+        raise
+    except Exception:
+        # Some unit tests use in-memory connections with explicit transaction
+        # ownership.  The write itself is still protected by the process lock.
+        pass
+
+
+def _ensure_semantic_jobs_claim_columns(conn: sqlite3.Connection) -> None:
+    try:
+        rows = conn.execute("PRAGMA table_info(graph_semantic_jobs)").fetchall()
+    except sqlite3.OperationalError:
+        return
+    existing = {
+        (row["name"] if hasattr(row, "keys") else row[1])
+        for row in rows
+    }
+    for name in ("worker_id", "claim_id", "claimed_at", "lease_expires_at", "claimed_by"):
+        if name not in existing:
+            conn.execute(
+                f"ALTER TABLE graph_semantic_jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
 
 
 def _string_list(raw: Any) -> list[str]:
@@ -167,14 +211,16 @@ def _update_snapshot_notes(
         raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
     notes = _decode_notes(snapshot.get("notes"))
     notes.update(patch)
-    conn.execute(
-        """
-        UPDATE graph_snapshots
-        SET notes = ?
-        WHERE project_id = ? AND snapshot_id = ?
-        """,
-        (_json(notes), project_id, snapshot_id),
-    )
+    with _semantic_write_lock():
+        conn.execute(
+            """
+            UPDATE graph_snapshots
+            SET notes = ?
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (_json(notes), project_id, snapshot_id),
+        )
+        _commit_semantic_write(conn)
     return notes
 
 
@@ -998,7 +1044,8 @@ def _load_semantic_graph_state_from_db(
     job_rows = conn.execute(
         """
         SELECT node_id, status, feature_hash, file_hashes_json, feedback_round,
-               batch_index, attempt_count, last_error, updated_at, created_at
+               batch_index, attempt_count, worker_id, claim_id, claimed_at,
+               lease_expires_at, claimed_by, last_error, updated_at, created_at
         FROM graph_semantic_jobs
         WHERE project_id = ? AND snapshot_id = ?
         ORDER BY node_id
@@ -1019,6 +1066,11 @@ def _load_semantic_graph_state_from_db(
             "feedback_round": int(row["feedback_round"] or 0),
             "batch_index": row["batch_index"],
             "attempt_count": int(row["attempt_count"] or 0),
+            "worker_id": str(row["worker_id"] or ""),
+            "claim_id": str(row["claim_id"] or ""),
+            "claimed_at": str(row["claimed_at"] or ""),
+            "lease_expires_at": str(row["lease_expires_at"] or ""),
+            "claimed_by": str(row["claimed_by"] or ""),
             "last_error": str(row["last_error"] or ""),
             "updated_at": str(row["updated_at"] or ""),
             "created_at": str(row["created_at"] or ""),
@@ -1077,8 +1129,9 @@ def _persist_semantic_state_to_db(
             INSERT INTO graph_semantic_jobs
               (project_id, snapshot_id, node_id, status, feature_hash,
                file_hashes_json, feedback_round, batch_index, attempt_count,
+               worker_id, claim_id, claimed_at, lease_expires_at, claimed_by,
                last_error, updated_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, snapshot_id, node_id) DO UPDATE SET
               status = excluded.status,
               feature_hash = excluded.feature_hash,
@@ -1086,6 +1139,11 @@ def _persist_semantic_state_to_db(
               feedback_round = excluded.feedback_round,
               batch_index = excluded.batch_index,
               attempt_count = excluded.attempt_count,
+              worker_id = excluded.worker_id,
+              claim_id = excluded.claim_id,
+              claimed_at = excluded.claimed_at,
+              lease_expires_at = excluded.lease_expires_at,
+              claimed_by = excluded.claimed_by,
               last_error = excluded.last_error,
               updated_at = excluded.updated_at
             """,
@@ -1099,6 +1157,11 @@ def _persist_semantic_state_to_db(
                 int(raw_job.get("feedback_round") or 0),
                 raw_job.get("batch_index"),
                 int(raw_job.get("attempt_count") or 0),
+                str(raw_job.get("worker_id") or ""),
+                str(raw_job.get("claim_id") or ""),
+                str(raw_job.get("claimed_at") or ""),
+                str(raw_job.get("lease_expires_at") or ""),
+                str(raw_job.get("claimed_by") or ""),
                 str(raw_job.get("last_error") or ""),
                 str(raw_job.get("updated_at") or state.get("updated_at") or ""),
                 str(raw_job.get("created_at") or raw_job.get("updated_at") or state.get("updated_at") or ""),
@@ -1120,7 +1183,9 @@ def _load_semantic_graph_state_source(
     # semantic state. After this point DB rows are the source of truth.
     companion_state = _load_semantic_graph_state(project_id, snapshot_id, snapshot)
     if companion_state.get("node_semantics") or companion_state.get("semantic_jobs"):
-        _persist_semantic_state_to_db(conn, project_id, snapshot_id, companion_state)
+        with _semantic_write_lock():
+            _persist_semantic_state_to_db(conn, project_id, snapshot_id, companion_state)
+            _commit_semantic_write(conn)
         companion_state["source"] = "imported_companion"
         return companion_state
     state["source"] = "db_empty"
@@ -1148,6 +1213,7 @@ def _upsert_semantic_job(
     existing = jobs.get(node_id) if isinstance(jobs.get(node_id), dict) else {}
     attempt_count = int(existing.get("attempt_count") or 0) + (1 if increment_attempt else 0)
     now = updated_at
+    keep_claim = status == "running"
     jobs[node_id] = {
         "node_id": node_id,
         "status": status,
@@ -1156,12 +1222,165 @@ def _upsert_semantic_job(
         "feedback_round": int(feedback_round or 0),
         "batch_index": batch_index,
         "attempt_count": attempt_count,
+        "worker_id": str(existing.get("worker_id") or "") if keep_claim else "",
+        "claim_id": str(existing.get("claim_id") or "") if keep_claim else "",
+        "claimed_at": str(existing.get("claimed_at") or "") if keep_claim else "",
+        "lease_expires_at": str(existing.get("lease_expires_at") or "") if keep_claim else "",
+        "claimed_by": str(existing.get("claimed_by") or "") if keep_claim else "",
         "last_error": last_error,
         "updated_at": now,
         "created_at": existing.get("created_at") or now,
     }
     state["updated_at"] = now
     _rebuild_semantic_graph_state_indexes(state)
+
+
+def _parse_utc(raw: Any) -> datetime | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _semantic_job_claim_visible(row: sqlite3.Row, worker_id: str, now: str) -> bool:
+    lease = str(row["lease_expires_at"] or "")
+    owner = str(row["worker_id"] or "")
+    if not lease:
+        return True
+    expires = _parse_utc(lease)
+    if expires is None:
+        return True
+    if expires <= _parse_utc(now):
+        return True
+    return bool(worker_id and owner == worker_id)
+
+
+def claim_semantic_jobs(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    worker_id: str,
+    statuses: list[str] | tuple[str, ...] | None = None,
+    limit: int = 10,
+    lease_seconds: int = 1800,
+    actor: str = "observer",
+) -> dict[str, Any]:
+    """Claim semantic AI jobs using short DB writes and per-row leases.
+
+    This is the concurrency-safe primitive for executor-backed semantic
+    runners.  Model calls should happen after this returns, outside the DB lock.
+    """
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        raise ValueError("worker_id is required")
+    _ensure_semantic_state_schema(conn)
+    allowed_statuses = [
+        str(item or "").strip()
+        for item in (statuses or ("pending_ai", "ai_pending", "ai_failed"))
+        if str(item or "").strip()
+    ]
+    if not allowed_statuses:
+        allowed_statuses = ["pending_ai", "ai_pending", "ai_failed"]
+    limit = max(1, min(int(limit or 10), 500))
+    lease_seconds = max(30, min(int(lease_seconds or 1800), 24 * 60 * 60))
+    now = utc_now()
+    now_dt = _parse_utc(now) or datetime.now(timezone.utc)
+    lease_expires_at = (
+        now_dt + timedelta(seconds=lease_seconds)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    placeholders = ",".join("?" for _ in allowed_statuses)
+    claim_id = f"sjc-{uuid.uuid4().hex[:10]}"
+    with _semantic_write_lock():
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM graph_semantic_jobs
+            WHERE project_id = ?
+              AND snapshot_id = ?
+              AND status IN ({placeholders})
+            ORDER BY updated_at, node_id
+            LIMIT ?
+            """,
+            (project_id, snapshot_id, *allowed_statuses, limit * 3),
+        ).fetchall()
+        claimed: list[dict[str, Any]] = []
+        for row in rows:
+            if len(claimed) >= limit:
+                break
+            if not _semantic_job_claim_visible(row, worker_id, now):
+                continue
+            cur = conn.execute(
+                """
+                UPDATE graph_semantic_jobs
+                SET status = ?,
+                    worker_id = ?,
+                    claim_id = ?,
+                    claimed_at = ?,
+                    lease_expires_at = ?,
+                    claimed_by = ?,
+                    attempt_count = attempt_count + 1,
+                    updated_at = ?
+                WHERE project_id = ?
+                  AND snapshot_id = ?
+                  AND node_id = ?
+                  AND status = ?
+                  AND (
+                    lease_expires_at = ''
+                    OR lease_expires_at <= ?
+                    OR worker_id = ?
+                  )
+                """,
+                (
+                    "running",
+                    worker_id,
+                    claim_id,
+                    now,
+                    lease_expires_at,
+                    str(actor or worker_id),
+                    now,
+                    project_id,
+                    snapshot_id,
+                    str(row["node_id"] or ""),
+                    str(row["status"] or ""),
+                    now,
+                    worker_id,
+                ),
+            )
+            if int(cur.rowcount or 0) != 1:
+                continue
+            try:
+                file_hashes = json.loads(row["file_hashes_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                file_hashes = {}
+            claimed.append({
+                "node_id": str(row["node_id"] or ""),
+                "previous_status": str(row["status"] or ""),
+                "status": "running",
+                "feature_hash": str(row["feature_hash"] or ""),
+                "file_hashes": file_hashes if isinstance(file_hashes, dict) else {},
+                "feedback_round": int(row["feedback_round"] or 0),
+                "batch_index": row["batch_index"],
+                "attempt_count": int(row["attempt_count"] or 0) + 1,
+                "worker_id": worker_id,
+                "claim_id": claim_id,
+                "claimed_at": now,
+                "lease_expires_at": lease_expires_at,
+            })
+        _commit_semantic_write(conn)
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "worker_id": worker_id,
+        "claim_id": claim_id,
+        "lease_expires_at": lease_expires_at,
+        "claimed_count": len(claimed),
+        "jobs": claimed,
+    }
 
 
 def _carry_forward_semantic_graph_state(
@@ -1605,7 +1824,9 @@ def _write_semantic_graph_state_artifacts(
     latest_graph_path = base / SEMANTIC_GRAPH_NAME
     round_state_path = rdir / SEMANTIC_GRAPH_STATE_NAME
     round_graph_path = rdir / SEMANTIC_GRAPH_NAME
-    _persist_semantic_state_to_db(conn, project_id, snapshot_id, state)
+    with _semantic_write_lock():
+        _persist_semantic_state_to_db(conn, project_id, snapshot_id, state)
+        _commit_semantic_write(conn)
     semantic_graph = _materialize_semantic_graph(
         graph_json,
         state,
@@ -2607,6 +2828,7 @@ def _count_quality_flags(features: list[dict[str, Any]]) -> dict[str, int]:
 __all__ = [
     "SEMANTIC_ENRICHMENT_SCHEMA_VERSION",
     "append_review_feedback",
+    "claim_semantic_jobs",
     "feedback_review_gate",
     "load_review_feedback",
     "normalize_feedback_item",

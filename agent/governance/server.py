@@ -3553,7 +3553,6 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     root = _graph_governance_project_root(project_id, body)
     from . import reconcile_semantic_enrichment as semantic
     from . import reconcile_feedback
-    from .db import sqlite_write_lock
     semantic_use_ai = _semantic_use_ai_from_body(body)
     semantic_mode = _automation_mode_from_body(
         body,
@@ -3581,70 +3580,130 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic-enrich")
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
-        with sqlite_write_lock():
-            try:
-                result = semantic.run_semantic_enrichment(
-                    conn,
-                    project_id,
-                    snapshot_id,
-                    root,
-                    feedback_items=feedback_items,
-                    feedback_round=body.get("feedback_round"),
-                    use_ai=semantic_use_ai,
-                    ai_call=semantic_ai_call,
-                    created_by=str(body.get("actor") or "observer"),
-                    max_excerpt_chars=(
-                        int(body["max_excerpt_chars"])
-                        if body.get("max_excerpt_chars") is not None
-                        else None
-                    ),
-                    ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
-                    **_semantic_ai_batch_kwargs_from_body(body),
-                    **_semantic_state_kwargs_from_body(body),
-                    **_semantic_ai_config_kwargs_from_body(body),
-                    **_semantic_selector_kwargs_from_body(body),
-                    semantic_config_path=body.get("semantic_config_path"),
-                )
-            except (KeyError, ValueError) as exc:
-                _raise_graph_api_validation(exc)
-            result.setdefault("automation", {})
-            result["automation"].update({
-                "semantic_mode": semantic_mode,
-                "feedback_review_mode": feedback_review_mode,
-            })
-            if feedback_review_mode in {"enqueue_only", "auto"}:
-                review_gate = semantic.feedback_review_gate(
-                    result.get("summary") or {},
-                    allow_heuristic_feedback_review=bool(body.get("allow_heuristic_feedback_review")),
-                )
-                if not review_gate.get("allowed"):
-                    result["feedback_queue"] = {
-                        "mode": feedback_review_mode,
-                        "blocked": True,
-                        "gate": review_gate,
-                    }
-                    conn.commit()
-                    return {"ok": True, **result}
-                round_label = f"round-{int(result.get('feedback_round') or 0):03d}"
-                classified = reconcile_feedback.classify_semantic_open_issues(
-                    project_id,
-                    snapshot_id,
-                    source_round=round_label,
-                    created_by=str(body.get("actor") or "observer"),
-                    limit=(
-                        int(body["feedback_classify_limit"])
-                        if body.get("feedback_classify_limit") is not None
-                        else None
-                    ),
-                    base_snapshot_id=str(body.get("semantic_base_snapshot_id") or body.get("base_snapshot_id") or ""),
-                )
+        try:
+            result = semantic.run_semantic_enrichment(
+                conn,
+                project_id,
+                snapshot_id,
+                root,
+                feedback_items=feedback_items,
+                feedback_round=body.get("feedback_round"),
+                use_ai=semantic_use_ai,
+                ai_call=semantic_ai_call,
+                created_by=str(body.get("actor") or "observer"),
+                max_excerpt_chars=(
+                    int(body["max_excerpt_chars"])
+                    if body.get("max_excerpt_chars") is not None
+                    else None
+                ),
+                ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                **_semantic_ai_batch_kwargs_from_body(body),
+                **_semantic_state_kwargs_from_body(body),
+                **_semantic_ai_config_kwargs_from_body(body),
+                **_semantic_selector_kwargs_from_body(body),
+                semantic_config_path=body.get("semantic_config_path"),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        result.setdefault("automation", {})
+        result["automation"].update({
+            "semantic_mode": semantic_mode,
+            "feedback_review_mode": feedback_review_mode,
+        })
+        if feedback_review_mode in {"enqueue_only", "auto"}:
+            review_gate = semantic.feedback_review_gate(
+                result.get("summary") or {},
+                allow_heuristic_feedback_review=bool(body.get("allow_heuristic_feedback_review")),
+            )
+            if not review_gate.get("allowed"):
                 result["feedback_queue"] = {
                     "mode": feedback_review_mode,
-                    "source_round": round_label,
-                    "classification": classified,
+                    "blocked": True,
+                    "gate": review_gate,
                 }
-            conn.commit()
+                conn.commit()
+                return {"ok": True, **result}
+            round_label = f"round-{int(result.get('feedback_round') or 0):03d}"
+            classified = reconcile_feedback.classify_semantic_open_issues(
+                project_id,
+                snapshot_id,
+                source_round=round_label,
+                created_by=str(body.get("actor") or "observer"),
+                limit=(
+                    int(body["feedback_classify_limit"])
+                    if body.get("feedback_classify_limit") is not None
+                    else None
+                ),
+                base_snapshot_id=str(body.get("semantic_base_snapshot_id") or body.get("base_snapshot_id") or ""),
+            )
+            result["feedback_queue"] = {
+                "mode": feedback_review_mode,
+                "source_round": round_label,
+                "classification": classified,
+            }
+        conn.commit()
         return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/queue/claim")
+def handle_graph_governance_snapshot_semantic_queue_claim(ctx: RequestContext):
+    """Claim semantic AI jobs for an executor-backed runner."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import reconcile_semantic_enrichment as semantic
+    from .errors import ValidationError
+
+    worker_id = str(body.get("worker_id") or body.get("semantic_worker_id") or "").strip()
+    if not worker_id:
+        raise ValidationError("worker_id is required")
+    limit = int(body.get("limit") or body.get("job_limit") or 10)
+    if limit < 0:
+        raise ValidationError("limit must be non-negative")
+    raw_statuses = body.get("statuses") or body.get("status") or None
+    if isinstance(raw_statuses, str):
+        statuses = [raw_statuses]
+    elif isinstance(raw_statuses, list):
+        statuses = [str(item or "") for item in raw_statuses]
+    else:
+        statuses = None
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.queue.claim")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        try:
+            result = semantic.claim_semantic_jobs(
+                conn,
+                project_id,
+                snapshot_id,
+                worker_id=worker_id,
+                statuses=statuses,
+                limit=limit,
+                lease_seconds=int(body.get("lease_seconds") or body.get("claim_lease_seconds") or 1800),
+                actor=str(body.get("actor") or worker_id),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_semantic_jobs_claimed",
+                actor=str(body.get("actor") or worker_id),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "worker_id": worker_id,
+                    "claim_id": result.get("claim_id", ""),
+                    "claimed_count": result.get("claimed_count", 0),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return result
     finally:
         conn.close()
 

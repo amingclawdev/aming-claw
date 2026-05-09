@@ -32,7 +32,8 @@ from agent.governance.graph_snapshot_store import (
     snapshot_id_for,
     waive_pending_scope_reconcile,
 )
-from agent.governance.governance_index import build_and_persist_governance_index
+from agent.governance.db import sqlite_write_lock
+from agent.governance.governance_index import build_governance_index, persist_governance_index
 from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
 from agent.governance.reconcile_trace import ReconcileTrace, artifact_ref
 from agent.governance.reconcile_phases.phase_z_v2 import (
@@ -431,19 +432,51 @@ def run_state_only_full_reconcile(
         "trace_dir": str(trace.trace_dir),
         "summary_path": str(trace.trace_dir / "summary.json"),
     }
-    snapshot = create_graph_snapshot(
+    governance_index = build_governance_index(
         conn,
         project_id,
-        snapshot_id=sid,
+        root,
+        run_id=rid,
         commit_sha=commit,
+        candidate_graph=candidate_graph,
+        snapshot_id=sid,
         snapshot_kind=snapshot_kind,
-        graph_json=candidate_graph,
         file_inventory=file_inventory,
-        drift_ledger=[],
-        status=SNAPSHOT_STATUS_CANDIDATE,
-        created_by=created_by,
-        notes=json.dumps(notes, ensure_ascii=False, sort_keys=True),
     )
+    with sqlite_write_lock():
+        snapshot = create_graph_snapshot(
+            conn,
+            project_id,
+            snapshot_id=sid,
+            commit_sha=commit,
+            snapshot_kind=snapshot_kind,
+            graph_json=candidate_graph,
+            file_inventory=file_inventory,
+            drift_ledger=[],
+            status=SNAPSHOT_STATUS_CANDIDATE,
+            created_by=created_by,
+            notes=json.dumps(notes, ensure_ascii=False, sort_keys=True),
+        )
+        index_counts = index_graph_snapshot(
+            conn,
+            project_id,
+            sid,
+            nodes=nodes,
+            edges=edges,
+        )
+        governance_index_summary = persist_governance_index(
+            conn,
+            project_id,
+            governance_index,
+            persist_inventory=True,
+        )
+        notes["governance_index"] = governance_index_summary
+        conn.execute(
+            "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+            (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+        )
+        conn.commit()
+    governance_index = {**governance_index, "persist_summary": governance_index_summary}
     trace.step(
         "create-graph-snapshot",
         input_payload={
@@ -460,13 +493,6 @@ def run_state_only_full_reconcile(
             "snapshot_artifact": artifact_ref(snapshot_graph_path(project_id, sid)),
         },
     )
-    index_counts = index_graph_snapshot(
-        conn,
-        project_id,
-        sid,
-        nodes=nodes,
-        edges=edges,
-    )
     trace.step(
         "index-graph-snapshot",
         input_payload={
@@ -476,19 +502,6 @@ def run_state_only_full_reconcile(
         },
         output_payload={"index_counts": index_counts},
     )
-    governance_index = build_and_persist_governance_index(
-        conn,
-        project_id,
-        root,
-        run_id=rid,
-        commit_sha=commit,
-        candidate_graph=candidate_graph,
-        snapshot_id=sid,
-        snapshot_kind=snapshot_kind,
-        file_inventory=file_inventory,
-        persist_inventory=True,
-    )
-    governance_index_summary = governance_index.get("persist_summary") or {}
     trace.step(
         "build-governance-index",
         input_payload={
@@ -500,11 +513,6 @@ def run_state_only_full_reconcile(
             "summary": governance_index_summary,
             "artifacts": governance_index_summary.get("artifacts") or {},
         },
-    )
-    notes["governance_index"] = governance_index_summary
-    conn.execute(
-        "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
-        (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
     )
     semantic_enrichment: dict[str, Any] = {}
     if semantic_enrich:
@@ -598,12 +606,14 @@ def run_state_only_full_reconcile(
     )
     activation = None
     if activate:
-        activation = activate_graph_snapshot(
-            conn,
-            project_id,
-            sid,
-            expected_old_snapshot_id=expected_old_snapshot_id,
-        )
+        with sqlite_write_lock():
+            activation = activate_graph_snapshot(
+                conn,
+                project_id,
+                sid,
+                expected_old_snapshot_id=expected_old_snapshot_id,
+            )
+            conn.commit()
         trace.step(
             "activate-snapshot",
             input_payload={
@@ -842,14 +852,6 @@ def run_pending_scope_reconcile_candidate(
             "pending_count": len(pending),
             "covered_commit_shas": covered,
         }
-    updated = _update_pending_scope_candidate(
-        conn,
-        project_id,
-        covered_commit_shas=covered,
-        snapshot_id=sid,
-        target_commit_sha=target,
-        run_id=rid,
-    )
     scope_file_delta = _build_scope_file_delta(
         old_rows=active_inventory,
         new_rows=_snapshot_inventory_rows(conn, project_id, sid),
@@ -866,16 +868,26 @@ def run_pending_scope_reconcile_candidate(
         "SELECT notes FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
         (project_id, sid),
     ).fetchone()
-    if row:
-        try:
-            notes = json.loads(row["notes"] if hasattr(row, "keys") else row[0])
-        except Exception:
-            notes = {}
-        notes["pending_scope_reconcile"] = pending_notes
-        conn.execute(
-            "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
-            (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+    with sqlite_write_lock():
+        updated = _update_pending_scope_candidate(
+            conn,
+            project_id,
+            covered_commit_shas=covered,
+            snapshot_id=sid,
+            target_commit_sha=target,
+            run_id=rid,
         )
+        if row:
+            try:
+                notes = json.loads(row["notes"] if hasattr(row, "keys") else row[0])
+            except Exception:
+                notes = {}
+            notes["pending_scope_reconcile"] = pending_notes
+            conn.execute(
+                "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+                (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+            )
+        conn.commit()
     return {
         **result,
         "pending_count": len(pending),
@@ -955,25 +967,27 @@ def run_backfill_escape_hatch(
             "pending_scope_commits": pending_commits,
             "pending_scope_count": len(pending_commits),
         }
-    finalize = finalize_graph_snapshot(
-        conn,
-        project_id,
-        result["snapshot_id"],
-        target_commit_sha=target,
-        expected_old_snapshot_id=expected_old_snapshot_id,
-        actor=created_by,
-        materialize_pending=False,
-        evidence={"source": "backfill_escape_hatch", "reason": reason},
-    )
-    waiver = waive_pending_scope_reconcile(
-        conn,
-        project_id,
-        commit_shas=pending_commits,
-        snapshot_id=result["snapshot_id"],
-        actor=created_by,
-        reason=reason,
-        evidence={"source": "backfill_escape_hatch"},
-    )
+    with sqlite_write_lock():
+        finalize = finalize_graph_snapshot(
+            conn,
+            project_id,
+            result["snapshot_id"],
+            target_commit_sha=target,
+            expected_old_snapshot_id=expected_old_snapshot_id,
+            actor=created_by,
+            materialize_pending=False,
+            evidence={"source": "backfill_escape_hatch", "reason": reason},
+        )
+        waiver = waive_pending_scope_reconcile(
+            conn,
+            project_id,
+            commit_shas=pending_commits,
+            snapshot_id=result["snapshot_id"],
+            actor=created_by,
+            reason=reason,
+            evidence={"source": "backfill_escape_hatch"},
+        )
+        conn.commit()
     return {
         **result,
         "snapshot_status": "active",
