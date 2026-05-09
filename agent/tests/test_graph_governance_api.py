@@ -232,6 +232,64 @@ def test_graph_governance_correction_patch_api_lifecycle(conn, monkeypatch):
     assert listed["patches"][0]["status"] == "accepted"
 
 
+def test_feedback_decision_accept_graph_correction_creates_patch(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-feedback-decision",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    from agent.governance import reconcile_feedback
+
+    classified = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        source_round="round-001",
+        created_by="semantic-ai",
+        issues=[
+            {
+                "node_id": "L7.1",
+                "reason": "dependency_patch_suggestions",
+                "type": "add_relation",
+                "target": "L7.2",
+                "edge_type": "depends_on",
+                "summary": "L7.1 depends on L7.2",
+            }
+        ],
+    )
+    feedback_id = classified["items"][0]["feedback_id"]
+
+    decided = server.handle_graph_governance_snapshot_feedback_decision(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "feedback_id": feedback_id,
+                "action": "accept_graph_correction",
+                "actor": "observer",
+            },
+        )
+    )
+
+    assert decided["decided_count"] == 1
+    assert decided["graph_patches"]["created_count"] == 1
+    assert decided["graph_patches"]["patches"][0]["status"] == "accepted"
+
+    listed = server.handle_graph_governance_correction_patch_list(
+        _ctx({"project_id": PID}, query={"status": "accepted"})
+    )
+    assert listed["count"] == 1
+    assert listed["patches"][0]["patch_json"]["edge"]["dst"] == "L7.2"
+
+
 def test_graph_governance_active_alias_resolves_for_nodes_and_edges(conn):
     snapshot = store.create_graph_snapshot(
         conn,

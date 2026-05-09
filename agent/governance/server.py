@@ -3530,6 +3530,20 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
                     else None
                 ),
             )
+            if action == "accept_graph_correction" and body.get("create_patch", True):
+                from . import graph_snapshot_store as store
+
+                snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+                result["graph_patches"] = reconcile_feedback.promote_feedback_items_to_graph_patches(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    feedback_ids,
+                    actor=str(body.get("actor") or "observer"),
+                    accept_patch=True,
+                    allow_high_risk_accept=bool(body.get("allow_high_risk_patch_accept")),
+                    base_commit=str(body.get("base_commit") or snapshot.get("commit_sha") or ""),
+                )
         except ValueError as exc:
             _raise_graph_api_validation(exc)
         try:
@@ -3550,6 +3564,66 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
         except Exception:
             pass
         return result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/graph-patches")
+def handle_graph_governance_snapshot_feedback_graph_patches(ctx: RequestContext):
+    """Promote feedback items into graph correction patch rows."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    raw_ids = body.get("feedback_ids")
+    if raw_ids is None:
+        raw_ids = [body.get("feedback_id")]
+    if isinstance(raw_ids, str):
+        feedback_ids = [raw_ids]
+    elif isinstance(raw_ids, list):
+        feedback_ids = [str(item or "").strip() for item in raw_ids]
+    else:
+        raise ValidationError("feedback_ids must be a string or list")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.graph-patches")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+        try:
+            result = reconcile_feedback.promote_feedback_items_to_graph_patches(
+                conn,
+                project_id,
+                snapshot_id,
+                feedback_ids,
+                actor=str(body.get("actor") or "observer"),
+                accept_patch=bool(body.get("accept_patch") or body.get("accept")),
+                allow_high_risk_accept=bool(body.get("allow_high_risk_patch_accept")),
+                base_commit=str(body.get("base_commit") or snapshot.get("commit_sha") or ""),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_graph_patch_promoted",
+                actor=str(body.get("actor") or "observer"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "feedback_ids": feedback_ids,
+                    "created_count": result.get("created_count", 0),
+                    "error_count": result.get("error_count", 0),
+                    "accept_patch": bool(body.get("accept_patch") or body.get("accept")),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception:
+            pass
+        conn.commit()
+        return {"ok": True, **result}
     finally:
         conn.close()
 

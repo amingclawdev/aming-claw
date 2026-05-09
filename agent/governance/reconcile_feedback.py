@@ -90,6 +90,9 @@ _REVIEW_CARRY_FORWARD_KEYS = {
     "accepted_by",
     "accepted_at",
     "backlog_bug_id",
+    "graph_correction_patch_id",
+    "graph_correction_patch_status",
+    "graph_correction_patch_type",
 }
 
 
@@ -2207,6 +2210,387 @@ def mark_feedback_backlog_filed(
     )
 
 
+def _clean_patch_id(seed: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(seed or "").strip()).strip("-")
+    return value[:80] or uuid.uuid4().hex[:12]
+
+
+def _raw_issue(item: dict[str, Any]) -> dict[str, Any]:
+    evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+    raw = evidence.get("raw_issue")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _feedback_patch_type(item: dict[str, Any]) -> str:
+    raw = _raw_issue(item)
+    reason = str((item.get("evidence") or {}).get("reason") or raw.get("reason") or "").lower()
+    issue_type = str(item.get("issue_type") or raw.get("type") or raw.get("kind") or "").lower()
+    text = " ".join([reason, issue_type, str(item.get("issue") or "").lower()])
+    if "merge_suggestions" in reason or "merge" in issue_type:
+        return "merge_nodes"
+    if "split_suggestions" in reason or "split" in issue_type:
+        return "split_node"
+    if "dead_code_candidates" in reason or "orphan" in issue_type or "dead" in issue_type:
+        return "mark_orphan"
+    if "doc" in text and "binding" in text:
+        return "move_doc_binding"
+    if "test" in text and "binding" in text:
+        return "move_test_binding"
+    if any(token in text for token in ("remove", "prune", "delete edge", "drop edge")):
+        return "remove_edge"
+    if "role" in text and ("package" in text or "marker" in text):
+        return "mark_package_marker"
+    return "add_edge"
+
+
+def _first_node(item: dict[str, Any]) -> str:
+    nodes = _source_nodes(item)
+    return nodes[0] if nodes else str(item.get("target_id") or "").strip()
+
+
+def _target_from_feedback(item: dict[str, Any], raw: dict[str, Any]) -> str:
+    return str(
+        raw.get("destination_node_id")
+        or raw.get("target_node_id")
+        or raw.get("target")
+        or raw.get("dst")
+        or raw.get("to")
+        or item.get("target_id")
+        or ""
+    ).strip()
+
+
+def _explicit_target_from_feedback(raw: dict[str, Any]) -> str:
+    return str(
+        raw.get("destination_node_id")
+        or raw.get("target_node_id")
+        or raw.get("target")
+        or raw.get("dst")
+        or raw.get("to")
+        or ""
+    ).strip()
+
+
+def _feedback_patch_payload(item: dict[str, Any], patch_type: str) -> dict[str, Any]:
+    raw = _raw_issue(item)
+    source = str(raw.get("source_node_id") or raw.get("src") or raw.get("from") or _first_node(item)).strip()
+    explicit_target = _explicit_target_from_feedback(raw)
+    target = explicit_target or _target_from_feedback(item, raw)
+    base = {
+        "feedback_id": item.get("feedback_id") or "",
+        "feedback_fingerprint": item.get("feedback_fingerprint") or "",
+        "source_snapshot_id": item.get("snapshot_id") or item.get("source_snapshot_id") or "",
+        "source_node_ids": _source_nodes(item),
+        "raw_issue": raw,
+        "summary": item.get("issue") or "",
+    }
+    if patch_type in {"add_edge", "remove_edge"}:
+        target = explicit_target
+        if not target:
+            raise ValueError("edge graph correction requires an explicit target node or alias")
+        edge_type = str(
+            raw.get("edge_type")
+            or raw.get("relation_type")
+            or raw.get("type")
+            or raw.get("kind")
+            or "depends_on"
+        ).strip()
+        if edge_type in {"", "add_relation", "missing_relation", "typed_relation"}:
+            edge_type = "depends_on"
+        return {
+            **base,
+            "edge": {
+                "src": source,
+                "dst": target,
+                "edge_type": edge_type,
+                "direction": str(raw.get("direction") or "dependency"),
+                "evidence": {
+                    "source": "semantic_feedback",
+                    "feedback_id": item.get("feedback_id") or "",
+                    "reason": (item.get("evidence") or {}).get("reason") or "",
+                },
+            },
+        }
+    if patch_type in {"move_doc_binding", "move_test_binding"}:
+        return {
+            **base,
+            "target_node_id": source,
+            "destination_node_id": target,
+            "files": _string_list(raw.get("files") or raw.get("paths") or item.get("paths")),
+        }
+    if patch_type == "merge_nodes":
+        nodes = _string_list(raw.get("source_node_ids") or raw.get("nodes") or item.get("source_node_ids"))
+        if target and target not in nodes:
+            nodes.append(target)
+        return {
+            **base,
+            "target_node_id": target or source,
+            "source_node_ids": nodes,
+            "semantic_policy": "merge_semantic_candidates_review_required",
+            "feedback_policy": "move_open_feedback_to_target",
+            "doc_test_policy": "merge_bindings_review_required",
+        }
+    if patch_type == "split_node":
+        return {
+            **base,
+            "target_node_id": source,
+            "proposed_nodes": raw.get("proposed_nodes") or raw.get("splits") or raw.get("targets") or [],
+            "semantic_policy": "copy_provenance_only",
+            "feedback_policy": "copy_open_feedback_to_split_candidates",
+            "doc_test_policy": "recalculate_coverage",
+        }
+    if patch_type == "mark_package_marker":
+        return {
+            **base,
+            "target_node_id": source,
+            "file_role": "package_marker",
+            "confidence": item.get("confidence") or 0.0,
+            "semantic_policy": "drop_leaf_semantic_keep_evidence",
+            "feedback_policy": "move_open_feedback_to_parent",
+            "doc_test_policy": "recalculate_coverage",
+        }
+    return {
+        **base,
+        "target_node_id": source,
+        "file_role": "orphan_candidate",
+        "semantic_policy": "keep_evidence_mark_stale",
+        "feedback_policy": "keep_on_node",
+        "doc_test_policy": "recalculate_coverage",
+    }
+
+
+def _load_node_aliases(conn, project_id: str, snapshot_id: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    try:
+        rows = conn.execute(
+            """
+            SELECT node_id, title, metadata_json
+            FROM graph_nodes_index
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+    except Exception:
+        return aliases
+    for row in rows:
+        node_id = str(row["node_id"] if hasattr(row, "keys") else row[0]).strip()
+        title = str(row["title"] if hasattr(row, "keys") else row[1]).strip()
+        raw_metadata = row["metadata_json"] if hasattr(row, "keys") else row[2]
+        metadata = {}
+        if isinstance(raw_metadata, str) and raw_metadata.strip():
+            try:
+                metadata = json.loads(raw_metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        if node_id:
+            aliases[node_id.lower()] = node_id
+        if title:
+            aliases[title.lower()] = node_id
+        module = str(metadata.get("module") or "").strip() if isinstance(metadata, dict) else ""
+        if module:
+            aliases[module.lower()] = node_id
+    return aliases
+
+
+def _resolve_node_alias(value: Any, aliases: dict[str, str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return aliases.get(text.lower(), text)
+
+
+def _resolve_patch_payload_aliases(patch: dict[str, Any], aliases: dict[str, str]) -> dict[str, Any]:
+    if not aliases:
+        return patch
+    out = dict(patch)
+    payload = dict(out.get("patch_json") or {})
+    out["target_node_id"] = _resolve_node_alias(out.get("target_node_id"), aliases)
+    if payload.get("target_node_id"):
+        payload["target_node_id"] = _resolve_node_alias(payload.get("target_node_id"), aliases)
+    if payload.get("destination_node_id"):
+        payload["destination_node_id"] = _resolve_node_alias(payload.get("destination_node_id"), aliases)
+    if isinstance(payload.get("source_node_ids"), list):
+        payload["source_node_ids"] = [
+            _resolve_node_alias(node_id, aliases)
+            for node_id in payload["source_node_ids"]
+        ]
+    edge = payload.get("edge")
+    if isinstance(edge, dict):
+        edge = dict(edge)
+        edge["src"] = _resolve_node_alias(edge.get("src"), aliases)
+        edge["dst"] = _resolve_node_alias(edge.get("dst"), aliases)
+        payload["edge"] = edge
+    out["patch_json"] = payload
+    return out
+
+
+def _validate_graph_patch_payload(patch: dict[str, Any]) -> None:
+    patch_type = str(patch.get("patch_type") or "")
+    payload = patch.get("patch_json") or {}
+    if patch_type in {"add_edge", "remove_edge"}:
+        edge = payload.get("edge") if isinstance(payload, dict) else None
+        if not isinstance(edge, dict):
+            raise ValueError("edge graph correction is missing edge payload")
+        src = str(edge.get("src") or "").strip()
+        dst = str(edge.get("dst") or "").strip()
+        if not src or not dst:
+            raise ValueError("edge graph correction requires non-empty source and destination")
+        if src == dst:
+            raise ValueError("edge graph correction cannot create a self edge")
+
+
+def build_graph_correction_patch_from_feedback(
+    item: dict[str, Any],
+    *,
+    base_commit: str = "",
+) -> dict[str, Any]:
+    """Convert a reviewed semantic feedback item into a patch proposal."""
+    if not isinstance(item, dict) or not item.get("feedback_id"):
+        raise ValueError("feedback item is required")
+    kind = str(item.get("final_feedback_kind") or item.get("feedback_kind") or "")
+    if kind != KIND_GRAPH_CORRECTION:
+        raise ValueError(f"feedback item is not a graph correction: {kind}")
+    patch_type = _feedback_patch_type(item)
+    source = _first_node(item)
+    fingerprint = str(item.get("feedback_fingerprint") or _feedback_fingerprint(item))
+    risk = "high" if patch_type in {"merge_nodes", "split_node"} else "medium"
+    if patch_type in {"mark_package_marker", "add_edge", "remove_edge", "move_doc_binding", "move_test_binding"}:
+        risk = "low"
+    return {
+        "patch_id": f"gcp-{_clean_patch_id(fingerprint)}",
+        "patch_type": patch_type,
+        "risk_level": risk,
+        "base_snapshot_id": str(item.get("snapshot_id") or item.get("source_snapshot_id") or ""),
+        "base_commit": base_commit,
+        "target_node_id": source,
+        "stable_node_key": "",
+        "patch_json": _feedback_patch_payload(item, patch_type),
+        "evidence": {
+            "source": "reconcile_feedback",
+            "feedback_id": item.get("feedback_id") or "",
+            "feedback_fingerprint": fingerprint,
+            "issue_type": item.get("issue_type") or "",
+            "issue": item.get("issue") or "",
+            "raw_issue": _raw_issue(item),
+        },
+    }
+
+
+def promote_feedback_items_to_graph_patches(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    feedback_ids: list[str],
+    *,
+    actor: str = "observer",
+    accept_patch: bool = False,
+    allow_high_risk_accept: bool = False,
+    base_commit: str = "",
+) -> dict[str, Any]:
+    """Create graph correction patch rows from semantic feedback items.
+
+    High-risk structural operations such as merge/split remain proposed unless
+    ``allow_high_risk_accept`` is explicit, so accepting a feedback item cannot
+    silently rewrite topology on the next reconcile pass.
+    """
+    from . import graph_correction_patches as patches
+
+    patches.ensure_schema(conn)
+    aliases = _load_node_aliases(conn, project_id, snapshot_id)
+    state = load_feedback_state(project_id, snapshot_id)
+    items = state.setdefault("items", {})
+    ids = [str(item or "").strip() for item in feedback_ids if str(item or "").strip()]
+    if not ids:
+        raise ValueError("at least one feedback_id is required")
+    now = _utc_now()
+    created: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    updated_items: list[dict[str, Any]] = []
+    for feedback_id in ids:
+        item = dict(items.get(feedback_id) or {})
+        if not item:
+            errors.append({"feedback_id": feedback_id, "error": "feedback item not found"})
+            continue
+        try:
+            if str(item.get("final_feedback_kind") or item.get("feedback_kind") or "") != KIND_GRAPH_CORRECTION:
+                item = _normalize_reviewed_item(
+                    item,
+                    decision=KIND_GRAPH_CORRECTION,
+                    rationale="Promoted to graph correction patch queue.",
+                    confidence=item.get("confidence") or 0.0,
+                    status_observation_category="",
+                    actor=actor,
+                    accept=accept_patch,
+                )
+            patch = _resolve_patch_payload_aliases(
+                build_graph_correction_patch_from_feedback(item, base_commit=base_commit),
+                aliases,
+            )
+            _validate_graph_patch_payload(patch)
+            row = patches.create_patch(
+                conn,
+                project_id,
+                patch_id=patch["patch_id"],
+                patch_type=patch["patch_type"],
+                patch_json=patch["patch_json"],
+                evidence=patch["evidence"],
+                status=patches.PATCH_STATUS_PROPOSED,
+                risk_level=patch["risk_level"],
+                base_snapshot_id=patch["base_snapshot_id"],
+                base_commit=patch["base_commit"],
+                target_node_id=patch["target_node_id"],
+                stable_key=patch["stable_node_key"],
+                created_by=actor,
+            )
+            patch_status = row["status"]
+            accepted = False
+            if accept_patch and (patch["risk_level"] != "high" or allow_high_risk_accept):
+                accepted = patches.accept_patch(conn, project_id, patch["patch_id"], accepted_by=actor)
+                patch_status = patches.PATCH_STATUS_ACCEPTED if accepted else patch_status
+            item["graph_correction_patch_id"] = patch["patch_id"]
+            item["graph_correction_patch_status"] = patch_status
+            item["graph_correction_patch_type"] = patch["patch_type"]
+            item["graph_correction_patch_risk_level"] = patch["risk_level"]
+            item["updated_at"] = now
+            if accept_patch:
+                item["status"] = STATUS_ACCEPTED
+                item["final_feedback_kind"] = KIND_GRAPH_CORRECTION
+                item["accepted_by"] = actor
+                item["accepted_at"] = now
+            elif item.get("status") == STATUS_CLASSIFIED:
+                item["status"] = STATUS_REVIEWED
+                item["final_feedback_kind"] = KIND_GRAPH_CORRECTION
+            created.append({
+                **row,
+                "status": patch_status,
+                "accepted": accepted,
+                "feedback_id": feedback_id,
+                "risk_level": patch["risk_level"],
+            })
+            updated_items.append(item)
+        except Exception as exc:
+            errors.append({"feedback_id": feedback_id, "error": str(exc)})
+    if updated_items:
+        _upsert_items(
+            project_id,
+            snapshot_id,
+            updated_items,
+            event_type="feedback.graph_patch_promoted",
+            actor=actor,
+        )
+    return {
+        "ok": not errors,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "requested_count": len(ids),
+        "created_count": len(created),
+        "error_count": len(errors),
+        "patches": created,
+        "errors": errors,
+        "summary": feedback_summary(project_id, snapshot_id),
+    }
+
+
 def decide_feedback_items(
     project_id: str,
     snapshot_id: str,
@@ -2318,6 +2702,8 @@ __all__ = [
     "review_feedback_items_batch",
     "build_project_improvement_backlog",
     "mark_feedback_backlog_filed",
+    "build_graph_correction_patch_from_feedback",
+    "promote_feedback_items_to_graph_patches",
     "decide_feedback_items",
     "feedback_summary",
     "feedback_state_path",
