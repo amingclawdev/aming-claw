@@ -214,6 +214,79 @@ def test_full_global_review_builds_health_picture_without_semantic_enrichment(co
     assert notes["global_semantic_review"]["latest_full_status"] == "reviewed"
 
 
+def test_full_global_review_scores_project_health_from_existing_signals(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+    reconcile_global_review.semantic._ensure_semantic_state_schema(conn)
+    row = conn.execute(
+        """
+        SELECT metadata_json FROM graph_nodes_index
+        WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'
+        """,
+        (PID, snapshot_id),
+    ).fetchone()
+    metadata = json.loads(row["metadata_json"])
+    metadata["function_count"] = 35
+    conn.execute(
+        """
+        UPDATE graph_nodes_index
+        SET metadata_json=?
+        WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'
+        """,
+        (json.dumps(metadata), PID, snapshot_id),
+    )
+    semantic_json = {
+        "status": "ai_complete",
+        "doc_status": "weak",
+        "test_status": "over_broad_relation",
+        "config_status": "n/a",
+        "quality_flags": ["review_required"],
+        "open_issues": [
+            {"reason": "merge_suggestions", "summary": "Possible duplicate capability."},
+            {"reason": "split_suggestions", "summary": "Feature surface is too broad."},
+            {"type": "test_add", "summary": "Add missing focused regression test."},
+        ],
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', 'sha256:test', '{}', ?, 0, 0, 'now')
+        """,
+        (PID, snapshot_id, json.dumps(semantic_json)),
+    )
+    conn.commit()
+
+    result = reconcile_global_review.run_full_global_review(
+        conn,
+        PID,
+        snapshot_id,
+        project,
+        actor="observer",
+        run_id="full-picture-health-v3",
+    )
+
+    health = result["health_picture"]
+    assert health["score_version"] == "project_health_v3_existing_data_signals"
+    assert health["semantic_coverage_ratio"] == 1
+    assert health["governance_observability_score"] == 100
+    assert health["artifact_binding_score"] == 90
+    assert health["project_health_score"] == 67
+    assert health["project_health_issue_counts"]["high_function_count"] == 1
+    assert health["project_health_issue_counts"]["duplicate_or_overlap_issue_reported"] == 1
+    assert health["project_health_issue_counts"]["broad_responsibility_issue_reported"] == 1
+    assert health["project_health_issue_counts"]["test_gap_issue_reported"] == 1
+    assert health["low_health_nodes"][0]["issues"] == [
+        "broad_responsibility_issue",
+        "doc_status_weak",
+        "duplicate_or_overlap_issue",
+        "high_function_count",
+        "review_required",
+        "test_gap_issue",
+        "test_status_over_broad",
+    ]
+
+
 def test_full_global_review_can_call_ai_once(conn, project):
     _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
 

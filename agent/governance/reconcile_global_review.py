@@ -78,6 +78,126 @@ def _string_list(raw: Any) -> list[str]:
     return out
 
 
+def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(needle in lowered for needle in needles)
+
+
+def _status_penalty(kind: str, status: str) -> tuple[int, str]:
+    text = str(status or "").strip().lower().replace("-", "_")
+    if not text or text in {"n/a", "na", "not_applicable", "not_applicable.", "present", "covered", "good", "adequate"}:
+        return 0, ""
+    if kind == "doc":
+        if _contains_any(text, ("missing", "insufficient", "under_documented")):
+            return 8, "doc_status_poor"
+        if _contains_any(text, ("weak", "thin")):
+            return 5, "doc_status_weak"
+        if _contains_any(text, ("partial", "no_anchor", "no_dedicated_anchor")):
+            return 3, "doc_status_partial"
+    if kind == "test":
+        if "missing" in text:
+            return 10, "test_status_missing"
+        if _contains_any(text, ("weak", "thin", "minimal", "gaps")):
+            return 6, "test_status_weak"
+        if _contains_any(text, ("over_broad", "over-broad", "broad_but", "indirect_only", "too_broad")):
+            return 5, "test_status_over_broad"
+        if "partial" in text:
+            return 4, "test_status_partial"
+    if kind == "config":
+        if _contains_any(text, ("missing", "insufficient")):
+            return 3, "config_status_weak"
+        if "minimal" in text:
+            return 1, "config_status_minimal"
+    return 0, ""
+
+
+def _quality_flag_penalty(flag: str) -> tuple[int, str, str]:
+    text = str(flag or "").strip().lower()
+    if not text:
+        return 0, "", ""
+    if text == "semantic_hash_mismatch":
+        return 0, "semantic_hash_mismatch", "governance_observability"
+    if text == "semantic_ai_error":
+        return 0, "semantic_ai_error", "governance_observability"
+    if text in {"needs_human_signoff", "review_required"}:
+        return 4, text, "semantic_review"
+    if text == "missing_test_binding":
+        return 4, text, "artifact_binding"
+    if text == "missing_doc_binding":
+        return 3, text, "artifact_binding"
+    if text.startswith("missing_"):
+        return 2, text, "artifact_binding"
+    return 1, text, "semantic_review"
+
+
+def _function_count_penalty(function_count: int) -> tuple[int, str]:
+    if function_count >= 70:
+        return 10, "very_large_feature_surface"
+    if function_count >= 50:
+        return 8, "large_feature_surface"
+    if function_count >= 30:
+        return 5, "high_function_count"
+    if function_count >= 20:
+        return 3, "moderate_function_count"
+    return 0, ""
+
+
+def _open_issue_penalties(open_issues: Any) -> tuple[dict[str, int], dict[str, int]]:
+    if not isinstance(open_issues, list):
+        return {}, {}
+    raw_counts: dict[str, int] = {}
+    for issue in open_issues:
+        if not isinstance(issue, dict):
+            raw_counts["open_issue"] = raw_counts.get("open_issue", 0) + 1
+            continue
+        issue_type = str(issue.get("type") or issue.get("kind") or "").lower()
+        reason = str(issue.get("reason") or "").lower()
+        summary = str(issue.get("summary") or issue.get("message") or "").lower()
+        text = " ".join([issue_type, reason, summary])
+        if "merge" in reason or "duplicate" in text or "overlap" in text:
+            key = "duplicate_or_overlap_issue"
+        elif "split" in reason or "split" in issue_type:
+            key = "broad_responsibility_issue"
+        elif "test" in text:
+            key = "test_gap_issue"
+        elif "doc" in text:
+            key = "doc_gap_issue"
+        elif "relation" in text or "dependency" in text or "edge" in text:
+            key = "dependency_gap_issue"
+        elif "code_review" in text:
+            key = "code_review_issue"
+        elif "observer" in text or "signoff" in text:
+            key = "observer_decision_issue"
+        else:
+            key = "open_issue"
+        raw_counts[key] = raw_counts.get(key, 0) + 1
+    weights = {
+        "duplicate_or_overlap_issue": 6,
+        "broad_responsibility_issue": 4,
+        "test_gap_issue": 4,
+        "doc_gap_issue": 3,
+        "dependency_gap_issue": 2,
+        "code_review_issue": 3,
+        "observer_decision_issue": 5,
+        "open_issue": 1,
+    }
+    caps = {
+        "duplicate_or_overlap_issue": 12,
+        "broad_responsibility_issue": 10,
+        "test_gap_issue": 12,
+        "doc_gap_issue": 9,
+        "dependency_gap_issue": 8,
+        "code_review_issue": 6,
+        "observer_decision_issue": 10,
+        "open_issue": 5,
+    }
+    penalties = {
+        key: min(raw_counts[key] * weights.get(key, 1), caps.get(key, 5))
+        for key in raw_counts
+    }
+    return penalties, raw_counts
+
+
 def _snapshot_notes(snapshot: dict[str, Any]) -> dict[str, Any]:
     notes = _decode(snapshot.get("notes"), {})
     return notes if isinstance(notes, dict) else {}
@@ -259,18 +379,39 @@ def _semantic_coverage_picture(
     test_bound = 0
     config_bound = 0
     health_scores: list[int] = []
+    artifact_scores: list[int] = []
     status_counts: dict[str, int] = {}
     quality_flag_counts: dict[str, int] = {}
+    health_issue_counts: dict[str, int] = {}
+    artifact_issue_counts: dict[str, int] = {}
+    penalty_by_category: dict[str, int] = {}
     low_health: list[dict[str, Any]] = []
     semantic_pending: list[dict[str, Any]] = []
     for node in nodes:
         node_id = str(node.get("node_id") or "")
         metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        architecture = metadata.get("architecture_signals") if isinstance(metadata.get("architecture_signals"), dict) else {}
         semantic_entry = semantic_nodes.get(node_id, {})
         semantic_status = str(semantic_entry.get("status") or "")
         status_counts[semantic_status or "missing"] = status_counts.get(semantic_status or "missing", 0) + 1
         score = 100
+        artifact_score = 100
         issues: list[str] = []
+        artifact_issues: list[str] = []
+
+        def add_penalty(issue: str, amount: int, category: str, *, artifact: bool = False) -> None:
+            nonlocal score, artifact_score
+            if amount <= 0 or not issue:
+                return
+            if artifact:
+                artifact_score -= amount
+                artifact_issues.append(issue)
+                artifact_issue_counts[issue] = artifact_issue_counts.get(issue, 0) + 1
+            score -= amount
+            issues.append(issue)
+            health_issue_counts[issue] = health_issue_counts.get(issue, 0) + 1
+            penalty_by_category[category] = penalty_by_category.get(category, 0) + amount
+
         if semantic_status == "ai_complete":
             semantic_complete += 1
         else:
@@ -283,46 +424,73 @@ def _semantic_coverage_picture(
         if _string_list(node.get("secondary_files")):
             doc_bound += 1
         else:
-            score -= 6
-            issues.append("missing_doc_binding")
+            add_penalty("missing_doc_binding", 6, "artifact_binding", artifact=True)
         if _string_list(node.get("test_files")):
             test_bound += 1
         else:
-            score -= 8
-            issues.append("missing_test_binding")
+            add_penalty("missing_test_binding", 8, "artifact_binding", artifact=True)
         if _string_list(metadata.get("config_files")):
             config_bound += 1
+        for kind, status in (
+            ("doc", str(semantic_entry.get("doc_status") or "")),
+            ("test", str(semantic_entry.get("test_status") or "")),
+            ("config", str(semantic_entry.get("config_status") or "")),
+        ):
+            penalty, issue = _status_penalty(kind, status)
+            add_penalty(issue, penalty, "artifact_status", artifact=(kind in {"doc", "test", "config"}))
+
+        function_count = int(metadata.get("function_count") or 0)
+        penalty, issue = _function_count_penalty(function_count)
+        add_penalty(issue, penalty, "complexity")
+        test_binding_count = len(_string_list(node.get("test_files")))
+        doc_binding_count = len(_string_list(node.get("secondary_files")))
+        if test_binding_count >= 30:
+            add_penalty("very_broad_test_binding", 4, "artifact_binding", artifact=True)
+        elif test_binding_count >= 15:
+            add_penalty("broad_test_binding", 2, "artifact_binding", artifact=True)
+        if doc_binding_count >= 10:
+            add_penalty("broad_doc_binding", 2, "artifact_binding", artifact=True)
+        roles = _string_list(architecture.get("roles"))
+        typed_relations = metadata.get("typed_relations") if isinstance(metadata.get("typed_relations"), list) else []
+        if (
+            not typed_relations
+            and any(role in {"orchestration", "state", "domain_contract", "gateway_entry"} for role in roles)
+        ):
+            add_penalty("important_node_without_typed_relations", 4, "dependency_model")
         for flag in _string_list(semantic_entry.get("quality_flags")):
             quality_flag_counts[flag] = quality_flag_counts.get(flag, 0) + 1
-            if flag == "semantic_hash_mismatch":
-                score -= 20
-            elif flag == "semantic_ai_error":
-                score -= 15
-            elif flag in {"needs_human_signoff", "review_required"}:
-                score -= 10
-            elif flag.startswith("missing_"):
-                score -= 5
-            issues.append(flag)
+            penalty, issue, category = _quality_flag_penalty(flag)
+            add_penalty(issue, penalty, category, artifact=category == "artifact_binding")
+        open_issue_penalties, open_issue_counts = _open_issue_penalties(semantic_entry.get("open_issues"))
+        for issue, count in open_issue_counts.items():
+            health_issue_counts[f"{issue}_reported"] = health_issue_counts.get(f"{issue}_reported", 0) + count
+        for issue, penalty in open_issue_penalties.items():
+            add_penalty(issue, penalty, "semantic_open_issues")
         score = max(0, score)
+        artifact_score = max(0, artifact_score)
         health_scores.append(score)
+        artifact_scores.append(artifact_score)
         if score < 90 or issues:
             low_health.append({
                 "node_id": node_id,
                 "title": node.get("title") or node_id,
                 "score": score,
+                "artifact_score": artifact_score,
                 "semantic_status": semantic_status or "missing",
                 "issues": sorted(set(issues)),
+                "artifact_issues": sorted(set(artifact_issues)),
                 "primary_files": _string_list(node.get("primary_files"))[:10],
                 "doc_files": _string_list(node.get("secondary_files"))[:10],
                 "test_files": _string_list(node.get("test_files"))[:10],
             })
     low_health.sort(key=lambda item: (int(item.get("score") or 0), str(item.get("node_id") or "")))
     avg_score = round(sum(health_scores) / len(health_scores), 2) if health_scores else 0.0
+    artifact_avg_score = round(sum(artifact_scores) / len(artifact_scores), 2) if artifact_scores else 0.0
     def ratio(count: int) -> float:
         return round(count / total, 4) if total else 0.0
     semantic_coverage_ratio = ratio(semantic_complete)
     return {
-        "score_version": "project_health_v2_semantic_separated",
+        "score_version": "project_health_v3_existing_data_signals",
         "feature_count": total,
         "semantic_complete_count": semantic_complete,
         "semantic_pending_count": len(semantic_pending),
@@ -334,10 +502,14 @@ def _semantic_coverage_picture(
         "test_bound_count": test_bound,
         "test_coverage_ratio": ratio(test_bound),
         "config_bound_count": config_bound,
+        "artifact_binding_score": artifact_avg_score,
         "project_health_score": avg_score,
         "average_health_score": avg_score,
         "semantic_status_counts": dict(sorted(status_counts.items())),
         "quality_flag_counts": dict(sorted(quality_flag_counts.items())),
+        "artifact_issue_counts": dict(sorted(artifact_issue_counts.items())),
+        "project_health_issue_counts": dict(sorted(health_issue_counts.items())),
+        "project_health_penalty_by_category": dict(sorted(penalty_by_category.items())),
         "low_health_count": len(low_health),
         "low_health_nodes": low_health[:100],
     }
