@@ -2264,11 +2264,12 @@ def handle_graph_governance_snapshot_summary(ctx: RequestContext):
 def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
     """List indexed graph nodes for one snapshot."""
     project_id = ctx.get_project_id()
-    snapshot_id = ctx.path_params["snapshot_id"]
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
     from . import graph_snapshot_store as store
 
     conn = get_connection(project_id)
     try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
         nodes = store.list_graph_snapshot_nodes(
             conn,
             project_id,
@@ -2287,11 +2288,12 @@ def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
 def handle_graph_governance_snapshot_edges(ctx: RequestContext):
     """List indexed graph edges for one snapshot."""
     project_id = ctx.get_project_id()
-    snapshot_id = ctx.path_params["snapshot_id"]
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
     from . import graph_snapshot_store as store
 
     conn = get_connection(project_id)
     try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
         edges = store.list_graph_snapshot_edges(
             conn,
             project_id,

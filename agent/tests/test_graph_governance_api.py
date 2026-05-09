@@ -232,6 +232,38 @@ def test_graph_governance_correction_patch_api_lifecycle(conn, monkeypatch):
     assert listed["patches"][0]["status"] == "accepted"
 
 
+def test_graph_governance_active_alias_resolves_for_nodes_and_edges(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-active-alias",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    nodes = server.handle_graph_governance_snapshot_nodes(
+        _ctx({"project_id": PID, "snapshot_id": "active"})
+    )
+    edges = server.handle_graph_governance_snapshot_edges(
+        _ctx({"project_id": PID, "snapshot_id": "active"})
+    )
+
+    assert nodes["snapshot_id"] == "full-active-alias"
+    assert nodes["count"] == 1
+    assert edges["snapshot_id"] == "full-active-alias"
+    assert edges["count"] == 1
+
+
 def test_graph_governance_dashboard_api_summarizes_active_state(conn):
     snapshot = store.create_graph_snapshot(
         conn,
