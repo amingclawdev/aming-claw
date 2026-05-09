@@ -212,6 +212,7 @@ def _semantic_enrichment_summary(result: dict[str, Any] | None) -> dict[str, Any
         "round_semantic_index_path": result.get("round_semantic_index_path", ""),
         "round_review_report_path": result.get("round_review_report_path", ""),
         "feature_count": summary.get("feature_count", 0),
+        "semantic_run_status": summary.get("semantic_run_status", ""),
         "ai_complete_count": summary.get("ai_complete_count", 0),
         "ai_unavailable_count": summary.get("ai_unavailable_count", 0),
         "ai_error_count": summary.get("ai_error_count", 0),
@@ -226,7 +227,9 @@ def _semantic_enrichment_summary(result: dict[str, Any] | None) -> dict[str, Any
         "batch_payload_input_dir": summary.get("batch_payload_input_dir", ""),
         "batch_payload_output_dir": summary.get("batch_payload_output_dir", ""),
         "ai_selected_count": summary.get("ai_selected_count", 0),
+        "ai_attempted_count": summary.get("ai_attempted_count", 0),
         "ai_skipped_selector_count": summary.get("ai_skipped_selector_count", 0),
+        "semantic_hash_mismatch_count": summary.get("semantic_hash_mismatch_count", 0),
         "ai_input_mode": summary.get("ai_input_mode", ""),
         "dynamic_semantic_graph_state": summary.get("dynamic_semantic_graph_state", False),
         "requested_ai_batch_size": summary.get("requested_ai_batch_size"),
@@ -544,13 +547,23 @@ def run_state_only_full_reconcile(
         semantic_enrichment = _semantic_enrichment_summary(semantic_result)
         if semantic_classify_feedback:
             from agent.governance import reconcile_feedback
+            from agent.governance import reconcile_semantic_enrichment
 
-            semantic_enrichment["feedback_queue"] = reconcile_feedback.classify_semantic_state_rounds(
-                project_id,
-                sid,
-                created_by=created_by,
-                base_snapshot_id=semantic_base_snapshot_id or "",
+            review_gate = reconcile_semantic_enrichment.feedback_review_gate(
+                semantic_result.get("summary") or {},
             )
+            if review_gate.get("allowed"):
+                semantic_enrichment["feedback_queue"] = reconcile_feedback.classify_semantic_state_rounds(
+                    project_id,
+                    sid,
+                    created_by=created_by,
+                    base_snapshot_id=semantic_base_snapshot_id or "",
+                )
+            else:
+                semantic_enrichment["feedback_queue"] = {
+                    "blocked": True,
+                    "gate": review_gate,
+                }
     trace.step(
         "semantic-enrichment",
         input_payload={

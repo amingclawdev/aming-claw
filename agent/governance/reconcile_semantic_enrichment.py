@@ -36,6 +36,48 @@ REVIEW_FEEDBACK_NAME = "review-feedback.jsonl"
 
 FeedbackAiCall = Callable[[str, dict[str, Any]], Any]
 
+SEMANTIC_STATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS graph_semantic_nodes (
+  project_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT '',
+  feature_hash TEXT NOT NULL DEFAULT '',
+  file_hashes_json TEXT NOT NULL DEFAULT '{}',
+  semantic_json TEXT NOT NULL DEFAULT '{}',
+  feedback_round INTEGER NOT NULL DEFAULT 0,
+  batch_index INTEGER,
+  updated_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(project_id, snapshot_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_semantic_nodes_status
+  ON graph_semantic_nodes(project_id, snapshot_id, status);
+
+CREATE TABLE IF NOT EXISTS graph_semantic_jobs (
+  project_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending_ai',
+  feature_hash TEXT NOT NULL DEFAULT '',
+  file_hashes_json TEXT NOT NULL DEFAULT '{}',
+  feedback_round INTEGER NOT NULL DEFAULT 0,
+  batch_index INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(project_id, snapshot_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_semantic_jobs_status
+  ON graph_semantic_jobs(project_id, snapshot_id, status, updated_at);
+"""
+
+
+def _ensure_semantic_state_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SEMANTIC_STATE_SCHEMA_SQL)
+
 
 def _string_list(raw: Any) -> list[str]:
     if raw is None:
@@ -896,6 +938,8 @@ def _empty_semantic_graph_state(
         "file_ownership": {},
         "open_issues": [],
         "completed_node_ids": [],
+        "semantic_jobs": {},
+        "semantic_job_counts": {},
         "updated_at": "",
     }
 
@@ -913,8 +957,211 @@ def _load_semantic_graph_state(
     state.update(payload)
     if not isinstance(state.get("node_semantics"), dict):
         state["node_semantics"] = {}
+    if not isinstance(state.get("semantic_jobs"), dict):
+        state["semantic_jobs"] = {}
     _rebuild_semantic_graph_state_indexes(state)
     return state
+
+
+def _load_semantic_graph_state_from_db(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_semantic_state_schema(conn)
+    state = _empty_semantic_graph_state(project_id, snapshot_id, snapshot)
+    node_rows = conn.execute(
+        """
+        SELECT node_id, status, feature_hash, file_hashes_json, semantic_json
+        FROM graph_semantic_nodes
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY node_id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    node_semantics: dict[str, dict[str, Any]] = {}
+    for row in node_rows:
+        try:
+            payload = json.loads(row["semantic_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            payload["feature_hash"] = str(row["feature_hash"] or payload.get("feature_hash") or "")
+            try:
+                file_hashes = json.loads(row["file_hashes_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                file_hashes = {}
+            payload["file_hashes"] = file_hashes if isinstance(file_hashes, dict) else {}
+            payload["status"] = str(row["status"] or payload.get("status") or "")
+            node_semantics[str(row["node_id"])] = payload
+    job_rows = conn.execute(
+        """
+        SELECT node_id, status, feature_hash, file_hashes_json, feedback_round,
+               batch_index, attempt_count, last_error, updated_at, created_at
+        FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY node_id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    semantic_jobs: dict[str, dict[str, Any]] = {}
+    for row in job_rows:
+        try:
+            file_hashes = json.loads(row["file_hashes_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            file_hashes = {}
+        semantic_jobs[str(row["node_id"])] = {
+            "node_id": str(row["node_id"]),
+            "status": str(row["status"] or ""),
+            "feature_hash": str(row["feature_hash"] or ""),
+            "file_hashes": file_hashes if isinstance(file_hashes, dict) else {},
+            "feedback_round": int(row["feedback_round"] or 0),
+            "batch_index": row["batch_index"],
+            "attempt_count": int(row["attempt_count"] or 0),
+            "last_error": str(row["last_error"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+            "created_at": str(row["created_at"] or ""),
+        }
+    state["node_semantics"] = node_semantics
+    state["semantic_jobs"] = semantic_jobs
+    _rebuild_semantic_graph_state_indexes(state)
+    return state
+
+
+def _persist_semantic_state_to_db(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    state: dict[str, Any],
+) -> None:
+    _ensure_semantic_state_schema(conn)
+    node_semantics = state.get("node_semantics") if isinstance(state.get("node_semantics"), dict) else {}
+    for node_id, raw_entry in node_semantics.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        conn.execute(
+            """
+            INSERT INTO graph_semantic_nodes
+              (project_id, snapshot_id, node_id, status, feature_hash,
+               file_hashes_json, semantic_json, feedback_round, batch_index, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, snapshot_id, node_id) DO UPDATE SET
+              status = excluded.status,
+              feature_hash = excluded.feature_hash,
+              file_hashes_json = excluded.file_hashes_json,
+              semantic_json = excluded.semantic_json,
+              feedback_round = excluded.feedback_round,
+              batch_index = excluded.batch_index,
+              updated_at = excluded.updated_at
+            """,
+            (
+                project_id,
+                snapshot_id,
+                str(node_id),
+                str(raw_entry.get("status") or ""),
+                str(raw_entry.get("feature_hash") or ""),
+                _json(raw_entry.get("file_hashes") or {}),
+                _json(raw_entry),
+                int(raw_entry.get("feedback_round") or 0),
+                raw_entry.get("batch_index"),
+                str(raw_entry.get("updated_at") or state.get("updated_at") or ""),
+            ),
+        )
+    semantic_jobs = state.get("semantic_jobs") if isinstance(state.get("semantic_jobs"), dict) else {}
+    for node_id, raw_job in semantic_jobs.items():
+        if not isinstance(raw_job, dict):
+            continue
+        conn.execute(
+            """
+            INSERT INTO graph_semantic_jobs
+              (project_id, snapshot_id, node_id, status, feature_hash,
+               file_hashes_json, feedback_round, batch_index, attempt_count,
+               last_error, updated_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, snapshot_id, node_id) DO UPDATE SET
+              status = excluded.status,
+              feature_hash = excluded.feature_hash,
+              file_hashes_json = excluded.file_hashes_json,
+              feedback_round = excluded.feedback_round,
+              batch_index = excluded.batch_index,
+              attempt_count = excluded.attempt_count,
+              last_error = excluded.last_error,
+              updated_at = excluded.updated_at
+            """,
+            (
+                project_id,
+                snapshot_id,
+                str(node_id),
+                str(raw_job.get("status") or "pending_ai"),
+                str(raw_job.get("feature_hash") or ""),
+                _json(raw_job.get("file_hashes") or {}),
+                int(raw_job.get("feedback_round") or 0),
+                raw_job.get("batch_index"),
+                int(raw_job.get("attempt_count") or 0),
+                str(raw_job.get("last_error") or ""),
+                str(raw_job.get("updated_at") or state.get("updated_at") or ""),
+                str(raw_job.get("created_at") or raw_job.get("updated_at") or state.get("updated_at") or ""),
+            ),
+        )
+
+
+def _load_semantic_graph_state_source(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    state = _load_semantic_graph_state_from_db(conn, project_id, snapshot_id, snapshot)
+    if state.get("node_semantics") or state.get("semantic_jobs"):
+        state["source"] = "db"
+        return state
+    # One-time compatibility import for snapshots created before DB-backed
+    # semantic state. After this point DB rows are the source of truth.
+    companion_state = _load_semantic_graph_state(project_id, snapshot_id, snapshot)
+    if companion_state.get("node_semantics") or companion_state.get("semantic_jobs"):
+        _persist_semantic_state_to_db(conn, project_id, snapshot_id, companion_state)
+        companion_state["source"] = "imported_companion"
+        return companion_state
+    state["source"] = "db_empty"
+    return state
+
+
+def _upsert_semantic_job(
+    state: dict[str, Any],
+    feature: dict[str, Any],
+    *,
+    status: str,
+    feedback_round: int,
+    batch_index: int | None,
+    updated_at: str,
+    last_error: str = "",
+    increment_attempt: bool = False,
+) -> None:
+    node_id = str(feature.get("node_id") or "")
+    if not node_id:
+        return
+    jobs = state.setdefault("semantic_jobs", {})
+    if not isinstance(jobs, dict):
+        jobs = {}
+        state["semantic_jobs"] = jobs
+    existing = jobs.get(node_id) if isinstance(jobs.get(node_id), dict) else {}
+    attempt_count = int(existing.get("attempt_count") or 0) + (1 if increment_attempt else 0)
+    now = updated_at
+    jobs[node_id] = {
+        "node_id": node_id,
+        "status": status,
+        "feature_hash": str(feature.get("feature_hash") or ""),
+        "file_hashes": feature.get("file_hashes") or {},
+        "feedback_round": int(feedback_round or 0),
+        "batch_index": batch_index,
+        "attempt_count": attempt_count,
+        "last_error": last_error,
+        "updated_at": now,
+        "created_at": existing.get("created_at") or now,
+    }
+    state["updated_at"] = now
+    _rebuild_semantic_graph_state_indexes(state)
 
 
 def _carry_forward_semantic_graph_state(
@@ -1112,6 +1359,87 @@ def _rebuild_semantic_graph_state_indexes(state: dict[str, Any]) -> None:
     state["file_ownership"] = dict(sorted(file_ownership.items()))
     state["open_issues"] = open_issues[-200:]
     state["completed_node_ids"] = sorted(set(completed))
+    jobs = state.get("semantic_jobs") if isinstance(state.get("semantic_jobs"), dict) else {}
+    job_counts: dict[str, int] = {}
+    for raw_job in jobs.values():
+        if not isinstance(raw_job, dict):
+            continue
+        status = str(raw_job.get("status") or "unknown")
+        job_counts[status] = job_counts.get(status, 0) + 1
+    state["semantic_job_counts"] = dict(sorted(job_counts.items()))
+
+
+def _file_hashes_match(current: Any, stored: Any) -> bool:
+    current_hashes = current if isinstance(current, dict) else {}
+    stored_hashes = stored if isinstance(stored, dict) else {}
+    if not current_hashes or not stored_hashes:
+        return True
+    return current_hashes == stored_hashes
+
+
+def _semantic_state_validation(feature: dict[str, Any], state_entry: dict[str, Any]) -> dict[str, Any]:
+    current_hash = str(feature.get("feature_hash") or "")
+    stored_hash = str(state_entry.get("feature_hash") or "")
+    feature_hash_match = bool(current_hash and stored_hash and current_hash == stored_hash)
+    file_hash_match = _file_hashes_match(feature.get("file_hashes"), state_entry.get("file_hashes"))
+    status = "current" if feature_hash_match and file_hash_match else "stale_hash_mismatch"
+    return {
+        "status": status,
+        "valid": status == "current",
+        "feature_hash": current_hash,
+        "stored_feature_hash": stored_hash,
+        "feature_hash_match": feature_hash_match,
+        "file_hash_match": file_hash_match,
+    }
+
+
+def _semantic_run_status(
+    *,
+    feature_count: int,
+    effective_use_ai: bool,
+    ai_selected_count: int,
+    ai_attempted_count: int,
+    ai_complete_count: int,
+    ai_error_count: int,
+    semantic_graph_state_hit_count: int,
+) -> str:
+    valid_semantic_count = ai_complete_count + semantic_graph_state_hit_count
+    if feature_count > 0 and valid_semantic_count >= feature_count:
+        return "ai_complete"
+    if valid_semantic_count > 0:
+        return "ai_partial"
+    if ai_selected_count <= 0:
+        return "index_only"
+    if not effective_use_ai:
+        return "ai_pending"
+    if ai_attempted_count > 0 and ai_error_count >= ai_attempted_count:
+        return "ai_failed"
+    return "ai_pending"
+
+
+def feedback_review_gate(
+    summary: dict[str, Any] | None,
+    *,
+    allow_heuristic_feedback_review: bool = False,
+) -> dict[str, Any]:
+    summary = summary if isinstance(summary, dict) else {}
+    if allow_heuristic_feedback_review:
+        return {"allowed": True, "reason": "heuristic_feedback_review_explicitly_allowed"}
+    graph_state = summary.get("semantic_graph_state") if isinstance(summary.get("semantic_graph_state"), dict) else {}
+    valid_semantic_count = int(summary.get("ai_complete_count") or 0) + int(graph_state.get("hit_count") or 0)
+    if valid_semantic_count > 0:
+        return {
+            "allowed": True,
+            "reason": "ai_semantic_available",
+            "valid_semantic_count": valid_semantic_count,
+        }
+    return {
+        "allowed": False,
+        "reason": "semantic_ai_not_complete",
+        "semantic_run_status": summary.get("semantic_run_status") or "",
+        "ai_selected_count": int(summary.get("ai_selected_count") or 0),
+        "ai_complete_count": int(summary.get("ai_complete_count") or 0),
+    }
 
 
 def _upsert_semantic_graph_state_entry(
@@ -1154,6 +1482,7 @@ def _semantic_graph_state_summary(state: dict[str, Any]) -> dict[str, Any]:
         })
     return {
         "schema_version": state.get("schema_version") or SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+        "source": state.get("source") or "db",
         "snapshot_id": state.get("snapshot_id") or "",
         "commit_sha": state.get("commit_sha") or "",
         "semanticized_node_count": len(state.get("node_semantics") or {}),
@@ -1161,6 +1490,7 @@ def _semantic_graph_state_summary(state: dict[str, Any]) -> dict[str, Any]:
         "accepted_feature_count": len(features),
         "file_ownership_count": len(state.get("file_ownership") or {}),
         "open_issue_count": len(state.get("open_issues") or []),
+        "semantic_job_counts": state.get("semantic_job_counts") or {},
         "completed_node_ids": _path_list(state.get("completed_node_ids"))[:300],
         "accepted_features": features,
         "open_issues": [_compact_memory_conflict(item) for item in (state.get("open_issues") or [])[-30:]],
@@ -1214,11 +1544,17 @@ def _semantic_entry_from_state(feature: dict[str, Any], state_entry: dict[str, A
     return entry
 
 
-def _materialize_semantic_graph(graph_json: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+def _materialize_semantic_graph(
+    graph_json: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    feature_index: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     graph = copy.deepcopy(graph_json if isinstance(graph_json, dict) else {})
     deps = graph.get("deps_graph") if isinstance(graph.get("deps_graph"), dict) else {}
     nodes = deps.get("nodes") if isinstance(deps.get("nodes"), list) else []
     semantics = state.get("node_semantics") if isinstance(state.get("node_semantics"), dict) else {}
+    feature_index = feature_index or {}
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -1229,7 +1565,18 @@ def _materialize_semantic_graph(graph_json: dict[str, Any], state: dict[str, Any
         if not isinstance(metadata, dict):
             metadata = {}
             node["metadata"] = metadata
-        metadata["semantic"] = semantics[node_id]
+        feature = _feature_context_from_node(
+            node,
+            feature_index=feature_index,
+            project_root=None,
+            max_excerpt_chars=0,
+        )
+        validation = _semantic_state_validation(feature, semantics[node_id])
+        metadata["semantic_status"] = validation
+        if validation["valid"]:
+            metadata["semantic"] = semantics[node_id]
+        else:
+            metadata.pop("semantic", None)
     graph.setdefault("metadata", {})
     if isinstance(graph["metadata"], dict):
         graph["metadata"]["semantic_graph_state"] = {
@@ -1237,17 +1584,20 @@ def _materialize_semantic_graph(graph_json: dict[str, Any], state: dict[str, Any
             "updated_at": state.get("updated_at") or "",
             "completed_node_count": len(state.get("completed_node_ids") or []),
             "accepted_feature_count": len(state.get("accepted_features") or {}),
+            "source": state.get("source") or "db",
         }
     return graph
 
 
 def _write_semantic_graph_state_artifacts(
+    conn: sqlite3.Connection,
     project_id: str,
     snapshot_id: str,
     graph_json: dict[str, Any],
     state: dict[str, Any],
     *,
     round_number: int,
+    feature_index: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     base = _semantic_base_dir(project_id, snapshot_id)
     rdir = _round_dir(project_id, snapshot_id, round_number)
@@ -1255,7 +1605,12 @@ def _write_semantic_graph_state_artifacts(
     latest_graph_path = base / SEMANTIC_GRAPH_NAME
     round_state_path = rdir / SEMANTIC_GRAPH_STATE_NAME
     round_graph_path = rdir / SEMANTIC_GRAPH_NAME
-    semantic_graph = _materialize_semantic_graph(graph_json, state)
+    _persist_semantic_state_to_db(conn, project_id, snapshot_id, state)
+    semantic_graph = _materialize_semantic_graph(
+        graph_json,
+        state,
+        feature_index=feature_index,
+    )
     _write_json(latest_state_path, state)
     _write_json(round_state_path, state)
     _write_json(latest_graph_path, semantic_graph)
@@ -1453,8 +1808,9 @@ def run_semantic_enrichment(
     round_number = int(feedback_round) if feedback_round is not None else len(existing_rounds)
     generated_at = utc_now()
     semantic_state_enabled = bool(semantic_graph_state)
+    _ensure_semantic_state_schema(conn)
     semantic_state = (
-        _load_semantic_graph_state(project_id, snapshot_id, snapshot)
+        _load_semantic_graph_state_source(conn, project_id, snapshot_id, snapshot)
         if semantic_state_enabled
         else _empty_semantic_graph_state(project_id, snapshot_id, snapshot)
     )
@@ -1470,7 +1826,8 @@ def run_semantic_enrichment(
         try:
             base_snapshot = get_graph_snapshot(conn, project_id, str(semantic_base_snapshot_id))
             if base_snapshot:
-                base_state = _load_semantic_graph_state(
+                base_state = _load_semantic_graph_state_source(
+                    conn,
                     project_id,
                     str(semantic_base_snapshot_id),
                     base_snapshot,
@@ -1493,6 +1850,7 @@ def run_semantic_enrichment(
     ai_skipped_count = 0
     ai_selected_count = 0
     ai_skipped_selector_count = 0
+    semantic_hash_mismatch_count = 0
     requested_ai_batch_size = _normal_batch_size(semantic_ai_batch_size)
     ai_input_mode = _normal_ai_input_mode(
         semantic_ai_input_mode,
@@ -1531,15 +1889,28 @@ def run_semantic_enrichment(
             else None
         )
         existing_semantic = existing_semantic if isinstance(existing_semantic, dict) else {}
+        semantic_state_validation = (
+            _semantic_state_validation(feature, existing_semantic)
+            if existing_semantic
+            else {"status": "missing", "valid": False}
+        )
         skipped_completed = bool(
             semantic_state_enabled
             and semantic_skip_completed
             and existing_semantic.get("status") == "ai_complete"
+            and semantic_state_validation.get("valid")
             and not relevant_feedback
         )
+        if (
+            existing_semantic.get("status") == "ai_complete"
+            and not semantic_state_validation.get("valid")
+        ):
+            semantic_hash_mismatch_count += 1
         if skipped_completed:
             selected_for_ai = False
             selection_reasons = list(selection_reasons) + ["semantic_graph_state_complete"]
+        elif existing_semantic.get("status") == "ai_complete" and existing_semantic:
+            selection_reasons = list(selection_reasons) + ["semantic_graph_state_hash_mismatch"]
         if selected_for_ai:
             ai_selected_count += 1
         payload_feature = dict(feature)
@@ -1588,6 +1959,7 @@ def run_semantic_enrichment(
             "selected_for_ai": selected_for_ai,
             "selection_reasons": selection_reasons,
             "existing_semantic": existing_semantic,
+            "semantic_state_validation": semantic_state_validation,
             "skipped_completed": skipped_completed,
         })
 
@@ -1603,6 +1975,25 @@ def run_semantic_enrichment(
         str(record["feature"].get("node_id") or "")
         for record in allowed_records
     }
+    if semantic_state_enabled:
+        for record in records:
+            if not record.get("selected_for_ai"):
+                continue
+            node_id = str(record["feature"].get("node_id") or "")
+            if effective_use_ai and node_id in allowed_node_ids:
+                job_status = "pending_ai"
+            elif effective_use_ai:
+                job_status = "skipped_limit"
+            else:
+                job_status = "ai_pending"
+            _upsert_semantic_job(
+                semantic_state,
+                record["feature"],
+                status=job_status,
+                feedback_round=round_number,
+                batch_index=None,
+                updated_at=generated_at,
+            )
     ai_responses: dict[str, dict[str, Any]] = {}
     memory_enabled = bool(semantic_batch_memory)
     memory_batch: dict[str, Any] = {}
@@ -1629,18 +2020,21 @@ def run_semantic_enrichment(
     if allowed_records:
         if semantic_state_enabled:
             _write_semantic_graph_state_artifacts(
+                conn,
                 project_id,
                 snapshot_id,
                 graph_json,
                 semantic_state,
                 round_number=round_number,
+                feature_index=feature_index,
             )
         if ai_batch_size <= 1:
             for record in allowed_records:
                 node_id = str(record["feature"].get("node_id") or "")
                 if semantic_state_enabled:
                     if dynamic_graph_state:
-                        semantic_state = _load_semantic_graph_state(
+                        semantic_state = _load_semantic_graph_state_source(
+                            conn,
                             project_id,
                             snapshot_id,
                             snapshot,
@@ -1667,6 +2061,25 @@ def run_semantic_enrichment(
                             payload_trace_base / "feature-inputs" / f"{record['node_name']}.json",
                             record["payload"],
                         )
+                if semantic_state_enabled:
+                    _upsert_semantic_job(
+                        semantic_state,
+                        record["feature"],
+                        status="running",
+                        feedback_round=round_number,
+                        batch_index=None,
+                        updated_at=utc_now(),
+                        increment_attempt=True,
+                    )
+                    _write_semantic_graph_state_artifacts(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        graph_json,
+                        semantic_state,
+                        round_number=round_number,
+                        feature_index=feature_index,
+                    )
                 response = _call_ai(
                     ai_call,
                     stage="reconcile_semantic_feature",
@@ -1674,6 +2087,24 @@ def run_semantic_enrichment(
                     )
                 if response is not None:
                     ai_responses[node_id] = response
+                if semantic_state_enabled:
+                    _upsert_semantic_job(
+                        semantic_state,
+                        record["feature"],
+                        status=(
+                            "ai_failed"
+                            if response is None or response.get("_ai_error")
+                            else "ai_complete"
+                        ),
+                        feedback_round=round_number,
+                        batch_index=None,
+                        updated_at=utc_now(),
+                        last_error=(
+                            str(response.get("_ai_error") or "")
+                            if isinstance(response, dict)
+                            else "ai_response_missing"
+                        ),
+                    )
                 if semantic_state_enabled and response is not None and not response.get("_ai_error"):
                     state_entry = _heuristic_semantic_entry(
                         record["feature"],
@@ -1707,11 +2138,13 @@ def run_semantic_enrichment(
                         memory_batch = updated_batch or memory_batch
                 if semantic_state_enabled:
                     _write_semantic_graph_state_artifacts(
+                        conn,
                         project_id,
                         snapshot_id,
                         graph_json,
                         semantic_state,
                         round_number=round_number,
+                        feature_index=feature_index,
                     )
         else:
             for batch_index, batch in enumerate(
@@ -1724,7 +2157,8 @@ def run_semantic_enrichment(
                 ai_batch_count += 1
                 batch_key = _batch_key(batch[0]["feature"], semantic_ai_batch_by) if batch else "all"
                 if semantic_state_enabled and dynamic_graph_state:
-                    semantic_state = _load_semantic_graph_state(
+                    semantic_state = _load_semantic_graph_state_source(
+                        conn,
                         project_id,
                         snapshot_id,
                         snapshot,
@@ -1790,6 +2224,26 @@ def run_semantic_enrichment(
                         payload_trace_base / "batch-inputs" / f"{batch_name}.json",
                         batch_payload,
                     )
+                if semantic_state_enabled:
+                    for record in batch:
+                        _upsert_semantic_job(
+                            semantic_state,
+                            record["feature"],
+                            status="running",
+                            feedback_round=round_number,
+                            batch_index=batch_index,
+                            updated_at=utc_now(),
+                            increment_attempt=True,
+                        )
+                    _write_semantic_graph_state_artifacts(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        graph_json,
+                        semantic_state,
+                        round_number=round_number,
+                        feature_index=feature_index,
+                    )
                 batch_response = _call_ai(
                     ai_call,
                     stage="reconcile_semantic_feature_batch",
@@ -1822,6 +2276,24 @@ def run_semantic_enrichment(
                 for record in batch:
                     node_id = str(record["feature"].get("node_id") or "")
                     response = ai_responses.get(node_id)
+                    if semantic_state_enabled:
+                        _upsert_semantic_job(
+                            semantic_state,
+                            record["feature"],
+                            status=(
+                                "ai_failed"
+                                if response is None or response.get("_ai_error")
+                                else "ai_complete"
+                            ),
+                            feedback_round=round_number,
+                            batch_index=batch_index,
+                            updated_at=utc_now(),
+                            last_error=(
+                                str(response.get("_ai_error") or "")
+                                if isinstance(response, dict)
+                                else "ai_response_missing"
+                            ),
+                        )
                     if semantic_state_enabled and response is not None and not response.get("_ai_error"):
                         state_entry = _heuristic_semantic_entry(
                             record["feature"],
@@ -1856,11 +2328,13 @@ def run_semantic_enrichment(
                         memory_batch = updated_batch or memory_batch
                 if semantic_state_enabled:
                     _write_semantic_graph_state_artifacts(
+                        conn,
                         project_id,
                         snapshot_id,
                         graph_json,
                         semantic_state,
                         round_number=round_number,
+                        feature_index=feature_index,
                     )
 
     for record in records:
@@ -1901,6 +2375,10 @@ def run_semantic_enrichment(
                 enrichment_status=status,
                 ai_response=ai_response if ai_response and not ai_response.get("_ai_error") else None,
             )
+            validation = record.get("semantic_state_validation") or {}
+            if validation.get("status") == "stale_hash_mismatch":
+                semantic_entry.setdefault("quality_flags", []).append("semantic_hash_mismatch")
+                semantic_entry["semantic_state_validation"] = validation
             if ai_response and ai_response.get("_ai_error"):
                 semantic_entry.setdefault("quality_flags", []).append("semantic_ai_error")
                 semantic_entry["semantic_ai_error"] = ai_response.get("_ai_error")
@@ -1941,14 +2419,27 @@ def run_semantic_enrichment(
         "file_ownership_count": memory_summary.get("file_ownership_count", 0),
         "open_conflict_count": memory_summary.get("open_conflict_count", 0),
     }
+    ai_attempted_count = len(allowed_records)
+    semantic_status = _semantic_run_status(
+        feature_count=len(semantic_features),
+        effective_use_ai=bool(effective_use_ai),
+        ai_selected_count=ai_selected_count,
+        ai_attempted_count=ai_attempted_count,
+        ai_complete_count=ai_complete_count,
+        ai_error_count=ai_error_count,
+        semantic_graph_state_hit_count=semantic_graph_state_hit_count,
+    )
     semantic_graph_state_report = {
         "enabled": bool(semantic_state_enabled),
+        "source": semantic_state.get("source") or "db",
         "hit_count": semantic_graph_state_hit_count,
         "skip_completed": bool(semantic_skip_completed),
         "completed_node_count": len(semantic_state.get("completed_node_ids") or []),
         "accepted_feature_count": len(semantic_state.get("accepted_features") or {}),
         "file_ownership_count": len(semantic_state.get("file_ownership") or {}),
         "open_issue_count": len(semantic_state.get("open_issues") or []),
+        "semantic_job_counts": semantic_state.get("semantic_job_counts") or {},
+        "hash_mismatch_count": semantic_hash_mismatch_count,
         "base_snapshot_id": carry_forward_report.get("base_snapshot_id", ""),
         "carried_forward_count": carry_forward_report.get("carried_forward_count", 0),
         "carry_forward": carry_forward_report,
@@ -1964,11 +2455,13 @@ def run_semantic_enrichment(
             round_state_path,
             round_graph_path,
         ) = _write_semantic_graph_state_artifacts(
+            conn,
             project_id,
             snapshot_id,
             graph_json,
             semantic_state,
             round_number=round_number,
+            feature_index=feature_index,
         )
         semantic_graph_state_report.update({
             "state_path": str(latest_state_path),
@@ -1987,6 +2480,7 @@ def run_semantic_enrichment(
         "generated_at": generated_at,
         "created_by": created_by,
         "ai_requested": bool(effective_use_ai),
+        "semantic_run_status": semantic_status,
         "semantic_selector": selector,
         "semantic_config": semantic_config.summary(),
         "semantic_batching": {
@@ -2014,12 +2508,15 @@ def run_semantic_enrichment(
         "feedback_round": round_number,
         "generated_at": generated_at,
         "feature_count": len(semantic_features),
+        "semantic_run_status": semantic_status,
         "ai_complete_count": ai_complete_count,
         "ai_unavailable_count": ai_unavailable_count,
         "ai_error_count": ai_error_count,
         "ai_skipped_count": ai_skipped_count,
         "ai_selected_count": ai_selected_count,
+        "ai_attempted_count": ai_attempted_count,
         "ai_skipped_selector_count": ai_skipped_selector_count,
+        "semantic_hash_mismatch_count": semantic_hash_mismatch_count,
         "ai_input_mode": ai_input_mode,
         "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
         "requested_ai_batch_size": requested_ai_batch_size,
@@ -2063,9 +2560,12 @@ def run_semantic_enrichment(
             "latest_round_semantic_index_path": str(semantic_index_path),
             "latest_round_review_report_path": str(review_report_path),
             "feature_count": len(semantic_features),
+            "semantic_run_status": semantic_status,
             "ai_complete_count": ai_complete_count,
             "ai_selected_count": ai_selected_count,
+            "ai_attempted_count": ai_attempted_count,
             "ai_skipped_selector_count": ai_skipped_selector_count,
+            "semantic_hash_mismatch_count": semantic_hash_mismatch_count,
             "ai_input_mode": ai_input_mode,
             "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
             "requested_ai_batch_size": requested_ai_batch_size,
@@ -2107,6 +2607,7 @@ def _count_quality_flags(features: list[dict[str, Any]]) -> dict[str, int]:
 __all__ = [
     "SEMANTIC_ENRICHMENT_SCHEMA_VERSION",
     "append_review_feedback",
+    "feedback_review_gate",
     "load_review_feedback",
     "normalize_feedback_item",
     "run_semantic_enrichment",

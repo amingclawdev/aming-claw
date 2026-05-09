@@ -471,6 +471,101 @@ def test_semantic_graph_state_accumulates_and_skips_completed(conn, tmp_path):
     by_id = {item["node_id"]: item for item in second["semantic_index"]["features"]}
     assert by_id["L7.1"]["enrichment_status"] == "semantic_graph_state"
     assert by_id["L7.1"]["feature_name"] == "Feature L7.1"
+    db_count = conn.execute(
+        "SELECT COUNT(*) FROM graph_semantic_nodes WHERE project_id=? AND snapshot_id=?",
+        (PID, "full-semantic-test"),
+    ).fetchone()[0]
+    assert db_count == 2
+
+
+def test_semantic_graph_state_resumes_from_db_when_companion_is_missing(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    calls: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append(stage)
+        return {
+            "feature_name": "DB-backed Semantic State",
+            "semantic_summary": "Persisted in DB, exported as companion JSON.",
+        }
+
+    first = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+    assert first["summary"]["ai_complete_count"] == 1
+    state_path = Path(first["summary"]["semantic_graph_state"]["state_path"])
+    state_path.unlink()
+
+    calls_after_first = len(calls)
+    second = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+
+    assert len(calls) == calls_after_first
+    assert second["summary"]["semantic_graph_state"]["source"] == "db"
+    assert second["summary"]["semantic_graph_state"]["hit_count"] == 1
+    assert second["semantic_index"]["features"][0]["feature_name"] == "DB-backed Semantic State"
+
+
+def test_semantic_graph_state_hash_mismatch_forces_resemanticization(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    calls: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append(stage)
+        return {
+            "feature_name": f"Run {len(calls)}",
+            "semantic_summary": "Hash-gated semantic result.",
+        }
+
+    first = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+    assert first["summary"]["ai_complete_count"] == 1
+    conn.execute(
+        """
+        UPDATE graph_semantic_nodes
+        SET feature_hash='sha256:stale'
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-test", "L7.1"),
+    )
+    conn.commit()
+
+    second = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+
+    assert len(calls) == 2
+    assert second["summary"]["semantic_hash_mismatch_count"] == 1
+    assert second["summary"]["ai_complete_count"] == 1
+    assert second["semantic_index"]["features"][0]["feature_name"] == "Run 2"
 
 
 def test_semantic_graph_state_carries_forward_unchanged_snapshot_entries(conn, tmp_path):

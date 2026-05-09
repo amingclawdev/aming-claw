@@ -325,6 +325,49 @@ def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
     assert Path(enriched["semantic_index_path"]).exists()
 
 
+def test_graph_governance_semantic_review_queue_waits_for_ai_semantics(conn, tmp_path):
+    project = tmp_path / "project"
+    primary = project / "agent" / "governance" / "server.py"
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    primary.write_text("def handle_graph_governance():\n    return 'ok'\n", encoding="utf-8")
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-review-gate-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    enriched = server.handle_graph_governance_snapshot_semantic_enrich(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "full-semantic-review-gate-api"},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "actor": "observer",
+                "semantic_mode": "manual",
+                "use_ai": False,
+                "feedback_review_mode": "auto",
+            },
+        )
+    )
+
+    assert enriched["ok"] is True
+    assert enriched["summary"]["semantic_run_status"] == "ai_pending"
+    assert enriched["summary"]["ai_complete_count"] == 0
+    assert enriched["feedback_queue"]["blocked"] is True
+    assert enriched["feedback_queue"]["gate"]["reason"] == "semantic_ai_not_complete"
+
+
 def test_graph_governance_status_observation_requires_explicit_backlog_action(conn):
     snapshot = store.create_graph_snapshot(
         conn,

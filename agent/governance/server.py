@@ -3613,6 +3613,18 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                 "feedback_review_mode": feedback_review_mode,
             })
             if feedback_review_mode in {"enqueue_only", "auto"}:
+                review_gate = semantic.feedback_review_gate(
+                    result.get("summary") or {},
+                    allow_heuristic_feedback_review=bool(body.get("allow_heuristic_feedback_review")),
+                )
+                if not review_gate.get("allowed"):
+                    result["feedback_queue"] = {
+                        "mode": feedback_review_mode,
+                        "blocked": True,
+                        "gate": review_gate,
+                    }
+                    conn.commit()
+                    return {"ok": True, **result}
                 round_label = f"round-{int(result.get('feedback_round') or 0):03d}"
                 classified = reconcile_feedback.classify_semantic_open_issues(
                     project_id,
