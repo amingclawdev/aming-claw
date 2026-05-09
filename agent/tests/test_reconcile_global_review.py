@@ -205,6 +205,8 @@ def test_full_global_review_builds_health_picture_without_semantic_enrichment(co
     assert result["health_picture"]["test_coverage_ratio"] == 1
     assert result["health_picture"]["project_health_score"] == 100
     assert result["health_picture"]["average_health_score"] == 100
+    assert result["health_picture"]["file_hygiene"]["available"] is False
+    assert result["health_picture"]["file_hygiene_score"] == 100
     assert result["health_picture"]["low_health_count"] == 0
     assert result["graph_query_trace"]["trace"]["status"] == "complete"
     assert Path(result["report_path"]).exists()
@@ -267,10 +269,11 @@ def test_full_global_review_scores_project_health_from_existing_signals(conn, pr
     )
 
     health = result["health_picture"]
-    assert health["score_version"] == "project_health_v3_existing_data_signals"
+    assert health["score_version"] == "project_health_v4_existing_data_plus_file_hygiene"
     assert health["semantic_coverage_ratio"] == 1
     assert health["governance_observability_score"] == 100
     assert health["artifact_binding_score"] == 90
+    assert health["raw_project_health_score"] == 67
     assert health["project_health_score"] == 67
     assert health["project_health_issue_counts"]["high_function_count"] == 1
     assert health["project_health_issue_counts"]["duplicate_or_overlap_issue_reported"] == 1
@@ -285,6 +288,62 @@ def test_full_global_review_scores_project_health_from_existing_signals(conn, pr
         "test_gap_issue",
         "test_status_over_broad",
     ]
+
+
+def test_full_global_review_includes_file_hygiene_from_existing_inventory(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+    snapshot = store.get_graph_snapshot(conn, PID, snapshot_id)
+    notes = json.loads(snapshot["notes"])
+    notes["run_id"] = "inventory-health-run"
+    conn.execute(
+        "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+        (json.dumps(notes), PID, snapshot_id),
+    )
+    rows = [
+        ("agent/orphan.py", "source", "orphan", "unmapped", "pending", 100),
+        ("docs/orphan.md", "doc", "orphan", "unmapped", "pending", 200),
+        ("scripts/check.ps1", "script", "pending_decision", "pending_decision", "pending", 300),
+        ("docs/dev/scratch/ai-output.json", "generated", "ignored", "ignored", "ignore", 10 * 1024 * 1024),
+    ]
+    for path, kind, scan, graph, decision, size in rows:
+        conn.execute(
+            """
+            INSERT INTO reconcile_file_inventory
+              (project_id, run_id, path, file_kind, scan_status, graph_status,
+               decision, size_bytes, updated_at)
+            VALUES (?, 'inventory-health-run', ?, ?, ?, ?, ?, ?, 'now')
+            """,
+            (PID, path, kind, scan, graph, decision, size),
+        )
+    conn.commit()
+
+    result = reconcile_global_review.run_full_global_review(
+        conn,
+        PID,
+        snapshot_id,
+        project,
+        actor="observer",
+        run_id="full-picture-file-hygiene",
+    )
+
+    hygiene = result["health_picture"]["file_hygiene"]
+    assert hygiene["available"] is True
+    assert hygiene["run_id"] == "inventory-health-run"
+    assert hygiene["orphan_count"] == 2
+    assert hygiene["pending_decision_count"] == 1
+    assert hygiene["cleanup_candidate_count"] == 1
+    assert hygiene["cleanup_candidate_mb"] == 10
+    assert hygiene["review_required_count"] == 3
+    assert hygiene["review_required_sample"][0]["suggested_dashboard_actions"] == [
+        "attach_to_node",
+        "create_node",
+        "delete_candidate",
+        "waive",
+    ]
+    assert result["health_picture"]["file_hygiene_score"] == pytest.approx(92.22)
+    assert result["health_picture"]["raw_project_health_score"] == 100
+    assert result["health_picture"]["project_health_global_penalties"]["file_hygiene"] == pytest.approx(1.9)
+    assert result["health_picture"]["project_health_score"] == pytest.approx(98.1)
 
 
 def test_full_global_review_can_call_ai_once(conn, project):

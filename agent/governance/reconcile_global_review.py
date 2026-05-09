@@ -198,6 +198,188 @@ def _open_issue_penalties(open_issues: Any) -> tuple[dict[str, int], dict[str, i
     return penalties, raw_counts
 
 
+def _inventory_run_id_from_notes(notes: dict[str, Any]) -> str:
+    for container_key in ("governance_index", "pending_scope_reconcile"):
+        container = notes.get(container_key)
+        if isinstance(container, dict):
+            value = str(container.get("run_id") or "").strip()
+            if value:
+                return value
+    return str(notes.get("run_id") or "").strip()
+
+
+def _file_kind_weight(kind: str, *, pending: bool = False) -> float:
+    normalized = str(kind or "").strip().lower()
+    if pending:
+        return {
+            "source": 2.0,
+            "test": 1.0,
+            "doc": 0.5,
+            "index_doc": 0.3,
+            "config": 0.5,
+            "script": 0.35,
+            "unknown": 0.5,
+            "generated": 0.05,
+        }.get(normalized, 0.5)
+    return {
+        "source": 4.0,
+        "test": 2.0,
+        "doc": 1.0,
+        "index_doc": 0.5,
+        "config": 1.0,
+        "script": 0.75,
+        "unknown": 1.0,
+        "generated": 0.05,
+    }.get(normalized, 1.0)
+
+
+def _file_hygiene_picture(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+    notes = _snapshot_notes(snapshot)
+    run_id = _inventory_run_id_from_notes(notes)
+    if not run_id or not _table_exists(conn, "reconcile_file_inventory"):
+        return {
+            "available": False,
+            "run_id": run_id,
+            "file_hygiene_score": 100.0,
+            "project_health_penalty": 0.0,
+            "reason": "missing_inventory_run" if not run_id else "missing_inventory_table",
+        }
+
+    rows = conn.execute(
+        """
+        SELECT path, file_kind, language, size_bytes, scan_status, graph_status,
+               decision, reason, mapped_node_ids, attached_node_ids, attachment_role
+        FROM reconcile_file_inventory
+        WHERE project_id = ? AND run_id = ?
+        """,
+        (project_id, run_id),
+    ).fetchall()
+    if not rows:
+        return {
+            "available": False,
+            "run_id": run_id,
+            "file_hygiene_score": 100.0,
+            "project_health_penalty": 0.0,
+            "reason": "empty_inventory",
+        }
+
+    by_kind: dict[str, int] = {}
+    by_scan_status: dict[str, int] = {}
+    by_graph_status: dict[str, int] = {}
+    orphan_by_kind: dict[str, int] = {}
+    pending_by_kind: dict[str, int] = {}
+    cleanup_by_kind: dict[str, int] = {}
+    review_required: list[dict[str, Any]] = []
+    cleanup_candidates: list[dict[str, Any]] = []
+    review_count = 0
+    orphan_count = 0
+    pending_count = 0
+    error_count = 0
+    cleanup_count = 0
+    cleanup_bytes = 0
+    hygiene_penalty = 0.0
+    project_penalty = 0.0
+
+    for raw_row in rows:
+        row = dict(raw_row)
+        path = str(row.get("path") or "")
+        kind = str(row.get("file_kind") or "unknown")
+        scan = str(row.get("scan_status") or "")
+        graph = str(row.get("graph_status") or "")
+        decision = str(row.get("decision") or "")
+        size = int(row.get("size_bytes") or 0)
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        by_scan_status[scan] = by_scan_status.get(scan, 0) + 1
+        by_graph_status[graph] = by_graph_status.get(graph, 0) + 1
+
+        is_orphan = scan == "orphan" or graph == "unmapped"
+        is_pending = scan == "pending_decision" or graph == "pending_decision"
+        is_error = scan == "error" or graph == "error"
+        is_cleanup = kind == "generated" or (scan == "ignored" and graph == "ignored" and decision == "ignore")
+
+        if is_orphan:
+            orphan_count += 1
+            orphan_by_kind[kind] = orphan_by_kind.get(kind, 0) + 1
+            weight = _file_kind_weight(kind)
+            hygiene_penalty += weight * 1.4
+            project_penalty += weight * 0.35
+        if is_pending:
+            pending_count += 1
+            pending_by_kind[kind] = pending_by_kind.get(kind, 0) + 1
+            weight = _file_kind_weight(kind, pending=True)
+            hygiene_penalty += weight
+            project_penalty += weight * 0.25
+        if is_error:
+            error_count += 1
+            hygiene_penalty += 6
+            project_penalty += 2
+        if is_orphan or is_pending or is_error:
+            review_count += 1
+            if len(review_required) < 50:
+                review_required.append({
+                    "path": path,
+                    "file_kind": kind,
+                    "scan_status": scan,
+                    "graph_status": graph,
+                    "decision": decision,
+                    "size_bytes": size,
+                    "suggested_dashboard_actions": ["attach_to_node", "create_node", "delete_candidate", "waive"],
+                })
+        if is_cleanup:
+            cleanup_count += 1
+            cleanup_by_kind[kind] = cleanup_by_kind.get(kind, 0) + 1
+            cleanup_bytes += size
+            if len(cleanup_candidates) < 5000:
+                cleanup_candidates.append({
+                    "path": path,
+                    "file_kind": kind,
+                    "scan_status": scan,
+                    "graph_status": graph,
+                    "decision": decision,
+                    "size_bytes": size,
+                    "suggested_dashboard_actions": ["delete_candidate", "waive"],
+                })
+
+    cleanup_mb = cleanup_bytes / (1024 * 1024)
+    cleanup_hygiene_penalty = min(25.0, cleanup_count * 0.03 + cleanup_mb * 0.04)
+    cleanup_project_penalty = min(4.0, cleanup_count * 0.01 + cleanup_mb * 0.005)
+    hygiene_penalty += cleanup_hygiene_penalty
+    project_penalty += cleanup_project_penalty
+    hygiene_penalty = min(70.0, hygiene_penalty)
+    project_penalty = min(12.0, project_penalty)
+    return {
+        "available": True,
+        "run_id": run_id,
+        "total_files": len(rows),
+        "file_hygiene_score": round(max(0.0, 100.0 - hygiene_penalty), 2),
+        "project_health_penalty": round(project_penalty, 2),
+        "review_required_count": review_count,
+        "orphan_count": orphan_count,
+        "pending_decision_count": pending_count,
+        "error_count": error_count,
+        "cleanup_candidate_count": cleanup_count,
+        "cleanup_candidate_bytes": cleanup_bytes,
+        "cleanup_candidate_mb": round(cleanup_mb, 2),
+        "by_kind": dict(sorted(by_kind.items())),
+        "by_scan_status": dict(sorted(by_scan_status.items())),
+        "by_graph_status": dict(sorted(by_graph_status.items())),
+        "orphan_by_kind": dict(sorted(orphan_by_kind.items())),
+        "pending_decision_by_kind": dict(sorted(pending_by_kind.items())),
+        "cleanup_candidate_by_kind": dict(sorted(cleanup_by_kind.items())),
+        "review_required_sample": review_required,
+        "cleanup_candidate_sample": sorted(
+            cleanup_candidates,
+            key=lambda item: int(item.get("size_bytes") or 0),
+            reverse=True,
+        )[:50],
+    }
+
+
 def _snapshot_notes(snapshot: dict[str, Any]) -> dict[str, Any]:
     notes = _decode(snapshot.get("notes"), {})
     return notes if isinstance(notes, dict) else {}
@@ -489,8 +671,11 @@ def _semantic_coverage_picture(
     def ratio(count: int) -> float:
         return round(count / total, 4) if total else 0.0
     semantic_coverage_ratio = ratio(semantic_complete)
+    file_hygiene = _file_hygiene_picture(conn, project_id, snapshot_id)
+    file_hygiene_penalty = float(file_hygiene.get("project_health_penalty") or 0.0)
+    project_health_score = round(max(0.0, avg_score - file_hygiene_penalty), 2)
     return {
-        "score_version": "project_health_v3_existing_data_signals",
+        "score_version": "project_health_v4_existing_data_plus_file_hygiene",
         "feature_count": total,
         "semantic_complete_count": semantic_complete,
         "semantic_pending_count": len(semantic_pending),
@@ -503,13 +688,19 @@ def _semantic_coverage_picture(
         "test_coverage_ratio": ratio(test_bound),
         "config_bound_count": config_bound,
         "artifact_binding_score": artifact_avg_score,
-        "project_health_score": avg_score,
-        "average_health_score": avg_score,
+        "file_hygiene_score": file_hygiene.get("file_hygiene_score", 100.0),
+        "file_hygiene": file_hygiene,
+        "raw_project_health_score": avg_score,
+        "project_health_score": project_health_score,
+        "average_health_score": project_health_score,
         "semantic_status_counts": dict(sorted(status_counts.items())),
         "quality_flag_counts": dict(sorted(quality_flag_counts.items())),
         "artifact_issue_counts": dict(sorted(artifact_issue_counts.items())),
         "project_health_issue_counts": dict(sorted(health_issue_counts.items())),
         "project_health_penalty_by_category": dict(sorted(penalty_by_category.items())),
+        "project_health_global_penalties": {
+            "file_hygiene": file_hygiene_penalty,
+        },
         "low_health_count": len(low_health),
         "low_health_nodes": low_health[:100],
     }
