@@ -185,6 +185,53 @@ def test_graph_governance_status_and_snapshot_query_api(conn):
     assert edges["edges"][0]["edge_type"] == "contains"
 
 
+def test_graph_governance_correction_patch_api_lifecycle(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+
+    created = server.handle_graph_governance_correction_patch_create(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "patch_id": "patch-api-package-marker",
+                "patch_type": "mark_package_marker",
+                "target_node_id": "L7.1",
+                "patch_json": {"target_node_id": "L7.1"},
+                "evidence": {"reason": "empty package initializer"},
+                "actor": "observer",
+            },
+        )
+    )
+    status, payload = created
+    assert status == 201
+    assert payload["patch_id"] == "patch-api-package-marker"
+
+    listed = server.handle_graph_governance_correction_patch_list(
+        _ctx({"project_id": PID}, query={"status": "proposed"})
+    )
+    assert listed["count"] == 1
+    assert listed["patches"][0]["patch_json"]["target_node_id"] == "L7.1"
+
+    accepted = server.handle_graph_governance_correction_patch_accept(
+        _ctx(
+            {"project_id": PID, "patch_id": "patch-api-package-marker"},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+    assert accepted["status"] == "accepted"
+
+    listed = server.handle_graph_governance_correction_patch_list(
+        _ctx({"project_id": PID}, query={"status": "accepted"})
+    )
+    assert listed["count"] == 1
+    assert listed["patches"][0]["status"] == "accepted"
+
+
 def test_graph_governance_dashboard_api_summarizes_active_state(conn):
     snapshot = store.create_graph_snapshot(
         conn,

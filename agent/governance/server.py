@@ -2135,6 +2135,112 @@ def handle_graph_governance_snapshot_list(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/correction-patches")
+def handle_graph_governance_correction_patch_list(ctx: RequestContext):
+    """List auditable graph correction patches for dashboard/observer review."""
+    project_id = ctx.get_project_id()
+    from . import graph_correction_patches as patches
+
+    conn = get_connection(project_id)
+    try:
+        rows = patches.list_correction_patches(
+            conn,
+            project_id,
+            statuses=_query_statuses(ctx.query),
+            patch_type=str(ctx.query.get("patch_type") or ""),
+            target_node_id=str(ctx.query.get("target_node_id") or ""),
+            limit=_query_int(ctx.query, "limit", 100),
+        )
+        return {"ok": True, "project_id": project_id, "patches": rows, "count": len(rows)}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/correction-patches")
+def handle_graph_governance_correction_patch_create(ctx: RequestContext):
+    """Create a graph correction patch suggestion without mutating the graph."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    from . import graph_correction_patches as patches
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.correction-patch.create")
+        try:
+            result = patches.create_patch(
+                conn,
+                project_id,
+                patch_id=body.get("patch_id"),
+                patch_type=str(body.get("patch_type") or ""),
+                patch_json=body.get("patch_json") if isinstance(body.get("patch_json"), dict) else {},
+                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+                status=str(body.get("status") or patches.PATCH_STATUS_PROPOSED),
+                risk_level=str(body.get("risk_level") or "medium"),
+                base_snapshot_id=str(body.get("base_snapshot_id") or ""),
+                base_commit=str(body.get("base_commit") or ""),
+                target_node_id=str(body.get("target_node_id") or ""),
+                stable_key=str(body.get("stable_node_key") or ""),
+                created_by=str(body.get("actor") or "observer"),
+            )
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        conn.commit()
+        return 201, {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/correction-patches/{patch_id}/accept")
+def handle_graph_governance_correction_patch_accept(ctx: RequestContext):
+    """Accept a graph correction patch so future reconcile runs replay it."""
+    project_id = ctx.get_project_id()
+    patch_id = ctx.path_params["patch_id"]
+    body = ctx.body
+    from . import graph_correction_patches as patches
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.correction-patch.accept")
+        changed = patches.accept_patch(
+            conn,
+            project_id,
+            patch_id,
+            accepted_by=str(body.get("actor") or "observer"),
+        )
+        if not changed:
+            _raise_graph_api_validation(ValueError(f"patch not found or not proposed: {patch_id}"))
+        conn.commit()
+        return {"ok": True, "project_id": project_id, "patch_id": patch_id, "status": "accepted"}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/correction-patches/{patch_id}/reject")
+def handle_graph_governance_correction_patch_reject(ctx: RequestContext):
+    """Reject a proposed/accepted graph correction patch."""
+    project_id = ctx.get_project_id()
+    patch_id = ctx.path_params["patch_id"]
+    body = ctx.body
+    from . import graph_correction_patches as patches
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.correction-patch.reject")
+        changed = patches.reject_patch(
+            conn,
+            project_id,
+            patch_id,
+            rejected_by=str(body.get("actor") or "observer"),
+            reason=str(body.get("reason") or ""),
+        )
+        if not changed:
+            _raise_graph_api_validation(ValueError(f"patch not found or already terminal: {patch_id}"))
+        conn.commit()
+        return {"ok": True, "project_id": project_id, "patch_id": patch_id, "status": "rejected"}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/summary")
 def handle_graph_governance_snapshot_summary(ctx: RequestContext):
     """Return compact dashboard summary for one graph snapshot."""

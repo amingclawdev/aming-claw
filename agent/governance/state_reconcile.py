@@ -32,6 +32,15 @@ from agent.governance.graph_snapshot_store import (
     snapshot_id_for,
     waive_pending_scope_reconcile,
 )
+from agent.governance.graph_correction_patches import (
+    annotate_graph_node_roles,
+    annotate_graph_relationship_metrics,
+    apply_correction_patches,
+    ensure_schema as ensure_graph_correction_schema,
+    list_replayable_patches,
+    persist_node_migrations,
+    record_patch_apply_report,
+)
 from agent.governance.db import sqlite_write_lock
 from agent.governance.governance_index import build_governance_index, persist_governance_index
 from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
@@ -407,6 +416,33 @@ def run_state_only_full_reconcile(
             "graph_stats": graph_payload_stats(candidate_graph),
         },
     )
+    active_snapshot_for_corrections = get_active_graph_snapshot(conn, project_id) or {}
+    role_annotation = annotate_graph_node_roles(candidate_graph)
+    candidate_graph = role_annotation["graph"]
+    relationship_metrics = annotate_graph_relationship_metrics(candidate_graph)
+    candidate_graph = relationship_metrics["graph"]
+    ensure_graph_correction_schema(conn)
+    replayable_patches = list_replayable_patches(conn, project_id)
+    patch_application = apply_correction_patches(
+        candidate_graph,
+        replayable_patches,
+        from_snapshot_id=str(active_snapshot_for_corrections.get("snapshot_id") or ""),
+        to_snapshot_id=sid,
+    )
+    candidate_graph = patch_application["graph"]
+    trace.step(
+        "graph-correction-patches",
+        input_payload={
+            "active_snapshot_id": active_snapshot_for_corrections.get("snapshot_id", ""),
+            "patch_count": len(replayable_patches),
+        },
+        output_payload={
+            "file_role_annotation": role_annotation["report"],
+            "relationship_metrics": relationship_metrics["report"],
+            "patch_report": patch_application["report"],
+            "graph_stats": graph_payload_stats(candidate_graph),
+        },
+    )
     file_inventory = _normalize_inventory_commit(
         [
             row for row in (phase_result.get("file_inventory") or [])
@@ -435,6 +471,9 @@ def run_state_only_full_reconcile(
         "phase_node_count": phase_result.get("node_count", 0),
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
         "file_inventory_summary": phase_result.get("file_inventory_summary") or {},
+        "file_role_annotation": role_annotation["report"],
+        "relationship_metrics": relationship_metrics["report"],
+        "graph_correction_patch_report": patch_application["report"],
         **(notes_extra or {}),
     }
     notes["trace"] = {
@@ -479,6 +518,21 @@ def run_state_only_full_reconcile(
             governance_index,
             persist_inventory=True,
         )
+        migration_count = persist_node_migrations(
+            conn,
+            project_id,
+            from_snapshot_id=str(active_snapshot_for_corrections.get("snapshot_id") or ""),
+            to_snapshot_id=sid,
+            migrations=patch_application["report"].get("migrations") or [],
+        )
+        patch_apply_counts = record_patch_apply_report(
+            conn,
+            project_id,
+            snapshot_id=sid,
+            report=patch_application["report"],
+        )
+        notes["graph_correction_patch_report"]["migration_count"] = migration_count
+        notes["graph_correction_patch_report"]["patch_apply_counts"] = patch_apply_counts
         notes["governance_index"] = governance_index_summary
         conn.execute(
             "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
