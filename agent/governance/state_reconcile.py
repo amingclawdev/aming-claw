@@ -36,6 +36,10 @@ from agent.governance.db import sqlite_write_lock
 from agent.governance.governance_index import build_governance_index, persist_governance_index
 from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
 from agent.governance.reconcile_trace import ReconcileTrace, artifact_ref
+from agent.governance.reconcile_file_inventory import (
+    filter_governed_inventory_rows,
+    filter_governed_paths,
+)
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
@@ -165,10 +169,15 @@ def _row_file_hash(row: dict[str, Any]) -> str:
 
 def _build_scope_file_delta(
     *,
+    project_root: str | Path | None = None,
     old_rows: list[dict[str, Any]],
     new_rows: list[dict[str, Any]],
     changed_files: list[str],
 ) -> dict[str, Any]:
+    if project_root is not None:
+        old_rows = filter_governed_inventory_rows(project_root, old_rows)
+        new_rows = filter_governed_inventory_rows(project_root, new_rows)
+        changed_files = filter_governed_paths(project_root, changed_files)
     old_by_path = _rows_by_path(old_rows)
     new_by_path = _rows_by_path(new_rows)
     old_paths = set(old_by_path)
@@ -853,6 +862,7 @@ def run_pending_scope_reconcile_candidate(
             "covered_commit_shas": covered,
         }
     scope_file_delta = _build_scope_file_delta(
+        project_root=root,
         old_rows=active_inventory,
         new_rows=_snapshot_inventory_rows(conn, project_id, sid),
         changed_files=changed_files,

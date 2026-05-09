@@ -2027,6 +2027,73 @@ def handle_graph_governance_dashboard(ctx: RequestContext):
         conn.close()
 
 
+def _git_commit_subject(commit_sha: str) -> str:
+    commit_sha = str(commit_sha or "").strip()
+    if not commit_sha:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "show", "-s", "--format=%s", commit_sha],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path(__file__).resolve().parents[2],
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+@route("GET", "/api/graph-governance/{project_id}/commits")
+def handle_graph_governance_commit_timeline(ctx: RequestContext):
+    """Return commit-anchored graph snapshot timeline for dashboard navigation."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        status = store.graph_governance_status(conn, project_id)
+        commits = store.list_commit_timeline(
+            conn,
+            project_id,
+            limit=_query_int(ctx.query, "limit", 50),
+            include_backlog=_query_bool(ctx.query, "include_backlog", True),
+        )
+        if _query_bool(ctx.query, "include_git_subject", True):
+            for row in commits:
+                row["subject"] = row.get("subject") or _git_commit_subject(row.get("commit_sha", ""))
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "active_commit_sha": status.get("graph_snapshot_commit", ""),
+            "active_snapshot_id": status.get("active_snapshot_id", ""),
+            "pending_scope_reconcile_count": status.get("pending_scope_reconcile_count", 0),
+            "commits": commits,
+            "count": len(commits),
+        }
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/commits/{commit_sha}/graph-state")
+def handle_graph_governance_commit_graph_state(ctx: RequestContext):
+    """Resolve a commit to the graph snapshot dashboard should display."""
+    project_id = ctx.get_project_id()
+    commit_sha = ctx.path_params["commit_sha"]
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        try:
+            result = store.resolve_commit_graph_state(conn, project_id, commit_sha)
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        result["subject"] = _git_commit_subject(commit_sha) if _query_bool(ctx.query, "include_git_subject", True) else ""
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots")
 def handle_graph_governance_snapshot_list(ctx: RequestContext):
     """List graph snapshots for operator/dashboard review."""
@@ -2042,6 +2109,25 @@ def handle_graph_governance_snapshot_list(ctx: RequestContext):
             limit=_query_int(ctx.query, "limit", 50),
         )
         return {"ok": True, "project_id": project_id, "snapshots": snapshots, "count": len(snapshots)}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/summary")
+def handle_graph_governance_snapshot_summary(ctx: RequestContext):
+    """Return compact dashboard summary for one graph snapshot."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        try:
+            summary = store.summarize_graph_snapshot(conn, project_id, snapshot_id)
+        except KeyError as exc:
+            _raise_graph_api_validation(exc)
+        return {"ok": True, **summary}
     finally:
         conn.close()
 

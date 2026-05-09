@@ -11,6 +11,7 @@ import pytest
 from agent.governance import graph_snapshot_store as store
 from agent.governance.db import _ensure_schema
 from agent.governance.state_reconcile import (
+    _build_scope_file_delta,
     run_backfill_escape_hatch,
     run_pending_scope_reconcile_candidate,
     run_state_only_full_reconcile,
@@ -54,6 +55,33 @@ def _init_git(repo: Path) -> None:
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test User")
+
+
+def test_scope_file_delta_respects_current_gitignore(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git(project)
+    _write(project / ".gitignore", "docs/dev/\n")
+    _write(project / "agent" / "service.py", "def run():\n    return 1\n")
+    _git(project, "add", ".gitignore", "agent/service.py")
+    _git(project, "commit", "-m", "initial")
+
+    delta = _build_scope_file_delta(
+        project_root=project,
+        old_rows=[
+            {"path": "agent/service.py", "file_hash": "sha256:old", "scan_status": "clustered"},
+            {"path": "docs/dev/proposal.md", "file_hash": "sha256:old", "scan_status": "orphan"},
+        ],
+        new_rows=[
+            {"path": "agent/service.py", "file_hash": "sha256:new", "scan_status": "clustered"},
+        ],
+        changed_files=["agent/service.py", "docs/dev/proposal.md"],
+    )
+
+    assert delta["changed_files"] == ["agent/service.py"]
+    assert delta["removed_files"] == []
+    assert delta["hash_changed_files"] == ["agent/service.py"]
+    assert delta["impacted_files"] == ["agent/service.py"]
 
 
 def _write_project(root: Path) -> list[Path]:

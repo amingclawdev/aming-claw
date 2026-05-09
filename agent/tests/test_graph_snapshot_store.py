@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from agent.governance import graph_snapshot_store as store
+from agent.governance import db
 from agent.governance.baseline_service import create_baseline
 from agent.governance.db import _ensure_schema
 
@@ -42,7 +43,7 @@ def test_schema_migration_is_idempotent(conn):
     version = conn.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()
-    assert version["value"] == "34"
+    assert version["value"] == str(db.SCHEMA_VERSION)
 
 
 def test_create_index_and_activate_snapshot(conn, tmp_path):

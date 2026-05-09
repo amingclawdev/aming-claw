@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 
 from agent.governance.db import _ensure_schema
 from agent.governance.reconcile_file_inventory import (
@@ -22,6 +23,47 @@ def _write(path, content):
 
 def _by_path(rows):
     return {row["path"]: row for row in rows}
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_inventory_respects_gitignore_even_for_force_tracked_drafts(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "docs" / "dev" / "draft.md"), "scratch draft\n")
+    _write(str(project / "docs" / "dev" / "tracked.md"), "legacy tracked scratch\n")
+    _write(str(project / ".gitignore"), "docs/dev/\n")
+    _git(project, "init")
+    _git(project, "config", "user.email", "test@example.com")
+    _git(project, "config", "user.name", "Test User")
+    _git(project, "add", ".gitignore", "agent/service.py")
+    _git(project, "add", "-f", "docs/dev/tracked.md")
+    _git(project, "commit", "-m", "initial")
+
+    rows = build_file_inventory(
+        project_root=str(project),
+        run_id="run-gitignore",
+        nodes=[
+            {
+                "node_id": "agent.service",
+                "primary_file": "agent/service.py",
+            }
+        ],
+        feature_clusters=[],
+        last_scanned_commit="commit-1",
+    )
+    rows_by_path = _by_path(rows)
+
+    assert "agent/service.py" in rows_by_path
+    assert "docs/dev/draft.md" not in rows_by_path
+    assert "docs/dev/tracked.md" not in rows_by_path
 
 
 def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):

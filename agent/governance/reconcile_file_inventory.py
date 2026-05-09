@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,6 +121,107 @@ def _file_facts(path: Path) -> tuple[str, str, int]:
     return digest, _file_hash(digest), size_bytes
 
 
+def _gitignored_paths(project_root: str | Path, paths: Iterable[str]) -> set[str]:
+    candidates = sorted({
+        normalize_relpath(str(project_root), path)
+        for path in paths
+        if normalize_relpath(str(project_root), path)
+    })
+    if not candidates:
+        return set()
+    root = Path(project_root)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--stdin", "--no-index", "-z"],
+            input=("\0".join(candidates) + "\0").encode("utf-8"),
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return set()
+    if result.returncode not in {0, 1}:
+        return set()
+    return {
+        normalize_relpath(str(project_root), item.decode("utf-8", errors="replace").strip())
+        for item in (result.stdout or b"").split(b"\0")
+        if item.strip()
+    }
+
+
+def _git_inventory_paths(project_root: str, profile: ProjectProfile) -> set[str] | None:
+    root = Path(project_root)
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if inside.returncode != 0 or (inside.stdout or "").strip().lower() != "true":
+            return None
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    except Exception:
+        return None
+    raw_paths = {
+        normalize_relpath(project_root, path)
+        for path in (result.stdout or "").split("\0")
+        if path.strip()
+    }
+    ignored = _gitignored_paths(project_root, raw_paths)
+    out: set[str] = set()
+    for rel in raw_paths - ignored:
+        abs_path = root / rel
+        if rel and abs_path.is_file() and not profile.is_excluded_path(rel):
+            out.add(rel)
+    return out
+
+
+def filter_governed_paths(project_root: str | Path, paths: Iterable[str]) -> list[str]:
+    """Return paths that should participate in reconcile governance.
+
+    Existing repositories treat ``.gitignore`` as a governance boundary: ignored
+    scratch files can exist on disk, but they should not create graph drift.
+    Removed files are kept if they do not match current ignore rules so real
+    source/doc/test deletions still surface in scope reconcile.
+    """
+    root = Path(project_root)
+    normalized = sorted({
+        normalize_relpath(str(root), path)
+        for path in paths
+        if normalize_relpath(str(root), path)
+    })
+    if not normalized:
+        return []
+    ignored = _gitignored_paths(root, normalized)
+    return [path for path in normalized if path not in ignored]
+
+
+def filter_governed_inventory_rows(
+    project_root: str | Path,
+    rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ignored = _gitignored_paths(
+        project_root,
+        [str(row.get("path") or "") for row in rows if isinstance(row, dict)],
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rel = normalize_relpath(str(project_root), row.get("path") or "")
+        if rel and rel not in ignored:
+            out.append(row)
+    return out
+
+
 def _language_for(path: str, kind: str) -> str:
     suffix = Path(path).suffix.lower()
     if suffix in {".py", ".pyi"}:
@@ -208,6 +310,11 @@ def is_index_doc_path(rel_path: str) -> bool:
 
 
 def _walk_project_files(project_root: str, profile: ProjectProfile) -> Iterable[str]:
+    git_paths = _git_inventory_paths(project_root, profile)
+    if git_paths is not None:
+        yield from sorted(git_paths)
+        return
+
     root = Path(project_root)
     for dirpath, dirnames, filenames in os.walk(root):
         kept_dirs = []

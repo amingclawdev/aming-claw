@@ -190,6 +190,115 @@ def test_graph_governance_dashboard_api_summarizes_active_state(conn):
     assert dashboard["drift_summary"]["by_type"]["missing_test"] == 1
 
 
+def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
+    monkeypatch.setattr(server, "_git_commit_subject", lambda sha: f"subject {sha[:7]}")
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-old-dashboard",
+        commit_sha="oldcommit",
+        snapshot_kind="scope",
+        graph_json=_graph(),
+        file_inventory=[
+            {
+                "path": "agent/governance/server.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+                "decision": "govern",
+            },
+            {
+                "path": "docs/orphan.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "decision": "pending",
+            },
+        ],
+        notes=json.dumps({
+            "semantic_enrichment": {
+                "semantic_graph_state": {"open_issue_count": 3}
+            },
+            "global_semantic_review": {
+                "latest_full_semantic_coverage_ratio": 0.5
+            },
+        }),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        old["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    candidate = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-new-dashboard",
+        commit_sha="newcommit",
+        snapshot_kind="scope",
+        graph_json=_graph("L7.2"),
+        file_inventory=[],
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        candidate["snapshot_id"],
+        nodes=_graph("L7.2")["deps_graph"]["nodes"],
+        edges=_graph("L7.2")["deps_graph"]["edges"],
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="pendingcommit",
+        parent_commit_sha="oldcommit",
+    )
+    conn.commit()
+
+    timeline = server.handle_graph_governance_commit_timeline(
+        _ctx({"project_id": PID}, query={"include_backlog": "false"})
+    )
+    assert timeline["ok"] is True
+    assert timeline["active_snapshot_id"] == old["snapshot_id"]
+    commits = {row["commit_sha"]: row for row in timeline["commits"]}
+    assert commits["oldcommit"]["is_active"] is True
+    assert commits["oldcommit"]["subject"] == "subject oldcomm"
+    assert commits["oldcommit"]["counts"]["features"] == 1
+    assert commits["oldcommit"]["counts"]["orphan_files"] == 1
+    assert commits["oldcommit"]["counts"]["ai_review_feedback"] == 3
+    assert commits["newcommit"]["snapshot_status"] == "candidate"
+
+    exact = server.handle_graph_governance_commit_graph_state(
+        _ctx({"project_id": PID, "commit_sha": "oldcommit"})
+    )
+    assert exact["resolution"] == "exact"
+    assert exact["resolved_snapshot_id"] == old["snapshot_id"]
+    assert exact["is_active"] is True
+    assert exact["has_semantic_review"] is True
+
+    pending = server.handle_graph_governance_commit_graph_state(
+        _ctx({"project_id": PID, "commit_sha": "pendingcommit"})
+    )
+    assert pending["resolution"] == "pending"
+    assert pending["pending_scope_reconcile"] is True
+
+    advisory = server.handle_graph_governance_commit_graph_state(
+        _ctx({"project_id": PID, "commit_sha": "missingcommit"})
+    )
+    assert advisory["resolution"] == "advisory_latest"
+    assert advisory["resolved_snapshot_id"] == old["snapshot_id"]
+    assert advisory["warnings"]
+
+    summary = server.handle_graph_governance_snapshot_summary(
+        _ctx({"project_id": PID, "snapshot_id": old["snapshot_id"]})
+    )
+    assert summary["counts"]["nodes"] == 1
+    assert summary["counts"]["edges"] == 1
+    assert summary["counts"]["files"] == 2
+    assert summary["health"]["semantic_coverage_ratio"] == 0.5
+
+
 def test_graph_governance_query_trace_api_records_source_and_events(conn):
     snapshot = store.create_graph_snapshot(
         conn,

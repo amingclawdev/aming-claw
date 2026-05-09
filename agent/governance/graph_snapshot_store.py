@@ -318,6 +318,14 @@ def _decode_json(raw: Any, default: Any) -> Any:
     return default
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -768,6 +776,59 @@ def list_graph_snapshots(
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def list_graph_snapshots_for_commit(
+    conn: sqlite3.Connection,
+    project_id: str,
+    commit_sha: str,
+    *,
+    statuses: Iterable[str] | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id, commit_sha]
+    sql = "SELECT * FROM graph_snapshots WHERE project_id = ? AND commit_sha = ?"
+    status_values = [str(s) for s in statuses or [] if s]
+    if status_values:
+        placeholders = ",".join("?" for _ in status_values)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(status_values)
+    sql += """
+        ORDER BY
+          CASE status
+            WHEN 'active' THEN 0
+            WHEN 'superseded' THEN 1
+            WHEN 'candidate' THEN 2
+            WHEN 'finalizing' THEN 3
+            ELSE 4
+          END,
+          created_at DESC,
+          snapshot_id DESC
+        LIMIT ?
+    """
+    params.append(max(1, min(int(limit or 20), 100)))
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def get_graph_snapshot_for_commit(
+    conn: sqlite3.Connection,
+    project_id: str,
+    commit_sha: str,
+) -> dict[str, Any] | None:
+    rows = list_graph_snapshots_for_commit(
+        conn,
+        project_id,
+        commit_sha,
+        statuses=[
+            SNAPSHOT_STATUS_ACTIVE,
+            SNAPSHOT_STATUS_SUPERSEDED,
+            SNAPSHOT_STATUS_CANDIDATE,
+            SNAPSHOT_STATUS_FINALIZING,
+        ],
+        limit=1,
+    )
+    return rows[0] if rows else None
+
+
 def list_graph_snapshot_nodes(
     conn: sqlite3.Connection,
     project_id: str,
@@ -926,6 +987,333 @@ def list_graph_snapshot_files(
     }
 
 
+def _count_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    project_id: str,
+    snapshot_id: str,
+) -> int:
+    if not _table_exists(conn, table):
+        return 0
+    row = conn.execute(
+        f"SELECT COUNT(*) AS count FROM {table} WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, snapshot_id),
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _group_counts(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, int]:
+    if not _table_exists(conn, table):
+        return {}
+    rows = conn.execute(
+        f"""
+        SELECT {column} AS key, COUNT(*) AS count
+        FROM {table}
+        WHERE project_id = ? AND snapshot_id = ?
+        GROUP BY {column}
+        ORDER BY {column}
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    return {str(row["key"] or ""): int(row["count"]) for row in rows if str(row["key"] or "")}
+
+
+def _snapshot_notes(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not snapshot:
+        return {}
+    notes = _decode_json(snapshot.get("notes"), {})
+    return notes if isinstance(notes, dict) else {}
+
+
+def _latest_global_review_from_notes(notes: dict[str, Any]) -> dict[str, Any]:
+    review_meta = notes.get("global_semantic_review")
+    if not isinstance(review_meta, dict):
+        return {}
+    path = str(review_meta.get("latest_full_review_path") or "").strip()
+    if not path:
+        return {}
+    payload = _read_json_artifact(Path(path), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _health_from_snapshot_notes(notes: dict[str, Any]) -> dict[str, Any]:
+    latest_review = _latest_global_review_from_notes(notes)
+    health = latest_review.get("health_picture") if isinstance(latest_review, dict) else {}
+    if not isinstance(health, dict):
+        health = {}
+    review_meta = notes.get("global_semantic_review") if isinstance(notes.get("global_semantic_review"), dict) else {}
+    return {
+        "project_health_score": health.get("project_health_score"),
+        "raw_project_health_score": health.get("raw_project_health_score"),
+        "file_hygiene_score": health.get("file_hygiene_score"),
+        "artifact_binding_score": health.get("artifact_binding_score"),
+        "governance_observability_score": health.get("governance_observability_score"),
+        "doc_coverage_ratio": health.get("doc_coverage_ratio"),
+        "test_coverage_ratio": health.get("test_coverage_ratio"),
+        "semantic_coverage_ratio": (
+            health.get("semantic_coverage_ratio")
+            if health.get("semantic_coverage_ratio") is not None
+            else review_meta.get("latest_full_semantic_coverage_ratio")
+        ),
+    }
+
+
+def _semantic_counts(conn: sqlite3.Connection, project_id: str, snapshot_id: str) -> dict[str, Any]:
+    return {
+        "nodes_by_status": _group_counts(conn, "graph_semantic_nodes", "status", project_id, snapshot_id),
+        "jobs_by_status": _group_counts(conn, "graph_semantic_jobs", "status", project_id, snapshot_id),
+        "semantic_node_count": _count_rows(conn, "graph_semantic_nodes", project_id, snapshot_id),
+        "semantic_job_count": _count_rows(conn, "graph_semantic_jobs", project_id, snapshot_id),
+    }
+
+
+def summarize_graph_snapshot(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Return a compact dashboard-safe summary for one graph snapshot."""
+    ensure_schema(conn)
+    snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+
+    nodes_by_layer = _group_counts(conn, "graph_nodes_index", "layer", project_id, snapshot_id)
+    edges_by_type = _group_counts(conn, "graph_edges_index", "edge_type", project_id, snapshot_id)
+    semantic = _semantic_counts(conn, project_id, snapshot_id)
+    try:
+        files = list_graph_snapshot_files(conn, project_id, snapshot_id, limit=1)
+        file_summary = files["summary"]
+        file_total = int(files["total_count"])
+    except Exception:
+        file_summary = {}
+        file_total = 0
+
+    notes = _snapshot_notes(snapshot)
+    semantic_state = {}
+    semantic_enrichment = notes.get("semantic_enrichment")
+    if isinstance(semantic_enrichment, dict):
+        semantic_state = semantic_enrichment.get("semantic_graph_state") or {}
+        if not isinstance(semantic_state, dict):
+            semantic_state = {}
+
+    by_scan = file_summary.get("by_scan_status", {}) if isinstance(file_summary, dict) else {}
+    by_kind = file_summary.get("by_kind", {}) if isinstance(file_summary, dict) else {}
+    counts = {
+        "nodes": _count_rows(conn, "graph_nodes_index", project_id, snapshot_id),
+        "nodes_by_layer": nodes_by_layer,
+        "edges": _count_rows(conn, "graph_edges_index", project_id, snapshot_id),
+        "edges_by_type": edges_by_type,
+        "features": int(nodes_by_layer.get("L7", 0)),
+        "files": file_total,
+        "orphan_files": int(by_scan.get("orphan", 0)),
+        "pending_decision_files": int(by_scan.get("pending_decision", 0)),
+        "cleanup_candidates": int(by_kind.get("generated", 0)),
+        "ai_review_feedback": int(semantic_state.get("open_issue_count") or 0),
+    }
+    return {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "commit_sha": snapshot["commit_sha"],
+        "snapshot_kind": snapshot["snapshot_kind"],
+        "snapshot_status": snapshot["status"],
+        "created_at": snapshot["created_at"],
+        "created_by": snapshot.get("created_by", ""),
+        "graph_sha256": snapshot.get("graph_sha256", ""),
+        "inventory_sha256": snapshot.get("inventory_sha256", ""),
+        "drift_sha256": snapshot.get("drift_sha256", ""),
+        "counts": counts,
+        "health": _health_from_snapshot_notes(notes),
+        "semantic": semantic,
+        "file_inventory_summary": file_summary,
+    }
+
+
+def _backlog_counts_for_commits(
+    conn: sqlite3.Connection,
+    commits: Iterable[str],
+) -> dict[str, dict[str, int]]:
+    selected = [str(commit or "").strip() for commit in commits if str(commit or "").strip()]
+    if not selected or not _table_exists(conn, "backlog_bugs"):
+        return {}
+    placeholders = ",".join("?" for _ in selected)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT "commit" AS commit_sha, status, mf_type, COUNT(*) AS count
+            FROM backlog_bugs
+            WHERE "commit" IN ({placeholders})
+            GROUP BY "commit", status, mf_type
+            """,
+            selected,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    out: dict[str, dict[str, int]] = {
+        commit: {"total": 0, "open": 0, "fixed": 0, "manual_fix": 0, "chain": 0}
+        for commit in selected
+    }
+    for row in rows:
+        commit = str(row["commit_sha"] or "")
+        status = str(row["status"] or "").lower()
+        mf_type = str(row["mf_type"] or "")
+        count = int(row["count"] or 0)
+        bucket = out.setdefault(commit, {"total": 0, "open": 0, "fixed": 0, "manual_fix": 0, "chain": 0})
+        bucket["total"] += count
+        if status == "open":
+            bucket["open"] += count
+        if status == "fixed":
+            bucket["fixed"] += count
+        if mf_type:
+            bucket["manual_fix"] += count
+        else:
+            bucket["chain"] += count
+    return out
+
+
+def _pending_by_commit(conn: sqlite3.Connection, project_id: str) -> dict[str, dict[str, Any]]:
+    pending = list_pending_scope_reconcile(
+        conn,
+        project_id,
+        statuses=[PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED],
+    )
+    return {str(row.get("commit_sha") or ""): row for row in pending}
+
+
+def list_commit_timeline(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 50,
+    include_backlog: bool = True,
+) -> list[dict[str, Any]]:
+    """Return latest snapshot-backed commits for commit-anchored dashboard navigation."""
+    snapshots = list_graph_snapshots(conn, project_id, limit=limit)
+    active = get_active_graph_snapshot(conn, project_id)
+    active_snapshot_id = str(active.get("snapshot_id") or "") if active else ""
+    pending = _pending_by_commit(conn, project_id)
+    by_commit: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        commit = str(snapshot.get("commit_sha") or "")
+        if not commit:
+            continue
+        existing = by_commit.get(commit)
+        if existing and existing.get("snapshot_status") == SNAPSHOT_STATUS_ACTIVE:
+            existing["snapshot_count"] += 1
+            continue
+        if existing and snapshot.get("status") != SNAPSHOT_STATUS_ACTIVE:
+            existing["snapshot_count"] += 1
+            continue
+        summary = summarize_graph_snapshot(conn, project_id, snapshot["snapshot_id"])
+        by_commit[commit] = {
+            "commit_sha": commit,
+            "short_sha": commit[:7],
+            "subject": "",
+            "created_at": snapshot.get("created_at", ""),
+            "snapshot_id": snapshot["snapshot_id"],
+            "snapshot_kind": snapshot["snapshot_kind"],
+            "snapshot_status": snapshot["status"],
+            "snapshot_count": int((existing or {}).get("snapshot_count") or 0) + 1,
+            "graph_resolution": "exact",
+            "is_active": snapshot["snapshot_id"] == active_snapshot_id,
+            "pending_scope_reconcile": commit in pending,
+            "pending_scope_status": pending.get(commit, {}).get("status", ""),
+            "counts": summary["counts"],
+            "health": summary["health"],
+        }
+    if include_backlog:
+        backlog = _backlog_counts_for_commits(conn, by_commit.keys())
+        for commit, row in by_commit.items():
+            row["backlog"] = backlog.get(commit, {"total": 0, "open": 0, "fixed": 0, "manual_fix": 0, "chain": 0})
+    return list(by_commit.values())[: max(1, min(int(limit or 50), 500))]
+
+
+def resolve_commit_graph_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    commit_sha: str,
+) -> dict[str, Any]:
+    """Resolve a commit to the graph snapshot dashboard should display."""
+    ensure_schema(conn)
+    commit_sha = str(commit_sha or "").strip()
+    if not commit_sha:
+        raise ValueError("commit_sha is required")
+
+    active = get_active_graph_snapshot(conn, project_id)
+    active_snapshot_id = str(active.get("snapshot_id") or "") if active else ""
+    exact = get_graph_snapshot_for_commit(conn, project_id, commit_sha)
+    pending_rows = list_pending_scope_reconcile(conn, project_id, commit_shas=[commit_sha])
+    pending_active = [
+        row for row in pending_rows
+        if row.get("status") in {PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED}
+    ]
+    if exact:
+        return {
+            "project_id": project_id,
+            "commit_sha": commit_sha,
+            "resolved_snapshot_id": exact["snapshot_id"],
+            "resolution": "exact",
+            "snapshot_status": exact["status"],
+            "snapshot_kind": exact["snapshot_kind"],
+            "has_graph": True,
+            "has_semantic_review": bool(_snapshot_notes(exact).get("global_semantic_review")),
+            "pending_scope_reconcile": bool(pending_active),
+            "pending_scope_status": pending_active[0]["status"] if pending_active else "",
+            "is_active": exact["snapshot_id"] == active_snapshot_id,
+            "warnings": [],
+        }
+    if pending_active:
+        return {
+            "project_id": project_id,
+            "commit_sha": commit_sha,
+            "resolved_snapshot_id": "",
+            "resolution": "pending",
+            "snapshot_status": "",
+            "snapshot_kind": "",
+            "has_graph": False,
+            "has_semantic_review": False,
+            "pending_scope_reconcile": True,
+            "pending_scope_status": pending_active[0]["status"],
+            "is_active": False,
+            "warnings": ["scope reconcile is pending for this commit"],
+        }
+    if active:
+        return {
+            "project_id": project_id,
+            "commit_sha": commit_sha,
+            "resolved_snapshot_id": active["snapshot_id"],
+            "resolution": "advisory_latest",
+            "snapshot_status": active["status"],
+            "snapshot_kind": active["snapshot_kind"],
+            "has_graph": True,
+            "has_semantic_review": bool(_snapshot_notes(active).get("global_semantic_review")),
+            "pending_scope_reconcile": False,
+            "pending_scope_status": "",
+            "is_active": True,
+            "warnings": ["no exact graph snapshot for commit; showing latest active graph as advisory context"],
+        }
+    return {
+        "project_id": project_id,
+        "commit_sha": commit_sha,
+        "resolved_snapshot_id": "",
+        "resolution": "missing",
+        "snapshot_status": "",
+        "snapshot_kind": "",
+        "has_graph": False,
+        "has_semantic_review": False,
+        "pending_scope_reconcile": False,
+        "pending_scope_status": "",
+        "is_active": False,
+        "warnings": ["no graph snapshot is available"],
+    }
+
+
 def export_graph_snapshot_cache(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1039,6 +1427,7 @@ def list_pending_scope_reconcile(
     project_id: str,
     *,
     statuses: Iterable[str] | None = None,
+    commit_shas: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     ensure_schema(conn)
     params: list[Any] = [project_id]
@@ -1048,6 +1437,11 @@ def list_pending_scope_reconcile(
         placeholders = ",".join("?" for _ in status_values)
         sql += f" AND status IN ({placeholders})"
         params.extend(status_values)
+    commit_values = [str(s) for s in commit_shas or [] if s]
+    if commit_values:
+        placeholders = ",".join("?" for _ in commit_values)
+        sql += f" AND commit_sha IN ({placeholders})"
+        params.extend(commit_values)
     sql += " ORDER BY queued_at, commit_sha"
     rows = conn.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
