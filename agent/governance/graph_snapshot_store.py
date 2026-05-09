@@ -318,12 +318,98 @@ def _decode_json(raw: Any, default: Any) -> Any:
     return default
 
 
+def _row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    if key not in row.keys():
+        return default
+    return row[key]
+
+
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
         (table_name,),
     ).fetchone()
     return row is not None
+
+
+def _semantic_hash_state(status: str, feature_hash: str, payload: dict[str, Any]) -> str:
+    validation = payload.get("semantic_state_validation")
+    if isinstance(validation, dict):
+        validation_status = str(validation.get("status") or "").lower()
+        if validation_status in {"stale_hash_mismatch", "hash_mismatch", "stale"}:
+            return "stale"
+        if validation.get("valid") is True:
+            return "current"
+        if validation.get("valid") is False:
+            return "stale"
+
+    flags = payload.get("quality_flags")
+    if isinstance(flags, list):
+        flag_set = {str(flag or "").strip().lower() for flag in flags}
+        if flag_set.intersection({"semantic_hash_mismatch", "source_hash_changed", "semantic_stale"}):
+            return "stale"
+
+    if status in {"ai_complete", "semantic_graph_state", "review_pending", "reviewed"} and feature_hash:
+        return "current"
+    if status in {"pending_ai", "ai_pending", "running", "ai_running"}:
+        return "pending"
+    if status in {"ai_failed", "failed"}:
+        return "failed"
+    return "unknown"
+
+
+def _semantic_overlay_from_node_row(row: sqlite3.Row) -> dict[str, Any]:
+    payload = _decode_json(_row_value(row, "semantic_json", ""), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    file_hashes = _decode_json(_row_value(row, "semantic_file_hashes_json", ""), {})
+    if not isinstance(file_hashes, dict):
+        file_hashes = {}
+
+    node_status = str(_row_value(row, "semantic_status", "") or "")
+    job_status = str(_row_value(row, "semantic_job_status", "") or "")
+    status = node_status or job_status or str(payload.get("status") or "structure_only")
+    feature_hash = str(
+        _row_value(row, "semantic_feature_hash", "")
+        or payload.get("feature_hash")
+        or _row_value(row, "semantic_job_feature_hash", "")
+        or ""
+    )
+    updated_at = str(
+        _row_value(row, "semantic_updated_at", "")
+        or _row_value(row, "semantic_job_updated_at", "")
+        or payload.get("updated_at")
+        or ""
+    )
+
+    overlay = dict(payload)
+    overlay.update({
+        "status": status,
+        "node_status": node_status,
+        "job_status": job_status,
+        "feature_hash": feature_hash,
+        "file_hashes": file_hashes,
+        "feedback_round": _row_value(row, "semantic_feedback_round", payload.get("feedback_round", 0)) or 0,
+        "batch_index": _row_value(row, "semantic_batch_index", payload.get("batch_index")),
+        "updated_at": updated_at,
+        "hash_state": _semantic_hash_state(status, feature_hash, payload),
+        "has_semantic_payload": bool(node_status and payload),
+    })
+
+    if job_status:
+        overlay["job"] = {
+            "status": job_status,
+            "feature_hash": str(_row_value(row, "semantic_job_feature_hash", "") or ""),
+            "attempt_count": int(_row_value(row, "semantic_job_attempt_count", 0) or 0),
+            "last_error": str(_row_value(row, "semantic_job_last_error", "") or ""),
+            "worker_id": str(_row_value(row, "semantic_job_worker_id", "") or ""),
+            "claim_id": str(_row_value(row, "semantic_job_claim_id", "") or ""),
+            "claimed_at": str(_row_value(row, "semantic_job_claimed_at", "") or ""),
+            "lease_expires_at": str(_row_value(row, "semantic_job_lease_expires_at", "") or ""),
+            "claimed_by": str(_row_value(row, "semantic_job_claimed_by", "") or ""),
+            "updated_at": str(_row_value(row, "semantic_job_updated_at", "") or ""),
+        }
+    return overlay
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -838,26 +924,70 @@ def list_graph_snapshot_nodes(
     offset: int = 0,
     layer: str = "",
     kind: str = "",
+    include_semantic: bool = True,
 ) -> list[dict[str, Any]]:
     ensure_schema(conn)
     params: list[Any] = [project_id, snapshot_id]
-    sql = """
-        SELECT node_id, layer, title, kind, primary_files_json,
-               secondary_files_json, test_files_json, metadata_json
-        FROM graph_nodes_index
-        WHERE project_id = ? AND snapshot_id = ?
+    semantic_join = include_semantic and _table_exists(conn, "graph_semantic_nodes")
+    semantic_job_join = include_semantic and _table_exists(conn, "graph_semantic_jobs")
+    select_columns = """
+        n.node_id, n.layer, n.title, n.kind, n.primary_files_json,
+        n.secondary_files_json, n.test_files_json, n.metadata_json
+    """
+    joins = ""
+    if semantic_join:
+        select_columns += """,
+        s.status AS semantic_status,
+        s.feature_hash AS semantic_feature_hash,
+        s.file_hashes_json AS semantic_file_hashes_json,
+        s.semantic_json AS semantic_json,
+        s.feedback_round AS semantic_feedback_round,
+        s.batch_index AS semantic_batch_index,
+        s.updated_at AS semantic_updated_at
+        """
+        joins += """
+        LEFT JOIN graph_semantic_nodes s
+          ON s.project_id = n.project_id
+         AND s.snapshot_id = n.snapshot_id
+         AND s.node_id = n.node_id
+        """
+    if semantic_job_join:
+        select_columns += """,
+        j.status AS semantic_job_status,
+        j.feature_hash AS semantic_job_feature_hash,
+        j.attempt_count AS semantic_job_attempt_count,
+        j.worker_id AS semantic_job_worker_id,
+        j.claim_id AS semantic_job_claim_id,
+        j.claimed_at AS semantic_job_claimed_at,
+        j.lease_expires_at AS semantic_job_lease_expires_at,
+        j.claimed_by AS semantic_job_claimed_by,
+        j.last_error AS semantic_job_last_error,
+        j.updated_at AS semantic_job_updated_at
+        """
+        joins += """
+        LEFT JOIN graph_semantic_jobs j
+          ON j.project_id = n.project_id
+         AND j.snapshot_id = n.snapshot_id
+         AND j.node_id = n.node_id
+        """
+    sql = f"""
+        SELECT {select_columns}
+        FROM graph_nodes_index n
+        {joins}
+        WHERE n.project_id = ? AND n.snapshot_id = ?
     """
     if layer:
-        sql += " AND layer = ?"
+        sql += " AND n.layer = ?"
         params.append(layer)
     if kind:
-        sql += " AND kind = ?"
+        sql += " AND n.kind = ?"
         params.append(kind)
-    sql += " ORDER BY node_id LIMIT ? OFFSET ?"
+    sql += " ORDER BY n.node_id LIMIT ? OFFSET ?"
     params.extend([max(1, min(int(limit or 200), 1000)), max(0, int(offset or 0))])
     rows = conn.execute(sql, params).fetchall()
-    return [
-        {
+    nodes: list[dict[str, Any]] = []
+    for row in rows:
+        node = {
             "node_id": row["node_id"],
             "layer": row["layer"],
             "title": row["title"],
@@ -867,8 +997,10 @@ def list_graph_snapshot_nodes(
             "test_files": _decode_json(row["test_files_json"], []),
             "metadata": _decode_json(row["metadata_json"], {}),
         }
-        for row in rows
-    ]
+        if include_semantic:
+            node["semantic"] = _semantic_overlay_from_node_row(row)
+        nodes.append(node)
+    return nodes
 
 
 def list_graph_snapshot_edges(

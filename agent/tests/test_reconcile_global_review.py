@@ -370,6 +370,7 @@ def test_full_global_review_can_call_ai_once(conn, project):
         project,
         global_review_use_ai=True,
         global_review_ai_call=fake_ai,
+        classify_feedback=True,
         actor="observer",
         run_id="full-picture-ai",
     )
@@ -378,6 +379,8 @@ def test_full_global_review_can_call_ai_once(conn, project):
     assert calls[0]["payload"]["mode"] == "full_global_semantic_review"
     assert result["global_ai_review"]["requested"] is True
     assert result["global_ai_review"]["open_issue_count"] == 1
+    assert result["feedback_classification"]["count"] == 1
+    assert result["feedback_classification"]["items"][0]["source_round"] == "global-full:full-picture-ai"
 
 
 def test_incremental_global_review_requires_changed_semantics_when_global_state_exists(

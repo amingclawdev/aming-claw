@@ -806,6 +806,61 @@ def _claim_visible_to_worker(item: dict[str, Any], worker_id: str = "") -> bool:
     return bool(worker_id and str(claim.get("worker_id") or "") == worker_id)
 
 
+def _semantic_review_readiness(
+    item: dict[str, Any],
+    semantic_state: dict[str, Any],
+) -> dict[str, Any]:
+    nodes = _source_nodes(item)
+    node_semantics = semantic_state.get("node_semantics") if isinstance(semantic_state, dict) else {}
+    node_semantics = node_semantics if isinstance(node_semantics, dict) else {}
+    if not nodes:
+        return {
+            "ready": False,
+            "reason": "missing_source_node",
+            "source_node_ids": [],
+            "statuses": {},
+        }
+    statuses: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    pending: list[str] = []
+    stale: list[str] = []
+    for node_id in nodes:
+        entry = node_semantics.get(node_id) if isinstance(node_semantics.get(node_id), dict) else {}
+        status = str(entry.get("status") or "")
+        feature_hash = str(entry.get("feature_hash") or "")
+        file_hashes = entry.get("file_hashes") if isinstance(entry.get("file_hashes"), dict) else {}
+        updated_at = str(entry.get("updated_at") or "")
+        statuses[node_id] = {
+            "status": status,
+            "feature_hash": feature_hash,
+            "has_file_hashes": bool(file_hashes),
+            "updated_at": updated_at,
+        }
+        if not entry:
+            missing.append(node_id)
+        elif status != "ai_complete":
+            pending.append(node_id)
+        elif not feature_hash:
+            stale.append(node_id)
+    if missing:
+        reason = "missing_semantic_state"
+    elif pending:
+        reason = "semantic_not_ai_complete"
+    elif stale:
+        reason = "missing_feature_hash"
+    else:
+        reason = "current_semantic_ready"
+    return {
+        "ready": not (missing or pending or stale),
+        "reason": reason,
+        "source_node_ids": nodes,
+        "statuses": statuses,
+        "missing_node_ids": missing,
+        "pending_node_ids": pending,
+        "stale_node_ids": stale,
+    }
+
+
 def build_feedback_review_queue(
     project_id: str,
     snapshot_id: str,
@@ -820,6 +875,7 @@ def build_feedback_review_queue(
     include_resolved: bool = False,
     include_claimed: bool = True,
     claimable_only: bool = False,
+    require_current_semantic: bool = False,
     worker_id: str = "",
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -853,7 +909,13 @@ def build_feedback_review_queue(
     hidden_status = 0
     hidden_resolved = 0
     hidden_claimed = 0
+    hidden_semantic_pending = 0
     groups: dict[str, dict[str, Any]] = {}
+    semantic_state = (
+        _read_json(semantic_graph_state_path(project_id, snapshot_id), {})
+        if require_current_semantic
+        else {}
+    )
 
     for item in raw_items:
         kind = str(item.get("feedback_kind") or "")
@@ -876,6 +938,14 @@ def build_feedback_review_queue(
             continue
         if active_claim and not include_claimed and not _claim_visible_to_worker(item, worker_id):
             hidden_claimed += 1
+            continue
+        semantic_readiness = (
+            _semantic_review_readiness(item, semantic_state)
+            if require_current_semantic
+            else {"ready": True, "reason": "not_required"}
+        )
+        if require_current_semantic and not semantic_readiness.get("ready"):
+            hidden_semantic_pending += 1
             continue
 
         key = _queue_group_key(item, item_lane, group_by=group_by)
@@ -911,6 +981,8 @@ def build_feedback_review_queue(
                 "suppressed_count": 0,
                 "active_claim_count": 0,
                 "claim": {},
+                "semantic_review_ready": bool(semantic_readiness.get("ready")),
+                "semantic_review_gate": semantic_readiness,
                 "requires_human_signoff": bool(item.get("requires_human_signoff")),
                 "confidence": float(item.get("confidence") or 0.0),
                 "created_at": str(item.get("created_at") or ""),
@@ -939,6 +1011,7 @@ def build_feedback_review_queue(
         if active_claim:
             group["active_claim_count"] = int(group.get("active_claim_count") or 0) + 1
             group["claim"] = active_claim
+        group["semantic_review_ready"] = bool(group.get("semantic_review_ready") and semantic_readiness.get("ready"))
         group["requires_human_signoff"] = bool(group.get("requires_human_signoff") or item.get("requires_human_signoff"))
         group["updated_at"] = max(str(group.get("updated_at") or ""), str(item.get("updated_at") or ""))
 
@@ -970,6 +1043,8 @@ def build_feedback_review_queue(
             "hidden_status_observation_count": hidden_status,
             "hidden_resolved_count": hidden_resolved,
             "hidden_claimed_count": hidden_claimed,
+            "hidden_semantic_pending_count": hidden_semantic_pending,
+            "require_current_semantic": bool(require_current_semantic),
             "by_kind": dict(sorted(by_kind.items())),
             "by_status": dict(sorted(by_status.items())),
             "by_lane_all_items": dict(sorted(by_lane_all.items())),
@@ -993,6 +1068,7 @@ def claim_feedback_review_queue(
     group_by: str = "feature",
     include_status_observations: bool = False,
     include_resolved: bool = False,
+    require_current_semantic: bool = False,
     limit_groups: int = 1,
     max_items: int = 25,
     lease_seconds: int = DEFAULT_REVIEW_LEASE_SECONDS,
@@ -1016,6 +1092,7 @@ def claim_feedback_review_queue(
         include_resolved=include_resolved,
         include_claimed=False,
         claimable_only=True,
+        require_current_semantic=require_current_semantic,
         worker_id=worker_id,
         limit=limit_groups,
     )

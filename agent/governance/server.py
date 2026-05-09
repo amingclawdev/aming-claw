@@ -2278,6 +2278,7 @@ def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
             offset=_query_int(ctx.query, "offset", 0),
             layer=str(ctx.query.get("layer") or ""),
             kind=str(ctx.query.get("kind") or ""),
+            include_semantic=_query_bool(ctx.query, "include_semantic", True),
         )
         return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "nodes": nodes, "count": len(nodes)}
     finally:
@@ -3142,6 +3143,7 @@ def handle_graph_governance_snapshot_feedback_queue(ctx: RequestContext):
                 include_resolved=_query_bool(ctx.query, "include_resolved", False),
                 include_claimed=_query_bool(ctx.query, "include_claimed", True),
                 claimable_only=_query_bool(ctx.query, "claimable_only", False),
+                require_current_semantic=_query_bool(ctx.query, "require_current_semantic", False),
                 worker_id=str(ctx.query.get("worker_id") or ""),
                 limit=_query_int(ctx.query, "limit", 100),
             ),
@@ -3453,6 +3455,11 @@ def handle_graph_governance_snapshot_feedback_queue_claim(ctx: RequestContext):
                 group_by=str(body.get("group_by") or "feature"),
                 include_status_observations=bool(body.get("include_status_observations")),
                 include_resolved=bool(body.get("include_resolved")),
+                require_current_semantic=bool(
+                    body.get("require_current_semantic")
+                    or body.get("current_semantics_only")
+                    or body.get("semantic_review_ready_only")
+                ),
                 limit_groups=limit_groups,
                 max_items=max_items,
                 lease_seconds=int(body.get("lease_seconds") or body.get("claim_lease_seconds") or 1800),
@@ -3648,6 +3655,11 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
         "automation_mode",
         default="manual",
     )
+    require_current_semantic = bool(
+        body.get("require_current_semantic")
+        or body.get("current_semantics_only")
+        or body.get("semantic_review_ready_only")
+    )
 
     conn = get_connection(project_id)
     try:
@@ -3671,6 +3683,7 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
                 group_by=str(body.get("group_by") or "feature"),
                 include_status_observations=bool(body.get("include_status_observations")),
                 include_resolved=bool(body.get("include_resolved")),
+                require_current_semantic=require_current_semantic,
                 limit_groups=limit_groups,
                 max_items=max_items,
                 lease_seconds=int(body.get("lease_seconds") or body.get("claim_lease_seconds") or 1800),
@@ -3695,6 +3708,7 @@ def handle_graph_governance_snapshot_feedback_review_queue(ctx: RequestContext):
                 include_resolved=bool(body.get("include_resolved")),
                 include_claimed=bool(body.get("include_claimed", True)),
                 claimable_only=bool(body.get("claimable_only")),
+                require_current_semantic=require_current_semantic,
                 worker_id=worker_id,
                 limit=limit_groups,
             )
@@ -4031,6 +4045,10 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
             review_gate = semantic.feedback_review_gate(
                 result.get("summary") or {},
                 allow_heuristic_feedback_review=bool(body.get("allow_heuristic_feedback_review")),
+                allow_partial_semantic_feedback_review=bool(
+                    body.get("allow_partial_semantic_feedback_review")
+                    or body.get("allow_partial_feedback_review")
+                ),
             )
             if not review_gate.get("allowed"):
                 result["feedback_queue"] = {
@@ -4038,26 +4056,57 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                     "blocked": True,
                     "gate": review_gate,
                 }
-                conn.commit()
-                return {"ok": True, **result}
-            round_label = f"round-{int(result.get('feedback_round') or 0):03d}"
-            classified = reconcile_feedback.classify_semantic_open_issues(
+            else:
+                round_label = f"round-{int(result.get('feedback_round') or 0):03d}"
+                classified = reconcile_feedback.classify_semantic_open_issues(
+                    project_id,
+                    snapshot_id,
+                    source_round=round_label,
+                    created_by=str(body.get("actor") or "observer"),
+                    limit=(
+                        int(body["feedback_classify_limit"])
+                        if body.get("feedback_classify_limit") is not None
+                        else None
+                    ),
+                    base_snapshot_id=str(body.get("semantic_base_snapshot_id") or body.get("base_snapshot_id") or ""),
+                )
+                result["feedback_queue"] = {
+                    "mode": feedback_review_mode,
+                    "source_round": round_label,
+                    "classification": classified,
+                    "gate": review_gate,
+                }
+        if bool(body.get("run_global_review_after_semantic") or body.get("full_global_review_after_semantic")):
+            from . import reconcile_global_review
+
+            global_review_use_ai = bool(
+                _semantic_bool_from_body(
+                    body,
+                    "global_review_use_ai",
+                    "use_global_review_ai",
+                    default=False,
+                )
+            )
+            global_review_ai_call = (
+                _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+                if global_review_use_ai
+                else None
+            )
+            raw_budget = body.get("query_budget")
+            query_budget = raw_budget if isinstance(raw_budget, dict) else None
+            result["global_review"] = reconcile_global_review.run_full_global_review(
+                conn,
                 project_id,
                 snapshot_id,
-                source_round=round_label,
-                created_by=str(body.get("actor") or "observer"),
-                limit=(
-                    int(body["feedback_classify_limit"])
-                    if body.get("feedback_classify_limit") is not None
-                    else None
-                ),
+                root,
+                global_review_use_ai=global_review_use_ai,
+                global_review_ai_call=global_review_ai_call,
+                classify_feedback=bool(body.get("classify_global_review_feedback", True)),
                 base_snapshot_id=str(body.get("semantic_base_snapshot_id") or body.get("base_snapshot_id") or ""),
+                actor=str(body.get("actor") or "observer"),
+                run_id=str(body.get("global_review_run_id") or body.get("run_id") or ""),
+                query_budget=query_budget,
             )
-            result["feedback_queue"] = {
-                "mode": feedback_review_mode,
-                "source_round": round_label,
-                "classification": classified,
-            }
         conn.commit()
         return {"ok": True, **result}
     finally:
@@ -4179,6 +4228,8 @@ def handle_graph_governance_snapshot_full_global_review(ctx: RequestContext):
                 root,
                 global_review_use_ai=global_review_use_ai,
                 global_review_ai_call=global_review_ai_call,
+                classify_feedback=bool(body.get("classify_feedback") or body.get("classify_global_review_feedback")),
+                base_snapshot_id=str(body.get("base_snapshot_id") or body.get("semantic_base_snapshot_id") or ""),
                 actor=str(body.get("actor") or "observer"),
                 run_id=str(body.get("run_id") or ""),
                 query_budget=query_budget,

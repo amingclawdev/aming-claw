@@ -10,6 +10,7 @@ import pytest
 from agent.governance import graph_correction_patches
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
+from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance import server
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import ValidationError
@@ -321,6 +322,79 @@ def test_graph_governance_active_alias_resolves_for_nodes_and_edges(conn):
     assert nodes["count"] == 1
     assert edges["snapshot_id"] == "full-active-alias"
     assert edges["count"] == 1
+
+
+def test_graph_governance_snapshot_nodes_include_semantic_overlay(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-nodes",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    semantic_payload = {
+        "feature_name": "Governance Server Feature",
+        "domain_label": "governance/api",
+        "intent": "Expose graph-governance HTTP routes for dashboard users.",
+        "doc_status": "adequate",
+        "test_status": "adequate",
+        "config_status": "n/a",
+        "quality_flags": [],
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', 'sha256:feature',
+                '{"agent/governance/server.py":"sha256:file"}', ?, 2, 7, '2026-05-09T20:31:24Z')
+        """,
+        (PID, snapshot["snapshot_id"], json.dumps(semantic_payload)),
+    )
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           feedback_round, batch_index, attempt_count, updated_at, created_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', 'sha256:feature',
+                '{"agent/governance/server.py":"sha256:file"}', 2, 7, 1,
+                '2026-05-09T20:31:24Z', '2026-05-09T20:00:00Z')
+        """,
+        (PID, snapshot["snapshot_id"]),
+    )
+    conn.commit()
+
+    nodes = server.handle_graph_governance_snapshot_nodes(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+
+    semantic = nodes["nodes"][0]["semantic"]
+    assert semantic["status"] == "ai_complete"
+    assert semantic["node_status"] == "ai_complete"
+    assert semantic["job_status"] == "ai_complete"
+    assert semantic["hash_state"] == "current"
+    assert semantic["has_semantic_payload"] is True
+    assert semantic["feature_name"] == "Governance Server Feature"
+    assert semantic["domain_label"] == "governance/api"
+    assert semantic["file_hashes"]["agent/governance/server.py"] == "sha256:file"
+    assert semantic["job"]["attempt_count"] == 1
+
+    structure_only = server.handle_graph_governance_snapshot_nodes(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"include_semantic": "false"},
+        )
+    )
+    assert "semantic" not in structure_only["nodes"][0]
 
 
 def test_graph_governance_dashboard_api_summarizes_active_state(conn):
@@ -757,6 +831,51 @@ def test_graph_governance_semantic_review_queue_waits_for_ai_semantics(conn, tmp
     assert enriched["feedback_queue"]["gate"]["reason"] == "semantic_ai_not_complete"
 
 
+def test_graph_governance_semantic_enrich_can_run_full_global_review_after_semantic(conn, tmp_path):
+    project = tmp_path / "project"
+    primary = project / "agent" / "governance" / "server.py"
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    primary.write_text("def handle_graph_governance():\n    return 'ok'\n", encoding="utf-8")
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-global-review-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    enriched = server.handle_graph_governance_snapshot_semantic_enrich(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "actor": "observer",
+                "semantic_mode": "manual",
+                "use_ai": False,
+                "feedback_review_mode": "manual",
+                "run_global_review_after_semantic": True,
+                "run_id": "dogfood-health-picture",
+            },
+        )
+    )
+
+    assert enriched["ok"] is True
+    assert enriched["global_review"]["ok"] is True
+    assert enriched["global_review"]["run_id"] == "dogfood-health-picture"
+    assert enriched["global_review"]["health_picture"]["project_health_score"] >= 0
+    assert Path(enriched["global_review"]["latest_report_path"]).exists()
+
+
 def test_graph_governance_status_observation_requires_explicit_backlog_action(conn):
     snapshot = store.create_graph_snapshot(
         conn,
@@ -976,6 +1095,98 @@ def test_graph_governance_feedback_review_queue_uses_reviewer_ai(conn, tmp_path,
     assert all(call["has_review_context"] for call in calls)
     assert {item["reviewer_decision"] for item in reviewed["reviewed"]} == {"graph_correction"}
     assert reviewed["summary"]["by_status"] == {"reviewed": 2}
+
+
+def test_graph_governance_feedback_review_queue_can_require_current_semantics(conn, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir(parents=True, exist_ok=True)
+    graph = _graph("L7.1")
+    graph["deps_graph"]["nodes"].append({
+        "id": "L7.2",
+        "layer": "L7",
+        "title": "Pending Feature Node",
+        "kind": "service_runtime",
+        "primary": ["agent/governance/reconcile_feedback.py"],
+        "secondary": [],
+        "test": [],
+        "metadata": {"subsystem": "governance"},
+    })
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-review-current-semantics-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    conn.commit()
+    state_path = reconcile_feedback.semantic_graph_state_path(PID, snapshot["snapshot_id"])
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            "node_semantics": {
+                "L7.1": {
+                    "status": "ai_complete",
+                    "feature_hash": "hash-current",
+                    "file_hashes": {"agent/governance/server.py": "a"},
+                    "updated_at": "2026-05-09T00:00:00Z",
+                },
+                "L7.2": {
+                    "status": "ai_failed",
+                    "feature_hash": "hash-pending",
+                    "updated_at": "2026-05-09T00:00:00Z",
+                },
+            }
+        }),
+        encoding="utf-8",
+    )
+    reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        source_round="round-001",
+        created_by="observer",
+        issues=[
+            {
+                "node_id": "L7.1",
+                "reason": "dependency_patch_suggestions",
+                "summary": "Add typed relation to the current feature.",
+                "target": "agent.governance.reconcile_feedback",
+                "type": "add_typed_relation",
+            },
+            {
+                "node_id": "L7.2",
+                "reason": "dependency_patch_suggestions",
+                "summary": "Add typed relation to the pending feature.",
+                "target": "agent.governance.server",
+                "type": "add_typed_relation",
+            },
+            {
+                "node_id": "L7.2",
+                "reason": "coverage_gap",
+                "summary": "missing doc binding on the pending feature.",
+                "type": "missing_doc_binding",
+            },
+        ],
+    )
+
+    queue = server.handle_graph_governance_snapshot_feedback_queue(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={
+                "source_round": "round-001",
+                "lane": "graph_patch_candidate",
+                "group_by": "feature",
+                "require_current_semantic": "true",
+            },
+        )
+    )
+
+    assert queue["summary"]["require_current_semantic"] is True
+    assert queue["summary"]["hidden_semantic_pending_count"] == 1
+    assert queue["summary"]["by_lane_all_items"]["status_only"] == 1
+    assert queue["summary"]["visible_item_count"] == 1
+    assert queue["groups"][0]["source_node_ids"] == ["L7.1"]
+    assert queue["groups"][0]["semantic_review_ready"] is True
 
 
 def test_graph_governance_feedback_review_queue_can_batch_reviewer_ai(conn, tmp_path, monkeypatch):

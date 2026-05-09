@@ -773,6 +773,18 @@ def _update_pending_scope_candidate(
     return int(cur.rowcount or 0)
 
 
+def _has_semantic_selector_override(*values: Any) -> bool:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, tuple, set, dict)) and not value:
+            continue
+        return True
+    return False
+
+
 def run_pending_scope_reconcile_candidate(
     conn: sqlite3.Connection,
     project_id: str,
@@ -858,6 +870,23 @@ def run_pending_scope_reconcile_candidate(
         str(active.get("commit_sha") or ""),
         target,
     )
+    has_semantic_selector_override = _has_semantic_selector_override(
+        semantic_ai_scope,
+        semantic_node_ids,
+        semantic_layers,
+        semantic_quality_flags,
+        semantic_missing,
+        semantic_changed_paths,
+        semantic_path_prefixes,
+        semantic_selector_match,
+    )
+    effective_semantic_ai_scope = semantic_ai_scope
+    effective_semantic_changed_paths = semantic_changed_paths
+    effective_semantic_selector_match = semantic_selector_match
+    if changed_files and not has_semantic_selector_override:
+        effective_semantic_ai_scope = "changed"
+        effective_semantic_changed_paths = changed_files
+        effective_semantic_selector_match = "any"
     rid = run_id or f"scope-reconcile-{_short_commit(target)}-pending"
     sid = snapshot_id or snapshot_id_for("scope", target)
     result = run_state_only_full_reconcile(
@@ -890,14 +919,14 @@ def run_pending_scope_reconcile_candidate(
         semantic_ai_provider=semantic_ai_provider,
         semantic_ai_model=semantic_ai_model,
         semantic_ai_role=semantic_ai_role,
-        semantic_ai_scope=semantic_ai_scope,
+        semantic_ai_scope=effective_semantic_ai_scope,
         semantic_node_ids=semantic_node_ids,
         semantic_layers=semantic_layers,
         semantic_quality_flags=semantic_quality_flags,
         semantic_missing=semantic_missing,
-        semantic_changed_paths=semantic_changed_paths,
+        semantic_changed_paths=effective_semantic_changed_paths,
         semantic_path_prefixes=semantic_path_prefixes,
-        semantic_selector_match=semantic_selector_match,
+        semantic_selector_match=effective_semantic_selector_match,
         semantic_include_structural=semantic_include_structural,
         semantic_config_path=semantic_config_path,
         notes_extra={
@@ -906,6 +935,9 @@ def run_pending_scope_reconcile_candidate(
                 "covered_commit_count": len(covered),
                 "active_snapshot_id": active.get("snapshot_id", ""),
                 "active_graph_commit": active.get("commit_sha", ""),
+                "semantic_selector_defaulted_to_changed_files": bool(
+                    changed_files and not has_semantic_selector_override
+                ),
             }
         },
     )

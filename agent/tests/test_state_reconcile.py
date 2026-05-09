@@ -357,6 +357,10 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
     assert delta["changed_files"] == ["agent/service.py"]
     assert "agent/service.py" in delta["hash_changed_files"]
     assert "agent/service.py" in delta["impacted_files"]
+    selector = result["semantic_enrichment"]["semantic_selector"]
+    assert selector["scope"] == "changed"
+    assert selector["changed_paths"] == ["agent/service.py"]
+    assert selector["match_mode"] == "any"
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(

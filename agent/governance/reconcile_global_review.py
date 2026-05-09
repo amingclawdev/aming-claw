@@ -846,6 +846,8 @@ def run_full_global_review(
     *,
     global_review_use_ai: bool = False,
     global_review_ai_call: GlobalReviewAiCall | None = None,
+    classify_feedback: bool = False,
+    base_snapshot_id: str = "",
     actor: str = "observer",
     run_id: str = "",
     query_budget: dict[str, int] | None = None,
@@ -908,6 +910,17 @@ def run_full_global_review(
         raw_issues = ai_response.get("open_issues") if isinstance(ai_response, dict) else []
         ai_issues = [item for item in (raw_issues or []) if isinstance(item, dict)]
 
+    classification: dict[str, Any] = {}
+    if classify_feedback and ai_issues:
+        classification = reconcile_feedback.classify_semantic_open_issues(
+            project_id,
+            snapshot_id,
+            source_round=f"global-full:{rid}",
+            created_by=actor,
+            issues=ai_issues,
+            base_snapshot_id=base_snapshot_id,
+        )
+
     generated_at = utc_now()
     report = {
         "schema_version": 1,
@@ -927,6 +940,7 @@ def run_full_global_review(
             "open_issue_count": len(ai_issues),
             "response": ai_response if global_review_use_ai else {},
         },
+        "feedback_classification": classification,
     }
     out_dir = _global_review_dir(project_id, snapshot_id)
     report_path = str(out_dir / f"{rid_path}.json")
@@ -1148,7 +1162,8 @@ def run_incremental_global_review(
             "semantic_graph_state": {"hit_count": 0},
             "semantic_run_status": "ai_complete" if complete_node_ids else "ai_pending",
             "ai_selected_count": len(node_ids),
-        }
+        },
+        allow_partial_semantic_feedback_review=True,
     )
     if node_ids and pending_node_ids:
         review_gate = {

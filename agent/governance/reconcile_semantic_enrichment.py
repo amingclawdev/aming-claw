@@ -1640,24 +1640,36 @@ def feedback_review_gate(
     summary: dict[str, Any] | None,
     *,
     allow_heuristic_feedback_review: bool = False,
+    allow_partial_semantic_feedback_review: bool = False,
 ) -> dict[str, Any]:
     summary = summary if isinstance(summary, dict) else {}
     if allow_heuristic_feedback_review:
         return {"allowed": True, "reason": "heuristic_feedback_review_explicitly_allowed"}
     graph_state = summary.get("semantic_graph_state") if isinstance(summary.get("semantic_graph_state"), dict) else {}
     valid_semantic_count = int(summary.get("ai_complete_count") or 0) + int(graph_state.get("hit_count") or 0)
-    if valid_semantic_count > 0:
+    feature_count = int(summary.get("feature_count") or 0)
+    if feature_count > 0 and valid_semantic_count >= feature_count:
         return {
             "allowed": True,
-            "reason": "ai_semantic_available",
+            "reason": "all_selected_semantics_current",
             "valid_semantic_count": valid_semantic_count,
+            "feature_count": feature_count,
+        }
+    if allow_partial_semantic_feedback_review and valid_semantic_count > 0:
+        return {
+            "allowed": True,
+            "reason": "partial_ai_semantic_available",
+            "valid_semantic_count": valid_semantic_count,
+            "feature_count": feature_count,
         }
     return {
         "allowed": False,
-        "reason": "semantic_ai_not_complete",
+        "reason": "semantic_ai_not_complete" if valid_semantic_count <= 0 else "semantic_ai_partial",
         "semantic_run_status": summary.get("semantic_run_status") or "",
+        "feature_count": feature_count,
         "ai_selected_count": int(summary.get("ai_selected_count") or 0),
         "ai_complete_count": int(summary.get("ai_complete_count") or 0),
+        "valid_semantic_count": valid_semantic_count,
     }
 
 
