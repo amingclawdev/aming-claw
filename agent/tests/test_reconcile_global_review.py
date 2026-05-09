@@ -182,6 +182,67 @@ def test_incremental_global_review_queues_semantics_and_blocks_without_ai(conn, 
     assert notes["global_semantic_review"]["latest_incremental_status"] == "blocked_semantic_pending"
 
 
+def test_full_global_review_builds_health_picture_without_semantic_enrichment(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+
+    result = reconcile_global_review.run_full_global_review(
+        conn,
+        PID,
+        snapshot_id,
+        project,
+        actor="observer",
+        run_id="full-picture",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "reviewed"
+    assert result["health_picture"]["feature_count"] == 1
+    assert result["health_picture"]["semantic_complete_count"] == 0
+    assert result["health_picture"]["semantic_coverage_ratio"] == 0
+    assert result["health_picture"]["doc_coverage_ratio"] == 1
+    assert result["health_picture"]["test_coverage_ratio"] == 1
+    assert result["graph_query_trace"]["trace"]["status"] == "complete"
+    assert Path(result["report_path"]).exists()
+
+    snapshot = store.get_graph_snapshot(conn, PID, snapshot_id)
+    notes = json.loads(snapshot["notes"])
+    assert notes["global_semantic_review"]["latest_full_status"] == "reviewed"
+
+
+def test_full_global_review_can_call_ai_once(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+
+    calls: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append({"stage": stage, "payload": payload})
+        return {
+            "global_summary": "The graph picture is usable but semantic coverage is incomplete.",
+            "open_issues": [
+                {
+                    "kind": "status_observation",
+                    "message": "Semantic coverage is incomplete.",
+                }
+            ],
+        }
+
+    result = reconcile_global_review.run_full_global_review(
+        conn,
+        PID,
+        snapshot_id,
+        project,
+        global_review_use_ai=True,
+        global_review_ai_call=fake_ai,
+        actor="observer",
+        run_id="full-picture-ai",
+    )
+
+    assert calls[0]["stage"] == "reconcile_global_semantic_review"
+    assert calls[0]["payload"]["mode"] == "full_global_semantic_review"
+    assert result["global_ai_review"]["requested"] is True
+    assert result["global_ai_review"]["open_issue_count"] == 1
+
+
 def test_incremental_global_review_requires_changed_semantics_when_global_state_exists(
     conn,
     project,
@@ -280,6 +341,26 @@ def test_incremental_global_review_api(conn, project):
 
     assert result["ok"] is True
     assert result["blocked"] is True
+    assert result["graph_query_trace"]["trace_id"]
+
+
+def test_full_global_review_api(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+
+    result = server.handle_graph_governance_snapshot_full_global_review(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot_id},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "actor": "observer",
+                "run_id": "full-picture-api",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["health_picture"]["feature_count"] == 1
     assert result["graph_query_trace"]["trace_id"]
 
 

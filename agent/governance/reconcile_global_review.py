@@ -240,6 +240,98 @@ def _semantic_picture(semantic_nodes: dict[str, dict[str, Any]]) -> dict[str, An
     }
 
 
+def _semantic_coverage_picture(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    semantic_nodes: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    nodes = store.list_graph_snapshot_nodes(
+        conn,
+        project_id,
+        snapshot_id,
+        layer="L7",
+        limit=2000,
+    )
+    total = len(nodes)
+    semantic_complete = 0
+    doc_bound = 0
+    test_bound = 0
+    config_bound = 0
+    health_scores: list[int] = []
+    status_counts: dict[str, int] = {}
+    quality_flag_counts: dict[str, int] = {}
+    low_health: list[dict[str, Any]] = []
+    for node in nodes:
+        node_id = str(node.get("node_id") or "")
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        semantic_entry = semantic_nodes.get(node_id, {})
+        semantic_status = str(semantic_entry.get("status") or "")
+        status_counts[semantic_status or "missing"] = status_counts.get(semantic_status or "missing", 0) + 1
+        score = 100
+        issues: list[str] = []
+        if semantic_status == "ai_complete":
+            semantic_complete += 1
+        else:
+            score -= 25
+            issues.append("semantic_not_complete")
+        if _string_list(node.get("secondary_files")):
+            doc_bound += 1
+        else:
+            score -= 6
+            issues.append("missing_doc_binding")
+        if _string_list(node.get("test_files")):
+            test_bound += 1
+        else:
+            score -= 8
+            issues.append("missing_test_binding")
+        if _string_list(metadata.get("config_files")):
+            config_bound += 1
+        for flag in _string_list(semantic_entry.get("quality_flags")):
+            quality_flag_counts[flag] = quality_flag_counts.get(flag, 0) + 1
+            if flag == "semantic_hash_mismatch":
+                score -= 20
+            elif flag == "semantic_ai_error":
+                score -= 15
+            elif flag in {"needs_human_signoff", "review_required"}:
+                score -= 10
+            elif flag.startswith("missing_"):
+                score -= 5
+            issues.append(flag)
+        score = max(0, score)
+        health_scores.append(score)
+        if score < 90 or issues:
+            low_health.append({
+                "node_id": node_id,
+                "title": node.get("title") or node_id,
+                "score": score,
+                "semantic_status": semantic_status or "missing",
+                "issues": sorted(set(issues)),
+                "primary_files": _string_list(node.get("primary_files"))[:10],
+                "doc_files": _string_list(node.get("secondary_files"))[:10],
+                "test_files": _string_list(node.get("test_files"))[:10],
+            })
+    low_health.sort(key=lambda item: (int(item.get("score") or 0), str(item.get("node_id") or "")))
+    avg_score = round(sum(health_scores) / len(health_scores), 2) if health_scores else 0.0
+    def ratio(count: int) -> float:
+        return round(count / total, 4) if total else 0.0
+    return {
+        "feature_count": total,
+        "semantic_complete_count": semantic_complete,
+        "semantic_coverage_ratio": ratio(semantic_complete),
+        "doc_bound_count": doc_bound,
+        "doc_coverage_ratio": ratio(doc_bound),
+        "test_bound_count": test_bound,
+        "test_coverage_ratio": ratio(test_bound),
+        "config_bound_count": config_bound,
+        "average_health_score": avg_score,
+        "semantic_status_counts": dict(sorted(status_counts.items())),
+        "quality_flag_counts": dict(sorted(quality_flag_counts.items())),
+        "low_health_count": len(low_health),
+        "low_health_nodes": low_health[:100],
+    }
+
+
 def _call_ai(ai_call: GlobalReviewAiCall | None, payload: dict[str, Any]) -> dict[str, Any]:
     if ai_call is None:
         return {}
@@ -252,6 +344,103 @@ def _call_ai(ai_call: GlobalReviewAiCall | None, payload: dict[str, Any]) -> dic
 
 def _global_review_dir(project_id: str, snapshot_id: str) -> Path:
     return store.snapshot_companion_dir(project_id, snapshot_id) / "semantic-enrichment" / "global-review"
+
+
+def _trace_full_context(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    actor: str,
+    run_id: str,
+    project_root: str | Path | None,
+    budget: dict[str, int] | None,
+) -> dict[str, Any]:
+    trace = graph_query_trace.start_trace(
+        conn,
+        project_id,
+        snapshot_id,
+        actor=actor,
+        query_source="ai_global_review",
+        query_purpose="global_architecture_review",
+        run_id=run_id,
+        budget=budget,
+    )["trace"]
+    trace_id = trace["trace_id"]
+    queries: list[dict[str, Any]] = []
+    budget_exhausted = False
+
+    def query(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal budget_exhausted
+        if budget_exhausted:
+            queries.append({
+                "tool": tool,
+                "args": args,
+                "skipped": True,
+                "skip_reason": "query_budget_exhausted",
+            })
+            return {}
+        result = graph_query_trace.traced_query(
+            conn,
+            project_id,
+            snapshot_id,
+            trace_id=trace_id,
+            tool=tool,
+            args=args,
+            project_root=project_root,
+        )
+        queries.append({
+            "tool": tool,
+            "args": args,
+            "result_count": result.get("result_count", 0),
+            "budget_exceeded": result.get("budget_exceeded", False),
+        })
+        if result.get("budget_exceeded") or result.get("error") == "query_budget_exceeded":
+            budget_exhausted = True
+        return result.get("result") if isinstance(result.get("result"), dict) else {}
+
+    subsystems = query("list_subsystems", {"limit": 200})
+    low_health = query("list_low_health_nodes", {"limit": 200})
+    inspected: list[dict[str, Any]] = []
+    for item in (low_health.get("nodes") or [])[:20]:
+        node = item.get("node") if isinstance(item, dict) else {}
+        node_id = str((node or {}).get("node_id") or "")
+        if not node_id:
+            continue
+        inspected_node = query("get_node", {"node_id": node_id, "include_semantic": True})
+        inspected.append({
+            "node_id": node_id,
+            "health": {
+                "approx_health_score": item.get("approx_health_score"),
+                "issues": item.get("issues") or [],
+            },
+            "node": inspected_node.get("node") or {},
+            "semantic": inspected_node.get("semantic") or {},
+        })
+    finished = graph_query_trace.finish_trace(
+        conn,
+        project_id,
+        trace_id,
+        status="budget_exceeded" if budget_exhausted else "complete",
+        reason=(
+            "full global semantic review context budget exceeded"
+            if budget_exhausted
+            else "full global semantic review context captured"
+        ),
+    )["trace"]
+    return {
+        "trace_id": trace_id,
+        "trace": {
+            "status": finished.get("status"),
+            "usage": finished.get("usage") or {},
+            "event_count": finished.get("event_count", 0),
+            "artifact_path": finished.get("artifact_path", ""),
+        },
+        "queries": queries,
+        "subsystems": subsystems,
+        "low_health": low_health,
+        "inspected_nodes": inspected,
+    }
 
 
 def _update_snapshot_global_review_notes(
@@ -273,6 +462,119 @@ def _update_snapshot_global_review_notes(
         "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
         (_json(notes), project_id, snapshot_id),
     )
+
+
+def run_full_global_review(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    project_root: str | Path | None = None,
+    *,
+    global_review_use_ai: bool = False,
+    global_review_ai_call: GlobalReviewAiCall | None = None,
+    actor: str = "observer",
+    run_id: str = "",
+    query_budget: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Build a full semantic health picture for one graph snapshot.
+
+    This intentionally does not run feature-level semantic enrichment. It only
+    reviews already stored structure/semantic state so callers can establish an
+    old global picture before scope-level incremental review.
+    """
+    store.ensure_schema(conn)
+    graph_query_trace.ensure_schema(conn)
+    snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+
+    rid = run_id or f"full-global-review-{snapshot_id}"
+    rid_path = _path_component(rid)
+    semantic_nodes = _load_semantic_nodes(conn, project_id, snapshot_id)
+    semantic_picture = _semantic_picture(semantic_nodes)
+    health_picture = _semantic_coverage_picture(
+        conn,
+        project_id,
+        snapshot_id,
+        semantic_nodes,
+    )
+    context = _trace_full_context(
+        conn,
+        project_id,
+        snapshot_id,
+        actor=actor,
+        run_id=rid,
+        project_root=project_root,
+        budget=query_budget,
+    )
+    ai_response: dict[str, Any] = {}
+    ai_issues: list[dict[str, Any]] = []
+    if global_review_use_ai:
+        payload = {
+            "schema_version": 1,
+            "mode": "full_global_semantic_review",
+            "permissions": {
+                "can": ["query_graph", "read_provided_context", "return_review_suggestions"],
+                "cannot": ["modify_code", "modify_docs", "modify_tests", "mutate_graph_topology", "file_backlog"],
+            },
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "commit_sha": snapshot.get("commit_sha") or "",
+            "semantic_picture": semantic_picture,
+            "health_picture": health_picture,
+            "graph_query_trace": context,
+            "instructions": [
+                "Review the entire semantic graph picture, not individual feature implementation.",
+                "Identify global architecture risks such as duplicate capabilities, unclear ownership, missing semantic coverage, or unhealthy doc/test/config bindings.",
+                "Return open_issues only for graph corrections or project improvements supported by evidence.",
+                "Represent coverage/doc/test drift as status observations unless the user explicitly requests backlog filing.",
+            ],
+        }
+        ai_response = _call_ai(global_review_ai_call, payload)
+        raw_issues = ai_response.get("open_issues") if isinstance(ai_response, dict) else []
+        ai_issues = [item for item in (raw_issues or []) if isinstance(item, dict)]
+
+    generated_at = utc_now()
+    report = {
+        "schema_version": 1,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "commit_sha": snapshot.get("commit_sha") or "",
+        "run_id": rid,
+        "generated_at": generated_at,
+        "status": "reviewed",
+        "semantic_picture": semantic_picture,
+        "health_picture": health_picture,
+        "graph_query_trace": context,
+        "global_ai_review": {
+            "requested": bool(global_review_use_ai),
+            "response_present": bool(ai_response and not ai_response.get("_ai_error")),
+            "error": ai_response.get("_ai_error", "") if isinstance(ai_response, dict) else "",
+            "open_issue_count": len(ai_issues),
+            "response": ai_response if global_review_use_ai else {},
+        },
+    }
+    out_dir = _global_review_dir(project_id, snapshot_id)
+    report_path = str(out_dir / f"{rid_path}.json")
+    latest_path = str(out_dir / "latest-full-review.json")
+    report["report_path"] = report_path
+    report["latest_report_path"] = latest_path
+    _write_json(Path(report_path), report)
+    _write_json(Path(latest_path), report)
+    _update_snapshot_global_review_notes(
+        conn,
+        project_id,
+        snapshot_id,
+        {
+            "latest_full_review_path": latest_path,
+            "latest_full_run_id": rid,
+            "latest_full_status": report["status"],
+            "latest_full_semantic_coverage_ratio": health_picture.get("semantic_coverage_ratio", 0),
+            "latest_full_average_health_score": health_picture.get("average_health_score", 0),
+            "updated_at": generated_at,
+        },
+    )
+    return {"ok": True, **report}
 
 
 def _trace_incremental_context(
@@ -606,4 +908,4 @@ def run_incremental_global_review(
     return {"ok": True, **report}
 
 
-__all__ = ["run_incremental_global_review"]
+__all__ = ["run_full_global_review", "run_incremental_global_review"]

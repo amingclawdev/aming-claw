@@ -3852,6 +3852,55 @@ def handle_graph_governance_snapshot_incremental_global_review(ctx: RequestConte
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/global-review/full")
+def handle_graph_governance_snapshot_full_global_review(ctx: RequestContext):
+    """Build a full semantic health picture for a graph snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from . import reconcile_global_review
+
+    global_review_use_ai = bool(
+        _semantic_bool_from_body(
+            body,
+            "global_review_use_ai",
+            "use_global_review_ai",
+            default=False,
+        )
+    )
+    global_review_ai_call = (
+        _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+        if global_review_use_ai
+        else None
+    )
+    raw_budget = body.get("query_budget")
+    query_budget = raw_budget if isinstance(raw_budget, dict) else None
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.global-review.full")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        try:
+            result = reconcile_global_review.run_full_global_review(
+                conn,
+                project_id,
+                snapshot_id,
+                root,
+                global_review_use_ai=global_review_use_ai,
+                global_review_ai_call=global_review_ai_call,
+                actor=str(body.get("actor") or "observer"),
+                run_id=str(body.get("run_id") or ""),
+                query_budget=query_budget,
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/queue/claim")
 def handle_graph_governance_snapshot_semantic_queue_claim(ctx: RequestContext):
     """Claim semantic AI jobs for an executor-backed runner."""
