@@ -3774,6 +3774,84 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/global-review/incremental")
+def handle_graph_governance_snapshot_incremental_global_review(ctx: RequestContext):
+    """Run post-scope semantic catch-up plus incremental global review."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from . import reconcile_global_review
+
+    semantic_use_ai = _semantic_use_ai_from_body(body)
+    semantic_mode = _automation_mode_from_body(
+        body,
+        "semantic_mode",
+        "semantic_automation_mode",
+        default=("auto" if semantic_use_ai else "manual"),
+    )
+    if semantic_mode in {"manual", "enqueue_only"}:
+        semantic_use_ai = False
+    elif semantic_mode == "auto" and semantic_use_ai is None:
+        semantic_use_ai = True
+    semantic_ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+    global_review_use_ai = bool(
+        _semantic_bool_from_body(
+            body,
+            "global_review_use_ai",
+            "use_global_review_ai",
+            default=False,
+        )
+    )
+    global_review_ai_call = (
+        _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+        if global_review_use_ai
+        else None
+    )
+    semantic_batch_kwargs = _semantic_ai_batch_kwargs_from_body(body)
+    raw_budget = body.get("query_budget")
+    query_budget = raw_budget if isinstance(raw_budget, dict) else None
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.global-review.incremental")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        try:
+            result = reconcile_global_review.run_incremental_global_review(
+                conn,
+                project_id,
+                snapshot_id,
+                root,
+                base_snapshot_id=str(body.get("base_snapshot_id") or body.get("semantic_base_snapshot_id") or ""),
+                changed_paths=body.get("changed_paths") or body.get("semantic_changed_paths"),
+                changed_node_ids=body.get("changed_node_ids") or body.get("node_ids"),
+                run_semantic=bool(
+                    _semantic_bool_from_body(body, "run_semantic", "semantic_enrich", default=True)
+                ),
+                semantic_use_ai=semantic_use_ai,
+                semantic_ai_call=semantic_ai_call,
+                semantic_ai_feature_limit=_semantic_ai_feature_limit_from_body(body),
+                semantic_ai_batch_size=semantic_batch_kwargs["semantic_ai_batch_size"],
+                semantic_ai_batch_by=semantic_batch_kwargs["semantic_ai_batch_by"],
+                semantic_ai_input_mode=semantic_batch_kwargs["semantic_ai_input_mode"],
+                semantic_config_path=body.get("semantic_config_path"),
+                classify_feedback=bool(
+                    _semantic_bool_from_body(body, "classify_feedback", "semantic_classify_feedback", default=True)
+                ),
+                global_review_use_ai=global_review_use_ai,
+                global_review_ai_call=global_review_ai_call,
+                actor=str(body.get("actor") or "observer"),
+                run_id=str(body.get("run_id") or ""),
+                query_budget=query_budget,
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/queue/claim")
 def handle_graph_governance_snapshot_semantic_queue_claim(ctx: RequestContext):
     """Claim semantic AI jobs for an executor-backed runner."""
