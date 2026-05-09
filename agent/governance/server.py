@@ -271,6 +271,15 @@ def route(method: str, path: str):
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
+    CORS_HEADERS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": (
+            "Content-Type, Authorization, X-Gov-Token, Idempotency-Key, X-Requested-With"
+        ),
+        "Access-Control-Expose-Headers": "X-Request-Id",
+    }
+
     def _find_handler(self, method: str):
         path = urlparse(self.path).path.rstrip("/")
         for m, prefix, handler in ROUTES:
@@ -315,9 +324,11 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
+            headers = dict(self.CORS_HEADERS)
             if extra_headers:
-                for k, v in extra_headers.items():
-                    self.send_header(k, v)
+                headers.update(extra_headers)
+            for k, v in headers.items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(payload)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
@@ -379,6 +390,17 @@ class GovernanceHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._handle("DELETE")
+
+    def do_OPTIONS(self):
+        try:
+            self.send_response(204)
+            for k, v in self.CORS_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
+            log.debug("client connection dropped during CORS preflight: %s", e)
 
     def log_message(self, format, *args):
         pass  # Suppress default logging

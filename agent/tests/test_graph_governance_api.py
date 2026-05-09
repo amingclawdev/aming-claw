@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -40,6 +41,23 @@ def _ctx(path_params: dict, *, method: str = "GET", query: dict | None = None, b
     )
 
 
+def _bare_handler():
+    handler = object.__new__(server.GovernanceHandler)
+    handler.path = "/api/health"
+    handler.headers = {}
+    handler.wfile = io.BytesIO()
+    handler.requestline = "GET /api/health HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.command = "GET"
+    handler.client_address = ("127.0.0.1", 0)
+    handler.sent_statuses = []
+    handler.sent_headers = []
+    handler.send_response = lambda code: handler.sent_statuses.append(code)
+    handler.send_header = lambda key, value: handler.sent_headers.append((key, value))
+    handler.end_headers = lambda: None
+    return handler
+
+
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
@@ -78,6 +96,33 @@ def _graph(node_id: str = "L7.1") -> dict:
             ],
         }
     }
+
+
+def test_governance_handler_json_response_includes_dev_cors_headers():
+    handler = _bare_handler()
+
+    handler._respond(200, {"ok": True})
+
+    headers = dict(handler.sent_headers)
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert "GET" in headers["Access-Control-Allow-Methods"]
+    assert "POST" in headers["Access-Control-Allow-Methods"]
+    assert "OPTIONS" in headers["Access-Control-Allow-Methods"]
+    assert "Content-Type" in headers["Access-Control-Allow-Headers"]
+    assert "X-Gov-Token" in headers["Access-Control-Allow-Headers"]
+
+
+def test_governance_handler_options_preflight_includes_dev_cors_headers():
+    handler = _bare_handler()
+
+    handler.do_OPTIONS()
+
+    headers = dict(handler.sent_headers)
+    assert handler.sent_statuses == [204]
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert "OPTIONS" in headers["Access-Control-Allow-Methods"]
+    assert headers["Access-Control-Max-Age"] == "86400"
+    assert headers["Content-Length"] == "0"
 
 
 def test_graph_governance_status_and_snapshot_query_api(conn):
