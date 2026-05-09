@@ -190,6 +190,72 @@ def test_graph_governance_dashboard_api_summarizes_active_state(conn):
     assert dashboard["drift_summary"]["by_type"]["missing_test"] == 1
 
 
+def test_graph_governance_query_trace_api_records_source_and_events(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-query-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    started = server.handle_graph_governance_query_trace_start(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "query_source": "ai_global_review",
+                "query_purpose": "global_architecture_review",
+                "actor": "test-ai",
+                "query_budget": {"max_queries": 3},
+            },
+        )
+    )
+    trace_id = started["trace"]["trace_id"]
+    assert started["trace"]["query_source"] == "ai_global_review"
+
+    queried = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "trace_id": trace_id,
+                "tool": "get_node",
+                "args": {"node_id": "L7.1"},
+            },
+        )
+    )
+    assert queried["ok"] is True
+    assert queried["result"]["node"]["title"] == "Feature Node"
+
+    fetched = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": trace_id})
+    )
+    assert fetched["trace"]["event_count"] == 1
+    assert fetched["trace"]["events"][0]["tool"] == "get_node"
+
+    finished = server.handle_graph_governance_query_trace_finish(
+        _ctx(
+            {"project_id": PID, "trace_id": trace_id},
+            method="POST",
+            body={"status": "complete"},
+        )
+    )
+    assert finished["trace"]["status"] == "complete"
+
+
 def test_graph_governance_queue_finalize_and_abandon_api(conn):
     old = store.create_graph_snapshot(
         conn,

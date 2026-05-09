@@ -2155,6 +2155,133 @@ def handle_graph_governance_snapshot_dashboard_review(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/query-traces/start")
+def handle_graph_governance_query_trace_start(ctx: RequestContext):
+    """Start an audited graph query trace for dashboard/AI/chain consumers."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    from . import graph_query_trace
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.query-trace.start")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
+        try:
+            with sqlite_write_lock():
+                result = graph_query_trace.start_trace(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    actor=str(body.get("actor") or "observer"),
+                    query_source=str(body.get("query_source") or "api_debug"),
+                    query_purpose=str(body.get("query_purpose") or "api_debug"),
+                    run_id=str(body.get("run_id") or ""),
+                    parent_task_id=str(body.get("parent_task_id") or ""),
+                    budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
+                    trace_id=body.get("trace_id") or None,
+                )
+                conn.commit()
+            return result
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/query")
+def handle_graph_governance_query(ctx: RequestContext):
+    """Run one graph query and append it to an auditable trace."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    from . import graph_query_trace
+    from .db import sqlite_write_lock
+
+    tool = str(body.get("tool") or "")
+    root = None
+    if (
+        body.get("project_root")
+        or body.get("workspace_path")
+        or body.get("repo_root")
+        or tool in {"search_docs", "get_file_excerpt"}
+    ):
+        root = _graph_governance_project_root(project_id, body)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.query")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, str(body.get("snapshot_id") or "active"))
+        try:
+            with sqlite_write_lock():
+                result = graph_query_trace.traced_query(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    tool=tool,
+                    args=body.get("args") if isinstance(body.get("args"), dict) else {},
+                    trace_id=str(body.get("trace_id") or ""),
+                    actor=str(body.get("actor") or "observer"),
+                    query_source=str(body.get("query_source") or "api_debug"),
+                    query_purpose=str(body.get("query_purpose") or "api_debug"),
+                    run_id=str(body.get("run_id") or ""),
+                    parent_task_id=str(body.get("parent_task_id") or ""),
+                    budget=body.get("query_budget") if isinstance(body.get("query_budget"), dict) else None,
+                    project_root=root,
+                )
+                conn.commit()
+            return result
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/query-traces/{trace_id}/finish")
+def handle_graph_governance_query_trace_finish(ctx: RequestContext):
+    """Finish an audited graph query trace."""
+    project_id = ctx.get_project_id()
+    trace_id = ctx.path_params["trace_id"]
+    body = ctx.body
+    from . import graph_query_trace
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.query-trace.finish")
+        try:
+            with sqlite_write_lock():
+                result = graph_query_trace.finish_trace(
+                    conn,
+                    project_id,
+                    trace_id,
+                    status=str(body.get("status") or "complete"),
+                    reason=str(body.get("reason") or ""),
+                )
+                conn.commit()
+            return result
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/query-traces/{trace_id}")
+def handle_graph_governance_query_trace_get(ctx: RequestContext):
+    """Return one audited graph query trace and event summary."""
+    project_id = ctx.get_project_id()
+    trace_id = ctx.path_params["trace_id"]
+    from . import graph_query_trace
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.query-trace.get")
+        try:
+            return graph_query_trace.get_trace(conn, project_id, trace_id)
+        except KeyError as exc:
+            _raise_graph_api_validation(exc)
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/export-cache")
 def handle_graph_governance_snapshot_export_cache(ctx: RequestContext):
     """Export a non-authoritative .aming-claw/cache graph.current.json."""
