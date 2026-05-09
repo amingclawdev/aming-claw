@@ -615,6 +615,36 @@ def _add_edge(edges: list[dict[str, Any]], edge: dict[str, Any]) -> bool:
     return True
 
 
+def _edge_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    edge = payload.get("edge") if isinstance(payload, dict) else {}
+    if isinstance(edge, dict) and edge:
+        return dict(edge)
+    return dict(payload if isinstance(payload, dict) else {})
+
+
+def _validate_add_edge_payload(
+    edge: dict[str, Any],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> str:
+    src = str(edge.get("src") or edge.get("source") or "")
+    dst = str(edge.get("dst") or edge.get("target") or "")
+    if not src or not dst:
+        return "edge_endpoint_empty"
+    if src == dst:
+        return "self_edge_not_allowed"
+    if src not in nodes_by_id or dst not in nodes_by_id:
+        return "edge_endpoint_missing"
+    return ""
+
+
+def _validate_remove_edge_payload(edge: dict[str, Any]) -> str:
+    src = str(edge.get("src") or edge.get("source") or "")
+    dst = str(edge.get("dst") or edge.get("target") or "")
+    if not src or not dst:
+        return "edge_endpoint_empty"
+    return ""
+
+
 def apply_correction_patches(
     graph_json: dict[str, Any],
     patches: list[dict[str, Any]],
@@ -713,21 +743,27 @@ def apply_correction_patches(
             continue
 
         if patch_type == "add_edge":
-            edge = dict(payload.get("edge") or payload)
+            edge = _edge_payload(payload)
+            status = _validate_add_edge_payload(edge, nodes_by_id)
+            if status:
+                stale.append({"patch_id": patch_id, "status": status, "patch_type": patch_type})
+                continue
             src = str(edge.get("src") or edge.get("source") or "")
             dst = str(edge.get("dst") or edge.get("target") or "")
-            if src not in nodes_by_id or dst not in nodes_by_id:
-                stale.append({"patch_id": patch_id, "status": "edge_endpoint_missing", "patch_type": patch_type})
-                continue
             edge.setdefault("evidence", {"source": "graph_correction_patch", "patch_id": patch_id})
             added = _add_edge(edges, edge)
             applied.append({"patch_id": patch_id, "status": "applied" if added else "already_present", "src": src, "dst": dst})
             continue
 
         if patch_type == "remove_edge":
-            src = str(payload.get("src") or payload.get("source") or "")
-            dst = str(payload.get("dst") or payload.get("target") or "")
-            edge_type = str(payload.get("edge_type") or payload.get("type") or "depends_on")
+            edge = _edge_payload(payload)
+            status = _validate_remove_edge_payload(edge)
+            if status:
+                stale.append({"patch_id": patch_id, "status": status, "patch_type": patch_type})
+                continue
+            src = str(edge.get("src") or edge.get("source") or "")
+            dst = str(edge.get("dst") or edge.get("target") or "")
+            edge_type = str(edge.get("edge_type") or edge.get("type") or "depends_on")
             removed = _remove_edge(edges, src=src, dst=dst, edge_type=edge_type)
             applied.append({"patch_id": patch_id, "status": "applied" if removed else "not_present", "src": src, "dst": dst})
             continue

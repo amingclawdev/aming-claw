@@ -182,3 +182,66 @@ def test_missing_patch_target_is_marked_stale():
     assert row["status"] == "stale"
     assert row["last_apply_status"] == "target_node_missing"
 
+
+def test_add_edge_patch_self_edge_is_marked_stale():
+    conn = _conn()
+    create_patch(
+        conn,
+        PID,
+        patch_id="patch-self-edge",
+        patch_type="add_edge",
+        target_node_id="L7.1",
+        patch_json={
+            "edge": {
+                "src": "L7.1",
+                "dst": "L7.1",
+                "edge_type": "depends_on",
+                "direction": "dependency",
+            }
+        },
+        evidence={"reason": "invalid semantic suggestion"},
+    )
+    assert accept_patch(conn, PID, "patch-self-edge", accepted_by="observer")
+
+    patches = list_replayable_patches(conn, PID)
+    result = apply_correction_patches(_graph(), patches, to_snapshot_id="full-new")
+
+    assert result["report"]["applied_count"] == 0
+    assert result["report"]["stale_count"] == 1
+    assert result["report"]["stale"][0]["status"] == "self_edge_not_allowed"
+    edges = result["graph"]["deps_graph"]["edges"]
+    assert not any(edge.get("src") == "L7.1" and edge.get("dst") == "L7.1" for edge in edges)
+
+    counts = record_patch_apply_report(conn, PID, snapshot_id="full-new", report=result["report"])
+    conn.commit()
+    assert counts == {"applied": 0, "stale": 1}
+    row = conn.execute(
+        "SELECT status, last_apply_status FROM graph_correction_patches WHERE patch_id=?",
+        ("patch-self-edge",),
+    ).fetchone()
+    assert row["status"] == "stale"
+    assert row["last_apply_status"] == "self_edge_not_allowed"
+
+
+def test_add_edge_patch_missing_endpoint_is_marked_stale():
+    conn = _conn()
+    create_patch(
+        conn,
+        PID,
+        patch_id="patch-empty-edge",
+        patch_type="add_edge",
+        target_node_id="L7.1",
+        patch_json={"edge": {"src": "L7.1", "dst": ""}},
+        evidence={"reason": "incomplete semantic suggestion"},
+    )
+    assert accept_patch(conn, PID, "patch-empty-edge", accepted_by="observer")
+
+    result = apply_correction_patches(
+        _graph(),
+        list_replayable_patches(conn, PID),
+        to_snapshot_id="full-new",
+    )
+
+    assert result["report"]["applied_count"] == 0
+    assert result["report"]["stale_count"] == 1
+    assert result["report"]["stale"][0]["status"] == "edge_endpoint_empty"
