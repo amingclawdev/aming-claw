@@ -198,9 +198,14 @@ def test_full_global_review_builds_health_picture_without_semantic_enrichment(co
     assert result["status"] == "reviewed"
     assert result["health_picture"]["feature_count"] == 1
     assert result["health_picture"]["semantic_complete_count"] == 0
+    assert result["health_picture"]["semantic_pending_count"] == 1
     assert result["health_picture"]["semantic_coverage_ratio"] == 0
+    assert result["health_picture"]["governance_observability_score"] == 0
     assert result["health_picture"]["doc_coverage_ratio"] == 1
     assert result["health_picture"]["test_coverage_ratio"] == 1
+    assert result["health_picture"]["project_health_score"] == 100
+    assert result["health_picture"]["average_health_score"] == 100
+    assert result["health_picture"]["low_health_count"] == 0
     assert result["graph_query_trace"]["trace"]["status"] == "complete"
     assert Path(result["report_path"]).exists()
 

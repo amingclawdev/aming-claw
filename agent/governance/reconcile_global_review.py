@@ -262,6 +262,7 @@ def _semantic_coverage_picture(
     status_counts: dict[str, int] = {}
     quality_flag_counts: dict[str, int] = {}
     low_health: list[dict[str, Any]] = []
+    semantic_pending: list[dict[str, Any]] = []
     for node in nodes:
         node_id = str(node.get("node_id") or "")
         metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
@@ -273,8 +274,12 @@ def _semantic_coverage_picture(
         if semantic_status == "ai_complete":
             semantic_complete += 1
         else:
-            score -= 25
-            issues.append("semantic_not_complete")
+            semantic_pending.append({
+                "node_id": node_id,
+                "title": node.get("title") or node_id,
+                "semantic_status": semantic_status or "missing",
+                "primary_files": _string_list(node.get("primary_files"))[:10],
+            })
         if _string_list(node.get("secondary_files")):
             doc_bound += 1
         else:
@@ -315,15 +320,21 @@ def _semantic_coverage_picture(
     avg_score = round(sum(health_scores) / len(health_scores), 2) if health_scores else 0.0
     def ratio(count: int) -> float:
         return round(count / total, 4) if total else 0.0
+    semantic_coverage_ratio = ratio(semantic_complete)
     return {
+        "score_version": "project_health_v2_semantic_separated",
         "feature_count": total,
         "semantic_complete_count": semantic_complete,
-        "semantic_coverage_ratio": ratio(semantic_complete),
+        "semantic_pending_count": len(semantic_pending),
+        "semantic_pending_nodes": semantic_pending[:100],
+        "semantic_coverage_ratio": semantic_coverage_ratio,
+        "governance_observability_score": round(semantic_coverage_ratio * 100, 2),
         "doc_bound_count": doc_bound,
         "doc_coverage_ratio": ratio(doc_bound),
         "test_bound_count": test_bound,
         "test_coverage_ratio": ratio(test_bound),
         "config_bound_count": config_bound,
+        "project_health_score": avg_score,
         "average_health_score": avg_score,
         "semantic_status_counts": dict(sorted(status_counts.items())),
         "quality_flag_counts": dict(sorted(quality_flag_counts.items())),
