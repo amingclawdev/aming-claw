@@ -1088,6 +1088,24 @@ def summarize_graph_snapshot(
     edges_by_type = _group_counts(conn, "graph_edges_index", "edge_type", project_id, snapshot_id)
     semantic = _semantic_counts(conn, project_id, snapshot_id)
     try:
+        from .graph_correction_patches import correction_patch_summary
+
+        graph_corrections = correction_patch_summary(conn, project_id)
+    except Exception:
+        graph_corrections = {
+            "total": 0,
+            "by_status": {},
+            "by_type": {},
+            "by_risk": {},
+            "last_apply_status": {},
+            "proposed_count": 0,
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "stale_count": 0,
+            "replayable_count": 0,
+            "high_risk_proposed_count": 0,
+        }
+    try:
         files = list_graph_snapshot_files(conn, project_id, snapshot_id, limit=1)
         file_summary = files["summary"]
         file_total = int(files["total_count"])
@@ -1131,6 +1149,7 @@ def summarize_graph_snapshot(
         "counts": counts,
         "health": _health_from_snapshot_notes(notes),
         "semantic": semantic,
+        "graph_correction_patches": graph_corrections,
         "file_inventory_summary": file_summary,
     }
 

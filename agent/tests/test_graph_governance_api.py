@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.governance import graph_correction_patches
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance import server
@@ -436,6 +437,34 @@ def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
         commit_sha="pendingcommit",
         parent_commit_sha="oldcommit",
     )
+    graph_correction_patches.create_patch(
+        conn,
+        PID,
+        patch_id="patch-summary-accepted",
+        patch_type="add_edge",
+        risk_level="low",
+        target_node_id="L7.1",
+        patch_json={
+            "edge": {
+                "src": "L7.1",
+                "dst": "L7.2",
+                "edge_type": "depends_on",
+                "direction": "dependency",
+            }
+        },
+        evidence={"reason": "dashboard summary test"},
+    )
+    graph_correction_patches.create_patch(
+        conn,
+        PID,
+        patch_id="patch-summary-proposed-high",
+        patch_type="merge_nodes",
+        risk_level="high",
+        target_node_id="L7.1",
+        patch_json={"source_node_ids": ["L7.1", "L7.2"], "target_node_id": "L7.1"},
+        evidence={"reason": "dashboard summary test"},
+    )
+    graph_correction_patches.accept_patch(conn, PID, "patch-summary-accepted", accepted_by="observer")
     conn.commit()
 
     timeline = server.handle_graph_governance_commit_timeline(
@@ -479,6 +508,9 @@ def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
     assert summary["counts"]["edges"] == 1
     assert summary["counts"]["files"] == 2
     assert summary["health"]["semantic_coverage_ratio"] == 0.5
+    assert summary["graph_correction_patches"]["total"] == 2
+    assert summary["graph_correction_patches"]["replayable_count"] == 1
+    assert summary["graph_correction_patches"]["high_risk_proposed_count"] == 1
 
 
 def test_graph_governance_query_trace_api_records_source_and_events(conn):

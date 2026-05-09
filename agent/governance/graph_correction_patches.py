@@ -556,6 +556,82 @@ def list_correction_patches(
     return out
 
 
+def correction_patch_summary(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
+    ensure_schema(conn)
+    by_status = {
+        str(row["status"]): int(row["cnt"])
+        for row in conn.execute(
+            """
+            SELECT status, COUNT(*) AS cnt
+            FROM graph_correction_patches
+            WHERE project_id = ?
+            GROUP BY status
+            """,
+            (project_id,),
+        ).fetchall()
+    }
+    by_type = {
+        str(row["patch_type"]): int(row["cnt"])
+        for row in conn.execute(
+            """
+            SELECT patch_type, COUNT(*) AS cnt
+            FROM graph_correction_patches
+            WHERE project_id = ?
+            GROUP BY patch_type
+            """,
+            (project_id,),
+        ).fetchall()
+    }
+    by_risk = {
+        str(row["risk_level"]): int(row["cnt"])
+        for row in conn.execute(
+            """
+            SELECT risk_level, COUNT(*) AS cnt
+            FROM graph_correction_patches
+            WHERE project_id = ?
+            GROUP BY risk_level
+            """,
+            (project_id,),
+        ).fetchall()
+    }
+    last_apply_status = {
+        str(row["last_apply_status"]): int(row["cnt"])
+        for row in conn.execute(
+            """
+            SELECT last_apply_status, COUNT(*) AS cnt
+            FROM graph_correction_patches
+            WHERE project_id = ? AND last_apply_status != ''
+            GROUP BY last_apply_status
+            """,
+            (project_id,),
+        ).fetchall()
+    }
+    accepted = int(by_status.get(PATCH_STATUS_ACCEPTED, 0))
+    high_risk_proposed = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM graph_correction_patches
+            WHERE project_id = ? AND status = ? AND risk_level = 'high'
+            """,
+            (project_id, PATCH_STATUS_PROPOSED),
+        ).fetchone()[0]
+    )
+    return {
+        "total": sum(by_status.values()),
+        "by_status": by_status,
+        "by_type": by_type,
+        "by_risk": by_risk,
+        "last_apply_status": last_apply_status,
+        "proposed_count": int(by_status.get(PATCH_STATUS_PROPOSED, 0)),
+        "accepted_count": accepted,
+        "rejected_count": int(by_status.get(PATCH_STATUS_REJECTED, 0)),
+        "stale_count": int(by_status.get(PATCH_STATUS_STALE, 0)),
+        "replayable_count": accepted,
+        "high_risk_proposed_count": high_risk_proposed,
+    }
+
+
 def _node_map(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {_node_id(node): node for node in nodes if isinstance(node, dict) and _node_id(node)}
 
