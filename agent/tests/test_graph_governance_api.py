@@ -1610,7 +1610,13 @@ def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
         nodes=_graph()["deps_graph"]["nodes"],
         edges=_graph()["deps_graph"]["edges"],
     )
-    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    # MF-2026-05-10-012: keep this fixture's semantic_health=="metadata_only"
+    # behaviour by skipping the new auto-rebuild hook. The test asserts the
+    # placeholder status that legacy snapshots carry before any projection
+    # has been built.
+    store.activate_graph_snapshot(
+        conn, PID, old["snapshot_id"], auto_rebuild_projection=False
+    )
     candidate = store.create_graph_snapshot(
         conn,
         PID,

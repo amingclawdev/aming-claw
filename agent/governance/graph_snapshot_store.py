@@ -662,6 +662,8 @@ def activate_graph_snapshot(
     *,
     expected_old_snapshot_id: str | None = None,
     ref_name: str = "active",
+    actor: str = "activate_hook",
+    auto_rebuild_projection: bool = True,
 ) -> dict[str, Any]:
     ensure_schema(conn)
     row = conn.execute(
@@ -702,13 +704,37 @@ def activate_graph_snapshot(
             "UPDATE graph_snapshots SET status = ? WHERE project_id = ? AND snapshot_id = ?",
             (SNAPSHOT_STATUS_SUPERSEDED, project_id, old_id),
         )
-    return {
+    result: dict[str, Any] = {
         "project_id": project_id,
         "snapshot_id": snapshot_id,
         "commit_sha": snapshot["commit_sha"],
         "previous_snapshot_id": old_id,
         "ref_name": ref_name,
     }
+
+    # MF-2026-05-10-012: dashboard derives feature counters from
+    # graph_semantic_projections (per-snapshot cache), not from raw events.
+    # Reconcile and admin recovery can both leave a freshly created snapshot
+    # without a projection, which manifests as "Node semantic 0/0" the moment
+    # it becomes active. Auto-rebuild on activate is idempotent — if the
+    # target snapshot already has a projection, skip. If projection rebuild
+    # fails (advisory only), we still report the activation as successful.
+    projection_status = "skipped"
+    if auto_rebuild_projection and ref_name == "active":
+        try:
+            from . import graph_events  # local import to avoid module cycle
+
+            existing = graph_events.get_semantic_projection(conn, project_id, snapshot_id)
+            if not existing or existing.get("status") in (None, "", "missing"):
+                graph_events.materialize_events(conn, project_id, snapshot_id, actor=actor)
+                graph_events.build_semantic_projection(conn, project_id, snapshot_id, actor=actor)
+                projection_status = "rebuilt"
+            else:
+                projection_status = "already_present"
+        except Exception as exc:  # noqa: BLE001 - advisory; activation already committed
+            projection_status = f"rebuild_failed: {exc}"
+    result["projection_status"] = projection_status
+    return result
 
 
 def finalize_graph_snapshot(
