@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import graph_correction_patches
+from agent.governance import graph_events
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
@@ -449,9 +450,39 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
     assert listed["count"] == 1
     assert listed["jobs"][0]["node_id"] == "L7.1"
     assert listed["jobs"][0]["status"] == "ai_pending"
+    assert listed["jobs"][0]["job_id"] == "L7.1"
+    fetched = server.handle_graph_governance_snapshot_semantic_job_get(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "job_id": "L7.1"})
+    )
+    assert fetched["job"]["status"] == "ai_pending"
+    cancelled = server.handle_graph_governance_snapshot_semantic_job_cancel(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "job_id": "L7.1"},
+            method="POST",
+            body={"actor": "dashboard_user"},
+        )
+    )
+    assert cancelled["job"]["status"] == "cancelled"
+    retried = server.handle_graph_governance_snapshot_semantic_job_retry(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "job_id": "L7.1"},
+            method="POST",
+            body={"actor": "dashboard_user"},
+        )
+    )
+    assert retried["job"]["status"] == "pending_ai"
+    events = server.handle_graph_governance_snapshot_events_list(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"event_type": "semantic_retry_requested"},
+        )
+    )
+    assert events["count"] == 2
+    assert events["events"][0]["target_type"] == "node"
+    assert events["events"][0]["target_id"] == "L7.1"
 
 
-def test_graph_governance_semantic_jobs_endpoint_rejects_edge_scope(conn, tmp_path, monkeypatch):
+def test_graph_governance_semantic_jobs_endpoint_records_edge_requests_as_events(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         server,
         "_require_graph_governance_operator",
@@ -467,18 +498,236 @@ def test_graph_governance_semantic_jobs_endpoint_rejects_edge_scope(conn, tmp_pa
     )
     conn.commit()
 
-    with pytest.raises(ValidationError):
-        server.handle_graph_governance_snapshot_semantic_jobs_create(
-            _ctx(
-                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
-                method="POST",
-                body={
-                    "project_root": str(tmp_path),
-                    "target_scope": "edge",
-                    "target_ids": ["L7.1|L3.1|contains"],
-                },
-            )
+    status, payload = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "edges": [{"src": "L7.1", "dst": "L3.1", "edge_type": "contains"}],
+            },
         )
+    )
+
+    assert status == 202
+    assert payload["target_scope"] == "edge"
+    assert payload["queued_count"] == 1
+    assert payload["events"][0]["event_type"] == "edge_semantic_requested"
+    assert payload["events"][0]["target_id"] == "L7.1->L3.1:contains"
+
+
+def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph()
+    feature_hash = graph_events.feature_hash_for_node(graph["deps_graph"]["nodes"][0])
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-event-source",
+        commit_sha="commit-a",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    semantic_payload = {
+        "feature_name": "Graph Governance API",
+        "semantic_purpose": "Expose graph state and semantic controls for dashboard workflows.",
+        "domain_label": "governance/graph",
+        "quality_flags": [],
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', ?, '{"agent/governance/server.py":"sha256:file-a"}',
+                ?, 1, 0, '2026-05-09T20:31:24Z')
+        """,
+        (PID, snapshot["snapshot_id"], feature_hash, json.dumps(semantic_payload)),
+    )
+    conn.commit()
+
+    backfilled = server.handle_graph_governance_snapshot_semantic_events_backfill(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+    assert backfilled["semantic_node_events_created"] == 1
+    events = server.handle_graph_governance_snapshot_events_list(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"event_type": "semantic_node_enriched"},
+        )
+    )
+    assert events["count"] == 1
+    assert events["events"][0]["feature_hash"] == feature_hash
+    assert events["events"][0]["file_hashes"]["agent/governance/server.py"] == "sha256:file-a"
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-current"},
+        )
+    )
+    assert projected["health"]["semantic_current_count"] == 1
+    assert projected["projection"]["node_semantics"]["L7.1"]["validity"]["status"] == "semantic_current"
+    assert projected["projection"]["node_semantics"]["L7.1"]["semantic"]["feature_name"] == "Graph Governance API"
+    fetched = server.handle_graph_governance_snapshot_semantic_projection_get(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+    assert fetched["projection_id"] == "semproj-current"
+
+    changed_graph = _graph()
+    changed_graph["deps_graph"]["nodes"][0]["title"] = "Renamed Feature Node"
+    changed_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-semantic-event-source",
+        commit_sha="commit-b",
+        snapshot_kind="scope",
+        parent_snapshot_id=snapshot["snapshot_id"],
+        graph_json=changed_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        changed_snapshot["snapshot_id"],
+        nodes=changed_graph["deps_graph"]["nodes"],
+        edges=changed_graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    changed_projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": changed_snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "backfill_existing": False},
+        )
+    )
+    changed_semantic = changed_projected["projection"]["node_semantics"]["L7.1"]
+    assert changed_semantic["semantic"]["feature_name"] == "Graph Governance API"
+    assert changed_semantic["validity"]["status"] == "semantic_stale_feature_hash"
+    assert changed_projected["health"]["semantic_stale_count"] == 1
+
+
+def test_graph_governance_events_lifecycle_and_materialize_candidate_snapshot(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-events-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'semantic_complete', 'oldhash', '{}', '{}', 1, 0, 'now')
+        """,
+        (PID, snapshot["snapshot_id"]),
+    )
+    conn.commit()
+
+    status, created = server.handle_graph_governance_snapshot_events_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "event_type": "node_rename_proposed",
+                "target_type": "node",
+                "target_id": "L7.1",
+                "payload": {"new_title": "Renamed Feature"},
+                "actor": "dashboard_user",
+            },
+        )
+    )
+    assert status == 201
+    event_id = created["event"]["event_id"]
+
+    accepted = server.handle_graph_governance_snapshot_event_accept(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "event_id": event_id},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+    assert accepted["event"]["status"] == graph_events.EVENT_STATUS_ACCEPTED
+    status, stale_candidate = server.handle_graph_governance_snapshot_events_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "event_type": "doc_binding_added",
+                "target_type": "node",
+                "target_id": "L7.1",
+                "payload": {"files": ["docs/dev/new-doc.md"]},
+                "precondition": {"expected_node_title": "Not The Current Title"},
+            },
+        )
+    )
+    assert status == 201
+    stale_event_id = stale_candidate["event"]["event_id"]
+    server.handle_graph_governance_snapshot_event_accept(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "event_id": stale_event_id},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+
+    materialized = server.handle_graph_governance_snapshot_events_materialize(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+    assert materialized["materialized_count"] == 1
+    assert materialized["new_snapshot_id"]
+    graph_json = json.loads(store.snapshot_graph_path(PID, materialized["new_snapshot_id"]).read_text(encoding="utf-8"))
+    assert graph_json["deps_graph"]["nodes"][0]["title"] == "Renamed Feature"
+    event = graph_events.get_event(conn, PID, snapshot["snapshot_id"], event_id)
+    assert event["status"] == graph_events.EVENT_STATUS_MATERIALIZED
+    stale_event = graph_events.get_event(conn, PID, snapshot["snapshot_id"], stale_event_id)
+    assert stale_event["status"] == graph_events.EVENT_STATUS_STALE
+    semantic_row = conn.execute(
+        """
+        SELECT status FROM graph_semantic_nodes
+        WHERE project_id = ? AND snapshot_id = ? AND node_id = 'L7.1'
+        """,
+        (PID, snapshot["snapshot_id"]),
+    ).fetchone()
+    assert semantic_row["status"] == "semantic_stale"
 
 
 def test_graph_governance_dashboard_api_summarizes_active_state(conn):

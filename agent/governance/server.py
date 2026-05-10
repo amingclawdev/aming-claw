@@ -3987,15 +3987,45 @@ def _semantic_jobs_target_ids(raw: object) -> list[str]:
     return [str(value or "").strip() for value in values if str(value or "").strip()]
 
 
-def _semantic_jobs_enqueue_body(body: dict) -> dict:
-    from .errors import ValidationError
-
+def _semantic_jobs_target_scope(body: dict) -> str:
     options = body.get("options") if isinstance(body.get("options"), dict) else {}
-    target_scope = str(
+    return str(
         body.get("target_scope")
         or options.get("target_scope")
         or "snapshot"
     ).strip().lower().replace("-", "_")
+
+
+def _semantic_jobs_edge_targets(body: dict) -> list[dict]:
+    raw_edges = body.get("edges") or body.get("edge_targets")
+    edge_rows: list[dict] = []
+    if isinstance(raw_edges, list):
+        for raw in raw_edges:
+            if isinstance(raw, dict):
+                src = str(raw.get("src") or raw.get("source") or "").strip()
+                dst = str(raw.get("dst") or raw.get("target") or "").strip()
+                edge_type = str(raw.get("edge_type") or raw.get("type") or "depends_on").strip() or "depends_on"
+                edge_id = str(raw.get("edge_id") or raw.get("id") or "").strip()
+                if not edge_id and src and dst:
+                    edge_id = f"{src}->{dst}:{edge_type}"
+                if edge_id:
+                    edge_rows.append({"edge_id": edge_id, "edge": raw})
+    for edge_id in _semantic_jobs_target_ids(
+        body.get("target_ids")
+        or body.get("target_id")
+        or body.get("edge_ids")
+        or body.get("edge_id")
+    ):
+        if edge_id and edge_id not in {row["edge_id"] for row in edge_rows}:
+            edge_rows.append({"edge_id": edge_id, "edge": {}})
+    return edge_rows
+
+
+def _semantic_jobs_enqueue_body(body: dict) -> dict:
+    from .errors import ValidationError
+
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    target_scope = _semantic_jobs_target_scope(body)
     if target_scope in {"edge", "edges"}:
         raise ValidationError(
             "edge semantic jobs are not supported by the current backend queue yet; "
@@ -4052,6 +4082,453 @@ def _semantic_jobs_enqueue_body(body: dict) -> dict:
     return enqueue_body
 
 
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events")
+def handle_graph_governance_snapshot_events_list(ctx: RequestContext):
+    """List auditable graph governance events for dashboard/operator workflows."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    from . import graph_events
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.list")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        events = graph_events.list_events(
+            conn,
+            project_id,
+            snapshot_id,
+            statuses=_query_statuses(ctx.query) or None,
+            event_types=_query_statuses(ctx.query, "event_type") or None,
+            target_type=str(ctx.query.get("target_type") or ""),
+            target_id=str(ctx.query.get("target_id") or ""),
+            limit=_query_int(ctx.query, "limit", 200),
+            offset=_query_int(ctx.query, "offset", 0),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "count": len(events),
+            "events": events,
+            "summary": {"by_status": graph_events.status_counts(conn, project_id, snapshot_id)},
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events")
+def handle_graph_governance_snapshot_events_create(ctx: RequestContext):
+    """Create a proposed/observed graph event using the shared event vocabulary."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.create")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        with sqlite_write_lock():
+            try:
+                event = graph_events.create_event(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    event_type=str(body.get("event_type") or body.get("type") or ""),
+                    event_kind=str(body.get("event_kind") or body.get("kind") or "user_feedback"),
+                    target_type=str(body.get("target_type") or ""),
+                    target_id=str(body.get("target_id") or body.get("node_id") or body.get("edge_id") or ""),
+                    status=str(body.get("status") or "proposed"),
+                    risk_level=str(body.get("risk_level") or body.get("risk") or "low"),
+                    confidence=float(body.get("confidence") or 0.0),
+                    baseline_commit=str(body.get("baseline_commit") or ""),
+                    target_commit=str(body.get("target_commit") or ""),
+                    stable_node_key=str(body.get("stable_node_key") or ""),
+                    feature_hash=str(body.get("feature_hash") or ""),
+                    file_hashes=body.get("file_hashes") if isinstance(body.get("file_hashes"), dict) else {},
+                    payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
+                    precondition=body.get("precondition") if isinstance(body.get("precondition"), dict) else {},
+                    evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+                    created_by=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                    event_id=str(body.get("event_id") or "") or None,
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return 201, {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "event": event}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/materialize")
+def handle_graph_governance_snapshot_events_materialize(ctx: RequestContext):
+    """Materialize accepted graph events into a new candidate snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.materialize")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        raw_ids = body.get("event_ids")
+        if raw_ids is None and body.get("event_id"):
+            raw_ids = [body.get("event_id")]
+        event_ids = _semantic_jobs_target_ids(raw_ids) if raw_ids is not None else []
+        with sqlite_write_lock():
+            try:
+                result = graph_events.materialize_events(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    event_ids=event_ids or None,
+                    actor=str(body.get("actor") or "observer"),
+                    new_snapshot_id=str(body.get("new_snapshot_id") or "") or None,
+                    activate=bool(body.get("activate") or body.get("make_active")),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": not result.get("errors"), **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/events/backfill")
+def handle_graph_governance_snapshot_semantic_events_backfill(ctx: RequestContext):
+    """Import existing semantic cache rows into graph_events as immutable evidence."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.events.backfill")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        with sqlite_write_lock():
+            try:
+                result = graph_events.backfill_existing_semantic_events(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    actor=str(body.get("actor") or body.get("created_by") or "observer"),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/projection")
+def handle_graph_governance_snapshot_semantic_projection_build(ctx: RequestContext):
+    """Build a hash-aware semantic projection snapshot from structure + graph_events."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.projection.build")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        with sqlite_write_lock():
+            try:
+                result = graph_events.build_semantic_projection(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    actor=str(body.get("actor") or body.get("created_by") or "observer"),
+                    projection_id=str(body.get("projection_id") or "") or None,
+                    backfill_existing=bool(body.get("backfill_existing", True)),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/projection")
+def handle_graph_governance_snapshot_semantic_projection_get(ctx: RequestContext):
+    """Return the latest semantic projection/health view for a snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    projection_id = str(ctx.query.get("projection_id") or "")
+    from . import graph_events
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.projection.get")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id, projection_id)
+        if not projection:
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "projection": None,
+                "health": {},
+                "status": "missing",
+            }
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "projection_id": projection.get("projection_id", ""),
+            "projection": projection.get("projection") or {},
+            "health": projection.get("health") or {},
+            "status": projection.get("status") or "current",
+            "event_watermark": projection.get("event_watermark", 0),
+            "base_commit": projection.get("base_commit", ""),
+            "created_at": projection.get("created_at", ""),
+            "updated_at": projection.get("updated_at", ""),
+        }
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}")
+def handle_graph_governance_snapshot_event_get(ctx: RequestContext):
+    """Fetch one graph event with parsed payload/evidence."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    event_id = ctx.path_params["event_id"]
+    from . import graph_events
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.get")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        event = graph_events.get_event(conn, project_id, snapshot_id, event_id)
+        if not event:
+            from .errors import ValidationError
+            raise ValidationError(f"graph event not found: {event_id}")
+        return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "event": event}
+    finally:
+        conn.close()
+
+
+def _graph_event_status_action(ctx: RequestContext, status: str, action: str):
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    event_id = ctx.path_params["event_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, action)
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        with sqlite_write_lock():
+            try:
+                event = graph_events.update_event_status(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    event_id,
+                    status=status,
+                    actor=str(body.get("actor") or "observer"),
+                    evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "event": event}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}/accept")
+def handle_graph_governance_snapshot_event_accept(ctx: RequestContext):
+    return _graph_event_status_action(ctx, "accepted", "graph-governance.snapshot.events.accept")
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}/reject")
+def handle_graph_governance_snapshot_event_reject(ctx: RequestContext):
+    return _graph_event_status_action(ctx, "rejected", "graph-governance.snapshot.events.reject")
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}/mark-stale")
+def handle_graph_governance_snapshot_event_mark_stale(ctx: RequestContext):
+    return _graph_event_status_action(ctx, "stale", "graph-governance.snapshot.events.mark-stale")
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}/ai-refine")
+def handle_graph_governance_snapshot_event_ai_refine(ctx: RequestContext):
+    """Refine an event payload with explicit input or the reconcile analyzer AI."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    event_id = ctx.path_params["event_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.ai-refine")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        event = graph_events.get_event(conn, project_id, snapshot_id, event_id)
+        if not event:
+            raise ValidationError(f"graph event not found: {event_id}")
+        refined_payload = body.get("refined_payload") or body.get("payload")
+        ai_review = body.get("ai_review") if isinstance(body.get("ai_review"), dict) else {}
+        if body.get("use_ai") or body.get("semantic_use_ai") or body.get("reviewer_use_ai"):
+            root = _graph_governance_project_root(project_id, body)
+            ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
+            if ai_call is None:
+                raise ValidationError("use_ai=true but reconcile analyzer call could not be built")
+            ai_result = ai_call("graph_event_refine", {
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "event": event,
+                "instructions": str(body.get("instructions") or ""),
+            }) or {}
+            if isinstance(ai_result, dict):
+                refined_payload = ai_result.get("refined_payload") or ai_result.get("payload") or refined_payload
+                ai_review = ai_result
+        if refined_payload is not None and not isinstance(refined_payload, dict):
+            raise ValidationError("refined_payload must be an object")
+        if refined_payload is None and not ai_review:
+            raise ValidationError("refined_payload or use_ai=true is required")
+        with sqlite_write_lock():
+            try:
+                refined = graph_events.refine_event(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    event_id,
+                    actor=str(body.get("actor") or "reconcile_analyzer"),
+                    payload=refined_payload if isinstance(refined_payload, dict) else None,
+                    ai_review=ai_review,
+                    evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "event": refined}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}/refine")
+def handle_graph_governance_snapshot_event_refine(ctx: RequestContext):
+    return handle_graph_governance_snapshot_event_ai_refine(ctx)
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/{event_id}/file-backlog")
+def handle_graph_governance_snapshot_event_file_backlog(ctx: RequestContext):
+    """File a graph event as a backlog row without requiring semantic feedback."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    event_id = ctx.path_params["event_id"]
+    body = ctx.body
+    from . import graph_events
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.file-backlog")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        event = graph_events.get_event(conn, project_id, snapshot_id, event_id)
+        if not event:
+            raise ValidationError(f"graph event not found: {event_id}")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        target_files = payload.get("target_files") or payload.get("files") or payload.get("paths") or []
+        if isinstance(target_files, str):
+            target_files = [target_files]
+        bug_id = str(body.get("bug_id") or payload.get("bug_id") or f"GRAPH-EVENT-{event_id}").strip()
+        title = str(
+            body.get("title")
+            or payload.get("title")
+            or f"Graph event follow-up: {event.get('event_type') or event_id}"
+        ).strip()
+        details = str(
+            body.get("details_md")
+            or payload.get("details_md")
+            or (
+                f"Filed from graph governance event.\n\n"
+                f"snapshot_id: {snapshot_id}\n"
+                f"event_id: {event_id}\n"
+                f"event_type: {event.get('event_type')}\n"
+                f"target: {event.get('target_type')}:{event.get('target_id')}\n"
+            )
+        )
+        priority = str(body.get("priority") or payload.get("priority") or "P2")
+        now = _utc_now()
+        with sqlite_write_lock():
+            conn.execute(
+                """INSERT INTO backlog_bugs
+                   (bug_id, title, status, priority, target_files, test_files,
+                    acceptance_criteria, chain_task_id, "commit", discovered_at,
+                    fixed_at, details_md, chain_trigger_json, required_docs,
+                    provenance_paths, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?, '', ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(bug_id) DO UPDATE SET
+                     title = excluded.title,
+                     status = excluded.status,
+                     priority = excluded.priority,
+                     target_files = excluded.target_files,
+                     details_md = excluded.details_md,
+                     chain_trigger_json = excluded.chain_trigger_json,
+                     provenance_paths = excluded.provenance_paths,
+                     updated_at = excluded.updated_at
+                """,
+                (
+                    bug_id,
+                    title,
+                    str(body.get("status") or "OPEN"),
+                    priority,
+                    json.dumps(target_files if isinstance(target_files, list) else [], ensure_ascii=False),
+                    json.dumps(body.get("test_files") if isinstance(body.get("test_files"), list) else [], ensure_ascii=False),
+                    json.dumps(body.get("acceptance_criteria") if isinstance(body.get("acceptance_criteria"), list) else [], ensure_ascii=False),
+                    now,
+                    details,
+                    json.dumps({
+                        "source": "graph_event",
+                        "snapshot_id": snapshot_id,
+                        "event_id": event_id,
+                        "event_type": event.get("event_type"),
+                    }, ensure_ascii=False, sort_keys=True),
+                    json.dumps(body.get("required_docs") if isinstance(body.get("required_docs"), list) else [], ensure_ascii=False),
+                    json.dumps([f"graph_events:{snapshot_id}:{event_id}"], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            marked = graph_events.mark_backlog_filed(
+                conn,
+                project_id,
+                snapshot_id,
+                event_id,
+                bug_id=bug_id,
+                actor=str(body.get("actor") or "observer"),
+                evidence={"source": "events.file-backlog"},
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "event_id": event_id,
+            "bug_id": bug_id,
+            "event": marked,
+        }
+    finally:
+        conn.close()
+
+
 def _semantic_job_rows(conn, project_id: str, snapshot_id: str, *, statuses: list[str] | None = None, limit: int = 200, offset: int = 0) -> list[dict]:
     from . import reconcile_semantic_enrichment as semantic
 
@@ -4078,6 +4555,7 @@ def _semantic_job_rows(conn, project_id: str, snapshot_id: str, *, statuses: lis
         except (TypeError, ValueError, json.JSONDecodeError):
             file_hashes = {}
         jobs.append({
+            "job_id": row["node_id"],
             "node_id": row["node_id"],
             "status": row["status"],
             "feature_hash": row["feature_hash"],
@@ -4095,6 +4573,14 @@ def _semantic_job_rows(conn, project_id: str, snapshot_id: str, *, statuses: lis
             "created_at": row["created_at"],
         })
     return jobs
+
+
+def _semantic_job_row(conn, project_id: str, snapshot_id: str, job_id: str) -> dict | None:
+    rows = _semantic_job_rows(conn, project_id, snapshot_id, limit=1000)
+    for row in rows:
+        if str(row.get("job_id") or row.get("node_id") or "") == job_id:
+            return row
+    return None
 
 
 def _semantic_job_status_counts(conn, project_id: str, snapshot_id: str) -> dict[str, int]:
@@ -4146,6 +4632,115 @@ def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}")
+def handle_graph_governance_snapshot_semantic_job_get(ctx: RequestContext):
+    """Fetch one semantic queue row by job_id/node_id."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    job_id = ctx.path_params["job_id"]
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.get")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        job = _semantic_job_row(conn, project_id, snapshot_id, job_id)
+        if not job:
+            from .errors import ValidationError
+            raise ValidationError(f"semantic job not found: {job_id}")
+        return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "job": job}
+    finally:
+        conn.close()
+
+
+def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str):
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    job_id = ctx.path_params["job_id"]
+    body = ctx.body
+    from . import graph_events
+    from . import reconcile_semantic_enrichment as semantic
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, action)
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        semantic._ensure_semantic_state_schema(conn)
+        with sqlite_write_lock():
+            job = _semantic_job_row(conn, project_id, snapshot_id, job_id)
+            if not job:
+                raise ValidationError(f"semantic job not found: {job_id}")
+            now = _utc_now()
+            if status == "pending_ai":
+                conn.execute(
+                    """
+                    UPDATE graph_semantic_jobs
+                    SET status = ?, worker_id = '', claim_id = '', claimed_at = '',
+                        lease_expires_at = '', claimed_by = '', last_error = '', updated_at = ?
+                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                    """,
+                    (status, now, project_id, snapshot_id, job_id),
+                )
+                event_type = "semantic_retry_requested"
+            else:
+                conn.execute(
+                    """
+                    UPDATE graph_semantic_jobs
+                    SET status = ?, worker_id = '', claim_id = '', claimed_at = '',
+                        lease_expires_at = '', claimed_by = '', updated_at = ?
+                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                    """,
+                    (status, now, project_id, snapshot_id, job_id),
+                )
+                event_type = "semantic_stale"
+            event = graph_events.create_event(
+                conn,
+                project_id,
+                snapshot_id,
+                event_type=event_type,
+                event_kind="semantic_job",
+                target_type="node",
+                target_id=job_id,
+                status="observed",
+                feature_hash=str(job.get("feature_hash") or ""),
+                file_hashes=job.get("file_hashes") if isinstance(job.get("file_hashes"), dict) else {},
+                payload={"job_action": action.rsplit(".", 1)[-1], "new_status": status},
+                evidence={"source": "semantic_jobs_api", "previous_status": job.get("status", "")},
+                created_by=str(body.get("actor") or "dashboard_user"),
+            )
+            conn.commit()
+        updated = _semantic_job_row(conn, project_id, snapshot_id, job_id)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "job": updated,
+            "event": event,
+            "summary": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/cancel")
+def handle_graph_governance_snapshot_semantic_job_cancel(ctx: RequestContext):
+    return _semantic_job_status_update(
+        ctx,
+        status="cancelled",
+        action="graph-governance.snapshot.semantic.jobs.cancel",
+    )
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/retry")
+def handle_graph_governance_snapshot_semantic_job_retry(ctx: RequestContext):
+    return _semantic_job_status_update(
+        ctx,
+        status="pending_ai",
+        action="graph-governance.snapshot.semantic.jobs.retry",
+    )
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs")
 def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
     """Queue semantic enrichment work using the existing semantic state substrate.
@@ -4158,11 +4753,56 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
     from . import reconcile_semantic_enrichment as semantic
+    from .db import sqlite_write_lock
 
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.create")
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        if _semantic_jobs_target_scope(body) in {"edge", "edges"}:
+            from . import graph_events
+            from .errors import ValidationError
+
+            edge_targets = _semantic_jobs_edge_targets(body)
+            if not edge_targets:
+                raise ValidationError("target_ids, edge_ids, or edges is required for edge semantic jobs")
+            with sqlite_write_lock():
+                events = [
+                    graph_events.create_event(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        event_type="edge_semantic_requested",
+                        event_kind="semantic_job",
+                        target_type="edge",
+                        target_id=edge["edge_id"],
+                        status="observed",
+                        payload={
+                            "edge": edge.get("edge") or {},
+                            "options": body.get("options") if isinstance(body.get("options"), dict) else {},
+                            "semantic_job_request": {
+                                "target_scope": "edge",
+                                "parallel": bool(body.get("parallel") or body.get("allow_parallel")),
+                            },
+                        },
+                        evidence={"source": "semantic_jobs_api"},
+                        created_by=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                    )
+                    for edge in edge_targets
+                ]
+                conn.commit()
+            return 202, {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "job_id": f"edge-semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+                "target_scope": "edge",
+                "status": "queued",
+                "queued_count": len(events),
+                "events": events,
+                "summary": {"events_by_status": graph_events.status_counts(conn, project_id, snapshot_id)},
+                "jobs": [],
+            }
         enqueue_body = _semantic_jobs_enqueue_body(body)
         try:
             result = semantic.run_semantic_enrichment(
@@ -4181,6 +4821,62 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
+        from . import graph_events
+
+        target_ids = _semantic_jobs_target_ids(
+            enqueue_body.get("semantic_node_ids")
+            or body.get("target_ids")
+            or body.get("node_ids")
+            or body.get("node_id")
+        )
+        if not target_ids:
+            selector = result.get("semantic_selector") if isinstance(result.get("semantic_selector"), dict) else {}
+            target_ids = _semantic_jobs_target_ids(selector.get("node_ids"))
+        jobs_for_events = _semantic_job_rows(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=1000,
+        )
+        job_by_node = {str(job.get("node_id") or ""): job for job in jobs_for_events}
+        if target_ids:
+            for node_id in target_ids:
+                job = job_by_node.get(node_id, {})
+                graph_events.create_event(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    event_type="semantic_retry_requested",
+                    event_kind="semantic_job",
+                    target_type="node",
+                    target_id=node_id,
+                    status="observed",
+                    feature_hash=str(job.get("feature_hash") or ""),
+                    file_hashes=job.get("file_hashes") if isinstance(job.get("file_hashes"), dict) else {},
+                    payload={
+                        "selector": result.get("semantic_selector") or {},
+                        "semantic_job_counts": result.get("semantic_job_counts") or {},
+                    },
+                    evidence={"source": "semantic_jobs_api"},
+                    created_by=str(enqueue_body.get("actor") or "dashboard_user"),
+                )
+        else:
+            graph_events.create_event(
+                conn,
+                project_id,
+                snapshot_id,
+                event_type="semantic_retry_requested",
+                event_kind="semantic_job",
+                target_type="snapshot",
+                target_id=snapshot_id,
+                status="observed",
+                payload={
+                    "selector": result.get("semantic_selector") or {},
+                    "semantic_job_counts": result.get("semantic_job_counts") or {},
+                },
+                evidence={"source": "semantic_jobs_api"},
+                created_by=str(enqueue_body.get("actor") or "dashboard_user"),
+            )
         conn.commit()
         jobs = _semantic_job_rows(
             conn,
