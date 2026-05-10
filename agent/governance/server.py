@@ -2524,7 +2524,8 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "lease_expires_at": row.get("lease_expires_at", ""),
                 "last_error": row.get("last_error", ""),
                 "last_result": row.get("result_json", ""),
-                "supported_actions": ["cancel", "observer_takeover", "view_trace"],
+                # MF-2026-05-10-011: cancel removed from scope_reconcile actions.
+                "supported_actions": ["observer_takeover", "view_trace"],
             })
 
         if stale_operation:
@@ -2728,53 +2729,23 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
 
 @route("POST", "/api/graph-governance/{project_id}/reconcile/scope/cancel")
 def handle_graph_governance_scope_reconcile_cancel(ctx: RequestContext):
-    """Soft-cancel pending scope reconcile rows by waiving the queued commit."""
-    project_id = ctx.get_project_id()
-    body = ctx.body if isinstance(ctx.body, dict) else {}
-    commit_sha = str(
-        body.get("commit_sha")
-        or body.get("target_commit_sha")
-        or body.get("commit")
-        or ""
-    ).strip()
-    operation_id = str(body.get("operation_id") or body.get("op_id") or "").strip()
-    if not commit_sha and operation_id.startswith("scope-reconcile:"):
-        commit_sha = operation_id.rsplit(":", 1)[-1].strip()
-    from . import graph_snapshot_store as store
-    from .db import sqlite_write_lock
-    from .errors import ValidationError
+    """Disabled (MF-2026-05-10-011): scope reconcile cancel has no business use.
 
-    if not commit_sha:
-        raise ValidationError("commit_sha or operation_id is required")
-    conn = get_connection(project_id)
-    try:
-        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.scope.cancel")
-        with sqlite_write_lock():
-            result = store.waive_pending_scope_reconcile(
-                conn,
-                project_id,
-                commit_shas=[commit_sha],
-                snapshot_id=str(body.get("snapshot_id") or ""),
-                actor=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
-                reason=str(body.get("reason") or "dashboard_cancel"),
-                evidence={
-                    "source": "scope_reconcile_cancel_api",
-                    "operation_id": operation_id,
-                },
-            )
-            conn.commit()
-        return {
-            "ok": True,
-            "project_id": project_id,
-            "commit_sha": commit_sha,
-            "operation_id": operation_id,
-            "status": "cancelled" if int(result.get("waived_count") or 0) else "not_found",
-            "storage_status": "waived",
-            "cancelled_count": int(result.get("waived_count") or 0),
-            **result,
-        }
-    finally:
-        conn.close()
+    Previously waived the pending_scope_reconcile row, which permanently poisoned
+    the same commit so the dashboard's "Queue scope reconcile" button silently
+    no-op'd. Removed at operator request. Recovery path: make a new commit on
+    main (HEAD changes → fresh pending row eligible) or call
+    /reconcile/backfill-escape for stuck-row recovery.
+    """
+    return 410, {
+        "ok": False,
+        "error": "scope_reconcile_cancel_disabled",
+        "message": (
+            "scope_reconcile cancel was removed by MF-2026-05-10-011 — no business need. "
+            "To recover from a stale pending row, push a new commit on main "
+            "(fresh HEAD) or use POST /reconcile/backfill-escape."
+        ),
+    }
 
 
 def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
@@ -6284,9 +6255,17 @@ def _semantic_cancel_status_bucket(status: str) -> str:
     normalized = _normalize_operation_status(status)
     if normalized in {"ai_pending", "queued", "pending_ai"}:
         return "queued"
-    if normalized == "running":
+    if normalized in {"running", "ai_running", "claimed", "ai_reviewing"}:
         return "running"
-    if normalized in {"complete", "failed", "cancelled"}:
+    if normalized in {
+        "complete",
+        "ai_complete",
+        "failed",
+        "ai_failed",
+        "cancelled",
+        "rejected",
+        "rule_complete",
+    }:
         return "terminal"
     return "other"
 
@@ -6333,14 +6312,31 @@ def _semantic_cancel_jobs(
     target_edge_ids: set[str] | None = None,
     source: str = "semantic_jobs_cancel_all_api",
 ) -> dict:
+    """Cancel non-terminal, non-running semantic queue rows.
+
+    MF-2026-05-10-011: running rows are no longer cancellable. They count
+    toward `skipped_running` so the dashboard can show the operator why some
+    rows survived the cancel-all click. Terminal rows (complete / failed /
+    cancelled / rejected / rule_complete / ai_failed) bump `skipped_terminal`.
+    """
     from . import graph_events
     from . import reconcile_semantic_enrichment as semantic
 
     semantic._ensure_semantic_state_schema(conn)
     requested_bucket = _semantic_cancel_requested_bucket(status)
+    if requested_bucket == "running":
+        # Caller asked to cancel running rows specifically — refuse and surface
+        # an explicit signal rather than silently skipping every row.
+        from .errors import ValidationError
+
+        raise ValidationError(
+            "running cancel is not supported (MF-2026-05-10-011); "
+            "only queued rows can be cancelled"
+        )
     now = _utc_now()
     cancelled: list[dict] = []
     skipped_terminal = 0
+    skipped_running = 0
     matched_count = 0
 
     if _semantic_cancel_kind_allowed("node", operation_type, target_scope):
@@ -6355,9 +6351,12 @@ def _semantic_cancel_jobs(
             if bucket == "terminal":
                 skipped_terminal += 1
                 continue
-            if requested_bucket and bucket != requested_bucket:
+            if bucket == "running":
+                skipped_running += 1
                 continue
-            if bucket not in {"queued", "running"}:
+            if bucket != "queued":
+                continue
+            if requested_bucket and bucket != requested_bucket:
                 continue
             matched_count += 1
             conn.execute(
@@ -6392,9 +6391,12 @@ def _semantic_cancel_jobs(
             if bucket == "terminal":
                 skipped_terminal += 1
                 continue
-            if requested_bucket and bucket != requested_bucket:
+            if bucket == "running":
+                skipped_running += 1
                 continue
-            if bucket not in {"queued", "running"}:
+            if bucket != "queued":
+                continue
+            if requested_bucket and bucket != requested_bucket:
                 continue
             matched_count += 1
             updated = graph_events.update_event_status(
@@ -6421,6 +6423,7 @@ def _semantic_cancel_jobs(
     return {
         "cancelled_count": len(cancelled),
         "skipped_terminal": skipped_terminal,
+        "skipped_running": skipped_running,
         "matched_count": matched_count,
         "cancelled_ops": cancelled,
         "summary": {
@@ -6830,6 +6833,21 @@ def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str
                         created_by=str(body.get("actor") or "dashboard_user"),
                     )
                 else:
+                    # MF-2026-05-10-011: running edge jobs are not cancellable.
+                    edge_status_bucket = _semantic_cancel_status_bucket(
+                        str(edge_event.get("status") or "")
+                    )
+                    if edge_status_bucket == "running":
+                        conn.commit()
+                        return 409, {
+                            "ok": False,
+                            "error": "cancel_running_not_supported",
+                            "project_id": project_id,
+                            "snapshot_id": snapshot_id,
+                            "job_id": job_id,
+                            "current_status": edge_event.get("status", ""),
+                            "message": "running edge semantic jobs cannot be cancelled (MF-2026-05-10-011)",
+                        }
                     event = graph_events.update_event_status(
                         conn,
                         project_id,
@@ -6859,6 +6877,33 @@ def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str
                     "summary": {"by_status": _edge_semantic_job_status_counts(conn, project_id, snapshot_id)},
                 }
             now = _utc_now()
+            if status == "cancelled":
+                # MF-2026-05-10-011: running node jobs are not cancellable.
+                node_status_bucket = _semantic_cancel_status_bucket(
+                    str(job.get("status") or "")
+                )
+                if node_status_bucket == "running":
+                    conn.commit()
+                    return 409, {
+                        "ok": False,
+                        "error": "cancel_running_not_supported",
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "job_id": job_id,
+                        "current_status": job.get("status", ""),
+                        "message": "running semantic jobs cannot be cancelled (MF-2026-05-10-011)",
+                    }
+                if node_status_bucket == "terminal":
+                    conn.commit()
+                    return {
+                        "ok": True,
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "job_id": job_id,
+                        "status": "noop_terminal",
+                        "current_status": job.get("status", ""),
+                        "message": "row already terminal — cancel is a no-op",
+                    }
             if status == "pending_ai":
                 conn.execute(
                     """
@@ -6939,6 +6984,137 @@ def handle_graph_governance_snapshot_semantic_jobs_cancel_all(ctx: RequestContex
             "project_id": project_id,
             "snapshot_id": snapshot_id,
             **result,
+        }
+    finally:
+        conn.close()
+
+
+@route(
+    "POST",
+    "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/clear-terminal",
+)
+def handle_graph_governance_snapshot_semantic_jobs_clear_terminal(ctx: RequestContext):
+    """Physically drain terminal semantic queue rows so the dashboard isn't
+    swamped with cancelled / completed / failed history (MF-2026-05-10-011).
+
+    Body filters (all optional, AND-combined):
+      operation_type : "node_semantic" | "edge_semantic"
+      before_ts      : ISO8601 — only rows with updated_at/created_at <= before_ts
+      statuses       : list of statuses to clear; defaults to the full terminal set
+                       ("cancelled", "complete", "ai_complete", "failed",
+                        "ai_failed", "rejected", "rule_complete")
+
+    Behaviour:
+      - node_semantic rows: physical DELETE from graph_semantic_jobs.
+      - edge_semantic rows: events are audit history and are NOT deleted; the
+        dashboard already filters terminal events out of its live queue view.
+        We report how many edge rows match so the operator sees coverage.
+    """
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    from . import reconcile_semantic_enrichment as semantic
+    from .db import sqlite_write_lock
+
+    TERMINAL_DEFAULT = {
+        "cancelled",
+        "complete",
+        "ai_complete",
+        "failed",
+        "ai_failed",
+        "rejected",
+        "rule_complete",
+    }
+    raw_statuses = body.get("statuses") or body.get("status")
+    if isinstance(raw_statuses, str):
+        requested_statuses = {raw_statuses.strip().lower()}
+    elif isinstance(raw_statuses, list):
+        requested_statuses = {str(s).strip().lower() for s in raw_statuses if str(s).strip()}
+    else:
+        requested_statuses = set(TERMINAL_DEFAULT)
+    # Refuse to delete anything that isn't terminal.
+    invalid = requested_statuses - TERMINAL_DEFAULT
+    if invalid:
+        from .errors import ValidationError
+
+        raise ValidationError(
+            f"clear-terminal only accepts terminal statuses; invalid: {sorted(invalid)}"
+        )
+    if not requested_statuses:
+        requested_statuses = set(TERMINAL_DEFAULT)
+
+    op_type_filter = str(body.get("operation_type") or "").strip().lower().replace("-", "_")
+    before_ts = str(body.get("before_ts") or "").strip()
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(
+            ctx, conn, "graph-governance.snapshot.semantic.jobs.clear_terminal"
+        )
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        semantic._ensure_semantic_state_schema(conn)
+        deleted_nodes = 0
+        deleted_node_rows: list[dict] = []
+        edge_matched = 0
+        edge_matched_rows: list[dict] = []
+        with sqlite_write_lock():
+            if op_type_filter in {"", "node_semantic"}:
+                for job in _semantic_job_rows(conn, project_id, snapshot_id, limit=5000):
+                    status_val = str(job.get("status") or "").strip().lower()
+                    if status_val not in requested_statuses:
+                        continue
+                    if not _semantic_cancel_before_allowed(job, before_ts):
+                        continue
+                    node_id = str(job.get("node_id") or job.get("job_id") or "").strip()
+                    if not node_id:
+                        continue
+                    conn.execute(
+                        """
+                        DELETE FROM graph_semantic_jobs
+                        WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                        """,
+                        (project_id, snapshot_id, node_id),
+                    )
+                    deleted_nodes += 1
+                    deleted_node_rows.append({
+                        "operation_id": f"node-semantic:{node_id}",
+                        "operation_type": "node_semantic",
+                        "target_id": node_id,
+                        "previous_status": status_val,
+                    })
+            if op_type_filter in {"", "edge_semantic"}:
+                # Edge rows live in graph_events as audit history. We do not
+                # physically remove events here — counting them gives the
+                # operator visibility, and the dashboard already hides terminal
+                # edge events from the live queue.
+                for job in _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=5000):
+                    status_val = str(job.get("status") or "").strip().lower()
+                    if status_val not in requested_statuses:
+                        continue
+                    if not _semantic_cancel_before_allowed(job, before_ts):
+                        continue
+                    edge_matched += 1
+                    edge_matched_rows.append({
+                        "operation_id": f"edge-semantic:{job.get('edge_id') or job.get('event_id') or ''}",
+                        "operation_type": "edge_semantic",
+                        "target_id": str(job.get("edge_id") or job.get("target_id") or ""),
+                        "previous_status": status_val,
+                        "note": "edge events kept as audit history",
+                    })
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "deleted_count": deleted_nodes,
+            "edge_audit_matched": edge_matched,
+            "requested_statuses": sorted(requested_statuses),
+            "deleted_node_rows": deleted_node_rows[:200],
+            "edge_audit_rows": edge_matched_rows[:200],
+            "summary": {
+                "node_semantic": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+                "edge_semantic": {"by_status": _edge_semantic_job_status_counts(conn, project_id, snapshot_id)},
+            },
         }
     finally:
         conn.close()
