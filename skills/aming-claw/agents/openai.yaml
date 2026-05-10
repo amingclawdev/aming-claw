@@ -1,0 +1,11 @@
+interface:
+  display_name: "Aming Claw"
+  short_description: "Governance graph-first workflow guard"
+  default_prompt: "Use $aming-claw to work in the Aming Claw repo with graph-first MF governance."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "aming-claw"
+      description: "Aming Claw governance MCP server configured by the repo .mcp.json."
+policy:
+  allow_implicit_invocation: true
