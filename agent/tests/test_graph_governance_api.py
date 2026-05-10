@@ -625,6 +625,89 @@ def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware
     assert changed_projected["health"]["semantic_stale_count"] == 1
 
 
+def test_graph_governance_semantic_projection_scores_unverified_hash_as_review_debt(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    base_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-unverified-base",
+        commit_sha="commit-base",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        base_snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete',
+                'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                '{"agent/governance/server.py":"sha256:file-a"}',
+                ?, 1, 0, '2026-05-10T00:00:00Z')
+        """,
+        (
+            PID,
+            base_snapshot["snapshot_id"],
+            json.dumps({"feature_name": "Old semantic with indexed hash"}),
+        ),
+    )
+    conn.commit()
+    server.handle_graph_governance_snapshot_semantic_events_backfill(
+        _ctx(
+            {"project_id": PID, "snapshot_id": base_snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-semantic-unverified",
+        commit_sha="commit-unverified",
+        snapshot_kind="scope",
+        parent_snapshot_id=base_snapshot["snapshot_id"],
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-unverified", "backfill_existing": False},
+        )
+    )
+
+    health = projected["health"]
+    assert health["semantic_unverified_hash_count"] == 1
+    assert health["semantic_review_debt_count"] == 1
+    assert health["semantic_trusted_ratio"] == 0.0
+    assert health["semantic_debt_penalty"] == 35.0
+    assert health["project_health_score"] < 70
+    assert projected["projection"]["node_semantics"]["L7.1"]["validity"]["status"] == (
+        "semantic_carried_forward_unverified_hash"
+    )
+
+
 def test_graph_governance_semantic_projection_excludes_package_markers_from_feature_health(conn, monkeypatch):
     monkeypatch.setattr(
         server,

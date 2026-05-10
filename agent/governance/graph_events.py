@@ -1400,6 +1400,10 @@ def _projection_health(
     nodes: list[dict[str, Any]],
     node_semantics: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    status_score_penalties = {
+        "semantic_missing": 45,
+        "semantic_carried_forward_unverified_hash": 35,
+    }
     raw_l7_nodes = [node for node in nodes if str(node.get("layer") or "").upper() == "L7"]
     l7_nodes = [node for node in raw_l7_nodes if _is_governed_feature_node(node)]
     total = len(l7_nodes)
@@ -1410,6 +1414,7 @@ def _projection_health(
     unverified_count = 0
     doc_bound = 0
     test_bound = 0
+    semantic_issue_count = 0
     low_health: list[dict[str, Any]] = []
     for node in l7_nodes:
         node_id = str(node.get("node_id") or "")
@@ -1438,13 +1443,13 @@ def _projection_health(
         else:
             test_bound += 1
         if status == "semantic_missing":
-            node_score -= 3
+            node_score -= status_score_penalties["semantic_missing"]
             issues.append("semantic_missing")
         elif status.startswith("semantic_stale"):
-            node_score -= 5
+            node_score -= 40
             issues.append(status)
         elif status == "semantic_carried_forward_unverified_hash":
-            node_score -= 1
+            node_score -= status_score_penalties["semantic_carried_forward_unverified_hash"]
             issues.append(status)
         semantic_payload = semantic.get("semantic") if isinstance(semantic.get("semantic"), dict) else {}
         for issue in semantic_payload.get("open_issues") or []:
@@ -1453,6 +1458,7 @@ def _projection_health(
             else:
                 issue_type = "open_issue"
             issues.append(issue_type)
+            semantic_issue_count += 1
             node_score -= 2
         node_score = max(0, node_score)
         if issues or node_score < 90:
@@ -1467,12 +1473,25 @@ def _projection_health(
     low_health.sort(key=lambda item: (int(item.get("score") or 0), str(item.get("node_id") or "")))
     def ratio(value: int) -> float:
         return round(value / total, 4) if total else 0.0
+    review_debt_count = missing_count + stale_count + unverified_count
     health_score = 100.0
     if total:
-        health_score -= round((missing_count * 3 + stale_count * 5 + unverified_count) / total, 2)
-        health_score -= round(((total - doc_bound) * 6 + (total - test_bound) * 8) / total, 2)
+        semantic_debt_penalty = (
+            missing_count * status_score_penalties["semantic_missing"]
+            + stale_count * 40
+            + unverified_count * status_score_penalties["semantic_carried_forward_unverified_hash"]
+        ) / total
+        binding_context_penalty = ((total - doc_bound) * 2 + (total - test_bound) * 2) / total
+        open_issue_penalty = min(10.0, (semantic_issue_count * 2) / total)
+        health_score -= round(semantic_debt_penalty, 2)
+        health_score -= round(binding_context_penalty, 2)
+        health_score -= round(open_issue_penalty, 2)
+    else:
+        semantic_debt_penalty = 0.0
+        binding_context_penalty = 0.0
+        open_issue_penalty = 0.0
     return {
-        "score_version": "semantic_projection_v1_event_source_hash_validity",
+        "score_version": "semantic_projection_v2_hash_validity_review_debt",
         "feature_count": total,
         "raw_feature_count": len(raw_l7_nodes),
         "governed_feature_count": total,
@@ -1482,11 +1501,19 @@ def _projection_health(
         "semantic_missing_count": missing_count,
         "semantic_unverified_hash_count": unverified_count,
         "semantic_current_ratio": ratio(current_count),
+        "semantic_trusted_count": current_count,
+        "semantic_trusted_ratio": ratio(current_count),
+        "semantic_review_debt_count": review_debt_count,
+        "semantic_review_debt_ratio": ratio(review_debt_count),
         "doc_bound_count": doc_bound,
         "doc_coverage_ratio": ratio(doc_bound),
         "test_bound_count": test_bound,
         "test_coverage_ratio": ratio(test_bound),
         "semantic_status_counts": dict(sorted(status_counts.items())),
+        "semantic_debt_penalty": round(semantic_debt_penalty, 2),
+        "binding_context_penalty": round(binding_context_penalty, 2),
+        "open_issue_penalty": round(open_issue_penalty, 2),
+        "semantic_open_issue_count": semantic_issue_count,
         "project_health_score": round(max(0.0, health_score), 2),
         "low_health_count": len(low_health),
         "low_health_nodes": low_health[:100],

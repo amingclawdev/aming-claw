@@ -1383,8 +1383,16 @@ def _semantic_health_picture(
             "semantic_stale_count": projection_health.get("semantic_stale_count"),
             "semantic_unverified_hash_count": projection_health.get("semantic_unverified_hash_count"),
             "semantic_current_ratio": projection_health.get("semantic_current_ratio"),
+            "semantic_trusted_count": projection_health.get("semantic_trusted_count"),
+            "semantic_trusted_ratio": projection_health.get("semantic_trusted_ratio"),
+            "semantic_review_debt_count": projection_health.get("semantic_review_debt_count"),
+            "semantic_review_debt_ratio": projection_health.get("semantic_review_debt_ratio"),
             "doc_coverage_ratio": projection_health.get("doc_coverage_ratio"),
             "test_coverage_ratio": projection_health.get("test_coverage_ratio"),
+            "semantic_debt_penalty": projection_health.get("semantic_debt_penalty"),
+            "binding_context_penalty": projection_health.get("binding_context_penalty"),
+            "open_issue_penalty": projection_health.get("open_issue_penalty"),
+            "semantic_open_issue_count": projection_health.get("semantic_open_issue_count"),
             "low_health_count": projection_health.get("low_health_count"),
         }
     coverage = legacy_health.get("semantic_coverage_ratio")
