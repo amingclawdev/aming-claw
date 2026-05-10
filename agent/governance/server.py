@@ -4061,6 +4061,11 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 run_id=str(body.get("run_id") or ""),
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
+                # MF-2026-05-10-014: dashboard-driven incremental catchup
+                # passes activate=true so the materialized snapshot becomes
+                # active in one round-trip; MF-012 hook then auto-builds
+                # the projection on activation.
+                activate=bool(body.get("activate", False)),
                 semantic_enrich=bool(body.get("semantic_enrich", True)),
                 semantic_use_ai=semantic_use_ai,
                 semantic_feedback_items=body.get("semantic_feedback_items") or body.get("feedback_items"),

@@ -122,6 +122,34 @@ def test_activate_non_active_ref_name_skips_rebuild(conn):
     assert result["projection_status"] == "skipped"
 
 
+def test_pending_scope_activate_param_is_plumbed_through():
+    """MF-2026-05-10-014: run_pending_scope_reconcile_candidate must accept
+    `activate` and forward it to the inner full-reconcile call so the
+    dashboard can incrementally catch up + auto-projection in one round-trip.
+
+    Static contract check (signature + source forwarding) — running the real
+    function needs full pending-scope DB setup which is out of scope here.
+    The integration smoke test happens against the live HTTP endpoint after
+    governance restart.
+    """
+    import inspect
+    from agent.governance import state_reconcile
+
+    sig = inspect.signature(state_reconcile.run_pending_scope_reconcile_candidate)
+    assert "activate" in sig.parameters, (
+        "MF-014 contract: run_pending_scope_reconcile_candidate must expose `activate` kwarg"
+    )
+    assert sig.parameters["activate"].default is False, (
+        "default must be False so existing callers (codex chain) are unchanged"
+    )
+
+    src = inspect.getsource(state_reconcile.run_pending_scope_reconcile_candidate)
+    assert "activate=activate" in src, (
+        "MF-014 contract: pending-scope must forward `activate=activate` to "
+        "run_state_only_full_reconcile (not hardcode False)"
+    )
+
+
 def test_activate_does_not_rollback_when_rebuild_fails(conn, monkeypatch):
     """Projection rebuild is advisory; activation must still commit even if
     the hook raises."""

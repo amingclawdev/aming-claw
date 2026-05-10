@@ -1213,6 +1213,7 @@ def run_pending_scope_reconcile_candidate(
     run_id: str = "",
     snapshot_id: str | None = None,
     created_by: str = "observer",
+    activate: bool = False,
     semantic_enrich: bool = True,
     semantic_use_ai: bool | None = None,
     semantic_feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
@@ -1319,7 +1320,11 @@ def run_pending_scope_reconcile_candidate(
         snapshot_id=sid,
         snapshot_kind="scope",
         created_by=created_by,
-        activate=False,
+        # MF-2026-05-10-014: pass through caller's activate intent so the
+        # dashboard "Queue scope reconcile" path can incrementally catch up
+        # the active snapshot in one HTTP round-trip. MF-012's hook then
+        # auto-rebuilds the projection on activation.
+        activate=activate,
         semantic_enrich=semantic_enrich,
         semantic_use_ai=semantic_use_ai,
         semantic_feedback_items=semantic_feedback_items,
