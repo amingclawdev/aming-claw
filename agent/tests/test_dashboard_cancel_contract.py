@@ -26,12 +26,18 @@ class _NoCloseConn:
         pass
 
 
-def _ctx(path_params: dict, *, method: str = "POST", body: dict | None = None):
+def _ctx(
+    path_params: dict,
+    *,
+    method: str = "POST",
+    body: dict | None = None,
+    query: dict | None = None,
+):
     return server.RequestContext(
         None,
         method,
         path_params,
-        {},
+        query or {},
         body or {},
         "req-dashboard-cancel-contract-test",
         "",
@@ -448,6 +454,73 @@ def test_scope_reconcile_supported_actions_omit_cancel(conn):
     assert rows, "expected a scope_reconcile row to be present"
     for row in rows:
         assert "cancel" not in (row.get("supported_actions") or [])
+
+
+def test_operations_queue_default_hides_terminal_rows(conn):
+    """MF-2026-05-10-013: /operations/queue must default-hide terminal rows
+    (cancelled / complete / ai_failed / rejected / rule_complete) so the
+    dashboard isn't drowned in audit history. Pass include_terminal=true
+    to see everything."""
+    snapshot = _create_snapshot(conn, "ops-queue-hide-terminal")
+    sid = snapshot["snapshot_id"]
+    store.activate_graph_snapshot(conn, PID, sid, auto_rebuild_projection=False)
+    conn.executemany(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, updated_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (PID, sid, "L7.1", "ai_pending",  "2026-05-10T18:00:00Z", "2026-05-10T18:00:00Z"),
+            (PID, sid, "L7.2", "cancelled",   "2026-05-10T18:00:00Z", "2026-05-10T18:00:00Z"),
+        ],
+    )
+    # Edge events: one queued (ai_pending via "observed"), one terminal (rejected).
+    graph_events.create_event(
+        conn, PID, sid,
+        event_type="edge_semantic_requested", event_kind="semantic_job",
+        target_type="edge", target_id="L7.1->L7.2:depends_on",
+        status="observed",
+        payload={"edge": {"src": "L7.1", "dst": "L7.2", "edge_type": "depends_on"}},
+        evidence={"source": "test"},
+        created_by="test",
+    )
+    graph_events.create_event(
+        conn, PID, sid,
+        event_type="edge_semantic_requested", event_kind="semantic_job",
+        target_type="edge", target_id="L7.1->L7.3:owns_state",
+        status="rejected",
+        payload={"edge": {"src": "L7.1", "dst": "L7.3", "edge_type": "owns_state"}},
+        evidence={"source": "test"},
+        created_by="test",
+    )
+    conn.commit()
+
+    # Default: hide terminal.
+    default_view = server.handle_graph_governance_operations_queue(
+        _ctx({"project_id": PID}, method="GET")
+    )
+    node_rows = [o for o in default_view["operations"] if o["operation_type"] == "node_semantic"]
+    edge_rows = [o for o in default_view["operations"] if o["operation_type"] == "edge_semantic"]
+    assert [r["target_id"] for r in node_rows] == ["L7.1"], (
+        "cancelled L7.2 must be hidden by default"
+    )
+    assert [r["target_id"] for r in edge_rows] == ["L7.1->L7.2:depends_on"], (
+        "rejected edge must be hidden by default"
+    )
+
+    # Opt-in: include_terminal=true → everything visible.
+    full_view = server.handle_graph_governance_operations_queue(
+        _ctx({"project_id": PID}, method="GET", query={"include_terminal": "true"})
+    )
+    full_node = sorted(
+        r["target_id"] for r in full_view["operations"] if r["operation_type"] == "node_semantic"
+    )
+    full_edge = sorted(
+        r["target_id"] for r in full_view["operations"] if r["operation_type"] == "edge_semantic"
+    )
+    assert full_node == ["L7.1", "L7.2"]
+    assert full_edge == ["L7.1->L7.2:depends_on", "L7.1->L7.3:owns_state"]
 
 
 def test_feedback_cancel_uses_keep_status_observation_contract(conn):

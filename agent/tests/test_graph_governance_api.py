@@ -746,8 +746,16 @@ def test_graph_governance_edge_semantic_jobs_auto_enrich_and_controls(conn, tmp_
     assert projected["health"]["edge_semantic_coverage_ratio"] == 0.0
     assert projected["health"]["edge_semantic_payload_coverage_ratio"] == 1.0
 
+    # MF-2026-05-10-013: terminal-status edge rows (including rule_complete)
+    # are now hidden by default; pass include_terminal to assert on them.
     queue = server.handle_graph_governance_operations_queue(
-        _ctx({"project_id": PID}, query={"snapshot_id": snapshot["snapshot_id"]})
+        _ctx(
+            {"project_id": PID},
+            query={
+                "snapshot_id": snapshot["snapshot_id"],
+                "include_terminal": "true",
+            },
+        )
     )
     operations = {row["operation_type"]: row for row in queue["operations"]}
     assert operations["edge_semantic"]["status"] == "rule_complete"

@@ -2480,8 +2480,21 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             snapshot_summary = store.summarize_graph_snapshot(conn, project_id, snapshot_id)
         job_limit = _query_int(ctx.query, "job_limit", 200)
         feedback_limit = _query_int(ctx.query, "feedback_limit", 100)
+        # MF-2026-05-10-013: default-hide terminal node + edge rows so the
+        # dashboard isn't drowned by cancelled / completed audit history.
+        # Pass `?include_terminal=true` to see everything.
+        include_terminal = _query_bool(ctx.query, "include_terminal", False)
         node_jobs = _semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit) if snapshot_id else []
         edge_jobs = _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit) if snapshot_id else []
+        if not include_terminal:
+            node_jobs = [
+                j for j in node_jobs
+                if _semantic_cancel_status_bucket(str(j.get("status") or "")) != "terminal"
+            ]
+            edge_jobs = [
+                j for j in edge_jobs
+                if _semantic_cancel_status_bucket(str(j.get("status") or "")) != "terminal"
+            ]
         node_job_counts = _semantic_job_status_counts(conn, project_id, snapshot_id) if snapshot_id else {}
         edge_job_counts = _edge_semantic_job_status_counts(conn, project_id, snapshot_id) if snapshot_id else {}
         feedback_queue = (
