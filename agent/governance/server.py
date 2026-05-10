@@ -3975,6 +3975,243 @@ def handle_graph_governance_snapshot_feedback_file_backlog(ctx: RequestContext):
         conn.close()
 
 
+def _semantic_jobs_target_ids(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = [raw]
+    return [str(value or "").strip() for value in values if str(value or "").strip()]
+
+
+def _semantic_jobs_enqueue_body(body: dict) -> dict:
+    from .errors import ValidationError
+
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    target_scope = str(
+        body.get("target_scope")
+        or options.get("target_scope")
+        or "snapshot"
+    ).strip().lower().replace("-", "_")
+    if target_scope in {"edge", "edges"}:
+        raise ValidationError(
+            "edge semantic jobs are not supported by the current backend queue yet; "
+            "use graph feedback/edge correction review until edge semantics are implemented"
+        )
+    if target_scope not in {"snapshot", "node", "nodes", "subtree"}:
+        raise ValidationError(f"unsupported semantic job target_scope: {target_scope}")
+
+    target_ids = _semantic_jobs_target_ids(
+        body.get("target_ids")
+        or body.get("target_id")
+        or body.get("node_ids")
+        or body.get("node_id")
+    )
+    if target_scope in {"node", "nodes", "subtree"} and not target_ids:
+        raise ValidationError("target_ids is required for node or subtree semantic jobs")
+
+    layers: list[str] = []
+    if options.get("include_l7_features", True):
+        layers.append("L7")
+    if options.get("include_containers"):
+        layers.extend(["L1", "L2", "L3"])
+    if options.get("include_l4_assets"):
+        layers.append("L4")
+    if body.get("semantic_layers") or body.get("layers"):
+        layers = _semantic_jobs_target_ids(body.get("semantic_layers") or body.get("layers"))
+    layers = [layer.upper() for layer in layers if str(layer or "").strip()]
+
+    skip_current = options.get("skip_current")
+    if skip_current is None:
+        skip_current = body.get("skip_current")
+    if skip_current is None:
+        skip_current = True
+    if options.get("retry_stale_failed"):
+        skip_current = False
+
+    enqueue_body = dict(body)
+    enqueue_body.update({
+        "semantic_use_ai": False,
+        "use_ai": False,
+        "semantic_mode": "enqueue_only",
+        "semantic_graph_state": True,
+        "semantic_skip_completed": bool(skip_current),
+        "actor": body.get("actor") or body.get("created_by") or "dashboard_user",
+    })
+    if target_ids:
+        enqueue_body["semantic_node_ids"] = target_ids
+    elif layers:
+        enqueue_body["semantic_layers"] = layers
+    else:
+        enqueue_body["semantic_layers"] = ["L7"]
+    if any(layer in {"L1", "L2", "L3", "L4"} for layer in enqueue_body.get("semantic_layers", [])):
+        enqueue_body["semantic_include_structural"] = True
+    return enqueue_body
+
+
+def _semantic_job_rows(conn, project_id: str, snapshot_id: str, *, statuses: list[str] | None = None, limit: int = 200, offset: int = 0) -> list[dict]:
+    from . import reconcile_semantic_enrichment as semantic
+
+    semantic._ensure_semantic_state_schema(conn)
+    params: list[object] = [project_id, snapshot_id]
+    sql = """
+        SELECT node_id, status, feature_hash, file_hashes_json, feedback_round,
+               batch_index, attempt_count, worker_id, claim_id, claimed_at,
+               lease_expires_at, claimed_by, last_error, updated_at, created_at
+        FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ?
+    """
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(statuses)
+    sql += " ORDER BY updated_at DESC, node_id LIMIT ? OFFSET ?"
+    params.extend([max(1, min(int(limit or 200), 1000)), max(0, int(offset or 0))])
+    rows = conn.execute(sql, params).fetchall()
+    jobs: list[dict] = []
+    for row in rows:
+        try:
+            file_hashes = json.loads(row["file_hashes_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            file_hashes = {}
+        jobs.append({
+            "node_id": row["node_id"],
+            "status": row["status"],
+            "feature_hash": row["feature_hash"],
+            "file_hashes": file_hashes,
+            "feedback_round": row["feedback_round"],
+            "batch_index": row["batch_index"],
+            "attempt_count": row["attempt_count"],
+            "worker_id": row["worker_id"],
+            "claim_id": row["claim_id"],
+            "claimed_at": row["claimed_at"],
+            "lease_expires_at": row["lease_expires_at"],
+            "claimed_by": row["claimed_by"],
+            "last_error": row["last_error"],
+            "updated_at": row["updated_at"],
+            "created_at": row["created_at"],
+        })
+    return jobs
+
+
+def _semantic_job_status_counts(conn, project_id: str, snapshot_id: str) -> dict[str, int]:
+    from . import reconcile_semantic_enrichment as semantic
+
+    semantic._ensure_semantic_state_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ?
+        GROUP BY status
+        ORDER BY status
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    return {str(row["status"] or ""): int(row["count"] or 0) for row in rows}
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs")
+def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
+    """List semantic enrichment queue rows for dashboard/job controls."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    statuses = _query_statuses(ctx.query)
+    limit = _query_int(ctx.query, "limit", 200)
+    offset = _query_int(ctx.query, "offset", 0)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.list")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        jobs = _semantic_job_rows(
+            conn,
+            project_id,
+            snapshot_id,
+            statuses=statuses or None,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "count": len(jobs),
+            "jobs": jobs,
+            "summary": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs")
+def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
+    """Queue semantic enrichment work using the existing semantic state substrate.
+
+    This is the dashboard-facing compatibility endpoint. It intentionally
+    enqueues DB-backed semantic rows without running AI inline.
+    """
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from . import reconcile_semantic_enrichment as semantic
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.create")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        enqueue_body = _semantic_jobs_enqueue_body(body)
+        try:
+            result = semantic.run_semantic_enrichment(
+                conn,
+                project_id,
+                snapshot_id,
+                root,
+                use_ai=False,
+                created_by=str(enqueue_body.get("actor") or "dashboard_user"),
+                max_excerpt_chars=0,
+                ai_feature_limit=0,
+                **_semantic_state_kwargs_from_body(enqueue_body),
+                **_semantic_selector_kwargs_from_body(enqueue_body),
+                semantic_config_path=enqueue_body.get("semantic_config_path"),
+                persist_feature_payloads=False,
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        conn.commit()
+        jobs = _semantic_job_rows(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=int(body.get("limit") or 200),
+        )
+        queued_count = sum(
+            1
+            for job in jobs
+            if str(job.get("status") or "") in {"ai_pending", "pending_ai", "running"}
+        )
+        return 202, {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "job_id": f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+            "status": "queued",
+            "queued_count": queued_count,
+            "summary": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+            "semantic_enrichment": {
+                "feedback_round": result.get("feedback_round"),
+                "semantic_selector": result.get("semantic_selector"),
+                "semantic_job_counts": result.get("semantic_job_counts") or {},
+            },
+            "jobs": jobs,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic-enrich")
 def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
     """Build/rebuild semantic companion artifacts for a graph snapshot."""

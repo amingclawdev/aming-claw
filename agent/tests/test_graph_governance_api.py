@@ -397,6 +397,90 @@ def test_graph_governance_snapshot_nodes_include_semantic_overlay(conn):
     assert "semantic" not in structure_only["nodes"][0]
 
 
+def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-jobs-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    created = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "node",
+                "target_ids": ["L7.1"],
+                "options": {"skip_current": False},
+                "created_by": "dashboard_user",
+            },
+        )
+    )
+
+    status, payload = created
+    assert status == 202
+    assert payload["ok"] is True
+    assert payload["status"] == "queued"
+    assert payload["summary"]["by_status"]["ai_pending"] == 1
+
+    listed = server.handle_graph_governance_snapshot_semantic_jobs_list(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"status": "ai_pending"},
+        )
+    )
+    assert listed["count"] == 1
+    assert listed["jobs"][0]["node_id"] == "L7.1"
+    assert listed["jobs"][0]["status"] == "ai_pending"
+
+
+def test_graph_governance_semantic_jobs_endpoint_rejects_edge_scope(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-edge-jobs-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+
+    with pytest.raises(ValidationError):
+        server.handle_graph_governance_snapshot_semantic_jobs_create(
+            _ctx(
+                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+                method="POST",
+                body={
+                    "project_root": str(tmp_path),
+                    "target_scope": "edge",
+                    "target_ids": ["L7.1|L3.1|contains"],
+                },
+            )
+        )
+
+
 def test_graph_governance_dashboard_api_summarizes_active_state(conn):
     snapshot = store.create_graph_snapshot(
         conn,
