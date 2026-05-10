@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import graph_events
 from . import graph_query_trace
 from . import graph_snapshot_store as store
 from . import reconcile_feedback
@@ -716,6 +717,100 @@ def _call_ai(ai_call: GlobalReviewAiCall | None, payload: dict[str, Any]) -> dic
     return response if isinstance(response, dict) else {}
 
 
+def _global_review_event_payload(report: dict[str, Any], *, review_kind: str) -> dict[str, Any]:
+    health = report.get("health_picture") if isinstance(report.get("health_picture"), dict) else {}
+    trace = report.get("graph_query_trace") if isinstance(report.get("graph_query_trace"), dict) else {}
+    trace_meta = trace.get("trace") if isinstance(trace.get("trace"), dict) else {}
+    ai_review = report.get("global_ai_review") if isinstance(report.get("global_ai_review"), dict) else {}
+    classification = (
+        report.get("feedback_classification")
+        if isinstance(report.get("feedback_classification"), dict)
+        else {}
+    )
+    return {
+        "schema_version": 1,
+        "review_kind": review_kind,
+        "run_id": report.get("run_id", ""),
+        "status": report.get("status", ""),
+        "blocked": bool(report.get("blocked")),
+        "report_path": report.get("report_path", ""),
+        "latest_report_path": report.get("latest_report_path", ""),
+        "health_summary": {
+            "project_health_score": health.get("project_health_score"),
+            "raw_project_health_score": health.get("raw_project_health_score"),
+            "semantic_coverage_ratio": health.get("semantic_coverage_ratio"),
+            "semantic_complete_count": health.get("semantic_complete_count"),
+            "semantic_pending_count": health.get("semantic_pending_count"),
+            "doc_coverage_ratio": health.get("doc_coverage_ratio"),
+            "test_coverage_ratio": health.get("test_coverage_ratio"),
+            "low_health_count": health.get("low_health_count"),
+            "file_hygiene_score": health.get("file_hygiene_score"),
+        },
+        "trace": {
+            "trace_id": trace.get("trace_id", ""),
+            "status": trace_meta.get("status", ""),
+            "usage": trace_meta.get("usage", {}),
+            "query_count": len(trace.get("queries") or []),
+        },
+        "global_ai_review": {
+            "requested": bool(ai_review.get("requested")),
+            "response_present": bool(ai_review.get("response_present")),
+            "open_issue_count": int(ai_review.get("open_issue_count") or 0),
+            "error": ai_review.get("error", ""),
+        },
+        "feedback_classification": {
+            "count": int(classification.get("count") or 0),
+            "by_lane": classification.get("by_lane", {}),
+        },
+        "changed_node_count": len(report.get("changed_node_ids") or []),
+        "pending_node_count": len(report.get("pending_node_ids") or []),
+    }
+
+
+def _record_global_review_event(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    commit_sha: str,
+    actor: str,
+    review_kind: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    graph_events.ensure_schema(conn)
+    event_id = "-".join(
+        [
+            "global-review",
+            _path_component(review_kind, max_len=16),
+            _path_component(snapshot_id, max_len=40),
+            _path_component(str(report.get("run_id") or ""), max_len=48),
+        ]
+    )
+    return graph_events.create_event(
+        conn,
+        project_id,
+        snapshot_id,
+        event_id=event_id,
+        event_type="semantic_global_review_generated",
+        event_kind="semantic_review",
+        target_type="snapshot",
+        target_id=snapshot_id,
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        risk_level="low",
+        confidence=1.0,
+        baseline_commit=commit_sha,
+        target_commit=commit_sha,
+        payload=_global_review_event_payload(report, review_kind=review_kind),
+        evidence={
+            "source": "reconcile_global_review",
+            "review_kind": review_kind,
+            "report_path": report.get("report_path", ""),
+            "latest_report_path": report.get("latest_report_path", ""),
+        },
+        created_by=actor,
+    )
+
+
 def _global_review_dir(project_id: str, snapshot_id: str) -> Path:
     return store.snapshot_companion_dir(project_id, snapshot_id) / "semantic-enrichment" / "global-review"
 
@@ -773,15 +868,15 @@ def _trace_full_context(
             budget_exhausted = True
         return result.get("result") if isinstance(result.get("result"), dict) else {}
 
-    subsystems = query("list_subsystems", {"limit": 200})
-    low_health = query("list_low_health_nodes", {"limit": 200})
+    subsystems = query("list_subsystems", {"limit": 200, "compact": True})
+    low_health = query("list_low_health_nodes", {"limit": 200, "compact": True})
     inspected: list[dict[str, Any]] = []
     for item in (low_health.get("nodes") or [])[:20]:
         node = item.get("node") if isinstance(item, dict) else {}
         node_id = str((node or {}).get("node_id") or "")
         if not node_id:
             continue
-        inspected_node = query("get_node", {"node_id": node_id, "include_semantic": True})
+        inspected_node = query("get_node", {"node_id": node_id, "include_semantic": True, "compact": True})
         inspected.append({
             "node_id": node_id,
             "health": {
@@ -949,6 +1044,22 @@ def run_full_global_review(
     report["latest_report_path"] = latest_path
     _write_json(Path(report_path), report)
     _write_json(Path(latest_path), report)
+    event = _record_global_review_event(
+        conn,
+        project_id,
+        snapshot_id,
+        commit_sha=str(snapshot.get("commit_sha") or ""),
+        actor=actor,
+        review_kind="full",
+        report=report,
+    )
+    report["graph_event"] = {
+        "event_id": event.get("event_id", ""),
+        "event_seq": event.get("event_seq", 0),
+        "status": event.get("status", ""),
+    }
+    _write_json(Path(report_path), report)
+    _write_json(Path(latest_path), report)
     _update_snapshot_global_review_notes(
         conn,
         project_id,
@@ -1019,11 +1130,11 @@ def _trace_incremental_context(
             budget_exhausted = True
         return result.get("result") if isinstance(result.get("result"), dict) else {}
 
-    query("list_subsystems", {"limit": 50})
-    low_health = query("list_low_health_nodes", {"limit": 50})
+    query("list_subsystems", {"limit": 50, "compact": True})
+    low_health = query("list_low_health_nodes", {"limit": 50, "compact": True})
     inspected: list[dict[str, Any]] = []
     for node_id in changed_node_ids[:20]:
-        node = query("get_node", {"node_id": node_id, "include_semantic": True})
+        node = query("get_node", {"node_id": node_id, "include_semantic": True, "compact": True})
         neighbors = query("get_neighbors", {"node_id": node_id, "limit": 40})
         inspected.append({
             "node_id": node_id,
@@ -1278,6 +1389,22 @@ def run_incremental_global_review(
     latest_path = str(out_dir / "latest-incremental-review.json")
     report["report_path"] = report_path
     report["latest_report_path"] = latest_path
+    _write_json(Path(report_path), report)
+    _write_json(Path(latest_path), report)
+    event = _record_global_review_event(
+        conn,
+        project_id,
+        snapshot_id,
+        commit_sha=str(snapshot.get("commit_sha") or ""),
+        actor=actor,
+        review_kind="incremental",
+        report=report,
+    )
+    report["graph_event"] = {
+        "event_id": event.get("event_id", ""),
+        "event_seq": event.get("event_seq", 0),
+        "status": event.get("status", ""),
+    }
     _write_json(Path(report_path), report)
     _write_json(Path(latest_path), report)
     _update_snapshot_global_review_notes(

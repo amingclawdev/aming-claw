@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.governance import graph_events
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance import reconcile_global_review
@@ -180,6 +181,15 @@ def test_incremental_global_review_queues_semantics_and_blocks_without_ai(conn, 
     snapshot = store.get_graph_snapshot(conn, PID, snapshot_id)
     notes = json.loads(snapshot["notes"])
     assert notes["global_semantic_review"]["latest_incremental_status"] == "blocked_semantic_pending"
+    events = graph_events.list_events(
+        conn,
+        PID,
+        snapshot_id,
+        event_types=["semantic_global_review_generated"],
+    )
+    assert len(events) == 1
+    assert events[0]["status"] == graph_events.EVENT_STATUS_OBSERVED
+    assert events[0]["payload"]["review_kind"] == "incremental"
 
 
 def test_full_global_review_builds_health_picture_without_semantic_enrichment(conn, project):
@@ -214,6 +224,53 @@ def test_full_global_review_builds_health_picture_without_semantic_enrichment(co
     snapshot = store.get_graph_snapshot(conn, PID, snapshot_id)
     notes = json.loads(snapshot["notes"])
     assert notes["global_semantic_review"]["latest_full_status"] == "reviewed"
+    events = graph_events.list_events(
+        conn,
+        PID,
+        snapshot_id,
+        event_types=["semantic_global_review_generated"],
+    )
+    assert len(events) == 1
+    assert events[0]["status"] == graph_events.EVENT_STATUS_OBSERVED
+    assert events[0]["payload"]["review_kind"] == "full"
+
+
+def test_full_global_review_uses_compact_trace_context_for_large_metadata(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+    row = conn.execute(
+        """
+        SELECT metadata_json FROM graph_nodes_index
+        WHERE project_id=? AND snapshot_id=? AND node_id='L3.1'
+        """,
+        (PID, snapshot_id),
+    ).fetchone()
+    metadata = json.loads(row["metadata_json"])
+    metadata["giant_unpromptable_blob"] = "x" * 30_000
+    metadata["functions"] = [{"name": f"helper_{i}", "line": i} for i in range(1000)]
+    conn.execute(
+        """
+        UPDATE graph_nodes_index
+        SET metadata_json=?
+        WHERE project_id=? AND snapshot_id=? AND node_id='L3.1'
+        """,
+        (json.dumps(metadata), PID, snapshot_id),
+    )
+    conn.commit()
+
+    result = reconcile_global_review.run_full_global_review(
+        conn,
+        PID,
+        snapshot_id,
+        project,
+        actor="observer",
+        run_id="full-picture-compact-trace",
+        query_budget={"max_queries": 20, "max_result_nodes": 200, "max_result_chars": 20_000},
+    )
+
+    assert result["graph_query_trace"]["trace"]["status"] == "complete"
+    subsystem_result = result["graph_query_trace"]["subsystems"]["subsystems"][0]
+    assert "giant_unpromptable_blob" not in subsystem_result["metadata"]
+    assert subsystem_result["metadata"]["function_count"] == 1000
 
 
 def test_full_global_review_scores_project_health_from_existing_signals(conn, project):

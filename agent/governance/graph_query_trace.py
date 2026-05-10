@@ -150,6 +150,25 @@ def _decode(raw: Any, default: Any) -> Any:
     return default
 
 
+def _string_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = [raw]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip().replace("\\", "/")
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
 def _hash(data: Any) -> str:
     return "sha256:" + hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
 
@@ -395,6 +414,55 @@ def _node_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _compact_node(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    graph_metrics = metadata.get("graph_metrics") if isinstance(metadata.get("graph_metrics"), dict) else {}
+    functions = metadata.get("functions") if isinstance(metadata.get("functions"), list) else []
+    config_files = _string_list(metadata.get("config_files"))
+    return {
+        "node_id": node.get("node_id", ""),
+        "layer": node.get("layer", ""),
+        "title": node.get("title", ""),
+        "kind": node.get("kind", ""),
+        "primary_files": _string_list(node.get("primary_files"))[:5],
+        "secondary_count": len(_string_list(node.get("secondary_files"))),
+        "test_count": len(_string_list(node.get("test_files"))),
+        "config_count": len(config_files),
+        "metadata": {
+            "hierarchy_parent": metadata.get("hierarchy_parent", ""),
+            "area_key": metadata.get("area_key", ""),
+            "subsystem_key": metadata.get("subsystem_key", ""),
+            "module": metadata.get("module", ""),
+            "file_role": metadata.get("file_role", ""),
+            "function_count": metadata.get("function_count", len(functions)),
+            "quality_flags": _string_list(metadata.get("quality_flags"))[:12],
+            "graph_metrics": {
+                "fan_in": graph_metrics.get("fan_in", 0),
+                "fan_out": graph_metrics.get("fan_out", 0),
+                "hierarchy_in": graph_metrics.get("hierarchy_in", 0),
+                "hierarchy_out": graph_metrics.get("hierarchy_out", 0),
+            },
+        },
+    }
+
+
+def _compact_semantic(semantic: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": semantic.get("status", ""),
+        "feature_name": semantic.get("feature_name", ""),
+        "domain_label": semantic.get("domain_label", ""),
+        "intent": semantic.get("intent", ""),
+        "quality_flags": _string_list(semantic.get("quality_flags"))[:12],
+        "open_issue_count": len(semantic.get("open_issues") or []),
+        "doc_status": semantic.get("doc_status", ""),
+        "test_status": semantic.get("test_status", ""),
+        "config_status": semantic.get("config_status", ""),
+        "feature_hash": semantic.get("feature_hash", ""),
+        "feedback_round": semantic.get("feedback_round", 0),
+        "updated_at": semantic.get("updated_at", ""),
+    }
+
+
 def _get_node_row(conn: sqlite3.Connection, project_id: str, snapshot_id: str, node_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         """
@@ -486,7 +554,16 @@ def _query_list_layers(conn: sqlite3.Connection, project_id: str, snapshot_id: s
 
 def _query_list_subsystems(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
     limit = max(1, min(int(args.get("limit") or 200), 1000))
-    nodes = store.list_graph_snapshot_nodes(conn, project_id, snapshot_id, layer="L3", limit=limit)
+    nodes = store.list_graph_snapshot_nodes(
+        conn,
+        project_id,
+        snapshot_id,
+        layer="L3",
+        limit=limit,
+        include_semantic=not bool(args.get("compact")),
+    )
+    if bool(args.get("compact")):
+        nodes = [_compact_node(node) for node in nodes]
     return {"subsystems": nodes, "count": len(nodes)}
 
 
@@ -510,9 +587,11 @@ def _query_get_node(conn: sqlite3.Connection, project_id: str, snapshot_id: str,
     node = _get_node_row(conn, project_id, snapshot_id, node_id)
     if not node:
         return {"ok": False, "error": "node_not_found", "node_id": node_id, "count": 0}
-    result = {"ok": True, "node": node, "count": 1}
+    compact = bool(args.get("compact"))
+    result = {"ok": True, "node": _compact_node(node) if compact else node, "count": 1}
     if bool(args.get("include_semantic", True)):
-        result["semantic"] = _semantic_for_node(conn, project_id, snapshot_id, node_id)
+        semantic = _semantic_for_node(conn, project_id, snapshot_id, node_id)
+        result["semantic"] = _compact_semantic(semantic) if compact else semantic
     if bool(args.get("include_feedback")):
         result["feedback"] = _feedback_for_node(project_id, snapshot_id, node_id, limit=int(args.get("feedback_limit") or 20))
     return result
@@ -752,7 +831,7 @@ def _query_list_low_health_nodes(conn: sqlite3.Connection, project_id: str, snap
         score -= 10 * issues.count("needs_human_signoff")
         score -= 5 if "high_function_count" in issues else 0
         candidates.append({
-            "node": node,
+            "node": _compact_node(node) if bool(args.get("compact")) else node,
             "semantic_status": row["status"] if "status" in row.keys() else "",
             "issues": sorted(set(issues)),
             "approx_health_score": max(0, score),
