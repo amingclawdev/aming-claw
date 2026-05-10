@@ -195,6 +195,21 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R10 | Doc location check | Any new documentation file | MUST verify file is placed in the correct directory per project convention (e.g., governance docs in docs/governance/, dev docs in docs/dev/). Misplaced docs must be moved before commit |
 | R11 | chain anchor via trailer (trailer-priority) | Every manual fix commit | MUST author the MF commit with a `Chain-Source-Stage:` git trailer (e.g. `Chain-Source-Stage: observer-hotfix`) so it is recognized as the latest chain anchor. `handle_version_check` in `agent/governance/server.py` now uses `chain_trailer.get_chain_state()` as the primary source of `chain_version` — the legacy `POST /api/version-update/{project_id}` write path is **deprecated** and the API returns `{"deprecated_write_ignored": true, "source": "git_trailer"}` (the DB `project_version.chain_version` row is no longer authoritative). Without a trailer on HEAD, `chain_trailer` walks first-parent back to the previous trailered commit and `HEAD != CHAIN_VERSION` blocks all dispatch through the version gate. Verify with `GET /api/version-check/{project_id}` returns `ok: true`, `dirty: false`, and `chain_version == HEAD`. Working reference: MF commit `0d4329d` (a trailered observer-hotfix that became the chain anchor). The deprecated `POST /api/version-sync` + `POST /api/version-update` flow MUST NOT be used as the primary mechanism — calling it is a no-op against chain state. |
 | R12 | Per-project chain history cache | Every manual fix commit | After commit, the per-project chain history cache at `agent/governance/chain_history/{project_id}.json` will be updated on next governance startup or bootstrap. Manual fixes that add commits without trailers will be detected as `legacy_inferred` entries in the cache. No manual action needed — the cache updates incrementally. |
+| R13 | Graph-first reuse check | Every AI-authored manual fix or implementation task | MUST inspect the active graph or graph snapshot for target files, nearby modules, existing nodes, and reusable subsystems before creating new modules or abstractions. The execution record must list reused graph nodes/modules or state that the graph was unavailable and why. |
+
+---
+
+### R13 Graph-First Reuse Checklist
+
+Before editing code, the agent must use the graph as the first map of the system:
+
+1. Query or inspect the active graph for target files and nearby modules.
+2. Identify existing L7 implementation nodes, L3/L2 parent areas, and relevant L4 assets/contracts.
+3. Check whether an existing module already implements the needed abstraction.
+4. Reuse or extend the existing module when it fits the request.
+5. Only create a new module after recording why no existing node/module is a good owner.
+
+This rule exists because the graph can reveal reusable work that text search alone may miss. If the graph says a subsystem already exists, the default action is to inspect and reuse it, not rebuild it.
 
 ---
 
