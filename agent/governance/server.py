@@ -3117,6 +3117,110 @@ def handle_graph_governance_snapshot_feedback_list(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback")
+def handle_graph_governance_snapshot_feedback_submit(ctx: RequestContext):
+    """Submit dashboard/operator feedback into the same lanes used by AI review."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    feedback_kind = str(body.get("feedback_kind") or body.get("kind") or "").strip()
+    issue = body.get("issue") if isinstance(body.get("issue"), dict) else {}
+    if not issue:
+        source_node_ids = body.get("source_node_ids") or body.get("node_ids") or body.get("node_id") or []
+        issue = {
+            "feedback_id": body.get("feedback_id") or body.get("id") or "",
+            "source_node_ids": source_node_ids,
+            "type": body.get("issue_type") or body.get("type") or feedback_kind,
+            "reason": body.get("reason") or body.get("rationale") or "dashboard feedback",
+            "summary": body.get("issue") or body.get("summary") or body.get("text") or "",
+            "target": body.get("target_id") or body.get("target") or "",
+            "target_type": body.get("target_type") or "",
+            "paths": body.get("paths") or body.get("target_files") or body.get("path") or [],
+            "priority": body.get("priority") or "",
+            "confidence": body.get("confidence"),
+            "requires_human_signoff": body.get("requires_human_signoff"),
+        }
+    if not feedback_kind:
+        feedback_kind = str(issue.get("feedback_kind") or issue.get("kind") or "")
+    if not feedback_kind:
+        raise ValidationError("feedback_kind is required for dashboard feedback")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.submit")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        try:
+            result = reconcile_feedback.submit_feedback_item(
+                project_id,
+                snapshot_id,
+                feedback_kind=feedback_kind,
+                issue=issue,
+                actor=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                source_round=str(body.get("source_round") or body.get("feedback_round") or "user"),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        item = dict((result.get("items") or [{}])[0])
+        graph_event = None
+        should_create_graph_event = bool(
+            body.get("create_graph_event")
+            or item.get("feedback_kind") == reconcile_feedback.KIND_GRAPH_CORRECTION
+        )
+        if should_create_graph_event:
+            target_type = str(item.get("target_type") or body.get("target_type") or "node")
+            target_id = str(item.get("target_id") or body.get("target_id") or "")
+            graph_event = graph_events.create_event(
+                conn,
+                project_id,
+                snapshot_id,
+                event_type="graph_correction_proposed",
+                event_kind="user_feedback",
+                target_type=target_type,
+                target_id=target_id,
+                status="proposed",
+                risk_level=str(body.get("risk_level") or "medium"),
+                confidence=float(item.get("confidence") or 0.0),
+                payload={
+                    "feedback_id": item.get("feedback_id", ""),
+                    "feedback": item,
+                    "suggested_action": item.get("suggested_action", ""),
+                },
+                evidence={"source": "dashboard_feedback_submit"},
+                created_by=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+            )
+        try:
+            audit_service.record(
+                conn,
+                project_id,
+                "reconcile_feedback_submitted",
+                actor=str(body.get("actor") or "dashboard_user"),
+                details=json.dumps({
+                    "snapshot_id": snapshot_id,
+                    "feedback_id": item.get("feedback_id", ""),
+                    "feedback_kind": item.get("feedback_kind", ""),
+                    "graph_event_id": (graph_event or {}).get("event_id", ""),
+                }, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception:
+            pass
+        conn.commit()
+        return 201, {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "feedback": item,
+            "event": graph_event,
+            "summary": reconcile_feedback.feedback_summary(project_id, snapshot_id),
+            "action_catalog": reconcile_feedback.feedback_action_catalog(),
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/queue")
 def handle_graph_governance_snapshot_feedback_queue(ctx: RequestContext):
     """Return grouped, dashboard-safe reconcile feedback review lanes."""
@@ -3901,6 +4005,23 @@ def handle_graph_governance_snapshot_feedback_file_backlog(ctx: RequestContext):
             _raise_graph_api_validation(exc)
         bug_id = backlog["bug_id"]
         payload = backlog["payload"]
+        overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else {}
+        for key in (
+            "title",
+            "status",
+            "priority",
+            "details_md",
+            "target_files",
+            "test_files",
+            "acceptance_criteria",
+            "chain_trigger_json",
+            "required_docs",
+            "provenance_paths",
+        ):
+            if key in body:
+                payload[key] = body[key]
+            if key in overrides:
+                payload[key] = overrides[key]
         now = _utc_now()
         conn.execute(
             """INSERT INTO backlog_bugs

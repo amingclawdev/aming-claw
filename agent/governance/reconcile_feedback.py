@@ -71,6 +71,44 @@ REVIEW_DECISIONS = {
 
 ReviewerAiCall = Callable[[str, dict[str, Any]], dict[str, Any]]
 
+
+def feedback_action_catalog() -> dict[str, Any]:
+    return {
+        "lanes": {
+            "review_required": {
+                "label": "Review required",
+                "primary_actions": ["review", "decision"],
+            },
+            "candidate_backlog": {
+                "label": "Candidate backlog",
+                "primary_actions": ["review", "file_backlog", "decision"],
+            },
+            "graph_patch_candidate": {
+                "label": "Graph patch candidate",
+                "primary_actions": ["review", "accept_graph_correction", "graph_patches", "decision"],
+            },
+            "status_only": {
+                "label": "Status observation",
+                "primary_actions": ["keep_status_observation", "file_backlog", "reject_false_positive"],
+            },
+            "resolved": {
+                "label": "Resolved",
+                "primary_actions": [],
+            },
+        },
+        "decision_actions": sorted(FEEDBACK_DECISION_ACTIONS),
+        "review_decisions": sorted(REVIEW_DECISIONS),
+        "status_observation_categories": sorted(STATUS_OBSERVATION_CATEGORIES),
+        "endpoints": {
+            "submit_feedback": "POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback",
+            "queue": "GET /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/queue",
+            "review": "POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/review",
+            "decision": "POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/decision",
+            "graph_patches": "POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/graph-patches",
+            "file_backlog": "POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/file-backlog",
+        },
+    }
+
 MAX_READ_EXCERPT_LINES = 200
 MAX_GREP_PATTERN_CHARS = 200
 MAX_GREP_FILE_BYTES = 2_000_000
@@ -1052,6 +1090,8 @@ def build_feedback_review_queue(
         },
         "groups": grouped,
         "count": len(grouped),
+        "group_count": len(grouped),
+        "action_catalog": feedback_action_catalog(),
     }
 
 
@@ -1548,6 +1588,42 @@ def normalize_open_issue(
     }
     normalized["feedback_fingerprint"] = _feedback_fingerprint(normalized)
     return normalized
+
+
+def submit_feedback_item(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    feedback_kind: str,
+    issue: dict[str, Any],
+    actor: str = "dashboard_user",
+    source_round: str | int = "user",
+) -> dict[str, Any]:
+    """Create one dashboard/operator feedback item using the review-lane vocabulary."""
+    kind = str(feedback_kind or "").strip() or classify_open_issue(issue)
+    if kind not in REVIEW_DECISIONS and kind != KIND_NEEDS_OBSERVER_DECISION:
+        raise ValueError(f"invalid feedback_kind: {feedback_kind}")
+    item = normalize_open_issue(
+        issue,
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        source_round=source_round,
+        created_by=actor,
+        feedback_kind=kind,
+    )
+    if issue.get("priority"):
+        item["priority"] = str(issue.get("priority") or item.get("priority") or "P2").upper()
+    if issue.get("confidence") is not None:
+        item["confidence"] = float(issue.get("confidence") or 0.0)
+    if issue.get("requires_human_signoff") is not None:
+        item["requires_human_signoff"] = bool(issue.get("requires_human_signoff"))
+    return _upsert_items(
+        project_id,
+        snapshot_id,
+        [item],
+        event_type="feedback.user_submitted",
+        actor=actor,
+    )
 
 
 def _upsert_items(
@@ -2763,6 +2839,8 @@ __all__ = [
     "STATUS_CATEGORY_ORPHAN_REVIEW",
     "STATUS_CATEGORY_FALSE_POSITIVE",
     "STATUS_CATEGORY_NEEDS_HUMAN",
+    "feedback_action_catalog",
+    "submit_feedback_item",
     "classify_open_issue",
     "classify_semantic_open_issues",
     "classify_semantic_state_rounds",

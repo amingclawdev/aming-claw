@@ -1562,6 +1562,112 @@ def test_graph_governance_status_observation_requires_explicit_backlog_action(co
     assert trigger["feedback_kind"] == "status_observation"
 
 
+def test_graph_governance_feedback_submit_creates_queue_item_and_graph_event(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-feedback-submit-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    status, submitted = server.handle_graph_governance_snapshot_feedback_submit(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "active"},
+            method="POST",
+            body={
+                "feedback_kind": "graph_correction",
+                "source_node_ids": ["L7.1"],
+                "target_type": "edge",
+                "target_id": "L7.1->L3.1:contains",
+                "issue_type": "add_relation",
+                "summary": "User thinks this edge needs semantic review.",
+                "actor": "dashboard-user",
+            },
+        )
+    )
+
+    assert status == 201
+    assert submitted["feedback"]["feedback_kind"] == "graph_correction"
+    assert submitted["event"]["event_type"] == "graph_correction_proposed"
+    assert submitted["event"]["payload"]["feedback_id"] == submitted["feedback"]["feedback_id"]
+
+    queue = server.handle_graph_governance_snapshot_feedback_queue(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "active"},
+            query={"lane": "graph_patch_candidate"},
+        )
+    )
+    assert queue["group_count"] == 1
+    assert queue["action_catalog"]["lanes"]["graph_patch_candidate"]["primary_actions"]
+
+
+def test_graph_governance_feedback_file_backlog_allows_dashboard_overrides(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-feedback-backlog-override",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    conn.commit()
+    submitted_status, submitted = server.handle_graph_governance_snapshot_feedback_submit(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "feedback_kind": "project_improvement",
+                "source_node_ids": ["L7.1"],
+                "summary": "User wants a targeted test coverage backlog.",
+                "paths": ["agent/governance/server.py"],
+                "actor": "dashboard-user",
+            },
+        )
+    )
+    assert submitted_status == 201
+
+    filed = server.handle_graph_governance_snapshot_feedback_file_backlog(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "feedback_id": submitted["feedback"]["feedback_id"],
+                "bug_id": "OPT-FEEDBACK-OVERRIDE",
+                "overrides": {
+                    "title": "Dashboard edited backlog title",
+                    "priority": "P1",
+                    "target_files": ["agent/governance/server.py"],
+                    "acceptance_criteria": ["Dashboard override is persisted."],
+                },
+            },
+        )
+    )
+
+    assert filed["bug_id"] == "OPT-FEEDBACK-OVERRIDE"
+    row = conn.execute(
+        "SELECT title, priority, target_files, acceptance_criteria FROM backlog_bugs WHERE bug_id=?",
+        ("OPT-FEEDBACK-OVERRIDE",),
+    ).fetchone()
+    assert row["title"] == "Dashboard edited backlog title"
+    assert row["priority"] == "P1"
+    assert json.loads(row["target_files"]) == ["agent/governance/server.py"]
+    assert json.loads(row["acceptance_criteria"]) == ["Dashboard override is persisted."]
+
+
 def test_graph_governance_feedback_review_use_reviewer_ai_enables_ai(conn, tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir(parents=True, exist_ok=True)
