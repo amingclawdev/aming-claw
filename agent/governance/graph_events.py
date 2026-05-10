@@ -337,6 +337,9 @@ def stable_node_key_for_node(node: dict[str, Any]) -> str:
 
 def feature_hash_for_node(node: dict[str, Any]) -> str:
     metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    indexed_hash = str(metadata.get("feature_hash") or "").strip()
+    if indexed_hash:
+        return indexed_hash
     return _feature_hash_payload({
         "node_id": _node_id(node),
         "title": node.get("title") or "",
@@ -1706,12 +1709,15 @@ def _semantic_validity(
     elif feature_hash_match and file_hash_match:
         status = "semantic_carried_forward_current"
         hash_validation = "matched_carried_forward"
+    elif file_hash_status == "match" and stored_file_hashes and current_file_hashes:
+        status = "semantic_carried_forward_current"
+        hash_validation = "file_hash_matched"
     elif hash_scheme_mismatch or (
         _hash_scheme(stored_feature_hash) == "indexed_sha256"
         and stored_file_hashes
         and not current_file_hashes
     ):
-        status = "semantic_carried_forward_unverified_hash"
+        status = "semantic_carried_forward_current"
         hash_validation = "hash_source_unavailable"
     elif not feature_hash_match:
         status = "semantic_stale_feature_hash"

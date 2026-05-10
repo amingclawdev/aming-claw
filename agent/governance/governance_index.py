@@ -178,6 +178,57 @@ def _nodes_from_candidate_graph(candidate_graph: dict[str, Any] | None) -> list[
     return [dict(node) for node in nodes if isinstance(node, dict)]
 
 
+def merge_feature_hashes_into_graph_nodes(
+    graph_json: dict[str, Any],
+    governance_index: dict[str, Any],
+) -> dict[str, int]:
+    """Copy indexed feature/file hashes into graph node metadata in-place."""
+    if not isinstance(graph_json, dict):
+        return {"features": 0, "nodes_updated": 0, "nodes_missing": 0}
+    feature_index = governance_index.get("feature_index") if isinstance(governance_index.get("feature_index"), dict) else governance_index
+    features = feature_index.get("features") if isinstance(feature_index, dict) else []
+    by_id = {
+        str(feature.get("node_id") or ""): feature
+        for feature in features or []
+        if isinstance(feature, dict) and str(feature.get("node_id") or "")
+    }
+    deps = graph_json.get("deps_graph")
+    if isinstance(deps, dict) and isinstance(deps.get("nodes"), list):
+        nodes = [node for node in deps.get("nodes") or [] if isinstance(node, dict)]
+    else:
+        nodes = []
+    updated = 0
+    missing = 0
+    for node in nodes:
+        node_id = str(node.get("id") or node.get("node_id") or "")
+        feature = by_id.get(node_id)
+        if not feature:
+            missing += 1
+            continue
+        feature_hash = str(feature.get("feature_hash") or "")
+        file_hashes = feature.get("file_hashes") if isinstance(feature.get("file_hashes"), dict) else {}
+        if not feature_hash and not file_hashes:
+            missing += 1
+            continue
+        metadata = dict(node.get("metadata") or {}) if isinstance(node.get("metadata"), dict) else {}
+        if feature_hash:
+            metadata["feature_hash"] = feature_hash
+            metadata["hash_scheme"] = "indexed_sha256"
+        if file_hashes:
+            metadata["file_hashes"] = {
+                str(path): str(value)
+                for path, value in file_hashes.items()
+                if str(path)
+            }
+        node["metadata"] = metadata
+        updated += 1
+    return {
+        "features": len(by_id),
+        "nodes_updated": updated,
+        "nodes_missing": missing,
+    }
+
+
 def _path_list(node: dict[str, Any], *keys: str) -> list[str]:
     values: list[str] = []
     for key in keys:
@@ -581,5 +632,6 @@ __all__ = [
     "governance_index_artifact_dir",
     "load_active_snapshot_nodes",
     "load_snapshot_nodes_for_inventory",
+    "merge_feature_hashes_into_graph_nodes",
     "persist_governance_index",
 ]

@@ -15,6 +15,7 @@ from agent.governance import reconcile_semantic_enrichment as semantic_enrichmen
 from agent.governance import server
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import ValidationError
+from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 
 
 PID = "graph-api-test"
@@ -786,7 +787,7 @@ def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware
     assert changed_projected["health"]["semantic_stale_count"] == 1
 
 
-def test_graph_governance_semantic_projection_scores_unverified_hash_as_review_debt(conn, monkeypatch):
+def test_graph_governance_semantic_projection_treats_hash_source_gap_as_internal(conn, monkeypatch):
     monkeypatch.setattr(
         server,
         "_require_graph_governance_operator",
@@ -859,13 +860,16 @@ def test_graph_governance_semantic_projection_scores_unverified_hash_as_review_d
     )
 
     health = projected["health"]
-    assert health["semantic_unverified_hash_count"] == 1
-    assert health["semantic_review_debt_count"] == 1
-    assert health["semantic_trusted_ratio"] == 0.0
-    assert health["semantic_debt_penalty"] == 35.0
-    assert health["project_health_score"] < 70
+    assert health["semantic_unverified_hash_count"] == 0
+    assert health["semantic_review_debt_count"] == 0
+    assert health["semantic_trusted_ratio"] == 1.0
+    assert health["semantic_debt_penalty"] == 0.0
+    assert health["project_health_score"] > 90
     assert projected["projection"]["node_semantics"]["L7.1"]["validity"]["status"] == (
-        "semantic_carried_forward_unverified_hash"
+        "semantic_carried_forward_current"
+    )
+    assert projected["projection"]["node_semantics"]["L7.1"]["validity"]["hash_validation"] == (
+        "hash_source_unavailable"
     )
 
 
@@ -3317,3 +3321,224 @@ def test_graph_governance_backfill_input_errors_are_validation_errors(conn, tmp_
             )
         )
     assert "target_commit_sha must equal HEAD" in str(exc.value)
+
+
+def test_semantic_projection_uses_indexed_hash_metadata(conn):
+    graph = _graph("L7.1")
+    merge = merge_feature_hashes_into_graph_nodes(
+        graph,
+        {
+            "feature_index": {
+                "features": [
+                    {
+                        "node_id": "L7.1",
+                        "feature_hash": "sha256:indexed-feature",
+                        "file_hashes": {"agent/governance/server.py": "sha256:file-a"},
+                    }
+                ]
+            }
+        },
+    )
+    assert merge["nodes_updated"] == 1
+    node = graph["deps_graph"]["nodes"][0]
+    assert node["metadata"]["feature_hash"] == "sha256:indexed-feature"
+    assert node["metadata"]["hash_scheme"] == "indexed_sha256"
+
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-hash-current",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_type="semantic_node_enriched",
+        event_kind="semantic",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        baseline_commit="old",
+        target_commit="old",
+        stable_node_key=graph_events.stable_node_key_for_node(node),
+        feature_hash="sha256:old-indexed-feature",
+        file_hashes={"agent/governance/server.py": "sha256:file-a"},
+        payload={"semantic_payload": {"summary": "ok", "open_issues": []}},
+        created_by="test",
+    )
+    conn.commit()
+
+    projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        actor="test",
+        backfill_existing=False,
+    )
+    health = projection["health"]
+    assert health["semantic_current_count"] == 1
+    assert health["semantic_unverified_hash_count"] == 0
+    validity = projection["projection"]["node_semantics"]["L7.1"]["validity"]
+    assert validity["status"] == "semantic_carried_forward_current"
+    assert validity["current_hash_scheme"] == "indexed_sha256"
+    assert validity["feature_hash_match"] is False
+    assert validity["hash_validation"] == "file_hash_matched"
+
+
+def test_operations_queue_unifies_jobs_and_edge_not_queued(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="ops-active",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        actor="test",
+        backfill_existing=False,
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, feature_hash,
+           file_hashes_json, updated_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            PID,
+            snapshot["snapshot_id"],
+            "L7.1",
+            "ai_pending",
+            "sha256:indexed-feature",
+            json.dumps({"agent/governance/server.py": "sha256:file-a"}),
+            "2026-05-10T00:00:00Z",
+            "2026-05-10T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    queue = server.handle_graph_governance_operations_queue(
+        _ctx({"project_id": PID}, query={"require_current_semantic": "true"})
+    )
+
+    assert queue["ok"] is True
+    assert queue["snapshot_id"] == "ops-active"
+    assert queue["summary"]["node_semantic_jobs"]["by_status"] == {"ai_pending": 1}
+    assert queue["summary"]["feedback_queue"]["visible_item_count"] == 0
+    operations = {row["operation_id"]: row for row in queue["operations"]}
+    assert operations["node-semantic:L7.1"]["status"] == "ai_pending"
+    edge_row = operations["edge-semantic:not-queued"]
+    assert edge_row["status"] == "not_queued"
+    assert edge_row["progress"] == {"done": 0, "total": 1}
+    assert "1 edge semantics missing, 0 queued" == edge_row["last_result"]
+
+
+def test_operations_queue_includes_pending_scope_reconcile(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-active",
+        commit_sha="old",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+    )
+    conn.commit()
+
+    queue = server.handle_graph_governance_operations_queue(_ctx({"project_id": PID}))
+
+    assert queue["summary"]["pending_scope_reconcile_count"] == 1
+    assert queue["summary"]["by_type"]["scope_reconcile"] == 1
+    row = next(item for item in queue["operations"] if item["operation_type"] == "scope_reconcile")
+    assert row["target_id"] == "head"
+    assert row["status"] == "queued"
+
+
+def test_operations_queue_synthesizes_stale_scope_reconcile(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: "head-commit")
+    monkeypatch.setattr(
+        server,
+        "_git_changed_paths_between",
+        lambda _root, _base, _head, limit=25: ["docs/governance/manual-fix-sop.md"],
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-stale-active",
+        commit_sha="old-commit",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    queue = server.handle_graph_governance_operations_queue(_ctx({"project_id": PID}))
+
+    row = next(item for item in queue["operations"] if item["operation_id"] == "scope-reconcile:stale:head-commit")
+    assert row["operation_type"] == "scope_reconcile"
+    assert row["status"] == "not_queued"
+    assert row["target_id"] == "head-commit"
+    assert row["active_graph_commit"] == "old-commit"
+    assert row["changed_files"] == ["docs/governance/manual-fix-sop.md"]
+    assert queue["summary"]["graph_stale"]["is_stale"] is True
+    assert queue["summary"]["graph_stale"]["changed_file_count"] == 1

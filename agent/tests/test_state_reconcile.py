@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import graph_events
+from agent.governance import state_reconcile
 from agent.governance import graph_snapshot_store as store
 from agent.governance.db import _ensure_schema
 from agent.governance.state_reconcile import (
@@ -377,6 +378,79 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
     assert events[0]["payload"]["files"] == ["agent/service.py"]
 
 
+def test_scope_graph_events_emit_secondary_doc_hash_changes(conn):
+    doc_path = "docs/governance/manual-fix-sop.md"
+    old_graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.1",
+                    "layer": "L7",
+                    "title": "Feature Node",
+                    "primary": ["agent/service.py"],
+                    "secondary": [doc_path],
+                    "metadata": {
+                        "stable_node_key": "feature-node",
+                        "feature_hash": "sha256:old-feature",
+                        "file_hashes": {
+                            "agent/service.py": "sha256:service",
+                            doc_path: "sha256:old-doc",
+                        },
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    new_graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.1",
+                    "layer": "L7",
+                    "title": "Feature Node",
+                    "primary": ["agent/service.py"],
+                    "secondary": [doc_path],
+                    "metadata": {
+                        "stable_node_key": "feature-node",
+                        "feature_hash": "sha256:new-feature",
+                        "file_hashes": {
+                            "agent/service.py": "sha256:service",
+                            doc_path: "sha256:new-doc",
+                        },
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+
+    summary = state_reconcile._emit_scope_graph_events(
+        conn,
+        PID,
+        old_snapshot_id="old-doc-snapshot",
+        new_snapshot_id="new-doc-snapshot",
+        old_graph_json=old_graph,
+        new_graph_json=new_graph,
+        scope_file_delta={"hash_changed_files": [doc_path]},
+        baseline_commit="old",
+        target_commit="head",
+        created_by="test",
+    )
+
+    assert summary["by_type"]["file_hash_changed"] == 1
+    events = graph_events.list_events(
+        conn,
+        PID,
+        "new-doc-snapshot",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["file_hash_changed"],
+    )
+    assert len(events) == 1
+    assert events[0]["payload"] == {"node_id": "L7.1", "files": [doc_path], "file_role": "secondary"}
+    assert events[0]["file_hashes"] == {doc_path: "sha256:new-doc"}
+
+
 def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, tmp_path):
     project = tmp_path / "project"
     _write_project(project)
@@ -441,7 +515,17 @@ def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, t
     assert selector["match_mode"] == "primary"
     assert result["semantic_enrichment"]["ai_selected_count"] == 0
     assert seen_nodes == []
-    assert result["scope_graph_events"]["event_count"] == 0
+    assert result["scope_graph_events"]["by_type"]["file_hash_changed"] == 1
+    events = graph_events.list_events(
+        conn,
+        PID,
+        "scope-test-only-delta",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["file_hash_changed"],
+    )
+    assert len(events) == 1
+    assert events[0]["payload"]["files"] == ["agent/tests/test_service.py"]
+    assert events[0]["payload"]["file_role"] == "test"
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(

@@ -25,14 +25,17 @@ from agent.governance.graph_snapshot_store import (
     ensure_schema as ensure_graph_snapshot_schema,
     finalize_graph_snapshot,
     get_active_graph_snapshot,
+    get_graph_snapshot,
     graph_payload_edges,
     graph_payload_stats,
     index_graph_snapshot,
     list_graph_snapshot_files,
     list_pending_scope_reconcile,
+    snapshot_companion_dir,
     snapshot_graph_path,
     snapshot_id_for,
     waive_pending_scope_reconcile,
+    write_companion_files,
 )
 from agent.governance.graph_correction_patches import (
     annotate_graph_node_roles,
@@ -44,7 +47,11 @@ from agent.governance.graph_correction_patches import (
     record_patch_apply_report,
 )
 from agent.governance.db import sqlite_write_lock
-from agent.governance.governance_index import build_governance_index, persist_governance_index
+from agent.governance.governance_index import (
+    build_governance_index,
+    merge_feature_hashes_into_graph_nodes,
+    persist_governance_index,
+)
 from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
 from agent.governance.reconcile_trace import ReconcileTrace, artifact_ref
 from agent.governance.reconcile_file_inventory import (
@@ -231,6 +238,107 @@ def _read_snapshot_graph(project_id: str, snapshot_id: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _read_snapshot_companion(project_id: str, snapshot_id: str, filename: str, default: Any) -> Any:
+    try:
+        payload = json.loads((snapshot_companion_dir(project_id, snapshot_id) / filename).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    return payload
+
+
+def repair_snapshot_feature_hash_metadata(
+    conn: sqlite3.Connection,
+    project_id: str,
+    project_root: str | Path,
+    *,
+    snapshot_id: str = "",
+    actor: str = "observer",
+) -> dict[str, Any]:
+    """Backfill indexed feature/file hashes into an existing snapshot and node index."""
+    ensure_graph_snapshot_schema(conn)
+    snapshot = (
+        get_graph_snapshot(conn, project_id, snapshot_id)
+        if snapshot_id
+        else get_active_graph_snapshot(conn, project_id)
+    )
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found for project {project_id}: {snapshot_id or 'active'}")
+    sid = str(snapshot.get("snapshot_id") or "")
+    graph_json = _read_snapshot_graph(project_id, sid)
+    if not graph_json:
+        raise ValueError(f"snapshot graph companion is empty or unreadable: {project_id}/{sid}")
+    file_inventory = _read_snapshot_companion(project_id, sid, "file_inventory.json", [])
+    if not isinstance(file_inventory, list):
+        file_inventory = []
+    drift_ledger = _read_snapshot_companion(project_id, sid, "drift_ledger.json", [])
+    if not isinstance(drift_ledger, list):
+        drift_ledger = []
+    governance_index = build_governance_index(
+        conn,
+        project_id,
+        project_root,
+        run_id=f"hash-repair-{_short_commit(str(snapshot.get('commit_sha') or ''))}",
+        commit_sha=str(snapshot.get("commit_sha") or ""),
+        candidate_graph=graph_json,
+        snapshot_id=sid,
+        snapshot_kind=str(snapshot.get("snapshot_kind") or ""),
+        file_inventory=file_inventory,
+    )
+    merge_summary = merge_feature_hashes_into_graph_nodes(graph_json, governance_index)
+    artifacts = write_companion_files(
+        project_id,
+        sid,
+        graph_json=graph_json,
+        file_inventory=file_inventory,
+        drift_ledger=drift_ledger,
+    )
+    index_counts = index_graph_snapshot(
+        conn,
+        project_id,
+        sid,
+        nodes=_deps_graph_nodes(graph_json),
+        edges=_deps_graph_edges(graph_json),
+    )
+    try:
+        notes = json.loads(str(snapshot.get("notes") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        notes = {}
+    if not isinstance(notes, dict):
+        notes = {}
+    notes["feature_hash_metadata_repair"] = {
+        "actor": actor,
+        "merge_summary": merge_summary,
+        "index_counts": index_counts,
+        "artifacts": {
+            "graph_sha256": artifacts.get("graph_sha256", ""),
+            "inventory_sha256": artifacts.get("inventory_sha256", ""),
+            "drift_sha256": artifacts.get("drift_sha256", ""),
+        },
+    }
+    conn.execute(
+        """
+        UPDATE graph_snapshots
+        SET graph_sha256 = ?, inventory_sha256 = ?, drift_sha256 = ?, notes = ?
+        WHERE project_id = ? AND snapshot_id = ?
+        """,
+        (
+            artifacts.get("graph_sha256", ""),
+            artifacts.get("inventory_sha256", ""),
+            artifacts.get("drift_sha256", ""),
+            json.dumps(notes, ensure_ascii=False, sort_keys=True),
+            project_id,
+            sid,
+        ),
+    )
+    return {
+        "snapshot_id": sid,
+        "commit_sha": snapshot.get("commit_sha", ""),
+        "merge_summary": merge_summary,
+        "index_counts": index_counts,
+        "artifacts": artifacts,
+    }
+
+
 def _graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
     deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
     if isinstance(deps, dict) and isinstance(deps.get("nodes"), list):
@@ -283,6 +391,18 @@ def _path_values(node: dict[str, Any], key: str) -> list[str]:
                 seen.add(path)
                 out.append(path)
     return out
+
+
+def _node_file_hashes(node: dict[str, Any]) -> dict[str, str]:
+    metadata = _node_metadata(node)
+    raw = metadata.get("file_hashes")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(path or "").replace("\\", "/").strip("/"): str(value or "")
+        for path, value in raw.items()
+        if str(path or "").strip()
+    }
 
 
 def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -421,19 +541,28 @@ def _emit_scope_graph_events(
                 node_id,
                 {"node_id": node_id, "old_parent": old_parent, "new_parent": new_parent},
             )
-        primary_changed = sorted(set(_path_values(new_node, "primary")).intersection(changed_files))
-        if primary_changed:
-            metadata = _node_metadata(new_node)
+        metadata = _node_metadata(new_node)
+        current_file_hashes = _node_file_hashes(new_node)
+        for file_role in ("primary", "secondary", "test", "config"):
+            role_changed = sorted(set(_path_values(new_node, file_role)).intersection(changed_files))
+            if not role_changed:
+                continue
+            event_file_hashes = {
+                path: current_file_hashes[path]
+                for path in role_changed
+                if path in current_file_hashes
+            }
             emit(
                 "file_hash_changed",
                 "node",
                 node_id,
-                {"node_id": node_id, "files": primary_changed, "file_role": "primary"},
+                {"node_id": node_id, "files": role_changed, "file_role": file_role},
                 stable_node_key=str(metadata.get("stable_node_key") or ""),
                 feature_hash=str(metadata.get("feature_hash") or ""),
+                file_hashes=event_file_hashes,
             )
         old_meta = _node_metadata(old_node)
-        new_meta = _node_metadata(new_node)
+        new_meta = metadata
         if new_meta.get("exclude_as_feature") is True and old_meta.get("exclude_as_feature") is not True:
             emit(
                 "package_marker_excluded",
@@ -774,6 +903,8 @@ def run_state_only_full_reconcile(
         snapshot_kind=snapshot_kind,
         file_inventory=file_inventory,
     )
+    hash_metadata_merge = merge_feature_hashes_into_graph_nodes(candidate_graph, governance_index)
+    notes["governance_index_hash_metadata"] = hash_metadata_merge
     with sqlite_write_lock():
         snapshot = create_graph_snapshot(
             conn,
@@ -858,6 +989,7 @@ def run_state_only_full_reconcile(
         output_payload={
             "summary": governance_index_summary,
             "artifacts": governance_index_summary.get("artifacts") or {},
+            "hash_metadata_merge": hash_metadata_merge,
         },
     )
     semantic_enrichment: dict[str, Any] = {}
@@ -1405,6 +1537,7 @@ def run_backfill_escape_hatch(
 
 
 __all__ = [
+    "repair_snapshot_feature_hash_metadata",
     "run_backfill_escape_hatch",
     "run_pending_scope_reconcile_candidate",
     "run_state_only_full_reconcile",

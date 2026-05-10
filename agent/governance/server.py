@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
+from typing import Any
 
 _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
@@ -2192,6 +2193,352 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
         }
     finally:
         conn.close()
+
+
+def _normalize_operation_status(status: str) -> str:
+    value = str(status or "").strip()
+    if value in {"pending_ai", "ai_pending"}:
+        return "ai_pending"
+    if value in {"running", "claimed", "ai_reviewing"}:
+        return "running"
+    if value in {"ai_complete", "complete", "succeeded", "reviewed", "materialized"}:
+        return "complete"
+    if value in {"ai_error", "failed", "error"}:
+        return "failed"
+    if value in {"cancelled", "canceled", "rejected"}:
+        return "cancelled"
+    if value in {"blocked", "not_queued", "queued"}:
+        return value
+    return value or "queued"
+
+
+def _operation_unit_progress(status: str) -> dict[str, int]:
+    normalized = _normalize_operation_status(status)
+    return {"done": 1 if normalized in {"complete", "cancelled", "failed"} else 0, "total": 1}
+
+
+def _git_head_commit(project_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=project_root,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_changed_paths_between(project_root: Path, base_commit: str, target_commit: str, *, limit: int = 25) -> list[str]:
+    base_commit = str(base_commit or "").strip()
+    target_commit = str(target_commit or "").strip()
+    if not base_commit or not target_commit:
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_commit}..{target_commit}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=project_root,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    paths = [line.strip().replace("\\", "/") for line in result.stdout.splitlines() if line.strip()]
+    return paths[: max(0, int(limit or 25))]
+
+
+def _graph_stale_scope_operation(
+    project_id: str,
+    *,
+    status: dict[str, Any],
+    pending_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    stale_summary: dict[str, Any] = {
+        "is_stale": False,
+        "active_graph_commit": str(status.get("graph_snapshot_commit") or ""),
+        "head_commit": "",
+        "changed_files": [],
+    }
+    try:
+        root = _graph_governance_project_root(project_id, {})
+    except Exception:
+        return None, stale_summary
+    head_commit = _git_head_commit(root)
+    graph_commit = str(status.get("graph_snapshot_commit") or "")
+    stale_summary["head_commit"] = head_commit
+    if not head_commit or not graph_commit or head_commit == graph_commit:
+        return None, stale_summary
+    changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=25)
+    stale_summary.update({
+        "is_stale": True,
+        "changed_files": changed_files,
+        "changed_file_count": len(changed_files),
+    })
+    pending_for_head = any(
+        str(row.get("commit_sha") or row.get("target_commit") or "") == head_commit
+        for row in pending_rows
+        if _normalize_operation_status(str(row.get("status") or "")) in {"queued", "running", "failed"}
+    )
+    if pending_for_head:
+        return None, stale_summary
+    changed_hint = f"; {len(changed_files)} changed files since snapshot" if changed_files else ""
+    operation = {
+        "operation_id": f"scope-reconcile:stale:{head_commit[:12]}",
+        "operation_type": "scope_reconcile",
+        "target_scope": "snapshot",
+        "target_id": head_commit,
+        "target_label": head_commit[:12],
+        "status": "not_queued",
+        "progress": {"done": 0, "total": 1},
+        "created_at": "",
+        "updated_at": "",
+        "claimed_by": "",
+        "worker_id": "",
+        "lease_expires_at": "",
+        "last_error": "",
+        "last_result": f"active graph at {graph_commit[:12]}, HEAD at {head_commit[:12]}{changed_hint}",
+        "supported_actions": ["queue_scope_reconcile", "view_trace", "file_backlog"],
+        "active_graph_commit": graph_commit,
+        "head_commit": head_commit,
+        "changed_files": changed_files,
+    }
+    return operation, stale_summary
+
+
+@route("GET", "/api/graph-governance/{project_id}/operations/queue")
+def handle_graph_governance_operations_queue(ctx: RequestContext):
+    """Return a unified dashboard queue for active governance operations."""
+    project_id = ctx.get_project_id()
+    from . import graph_correction_patches
+    from . import graph_snapshot_store as store
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.operations.queue")
+        status = store.graph_governance_status(conn, project_id)
+        snapshot_id = str(ctx.query.get("snapshot_id") or status.get("active_snapshot_id") or "")
+        snapshot_summary: dict[str, Any] = {}
+        if snapshot_id:
+            snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+            snapshot_summary = store.summarize_graph_snapshot(conn, project_id, snapshot_id)
+        job_limit = _query_int(ctx.query, "job_limit", 200)
+        feedback_limit = _query_int(ctx.query, "feedback_limit", 100)
+        node_jobs = _semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit) if snapshot_id else []
+        edge_jobs = _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit) if snapshot_id else []
+        node_job_counts = _semantic_job_status_counts(conn, project_id, snapshot_id) if snapshot_id else {}
+        edge_job_counts = _edge_semantic_job_status_counts(conn, project_id, snapshot_id) if snapshot_id else {}
+        feedback_queue = (
+            reconcile_feedback.build_feedback_review_queue(
+                project_id,
+                snapshot_id,
+                include_status_observations=_query_bool(ctx.query, "include_status_observations", False),
+                include_resolved=_query_bool(ctx.query, "include_resolved", False),
+                include_claimed=True,
+                require_current_semantic=_query_bool(ctx.query, "require_current_semantic", False),
+                limit=feedback_limit,
+            )
+            if snapshot_id
+            else {"summary": {}, "groups": [], "count": 0, "group_count": 0}
+        )
+        patch_summary = graph_correction_patches.correction_patch_summary(conn, project_id)
+        operations: list[dict[str, Any]] = []
+        pending_scope_rows = list(status.get("pending_scope_reconcile") or [])
+        stale_operation, graph_stale_summary = _graph_stale_scope_operation(
+            project_id,
+            status=status,
+            pending_rows=pending_scope_rows,
+        )
+
+        for row in pending_scope_rows:
+            op_status = _normalize_operation_status(row.get("status", "queued"))
+            commit = str(row.get("commit_sha") or row.get("target_commit") or "")
+            operations.append({
+                "operation_id": f"scope-reconcile:{commit or len(operations)}",
+                "operation_type": "scope_reconcile",
+                "target_scope": "snapshot",
+                "target_id": commit,
+                "target_label": commit[:12],
+                "status": op_status,
+                "progress": _operation_unit_progress(op_status),
+                "created_at": row.get("queued_at", ""),
+                "updated_at": row.get("updated_at", row.get("started_at", "")),
+                "claimed_by": row.get("claimed_by", ""),
+                "worker_id": row.get("worker_id", ""),
+                "lease_expires_at": row.get("lease_expires_at", ""),
+                "last_error": row.get("last_error", ""),
+                "last_result": row.get("result_json", ""),
+                "supported_actions": ["cancel", "observer_takeover", "view_trace"],
+            })
+
+        if stale_operation:
+            operations.append(stale_operation)
+
+        for job in node_jobs:
+            op_status = _normalize_operation_status(job.get("status", ""))
+            operations.append({
+                "operation_id": f"node-semantic:{job.get('job_id') or job.get('node_id')}",
+                "operation_type": "node_semantic",
+                "target_scope": "node",
+                "target_id": job.get("node_id", ""),
+                "target_label": job.get("node_id", ""),
+                "status": op_status,
+                "progress": _operation_unit_progress(op_status),
+                "created_at": job.get("created_at", ""),
+                "updated_at": job.get("updated_at", ""),
+                "claimed_by": job.get("claimed_by", ""),
+                "worker_id": job.get("worker_id", ""),
+                "lease_expires_at": job.get("lease_expires_at", ""),
+                "last_error": job.get("last_error", ""),
+                "last_result": "",
+                "trace_id": job.get("claim_id", ""),
+                "supported_actions": ["retry", "cancel", "view_trace"],
+            })
+
+        for job in edge_jobs:
+            op_status = _normalize_operation_status(job.get("status", ""))
+            operations.append({
+                "operation_id": f"edge-semantic:{job.get('edge_id') or job.get('event_id')}",
+                "operation_type": "edge_semantic",
+                "target_scope": "edge",
+                "target_id": job.get("edge_id", ""),
+                "target_label": job.get("edge_id", ""),
+                "status": op_status,
+                "progress": _operation_unit_progress(op_status),
+                "created_at": job.get("created_at", ""),
+                "updated_at": job.get("updated_at", ""),
+                "claimed_by": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+                "last_error": "",
+                "last_result": job.get("event_type", ""),
+                "trace_id": job.get("event_id", ""),
+                "supported_actions": ["view_trace", "file_backlog"],
+            })
+
+        semantic_health = (
+            (snapshot_summary.get("health") or {}).get("semantic_health")
+            if isinstance(snapshot_summary.get("health"), dict)
+            else {}
+        ) or {}
+        edge_missing = int(semantic_health.get("edge_semantic_missing_count") or 0)
+        edge_eligible = int(semantic_health.get("edge_semantic_eligible_count") or 0)
+        edge_current = int(semantic_health.get("edge_semantic_current_count") or 0)
+        if snapshot_id and edge_missing > 0 and not edge_jobs:
+            operations.append({
+                "operation_id": "edge-semantic:not-queued",
+                "operation_type": "edge_semantic",
+                "target_scope": "edge",
+                "target_id": "*",
+                "target_label": "edge semantics",
+                "status": "not_queued",
+                "progress": {"done": edge_current, "total": edge_eligible},
+                "created_at": "",
+                "updated_at": "",
+                "claimed_by": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+                "last_error": "",
+                "last_result": f"{edge_missing} edge semantics missing, 0 queued",
+                "supported_actions": ["file_backlog"],
+            })
+
+        feedback_summary = feedback_queue.get("summary") if isinstance(feedback_queue.get("summary"), dict) else {}
+        feedback_count = int(
+            feedback_summary.get("visible_item_count")
+            or feedback_queue.get("count")
+            or feedback_queue.get("group_count")
+            or 0
+        )
+        if feedback_count:
+            operations.append({
+                "operation_id": "feedback-review:queue",
+                "operation_type": "feedback_review",
+                "target_scope": "snapshot",
+                "target_id": snapshot_id,
+                "target_label": "feedback queue",
+                "status": "queued",
+                "progress": {"done": 0, "total": feedback_count},
+                "created_at": "",
+                "updated_at": "",
+                "claimed_by": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+                "last_error": "",
+                "last_result": "",
+                "supported_actions": ["observer_takeover", "file_backlog", "view_trace"],
+            })
+
+        patch_total = int(patch_summary.get("proposed_count") or 0) + int(patch_summary.get("replayable_count") or 0)
+        if patch_total:
+            operations.append({
+                "operation_id": "graph-patch:queue",
+                "operation_type": "graph_patch_apply",
+                "target_scope": "project",
+                "target_id": project_id,
+                "target_label": "graph correction patches",
+                "status": "queued",
+                "progress": {"done": 0, "total": patch_total},
+                "created_at": "",
+                "updated_at": "",
+                "claimed_by": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+                "last_error": "",
+                "last_result": "",
+                "supported_actions": ["pause", "resume", "view_trace"],
+            })
+
+        operations.sort(key=lambda item: (str(item.get("updated_at") or item.get("created_at") or ""), str(item.get("operation_id") or "")), reverse=True)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "active_snapshot_id": status.get("active_snapshot_id", ""),
+            "count": len(operations),
+            "operations": operations,
+            "summary": {
+                "by_type": _count_by(operations, "operation_type"),
+                "by_status": _count_by(operations, "status"),
+                "pending_scope_reconcile_count": status.get("pending_scope_reconcile_count", 0),
+                "node_semantic_jobs": {
+                    "by_status": node_job_counts,
+                    "progress": _semantic_job_progress(node_job_counts),
+                },
+                "edge_semantic_jobs": {
+                    "by_status": edge_job_counts,
+                    "progress": _semantic_job_progress(edge_job_counts),
+                },
+                "semantic_denominators": {
+                    "node_current": semantic_health.get("semantic_current_count", 0),
+                    "node_unverified": semantic_health.get("semantic_unverified_hash_count", 0),
+                    "node_missing": semantic_health.get("semantic_missing_count", 0),
+                    "node_stale": semantic_health.get("semantic_stale_count", 0),
+                    "edge_eligible": semantic_health.get("edge_semantic_eligible_count", 0),
+                    "edge_current": semantic_health.get("edge_semantic_current_count", 0),
+                    "edge_requested": semantic_health.get("edge_semantic_requested_count", 0),
+                    "edge_missing": semantic_health.get("edge_semantic_missing_count", 0),
+                },
+                "feedback_queue": feedback_summary,
+                "graph_correction_patches": patch_summary,
+                "graph_stale": graph_stale_summary,
+            },
+        }
+    finally:
+        conn.close()
+
+
+def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or "")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _git_commit_subject(commit_sha: str) -> str:
