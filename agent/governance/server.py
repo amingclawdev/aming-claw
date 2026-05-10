@@ -2726,6 +2726,57 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/reconcile/scope/cancel")
+def handle_graph_governance_scope_reconcile_cancel(ctx: RequestContext):
+    """Soft-cancel pending scope reconcile rows by waiving the queued commit."""
+    project_id = ctx.get_project_id()
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    commit_sha = str(
+        body.get("commit_sha")
+        or body.get("target_commit_sha")
+        or body.get("commit")
+        or ""
+    ).strip()
+    operation_id = str(body.get("operation_id") or body.get("op_id") or "").strip()
+    if not commit_sha and operation_id.startswith("scope-reconcile:"):
+        commit_sha = operation_id.rsplit(":", 1)[-1].strip()
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    if not commit_sha:
+        raise ValidationError("commit_sha or operation_id is required")
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.scope.cancel")
+        with sqlite_write_lock():
+            result = store.waive_pending_scope_reconcile(
+                conn,
+                project_id,
+                commit_shas=[commit_sha],
+                snapshot_id=str(body.get("snapshot_id") or ""),
+                actor=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                reason=str(body.get("reason") or "dashboard_cancel"),
+                evidence={
+                    "source": "scope_reconcile_cancel_api",
+                    "operation_id": operation_id,
+                },
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "commit_sha": commit_sha,
+            "operation_id": operation_id,
+            "status": "cancelled" if int(result.get("waived_count") or 0) else "not_found",
+            "storage_status": "waived",
+            "cancelled_count": int(result.get("waived_count") or 0),
+            **result,
+        }
+    finally:
+        conn.close()
+
+
 def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -4780,6 +4831,76 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/cancel")
+def handle_graph_governance_snapshot_feedback_cancel(ctx: RequestContext):
+    """Soft-cancel feedback review rows by keeping them as status observations."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    from . import reconcile_feedback
+    from .errors import ValidationError
+
+    raw_ids = body.get("feedback_ids")
+    if raw_ids is None and body.get("feedback_id") is not None:
+        raw_ids = [body.get("feedback_id")]
+    if isinstance(raw_ids, str):
+        feedback_ids = [raw_ids]
+    elif isinstance(raw_ids, list):
+        feedback_ids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
+    elif raw_ids is None:
+        feedback_ids = []
+    else:
+        raise ValidationError("feedback_ids must be a string or list")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.feedback.cancel")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        if raw_ids is None:
+            terminal = {"reviewed", "accepted", "rejected", "backlog_filed"}
+            feedback_ids = [
+                str(item.get("feedback_id") or "")
+                for item in reconcile_feedback.list_feedback_items(
+                    project_id,
+                    snapshot_id,
+                    limit=int(body.get("limit") or 1000),
+                )
+                if str(item.get("status") or "") not in terminal
+            ]
+        if not feedback_ids:
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "status": "soft_cancelled",
+                "cancelled_count": 0,
+                "skipped_terminal": 0,
+                "items": [],
+                "summary": reconcile_feedback.feedback_summary(project_id, snapshot_id),
+            }
+        result = reconcile_feedback.decide_feedback_items(
+            project_id,
+            snapshot_id,
+            feedback_ids,
+            action="keep_status_observation",
+            actor=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+            rationale=str(body.get("rationale") or "Dashboard soft-cancelled feedback review."),
+            status_observation_category=str(body.get("status_observation_category") or ""),
+        )
+        return {
+            "ok": bool(result.get("ok")),
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "status": "soft_cancelled",
+            "cancelled_count": int(result.get("decided_count") or 0),
+            "skipped_terminal": 0,
+            "feedback_cancel_contract": "keep_status_observation",
+            **result,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/graph-patches")
 def handle_graph_governance_snapshot_feedback_graph_patches(ctx: RequestContext):
     """Promote feedback items into graph correction patch rows."""
@@ -5233,6 +5354,29 @@ def _semantic_edge_id(edge: dict) -> str:
     dst = str(edge.get("dst") or edge.get("target") or "").strip()
     edge_type = str(edge.get("edge_type") or edge.get("type") or "depends_on").strip() or "depends_on"
     return f"{src}->{dst}:{edge_type}" if src and dst else ""
+
+
+def _semantic_edge_id_variants(edge_id: str) -> list[str]:
+    """Return dashboard/API-compatible edge id spellings in canonical-first order."""
+    raw = str(edge_id or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    if "|" in raw:
+        parts = [part.strip() for part in raw.split("|")]
+        if len(parts) == 3 and all(parts):
+            variants.insert(0, f"{parts[0]}->{parts[1]}:{parts[2]}")
+    if "->" in raw and ":" in raw:
+        src, rest = raw.split("->", 1)
+        dst, edge_type = rest.rsplit(":", 1)
+        pipe = f"{src}|{dst}|{edge_type}"
+        if pipe not in variants:
+            variants.append(pipe)
+    deduped: list[str] = []
+    for value in variants:
+        if value and value not in deduped:
+            deduped.append(value)
+    return deduped
 
 
 def _semantic_jobs_edge_targets(
@@ -6033,22 +6177,25 @@ def _edge_semantic_event_row(conn, project_id: str, snapshot_id: str, job_id: st
     job_id = str(job_id or "").strip()
     if not job_id:
         return None
-    event = graph_events.get_event(conn, project_id, snapshot_id, job_id)
-    if event and event.get("target_type") == "edge" and event.get("event_type") in {
-        "edge_semantic_requested",
-        "edge_semantic_enriched",
-    }:
-        return event
-    events = graph_events.list_events(
-        conn,
-        project_id,
-        snapshot_id,
-        event_types=["edge_semantic_requested", "edge_semantic_enriched"],
-        target_type="edge",
-        target_id=job_id,
-        limit=1000,
-    )
-    return events[-1] if events else None
+    for candidate in _semantic_edge_id_variants(job_id):
+        event = graph_events.get_event(conn, project_id, snapshot_id, candidate)
+        if event and event.get("target_type") == "edge" and event.get("event_type") in {
+            "edge_semantic_requested",
+            "edge_semantic_enriched",
+        }:
+            return event
+        events = graph_events.list_events(
+            conn,
+            project_id,
+            snapshot_id,
+            event_types=["edge_semantic_requested", "edge_semantic_enriched"],
+            target_type="edge",
+            target_id=candidate,
+            limit=1000,
+        )
+        if events:
+            return events[-1]
+    return None
 
 
 def _edge_semantic_job_row(conn, project_id: str, snapshot_id: str, job_id: str) -> dict | None:
@@ -6099,6 +6246,227 @@ def _edge_semantic_job_status_counts(conn, project_id: str, snapshot_id: str) ->
         status = str(row.get("status") or "")
         counts[status] = counts.get(status, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _semantic_queued_op(job: dict, operation_type: str) -> dict[str, str]:
+    if operation_type == "edge_semantic":
+        target_id = str(job.get("edge_id") or job.get("target_id") or "").strip()
+        return {
+            "operation_id": f"edge-semantic:{target_id}",
+            "operation_type": "edge_semantic",
+            "target_scope": "edge",
+            "target_id": target_id,
+            "job_id": str(job.get("job_id") or target_id),
+        }
+    target_id = str(job.get("node_id") or job.get("target_id") or job.get("job_id") or "").strip()
+    return {
+        "operation_id": f"node-semantic:{target_id}",
+        "operation_type": "node_semantic",
+        "target_scope": "node",
+        "target_id": target_id,
+        "job_id": str(job.get("job_id") or target_id),
+    }
+
+
+def _semantic_queued_ops(jobs: list[dict], operation_type: str) -> list[dict[str, str]]:
+    ops: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for job in jobs:
+        op = _semantic_queued_op(job, operation_type)
+        key = str(op.get("operation_id") or "")
+        if key and key not in seen:
+            seen.add(key)
+            ops.append(op)
+    return ops
+
+
+def _semantic_cancel_status_bucket(status: str) -> str:
+    normalized = _normalize_operation_status(status)
+    if normalized in {"ai_pending", "queued", "pending_ai"}:
+        return "queued"
+    if normalized == "running":
+        return "running"
+    if normalized in {"complete", "failed", "cancelled"}:
+        return "terminal"
+    return "other"
+
+
+def _semantic_cancel_requested_bucket(status: str | None) -> str:
+    value = str(status or "").strip().lower().replace("-", "_")
+    if value in {"queued", "pending", "ai_pending", "pending_ai"}:
+        return "queued"
+    if value in {"running", "claimed", "ai_reviewing"}:
+        return "running"
+    return value
+
+
+def _semantic_cancel_kind_allowed(kind: str, operation_type: str, target_scope: str) -> bool:
+    operation_type = str(operation_type or "").strip().lower().replace("-", "_")
+    target_scope = str(target_scope or "").strip().lower().replace("-", "_")
+    if operation_type and operation_type != f"{kind}_semantic":
+        return False
+    if target_scope in {"edge", "edges"}:
+        return kind == "edge"
+    if target_scope in {"node", "nodes", "subtree", "snapshot"}:
+        return kind == "node"
+    return True
+
+
+def _semantic_cancel_before_allowed(row: dict, before_ts: str) -> bool:
+    if not before_ts:
+        return True
+    row_ts = str(row.get("updated_at") or row.get("created_at") or "").strip()
+    return bool(row_ts and row_ts <= before_ts)
+
+
+def _semantic_cancel_jobs(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    actor: str,
+    operation_type: str = "",
+    target_scope: str = "",
+    before_ts: str = "",
+    status: str = "",
+    target_node_ids: set[str] | None = None,
+    target_edge_ids: set[str] | None = None,
+    source: str = "semantic_jobs_cancel_all_api",
+) -> dict:
+    from . import graph_events
+    from . import reconcile_semantic_enrichment as semantic
+
+    semantic._ensure_semantic_state_schema(conn)
+    requested_bucket = _semantic_cancel_requested_bucket(status)
+    now = _utc_now()
+    cancelled: list[dict] = []
+    skipped_terminal = 0
+    matched_count = 0
+
+    if _semantic_cancel_kind_allowed("node", operation_type, target_scope):
+        node_filter = target_node_ids if target_node_ids is not None else None
+        for job in _semantic_job_rows(conn, project_id, snapshot_id, limit=1000):
+            node_id = str(job.get("node_id") or job.get("job_id") or "").strip()
+            if node_filter is not None and node_id not in node_filter:
+                continue
+            if not _semantic_cancel_before_allowed(job, before_ts):
+                continue
+            bucket = _semantic_cancel_status_bucket(str(job.get("status") or ""))
+            if bucket == "terminal":
+                skipped_terminal += 1
+                continue
+            if requested_bucket and bucket != requested_bucket:
+                continue
+            if bucket not in {"queued", "running"}:
+                continue
+            matched_count += 1
+            conn.execute(
+                """
+                UPDATE graph_semantic_jobs
+                SET status = 'cancelled', worker_id = '', claim_id = '', claimed_at = '',
+                    lease_expires_at = '', claimed_by = '', updated_at = ?
+                WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                """,
+                (now, project_id, snapshot_id, node_id),
+            )
+            cancelled.append({
+                **_semantic_queued_op(job, "node_semantic"),
+                "previous_status": str(job.get("status") or ""),
+                "status": "cancelled",
+            })
+
+    if _semantic_cancel_kind_allowed("edge", operation_type, target_scope):
+        edge_filter = target_edge_ids if target_edge_ids is not None else None
+        canonical_edge_filter: set[str] | None = None
+        if edge_filter is not None:
+            canonical_edge_filter = set()
+            for edge_id in edge_filter:
+                canonical_edge_filter.update(_semantic_edge_id_variants(edge_id))
+        for job in _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=1000):
+            edge_id = str(job.get("edge_id") or job.get("target_id") or "").strip()
+            if canonical_edge_filter is not None and edge_id not in canonical_edge_filter:
+                continue
+            if not _semantic_cancel_before_allowed(job, before_ts):
+                continue
+            bucket = _semantic_cancel_status_bucket(str(job.get("status") or ""))
+            if bucket == "terminal":
+                skipped_terminal += 1
+                continue
+            if requested_bucket and bucket != requested_bucket:
+                continue
+            if bucket not in {"queued", "running"}:
+                continue
+            matched_count += 1
+            updated = graph_events.update_event_status(
+                conn,
+                project_id,
+                snapshot_id,
+                str(job.get("event_id") or job.get("job_id") or ""),
+                status="rejected",
+                actor=actor,
+                evidence={
+                    "source": source,
+                    "previous_status": str(job.get("status") or ""),
+                    "edge_id": edge_id,
+                },
+            )
+            cancelled.append({
+                **_semantic_queued_op(job, "edge_semantic"),
+                "event_id": str(updated.get("event_id") or ""),
+                "previous_status": str(job.get("status") or ""),
+                "status": "cancelled",
+                "storage_status": "rejected",
+            })
+
+    return {
+        "cancelled_count": len(cancelled),
+        "skipped_terminal": skipped_terminal,
+        "matched_count": matched_count,
+        "cancelled_ops": cancelled,
+        "summary": {
+            "node_semantic": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+            "edge_semantic": {"by_status": _edge_semantic_job_status_counts(conn, project_id, snapshot_id)},
+        },
+    }
+
+
+def _semantic_session_job_targets(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    session_job_id: str,
+) -> tuple[set[str], set[str]]:
+    from . import graph_events
+
+    node_ids: set[str] = set()
+    edge_ids: set[str] = set()
+    events = graph_events.list_events(
+        conn,
+        project_id,
+        snapshot_id,
+        event_types=["semantic_retry_requested", "edge_semantic_requested", "edge_semantic_enriched"],
+        limit=1000,
+    )
+    for event in events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_session = str(
+            payload.get("semantic_session_job_id")
+            or payload.get("session_job_id")
+            or ""
+        )
+        if event_session != session_job_id:
+            continue
+        target_type = str(event.get("target_type") or "").strip()
+        target_id = str(event.get("target_id") or "").strip()
+        if target_type == "node" and target_id:
+            node_ids.add(target_id)
+        elif target_type == "edge" and target_id:
+            edge_ids.add(target_id)
+        elif target_type == "snapshot":
+            raw_ids = payload.get("session_target_ids")
+            if isinstance(raw_ids, list):
+                node_ids.update(str(item or "").strip() for item in raw_ids if str(item or "").strip())
+    return node_ids, edge_ids
 
 
 def _semantic_job_progress(counts: dict[str, int]) -> dict[str, object]:
@@ -6402,6 +6770,32 @@ def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str
             if not job:
                 edge_event = _edge_semantic_event_row(conn, project_id, snapshot_id, job_id)
                 if not edge_event:
+                    if status == "cancelled":
+                        node_ids, edge_ids = _semantic_session_job_targets(
+                            conn,
+                            project_id,
+                            snapshot_id,
+                            job_id,
+                        )
+                        if node_ids or edge_ids:
+                            result = _semantic_cancel_jobs(
+                                conn,
+                                project_id,
+                                snapshot_id,
+                                actor=str(body.get("actor") or "dashboard_user"),
+                                target_node_ids=node_ids,
+                                target_edge_ids=edge_ids,
+                                source="semantic_jobs_session_cancel_api",
+                            )
+                            conn.commit()
+                            return {
+                                "ok": True,
+                                "project_id": project_id,
+                                "snapshot_id": snapshot_id,
+                                "job_id": job_id,
+                                "status": "cancelled",
+                                **result,
+                            }
                     raise ValidationError(f"semantic job not found: {job_id}")
                 if status == "pending_ai":
                     payload = edge_event.get("payload") if isinstance(edge_event.get("payload"), dict) else {}
@@ -6516,6 +6910,40 @@ def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/cancel-all")
+def handle_graph_governance_snapshot_semantic_jobs_cancel_all(ctx: RequestContext):
+    """Cancel non-terminal semantic queue rows with dashboard-friendly filters."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.cancel_all")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        with sqlite_write_lock():
+            result = _semantic_cancel_jobs(
+                conn,
+                project_id,
+                snapshot_id,
+                actor=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                operation_type=str(body.get("operation_type") or ""),
+                target_scope=str(body.get("target_scope") or ""),
+                before_ts=str(body.get("before_ts") or ""),
+                status=str(body.get("status") or ""),
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            **result,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/cancel")
 def handle_graph_governance_snapshot_semantic_job_cancel(ctx: RequestContext):
     return _semantic_job_status_update(
@@ -6586,12 +7014,13 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 target_ids=[edge["edge_id"] for edge in edge_targets],
                 layers=[],
             )
+            session_job_id = f"edge-semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}"
             if dry_run:
                 return 202, {
                     "ok": True,
                     "project_id": project_id,
                     "snapshot_id": snapshot_id,
-                    "job_id": f"edge-semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+                    "job_id": session_job_id,
                     "target_scope": "edge",
                     "status": "dry_run",
                     "dry_run": True,
@@ -6601,6 +7030,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     "batch_plan": operator_request["batch_plan"],
                     "events": [],
                     "jobs": [],
+                    "queued_ops": [],
                 }
             auto_enrich = _edge_semantic_auto_enrich_enabled(body)
             instructions = _edge_semantic_instructions(root, body)
@@ -6638,6 +7068,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                             target_id=edge["edge_id"],
                             status="observed",
                             payload={
+                                "semantic_session_job_id": session_job_id,
                                 "edge": raw_edge,
                                 "edge_context": edge_context,
                                 "semantic_payload": {},
@@ -6689,6 +7120,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                         target_id=edge["edge_id"],
                         status="failed" if isinstance(ai_response, dict) and ai_response.get("_ai_error") else "observed",
                         payload={
+                            "semantic_session_job_id": session_job_id,
                             "edge": raw_edge,
                             "edge_context": edge_context,
                             "semantic_payload": semantic_payload,
@@ -6712,11 +7144,14 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     events.append(enriched)
                     enriched_count += 1
                 conn.commit()
+            jobs = _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=int(body.get("limit") or 200))
+            target_edge_ids = {str(edge.get("edge_id") or "") for edge in edge_targets}
+            jobs = [job for job in jobs if str(job.get("edge_id") or "") in target_edge_ids]
             return 202, {
                 "ok": True,
                 "project_id": project_id,
                 "snapshot_id": snapshot_id,
-                "job_id": f"edge-semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+                "job_id": session_job_id,
                 "target_scope": "edge",
                 "status": "queued",
                 "queued_count": requested_count,
@@ -6726,7 +7161,8 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 "batch_plan": operator_request["batch_plan"],
                 "events": events,
                 "summary": {"events_by_status": graph_events.status_counts(conn, project_id, snapshot_id)},
-                "jobs": _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=int(body.get("limit") or 200)),
+                "jobs": jobs,
+                "queued_ops": _semantic_queued_ops(jobs, "edge_semantic"),
             }
         enqueue_body = _semantic_jobs_enqueue_body(body)
         requested_target_ids = _semantic_jobs_target_ids(
@@ -6748,6 +7184,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             target_ids=requested_target_ids,
             layers=requested_layers,
         )
+        session_job_id = f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}"
         if dry_run:
             planned_target_ids = _semantic_jobs_node_plan_targets(
                 conn,
@@ -6769,7 +7206,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 "ok": True,
                 "project_id": project_id,
                 "snapshot_id": snapshot_id,
-                "job_id": f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+                "job_id": session_job_id,
                 "status": "dry_run",
                 "dry_run": True,
                 "queued_count": 0,
@@ -6783,6 +7220,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     "semantic_job_counts": counts,
                 },
                 "jobs": [],
+                "queued_ops": [],
             }
         try:
             result = semantic.run_semantic_enrichment(
@@ -6836,6 +7274,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     feature_hash=str(job.get("feature_hash") or ""),
                     file_hashes=job.get("file_hashes") if isinstance(job.get("file_hashes"), dict) else {},
                     payload={
+                        "semantic_session_job_id": session_job_id,
                         "operator_request": operator_request,
                         "batch_plan": operator_request["batch_plan"],
                         "selector": result_summary.get("semantic_selector") or {},
@@ -6859,6 +7298,8 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 target_id=snapshot_id,
                 status="observed",
                 payload={
+                    "semantic_session_job_id": session_job_id,
+                    "session_target_ids": target_ids,
                     "operator_request": operator_request,
                     "batch_plan": operator_request["batch_plan"],
                     "selector": result_summary.get("semantic_selector") or {},
@@ -6885,11 +7326,12 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
         counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
         progress = _semantic_job_progress(counts)
         queued_count = int(result_summary.get("ai_selected_count") or 0)
+        queued_ops = _semantic_queued_ops(jobs[:queued_count], "node_semantic") if queued_count else []
         return 202, {
             "ok": True,
             "project_id": project_id,
             "snapshot_id": snapshot_id,
-            "job_id": f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+            "job_id": session_job_id,
             "status": "queued",
             "dry_run": False,
             "queued_count": queued_count,
@@ -6907,6 +7349,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 ),
             },
             "jobs": jobs,
+            "queued_ops": queued_ops,
         }
     finally:
         conn.close()

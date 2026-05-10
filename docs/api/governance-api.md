@@ -577,13 +577,77 @@ request, not every open semantic job already present on the snapshot. When
 preview with `status: "dry_run"`, `queued_count: 0`, and `planned_count` set,
 without inserting `graph_semantic_jobs` rows or graph events.
 
+Successful node and edge requests return a session `job_id` plus `queued_ops`.
+`queued_ops` contains the per-row operation id and target id that dashboard
+clients can show or cancel:
+
+```json
+{
+  "job_id": "semantic-jobs-scope-abc12345",
+  "queued_count": 1,
+  "queued_ops": [{
+    "operation_id": "node-semantic:L7.104",
+    "operation_type": "node_semantic",
+    "target_scope": "node",
+    "target_id": "L7.104",
+    "job_id": "L7.104"
+  }]
+}
+```
+
 Edge rows can be retried or cancelled through the existing semantic job control
-routes using either the event id or the edge id:
+routes using either the event id, the canonical edge id (`src->dst:type`), or
+the dashboard pipe id (`src|dst|type`):
 
 ```json
 POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/retry
 POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/cancel
 ```
+
+The cancel endpoint also accepts the session `job_id` returned by
+`POST /semantic/jobs`; in that form it cancels all open rows from that request.
+Use `cancel-all` for cleanup after broad dashboard actions:
+
+```json
+POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/cancel-all
+
+{
+  "operation_type": "node_semantic",
+  "target_scope": "node",
+  "before_ts": "2026-05-10T20:00:00Z",
+  "status": "queued"
+}
+```
+
+All fields are optional and AND-combined. Terminal rows are not mutated; the
+response reports `cancelled_count`, `skipped_terminal`, and `cancelled_ops`.
+
+Scope reconcile rows that appear in the operations queue with `cancel` support
+can be soft-cancelled by waiving the pending reconcile row:
+
+```json
+POST /api/graph-governance/{project_id}/reconcile/scope/cancel
+
+{
+  "commit_sha": "abc123",
+  "operation_id": "scope-reconcile:abc123"
+}
+```
+
+Feedback review uses a soft-cancel contract: cancelled feedback is kept as a
+status observation via the existing `keep_status_observation` decision. For
+single or batch cleanup:
+
+```json
+POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/cancel
+
+{
+  "feedback_ids": ["fb-123"]
+}
+```
+
+Omitting `feedback_ids` soft-cancels all non-terminal feedback items for the
+snapshot, up to `limit`.
 
 ---
 
