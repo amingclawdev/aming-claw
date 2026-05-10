@@ -2568,9 +2568,28 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             if isinstance(snapshot_summary.get("health"), dict)
             else {}
         ) or {}
+        node_stale = int(semantic_health.get("semantic_stale_count") or 0)
         edge_missing = int(semantic_health.get("edge_semantic_missing_count") or 0)
         edge_eligible = int(semantic_health.get("edge_semantic_eligible_count") or 0)
         edge_current = int(semantic_health.get("edge_semantic_current_count") or 0)
+        if snapshot_id and node_stale > 0 and not node_jobs:
+            operations.append({
+                "operation_id": "node-semantic:not-queued",
+                "operation_type": "node_semantic",
+                "target_scope": "node",
+                "target_id": "*",
+                "target_label": "node semantics",
+                "status": "not_queued",
+                "progress": {"done": 0, "total": node_stale},
+                "created_at": "",
+                "updated_at": "",
+                "claimed_by": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+                "last_error": "",
+                "last_result": f"{node_stale} stale node semantics, 0 queued",
+                "supported_actions": ["queue_node_semantics", "file_backlog", "view_trace"],
+            })
         if snapshot_id and edge_missing > 0 and not edge_jobs:
             operations.append({
                 "operation_id": "edge-semantic:not-queued",

@@ -905,6 +905,14 @@ def test_graph_governance_current_state_contract_reports_graph_and_semantic_drif
     assert operations["summary"]["current_state"]["graph_stale"]["is_stale"] is True
     assert operations["summary"]["semantic_snapshot"]["projection_id"] == "semproj-current-state"
     assert operations["summary"]["semantic_drift"]["node_stale"] == 1
+    ops_by_id = {row["operation_id"]: row for row in operations["operations"]}
+    stale_node_row = ops_by_id["node-semantic:not-queued"]
+    assert stale_node_row["operation_type"] == "node_semantic"
+    assert stale_node_row["status"] == "not_queued"
+    assert stale_node_row["progress"] == {"done": 0, "total": 1}
+    assert stale_node_row["supported_actions"] == ["queue_node_semantics", "file_backlog", "view_trace"]
+    assert operations["summary"]["by_type"]["node_semantic"] == 1
+    assert operations["summary"]["by_status"]["not_queued"] == 3
 
 
 def test_graph_governance_semantic_projection_treats_hash_source_gap_as_internal(conn, monkeypatch):
