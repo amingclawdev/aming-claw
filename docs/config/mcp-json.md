@@ -27,7 +27,7 @@ Each server entry contains:
 
 - **Type:** `array` of `string`
 - **Description:** Arguments passed to the command.
-- **Example:** `["-m", "agent.governance.mcp_server"]`
+- **Example:** `["-m", "agent.mcp.server", "--project", "aming-claw", "--workers", "0"]`
 
 ##### `env` (optional)
 
@@ -46,9 +46,19 @@ Each server entry contains:
   "mcpServers": {
     "aming-claw": {
       "command": "python",
-      "args": ["-m", "agent.governance.mcp_server"],
+      "args": [
+        "-m",
+        "agent.mcp.server",
+        "--project",
+        "aming-claw",
+        "--workers",
+        "0",
+        "--governance-url",
+        "http://localhost:40000"
+      ],
       "env": {
-        "PROJECT_ID": "my-project"
+        "GOVERNANCE_URL": "http://localhost:40000",
+        "PYTHONDONTWRITEBYTECODE": "1"
       }
     }
   }
@@ -57,6 +67,7 @@ Each server entry contains:
 
 ## Notes
 
-- The MCP server provides governance tools (task management, workflow queries, memory operations) as MCP tool calls.
-- The `ServiceManager` auto-starts the executor worker when the MCP server initializes.
+- The active MCP server entrypoint is `agent.mcp.server`. The older `agent.governance.mcp_server` is retained only for compatibility.
+- The MCP server provides governance tools as MCP tool calls: task management, workflow impact, backlog filing, graph governance queries, operations queue checks, version checks, and optional executor control.
+- Use `--workers 0` for normal editor/plugin sessions so opening MCP does not spawn duplicate queue consumers. Start workers only from an explicit executor-owned session.
 - See [.aming-claw.yaml](aming-claw-yaml.md) for project-level configuration.

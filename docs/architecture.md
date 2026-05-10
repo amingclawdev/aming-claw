@@ -52,7 +52,7 @@ Key files:
 The executor worker is a single-instance process per project that claims and executes tasks from the governance queue.
 
 **Lifecycle:**
-- Started automatically by MCP ServiceManager on session open
+- Started explicitly by an executor-owned session or by MCP ServiceManager only when `--autostart-executor` is enabled
 - File lock + PID file ensures single instance
 - Heartbeat every 30s; stuck detection at 120s
 - Crash recovery on startup: requeues orphaned claimed tasks
@@ -73,18 +73,20 @@ The MCP (Model Context Protocol) server provides tool-based access to governance
 
 **Tools exposed:**
 - `task_list`, `task_create`, `task_claim`, `task_complete`, `task_cancel`, `task_hold`, `task_release`
+- `backlog_list`, `backlog_get`, `backlog_upsert`, `backlog_close`
+- `graph_status`, `graph_operations_queue`, `graph_query`, `graph_pending_scope_queue`
 - `executor_status`, `executor_scale`
-- `observer_mode`, `wf_summary`, `wf_impact`
+- `observer_mode`, `wf_summary`, `wf_impact`, `node_update`
 - `version_check`, `health`, `preflight_check`
 - `telegram_send`
 
 **Service lifecycle:**
 - Configured via `.mcp.json` in project root
-- Auto-starts executor worker via ServiceManager
-- ServiceManager monitor thread checks every 10s, restarts on crash
-- Session exit → MCP shutdown → executor stops
+- Normal editor/plugin sessions pass `--workers 0` so MCP exposes tools without claiming queue work
+- In-process workers start only when `--workers N` is greater than zero
+- Executor subprocess autostart is opt-in via `--autostart-executor`
 
-Key file: `agent/mcp_server.py`
+Key files: `agent/mcp/server.py`, `agent/mcp/tools.py`
 
 ### 2.4 Telegram Gateway
 
@@ -247,7 +249,7 @@ The executor syncs git HEAD to governance DB every 60s (only on change). The ver
 
 ### MCP Tools
 
-All governance operations are also available as MCP tools for Claude Code sessions. See `.mcp.json` for the complete tool configuration.
+Core governance operations are available as MCP tools for Claude Code sessions, including task management, backlog filing, graph governance, workflow impact, version checks, and optional executor control. See `.mcp.json` for the active server configuration.
 
 ## 9. Data Flow Diagram
 
