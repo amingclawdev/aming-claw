@@ -608,6 +608,17 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
     assert projected["health"]["edge_semantic_eligible_count"] == 1
     assert projected["health"]["edge_semantic_requested_count"] == 1
     assert projected["health"]["edge_semantic_current_count"] == 0
+    edge_jobs = server.handle_graph_governance_snapshot_semantic_jobs_list(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"target_scope": "edge"},
+        )
+    )
+    assert edge_jobs["target_scope"] == "edge"
+    assert edge_jobs["count"] == 1
+    assert edge_jobs["jobs"][0]["edge_id"] == "L7.1->L7.2:depends_on"
+    assert edge_jobs["jobs"][0]["status"] == "ai_pending"
+    assert edge_jobs["summary"]["by_status"] == {"ai_pending": 1}
 
     status, enriched = server.handle_graph_governance_snapshot_semantic_jobs_create(
         _ctx(
@@ -645,6 +656,16 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
     assert edge_semantic["semantic"]["relation_purpose"] == "Feature Node calls Dependency Node."
     assert projected["health"]["edge_semantic_current_count"] == 1
     assert projected["health"]["edge_semantic_coverage_ratio"] == 1.0
+    edge_jobs = server.handle_graph_governance_snapshot_semantic_jobs_list(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"target_scope": "edge"},
+        )
+    )
+    assert edge_jobs["count"] == 1
+    assert edge_jobs["jobs"][0]["status"] == "ai_complete"
+    assert edge_jobs["jobs"][0]["semantic"]["relation_purpose"] == "Feature Node calls Dependency Node."
+    assert edge_jobs["summary"]["progress"]["complete"] == 1
 
     summary = server.handle_graph_governance_snapshot_summary(
         _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})

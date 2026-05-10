@@ -5352,6 +5352,76 @@ def _semantic_job_status_counts(conn, project_id: str, snapshot_id: str) -> dict
     return {str(row["status"] or ""): int(row["count"] or 0) for row in rows}
 
 
+def _edge_semantic_job_status(event: dict) -> str:
+    event_status = str(event.get("status") or "").strip()
+    if event_status in {"cancelled", "failed", "rejected", "stale"}:
+        return event_status
+    event_type = str(event.get("event_type") or "").strip()
+    if event_type == "edge_semantic_enriched":
+        return "ai_complete"
+    return "ai_pending"
+
+
+def _edge_semantic_job_rows(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    statuses: list[str] | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict]:
+    from . import graph_events
+
+    events = graph_events.list_events(
+        conn,
+        project_id,
+        snapshot_id,
+        event_types=["edge_semantic_requested", "edge_semantic_enriched"],
+        target_type="edge",
+        limit=1000,
+    )
+    latest_by_edge: dict[str, dict] = {}
+    for event in events:
+        edge_id = str(event.get("target_id") or "").strip()
+        if edge_id:
+            latest_by_edge[edge_id] = event
+    wanted = {str(status or "") for status in statuses or [] if str(status or "")}
+    rows: list[dict] = []
+    for event in latest_by_edge.values():
+        status = _edge_semantic_job_status(event)
+        if wanted and status not in wanted:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        rows.append({
+            "job_id": event.get("event_id", ""),
+            "event_id": event.get("event_id", ""),
+            "target_scope": "edge",
+            "edge_id": event.get("target_id", ""),
+            "target_id": event.get("target_id", ""),
+            "status": status,
+            "event_status": event.get("status", ""),
+            "event_type": event.get("event_type", ""),
+            "edge_context": payload.get("edge_context") if isinstance(payload.get("edge_context"), dict) else {},
+            "semantic": payload.get("semantic_payload") if isinstance(payload.get("semantic_payload"), dict) else {},
+            "operator_request": payload.get("operator_request") if isinstance(payload.get("operator_request"), dict) else {},
+            "created_at": event.get("created_at", ""),
+            "updated_at": event.get("updated_at", ""),
+        })
+    rows.sort(key=lambda row: (str(row.get("updated_at") or ""), str(row.get("edge_id") or "")), reverse=True)
+    start = max(0, int(offset or 0))
+    end = start + max(1, min(int(limit or 200), 1000))
+    return rows[start:end]
+
+
+def _edge_semantic_job_status_counts(conn, project_id: str, snapshot_id: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=1000):
+        status = str(row.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _semantic_job_progress(counts: dict[str, int]) -> dict[str, object]:
     total = sum(int(value or 0) for value in counts.values())
     pending = int(counts.get("ai_pending", 0) or 0) + int(counts.get("pending_ai", 0) or 0)
@@ -5445,10 +5515,38 @@ def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
     statuses = _query_statuses(ctx.query)
     limit = _query_int(ctx.query, "limit", 200)
     offset = _query_int(ctx.query, "offset", 0)
+    target_scope = str(
+        ctx.query.get("target_scope")
+        or ctx.query.get("scope")
+        or "node"
+    ).strip().lower().replace("-", "_")
+    include_edge_events = (
+        target_scope in {"edge", "edges", "all"}
+        or _query_bool(ctx.query, "include_edge_events", False)
+    )
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.list")
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        if target_scope in {"edge", "edges"}:
+            edge_jobs = _edge_semantic_job_rows(
+                conn,
+                project_id,
+                snapshot_id,
+                statuses=statuses or None,
+                limit=limit,
+                offset=offset,
+            )
+            edge_counts = _edge_semantic_job_status_counts(conn, project_id, snapshot_id)
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "target_scope": "edge",
+                "count": len(edge_jobs),
+                "jobs": edge_jobs,
+                "summary": {"by_status": edge_counts, "progress": _semantic_job_progress(edge_counts)},
+            }
         jobs = _semantic_job_rows(
             conn,
             project_id,
@@ -5458,7 +5556,7 @@ def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
             offset=offset,
         )
         counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
-        return {
+        response = {
             "ok": True,
             "project_id": project_id,
             "snapshot_id": snapshot_id,
@@ -5466,6 +5564,21 @@ def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
             "jobs": jobs,
             "summary": {"by_status": counts, "progress": _semantic_job_progress(counts)},
         }
+        if include_edge_events:
+            edge_jobs = _edge_semantic_job_rows(
+                conn,
+                project_id,
+                snapshot_id,
+                limit=limit,
+                offset=offset,
+            )
+            edge_counts = _edge_semantic_job_status_counts(conn, project_id, snapshot_id)
+            response["edge_jobs"] = edge_jobs
+            response["edge_summary"] = {
+                "by_status": edge_counts,
+                "progress": _semantic_job_progress(edge_counts),
+            }
+        return response
     finally:
         conn.close()
 
