@@ -385,6 +385,22 @@ def _function_meta_from_adapter_symbols(
     return functions
 
 
+def _function_line_index(functions: List[FunctionMeta]) -> Dict[str, List[int]]:
+    line_index: Dict[str, List[int]] = {}
+    for func in functions:
+        short_name = str(func.qualified_name or func.name).rsplit("::", 1)[-1]
+        if not short_name:
+            continue
+        start = int(func.lineno or 0)
+        if start <= 0:
+            continue
+        end = int(func.end_lineno or start)
+        if end <= 0:
+            end = start
+        line_index[short_name] = [start, end]
+    return line_index
+
+
 def _adapter_import_map(
     project_root: str,
     source_file: str,
@@ -929,6 +945,7 @@ def aggregate_functions_into_nodes(
             "module": mod_name,
             "layer": agg_layer,
             "functions": [f.qualified_name for f in mod_info.functions],
+            "function_lines": _function_line_index(mod_info.functions),
             "function_count": len(mod_info.functions),
             "language": mod_info.language,
             "source_kind": mod_info.source_kind,
@@ -1823,6 +1840,7 @@ def append_filetree_fallback_source_nodes(
             "module": module,
             "layer": 0,
             "functions": [],
+            "function_lines": {},
             "function_count": 0,
             "test_coverage": find_test_coverage(project_root, rel),
             "doc_coverage": find_doc_coverage(project_root, rel),
@@ -2655,6 +2673,7 @@ def build_rebase_candidate_graph(
                 "module": module_name,
                 "function_count": node.get("function_count", 0),
                 "functions": node.get("functions") or [],
+                "function_lines": node.get("function_lines") or {},
                 "config_files": sorted({p for p in config_files if p}),
                 "architecture_signals": node.get("architecture_signals") or {},
                 "typed_relations": node.get("typed_relations") or [],

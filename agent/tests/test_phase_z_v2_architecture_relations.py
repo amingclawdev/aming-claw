@@ -61,6 +61,56 @@ def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):
     assert ("agent.governance.auto_chain", "writes_artifact", "graph.rebase.overlay.json") in triples
 
 
+def test_l7_metadata_persists_function_line_index(tmp_path):
+    project = tmp_path / "project"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    _write(
+        str(project / "agent" / "governance" / "db.py"),
+        "def sqlite_write_lock():\n"
+        "    return 1\n\n"
+        "class DecisionValidator:\n"
+        "    def validate(self):\n"
+        "        value = sqlite_write_lock()\n"
+        "        return value\n\n"
+        "async def run_async():\n"
+        "    return 2\n",
+    )
+
+    result = build_graph_v2_from_symbols(
+        str(project),
+        dry_run=True,
+        scratch_dir=str(scratch),
+    )
+
+    node = next(
+        node for node in result["nodes"]
+        if node["module"] == "agent.governance.db"
+    )
+    assert node["function_lines"] == {
+        "sqlite_write_lock": [1, 2],
+        "DecisionValidator.validate": [5, 7],
+        "run_async": [9, 10],
+    }
+
+    candidate = build_rebase_candidate_graph(
+        str(project),
+        result,
+        session_id="session-lines-test",
+        run_id=result["run_id"],
+    )
+    graph = candidate["deps_graph"]
+    l7_node = next(
+        graph_node for graph_node in graph["nodes"]
+        if graph_node["layer"] == "L7"
+        and graph_node["title"] == "agent.governance.db"
+    )
+    metadata = l7_node["metadata"]
+    assert metadata["function_lines"] == node["function_lines"]
+    assert metadata["functions"] == node["functions"]
+    assert metadata["function_count"] == len(metadata["function_lines"])
+
+
 def test_architecture_graph_promotes_state_and_workflow_parents(tmp_path):
     project = tmp_path / "project"
     scratch = tmp_path / "scratch"
