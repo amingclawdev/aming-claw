@@ -101,6 +101,32 @@ def _graph(node_id: str = "L7.1") -> dict:
     }
 
 
+def _graph_with_dependency() -> dict:
+    graph = _graph("L7.1")
+    graph["deps_graph"]["nodes"].append(
+        {
+            "id": "L7.2",
+            "layer": "L7",
+            "title": "Dependency Node",
+            "kind": "service_runtime",
+            "primary": ["agent/governance/dependency.py"],
+            "secondary": [],
+            "test": [],
+            "metadata": {"subsystem": "governance"},
+        }
+    )
+    graph["deps_graph"]["edges"].append(
+        {
+            "source": "L7.1",
+            "target": "L7.2",
+            "edge_type": "depends_on",
+            "direction": "dependency",
+            "evidence": {"source": "test-dependency"},
+        }
+    )
+    return graph
+
+
 def test_governance_handler_json_response_includes_dev_cors_headers():
     handler = _bare_handler()
 
@@ -527,6 +553,98 @@ def test_graph_governance_semantic_jobs_endpoint_records_edge_requests_as_events
     assert payload["events"][0]["event_type"] == "edge_semantic_requested"
     assert payload["events"][0]["target_id"] == "L7.1->L3.1:contains"
     assert payload["events"][0]["payload"]["operator_request"]["batch_plan"]["target_scope"] == "edge"
+    assert payload["events"][0]["payload"]["edge_context"]["edge_id"] == "L7.1->L3.1:contains"
+
+
+def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched_edges(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-edge-projection",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    status, payload = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "selector": {"all_eligible": True, "edge_types": ["depends_on"], "limit": 10},
+                "actor": "dashboard_user",
+            },
+        )
+    )
+
+    assert status == 202
+    assert payload["queued_count"] == 1
+    assert payload["batch_plan"]["target_ids"] == ["L7.1->L7.2:depends_on"]
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-requested"},
+        )
+    )
+    edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
+    assert edge_semantic["validity"]["status"] == "edge_semantic_requested"
+    assert projected["health"]["edge_semantic_eligible_count"] == 1
+    assert projected["health"]["edge_semantic_requested_count"] == 1
+    assert projected["health"]["edge_semantic_current_count"] == 0
+
+    status, enriched = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "edges": [{"src": "L7.1", "dst": "L7.2", "edge_type": "depends_on"}],
+                "edge_semantics": [
+                    {
+                        "src": "L7.1",
+                        "dst": "L7.2",
+                        "edge_type": "depends_on",
+                        "relation_purpose": "Feature Node calls Dependency Node.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "actor": "semantic-ai",
+            },
+        )
+    )
+    assert status == 202
+    assert enriched["events"][0]["event_type"] == "edge_semantic_enriched"
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-enriched"},
+        )
+    )
+    edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
+    assert edge_semantic["validity"]["status"] == "edge_semantic_current"
+    assert edge_semantic["semantic"]["relation_purpose"] == "Feature Node calls Dependency Node."
+    assert projected["health"]["edge_semantic_current_count"] == 1
+    assert projected["health"]["edge_semantic_coverage_ratio"] == 1.0
 
 
 def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware(conn, monkeypatch):

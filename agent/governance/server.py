@@ -3996,18 +3996,28 @@ def _semantic_jobs_target_scope(body: dict) -> str:
     ).strip().lower().replace("-", "_")
 
 
-def _semantic_jobs_edge_targets(body: dict) -> list[dict]:
+def _semantic_edge_id(edge: dict) -> str:
+    src = str(edge.get("src") or edge.get("source") or "").strip()
+    dst = str(edge.get("dst") or edge.get("target") or "").strip()
+    edge_type = str(edge.get("edge_type") or edge.get("type") or "depends_on").strip() or "depends_on"
+    return f"{src}->{dst}:{edge_type}" if src and dst else ""
+
+
+def _semantic_jobs_edge_targets(
+    body: dict,
+    *,
+    conn: sqlite3.Connection | None = None,
+    project_id: str = "",
+    snapshot_id: str = "",
+) -> list[dict]:
     raw_edges = body.get("edges") or body.get("edge_targets")
     edge_rows: list[dict] = []
     if isinstance(raw_edges, list):
         for raw in raw_edges:
             if isinstance(raw, dict):
-                src = str(raw.get("src") or raw.get("source") or "").strip()
-                dst = str(raw.get("dst") or raw.get("target") or "").strip()
-                edge_type = str(raw.get("edge_type") or raw.get("type") or "depends_on").strip() or "depends_on"
                 edge_id = str(raw.get("edge_id") or raw.get("id") or "").strip()
-                if not edge_id and src and dst:
-                    edge_id = f"{src}->{dst}:{edge_type}"
+                if not edge_id:
+                    edge_id = _semantic_edge_id(raw)
                 if edge_id:
                     edge_rows.append({"edge_id": edge_id, "edge": raw})
     for edge_id in _semantic_jobs_target_ids(
@@ -4018,6 +4028,52 @@ def _semantic_jobs_edge_targets(body: dict) -> list[dict]:
     ):
         if edge_id and edge_id not in {row["edge_id"] for row in edge_rows}:
             edge_rows.append({"edge_id": edge_id, "edge": {}})
+    if edge_rows:
+        return edge_rows
+
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    selector = body.get("selector") if isinstance(body.get("selector"), dict) else {}
+    all_eligible = bool(
+        body.get("all_eligible")
+        or options.get("all_eligible")
+        or selector.get("all_eligible")
+    )
+    if not all_eligible or conn is None or not project_id or not snapshot_id:
+        return []
+
+    from . import graph_snapshot_store as store
+
+    raw_types = (
+        body.get("edge_types")
+        or options.get("edge_types")
+        or selector.get("edge_types")
+        or []
+    )
+    allowed_types = set(_semantic_jobs_target_ids(raw_types))
+    include_contains = bool(
+        body.get("include_contains")
+        or options.get("include_contains")
+        or selector.get("include_contains")
+    )
+    limit = int(body.get("limit") or options.get("limit") or selector.get("limit") or 200)
+    candidates = store.list_graph_snapshot_edges(
+        conn,
+        project_id,
+        snapshot_id,
+        limit=2000,
+    )
+    for edge in candidates:
+        edge_id = _semantic_edge_id(edge)
+        edge_type = str(edge.get("edge_type") or "").strip()
+        if not edge_id:
+            continue
+        if edge_type == "contains" and not include_contains:
+            continue
+        if allowed_types and edge_type not in allowed_types:
+            continue
+        edge_rows.append({"edge_id": edge_id, "edge": edge})
+        if len(edge_rows) >= max(1, min(limit, 1000)):
+            break
     return edge_rows
 
 
@@ -4849,9 +4905,27 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             from . import graph_events
             from .errors import ValidationError
 
-            edge_targets = _semantic_jobs_edge_targets(body)
+            edge_targets = _semantic_jobs_edge_targets(
+                body,
+                conn=conn,
+                project_id=project_id,
+                snapshot_id=snapshot_id,
+            )
             if not edge_targets:
-                raise ValidationError("target_ids, edge_ids, or edges is required for edge semantic jobs")
+                raise ValidationError(
+                    "target_ids, edge_ids, edges, or selector/all_eligible is required for edge semantic jobs"
+                )
+            semantic_by_edge: dict[str, dict] = {}
+            raw_semantics = body.get("edge_semantics") or body.get("semantic_edges")
+            if isinstance(raw_semantics, list):
+                for raw in raw_semantics:
+                    if not isinstance(raw, dict):
+                        continue
+                    edge_id = str(raw.get("edge_id") or raw.get("id") or "").strip()
+                    if not edge_id:
+                        edge_id = _semantic_edge_id(raw)
+                    if edge_id:
+                        semantic_by_edge[edge_id] = raw
             operator_request = _semantic_jobs_operator_request(
                 body,
                 snapshot_id,
@@ -4866,13 +4940,33 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                         conn,
                         project_id,
                         snapshot_id,
-                        event_type="edge_semantic_requested",
+                        event_type=(
+                            "edge_semantic_enriched"
+                            if edge["edge_id"] in semantic_by_edge
+                            else "edge_semantic_requested"
+                        ),
                         event_kind="semantic_job",
                         target_type="edge",
                         target_id=edge["edge_id"],
                         status="observed",
                         payload={
                             "edge": edge.get("edge") or {},
+                            "edge_context": {
+                                "edge_id": edge["edge_id"],
+                                "src": (edge.get("edge") or {}).get("src")
+                                or (edge.get("edge") or {}).get("source")
+                                or "",
+                                "dst": (edge.get("edge") or {}).get("dst")
+                                or (edge.get("edge") or {}).get("target")
+                                or "",
+                                "edge_type": (edge.get("edge") or {}).get("edge_type")
+                                or (edge.get("edge") or {}).get("type")
+                                or "",
+                                "evidence": (edge.get("edge") or {}).get("evidence")
+                                if isinstance((edge.get("edge") or {}).get("evidence"), dict)
+                                else {},
+                            },
+                            "semantic_payload": semantic_by_edge.get(edge["edge_id"], {}),
                             "options": body.get("options") if isinstance(body.get("options"), dict) else {},
                             "operator_request": operator_request,
                             "batch_plan": operator_request["batch_plan"],

@@ -386,6 +386,28 @@ def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def _edge_id(edge: dict[str, Any]) -> str:
+    src, dst, edge_type, _direction = _edge_key(edge)
+    return f"{src}->{dst}:{edge_type}" if src and dst else ""
+
+
+def _edge_from_id(edge_id: str) -> dict[str, Any]:
+    text = str(edge_id or "").strip()
+    if "->" not in text:
+        return {"edge_id": text}
+    src, rest = text.split("->", 1)
+    if ":" in rest:
+        dst, edge_type = rest.rsplit(":", 1)
+    else:
+        dst, edge_type = rest, "depends_on"
+    return {
+        "edge_id": text,
+        "src": src,
+        "dst": dst,
+        "edge_type": edge_type or "depends_on",
+    }
+
+
 def _append_edge(edges: list[dict[str, Any]], edge: dict[str, Any]) -> bool:
     src, dst, edge_type, direction = _edge_key(edge)
     if not src or not dst:
@@ -1146,6 +1168,23 @@ def _event_payload_semantic(event: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _event_payload_edge_semantic(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    semantic_payload = payload.get("semantic_payload")
+    if isinstance(semantic_payload, dict):
+        return semantic_payload
+    nested = payload.get("semantic")
+    if isinstance(nested, dict):
+        return nested
+    if event.get("event_type") == "edge_semantic_requested":
+        request = payload.get("operator_request")
+        return {
+            "status": "semantic_requested",
+            "operator_request": request if isinstance(request, dict) else {},
+        }
+    return {}
+
+
 def backfill_existing_semantic_events(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1315,6 +1354,120 @@ def _latest_semantic_event_for_node(
         ).fetchone()
         return _row_to_event(row) if row else None
     return None
+
+
+def _eligible_semantic_edges(edges: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    eligible: dict[str, dict[str, Any]] = {}
+    for edge in edges:
+        edge_type = str(edge.get("edge_type") or edge.get("type") or "").strip()
+        if edge_type == "contains":
+            continue
+        edge_id = _edge_id(edge)
+        if edge_id:
+            item = dict(edge)
+            item["edge_id"] = edge_id
+            eligible[edge_id] = item
+    return eligible
+
+
+def _latest_edge_semantic_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, dict[str, Any]]:
+    ensure_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT * FROM graph_events
+        WHERE project_id = ?
+          AND snapshot_id = ?
+          AND target_type = 'edge'
+          AND event_type IN ('edge_semantic_requested', 'edge_semantic_enriched')
+          AND status IN ('observed', 'materialized', 'accepted')
+        ORDER BY event_seq ASC, updated_at ASC, created_at ASC
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        event = _row_to_event(row)
+        edge_id = str(event.get("target_id") or "").strip()
+        if edge_id:
+            latest[edge_id] = event
+    return latest
+
+
+def _edge_semantic_status(edge: dict[str, Any] | None, event: dict[str, Any] | None) -> str:
+    if not event:
+        return "edge_semantic_missing"
+    if not edge:
+        return "edge_semantic_orphaned"
+    if event.get("event_type") == "edge_semantic_enriched":
+        return "edge_semantic_current"
+    return "edge_semantic_requested"
+
+
+def _build_edge_semantics(
+    edges: list[dict[str, Any]],
+    edge_events: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    eligible_edges = _eligible_semantic_edges(edges)
+    edge_ids = sorted(set(eligible_edges) | set(edge_events))
+    out: dict[str, dict[str, Any]] = {}
+    for edge_id in edge_ids:
+        edge = eligible_edges.get(edge_id)
+        event = edge_events.get(edge_id)
+        status = _edge_semantic_status(edge, event)
+        edge_payload = dict(edge or _edge_from_id(edge_id))
+        edge_payload.setdefault("edge_id", edge_id)
+        out[edge_id] = {
+            "edge_id": edge_id,
+            "edge": edge_payload,
+            "semantic": _event_payload_edge_semantic(event or {}),
+            "validity": {
+                "status": status,
+                "valid": status == "edge_semantic_current",
+                "edge_exists": bool(edge),
+                "semantic_event_id": (event or {}).get("event_id", ""),
+                "semantic_event_snapshot_id": (event or {}).get("snapshot_id", ""),
+                "semantic_event_commit": (event or {}).get("target_commit", "")
+                or (event or {}).get("baseline_commit", ""),
+            },
+            "source_event": {
+                "event_id": (event or {}).get("event_id", ""),
+                "snapshot_id": (event or {}).get("snapshot_id", ""),
+                "event_seq": (event or {}).get("event_seq", 0),
+                "event_type": (event or {}).get("event_type", ""),
+                "updated_at": (event or {}).get("updated_at", ""),
+            },
+        }
+    return out
+
+
+def _edge_projection_health(
+    edges: list[dict[str, Any]],
+    edge_semantics: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    eligible_count = len(_eligible_semantic_edges(edges))
+    status_counts: dict[str, int] = {}
+    for entry in edge_semantics.values():
+        validity = entry.get("validity") if isinstance(entry.get("validity"), dict) else {}
+        status = str(validity.get("status") or "edge_semantic_missing")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    current = int(status_counts.get("edge_semantic_current", 0) or 0)
+    requested = int(status_counts.get("edge_semantic_requested", 0) or 0)
+    orphaned = int(status_counts.get("edge_semantic_orphaned", 0) or 0)
+    missing = max(0, eligible_count - current - requested)
+    return {
+        "edge_count": len(edges),
+        "edge_semantic_eligible_count": eligible_count,
+        "edge_semantic_current_count": current,
+        "edge_semantic_requested_count": requested,
+        "edge_semantic_missing_count": missing,
+        "edge_semantic_orphaned_count": orphaned,
+        "edge_semantic_status_counts": dict(sorted(status_counts.items())),
+        "edge_semantic_coverage_ratio": round(current / eligible_count, 4) if eligible_count else 1.0,
+    }
 
 
 def _file_hash_status(current: dict[str, Any], stored: dict[str, Any]) -> str:
@@ -1544,6 +1697,12 @@ def build_semantic_projection(
         include_semantic=False,
         limit=1000,
     )
+    edges = store.list_graph_snapshot_edges(
+        conn,
+        project_id,
+        snapshot_id,
+        limit=2000,
+    )
     node_semantics: dict[str, dict[str, Any]] = {}
     for node in nodes:
         node_id = str(node.get("node_id") or "")
@@ -1564,12 +1723,17 @@ def build_semantic_projection(
                 "updated_at": (event or {}).get("updated_at", ""),
             },
         }
+    edge_semantics = _build_edge_semantics(
+        edges,
+        _latest_edge_semantic_events(conn, project_id, snapshot_id),
+    )
     watermark_row = conn.execute(
         "SELECT COALESCE(MAX(event_seq), 0) AS watermark FROM graph_events WHERE project_id = ? AND snapshot_id = ?",
         (project_id, snapshot_id),
     ).fetchone()
     event_watermark = int(watermark_row["watermark"] if watermark_row else 0)
     health = _projection_health(nodes, node_semantics)
+    health.update(_edge_projection_health(edges, edge_semantics))
     projection = {
         "schema_version": 1,
         "project_id": project_id,
@@ -1577,6 +1741,7 @@ def build_semantic_projection(
         "commit_sha": commit_sha,
         "event_watermark": event_watermark,
         "node_semantics": node_semantics,
+        "edge_semantics": edge_semantics,
         "health_review": health,
     }
     pid = projection_id or f"semproj-{str(commit_sha or 'unknown')[:7]}-{event_watermark}-{uuid.uuid4().hex[:6]}"
