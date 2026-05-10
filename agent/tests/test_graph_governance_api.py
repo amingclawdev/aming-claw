@@ -838,6 +838,177 @@ def test_graph_governance_semantic_projection_scores_unverified_hash_as_review_d
     )
 
 
+def test_graph_governance_active_dashboard_bundle_returns_common_dashboard_data(conn):
+    graph = _graph()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-dashboard-active-bundle",
+        commit_sha="commit-dashboard",
+        snapshot_kind="full",
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "agent/governance/server.py",
+                "file_kind": "source",
+                "scan_status": "clustered",
+                "graph_status": "mapped",
+            },
+        ],
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           feedback_round, batch_index, attempt_count, updated_at, created_at)
+        VALUES (?, ?, 'L7.1', 'pending_ai', 'sha256:feature', '{}',
+                1, 0, 0, '2026-05-10T00:01:00Z', '2026-05-10T00:00:00Z')
+        """,
+        (PID, snapshot["snapshot_id"]),
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_type="semantic_retry_requested",
+        event_kind="semantic_job",
+        target_type="node",
+        target_id="L7.1",
+        status="observed",
+        payload={"reason": "dashboard bundle test"},
+        created_by="observer",
+    )
+    graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        actor="observer",
+        projection_id="semproj-dashboard-bundle",
+    )
+    reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[{
+            "node_id": "L7.1",
+            "reason": "dependency_patch_suggestions",
+            "summary": "Add a relation for the dashboard bundle.",
+            "target": "agent.governance.server",
+            "type": "add_typed_relation",
+        }],
+    )
+    conn.commit()
+
+    bundle = server.handle_graph_governance_dashboard_active_bundle(
+        _ctx(
+            {"project_id": PID},
+            query={"node_limit": "10", "edge_limit": "10", "event_limit": "10", "job_limit": "10"},
+        )
+    )
+
+    assert bundle["ok"] is True
+    assert bundle["snapshot_id"] == snapshot["snapshot_id"]
+    assert bundle["summary"]["snapshot_id"] == snapshot["snapshot_id"]
+    assert bundle["nodes"][0]["node_id"] == "L7.1"
+    assert bundle["events"]["count"] >= 1
+    assert bundle["semantic_jobs"]["summary"]["by_status"] == {"pending_ai": 1}
+    assert bundle["semantic_projection"]["projection_id"] == "semproj-dashboard-bundle"
+    assert bundle["feedback_queue"]["summary"]["raw_count"] == 1
+    assert bundle["commit_timeline"]["count"] == 1
+    assert "semantic_projection" in bundle["endpoints"]
+
+
+def test_graph_governance_node_timeline_combines_events_semantics_jobs_and_feedback(conn):
+    graph = _graph()
+    feature_hash = graph_events.feature_hash_for_node(graph["deps_graph"]["nodes"][0])
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-node-timeline",
+        commit_sha="commit-node-timeline",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           feedback_round, batch_index, attempt_count, updated_at, created_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', ?, '{"agent/governance/server.py":"sha256:file"}',
+                1, 0, 1, '2026-05-10T01:02:00Z', '2026-05-10T01:00:00Z')
+        """,
+        (PID, snapshot["snapshot_id"], feature_hash),
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_type="semantic_node_enriched",
+        event_kind="semantic_job",
+        target_type="node",
+        target_id="L7.1",
+        status="observed",
+        feature_hash=feature_hash,
+        file_hashes={"agent/governance/server.py": "sha256:file"},
+        payload={"semantic_payload": {"feature_name": "Timeline Feature"}},
+        created_by="semantic-ai",
+    )
+    graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        actor="observer",
+        projection_id="semproj-node-timeline",
+    )
+    reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        snapshot["snapshot_id"],
+        created_by="observer",
+        issues=[{
+            "node_id": "L7.1",
+            "reason": "coverage_gap",
+            "summary": "Timeline feature needs review.",
+            "type": "missing_doc_binding",
+        }],
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_snapshot_node_timeline(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "node_id": "L7.1"})
+    )
+
+    assert result["ok"] is True
+    assert result["node"]["node_id"] == "L7.1"
+    assert result["semantic"]["semantic"]["feature_name"] == "Timeline Feature"
+    assert result["semantic_job"]["status"] == "ai_complete"
+    assert result["summary"]["event_count"] >= 1
+    assert result["summary"]["feedback_count"] == 1
+    assert {item["source"] for item in result["timeline"]} >= {
+        "snapshot_node",
+        "semantic_projection",
+        "semantic_job",
+        "graph_event",
+        "feedback",
+    }
+
+
 def test_graph_governance_semantic_projection_excludes_package_markers_from_feature_health(conn, monkeypatch):
     monkeypatch.setattr(
         server,

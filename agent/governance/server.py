@@ -2049,6 +2049,128 @@ def handle_graph_governance_dashboard(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/dashboard/active")
+def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
+    """Return the common active dashboard payload in one request."""
+    project_id = ctx.get_project_id()
+    from . import graph_events
+    from . import graph_snapshot_store as store
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        status = store.graph_governance_status(conn, project_id)
+        snapshot_id = str(ctx.query.get("snapshot_id") or status.get("active_snapshot_id") or "")
+        if not snapshot_id:
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": "",
+                "status": status,
+                "summary": {},
+                "nodes": [],
+                "edges": [],
+                "files": {"summary": {}, "files": [], "total_count": 0, "filtered_count": 0},
+                "events": {"events": [], "count": 0, "summary": {}},
+                "feedback_queue": {"items": [], "groups": [], "count": 0},
+                "semantic_jobs": {"jobs": [], "summary": {}},
+                "semantic_projection": {"projection_id": "", "health": {}},
+                "commit_timeline": {"commits": [], "count": 0},
+            }
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        node_limit = _query_int(ctx.query, "node_limit", 500)
+        edge_limit = _query_int(ctx.query, "edge_limit", 1000)
+        event_limit = _query_int(ctx.query, "event_limit", 50)
+        feedback_limit = _query_int(ctx.query, "feedback_limit", 50)
+        job_limit = _query_int(ctx.query, "job_limit", 50)
+        file_limit = _query_int(ctx.query, "file_limit", 50)
+        commit_limit = _query_int(ctx.query, "commit_limit", 20)
+
+        events = graph_events.list_events(conn, project_id, snapshot_id, limit=event_limit)
+        job_counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
+        commits = store.list_commit_timeline(
+            conn,
+            project_id,
+            limit=commit_limit,
+            include_backlog=_query_bool(ctx.query, "include_backlog", True),
+        )
+        feedback_queue = reconcile_feedback.build_feedback_review_queue(
+            project_id,
+            snapshot_id,
+            include_status_observations=_query_bool(ctx.query, "include_status_observations", False),
+            include_resolved=_query_bool(ctx.query, "include_resolved", False),
+            include_claimed=True,
+            limit=feedback_limit,
+        )
+        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "status": status,
+            "summary": store.summarize_graph_snapshot(conn, project_id, snapshot_id),
+            "nodes": store.list_graph_snapshot_nodes(
+                conn,
+                project_id,
+                snapshot_id,
+                limit=node_limit,
+                include_semantic=_query_bool(ctx.query, "include_node_semantic", True),
+            ),
+            "edges": store.list_graph_snapshot_edges(
+                conn,
+                project_id,
+                snapshot_id,
+                limit=edge_limit,
+                edge_type=str(ctx.query.get("edge_type") or ""),
+            ),
+            "files": store.list_graph_snapshot_files(
+                conn,
+                project_id,
+                snapshot_id,
+                limit=file_limit,
+                file_kind=str(ctx.query.get("file_kind") or ""),
+                scan_status=str(ctx.query.get("scan_status") or ""),
+                graph_status=str(ctx.query.get("graph_status") or ""),
+                decision=str(ctx.query.get("decision") or ""),
+            ),
+            "events": {
+                "events": events,
+                "count": len(events),
+                "summary": {"by_status": graph_events.status_counts(conn, project_id, snapshot_id)},
+            },
+            "feedback_queue": feedback_queue,
+            "semantic_jobs": {
+                "jobs": _semantic_job_rows(conn, project_id, snapshot_id, limit=job_limit),
+                "summary": {
+                    "by_status": job_counts,
+                    "progress": _semantic_job_progress(job_counts),
+                },
+            },
+            "semantic_projection": {
+                "projection_id": projection.get("projection_id", ""),
+                "event_watermark": projection.get("event_watermark", 0),
+                "base_commit": projection.get("base_commit", ""),
+                "health": projection.get("health", {}),
+            },
+            "commit_timeline": {
+                "commits": commits,
+                "count": len(commits),
+            },
+            "endpoints": {
+                "summary": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/summary",
+                "nodes": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes",
+                "edges": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/edges",
+                "files": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/files",
+                "events": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events",
+                "semantic_jobs": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs",
+                "semantic_projection": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/projection",
+                "feedback_queue": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/queue",
+            },
+        }
+    finally:
+        conn.close()
+
+
 def _git_commit_subject(commit_sha: str) -> str:
     commit_sha = str(commit_sha or "").strip()
     if not commit_sha:
@@ -2281,6 +2403,161 @@ def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
             include_semantic=_query_bool(ctx.query, "include_semantic", True),
         )
         return {"ok": True, "project_id": project_id, "snapshot_id": snapshot_id, "nodes": nodes, "count": len(nodes)}
+    finally:
+        conn.close()
+
+
+def _timeline_json(raw, default):
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+        return value if value is not None else default
+    return default
+
+
+def _timeline_node_from_row(row) -> dict:
+    if not row:
+        return {}
+    return {
+        "node_id": row["node_id"],
+        "layer": row["layer"],
+        "title": row["title"],
+        "kind": row["kind"],
+        "primary_files": _timeline_json(row["primary_files_json"], []),
+        "secondary_files": _timeline_json(row["secondary_files_json"], []),
+        "test_files": _timeline_json(row["test_files_json"], []),
+        "metadata": _timeline_json(row["metadata_json"], {}),
+    }
+
+
+def _timeline_at(item: dict, *keys: str) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes/{node_id}/timeline")
+def handle_graph_governance_snapshot_node_timeline(ctx: RequestContext):
+    """Return a node-centered audit timeline for dashboard detail panels."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    node_id = ctx.path_params["node_id"]
+    from . import graph_events
+    from . import graph_snapshot_store as store
+    from . import reconcile_feedback
+
+    conn = get_connection(project_id)
+    try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+        row = conn.execute(
+            """
+            SELECT node_id, layer, title, kind, primary_files_json,
+                   secondary_files_json, test_files_json, metadata_json
+            FROM graph_nodes_index
+            WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+            """,
+            (project_id, snapshot_id, node_id),
+        ).fetchone()
+        if not row:
+            from .errors import ValidationError
+            raise ValidationError(f"graph node not found: {node_id}")
+
+        event_limit = _query_int(ctx.query, "event_limit", 100)
+        feedback_limit = _query_int(ctx.query, "feedback_limit", 50)
+        node = _timeline_node_from_row(row)
+        events = graph_events.list_events(
+            conn,
+            project_id,
+            snapshot_id,
+            target_type="node",
+            target_id=node_id,
+            limit=event_limit,
+        )
+        feedback = reconcile_feedback.list_feedback_items(
+            project_id,
+            snapshot_id,
+            node_id=node_id,
+            limit=feedback_limit,
+        )
+        job = _semantic_job_row(conn, project_id, snapshot_id, node_id) or {}
+        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+        projection_payload = projection.get("projection") if isinstance(projection.get("projection"), dict) else {}
+        node_semantics = (
+            projection_payload.get("node_semantics")
+            if isinstance(projection_payload.get("node_semantics"), dict)
+            else {}
+        )
+        semantic = node_semantics.get(node_id, {}) if isinstance(node_semantics, dict) else {}
+
+        timeline: list[dict] = [{
+            "source": "snapshot_node",
+            "kind": "structure",
+            "at": str(snapshot.get("created_at") or ""),
+            "summary": "Node exists in this graph snapshot.",
+            "node": node,
+        }]
+        if semantic:
+            validity = semantic.get("validity") if isinstance(semantic.get("validity"), dict) else {}
+            source_event = semantic.get("source_event") if isinstance(semantic.get("source_event"), dict) else {}
+            timeline.append({
+                "source": "semantic_projection",
+                "kind": "semantic",
+                "at": str(source_event.get("updated_at") or projection.get("updated_at") or projection.get("created_at") or ""),
+                "summary": str(validity.get("status") or "semantic_projected"),
+                "projection_id": projection.get("projection_id", ""),
+                "semantic": semantic,
+            })
+        if job:
+            timeline.append({
+                "source": "semantic_job",
+                "kind": "semantic_job",
+                "at": _timeline_at(job, "updated_at", "created_at"),
+                "summary": str(job.get("status") or ""),
+                "job": job,
+            })
+        for event in events:
+            timeline.append({
+                "source": "graph_event",
+                "kind": str(event.get("event_type") or ""),
+                "at": _timeline_at(event, "updated_at", "created_at"),
+                "summary": str(event.get("event_type") or event.get("event_kind") or ""),
+                "event": event,
+            })
+        for item in feedback:
+            timeline.append({
+                "source": "feedback",
+                "kind": str(item.get("feedback_kind") or item.get("final_feedback_kind") or ""),
+                "at": _timeline_at(item, "updated_at", "reviewed_at", "accepted_at", "created_at"),
+                "summary": str(item.get("summary") or item.get("reason") or item.get("status") or ""),
+                "feedback": item,
+            })
+
+        timeline.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "node_id": node_id,
+            "node": node,
+            "semantic": semantic,
+            "semantic_job": job,
+            "events": events,
+            "feedback": feedback,
+            "timeline": timeline,
+            "summary": {
+                "event_count": len(events),
+                "feedback_count": len(feedback),
+                "has_semantic_projection": bool(semantic),
+                "semantic_job_status": str(job.get("status") or ""),
+            },
+        }
     finally:
         conn.close()
 
