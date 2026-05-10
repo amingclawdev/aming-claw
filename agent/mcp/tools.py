@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import sys
 import urllib.parse
+import urllib.request
+import urllib.error
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -323,6 +328,69 @@ TOOLS: list[dict] = [
             "required": ["workers"],
         },
     },
+    # --- Host Operations ---
+    {
+        "name": "manager_health",
+        "description": "Check the host ServiceManager sidecar health and runtime version.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "manager_start",
+        "description": "Bootstrap ServiceManager via the fixed host script when the manager sidecar is unavailable. Does not expose arbitrary shell execution.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "health_wait_seconds": {
+                    "type": "integer",
+                    "description": "Maximum seconds for scripts/start-manager.ps1 to wait for the managed worker.",
+                    "default": 90,
+                    "minimum": 5,
+                    "maximum": 300,
+                },
+                "takeover": {
+                    "type": "boolean",
+                    "description": "Rejected from MCP because script takeover can terminate the current MCP process.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "governance_redeploy",
+        "description": "Redeploy governance via the ServiceManager sidecar. Governance remains a manager-owned process, not an MCP child.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "chain_version": {"type": "string", "description": "Short commit hash. Defaults to current git short HEAD."},
+                "sync_version": {"type": "boolean", "description": "Sync full git HEAD to governance after a successful redeploy.", "default": True},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "executor_respawn",
+        "description": "Ask ServiceManager to respawn the external executor worker via manager_signal.json.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "chain_version": {"type": "string", "description": "Short commit hash. Defaults to current git short HEAD."},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "runtime_status",
+        "description": "Aggregate governance health, manager health, and version_check into one runtime status report.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+            },
+            "required": ["project_id"],
+        },
+    },
     # --- System ---
     {
         "name": "health",
@@ -362,16 +430,30 @@ TOOLS: list[dict] = [
 class ToolDispatcher:
     """Routes MCP tool calls to governance API or in-process worker pool."""
 
-    def __init__(self, api_fn, worker_pool, service_mgr=None):
+    def __init__(
+        self,
+        api_fn,
+        worker_pool,
+        service_mgr=None,
+        manager_api_fn=None,
+        workspace: str | None = None,
+    ):
         """
         Args:
             api_fn: Callable(method, path, data) → dict (HTTP to governance)
             worker_pool: WorkerPool instance for executor tools (may be None)
             service_mgr: ServiceManager for executor subprocess lifecycle
+            manager_api_fn: Callable(method, path, data) → dict (HTTP to manager sidecar)
+            workspace: Host workspace used for fixed bootstrap scripts and git status
         """
         self._api = api_fn
         self._pool = worker_pool
         self._svc = service_mgr
+        self._manager_api = manager_api_fn or self._default_manager_api
+        self._workspace = workspace or os.environ.get(
+            "CODEX_WORKSPACE",
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        )
 
     def dispatch(self, name: str, args: dict) -> Any:
         args = dict(args or {})
@@ -542,6 +624,79 @@ class ToolDispatcher:
                 return self._pool.scale(args["workers"])
             return {"error": "No executor manager configured"}
 
+        # --- Host operations ---
+        if name == "manager_health":
+            return self._manager_api("GET", "/api/manager/health")
+
+        if name == "manager_start":
+            if args.get("takeover"):
+                return {
+                    "ok": False,
+                    "error": "takeover_not_supported_from_mcp",
+                    "message": "scripts/start-manager.ps1 -Takeover can terminate MCP server processes; run takeover from an external ops shell.",
+                }
+            health = self._manager_api("GET", "/api/manager/health")
+            if health.get("ok"):
+                return {"ok": True, "action": "already_running", "manager": health}
+            wait_seconds = int(args.get("health_wait_seconds") or 90)
+            wait_seconds = max(5, min(wait_seconds, 300))
+            started = self._start_manager(wait_seconds)
+            started["previous_health"] = health
+            return started
+
+        if name == "governance_redeploy":
+            pid = args["project_id"]
+            chain_version = args.get("chain_version") or self._git_head(short=True)
+            if not chain_version:
+                return {"ok": False, "error": "missing_chain_version"}
+            result = self._manager_api(
+                "POST",
+                "/api/manager/redeploy/governance",
+                {"chain_version": chain_version},
+            )
+            if result.get("ok") and args.get("sync_version", True):
+                head = self._git_head(short=False)
+                if head:
+                    result["version_sync"] = self._api(
+                        "POST",
+                        f"/api/version-sync/{pid}",
+                        {"git_head": head, "dirty_files": self._git_dirty_files()},
+                    )
+            return result
+
+        if name == "executor_respawn":
+            chain_version = args.get("chain_version") or self._git_head(short=True)
+            body = {"chain_version": chain_version} if chain_version else {}
+            return self._manager_api("POST", "/api/manager/respawn-executor", body)
+
+        if name == "runtime_status":
+            pid = args["project_id"]
+            governance = self._api("GET", "/api/health")
+            manager = self._manager_api("GET", "/api/manager/health")
+            version = self._api("GET", f"/api/version-check/{pid}")
+            status = {
+                "ok": bool(
+                    governance.get("status") == "ok"
+                    and manager.get("ok")
+                    and version.get("ok")
+                    and version.get("runtime_match")
+                ),
+                "project_id": pid,
+                "governance": governance,
+                "manager": manager,
+                "version_check": version,
+                "recommended_actions": [],
+            }
+            if governance.get("status") != "ok":
+                status["recommended_actions"].append("governance_redeploy")
+            if not manager.get("ok"):
+                status["recommended_actions"].append("manager_start")
+            if version.get("dirty"):
+                status["recommended_actions"].append("commit_or_stash_dirty_files")
+            if version.get("ok") and not version.get("runtime_match"):
+                status["recommended_actions"].append("governance_redeploy_or_restart_sm")
+            return status
+
         # --- System ---
         if name == "health":
             return self._api("GET", "/api/health")
@@ -590,6 +745,102 @@ class ToolDispatcher:
             return self._send_telegram(args["chat_id"], args["text"])
 
         raise ValueError(f"Unknown tool: {name!r}")
+
+    def _default_manager_api(self, method: str, path: str, data: dict | None = None) -> dict:
+        """HTTP helper for manager sidecar when the MCP server did not inject one."""
+        manager_url = os.environ.get("MANAGER_URL", "http://127.0.0.1:40101").rstrip("/")
+        url = f"{manager_url}{path}"
+        try:
+            if data is not None:
+                body = json.dumps(data).encode()
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    method=method,
+                    headers={"Content-Type": "application/json"},
+                )
+            else:
+                req = urllib.request.Request(url, method=method)
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode() if exc.fp else ""
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"ok": False, "error": str(exc), "body": raw}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _git_head(self, short: bool) -> str:
+        args = ["git", "rev-parse"]
+        if short:
+            args.append("--short")
+        args.append("HEAD")
+        try:
+            return subprocess.check_output(args, cwd=self._workspace, timeout=5).decode().strip()
+        except Exception:
+            return ""
+
+    def _git_dirty_files(self) -> list[str]:
+        try:
+            dirty = subprocess.check_output(
+                ["git", "diff", "--name-only"],
+                cwd=self._workspace,
+                timeout=5,
+            ).decode().strip()
+        except Exception:
+            return []
+        return [line for line in dirty.splitlines() if line.strip()]
+
+    def _start_manager(self, health_wait_seconds: int) -> dict:
+        if sys.platform != "win32":
+            return {
+                "ok": False,
+                "error": "platform_bootstrap_not_supported",
+                "platform": sys.platform,
+                "message": "Non-Windows manager bootstrap needs POSIX scripts; tracked by OPT-BACKLOG-HOST-OPS-CROSS-PLATFORM-SCRIPTS.",
+            }
+        script = os.path.join(self._workspace, "scripts", "start-manager.ps1")
+        if not os.path.exists(script):
+            return {"ok": False, "error": "start_manager_script_missing", "script": script}
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script,
+            "-HealthWaitSeconds",
+            str(health_wait_seconds),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=self._workspace,
+                capture_output=True,
+                text=True,
+                timeout=health_wait_seconds + 30,
+            )
+        except FileNotFoundError as exc:
+            return {"ok": False, "error": "powershell_not_found", "detail": str(exc), "command": cmd[:1]}
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "error": "manager_start_timeout",
+                "stdout": (exc.stdout or "")[-2000:],
+                "stderr": (exc.stderr or "")[-2000:],
+            }
+
+        health = self._manager_api("GET", "/api/manager/health")
+        return {
+            "ok": bool(proc.returncode == 0 and health.get("ok")),
+            "action": "manager_start",
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "")[-4000:],
+            "stderr": (proc.stderr or "")[-4000:],
+            "manager": health,
+        }
 
     def _send_telegram(self, chat_id: str, text: str) -> dict:
         """Send message directly via Telegram Bot API."""

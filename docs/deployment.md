@@ -94,6 +94,8 @@ curl http://localhost:40000/api/health
 
 The executor worker **must be launched under ServiceManager supervision**. The MCP server will NOT start it (because `.mcp.json` uses `--workers 0`). Orphan executors started by any other means have no crash recovery and no deploy-signal handling.
 
+MCP may expose host-ops tools (`manager_health`, `manager_start`, `governance_redeploy`, `executor_respawn`, `runtime_status`) to call ServiceManager or its sidecar. These tools are a fixed-command repair facade, not MCP ownership of the executor lifecycle. The MCP `manager_start` bootstrap currently targets the Windows PowerShell script; POSIX bootstrap scripts are tracked separately.
+
 ### Starting ServiceManager (required)
 
 ```powershell
@@ -102,8 +104,8 @@ The executor worker **must be launched under ServiceManager supervision**. The M
 ```
 
 ```bash
-# Cross-platform — equivalent direct invocation
-python -m agent.service_manager
+# Cross-platform direct invocation; POSIX bootstrap scripts are tracked separately
+python -m agent.service_manager --project aming-claw --governance-url http://localhost:40000 --workspace "$PWD"
 ```
 
 Verify with `tasklist /v /fi "imagename eq python.exe" | findstr service_manager` (Windows) or `pgrep -fa service_manager.py` (Unix). The executor is only properly supervised if its parent process is `agent/service_manager.py`.
@@ -120,10 +122,11 @@ Verify with `tasklist /v /fi "imagename eq python.exe" | findstr service_manager
 ### Manual Executor Control
 
 ```bash
-# Check executor status (via MCP tool)
-# executor_status tool shows: running, tasks_claimed, uptime
+# Check runtime status via MCP tools
+# runtime_status aggregates governance, ServiceManager, and version_check.
+# executor_status returns external/no-manager for normal --workers 0 MCP sessions.
 
-# Scale executor (via MCP tool)
+# Scale MCP-local workers only when MCP was explicitly started with --workers N
 # executor_scale(0) — pause claiming (for observer mode)
 # executor_scale(1) — resume claiming
 ```

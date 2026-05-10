@@ -75,6 +75,7 @@ The MCP (Model Context Protocol) server provides tool-based access to governance
 - `task_list`, `task_create`, `task_claim`, `task_complete`, `task_cancel`, `task_hold`, `task_release`
 - `backlog_list`, `backlog_get`, `backlog_upsert`, `backlog_close`
 - `graph_status`, `graph_operations_queue`, `graph_query`, `graph_pending_scope_queue`
+- `manager_health`, `manager_start`, `governance_redeploy`, `executor_respawn`, `runtime_status`
 - `executor_status`, `executor_scale`
 - `observer_mode`, `wf_summary`, `wf_impact`, `node_update`
 - `version_check`, `health`, `preflight_check`
@@ -85,6 +86,7 @@ The MCP (Model Context Protocol) server provides tool-based access to governance
 - Normal editor/plugin sessions pass `--workers 0` so MCP exposes tools without claiming queue work
 - In-process workers start only when `--workers N` is greater than zero
 - Executor subprocess autostart is opt-in via `--autostart-executor`
+- Host-ops tools call the manager sidecar or fixed bootstrap scripts; MCP does not own long-lived governance or executor lifecycle
 
 Key files: `agent/mcp/server.py`, `agent/mcp/tools.py`
 

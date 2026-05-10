@@ -111,9 +111,11 @@ class AmingClawMCP:
     """MCP Server main class."""
 
     def __init__(self, project_id: str, governance_url: str, workspace: str,
-                 redis_url: str, max_workers: int = 0, autostart_executor: bool = False):
+                 redis_url: str, manager_url: str = "http://127.0.0.1:40101",
+                 max_workers: int = 0, autostart_executor: bool = False):
         self.project_id = project_id
         self.gov_url = governance_url.rstrip("/")
+        self.manager_url = manager_url.rstrip("/")
         self._workspace = workspace
         self._autostart_executor = autostart_executor
 
@@ -157,6 +159,8 @@ class AmingClawMCP:
             api_fn=self._http,
             worker_pool=self.worker_pool,
             service_mgr=self.service_mgr,
+            manager_api_fn=self._manager_http,
+            workspace=workspace,
         )
 
     def run(self) -> None:
@@ -237,6 +241,13 @@ class AmingClawMCP:
 
     def _http(self, method: str, path: str, data: dict = None) -> dict:
         url = f"{self.gov_url}{path}"
+        return self._request_json(method, url, data, timeout=15)
+
+    def _manager_http(self, method: str, path: str, data: dict = None) -> dict:
+        url = f"{self.manager_url}{path}"
+        return self._request_json(method, url, data, timeout=90)
+
+    def _request_json(self, method: str, url: str, data: dict = None, timeout: int = 15) -> dict:
         try:
             if data is not None:
                 body = json.dumps(data).encode()
@@ -244,7 +255,7 @@ class AmingClawMCP:
                                              headers={"Content-Type": "application/json"})
             else:
                 req = urllib.request.Request(url, method=method)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode() if exc.fp else ""
@@ -339,6 +350,7 @@ def main():
     parser = argparse.ArgumentParser(description="Aming Claw MCP Server")
     parser.add_argument("--project", default="aming-claw", help="Project ID")
     parser.add_argument("--governance-url", default=os.getenv("GOVERNANCE_URL", "http://localhost:40000"))
+    parser.add_argument("--manager-url", default=os.getenv("MANAGER_URL", "http://127.0.0.1:40101"))
     parser.add_argument("--workspace", default=os.getenv("CODEX_WORKSPACE", str(Path(__file__).resolve().parents[2])))
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:40079/0"))
     parser.add_argument("--workers", type=int, default=int(os.getenv("MCP_WORKERS", "1")))
@@ -361,6 +373,7 @@ def main():
         governance_url=args.governance_url,
         workspace=args.workspace,
         redis_url=args.redis_url,
+        manager_url=args.manager_url,
         max_workers=args.workers,
         autostart_executor=args.autostart_executor,
     )
