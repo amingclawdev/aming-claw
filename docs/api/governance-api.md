@@ -1055,7 +1055,32 @@ indeterminate state.
 
 ---
 
+## Graph Governance Dashboard Current State
+
+`GET /api/graph-governance/{project_id}/status`,
+`GET /api/graph-governance/{project_id}/dashboard`,
+`GET /api/graph-governance/{project_id}/dashboard/active`, and the operations
+queue summary expose a canonical `current_state` object for dashboard consumers.
+
+Important fields:
+
+| Field | Meaning |
+|-------|---------|
+| `current_state.graph_stale` | Synthesized active-graph-vs-HEAD state, including active graph commit, HEAD commit, `changed_file_count`, and changed file sample. |
+| `current_state.semantic_snapshot` | Active semantic projection identity: snapshot id, projection id, base commit, event watermark, status, created/updated timestamps. |
+| `current_state.semantic_drift` | Normalized semantic counts for nodes and edges: current, stale, missing, unverified, requested, eligible, and status histograms. |
+| `current_state.drift_ledger` | Explicit `graph_drift_ledger` row count only. This is not the same as synthesized current drift. |
+
+`GET /api/graph-governance/{project_id}/drift` remains ledger-compatible: `count`
+is the number of explicit ledger rows. It also returns `current_state`,
+`graph_stale`, `semantic_drift`, `ledger_count`, and `ledger_only=true` so a UI
+does not confuse an empty ledger with a current graph or semantic state that
+needs reconcile.
+
+---
+
 ## Changelog
+- 2026-05-10: Graph governance dashboard APIs expose `current_state` for graph stale state, semantic projection metadata, and semantic drift counts; `/drift` clarifies ledger-only count versus synthesized current drift
 - 2026-04-24: MF-001/MF-002 conn-contention fixes — conn.commit()-before-publish pattern in PM-stage and dev-stage on_task_completed paths; version-update lockdown (whitelist enforcement on updated_by field); backlog endpoint provenance_paths documentation; strict-gate error codes for backlog upsert
 - 2026-03-28: Batch 1 flow fixes — R1: test/QA gate fail creates dev retry (downgrade re-run) instead of same-stage escalate; R2: _build_qa_prompt requires exactly qa_pass or reject; M3: dev success writes pattern memory; S1: session_context skips empty session_summary when decisions=0 and messages=0
 - 2026-03-28: P1-P3 optimization — memory injection all task types; index_status tracking + flush-index; conflict_policy enforcement; TTL cleanup endpoint; orphan task recovery; role-split guides (guide-dev-agent.md, guide-tester-qa.md, guide-coordinator.md)

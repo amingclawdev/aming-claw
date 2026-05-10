@@ -787,6 +787,126 @@ def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware
     assert changed_projected["health"]["semantic_stale_count"] == 1
 
 
+def test_graph_governance_current_state_contract_reports_graph_and_semantic_drift(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: Path("."))
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: "commit-b")
+    monkeypatch.setattr(
+        server,
+        "_git_changed_paths_between",
+        lambda _root, _base, _target, limit=25: ["agent/governance/server.py"],
+    )
+    base_graph = _graph_with_dependency()
+    feature_hash = graph_events.feature_hash_for_node(base_graph["deps_graph"]["nodes"][0])
+    base_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-current-state-base",
+        commit_sha="commit-base",
+        snapshot_kind="full",
+        graph_json=base_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        base_snapshot["snapshot_id"],
+        nodes=base_graph["deps_graph"]["nodes"],
+        edges=base_graph["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', ?,
+                '{"agent/governance/server.py":"sha256:file-base"}',
+                ?, 1, 0, '2026-05-10T00:00:00Z')
+        """,
+        (
+            PID,
+            base_snapshot["snapshot_id"],
+            feature_hash,
+            json.dumps({"feature_name": "Stale semantic"}),
+        ),
+    )
+    conn.commit()
+    server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": base_snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-current-state-base"},
+        )
+    )
+    changed_graph = _graph_with_dependency()
+    changed_graph["deps_graph"]["nodes"][0]["title"] = "Renamed Feature Node"
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-current-state-contract",
+        commit_sha="commit-a",
+        snapshot_kind="full",
+        parent_snapshot_id=base_snapshot["snapshot_id"],
+        graph_json=changed_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=changed_graph["deps_graph"]["nodes"],
+        edges=changed_graph["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-current-state", "backfill_existing": False},
+        )
+    )
+    assert projected["health"]["semantic_stale_count"] == 1
+    assert projected["health"]["semantic_missing_count"] == 1
+    assert projected["health"]["edge_semantic_missing_count"] == 1
+
+    status = server.handle_graph_governance_status(_ctx({"project_id": PID}))
+
+    current = status["current_state"]
+    assert current["graph_stale"]["is_stale"] is True
+    assert current["graph_stale"]["active_graph_commit"] == "commit-a"
+    assert current["graph_stale"]["head_commit"] == "commit-b"
+    assert current["graph_stale"]["changed_file_count"] == 1
+    assert current["semantic_snapshot"]["projection_id"] == "semproj-current-state"
+    assert current["semantic_snapshot"]["base_commit"] == "commit-a"
+    assert current["semantic_drift"]["node_stale"] == 1
+    assert current["semantic_drift"]["node_missing"] == 1
+    assert current["semantic_drift"]["edge_missing"] == 1
+    assert current["semantic_drift"]["semantic_status_counts"]["semantic_stale_feature_hash"] == 1
+    assert current["drift_ledger"]["count"] == 0
+    assert current["drift_ledger"]["ledger_only"] is True
+
+    drift = server.handle_graph_governance_drift_list(_ctx({"project_id": PID}))
+    assert drift["count"] == 0
+    assert drift["ledger_only"] is True
+    assert drift["graph_stale"]["is_stale"] is True
+    assert drift["semantic_drift"]["edge_missing"] == 1
+
+    operations = server.handle_graph_governance_operations_queue(
+        _ctx(
+            {"project_id": PID},
+            query={"include_status_observations": "true", "include_resolved": "true"},
+        )
+    )
+    assert operations["summary"]["current_state"]["graph_stale"]["is_stale"] is True
+    assert operations["summary"]["semantic_snapshot"]["projection_id"] == "semproj-current-state"
+    assert operations["summary"]["semantic_drift"]["node_stale"] == 1
+
+
 def test_graph_governance_semantic_projection_treats_hash_source_gap_as_internal(conn, monkeypatch):
     monkeypatch.setattr(
         server,

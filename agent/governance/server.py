@@ -2008,6 +2008,12 @@ def handle_graph_governance_status(ctx: RequestContext):
     conn = get_connection(project_id)
     try:
         status = store.graph_governance_status(conn, project_id)
+        status["current_state"] = _dashboard_current_state(
+            conn,
+            project_id,
+            status=status,
+            snapshot_id=str(status.get("active_snapshot_id") or ""),
+        )
         target_commit = str(ctx.query.get("target_commit") or "")
         if target_commit:
             status["strict_ready"] = store.strict_graph_ready(
@@ -2064,6 +2070,12 @@ def handle_graph_governance_dashboard(ctx: RequestContext):
             "project_id": project_id,
             "snapshot_id": snapshot_id,
             "status": status,
+            "current_state": _dashboard_current_state(
+                conn,
+                project_id,
+                status=status,
+                snapshot_id=snapshot_id,
+            ),
             "recent_snapshots": snapshots,
             "file_state": file_state,
             "drift_summary": _summarize_graph_drift_rows(drift_rows),
@@ -2086,11 +2098,18 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
         status = store.graph_governance_status(conn, project_id)
         snapshot_id = str(ctx.query.get("snapshot_id") or status.get("active_snapshot_id") or "")
         if not snapshot_id:
+            current_state = _dashboard_current_state(
+                conn,
+                project_id,
+                status=status,
+                snapshot_id="",
+            )
             return {
                 "ok": True,
                 "project_id": project_id,
                 "snapshot_id": "",
                 "status": status,
+                "current_state": current_state,
                 "summary": {},
                 "nodes": [],
                 "edges": [],
@@ -2127,12 +2146,22 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
             limit=feedback_limit,
         )
         projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+        summary = store.summarize_graph_snapshot(conn, project_id, snapshot_id)
+        current_state = _dashboard_current_state(
+            conn,
+            project_id,
+            status=status,
+            snapshot_id=snapshot_id,
+            snapshot_summary=summary,
+            projection=projection,
+        )
         return {
             "ok": True,
             "project_id": project_id,
             "snapshot_id": snapshot_id,
             "status": status,
-            "summary": store.summarize_graph_snapshot(conn, project_id, snapshot_id),
+            "current_state": current_state,
+            "summary": summary,
             "nodes": store.list_graph_snapshot_nodes(
                 conn,
                 project_id,
@@ -2263,6 +2292,7 @@ def _graph_stale_scope_operation(
         "active_graph_commit": str(status.get("graph_snapshot_commit") or ""),
         "head_commit": "",
         "changed_files": [],
+        "changed_file_count": 0,
     }
     try:
         root = _graph_governance_project_root(project_id, {})
@@ -2308,6 +2338,118 @@ def _graph_stale_scope_operation(
         "changed_files": changed_files,
     }
     return operation, stale_summary
+
+
+def _semantic_current_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    snapshot_summary: dict[str, Any] | None = None,
+    projection: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return compact semantic projection metadata and dashboard drift counts."""
+    snapshot_id = str(snapshot_id or "")
+    semantic_snapshot: dict[str, Any] = {
+        "snapshot_id": snapshot_id,
+        "projection_id": "",
+        "base_commit": "",
+        "event_watermark": 0,
+        "projection_status": "missing",
+        "created_at": "",
+        "updated_at": "",
+    }
+    health: dict[str, Any] = {}
+    if snapshot_id:
+        if projection is None:
+            from . import graph_events
+
+            projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+        if projection:
+            health = projection.get("health") if isinstance(projection.get("health"), dict) else {}
+            semantic_snapshot.update({
+                "projection_id": projection.get("projection_id", ""),
+                "base_commit": projection.get("base_commit", ""),
+                "event_watermark": projection.get("event_watermark", 0),
+                "projection_status": projection.get("status", "current") or "current",
+                "created_at": projection.get("created_at", ""),
+                "updated_at": projection.get("updated_at", ""),
+            })
+        if not health and snapshot_summary:
+            summary_health = snapshot_summary.get("health") if isinstance(snapshot_summary.get("health"), dict) else {}
+            health = summary_health.get("semantic_health") if isinstance(summary_health.get("semantic_health"), dict) else {}
+            if health and not semantic_snapshot["projection_id"]:
+                semantic_snapshot["projection_id"] = str(health.get("projection_id") or "")
+                semantic_snapshot["projection_status"] = str(health.get("status") or "current")
+
+    node_current = int(health.get("semantic_current_count") or 0)
+    node_unverified = int(health.get("semantic_unverified_hash_count") or 0)
+    node_missing = int(health.get("semantic_missing_count") or 0)
+    node_stale = int(health.get("semantic_stale_count") or 0)
+    edge_eligible = int(health.get("edge_semantic_eligible_count") or 0)
+    edge_current = int(health.get("edge_semantic_current_count") or 0)
+    edge_requested = int(health.get("edge_semantic_requested_count") or 0)
+    edge_missing = int(health.get("edge_semantic_missing_count") or 0)
+    semantic_drift = {
+        "node_total": health.get("feature_count", 0),
+        "node_current": node_current,
+        "node_unverified": node_unverified,
+        "node_missing": node_missing,
+        "node_stale": node_stale,
+        "edge_eligible": edge_eligible,
+        "edge_current": edge_current,
+        "edge_requested": edge_requested,
+        "edge_missing": edge_missing,
+        "semantic_status_counts": health.get("semantic_status_counts", {}),
+        "edge_semantic_status_counts": health.get("edge_semantic_status_counts", {}),
+        "has_drift": bool(node_unverified or node_missing or node_stale or edge_missing),
+    }
+    return semantic_snapshot, semantic_drift
+
+
+def _dashboard_current_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    status: dict[str, Any],
+    snapshot_id: str = "",
+    snapshot_summary: dict[str, Any] | None = None,
+    projection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Canonical dashboard state for graph staleness and semantic drift."""
+    from . import graph_snapshot_store as store
+
+    snapshot_id = str(snapshot_id or status.get("active_snapshot_id") or "")
+    pending_rows = list(status.get("pending_scope_reconcile") or [])
+    _operation, graph_stale = _graph_stale_scope_operation(
+        project_id,
+        status=status,
+        pending_rows=pending_rows,
+    )
+    semantic_snapshot, semantic_drift = _semantic_current_state(
+        conn,
+        project_id,
+        snapshot_id,
+        snapshot_summary=snapshot_summary,
+        projection=projection,
+    )
+    drift_rows = store.list_graph_drift(
+        conn,
+        project_id,
+        snapshot_id=snapshot_id,
+        limit=1000,
+    ) if snapshot_id else []
+    return {
+        "snapshot_id": snapshot_id,
+        "graph_stale": graph_stale,
+        "semantic_snapshot": semantic_snapshot,
+        "semantic_drift": semantic_drift,
+        "drift_ledger": {
+            "count": len(drift_rows),
+            "ledger_only": True,
+            "description": "Explicit graph_drift_ledger rows only; current graph-vs-HEAD state is graph_stale.",
+        },
+    }
 
 
 @route("GET", "/api/graph-governance/{project_id}/operations/queue")
@@ -2494,6 +2636,14 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "supported_actions": ["pause", "resume", "view_trace"],
             })
 
+        current_state = _dashboard_current_state(
+            conn,
+            project_id,
+            status=status,
+            snapshot_id=snapshot_id,
+            snapshot_summary=snapshot_summary,
+        )
+        current_state["graph_stale"] = graph_stale_summary
         operations.sort(key=lambda item: (str(item.get("updated_at") or item.get("created_at") or ""), str(item.get("operation_id") or "")), reverse=True)
         return {
             "ok": True,
@@ -2527,6 +2677,9 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "feedback_queue": feedback_summary,
                 "graph_correction_patches": patch_summary,
                 "graph_stale": graph_stale_summary,
+                "semantic_snapshot": current_state["semantic_snapshot"],
+                "semantic_drift": current_state["semantic_drift"],
+                "current_state": current_state,
             },
         }
     finally:
@@ -3421,16 +3574,38 @@ def handle_graph_governance_drift_list(ctx: RequestContext):
 
     conn = get_connection(project_id)
     try:
+        status_payload = store.graph_governance_status(conn, project_id)
+        raw_snapshot_id = str(ctx.query.get("snapshot_id") or "")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id) if raw_snapshot_id else ""
         rows = store.list_graph_drift(
             conn,
             project_id,
-            snapshot_id=str(ctx.query.get("snapshot_id") or ""),
+            snapshot_id=snapshot_id,
             status=str(ctx.query.get("status") or ""),
             drift_type=str(ctx.query.get("drift_type") or ""),
             limit=_query_int(ctx.query, "limit", 200),
             offset=_query_int(ctx.query, "offset", 0),
         )
-        return {"ok": True, "project_id": project_id, "drift": rows, "count": len(rows)}
+        resolved_snapshot_id = snapshot_id or str(status_payload.get("active_snapshot_id") or "")
+        current_state = _dashboard_current_state(
+            conn,
+            project_id,
+            status=status_payload,
+            snapshot_id=resolved_snapshot_id,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": resolved_snapshot_id,
+            "drift": rows,
+            "count": len(rows),
+            "ledger_count": len(rows),
+            "ledger_only": True,
+            "current_state": current_state,
+            "graph_stale": current_state["graph_stale"],
+            "semantic_drift": current_state["semantic_drift"],
+            "note": "drift rows are explicit graph_drift_ledger entries; use current_state.graph_stale and current_state.semantic_drift for synthesized dashboard drift.",
+        }
     finally:
         conn.close()
 
