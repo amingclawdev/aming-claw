@@ -792,6 +792,8 @@ def _lane_rank(lane: str) -> int:
 
 
 def _queue_group_key(item: dict[str, Any], lane: str, *, group_by: str = "target") -> str:
+    if group_by == "lane":
+        return lane
     nodes = _source_nodes(item)
     node_key = ",".join(nodes) if nodes else ""
     category = str(
@@ -938,7 +940,7 @@ def build_feedback_review_queue(
             if str(item.get("source_round") or "") == str(source_round)
         ]
     group_by = str(group_by or "target").strip().lower()
-    if group_by not in {"target", "feature", "node", "source_node"}:
+    if group_by not in {"target", "feature", "node", "source_node", "lane"}:
         group_by = "target"
 
     by_kind: dict[str, int] = {}
@@ -994,15 +996,19 @@ def build_feedback_review_queue(
         target_type = str(item.get("target_type") or "")
         issue_type = str(item.get("issue_type") or "")
         if group is None:
+            group_target_type = "feedback_lane" if group_by == "lane" else target_type
+            group_target_id = item_lane if group_by == "lane" else target_id
+            group_issue_type = "" if group_by == "lane" else issue_type
             group = {
                 "queue_id": f"fq-{_short_hash({'snapshot_id': snapshot_id, 'key': key})}",
+                "group_by": group_by,
                 "lane": item_lane,
                 "action_hint": _queue_action_hint(item_lane),
                 "priority": priority,
                 "source_node_ids": nodes,
-                "target_type": target_type,
-                "target_id": target_id,
-                "issue_type": issue_type,
+                "target_type": group_target_type,
+                "target_id": group_target_id,
+                "issue_type": group_issue_type,
                 "target_ids": [],
                 "target_count": 0,
                 "target_type_counts": {},

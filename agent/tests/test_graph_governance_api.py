@@ -1844,6 +1844,16 @@ def test_graph_governance_feedback_submit_creates_queue_item_and_graph_event(con
     assert queue["group_count"] == 1
     assert queue["action_catalog"]["lanes"]["graph_patch_candidate"]["primary_actions"]
 
+    lane_queue = server.handle_graph_governance_snapshot_feedback_queue(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "active"},
+            query={"group_by": "lane"},
+        )
+    )
+    assert lane_queue["group_by"] == "lane"
+    assert lane_queue["groups"][0]["group_by"] == "lane"
+    assert lane_queue["groups"][0]["target_type"] == "feedback_lane"
+
 
 def test_graph_governance_feedback_file_backlog_allows_dashboard_overrides(conn, monkeypatch):
     monkeypatch.setattr(

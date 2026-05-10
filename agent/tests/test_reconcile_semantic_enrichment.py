@@ -1317,6 +1317,23 @@ def test_reconcile_feedback_review_queue_can_group_by_feature(conn, tmp_path):
     }
     assert by_node[("L7.2",)]["lane"] == "review_required"
 
+    lane_queue = reconcile_feedback.build_feedback_review_queue(
+        PID,
+        "full-semantic-test",
+        source_round="round-003",
+        group_by="lane",
+    )
+    assert lane_queue["group_by"] == "lane"
+    assert lane_queue["summary"]["visible_group_count"] == 2
+    by_lane = {group["lane"]: group for group in lane_queue["groups"]}
+    assert by_lane["graph_patch_candidate"]["group_by"] == "lane"
+    assert by_lane["graph_patch_candidate"]["target_type"] == "feedback_lane"
+    assert by_lane["graph_patch_candidate"]["target_id"] == "graph_patch_candidate"
+    assert by_lane["graph_patch_candidate"]["item_count"] == 2
+    assert by_lane["graph_patch_candidate"]["target_count"] == 2
+    assert by_lane["graph_patch_candidate"]["source_node_ids"] == ["L7.1"]
+    assert by_lane["review_required"]["item_count"] == 1
+
 
 def test_semantic_enrichment_uses_project_config_override(conn, tmp_path):
     project = tmp_path / "project"
