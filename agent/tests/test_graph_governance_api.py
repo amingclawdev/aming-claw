@@ -1451,6 +1451,94 @@ def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
     assert summary["graph_correction_patches"]["high_risk_proposed_count"] == 1
 
 
+def test_graph_governance_summary_exposes_file_hygiene_review_samples(conn, tmp_path):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-hygiene-summary",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    report_path = tmp_path / "global-review.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "health_picture": {
+                    "project_health_score": 81.5,
+                    "file_hygiene_score": 57.45,
+                    "low_health_count": 3,
+                    "project_health_issue_counts": {"file_hygiene": 2},
+                    "file_hygiene": {
+                        "available": True,
+                        "run_id": "inventory-run",
+                        "total_files": 7,
+                        "review_required_count": 2,
+                        "orphan_count": 1,
+                        "pending_decision_count": 1,
+                        "cleanup_candidate_count": 1,
+                        "cleanup_candidate_mb": 4.5,
+                        "by_kind": {"doc": 1, "generated": 1},
+                        "by_scan_status": {"orphan": 1, "ignored": 1},
+                        "by_graph_status": {"unmapped": 1, "ignored": 1},
+                        "review_required_sample": [
+                            {
+                                "path": "docs/orphan.md",
+                                "file_kind": "doc",
+                                "suggested_dashboard_actions": ["attach_to_node", "waive"],
+                            }
+                        ],
+                        "cleanup_candidate_sample": [
+                            {
+                                "path": "docs/dev/scratch/ai-output.json",
+                                "file_kind": "generated",
+                                "size_bytes": 4718592,
+                                "suggested_dashboard_actions": ["delete_candidate", "waive"],
+                            }
+                        ],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    notes = {
+        "global_semantic_review": {
+            "latest_full_review_path": str(report_path),
+            "latest_full_run_id": "full-review-file-hygiene",
+            "latest_full_status": "completed",
+        }
+    }
+    conn.execute(
+        "UPDATE graph_snapshots SET notes=? WHERE project_id=? AND snapshot_id=?",
+        (json.dumps(notes), PID, snapshot["snapshot_id"]),
+    )
+    conn.commit()
+
+    summary = server.handle_graph_governance_snapshot_summary(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+
+    insight = summary["health"]["project_insight_health"]
+    assert insight["status"] == "reviewed"
+    assert insight["file_hygiene_score"] == 57.45
+    assert insight["file_hygiene"]["available"] is True
+    assert insight["file_hygiene"]["review_required_count"] == 2
+    assert insight["file_hygiene"]["cleanup_candidate_count"] == 1
+    assert insight["file_hygiene"]["review_required_sample"][0]["path"] == "docs/orphan.md"
+    assert (
+        insight["file_hygiene"]["cleanup_candidate_sample"][0]["path"]
+        == "docs/dev/scratch/ai-output.json"
+    )
+
+
 def test_graph_governance_query_trace_api_records_source_and_events(conn):
     snapshot = store.create_graph_snapshot(
         conn,

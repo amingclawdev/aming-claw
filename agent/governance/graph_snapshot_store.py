@@ -1422,6 +1422,7 @@ def _project_insight_health_picture(
 ) -> dict[str, Any]:
     health = latest_review.get("health_picture") if isinstance(latest_review, dict) else {}
     if isinstance(health, dict) and health:
+        file_hygiene = health.get("file_hygiene") if isinstance(health.get("file_hygiene"), dict) else {}
         return {
             "score_version": "project_insight_health_v1_global_review",
             "score": _as_float(health.get("project_health_score"), None),
@@ -1431,6 +1432,24 @@ def _project_insight_health_picture(
             "latest_status": review_meta.get("latest_full_status", ""),
             "low_health_count": health.get("low_health_count"),
             "issue_counts": health.get("project_health_issue_counts", {}),
+            "file_hygiene_score": health.get("file_hygiene_score"),
+            "file_hygiene": {
+                "available": bool(file_hygiene.get("available")),
+                "run_id": file_hygiene.get("run_id", ""),
+                "total_files": file_hygiene.get("total_files"),
+                "review_required_count": file_hygiene.get("review_required_count"),
+                "orphan_count": file_hygiene.get("orphan_count"),
+                "pending_decision_count": file_hygiene.get("pending_decision_count"),
+                "error_count": file_hygiene.get("error_count"),
+                "cleanup_candidate_count": file_hygiene.get("cleanup_candidate_count"),
+                "cleanup_candidate_bytes": file_hygiene.get("cleanup_candidate_bytes"),
+                "cleanup_candidate_mb": file_hygiene.get("cleanup_candidate_mb"),
+                "by_kind": file_hygiene.get("by_kind", {}),
+                "by_scan_status": file_hygiene.get("by_scan_status", {}),
+                "by_graph_status": file_hygiene.get("by_graph_status", {}),
+                "review_required_sample": file_hygiene.get("review_required_sample", []),
+                "cleanup_candidate_sample": file_hygiene.get("cleanup_candidate_sample", []),
+            },
         }
     if review_meta:
         return {
