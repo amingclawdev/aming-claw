@@ -2630,8 +2630,9 @@ def handle_graph_governance_snapshot_files(ctx: RequestContext):
                 graph_status=str(ctx.query.get("graph_status") or ""),
                 decision=str(ctx.query.get("decision") or ""),
                 path_contains=str(ctx.query.get("path") or ""),
+                sort=str(ctx.query.get("sort") or ""),
             )
-        except KeyError as exc:
+        except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
         return {
             "ok": True,
@@ -2640,6 +2641,7 @@ def handle_graph_governance_snapshot_files(ctx: RequestContext):
             "summary": result["summary"],
             "total_count": result["total_count"],
             "filtered_count": result["filtered_count"],
+            "sort": result.get("sort", ""),
             "files": result["files"],
         }
     finally:

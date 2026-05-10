@@ -3028,6 +3028,30 @@ def test_graph_governance_snapshot_files_api_reads_companion_inventory(conn):
                 "decision": "pending",
                 "mapped_node_ids": [],
             },
+            {
+                "path": ".coverage",
+                "file_kind": "generated",
+                "scan_status": "ignored",
+                "graph_status": "ignored",
+                "decision": "ignore",
+                "size_bytes": 512,
+            },
+            {
+                "path": "dbservice/package-lock.json",
+                "file_kind": "generated",
+                "scan_status": "ignored",
+                "graph_status": "ignored",
+                "decision": "ignore",
+                "size_bytes": 4096,
+            },
+            {
+                "path": "agent/.coverage",
+                "file_kind": "generated",
+                "scan_status": "ignored",
+                "graph_status": "ignored",
+                "decision": "ignore",
+                "size_bytes": 1024,
+            },
         ],
     )
     conn.commit()
@@ -3043,6 +3067,27 @@ def test_graph_governance_snapshot_files_api_reads_companion_inventory(conn):
     assert files["summary"]["by_scan_status"]["orphan"] == 1
     assert files["filtered_count"] == 1
     assert files["files"][0]["path"] == "docs/missing.md"
+
+    cleanup = server.handle_graph_governance_snapshot_files(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"file_kind": "generated", "sort": "size_desc"},
+        )
+    )
+    assert cleanup["sort"] == "size_desc"
+    assert [item["path"] for item in cleanup["files"]] == [
+        "dbservice/package-lock.json",
+        "agent/.coverage",
+        ".coverage",
+    ]
+
+    with pytest.raises(ValidationError, match="unsupported file inventory sort"):
+        server.handle_graph_governance_snapshot_files(
+            _ctx(
+                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+                query={"sort": "unknown"},
+            )
+        )
 
 
 def test_graph_governance_snapshot_export_cache_writes_non_authoritative_files(conn, tmp_path):

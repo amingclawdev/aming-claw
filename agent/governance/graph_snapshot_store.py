@@ -1085,6 +1085,7 @@ def list_graph_snapshot_files(
     graph_status: str = "",
     decision: str = "",
     path_contains: str = "",
+    sort: str = "",
 ) -> dict[str, Any]:
     """List file inventory rows stored with a snapshot companion artifact."""
     ensure_schema(conn)
@@ -1108,6 +1109,22 @@ def list_graph_snapshot_files(
         return True
 
     filtered = [row for row in rows if _matches(row)]
+    normalized_sort = str(sort or "").strip().lower().replace("-", "_")
+    if normalized_sort:
+        if normalized_sort in {"path", "path_asc"}:
+            filtered = sorted(filtered, key=lambda row: str(row.get("path") or ""))
+        elif normalized_sort == "size_desc":
+            filtered = sorted(
+                filtered,
+                key=lambda row: (-int(row.get("size_bytes") or 0), str(row.get("path") or "")),
+            )
+        elif normalized_sort == "size_asc":
+            filtered = sorted(
+                filtered,
+                key=lambda row: (int(row.get("size_bytes") or 0), str(row.get("path") or "")),
+            )
+        else:
+            raise ValueError(f"unsupported file inventory sort: {sort}")
     start = max(0, int(offset or 0))
     end = start + max(1, min(int(limit or 200), 1000))
     return {
@@ -1115,6 +1132,7 @@ def list_graph_snapshot_files(
         "summary": summarize_file_inventory_rows(rows),
         "total_count": len(rows),
         "filtered_count": len(filtered),
+        "sort": normalized_sort,
         "files": filtered[start:end],
     }
 
