@@ -886,7 +886,7 @@ def run_pending_scope_reconcile_candidate(
     if changed_files and not has_semantic_selector_override:
         effective_semantic_ai_scope = "changed"
         effective_semantic_changed_paths = changed_files
-        effective_semantic_selector_match = "any"
+        effective_semantic_selector_match = "primary"
     rid = run_id or f"scope-reconcile-{_short_commit(target)}-pending"
     sid = snapshot_id or snapshot_id_for("scope", target)
     result = run_state_only_full_reconcile(

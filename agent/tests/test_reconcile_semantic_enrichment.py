@@ -311,6 +311,83 @@ def test_semantic_enrichment_can_select_explicit_node_for_ai(conn, tmp_path):
     assert by_id["L7.2"]["semantic_selection_reasons"] == ["node_id"]
 
 
+def test_semantic_enrichment_skips_package_markers_by_default_but_allows_explicit_node(
+    conn,
+    tmp_path,
+):
+    project = tmp_path / "project"
+    _write(project / "agent" / "__init__.py", "def bootstrap_project():\n    return None\n")
+    _write(project / "agent" / "service.py", "def service_entry():\n    return 'ok'\n")
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.1",
+                    "layer": "L7",
+                    "title": "Service",
+                    "primary": ["agent/service.py"],
+                    "metadata": {"file_role": "implementation"},
+                },
+                {
+                    "id": "L7.pkg",
+                    "layer": "L7",
+                    "title": "agent",
+                    "primary": ["agent/__init__.py"],
+                    "metadata": {
+                        "exclude_as_feature": True,
+                        "file_role": "package_marker",
+                    },
+                },
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="package-marker-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    seen_nodes: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_nodes.append(payload["feature"]["node_id"])
+        return {"feature_name": f"AI {payload['feature']['node_id']}"}
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "package-marker-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="all",
+        created_by="test",
+    )
+
+    assert seen_nodes == ["L7.1"]
+    assert [item["node_id"] for item in result["semantic_index"]["features"]] == ["L7.1"]
+
+    seen_nodes.clear()
+    explicit = run_semantic_enrichment(
+        conn,
+        PID,
+        "package-marker-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.pkg"],
+        semantic_skip_completed=False,
+        created_by="test",
+    )
+
+    assert seen_nodes == ["L7.pkg"]
+    assert explicit["summary"]["ai_selected_count"] == 1
+
+
 def test_semantic_enrichment_can_select_structural_layer(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project, include_extra=True)
@@ -368,6 +445,34 @@ def test_semantic_enrichment_can_select_missing_doc_nodes(conn, tmp_path):
     assert seen_nodes == ["L7.2"]
     assert result["summary"]["semantic_selector"]["missing"] == ["doc"]
     assert result["summary"]["semantic_selector"]["layers"] == ["L7"]
+
+
+def test_semantic_enrichment_primary_selector_ignores_test_binding_changes(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    seen_nodes: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_nodes.append(payload["feature"]["node_id"])
+        return {"feature_name": f"AI {payload['feature']['node_id']}"}
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="changed",
+        semantic_changed_paths=["agent/tests/test_backlog_runtime.py"],
+        semantic_selector_match="primary",
+        created_by="test",
+    )
+
+    assert seen_nodes == []
+    assert result["summary"]["semantic_selector"]["match_mode"] == "primary"
+    assert result["summary"]["ai_selected_count"] == 0
+    assert result["summary"]["ai_skipped_selector_count"] == 1
 
 
 def test_semantic_enrichment_can_batch_ai_features(conn, tmp_path):

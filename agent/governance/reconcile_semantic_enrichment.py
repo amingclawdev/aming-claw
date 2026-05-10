@@ -299,7 +299,7 @@ def _semantic_selector(raw: dict[str, Any] | None) -> dict[str, Any]:
     changed_paths = _path_list(payload.get("changed_paths") or payload.get("semantic_changed_paths"))
     path_prefixes = _path_list(payload.get("path_prefixes") or payload.get("semantic_path_prefixes"))
     match_mode = str(payload.get("match_mode") or payload.get("semantic_selector_match") or "all").strip().lower()
-    if match_mode not in {"all", "any"}:
+    if match_mode not in {"all", "any", "primary"}:
         match_mode = "all"
     include_structural = bool(payload.get("include_structural") or payload.get("semantic_include_structural"))
     if layers and any(layer in {"L1", "L2", "L3", "L4", "L5", "L6"} for layer in layers):
@@ -348,11 +348,33 @@ def _node_has_primary(node: dict[str, Any]) -> bool:
     return bool(_path_list(node.get("primary") or node.get("primary_files")))
 
 
+def _node_excluded_from_default_semantics(node: dict[str, Any]) -> bool:
+    metadata = dict(node.get("metadata") or {})
+    if metadata.get("exclude_as_feature") is True:
+        return True
+    file_role = str(metadata.get("file_role") or "").strip().lower()
+    if file_role in {"package_marker", "namespace_marker", "init_marker", "module_marker"}:
+        return True
+    quality_flags = {
+        str(item or "").strip().lower()
+        for item in (metadata.get("quality_flags") or [])
+    }
+    return "coverage_noise_candidate" in quality_flags and file_role.endswith("marker")
+
+
 def _semantic_candidate_nodes(graph_json: dict[str, Any], selector: dict[str, Any]) -> list[dict[str, Any]]:
     include_structural = bool(selector.get("include_structural"))
+    explicit_node_ids = {str(item) for item in (selector.get("node_ids") or [])}
     out: list[dict[str, Any]] = []
     for node in _graph_nodes(graph_json):
-        if not _node_id(node):
+        node_id = _node_id(node)
+        if not node_id:
+            continue
+        if (
+            not include_structural
+            and node_id not in explicit_node_ids
+            and _node_excluded_from_default_semantics(node)
+        ):
             continue
         if _node_has_primary(node) or include_structural:
             out.append(node)
@@ -557,9 +579,10 @@ def _quality_flags(feature: dict[str, Any], feedback: list[dict[str, Any]]) -> l
     return flags
 
 
-def _feature_paths(feature: dict[str, Any]) -> list[str]:
+def _feature_paths(feature: dict[str, Any], *, primary_only: bool = False) -> list[str]:
     paths: list[str] = []
-    for key in ("primary", "secondary", "test", "config"):
+    keys = ("primary",) if primary_only else ("primary", "secondary", "test", "config")
+    for key in keys:
         paths.extend(_path_list(feature.get(key)))
     return paths
 
@@ -580,8 +603,14 @@ def _missing_matches(feature: dict[str, Any], missing: list[str]) -> bool:
     return any(checks.get(item, False) for item in missing)
 
 
-def _path_matches(feature: dict[str, Any], paths: list[str], prefixes: list[str]) -> bool:
-    feature_paths = _feature_paths(feature)
+def _path_matches(
+    feature: dict[str, Any],
+    paths: list[str],
+    prefixes: list[str],
+    *,
+    primary_only: bool = False,
+) -> bool:
+    feature_paths = _feature_paths(feature, primary_only=primary_only)
     if paths:
         requested = {path.replace("\\", "/").strip("/") for path in paths}
         if not requested.intersection(feature_paths):
@@ -625,13 +654,21 @@ def _selector_decision(
         checks.append(("quality_flags", bool(set(flags).intersection(quality_flags))))
     if missing:
         checks.append(("missing", _missing_matches(feature, missing)))
+    match_mode = str(selector.get("match_mode") or "all")
     if changed_paths or path_prefixes:
-        checks.append(("paths", _path_matches(feature, changed_paths, path_prefixes)))
+        checks.append((
+            "paths",
+            _path_matches(
+                feature,
+                changed_paths,
+                path_prefixes,
+                primary_only=match_mode == "primary",
+            ),
+        ))
     if not checks:
         return scope == "all", ["scope_all"] if scope == "all" else ["not_selected"]
 
-    match_mode = str(selector.get("match_mode") or "all")
-    matched = all(ok for _, ok in checks) if match_mode == "all" else any(ok for _, ok in checks)
+    matched = any(ok for _, ok in checks) if match_mode == "any" else all(ok for _, ok in checks)
     reasons = [name for name, ok in checks if ok] or ["selector_no_match"]
     return matched, reasons
 

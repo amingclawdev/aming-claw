@@ -360,7 +360,73 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/service.py"]
-    assert selector["match_mode"] == "any"
+    assert selector["match_mode"] == "primary"
+
+
+def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-test-only-change",
+        commit_sha=base_commit,
+        snapshot_id="full-base-test-only-change",
+        created_by="test",
+        activate=True,
+    )
+    assert base["ok"] is True
+
+    test_file = project / "agent" / "tests" / "test_service.py"
+    test_file.write_text(
+        "from agent.service import service_entry\n\n"
+        "def test_service_entry():\n"
+        "    assert service_entry() == 'ok'\n\n"
+        "def test_service_entry_again():\n"
+        "    assert service_entry() == 'ok'\n",
+        encoding="utf-8",
+    )
+    _git(project, "add", "agent/tests/test_service.py")
+    _git(project, "commit", "-m", "change service test")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+    seen_nodes: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_nodes.append(payload["feature"]["node_id"])
+        return {"feature_name": f"AI {payload['feature']['node_id']}"}
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-only-delta",
+        snapshot_id="scope-test-only-delta",
+        semantic_use_ai=True,
+        semantic_ai_call=fake_ai,
+    )
+
+    assert result["ok"] is True
+    assert result["scope_file_delta"]["changed_files"] == ["agent/tests/test_service.py"]
+    selector = result["semantic_enrichment"]["semantic_selector"]
+    assert selector["scope"] == "changed"
+    assert selector["changed_paths"] == ["agent/tests/test_service.py"]
+    assert selector["match_mode"] == "primary"
+    assert result["semantic_enrichment"]["ai_selected_count"] == 0
+    assert seen_nodes == []
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(
