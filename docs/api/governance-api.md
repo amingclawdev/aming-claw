@@ -524,6 +524,54 @@ The response tells you:
 
 ---
 
+## Graph Governance Dashboard Queue
+
+Dashboard operations should read `GET /api/graph-governance/{project_id}/operations/queue`
+as the compact source of actionable graph, semantic, and review work. Edge
+semantic drift is exposed as `edge_semantic` operations:
+
+- `edge-semantic:not-queued` means eligible graph edges do not yet have edge
+  semantic events. It supports `queue_edge_semantics`, `run_edge_semantics`,
+  and `file_backlog`.
+- Pending edge rows come from `edge_semantic_requested` graph events and report
+  status `ai_pending`.
+- Completed edge rows come from `edge_semantic_enriched` graph events and report
+  status `complete`.
+
+To queue or run edge semantic work, call:
+
+```json
+POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs
+
+{
+  "target_scope": "edge",
+  "selector": {
+    "all_eligible": true,
+    "edge_types": ["depends_on"],
+    "limit": 100
+  },
+  "semantic_mode": "auto",
+  "actor": "dashboard_user"
+}
+```
+
+Without `semantic_mode: "auto"`, the endpoint records
+`edge_semantic_requested` events only. With auto mode, the backend also emits
+`edge_semantic_enriched` events using the edge semantic analyzer profile and a
+state-only semantic payload. The projection endpoint then updates
+`edge_semantic_current_count`, `edge_semantic_requested_count`, and
+`edge_semantic_missing_count` without mutating graph topology.
+
+Edge rows can be retried or cancelled through the existing semantic job control
+routes using either the event id or the edge id:
+
+```json
+POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/retry
+POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs/{job_id}/cancel
+```
+
+---
+
 ## Error Handling
 
 | HTTP Status | Error Code | What You Should Do |

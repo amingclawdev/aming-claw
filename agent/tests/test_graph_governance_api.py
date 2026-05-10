@@ -679,6 +679,98 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
     assert semantic_health["edge_semantic_coverage_ratio"] == 1.0
 
 
+def test_graph_governance_edge_semantic_jobs_auto_enrich_and_controls(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-edge-auto-runner",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    status, payload = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "selector": {"all_eligible": True, "edge_types": ["depends_on"], "limit": 10},
+                "semantic_mode": "auto",
+                "actor": "dashboard_user",
+            },
+        )
+    )
+
+    assert status == 202
+    assert payload["queued_count"] == 1
+    assert payload["enriched_count"] == 1
+    assert [event["event_type"] for event in payload["events"]] == [
+        "edge_semantic_requested",
+        "edge_semantic_enriched",
+    ]
+    assert payload["jobs"][0]["status"] == "ai_complete"
+    assert payload["jobs"][0]["semantic"]["relation_purpose"] == "L7.1 depends on L7.2."
+    assert payload["jobs"][0]["semantic"]["analyzer_role"] == "reconcile_edge_semantic_analyzer"
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-auto-runner"},
+        )
+    )
+    assert projected["health"]["edge_semantic_current_count"] == 1
+    assert projected["health"]["edge_semantic_missing_count"] == 0
+
+    queue = server.handle_graph_governance_operations_queue(
+        _ctx({"project_id": PID}, query={"snapshot_id": snapshot["snapshot_id"]})
+    )
+    operations = {row["operation_type"]: row for row in queue["operations"]}
+    assert operations["edge_semantic"]["status"] == "complete"
+    assert "retry" in operations["edge_semantic"]["supported_actions"]
+    assert "edge-semantic:not-queued" not in {row["operation_id"] for row in queue["operations"]}
+
+    edge_event_id = payload["jobs"][0]["event_id"]
+    cancel = server.handle_graph_governance_snapshot_semantic_job_cancel(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"], "job_id": edge_event_id},
+            method="POST",
+            body={"actor": "dashboard_user"},
+        )
+    )
+    assert cancel["job"]["status"] == "rejected"
+    retry = server.handle_graph_governance_snapshot_semantic_job_retry(
+        _ctx(
+            {
+                "project_id": PID,
+                "snapshot_id": snapshot["snapshot_id"],
+                "job_id": "L7.1->L7.2:depends_on",
+            },
+            method="POST",
+            body={"actor": "dashboard_user"},
+        )
+    )
+    assert retry["job"]["status"] == "ai_pending"
+    assert retry["event"]["event_type"] == "edge_semantic_requested"
+
+
 def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware(conn, monkeypatch):
     monkeypatch.setattr(
         server,
@@ -3588,6 +3680,8 @@ def test_operations_queue_unifies_jobs_and_edge_not_queued(conn, monkeypatch):
     assert edge_row["status"] == "not_queued"
     assert edge_row["progress"] == {"done": 0, "total": 1}
     assert "1 edge semantics missing, 0 queued" == edge_row["last_result"]
+    assert "queue_edge_semantics" in edge_row["supported_actions"]
+    assert "run_edge_semantics" in edge_row["supported_actions"]
 
 
 def test_operations_queue_includes_pending_scope_reconcile(conn, monkeypatch):
