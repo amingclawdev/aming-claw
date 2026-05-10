@@ -569,6 +569,14 @@ coverage, `edge_semantic_rule_count` is rule fallback coverage,
 `edge_semantic_missing_count` / `edge_semantic_needs_ai_count` count edges still
 missing trusted semantics. Graph topology is not mutated.
 
+For node semantic jobs, dashboard callers may pass `target_scope: "node"` with
+`target_ids`. `options.scope: "selected_node"` is treated as the selected target
+only, including retry mode. `queued_count` reports rows selected by the current
+request, not every open semantic job already present on the snapshot. When
+`dry_run` is true either at top level or under `options`, the endpoint returns a
+preview with `status: "dry_run"`, `queued_count: 0`, and `planned_count` set,
+without inserting `graph_semantic_jobs` rows or graph events.
+
 Edge rows can be retried or cancelled through the existing semantic job control
 routes using either the event id or the edge id:
 

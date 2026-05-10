@@ -5209,8 +5209,18 @@ def _semantic_jobs_target_ids(raw: object) -> list[str]:
     return [str(value or "").strip() for value in values if str(value or "").strip()]
 
 
+def _semantic_jobs_options(body: dict) -> dict:
+    return body.get("options") if isinstance(body.get("options"), dict) else {}
+
+
+def _semantic_jobs_dry_run(body: dict) -> bool:
+    options = _semantic_jobs_options(body)
+    value = body.get("dry_run") if body.get("dry_run") is not None else options.get("dry_run")
+    return bool(_semantic_bool_from_body({"dry_run": value}, "dry_run", default=False))
+
+
 def _semantic_jobs_target_scope(body: dict) -> str:
-    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    options = _semantic_jobs_options(body)
     return str(
         body.get("target_scope")
         or options.get("target_scope")
@@ -5302,7 +5312,7 @@ def _semantic_jobs_edge_targets(
 def _semantic_jobs_enqueue_body(body: dict) -> dict:
     from .errors import ValidationError
 
-    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    options = _semantic_jobs_options(body)
     target_scope = _semantic_jobs_target_scope(body)
     if target_scope in {"edge", "edges"}:
         raise ValidationError(
@@ -5317,6 +5327,9 @@ def _semantic_jobs_enqueue_body(body: dict) -> dict:
         or body.get("target_id")
         or body.get("node_ids")
         or body.get("node_id")
+        or options.get("target_ids")
+        or options.get("node_ids")
+        or options.get("node_id")
     )
     if target_scope in {"node", "nodes", "subtree"} and not target_ids:
         raise ValidationError("target_ids is required for node or subtree semantic jobs")
@@ -5349,6 +5362,17 @@ def _semantic_jobs_enqueue_body(body: dict) -> dict:
         "semantic_skip_completed": bool(skip_current),
         "actor": body.get("actor") or body.get("created_by") or "dashboard_user",
     })
+    semantic_scope = (
+        body.get("semantic_ai_scope")
+        or body.get("ai_scope")
+        or options.get("semantic_ai_scope")
+        or options.get("scope")
+    )
+    if semantic_scope:
+        normalized_scope = str(semantic_scope).strip().lower().replace("-", "_")
+        if normalized_scope in {"selected_node", "selected_nodes", "selected_subtree"}:
+            normalized_scope = "selected"
+        enqueue_body["semantic_ai_scope"] = normalized_scope
     if target_ids:
         enqueue_body["semantic_node_ids"] = target_ids
     elif layers:
@@ -5358,6 +5382,49 @@ def _semantic_jobs_enqueue_body(body: dict) -> dict:
     if any(layer in {"L1", "L2", "L3", "L4"} for layer in enqueue_body.get("semantic_layers", [])):
         enqueue_body["semantic_include_structural"] = True
     return enqueue_body
+
+
+def _semantic_jobs_node_plan_targets(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    enqueue_body: dict,
+) -> list[str]:
+    explicit = _semantic_jobs_target_ids(
+        enqueue_body.get("semantic_node_ids")
+        or enqueue_body.get("target_ids")
+        or enqueue_body.get("node_ids")
+        or enqueue_body.get("node_id")
+    )
+    if explicit:
+        return explicit
+    layers = {
+        str(layer or "").upper()
+        for layer in (enqueue_body.get("semantic_layers") or [])
+        if str(layer or "").strip()
+    }
+    include_structural = bool(enqueue_body.get("semantic_include_structural"))
+    from . import graph_snapshot_store as store
+
+    nodes = store.list_graph_snapshot_nodes(
+        conn,
+        project_id,
+        snapshot_id,
+        limit=1000,
+        include_semantic=False,
+    )
+    planned: list[str] = []
+    for node in nodes:
+        node_id = str(node.get("node_id") or node.get("id") or "").strip()
+        layer = str(node.get("layer") or "").upper()
+        if not node_id:
+            continue
+        if layers and layer not in layers:
+            continue
+        primary = node.get("primary_files") or node.get("primary") or []
+        if primary or include_structural:
+            planned.append(node_id)
+    return planned
 
 
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events")
@@ -6485,6 +6552,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.create")
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        dry_run = _semantic_jobs_dry_run(body)
         if _semantic_jobs_target_scope(body) in {"edge", "edges"}:
             from . import graph_events
             from .errors import ValidationError
@@ -6518,6 +6586,22 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 target_ids=[edge["edge_id"] for edge in edge_targets],
                 layers=[],
             )
+            if dry_run:
+                return 202, {
+                    "ok": True,
+                    "project_id": project_id,
+                    "snapshot_id": snapshot_id,
+                    "job_id": f"edge-semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+                    "target_scope": "edge",
+                    "status": "dry_run",
+                    "dry_run": True,
+                    "queued_count": 0,
+                    "planned_count": len(edge_targets),
+                    "operator_request": operator_request,
+                    "batch_plan": operator_request["batch_plan"],
+                    "events": [],
+                    "jobs": [],
+                }
             auto_enrich = _edge_semantic_auto_enrich_enabled(body)
             instructions = _edge_semantic_instructions(root, body)
             ai_call = _semantic_ai_call_from_body(
@@ -6664,6 +6748,42 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             target_ids=requested_target_ids,
             layers=requested_layers,
         )
+        if dry_run:
+            planned_target_ids = _semantic_jobs_node_plan_targets(
+                conn,
+                project_id,
+                snapshot_id,
+                enqueue_body,
+            )
+            selector = {
+                "dry_run": True,
+                "node_ids": planned_target_ids,
+                "semantic_node_ids": planned_target_ids,
+                "semantic_layers": requested_layers,
+                "semantic_ai_scope": enqueue_body.get("semantic_ai_scope") or "",
+            }
+            operator_request["batch_plan"]["selector"] = selector
+            counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
+            progress = _semantic_job_progress(counts)
+            return 202, {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "job_id": f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
+                "status": "dry_run",
+                "dry_run": True,
+                "queued_count": 0,
+                "planned_count": len(planned_target_ids),
+                "operator_request": operator_request,
+                "batch_plan": operator_request["batch_plan"],
+                "summary": {"by_status": counts, "progress": progress},
+                "semantic_enrichment": {
+                    "feedback_round": None,
+                    "semantic_selector": selector,
+                    "semantic_job_counts": counts,
+                },
+                "jobs": [],
+            }
         try:
             result = semantic.run_semantic_enrichment(
                 conn,
@@ -6683,6 +6803,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             _raise_graph_api_validation(exc)
         from . import graph_events
 
+        result_summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
         target_ids = _semantic_jobs_target_ids(
             enqueue_body.get("semantic_node_ids")
             or body.get("target_ids")
@@ -6690,9 +6811,9 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             or body.get("node_id")
         )
         if not target_ids:
-            selector = result.get("semantic_selector") if isinstance(result.get("semantic_selector"), dict) else {}
+            selector = result_summary.get("semantic_selector") if isinstance(result_summary.get("semantic_selector"), dict) else {}
             target_ids = _semantic_jobs_target_ids(selector.get("node_ids"))
-        operator_request["batch_plan"]["selector"] = result.get("semantic_selector") or {}
+        operator_request["batch_plan"]["selector"] = result_summary.get("semantic_selector") or {}
         jobs_for_events = _semantic_job_rows(
             conn,
             project_id,
@@ -6717,8 +6838,12 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     payload={
                         "operator_request": operator_request,
                         "batch_plan": operator_request["batch_plan"],
-                        "selector": result.get("semantic_selector") or {},
-                        "semantic_job_counts": result.get("semantic_job_counts") or {},
+                        "selector": result_summary.get("semantic_selector") or {},
+                        "semantic_job_counts": (
+                            (result_summary.get("semantic_graph_state") or {}).get("semantic_job_counts")
+                            if isinstance(result_summary.get("semantic_graph_state"), dict)
+                            else {}
+                        ),
                     },
                     evidence={"source": "semantic_jobs_api"},
                     created_by=str(enqueue_body.get("actor") or "dashboard_user"),
@@ -6736,36 +6861,50 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 payload={
                     "operator_request": operator_request,
                     "batch_plan": operator_request["batch_plan"],
-                    "selector": result.get("semantic_selector") or {},
-                    "semantic_job_counts": result.get("semantic_job_counts") or {},
+                    "selector": result_summary.get("semantic_selector") or {},
+                    "semantic_job_counts": (
+                        (result_summary.get("semantic_graph_state") or {}).get("semantic_job_counts")
+                        if isinstance(result_summary.get("semantic_graph_state"), dict)
+                        else {}
+                    ),
                 },
                 evidence={"source": "semantic_jobs_api"},
                 created_by=str(enqueue_body.get("actor") or "dashboard_user"),
             )
         conn.commit()
+        job_limit = int(body.get("limit") or 200)
         jobs = _semantic_job_rows(
             conn,
             project_id,
             snapshot_id,
-            limit=int(body.get("limit") or 200),
+            limit=1000 if target_ids else job_limit,
         )
+        if target_ids:
+            target_set = set(target_ids)
+            jobs = [job for job in jobs if str(job.get("node_id") or "") in target_set][:job_limit]
         counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
         progress = _semantic_job_progress(counts)
-        queued_count = int(progress["open"])
+        queued_count = int(result_summary.get("ai_selected_count") or 0)
         return 202, {
             "ok": True,
             "project_id": project_id,
             "snapshot_id": snapshot_id,
             "job_id": f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
             "status": "queued",
+            "dry_run": False,
             "queued_count": queued_count,
+            "planned_count": queued_count,
             "operator_request": operator_request,
             "batch_plan": operator_request["batch_plan"],
             "summary": {"by_status": counts, "progress": progress},
             "semantic_enrichment": {
                 "feedback_round": result.get("feedback_round"),
-                "semantic_selector": result.get("semantic_selector"),
-                "semantic_job_counts": result.get("semantic_job_counts") or {},
+                "semantic_selector": result_summary.get("semantic_selector"),
+                "semantic_job_counts": (
+                    (result_summary.get("semantic_graph_state") or {}).get("semantic_job_counts")
+                    if isinstance(result_summary.get("semantic_graph_state"), dict)
+                    else {}
+                ),
             },
             "jobs": jobs,
         }
