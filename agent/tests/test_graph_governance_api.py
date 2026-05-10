@@ -440,6 +440,12 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
     assert payload["ok"] is True
     assert payload["status"] == "queued"
     assert payload["summary"]["by_status"]["ai_pending"] == 1
+    assert payload["summary"]["progress"]["open"] == 1
+    assert payload["operator_request"]["requested_by"] == "dashboard_user"
+    assert payload["operator_request"]["query_source"] == "dashboard"
+    assert payload["operator_request"]["analyzer"]["model"]
+    assert payload["batch_plan"]["target_scope"] == "node"
+    assert payload["batch_plan"]["target_ids"] == ["L7.1"]
 
     listed = server.handle_graph_governance_snapshot_semantic_jobs_list(
         _ctx(
@@ -448,6 +454,7 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
         )
     )
     assert listed["count"] == 1
+    assert listed["summary"]["progress"]["pending"] == 1
     assert listed["jobs"][0]["node_id"] == "L7.1"
     assert listed["jobs"][0]["status"] == "ai_pending"
     assert listed["jobs"][0]["job_id"] == "L7.1"
@@ -480,6 +487,8 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
     assert events["count"] == 2
     assert events["events"][0]["target_type"] == "node"
     assert events["events"][0]["target_id"] == "L7.1"
+    assert events["events"][0]["payload"]["operator_request"]["requested_by"] == "dashboard_user"
+    assert events["events"][0]["payload"]["batch_plan"]["target_ids"] == ["L7.1"]
 
 
 def test_graph_governance_semantic_jobs_endpoint_records_edge_requests_as_events(conn, tmp_path, monkeypatch):
@@ -513,8 +522,11 @@ def test_graph_governance_semantic_jobs_endpoint_records_edge_requests_as_events
     assert status == 202
     assert payload["target_scope"] == "edge"
     assert payload["queued_count"] == 1
+    assert payload["operator_request"]["query_source"] == "dashboard"
+    assert payload["batch_plan"]["target_scope"] == "edge"
     assert payload["events"][0]["event_type"] == "edge_semantic_requested"
     assert payload["events"][0]["target_id"] == "L7.1->L3.1:contains"
+    assert payload["events"][0]["payload"]["operator_request"]["batch_plan"]["target_scope"] == "edge"
 
 
 def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware(conn, monkeypatch):

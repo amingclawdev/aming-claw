@@ -4600,6 +4600,91 @@ def _semantic_job_status_counts(conn, project_id: str, snapshot_id: str) -> dict
     return {str(row["status"] or ""): int(row["count"] or 0) for row in rows}
 
 
+def _semantic_job_progress(counts: dict[str, int]) -> dict[str, object]:
+    total = sum(int(value or 0) for value in counts.values())
+    pending = int(counts.get("ai_pending", 0) or 0) + int(counts.get("pending_ai", 0) or 0)
+    running = int(counts.get("running", 0) or 0)
+    complete = (
+        int(counts.get("ai_complete", 0) or 0)
+        + int(counts.get("complete", 0) or 0)
+        + int(counts.get("succeeded", 0) or 0)
+    )
+    failed = int(counts.get("ai_error", 0) or 0) + int(counts.get("failed", 0) or 0)
+    cancelled = int(counts.get("cancelled", 0) or 0)
+    terminal = complete + failed + cancelled
+    return {
+        "total": total,
+        "pending": pending,
+        "running": running,
+        "complete": complete,
+        "failed": failed,
+        "cancelled": cancelled,
+        "terminal": terminal,
+        "open": pending + running,
+        "completion_ratio": round(terminal / total, 4) if total else 1.0,
+    }
+
+
+def _semantic_jobs_operator_request(
+    body: dict,
+    snapshot_id: str,
+    root: Path,
+    *,
+    target_scope: str,
+    target_ids: list[str],
+    layers: list[str],
+    selector: dict | None = None,
+) -> dict[str, object]:
+    requested_by = str(
+        body.get("actor")
+        or body.get("created_by")
+        or body.get("requested_by")
+        or "dashboard_user"
+    )
+    query_source = str(
+        body.get("query_source")
+        or body.get("source")
+        or body.get("request_source")
+        or "dashboard"
+    )
+    try:
+        from .reconcile_semantic_config import load_semantic_enrichment_config
+
+        config = load_semantic_enrichment_config(
+            project_root=root,
+            config_path=body.get("semantic_config_path"),
+        )
+        analyzer = config.summary()
+    except Exception as exc:  # noqa: BLE001 - metadata should not block queue creation
+        analyzer = {"error": str(exc)}
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    batch_plan = {
+        "target_scope": target_scope,
+        "target_ids": target_ids,
+        "layers": layers,
+        "selector": selector or {},
+        "skip_current": bool(options.get("skip_current", body.get("skip_current", True))),
+        "parallel": bool(body.get("parallel") or body.get("allow_parallel")),
+        "mode": str(body.get("semantic_mode") or options.get("semantic_mode") or "enqueue_only"),
+    }
+    return {
+        "requested_by": requested_by,
+        "query_source": query_source,
+        "snapshot_id": snapshot_id,
+        "projection_id": str(body.get("projection_id") or ""),
+        "analyzer": {
+            "name": analyzer.get("analyzer", ""),
+            "provider": analyzer.get("provider", ""),
+            "model": analyzer.get("model", ""),
+            "role": analyzer.get("role", ""),
+            "source_path": analyzer.get("source_path", ""),
+            "override_path": analyzer.get("override_path", ""),
+            "error": analyzer.get("error", ""),
+        },
+        "batch_plan": batch_plan,
+    }
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs")
 def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
     """List semantic enrichment queue rows for dashboard/job controls."""
@@ -4620,13 +4705,14 @@ def handle_graph_governance_snapshot_semantic_jobs_list(ctx: RequestContext):
             limit=limit,
             offset=offset,
         )
+        counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
         return {
             "ok": True,
             "project_id": project_id,
             "snapshot_id": snapshot_id,
             "count": len(jobs),
             "jobs": jobs,
-            "summary": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+            "summary": {"by_status": counts, "progress": _semantic_job_progress(counts)},
         }
     finally:
         conn.close()
@@ -4766,6 +4852,14 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             edge_targets = _semantic_jobs_edge_targets(body)
             if not edge_targets:
                 raise ValidationError("target_ids, edge_ids, or edges is required for edge semantic jobs")
+            operator_request = _semantic_jobs_operator_request(
+                body,
+                snapshot_id,
+                root,
+                target_scope="edge",
+                target_ids=[edge["edge_id"] for edge in edge_targets],
+                layers=[],
+            )
             with sqlite_write_lock():
                 events = [
                     graph_events.create_event(
@@ -4780,6 +4874,8 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                         payload={
                             "edge": edge.get("edge") or {},
                             "options": body.get("options") if isinstance(body.get("options"), dict) else {},
+                            "operator_request": operator_request,
+                            "batch_plan": operator_request["batch_plan"],
                             "semantic_job_request": {
                                 "target_scope": "edge",
                                 "parallel": bool(body.get("parallel") or body.get("allow_parallel")),
@@ -4799,11 +4895,32 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 "target_scope": "edge",
                 "status": "queued",
                 "queued_count": len(events),
+                "operator_request": operator_request,
+                "batch_plan": operator_request["batch_plan"],
                 "events": events,
                 "summary": {"events_by_status": graph_events.status_counts(conn, project_id, snapshot_id)},
                 "jobs": [],
             }
         enqueue_body = _semantic_jobs_enqueue_body(body)
+        requested_target_ids = _semantic_jobs_target_ids(
+            enqueue_body.get("semantic_node_ids")
+            or body.get("target_ids")
+            or body.get("node_ids")
+            or body.get("node_id")
+        )
+        requested_layers = [
+            str(layer or "").upper()
+            for layer in (enqueue_body.get("semantic_layers") or [])
+            if str(layer or "").strip()
+        ]
+        operator_request = _semantic_jobs_operator_request(
+            body,
+            snapshot_id,
+            root,
+            target_scope=_semantic_jobs_target_scope(body),
+            target_ids=requested_target_ids,
+            layers=requested_layers,
+        )
         try:
             result = semantic.run_semantic_enrichment(
                 conn,
@@ -4832,6 +4949,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
         if not target_ids:
             selector = result.get("semantic_selector") if isinstance(result.get("semantic_selector"), dict) else {}
             target_ids = _semantic_jobs_target_ids(selector.get("node_ids"))
+        operator_request["batch_plan"]["selector"] = result.get("semantic_selector") or {}
         jobs_for_events = _semantic_job_rows(
             conn,
             project_id,
@@ -4854,6 +4972,8 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     feature_hash=str(job.get("feature_hash") or ""),
                     file_hashes=job.get("file_hashes") if isinstance(job.get("file_hashes"), dict) else {},
                     payload={
+                        "operator_request": operator_request,
+                        "batch_plan": operator_request["batch_plan"],
                         "selector": result.get("semantic_selector") or {},
                         "semantic_job_counts": result.get("semantic_job_counts") or {},
                     },
@@ -4871,6 +4991,8 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 target_id=snapshot_id,
                 status="observed",
                 payload={
+                    "operator_request": operator_request,
+                    "batch_plan": operator_request["batch_plan"],
                     "selector": result.get("semantic_selector") or {},
                     "semantic_job_counts": result.get("semantic_job_counts") or {},
                 },
@@ -4884,11 +5006,9 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             snapshot_id,
             limit=int(body.get("limit") or 200),
         )
-        queued_count = sum(
-            1
-            for job in jobs
-            if str(job.get("status") or "") in {"ai_pending", "pending_ai", "running"}
-        )
+        counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
+        progress = _semantic_job_progress(counts)
+        queued_count = int(progress["open"])
         return 202, {
             "ok": True,
             "project_id": project_id,
@@ -4896,7 +5016,9 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             "job_id": f"semantic-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}",
             "status": "queued",
             "queued_count": queued_count,
-            "summary": {"by_status": _semantic_job_status_counts(conn, project_id, snapshot_id)},
+            "operator_request": operator_request,
+            "batch_plan": operator_request["batch_plan"],
+            "summary": {"by_status": counts, "progress": progress},
             "semantic_enrichment": {
                 "feedback_round": result.get("feedback_round"),
                 "semantic_selector": result.get("semantic_selector"),
