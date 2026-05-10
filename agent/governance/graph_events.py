@@ -134,6 +134,10 @@ ALLOWED_EVENT_TYPES = {
     "graph_correction_accepted",
     "graph_correction_rejected",
     "backlog_candidate_requested",
+    "file_attach_requested",
+    "file_node_create_requested",
+    "file_delete_candidate",
+    "file_waived",
 }
 
 GRAPH_MUTATION_EVENT_TYPES = {

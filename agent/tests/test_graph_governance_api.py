@@ -1539,6 +1539,104 @@ def test_graph_governance_summary_exposes_file_hygiene_review_samples(conn, tmp_
     )
 
 
+def test_graph_governance_file_hygiene_actions_create_auditable_events(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-hygiene-actions",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.write_companion_files(
+        PID,
+        snapshot["snapshot_id"],
+        graph_json=_graph(),
+        file_inventory=[
+            {
+                "path": "docs/orphan.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "decision": "pending",
+                "size_bytes": 123,
+            },
+            {
+                "path": "docs/dev/scratch/ai-output.json",
+                "file_kind": "generated",
+                "scan_status": "ignored",
+                "graph_status": "ignored",
+                "decision": "ignore",
+                "size_bytes": 456,
+            },
+        ],
+    )
+    conn.commit()
+
+    status, attached = server.handle_graph_governance_snapshot_file_hygiene_action(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "action": "attach_to_node",
+                "path": "docs/orphan.md",
+                "node_id": "L7.1",
+                "actor": "dashboard-user",
+            },
+        )
+    )
+    assert status == 201
+    assert attached["event"]["event_type"] == "doc_binding_added"
+    assert attached["event"]["target_type"] == "node"
+    assert attached["event"]["target_id"] == "L7.1"
+    assert attached["event"]["payload"]["files"] == ["docs/orphan.md"]
+    assert attached["event"]["payload"]["destructive_mutation_performed"] is False
+
+    with pytest.raises(ValidationError, match="confirm_delete_candidate"):
+        server.handle_graph_governance_snapshot_file_hygiene_action(
+            _ctx(
+                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+                method="POST",
+                body={
+                    "action": "delete_candidate",
+                    "path": "docs/dev/scratch/ai-output.json",
+                    "actor": "dashboard-user",
+                },
+            )
+        )
+
+    status, delete_candidate = server.handle_graph_governance_snapshot_file_hygiene_action(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "action": "delete_candidate",
+                "path": "docs/dev/scratch/ai-output.json",
+                "confirm_delete_candidate": True,
+                "actor": "dashboard-user",
+            },
+        )
+    )
+    assert status == 201
+    assert delete_candidate["event"]["event_type"] == "file_delete_candidate"
+    assert delete_candidate["event"]["target_type"] == "file"
+    assert delete_candidate["event"]["target_id"] == "docs/dev/scratch/ai-output.json"
+    assert delete_candidate["event"]["risk_level"] == "high"
+    assert delete_candidate["event"]["payload"]["destructive_mutation_performed"] is False
+
+
 def test_graph_governance_query_trace_api_records_source_and_events(conn):
     snapshot = store.create_graph_snapshot(
         conn,

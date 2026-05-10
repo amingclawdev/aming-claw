@@ -2646,6 +2646,145 @@ def handle_graph_governance_snapshot_files(ctx: RequestContext):
         conn.close()
 
 
+_FILE_HYGIENE_ACTIONS = {
+    "attach_to_node",
+    "create_node",
+    "delete_candidate",
+    "waive",
+    "file_backlog",
+}
+
+
+def _file_hygiene_event_type(action: str, file_kind: str, node_id: str = "") -> str:
+    if action == "attach_to_node" and node_id:
+        if file_kind in {"doc", "index_doc"}:
+            return "doc_binding_added"
+        if file_kind == "test":
+            return "test_binding_added"
+        if file_kind == "config":
+            return "config_binding_added"
+    return {
+        "attach_to_node": "file_attach_requested",
+        "create_node": "file_node_create_requested",
+        "delete_candidate": "file_delete_candidate",
+        "waive": "file_waived",
+        "file_backlog": "backlog_candidate_requested",
+    }[action]
+
+
+def _find_file_inventory_row(files_result: dict, path: str) -> dict:
+    for row in files_result.get("files") or []:
+        if str(row.get("path") or "") == path:
+            return dict(row)
+    return {}
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/actions")
+def handle_graph_governance_snapshot_file_hygiene_action(ctx: RequestContext):
+    """Turn dashboard file-hygiene actions into auditable graph events.
+
+    This endpoint intentionally does not mutate or delete files.  Even a
+    delete candidate is recorded as a high-risk proposed event so the existing
+    event review / backlog / materialization flow remains the control point.
+    """
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    action = str(body.get("action") or "").strip().lower()
+    path = str(body.get("path") or body.get("file_path") or "").strip().replace("\\", "/")
+    node_id = str(body.get("node_id") or body.get("target_node_id") or "").strip()
+    if action not in _FILE_HYGIENE_ACTIONS:
+        raise ValidationError(f"unsupported file hygiene action: {action}")
+    if not path:
+        raise ValidationError("path is required")
+    if action == "delete_candidate" and not bool(
+        body.get("confirm_delete_candidate") or body.get("operator_signoff")
+    ):
+        raise ValidationError("delete_candidate requires confirm_delete_candidate=true")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.file-hygiene.action")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        files_result = store.list_graph_snapshot_files(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=1000,
+            path_contains=path,
+        )
+        row = _find_file_inventory_row(files_result, path)
+        if not row:
+            raise ValidationError(f"file inventory row not found: {path}")
+
+        file_kind = str(row.get("file_kind") or "unknown")
+        event_type = _file_hygiene_event_type(action, file_kind, node_id=node_id)
+        target_type = "node" if event_type.endswith("_binding_added") else "file"
+        target_id = node_id if target_type == "node" else path
+        risk = "high" if action == "delete_candidate" else "medium" if action == "create_node" else "low"
+        payload = {
+            "action": action,
+            "path": path,
+            "files": [path],
+            "target_files": [path],
+            "file_inventory": row,
+            "target_node_id": node_id,
+            "title": str(body.get("title") or f"File hygiene action: {action} {path}"),
+            "user_text": str(body.get("user_text") or body.get("reason") or ""),
+            "destructive_mutation_performed": False,
+        }
+        payload.update(body.get("payload") if isinstance(body.get("payload"), dict) else {})
+        precondition = {
+            "snapshot_id": snapshot_id,
+            "expected_file_path": path,
+            "expected_file_kind": file_kind,
+            "expected_scan_status": str(row.get("scan_status") or ""),
+            "expected_graph_status": str(row.get("graph_status") or ""),
+        }
+        if target_type == "node":
+            precondition["node_exists"] = True
+        with sqlite_write_lock():
+            try:
+                event = graph_events.create_event(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    event_type=event_type,
+                    event_kind="proposed_event",
+                    target_type=target_type,
+                    target_id=target_id,
+                    status=graph_events.EVENT_STATUS_PROPOSED,
+                    risk_level=risk,
+                    confidence=float(body.get("confidence") or 0.8),
+                    payload=payload,
+                    precondition=precondition,
+                    evidence={
+                        "source": "file_hygiene_action_api",
+                        "action": action,
+                        "actor": body.get("actor", "dashboard-user"),
+                    },
+                    created_by=str(body.get("actor") or "dashboard-user"),
+                )
+            except (KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return 201, {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "action": action,
+            "event": event,
+            "file": row,
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/dashboard-review")
 def handle_graph_governance_snapshot_dashboard_review(ctx: RequestContext):
     """Return a dashboard-ready bundle with two graph views and review state."""
