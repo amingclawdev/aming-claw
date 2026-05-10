@@ -1443,6 +1443,55 @@ def claim_semantic_jobs(
     }
 
 
+def _projection_current_node_ids(
+    conn: sqlite3.Connection,
+    project_id: str,
+    base_snapshot_id: str | None,
+) -> set[str]:
+    """Return node ids the base snapshot's projection considers semantic-current.
+
+    Used by `run_semantic_enrichment` to avoid spuriously re-enqueuing
+    `ai_pending` rows for nodes that the base projection already labels
+    `semantic_current` or `semantic_carried_forward_current`. Without this
+    filter, every dashboard scope-reconcile click queued ~90 phantom rows
+    because the legacy per-snapshot persistent layer (state.json /
+    graph_semantic_nodes) only stored the freshly enriched subset, while the
+    projection (event-derived) carried the full chain forward by feature_hash.
+
+    See OPT-BACKLOG-PENDING-SCOPE-PHANTOM-NODES-REQUEUE (MF-2026-05-10-015).
+    Long-term cleanup tracked under OPT-BACKLOG-DEPRECATE-GRAPH-SEMANTIC-NODES.
+    """
+    base_snapshot_id = str(base_snapshot_id or "").strip()
+    if not base_snapshot_id:
+        return set()
+    try:
+        from . import graph_events  # local import to avoid module cycle
+    except Exception:
+        return set()
+    try:
+        proj = graph_events.get_semantic_projection(conn, project_id, base_snapshot_id)
+    except Exception:
+        return set()
+    if not isinstance(proj, dict):
+        return set()
+    node_semantics = (
+        proj.get("projection", {}).get("node_semantics")
+        if isinstance(proj.get("projection"), dict)
+        else None
+    )
+    if not isinstance(node_semantics, dict):
+        return set()
+    current_ids: set[str] = set()
+    for nid, entry in node_semantics.items():
+        if not isinstance(entry, dict):
+            continue
+        validity = entry.get("validity") if isinstance(entry.get("validity"), dict) else {}
+        status = str(validity.get("status") or "").strip().lower()
+        if status in {"semantic_current", "semantic_carried_forward_current"}:
+            current_ids.add(str(nid))
+    return current_ids
+
+
 def _carry_forward_semantic_graph_state(
     state: dict[str, Any],
     base_state: dict[str, Any],
@@ -2534,11 +2583,22 @@ def run_semantic_enrichment(
         str(record["feature"].get("node_id") or "")
         for record in allowed_records
     }
+    # MF-2026-05-10-015: load the base projection's current-node set so
+    # we don't spuriously re-enqueue phantom-current carried_forward nodes.
+    projection_current_ids = _projection_current_node_ids(
+        conn, project_id, semantic_base_snapshot_id
+    ) if semantic_state_enabled else set()
     if semantic_state_enabled:
         for record in records:
             if not record.get("selected_for_ai"):
                 continue
             node_id = str(record["feature"].get("node_id") or "")
+            # MF-2026-05-10-015: skip nodes the base projection already labels
+            # current/carried-forward-current. The legacy persistent layer
+            # (state.json) doesn't see those phantoms; without this filter
+            # every reconcile re-queues ~90 ai_pending rows for unchanged code.
+            if node_id and node_id in projection_current_ids:
+                continue
             if effective_use_ai and node_id in allowed_node_ids:
                 job_status = "pending_ai"
             elif effective_use_ai:
