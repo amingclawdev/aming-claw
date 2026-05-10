@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.governance import graph_events
 from agent.governance import graph_snapshot_store as store
 from agent.governance.db import _ensure_schema
 from agent.governance.state_reconcile import (
@@ -361,6 +362,19 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/service.py"]
     assert selector["match_mode"] == "primary"
+    assert result["scope_graph_events"]["by_type"]["file_hash_changed"] == 1
+    events = graph_events.list_events(
+        conn,
+        PID,
+        "scope-delta-test",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["file_hash_changed"],
+    )
+    assert len(events) == 1
+    assert events[0]["event_kind"] == "scope_reconcile"
+    assert events[0]["target_type"] == "node"
+    assert events[0]["target_commit"] == head_commit
+    assert events[0]["payload"]["files"] == ["agent/service.py"]
 
 
 def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, tmp_path):
@@ -427,6 +441,7 @@ def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, t
     assert selector["match_mode"] == "primary"
     assert result["semantic_enrichment"]["ai_selected_count"] == 0
     assert seen_nodes == []
+    assert result["scope_graph_events"]["event_count"] == 0
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(

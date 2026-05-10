@@ -8,11 +8,13 @@ snapshot becomes active.
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
 
+from agent.governance import graph_events
 from agent.governance.graph_snapshot_store import (
     PENDING_STATUS_FAILED,
     PENDING_STATUS_QUEUED,
@@ -216,6 +218,283 @@ def _build_scope_file_delta(
         "impacted_files": impacted,
         "changed_file_count": len(changed),
         "impacted_file_count": len(impacted),
+    }
+
+
+def _read_snapshot_graph(project_id: str, snapshot_id: str) -> dict[str, Any]:
+    if not snapshot_id:
+        return {}
+    try:
+        payload = json.loads(snapshot_graph_path(project_id, snapshot_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
+    deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
+    if isinstance(deps, dict) and isinstance(deps.get("nodes"), list):
+        return [node for node in deps.get("nodes", []) if isinstance(node, dict)]
+    nodes = graph_json.get("nodes") if isinstance(graph_json, dict) else []
+    if isinstance(nodes, list):
+        return [node for node in nodes if isinstance(node, dict)]
+    if isinstance(nodes, dict):
+        out: list[dict[str, Any]] = []
+        for node_id, node in nodes.items():
+            item = dict(node) if isinstance(node, dict) else {}
+            item.setdefault("id", node_id)
+            out.append(item)
+        return out
+    return []
+
+
+def _node_id(node: dict[str, Any]) -> str:
+    return str(node.get("id") or node.get("node_id") or "")
+
+
+def _node_metadata(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata")
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _node_parent(node: dict[str, Any]) -> str:
+    metadata = _node_metadata(node)
+    return str(metadata.get("hierarchy_parent") or node.get("parent") or node.get("parent_id") or "")
+
+
+def _path_values(node: dict[str, Any], key: str) -> list[str]:
+    aliases = {
+        "primary": ("primary", "primary_files"),
+        "secondary": ("secondary", "secondary_files"),
+        "test": ("test", "test_files"),
+        "config": ("config", "config_files"),
+    }.get(key, (key,))
+    out: list[str] = []
+    seen: set[str] = set()
+    metadata = _node_metadata(node)
+    for alias in aliases:
+        raw = node.get(alias)
+        if raw is None and alias.endswith("_files"):
+            raw = metadata.get(alias)
+        values = raw if isinstance(raw, list) else [raw] if raw else []
+        for value in values:
+            path = str(value or "").replace("\\", "/").strip("/")
+            if path and path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
+
+
+def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
+    metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
+    return (
+        str(edge.get("source") or edge.get("from") or ""),
+        str(edge.get("target") or edge.get("to") or ""),
+        str(edge.get("type") or edge.get("relation") or edge.get("relation_type") or ""),
+        str(metadata.get("edge_kind") or edge.get("kind") or ""),
+    )
+
+
+def _scope_event_id(event_type: str, target_type: str, target_id: str, payload: dict[str, Any]) -> str:
+    raw = json.dumps(
+        {
+            "event_type": event_type,
+            "target_type": target_type,
+            "target_id": target_id,
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"scope-{event_type}-{digest}"
+
+
+def _emit_scope_graph_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    old_snapshot_id: str,
+    new_snapshot_id: str,
+    old_graph_json: dict[str, Any],
+    new_graph_json: dict[str, Any],
+    scope_file_delta: dict[str, Any],
+    baseline_commit: str,
+    target_commit: str,
+    created_by: str,
+) -> dict[str, Any]:
+    graph_events.ensure_schema(conn)
+    old_nodes = {_node_id(node): node for node in _graph_nodes(old_graph_json) if _node_id(node)}
+    new_nodes = {_node_id(node): node for node in _graph_nodes(new_graph_json) if _node_id(node)}
+    changed_files = {
+        str(path or "").replace("\\", "/").strip("/")
+        for path in scope_file_delta.get("hash_changed_files", [])
+        if str(path or "").strip()
+    }
+    emitted: list[dict[str, Any]] = []
+
+    def emit(
+        event_type: str,
+        target_type: str,
+        target_id: str,
+        payload: dict[str, Any],
+        *,
+        stable_node_key: str = "",
+        feature_hash: str = "",
+        file_hashes: dict[str, Any] | None = None,
+    ) -> None:
+        event = graph_events.create_event(
+            conn,
+            project_id,
+            new_snapshot_id,
+            event_type=event_type,
+            event_kind="scope_reconcile",
+            target_type=target_type,
+            target_id=target_id,
+            status=graph_events.EVENT_STATUS_OBSERVED,
+            confidence=1.0,
+            baseline_commit=baseline_commit,
+            target_commit=target_commit,
+            stable_node_key=stable_node_key,
+            feature_hash=feature_hash,
+            file_hashes=file_hashes or {},
+            payload=payload,
+            evidence={
+                "source": "scope_reconcile",
+                "old_snapshot_id": old_snapshot_id,
+                "new_snapshot_id": new_snapshot_id,
+            },
+            created_by=created_by,
+            event_id=_scope_event_id(event_type, target_type, target_id, payload),
+        )
+        emitted.append(event)
+
+    old_ids = set(old_nodes)
+    new_ids = set(new_nodes)
+    for node_id in sorted(new_ids - old_ids):
+        node = new_nodes[node_id]
+        metadata = _node_metadata(node)
+        emit(
+            "node_added",
+            "node",
+            node_id,
+            {
+                "node_id": node_id,
+                "title": node.get("title") or "",
+                "layer": node.get("layer") or "",
+                "primary": _path_values(node, "primary"),
+                "hierarchy_parent": _node_parent(node),
+            },
+            stable_node_key=str(metadata.get("stable_node_key") or ""),
+            feature_hash=str(metadata.get("feature_hash") or ""),
+        )
+    for node_id in sorted(old_ids - new_ids):
+        node = old_nodes[node_id]
+        emit(
+            "node_removed",
+            "node",
+            node_id,
+            {
+                "node_id": node_id,
+                "title": node.get("title") or "",
+                "layer": node.get("layer") or "",
+                "primary": _path_values(node, "primary"),
+                "hierarchy_parent": _node_parent(node),
+            },
+        )
+
+    binding_events = {
+        "secondary": ("doc_binding_added", "doc_binding_removed"),
+        "test": ("test_binding_added", "test_binding_removed"),
+        "config": ("config_binding_added", "config_binding_removed"),
+    }
+    for node_id in sorted(old_ids & new_ids):
+        old_node = old_nodes[node_id]
+        new_node = new_nodes[node_id]
+        old_parent = _node_parent(old_node)
+        new_parent = _node_parent(new_node)
+        if old_parent != new_parent:
+            emit(
+                "node_reparented",
+                "node",
+                node_id,
+                {"node_id": node_id, "old_parent": old_parent, "new_parent": new_parent},
+            )
+        primary_changed = sorted(set(_path_values(new_node, "primary")).intersection(changed_files))
+        if primary_changed:
+            metadata = _node_metadata(new_node)
+            emit(
+                "file_hash_changed",
+                "node",
+                node_id,
+                {"node_id": node_id, "files": primary_changed, "file_role": "primary"},
+                stable_node_key=str(metadata.get("stable_node_key") or ""),
+                feature_hash=str(metadata.get("feature_hash") or ""),
+            )
+        old_meta = _node_metadata(old_node)
+        new_meta = _node_metadata(new_node)
+        if new_meta.get("exclude_as_feature") is True and old_meta.get("exclude_as_feature") is not True:
+            emit(
+                "package_marker_excluded",
+                "node",
+                node_id,
+                {
+                    "node_id": node_id,
+                    "primary": _path_values(new_node, "primary"),
+                    "file_role": new_meta.get("file_role") or "",
+                },
+            )
+        for key, (added_type, removed_type) in binding_events.items():
+            old_paths = set(_path_values(old_node, key))
+            new_paths = set(_path_values(new_node, key))
+            for path in sorted(new_paths - old_paths):
+                emit(added_type, "node", node_id, {"node_id": node_id, "path": path, "binding": key})
+            for path in sorted(old_paths - new_paths):
+                emit(removed_type, "node", node_id, {"node_id": node_id, "path": path, "binding": key})
+
+    old_edges = {_edge_key(edge): edge for edge in graph_payload_edges(old_graph_json) if _edge_key(edge)[:3] != ("", "", "")}
+    new_edges = {_edge_key(edge): edge for edge in graph_payload_edges(new_graph_json) if _edge_key(edge)[:3] != ("", "", "")}
+    for key in sorted(set(new_edges) - set(old_edges)):
+        source, target, relation, edge_kind = key
+        emit(
+            "edge_added",
+            "edge",
+            f"{source}->{target}:{relation}",
+            {
+                "source": source,
+                "target": target,
+                "relation_type": relation,
+                "edge_kind": edge_kind,
+                "edge": new_edges[key],
+            },
+        )
+    for key in sorted(set(old_edges) - set(new_edges)):
+        source, target, relation, edge_kind = key
+        emit(
+            "edge_removed",
+            "edge",
+            f"{source}->{target}:{relation}",
+            {
+                "source": source,
+                "target": target,
+                "relation_type": relation,
+                "edge_kind": edge_kind,
+                "edge": old_edges[key],
+            },
+        )
+
+    by_type: dict[str, int] = {}
+    for event in emitted:
+        event_type = str(event.get("event_type") or "")
+        by_type[event_type] = by_type.get(event_type, 0) + 1
+    return {
+        "enabled": True,
+        "event_count": len(emitted),
+        "by_type": dict(sorted(by_type.items())),
+        "snapshot_id": new_snapshot_id,
+        "old_snapshot_id": old_snapshot_id,
+        "target_commit": target_commit,
     }
 
 
@@ -953,6 +1232,9 @@ def run_pending_scope_reconcile_candidate(
         new_rows=_snapshot_inventory_rows(conn, project_id, sid),
         changed_files=changed_files,
     )
+    old_graph_json = _read_snapshot_graph(project_id, str(active.get("snapshot_id") or ""))
+    new_graph_json = _read_snapshot_graph(project_id, sid)
+    scope_event_summary: dict[str, Any] = {}
     pending_notes = {
         "covered_commit_shas": covered,
         "covered_commit_count": len(covered),
@@ -965,6 +1247,19 @@ def run_pending_scope_reconcile_candidate(
         (project_id, sid),
     ).fetchone()
     with sqlite_write_lock():
+        scope_event_summary = _emit_scope_graph_events(
+            conn,
+            project_id,
+            old_snapshot_id=str(active.get("snapshot_id") or ""),
+            new_snapshot_id=sid,
+            old_graph_json=old_graph_json,
+            new_graph_json=new_graph_json,
+            scope_file_delta=scope_file_delta,
+            baseline_commit=str(active.get("commit_sha") or ""),
+            target_commit=target,
+            created_by=created_by,
+        )
+        pending_notes["scope_graph_events"] = scope_event_summary
         updated = _update_pending_scope_candidate(
             conn,
             project_id,
@@ -991,6 +1286,7 @@ def run_pending_scope_reconcile_candidate(
         "covered_pending_count": len(covered),
         "pending_rows_bound": updated,
         "scope_file_delta": scope_file_delta,
+        "scope_graph_events": scope_event_summary,
         "active_snapshot_id": active.get("snapshot_id", ""),
         "active_graph_commit": active.get("commit_sha", ""),
     }
