@@ -4374,6 +4374,42 @@ def handle_graph_governance_snapshot_events_materialize(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/events/materialize/preview")
+def handle_graph_governance_snapshot_events_materialize_preview(ctx: RequestContext):
+    """Preview graph-event materialization without mutating events or snapshots."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_events
+
+    raw_ids = body.get("event_ids")
+    if raw_ids is None and body.get("event_id"):
+        raw_ids = [body.get("event_id")]
+    event_ids = _semantic_jobs_target_ids(raw_ids) if raw_ids is not None else []
+    raw_statuses = body.get("statuses") or body.get("status")
+    statuses = _semantic_jobs_target_ids(raw_statuses) if raw_statuses is not None else []
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.events.materialize.preview")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        try:
+            result = graph_events.preview_events(
+                conn,
+                project_id,
+                snapshot_id,
+                event_ids=event_ids or None,
+                statuses=statuses or None,
+                actor=str(body.get("actor") or "observer"),
+                include_graph=bool(body.get("include_graph") or body.get("include_preview_graph")),
+            )
+        except (KeyError, ValueError) as exc:
+            _raise_graph_api_validation(exc)
+        return {"ok": not result.get("errors"), **result}
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/events/backfill")
 def handle_graph_governance_snapshot_semantic_events_backfill(ctx: RequestContext):
     """Import existing semantic cache rows into graph_events as immutable evidence."""

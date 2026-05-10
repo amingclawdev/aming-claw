@@ -959,6 +959,202 @@ def _mark_semantic_stale(
     return int(cur.rowcount or 0)
 
 
+def _select_events_for_apply_or_preview(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    event_ids: Iterable[str] | None = None,
+    statuses: Iterable[str] | None = None,
+    default_status: str | None = EVENT_STATUS_ACCEPTED,
+) -> list[dict[str, Any]]:
+    requested_ids = [str(item or "").strip() for item in event_ids or [] if str(item or "").strip()]
+    status_values = [str(item or "").strip() for item in statuses or [] if str(item or "").strip()]
+    if not status_values and default_status:
+        status_values = [default_status]
+    params: list[Any] = [project_id, snapshot_id]
+    sql = "SELECT * FROM graph_events WHERE project_id = ? AND snapshot_id = ?"
+    if requested_ids:
+        sql += " AND event_id IN (" + ",".join("?" for _ in requested_ids) + ")"
+        params.extend(requested_ids)
+    if status_values:
+        sql += " AND status IN (" + ",".join("?" for _ in status_values) + ")"
+        params.extend(status_values)
+    sql += " ORDER BY event_seq ASC"
+    return [_row_to_event(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def _node_preview_summary(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    return {
+        "node_id": _node_id(node),
+        "title": node.get("title", ""),
+        "layer": node.get("layer", ""),
+        "kind": node.get("kind", ""),
+        "primary_files": _node_files(node, "primary"),
+        "secondary_files": _node_files(node, "secondary"),
+        "test_files": _node_files(node, "test"),
+        "config_files": _node_files(node, "config"),
+        "hierarchy_parent": metadata.get("hierarchy_parent") or metadata.get("parent_id") or "",
+        "file_role": metadata.get("file_role", ""),
+        "exclude_as_feature": bool(metadata.get("exclude_as_feature")),
+        "quality_flags": _string_list(metadata.get("quality_flags")),
+    }
+
+
+def _node_preview_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    fields = [
+        "title",
+        "layer",
+        "kind",
+        "primary_files",
+        "secondary_files",
+        "test_files",
+        "config_files",
+        "hierarchy_parent",
+        "file_role",
+        "exclude_as_feature",
+        "quality_flags",
+    ]
+    changed = [
+        field for field in fields
+        if before.get(field) != after.get(field)
+    ]
+    return {
+        "node_id": after.get("node_id") or before.get("node_id") or "",
+        "changed_fields": changed,
+        "before": {field: before.get(field) for field in changed},
+        "after": {field: after.get(field) for field in changed},
+    }
+
+
+def _edge_preview_summary(edge: dict[str, Any]) -> dict[str, Any]:
+    src, dst, edge_type, direction = _edge_key(edge)
+    return {
+        "edge_id": f"{src}->{dst}:{edge_type}" if src and dst else "",
+        "src": src,
+        "dst": dst,
+        "edge_type": edge_type,
+        "direction": direction,
+    }
+
+
+def _graph_preview_diff(before_graph: dict[str, Any], after_graph: dict[str, Any]) -> dict[str, Any]:
+    before_nodes = {_node_id(node): _node_preview_summary(node) for node in _graph_nodes(before_graph)}
+    after_nodes = {_node_id(node): _node_preview_summary(node) for node in _graph_nodes(after_graph)}
+    before_edges = {_edge_key(edge): _edge_preview_summary(edge) for edge in store.graph_payload_edges(before_graph)}
+    after_edges = {_edge_key(edge): _edge_preview_summary(edge) for edge in store.graph_payload_edges(after_graph)}
+    added_node_ids = sorted(set(after_nodes) - set(before_nodes))
+    removed_node_ids = sorted(set(before_nodes) - set(after_nodes))
+    changed_nodes = [
+        diff for node_id in sorted(set(before_nodes).intersection(after_nodes))
+        if (diff := _node_preview_diff(before_nodes[node_id], after_nodes[node_id]))["changed_fields"]
+    ]
+    added_edges = [after_edges[key] for key in sorted(set(after_edges) - set(before_edges))]
+    removed_edges = [before_edges[key] for key in sorted(set(before_edges) - set(after_edges))]
+    return {
+        "nodes": {
+            "added_count": len(added_node_ids),
+            "removed_count": len(removed_node_ids),
+            "changed_count": len(changed_nodes),
+            "added": [after_nodes[node_id] for node_id in added_node_ids[:100]],
+            "removed": [before_nodes[node_id] for node_id in removed_node_ids[:100]],
+            "changed": changed_nodes[:200],
+        },
+        "edges": {
+            "added_count": len(added_edges),
+            "removed_count": len(removed_edges),
+            "added": added_edges[:200],
+            "removed": removed_edges[:200],
+        },
+    }
+
+
+def preview_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    event_ids: Iterable[str] | None = None,
+    statuses: Iterable[str] | None = None,
+    actor: str = "observer",
+    include_graph: bool = False,
+) -> dict[str, Any]:
+    """Preview graph event materialization without changing DB state."""
+    ensure_schema(conn)
+    snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+    if not snapshot:
+        raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
+    requested_ids = [str(item or "").strip() for item in event_ids or [] if str(item or "").strip()]
+    events = _select_events_for_apply_or_preview(
+        conn,
+        project_id,
+        snapshot_id,
+        event_ids=requested_ids or None,
+        statuses=statuses,
+        default_status=None if requested_ids else EVENT_STATUS_ACCEPTED,
+    )
+    materializable = [event for event in events if str(event.get("event_type") or "") in GRAPH_MUTATION_EVENT_TYPES]
+    original_graph = _load_graph_json(project_id, snapshot_id)
+    preview_graph = copy.deepcopy(original_graph)
+    applied: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    impacted: set[str] = set()
+    for event in events:
+        if str(event.get("event_type") or "") not in GRAPH_MUTATION_EVENT_TYPES:
+            skipped.append({
+                "event_id": event.get("event_id", ""),
+                "event_type": event.get("event_type", ""),
+                "reason": "not_graph_mutation_event",
+            })
+            continue
+        try:
+            precondition = _precondition_error(preview_graph, event, snapshot_id=snapshot_id)
+            if precondition:
+                errors.append({
+                    "event_id": event.get("event_id", ""),
+                    "event_type": event.get("event_type", ""),
+                    "error": precondition,
+                    "would_status": EVENT_STATUS_STALE,
+                })
+                continue
+            result = _apply_event(preview_graph, event)
+        except Exception as exc:  # noqa: BLE001 - preview reports event-specific errors
+            errors.append({
+                "event_id": event.get("event_id", ""),
+                "event_type": event.get("event_type", ""),
+                "error": str(exc),
+                "would_status": EVENT_STATUS_FAILED,
+            })
+            continue
+        applied.append(result)
+        impacted.update(result.get("impacted_node_ids") or [])
+    diff = _graph_preview_diff(original_graph, preview_graph)
+    result = {
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "commit_sha": snapshot.get("commit_sha", ""),
+        "actor": actor,
+        "requested_event_ids": requested_ids,
+        "selected_event_count": len(events),
+        "materializable_event_count": len(materializable),
+        "would_materialize_count": len(applied),
+        "would_error_count": len(errors),
+        "would_skip_count": len(skipped),
+        "would_create_snapshot": bool(applied),
+        "would_mark_semantic_stale_count": len(impacted),
+        "impacted_node_ids": sorted(impacted),
+        "applied": applied,
+        "errors": errors,
+        "skipped": skipped,
+        "diff": diff,
+    }
+    if include_graph:
+        result["preview_graph"] = preview_graph
+    return result
+
+
 def materialize_events(
     conn: sqlite3.Connection,
     project_id: str,
@@ -974,27 +1170,14 @@ def materialize_events(
     if not snapshot:
         raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
     requested_ids = [str(item or "").strip() for item in event_ids or [] if str(item or "").strip()]
-    if requested_ids:
-        placeholders = ",".join("?" for _ in requested_ids)
-        rows = conn.execute(
-            f"""
-            SELECT * FROM graph_events
-            WHERE project_id = ? AND snapshot_id = ? AND event_id IN ({placeholders})
-              AND status = ?
-            ORDER BY event_seq ASC
-            """,
-            (project_id, snapshot_id, *requested_ids, EVENT_STATUS_ACCEPTED),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM graph_events
-            WHERE project_id = ? AND snapshot_id = ? AND status = ?
-            ORDER BY event_seq ASC
-            """,
-            (project_id, snapshot_id, EVENT_STATUS_ACCEPTED),
-        ).fetchall()
-    events = [_row_to_event(row) for row in rows]
+    events = _select_events_for_apply_or_preview(
+        conn,
+        project_id,
+        snapshot_id,
+        event_ids=requested_ids or None,
+        statuses=[EVENT_STATUS_ACCEPTED],
+        default_status=EVENT_STATUS_ACCEPTED,
+    )
     graph_events = [event for event in events if str(event.get("event_type") or "") in GRAPH_MUTATION_EVENT_TYPES]
     if not graph_events:
         return {
@@ -1858,6 +2041,7 @@ __all__ = [
     "list_events",
     "mark_backlog_filed",
     "materialize_events",
+    "preview_events",
     "refine_event",
     "status_counts",
     "stable_node_key_for_node",

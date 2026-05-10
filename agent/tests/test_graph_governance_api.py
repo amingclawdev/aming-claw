@@ -1021,6 +1021,70 @@ def test_graph_governance_events_lifecycle_and_materialize_candidate_snapshot(co
     assert semantic_row["status"] == "semantic_stale"
 
 
+def test_graph_governance_materialize_preview_does_not_mutate_events_or_snapshots(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-events-preview-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    status, created = server.handle_graph_governance_snapshot_events_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "event_type": "node_rename_proposed",
+                "target_type": "node",
+                "target_id": "L7.1",
+                "payload": {"new_title": "Previewed Feature"},
+                "actor": "dashboard_user",
+            },
+        )
+    )
+    assert status == 201
+    event_id = created["event"]["event_id"]
+
+    preview = server.handle_graph_governance_snapshot_events_materialize_preview(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "event_id": event_id},
+        )
+    )
+
+    assert preview["ok"] is True
+    assert preview["would_create_snapshot"] is True
+    assert preview["would_materialize_count"] == 1
+    assert preview["diff"]["nodes"]["changed_count"] == 1
+    assert preview["diff"]["nodes"]["changed"][0]["after"]["title"] == "Previewed Feature"
+    event = graph_events.get_event(conn, PID, snapshot["snapshot_id"], event_id)
+    assert event["status"] == graph_events.EVENT_STATUS_PROPOSED
+    rows = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM graph_snapshots
+        WHERE project_id=? AND parent_snapshot_id=?
+        """,
+        (PID, snapshot["snapshot_id"]),
+    ).fetchone()
+    assert rows["count"] == 0
+
+
 def test_graph_governance_dashboard_api_summarizes_active_state(conn):
     snapshot = store.create_graph_snapshot(
         conn,
