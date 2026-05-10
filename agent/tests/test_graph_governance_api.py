@@ -725,9 +725,11 @@ def test_graph_governance_edge_semantic_jobs_auto_enrich_and_controls(conn, tmp_
         "edge_semantic_requested",
         "edge_semantic_enriched",
     ]
-    assert payload["jobs"][0]["status"] == "ai_complete"
+    assert payload["jobs"][0]["status"] == "rule_complete"
     assert payload["jobs"][0]["semantic"]["relation_purpose"] == "L7.1 depends on L7.2."
     assert payload["jobs"][0]["semantic"]["analyzer_role"] == "reconcile_edge_semantic_analyzer"
+    assert payload["jobs"][0]["semantic_source"] == "edge_semantic_rule"
+    assert payload["jobs"][0]["requires_ai"] is True
 
     projected = server.handle_graph_governance_snapshot_semantic_projection_build(
         _ctx(
@@ -736,14 +738,20 @@ def test_graph_governance_edge_semantic_jobs_auto_enrich_and_controls(conn, tmp_
             body={"actor": "observer", "projection_id": "semproj-edge-auto-runner"},
         )
     )
-    assert projected["health"]["edge_semantic_current_count"] == 1
-    assert projected["health"]["edge_semantic_missing_count"] == 0
+    assert projected["health"]["edge_semantic_current_count"] == 0
+    assert projected["health"]["edge_semantic_rule_count"] == 1
+    assert projected["health"]["edge_semantic_missing_count"] == 1
+    assert projected["health"]["edge_semantic_needs_ai_count"] == 1
+    assert projected["health"]["edge_semantic_payload_current_count"] == 1
+    assert projected["health"]["edge_semantic_coverage_ratio"] == 0.0
+    assert projected["health"]["edge_semantic_payload_coverage_ratio"] == 1.0
 
     queue = server.handle_graph_governance_operations_queue(
         _ctx({"project_id": PID}, query={"snapshot_id": snapshot["snapshot_id"]})
     )
     operations = {row["operation_type"]: row for row in queue["operations"]}
-    assert operations["edge_semantic"]["status"] == "complete"
+    assert operations["edge_semantic"]["status"] == "rule_complete"
+    assert "run_edge_semantics" in operations["edge_semantic"]["supported_actions"]
     assert "retry" in operations["edge_semantic"]["supported_actions"]
     assert "edge-semantic:not-queued" not in {row["operation_id"] for row in queue["operations"]}
 

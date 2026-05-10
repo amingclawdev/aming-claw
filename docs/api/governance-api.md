@@ -535,8 +535,12 @@ semantic drift is exposed as `edge_semantic` operations:
   and `file_backlog`.
 - Pending edge rows come from `edge_semantic_requested` graph events and report
   status `ai_pending`.
-- Completed edge rows come from `edge_semantic_enriched` graph events and report
-  status `complete`.
+- Trusted completed edge rows come from `edge_semantic_enriched` graph events
+  with AI or explicit semantic payloads and report status `complete`.
+- Rule-filled edge rows whose payload evidence source is `edge_semantic_rule`
+  report status `rule_complete`. They are deterministic fallback coverage, not
+  trusted/current AI edge semantics, and remain actionable via
+  `run_edge_semantics`.
 
 To queue or run edge semantic work, call:
 
@@ -556,11 +560,14 @@ POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs
 ```
 
 Without `semantic_mode: "auto"`, the endpoint records
-`edge_semantic_requested` events only. With auto mode, the backend also emits
-`edge_semantic_enriched` events using the edge semantic analyzer profile and a
-state-only semantic payload. The projection endpoint then updates
-`edge_semantic_current_count`, `edge_semantic_requested_count`, and
-`edge_semantic_missing_count` without mutating graph topology.
+`edge_semantic_requested` events only. With auto mode, the backend may also emit
+`edge_semantic_enriched` events using deterministic `edge_semantic_rule`
+payloads when no trusted AI/explicit payload is available. The projection keeps
+these separate: `edge_semantic_current_count` is trusted AI/explicit current
+coverage, `edge_semantic_rule_count` is rule fallback coverage,
+`edge_semantic_payload_current_count` is trusted plus rule payload coverage, and
+`edge_semantic_missing_count` / `edge_semantic_needs_ai_count` count edges still
+missing trusted semantics. Graph topology is not mutated.
 
 Edge rows can be retried or cancelled through the existing semantic job control
 routes using either the event id or the edge id:

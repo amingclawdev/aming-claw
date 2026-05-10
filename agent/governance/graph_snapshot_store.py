@@ -1415,8 +1415,13 @@ def _semantic_health_picture(
             "edge_semantic_eligible_count": projection_health.get("edge_semantic_eligible_count"),
             "edge_semantic_requested_count": projection_health.get("edge_semantic_requested_count"),
             "edge_semantic_current_count": projection_health.get("edge_semantic_current_count"),
+            "edge_semantic_rule_count": projection_health.get("edge_semantic_rule_count"),
             "edge_semantic_missing_count": projection_health.get("edge_semantic_missing_count"),
+            "edge_semantic_unqueued_count": projection_health.get("edge_semantic_unqueued_count"),
+            "edge_semantic_needs_ai_count": projection_health.get("edge_semantic_needs_ai_count"),
+            "edge_semantic_payload_current_count": projection_health.get("edge_semantic_payload_current_count"),
             "edge_semantic_coverage_ratio": projection_health.get("edge_semantic_coverage_ratio"),
+            "edge_semantic_payload_coverage_ratio": projection_health.get("edge_semantic_payload_coverage_ratio"),
         }
     coverage = legacy_health.get("semantic_coverage_ratio")
     if coverage is None:

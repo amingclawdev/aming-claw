@@ -2230,6 +2230,8 @@ def _normalize_operation_status(status: str) -> str:
         return "ai_pending"
     if value in {"running", "claimed", "ai_reviewing"}:
         return "running"
+    if value in {"rule_complete", "heuristic_complete"}:
+        return "rule_complete"
     if value in {"ai_complete", "complete", "succeeded", "reviewed", "materialized"}:
         return "complete"
     if value in {"ai_error", "failed", "error"}:
@@ -2389,7 +2391,10 @@ def _semantic_current_state(
     edge_eligible = int(health.get("edge_semantic_eligible_count") or 0)
     edge_current = int(health.get("edge_semantic_current_count") or 0)
     edge_requested = int(health.get("edge_semantic_requested_count") or 0)
+    edge_rule = int(health.get("edge_semantic_rule_count") or 0)
     edge_missing = int(health.get("edge_semantic_missing_count") or 0)
+    edge_needs_ai = int(health.get("edge_semantic_needs_ai_count") or edge_missing or 0)
+    edge_unqueued = int(health.get("edge_semantic_unqueued_count") or 0)
     semantic_drift = {
         "node_total": health.get("feature_count", 0),
         "node_current": node_current,
@@ -2399,10 +2404,14 @@ def _semantic_current_state(
         "edge_eligible": edge_eligible,
         "edge_current": edge_current,
         "edge_requested": edge_requested,
+        "edge_rule": edge_rule,
         "edge_missing": edge_missing,
+        "edge_needs_ai": edge_needs_ai,
+        "edge_unqueued": edge_unqueued,
+        "edge_payload_current": int(health.get("edge_semantic_payload_current_count") or 0),
         "semantic_status_counts": health.get("semantic_status_counts", {}),
         "edge_semantic_status_counts": health.get("edge_semantic_status_counts", {}),
-        "has_drift": bool(node_unverified or node_missing or node_stale or edge_missing),
+        "has_drift": bool(node_unverified or node_missing or node_stale or edge_needs_ai),
     }
     return semantic_snapshot, semantic_drift
 
@@ -2546,6 +2555,8 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             op_status = _normalize_operation_status(job.get("status", ""))
             if op_status == "ai_pending":
                 supported_actions = ["run_edge_semantics", "cancel", "view_trace", "file_backlog"]
+            elif op_status == "rule_complete":
+                supported_actions = ["run_edge_semantics", "retry", "view_trace", "file_backlog"]
             elif op_status in {"failed", "cancelled"}:
                 supported_actions = ["retry", "view_trace", "file_backlog"]
             else:
@@ -2697,7 +2708,11 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                     "edge_eligible": semantic_health.get("edge_semantic_eligible_count", 0),
                     "edge_current": semantic_health.get("edge_semantic_current_count", 0),
                     "edge_requested": semantic_health.get("edge_semantic_requested_count", 0),
+                    "edge_rule": semantic_health.get("edge_semantic_rule_count", 0),
                     "edge_missing": semantic_health.get("edge_semantic_missing_count", 0),
+                    "edge_needs_ai": semantic_health.get("edge_semantic_needs_ai_count", 0),
+                    "edge_unqueued": semantic_health.get("edge_semantic_unqueued_count", 0),
+                    "edge_payload_current": semantic_health.get("edge_semantic_payload_current_count", 0),
                 },
                 "feedback_queue": feedback_summary,
                 "graph_correction_patches": patch_summary,
@@ -5905,12 +5920,27 @@ def _edge_semantic_job_status(event: dict) -> str:
         return event_status
     event_type = str(event.get("event_type") or "").strip()
     if event_type == "edge_semantic_enriched":
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        semantic_payload = payload.get("semantic_payload") if isinstance(payload.get("semantic_payload"), dict) else {}
+        evidence = (
+            semantic_payload.get("evidence")
+            if isinstance(semantic_payload.get("evidence"), dict)
+            else {}
+        )
+        if str(evidence.get("source") or "") == "edge_semantic_rule":
+            return "rule_complete"
         return "ai_complete"
     return "ai_pending"
 
 
 def _edge_semantic_job_from_event(event: dict) -> dict:
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    semantic_payload = payload.get("semantic_payload") if isinstance(payload.get("semantic_payload"), dict) else {}
+    evidence = (
+        semantic_payload.get("evidence")
+        if isinstance(semantic_payload.get("evidence"), dict)
+        else {}
+    )
     return {
         "job_id": event.get("event_id", ""),
         "event_id": event.get("event_id", ""),
@@ -5921,7 +5951,9 @@ def _edge_semantic_job_from_event(event: dict) -> dict:
         "event_status": event.get("status", ""),
         "event_type": event.get("event_type", ""),
         "edge_context": payload.get("edge_context") if isinstance(payload.get("edge_context"), dict) else {},
-        "semantic": payload.get("semantic_payload") if isinstance(payload.get("semantic_payload"), dict) else {},
+        "semantic": semantic_payload,
+        "semantic_source": str(evidence.get("source") or ""),
+        "requires_ai": _edge_semantic_job_status(event) != "ai_complete",
         "operator_request": payload.get("operator_request") if isinstance(payload.get("operator_request"), dict) else {},
         "created_at": event.get("created_at", ""),
         "updated_at": event.get("updated_at", ""),
@@ -6006,6 +6038,7 @@ def _semantic_job_progress(counts: dict[str, int]) -> dict[str, object]:
     total = sum(int(value or 0) for value in counts.values())
     pending = int(counts.get("ai_pending", 0) or 0) + int(counts.get("pending_ai", 0) or 0)
     running = int(counts.get("running", 0) or 0)
+    rule = int(counts.get("rule_complete", 0) or 0) + int(counts.get("heuristic_complete", 0) or 0)
     complete = (
         int(counts.get("ai_complete", 0) or 0)
         + int(counts.get("complete", 0) or 0)
@@ -6019,10 +6052,12 @@ def _semantic_job_progress(counts: dict[str, int]) -> dict[str, object]:
         "pending": pending,
         "running": running,
         "complete": complete,
+        "rule_complete": rule,
+        "needs_ai": pending + running + rule,
         "failed": failed,
         "cancelled": cancelled,
         "terminal": terminal,
-        "open": pending + running,
+        "open": pending + running + rule,
         "completion_ratio": round(terminal / total, 4) if total else 1.0,
     }
 

@@ -1593,6 +1593,10 @@ def _edge_semantic_status(edge: dict[str, Any] | None, event: dict[str, Any] | N
     if not edge:
         return "edge_semantic_orphaned"
     if event.get("event_type") == "edge_semantic_enriched":
+        semantic_payload = _event_payload_edge_semantic(event)
+        evidence = semantic_payload.get("evidence") if isinstance(semantic_payload.get("evidence"), dict) else {}
+        if str(evidence.get("source") or "") == "edge_semantic_rule":
+            return "edge_semantic_rule"
         return "edge_semantic_current"
     return "edge_semantic_requested"
 
@@ -1617,6 +1621,7 @@ def _build_edge_semantics(
             "validity": {
                 "status": status,
                 "valid": status == "edge_semantic_current",
+                "requires_ai": status != "edge_semantic_current",
                 "edge_exists": bool(edge),
                 "semantic_event_id": (event or {}).get("event_id", ""),
                 "semantic_event_snapshot_id": (event or {}).get("snapshot_id", ""),
@@ -1646,17 +1651,27 @@ def _edge_projection_health(
         status_counts[status] = status_counts.get(status, 0) + 1
     current = int(status_counts.get("edge_semantic_current", 0) or 0)
     requested = int(status_counts.get("edge_semantic_requested", 0) or 0)
+    rule = int(status_counts.get("edge_semantic_rule", 0) or 0)
     orphaned = int(status_counts.get("edge_semantic_orphaned", 0) or 0)
-    missing = max(0, eligible_count - current - requested)
+    unqueued = int(status_counts.get("edge_semantic_missing", 0) or 0)
+    missing = max(0, eligible_count - current)
+    payload_current = current + rule
     return {
         "edge_count": len(edges),
         "edge_semantic_eligible_count": eligible_count,
         "edge_semantic_current_count": current,
         "edge_semantic_requested_count": requested,
+        "edge_semantic_rule_count": rule,
         "edge_semantic_missing_count": missing,
+        "edge_semantic_unqueued_count": unqueued,
+        "edge_semantic_needs_ai_count": missing,
+        "edge_semantic_payload_current_count": payload_current,
         "edge_semantic_orphaned_count": orphaned,
         "edge_semantic_status_counts": dict(sorted(status_counts.items())),
         "edge_semantic_coverage_ratio": round(current / eligible_count, 4) if eligible_count else 1.0,
+        "edge_semantic_payload_coverage_ratio": (
+            round(payload_current / eligible_count, 4) if eligible_count else 1.0
+        ),
     }
 
 
