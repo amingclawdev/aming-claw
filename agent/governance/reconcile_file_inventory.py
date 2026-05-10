@@ -10,34 +10,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 from agent.governance.project_profile import ProjectProfile, discover_project_profile
 
 
-CONFIG_FILENAMES = {
-    ".env", ".env.example", "Dockerfile", "Makefile", "Pipfile",
-    "pyproject.toml", "requirements.txt", "package.json", "tsconfig.json",
-    "Cargo.toml", "go.mod", "CMakeLists.txt", "compile_commands.json",
-    ".gitignore", ".mcp.json", "VERSION",
-}
-CONFIG_EXTENSIONS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
-SCRIPT_EXTENSIONS = {".sh", ".bash", ".ps1", ".bat", ".cmd"}
-DOC_EXTENSIONS = {".md", ".rst", ".txt", ".adoc"}
-INDEX_DOC_FILENAMES = {
-    "README.md",
-    "WORKFLOW.md",
-    "CONTRIBUTING.md",
-    "CHANGELOG.md",
-}
-GENERATED_FILENAMES = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-    "Cargo.lock", ".coverage", "governance.db",
-}
-GENERATED_EXTENSIONS = {".log", ".db", ".sqlite", ".sqlite3", ".pyc"}
-GENERATED_DIR_MARKERS = {"generated", "__generated__", "gen"}
-GENERATED_DIR_SUFFIXES = (".egg-info",)
-GENERATED_PATH_PREFIXES = ("docs/dev/scratch/", "docs/dev/observer/logs/")
-TEST_SUPPORT_FILENAMES = {"__init__.py", "conftest.py"}
-TEST_SUPPORT_DIRS = {"fixtures", "fixture", "testdata", "test_data", "snapshots", "__snapshots__"}
+CONFIG_FILENAMES = set(DEFAULT_LANGUAGE_POLICY.config_filenames)
+CONFIG_EXTENSIONS = set(DEFAULT_LANGUAGE_POLICY.config_extensions)
+SCRIPT_EXTENSIONS = set(DEFAULT_LANGUAGE_POLICY.script_extensions)
+DOC_EXTENSIONS = set(DEFAULT_LANGUAGE_POLICY.doc_extensions)
+INDEX_DOC_FILENAMES = set(DEFAULT_LANGUAGE_POLICY.index_doc_filenames)
+GENERATED_FILENAMES = set(DEFAULT_LANGUAGE_POLICY.generated_filenames)
+GENERATED_EXTENSIONS = set(DEFAULT_LANGUAGE_POLICY.generated_extensions)
+GENERATED_DIR_MARKERS = set(DEFAULT_LANGUAGE_POLICY.generated_dir_markers)
+GENERATED_DIR_SUFFIXES = DEFAULT_LANGUAGE_POLICY.generated_dir_suffixes
+GENERATED_PATH_PREFIXES = DEFAULT_LANGUAGE_POLICY.generated_path_prefixes
+TEST_SUPPORT_FILENAMES = set(DEFAULT_LANGUAGE_POLICY.test_support_filenames)
+TEST_SUPPORT_DIRS = set(DEFAULT_LANGUAGE_POLICY.test_support_dirs)
 DOC_ARCHIVE_PREFIXES = ("Ying_work/doc/",)
 DOC_ARCHIVE_NAME_PREFIXES = (
     "audit-",
@@ -223,50 +211,17 @@ def filter_governed_inventory_rows(
 
 
 def _language_for(path: str, kind: str) -> str:
-    suffix = Path(path).suffix.lower()
-    if suffix in {".py", ".pyi"}:
-        return "python"
-    if suffix in {".js", ".jsx"}:
-        return "javascript"
-    if suffix in {".ts", ".tsx"}:
-        return "typescript"
-    if suffix == ".go":
-        return "go"
-    if suffix == ".rs":
-        return "rust"
-    if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
-        return "cpp"
-    if suffix in {".sh", ".bash"}:
-        return "shell"
-    if suffix == ".ps1":
-        return "powershell"
-    if suffix in {".yaml", ".yml"}:
-        return "yaml"
-    if suffix == ".json":
-        return "json"
-    if suffix in {".toml"}:
-        return "toml"
-    if kind in {"doc", "index_doc"}:
-        return "markdown" if suffix == ".md" else "text"
-    return ""
+    return DEFAULT_LANGUAGE_POLICY.language_for_path(path, kind)
 
 
 def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
     """Classify a project file into a governance inventory bucket."""
     rel = profile.normalize_relpath(rel_path)
-    name = Path(rel).name
     suffix = Path(rel).suffix.lower()
-    parts = {p.lower() for p in rel.split("/") if p}
 
-    if (
-        name in GENERATED_FILENAMES
-        or suffix in GENERATED_EXTENSIONS
-        or parts & GENERATED_DIR_MARKERS
-        or any(part.endswith(GENERATED_DIR_SUFFIXES) for part in parts)
-        or any(rel.startswith(prefix) for prefix in GENERATED_PATH_PREFIXES)
-    ):
+    if DEFAULT_LANGUAGE_POLICY.is_generated_path(rel):
         return "generated"
-    if name in CONFIG_FILENAMES or name.startswith("Dockerfile") or suffix in CONFIG_EXTENSIONS:
+    if DEFAULT_LANGUAGE_POLICY.is_config_path(rel):
         return "config"
     if profile.is_test_path(rel):
         return "test"
@@ -282,10 +237,7 @@ def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
 
 
 def is_test_support_path(rel_path: str) -> bool:
-    rel = str(rel_path or "").replace("\\", "/").strip("/")
-    name = Path(rel).name
-    parts = {p.lower() for p in rel.split("/") if p}
-    return name in TEST_SUPPORT_FILENAMES or bool(parts & TEST_SUPPORT_DIRS)
+    return DEFAULT_LANGUAGE_POLICY.is_test_support_path(rel_path)
 
 
 def is_archive_doc_path(rel_path: str) -> bool:
@@ -301,12 +253,7 @@ def is_archive_doc_path(rel_path: str) -> bool:
 
 
 def is_index_doc_path(rel_path: str) -> bool:
-    rel = str(rel_path or "").replace("\\", "/").strip("/")
-    name = Path(rel).name
-    lower_name = name.lower()
-    if name in INDEX_DOC_FILENAMES or lower_name in {"readme.md", "index.md"}:
-        return True
-    return False
+    return DEFAULT_LANGUAGE_POLICY.is_index_doc_path(rel_path)
 
 
 def _walk_project_files(project_root: str, profile: ProjectProfile) -> Iterable[str]:

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import ast
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 
 class PythonAdapter:
@@ -25,7 +27,20 @@ class PythonAdapter:
         if not file_path:
             return False
         lower = file_path.lower()
-        return lower.endswith(".py") or lower.endswith(".pyi")
+        return any(lower.endswith(ext) for ext in DEFAULT_LANGUAGE_POLICY.python_extensions)
+
+    def language(self) -> str:
+        """Return the stable policy language key for Python files."""
+        return "python"
+
+    def classify_file(self, file_path: str) -> Dict[str, Any]:
+        """Return lightweight policy metadata for *file_path*."""
+        language = DEFAULT_LANGUAGE_POLICY.language_for_path(file_path)
+        return {
+            "file_kind": "source" if self.supports(file_path) else "",
+            "language": language,
+            "adapter": "python",
+        }
 
     # ------------------------------------------------------------------
     # collect_decorators
@@ -130,6 +145,65 @@ class PythonAdapter:
         if base.startswith("test_") or base.endswith("_test.py"):
             return None
         return f"tests/test_{base}"
+
+    def find_test_pairing(self, source_file: str) -> Optional[str]:
+        """Compatibility alias for graph builders that use richer adapter hooks."""
+        return self.detect_test_pairing(source_file)
+
+    def parse_symbols(self, file_path: str, source: str = "") -> List[Dict[str, Any]]:
+        """Parse Python classes/functions into neutral symbol dictionaries."""
+        try:
+            tree = ast.parse(source or "", filename=file_path or "<unknown>")
+        except (SyntaxError, ValueError):
+            return []
+        symbols: List[Dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.append({
+                    "name": node.name,
+                    "kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                    "lineno": getattr(node, "lineno", 0),
+                    "end_lineno": getattr(node, "end_lineno", getattr(node, "lineno", 0)),
+                    "decorators": self.collect_decorators(node),
+                })
+        return symbols
+
+    def parse_imports(self, file_path: str, source: str = "") -> List[Dict[str, Any]]:
+        """Parse Python imports into neutral import dictionaries."""
+        try:
+            tree = ast.parse(source or "", filename=file_path or "<unknown>")
+        except (SyntaxError, ValueError):
+            return []
+        imports: List[Dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.append({
+                        "local": alias.asname or alias.name,
+                        "imported": alias.name,
+                        "kind": "import",
+                    })
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                for alias in node.names:
+                    imported = f"{module}.{alias.name}" if module else alias.name
+                    imports.append({
+                        "local": alias.asname or alias.name,
+                        "imported": imported,
+                        "kind": "from_import",
+                    })
+        return imports
+
+    def extract_relations(
+        self,
+        file_path: str,
+        source: str = "",
+        *,
+        symbols: Optional[List[Dict[str, Any]]] = None,
+        imports: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Python typed relations are extracted by Phase Z's richer AST pass."""
+        return []
 
 
 __all__ = ["PythonAdapter"]

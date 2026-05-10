@@ -180,6 +180,40 @@ def test_inventory_maps_candidate_fallback_source_nodes(tmp_path):
     assert row["decision"] == "govern"
 
 
+def test_inventory_uses_shared_language_policy_for_mixed_js_ts_fixture(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "web" / "src" / "index.js"), "export function main() {}\n")
+    _write(str(project / "web" / "src" / "App.tsx"), "export function App() { return null }\n")
+    _write(str(project / "web" / "src" / "App.test.tsx"), "test('app', () => {})\n")
+    _write(str(project / "web" / "src" / "config.json"), "{}\n")
+    _write(str(project / "docs" / "README.md"), "# docs\n")
+    _write(str(project / "web" / "node_modules" / "pkg" / "index.js"), "ignored();\n")
+    _write(str(project / "web" / "dist" / "bundle.js"), "ignored();\n")
+    _write(str(project / "coverage" / "lcov.info"), "ignored\n")
+
+    rows = build_file_inventory(
+        project_root=str(project),
+        run_id="run-mixed-policy",
+        nodes=[],
+        feature_clusters=[],
+    )
+    rows_by_path = _by_path(rows)
+
+    assert rows_by_path["web/src/index.js"]["file_kind"] == "source"
+    assert rows_by_path["web/src/index.js"]["language"] == "javascript"
+    assert rows_by_path["web/src/App.tsx"]["file_kind"] == "source"
+    assert rows_by_path["web/src/App.tsx"]["language"] == "typescript"
+    assert rows_by_path["web/src/App.test.tsx"]["file_kind"] == "test"
+    assert rows_by_path["web/src/App.test.tsx"]["language"] == "typescript"
+    assert rows_by_path["web/src/config.json"]["file_kind"] == "config"
+    assert rows_by_path["web/src/config.json"]["language"] == "json"
+    assert rows_by_path["docs/README.md"]["file_kind"] == "index_doc"
+    assert "web/node_modules/pkg/index.js" not in rows_by_path
+    assert "web/dist/bundle.js" not in rows_by_path
+    assert "coverage/lcov.info" not in rows_by_path
+
+
 def test_inventory_persists_to_governance_table(tmp_path):
     project = tmp_path / "project"
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")

@@ -8,7 +8,9 @@ operate without crashing on heterogeneous input.
 from __future__ import annotations
 
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 
 class FileTreeAdapter:
@@ -17,6 +19,19 @@ class FileTreeAdapter:
     def supports(self, file_path: str) -> bool:
         """Always returns True — the fallback supports any non-empty path."""
         return bool(file_path)
+
+    def language(self) -> str:
+        """The fallback derives language from the shared policy per file."""
+        return ""
+
+    def classify_file(self, file_path: str) -> Dict[str, Any]:
+        """Return lightweight policy metadata for file-tree fallback nodes."""
+        language = DEFAULT_LANGUAGE_POLICY.language_for_path(file_path)
+        return {
+            "file_kind": "source" if DEFAULT_LANGUAGE_POLICY.is_source_path(file_path) else "",
+            "language": language,
+            "adapter": "filetree",
+        }
 
     def collect_decorators(self, ast_node: Any) -> List[str]:
         """The filetree fallback knows nothing about AST decorators."""
@@ -32,6 +47,29 @@ class FileTreeAdapter:
     def detect_test_pairing(self, source_file: str) -> Optional[str]:
         """No conventional test pairing without language semantics."""
         return None
+
+    def find_test_pairing(self, source_file: str) -> Optional[str]:
+        """No conventional test pairing without language semantics."""
+        return None
+
+    def parse_symbols(self, file_path: str, source: str = "") -> List[Dict[str, Any]]:
+        """The fallback intentionally emits no symbols."""
+        return []
+
+    def parse_imports(self, file_path: str, source: str = "") -> List[Dict[str, Any]]:
+        """The fallback intentionally emits no imports."""
+        return []
+
+    def extract_relations(
+        self,
+        file_path: str,
+        source: str = "",
+        *,
+        symbols: Optional[List[Dict[str, Any]]] = None,
+        imports: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """The fallback intentionally emits no typed relations."""
+        return []
 
 
 __all__ = ["FileTreeAdapter"]

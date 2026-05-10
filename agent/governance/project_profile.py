@@ -11,31 +11,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List
 
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY, LanguagePolicy
 
-SOURCE_EXTENSIONS = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".c", ".cc",
-    ".cpp", ".cxx", ".h", ".hpp",
-}
-PYTHON_EXTENSIONS = {".py", ".pyi"}
-TEST_DIR_NAMES = {"test", "tests", "__tests__"}
-DOC_DIR_NAMES = {"doc", "docs", "documentation"}
-DEFAULT_EXCLUDE_ROOTS = {
-    "__pycache__", ".git", "node_modules", ".venv", "venv", ".tox",
-    ".aming-claw", ".claude", ".worktrees", "shared-volume", "runtime", ".mypy_cache",
-    ".pytest_cache", ".observer-cache", ".governance-cache", "build", "dist",
-    "target", "coverage", ".next", ".nuxt", ".eggs", "search-workspace",
-}
-MANIFEST_LANGUAGE_HINTS = {
-    "pyproject.toml": "python",
-    "setup.py": "python",
-    "requirements.txt": "python",
-    "package.json": "javascript",
-    "tsconfig.json": "typescript",
-    "Cargo.toml": "rust",
-    "go.mod": "go",
-    "CMakeLists.txt": "cpp",
-    "compile_commands.json": "cpp",
-}
+SOURCE_EXTENSIONS = set(DEFAULT_LANGUAGE_POLICY.source_extensions)
+PYTHON_EXTENSIONS = set(DEFAULT_LANGUAGE_POLICY.python_extensions)
+TEST_DIR_NAMES = set(DEFAULT_LANGUAGE_POLICY.test_dir_names)
+DOC_DIR_NAMES = set(DEFAULT_LANGUAGE_POLICY.doc_dir_names)
+DEFAULT_EXCLUDE_ROOTS = set(DEFAULT_LANGUAGE_POLICY.exclude_roots)
+MANIFEST_LANGUAGE_HINTS = dict(DEFAULT_LANGUAGE_POLICY.manifest_language_hints)
 
 
 @dataclass(frozen=True)
@@ -49,50 +32,34 @@ class ProjectProfile:
     doc_roots: List[str] = field(default_factory=list)
     exclude_roots: List[str] = field(default_factory=list)
     manifest_files: List[str] = field(default_factory=list)
+    language_policy: LanguagePolicy = field(
+        default=DEFAULT_LANGUAGE_POLICY,
+        compare=False,
+        repr=False,
+    )
 
     def normalize_relpath(self, path: str) -> str:
-        raw = str(path or "")
-        try:
-            if os.path.isabs(raw):
-                raw = os.path.relpath(raw, self.project_root)
-        except ValueError:
-            pass
-        return raw.replace("\\", "/").strip("/")
+        return self.language_policy.normalize_relpath(self.project_root, path)
 
     def is_excluded_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
-        parts = [p for p in rel.split("/") if p]
-        if any(part in DEFAULT_EXCLUDE_ROOTS for part in parts):
-            return True
-        return _is_under_any(rel, self.exclude_roots)
+        return self.language_policy.is_excluded_path(rel, self.exclude_roots)
 
     def is_doc_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
-        parts = [p for p in rel.split("/") if p]
-        if any(part.lower() in DOC_DIR_NAMES for part in parts):
-            return True
-        return _is_under_any(rel, self.doc_roots)
+        return self.language_policy.is_doc_path(rel, self.doc_roots)
 
     def is_test_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
-        parts = [p.lower() for p in rel.split("/") if p]
-        name = parts[-1] if parts else ""
-        if any(part in TEST_DIR_NAMES for part in parts):
-            return True
-        if name.startswith("test_") or name.endswith("_test.py"):
-            return True
-        if ".test." in name or ".spec." in name:
-            return True
-        return _is_under_any(rel, self.test_roots)
+        return self.language_policy.is_test_path(rel, self.test_roots)
 
     def is_production_source_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
-        suffix = Path(rel).suffix.lower()
-        return (
-            suffix in SOURCE_EXTENSIONS
-            and not self.is_excluded_path(rel)
-            and not self.is_test_path(rel)
-            and not self.is_doc_path(rel)
+        return self.language_policy.is_production_source_path(
+            rel,
+            test_roots=self.test_roots,
+            doc_roots=self.doc_roots,
+            exclude_roots=self.exclude_roots,
         )
 
 
@@ -123,38 +90,28 @@ def discover_project_profile(project_root: str) -> ProjectProfile:
 def _discover_manifests(root: Path) -> List[str]:
     found = []
     for path in _iter_files(root):
-        if path.name in MANIFEST_LANGUAGE_HINTS:
+        if DEFAULT_LANGUAGE_POLICY.manifest_language(path.name):
             found.append(_rel(root, path))
     return sorted(found)
 
 
 def _discover_languages(root: Path, manifests: Iterable[str]) -> List[str]:
     langs = {
-        MANIFEST_LANGUAGE_HINTS[Path(name).name]
+        DEFAULT_LANGUAGE_POLICY.manifest_language(name)
         for name in manifests
-        if Path(name).name in MANIFEST_LANGUAGE_HINTS
+        if DEFAULT_LANGUAGE_POLICY.manifest_language(name)
     }
     for path in _iter_files(root):
-        suffix = path.suffix.lower()
-        if suffix in PYTHON_EXTENSIONS:
-            langs.add("python")
-        elif suffix in {".js", ".jsx"}:
-            langs.add("javascript")
-        elif suffix in {".ts", ".tsx"}:
-            langs.add("typescript")
-        elif suffix == ".go":
-            langs.add("go")
-        elif suffix == ".rs":
-            langs.add("rust")
-        elif suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
-            langs.add("cpp")
+        language = DEFAULT_LANGUAGE_POLICY.language_for_path(str(path))
+        if language in {"python", "javascript", "typescript", "go", "rust", "cpp"}:
+            langs.add(language)
     return sorted(langs)
 
 
 def _discover_named_dirs(root: Path, names: set[str]) -> List[str]:
     found = set()
     for dirpath, dirnames, _filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in DEFAULT_EXCLUDE_ROOTS]
+        dirnames[:] = [d for d in dirnames if not DEFAULT_LANGUAGE_POLICY.is_excluded_path(d)]
         for dirname in list(dirnames):
             if dirname.lower() in names:
                 found.add(_rel(root, Path(dirpath) / dirname))
@@ -187,7 +144,7 @@ def _discover_source_roots(
             continue
         if _is_under_any(rel, test_roots) or _is_under_any(rel, doc_roots):
             continue
-        if child.name in DEFAULT_EXCLUDE_ROOTS or _is_under_any(rel, exclude_roots):
+        if DEFAULT_LANGUAGE_POLICY.is_excluded_path(child.name) or _is_under_any(rel, exclude_roots):
             continue
         if _contains_source_file(child, root):
             roots.add(rel)
@@ -200,7 +157,7 @@ def _contains_root_source_file(root: Path) -> bool:
             continue
         if child.name in DEFAULT_EXCLUDE_ROOTS:
             continue
-        if child.suffix.lower() in SOURCE_EXTENSIONS:
+        if DEFAULT_LANGUAGE_POLICY.is_source_path(str(child)):
             return True
     return False
 
@@ -211,14 +168,14 @@ def _contains_source_file(path: Path, root: Path) -> bool:
         parts = [p.lower() for p in rel.split("/") if p]
         if any(part in TEST_DIR_NAMES or part in DOC_DIR_NAMES for part in parts):
             continue
-        if file_path.suffix.lower() in SOURCE_EXTENSIONS:
+        if DEFAULT_LANGUAGE_POLICY.is_source_path(str(file_path)):
             return True
     return False
 
 
 def _iter_files(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in DEFAULT_EXCLUDE_ROOTS]
+        dirnames[:] = [d for d in dirnames if not DEFAULT_LANGUAGE_POLICY.is_excluded_path(d)]
         for fname in filenames:
             yield Path(dirpath) / fname
 

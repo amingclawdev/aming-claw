@@ -18,6 +18,9 @@ def _write(path, content):
 def test_parse_production_modules_excludes_tests_and_docs(tmp_path):
     project = tmp_path / "project"
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "web" / "src" / "index.ts"), "export function start() { return 1 }\n")
+    _write(str(project / "web" / "src" / "index.test.ts"), "test('start', () => {})\n")
+    _write(str(project / "web" / "node_modules" / "pkg" / "index.js"), "ignored();\n")
     _write(str(project / "agent" / "tests" / "test_service.py"), "def test_run():\n    assert True\n")
     _write(str(project / "tests" / "test_external.py"), "def test_external():\n    assert True\n")
     _write(str(project / "scripts" / "cli.py"), "def main():\n    return run()\n")
@@ -26,7 +29,12 @@ def test_parse_production_modules_excludes_tests_and_docs(tmp_path):
     modules = parse_production_modules(str(project))
 
     assert "agent.service" in modules
+    assert "web.src.index" in modules
+    assert modules["web.src.index"].language == "typescript"
+    assert modules["web.src.index"].source_kind == "filetree_fallback"
     assert "scripts.cli" in modules
+    assert "web.src.index.test" not in modules
+    assert "web.node_modules.pkg.index" not in modules
     assert "agent.tests.test_service" not in modules
     assert "tests.test_external" not in modules
     assert "docs.example" not in modules

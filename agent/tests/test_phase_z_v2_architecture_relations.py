@@ -188,9 +188,15 @@ def test_filetree_fallback_covers_non_python_and_root_sources(tmp_path):
         scratch_dir=str(scratch),
     )
 
-    primaries = {node["primary_file"].replace("\\", "/") for node in result["nodes"]}
+    by_primary = {
+        node["primary_file"].replace("\\", "/"): node
+        for node in result["nodes"]
+    }
+    primaries = set(by_primary)
     assert any(path.endswith("agent/service.py") for path in primaries)
     assert "dbservice/index.js" in primaries
+    assert by_primary["dbservice/index.js"]["language"] == "javascript"
+    assert by_primary["dbservice/index.js"]["source_kind"] == "filetree_fallback"
     assert any(path.endswith("start_governance.py") for path in primaries)
     fallback_clusters = [
         cluster for cluster in result["feature_clusters"]

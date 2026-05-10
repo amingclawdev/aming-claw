@@ -19,17 +19,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from agent.governance.language_adapters import FileTreeAdapter, LanguageAdapter, PythonAdapter
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
+
 # ---------------------------------------------------------------------------
 # R6: Directories to exclude from production module scanning
 # ---------------------------------------------------------------------------
-EXCLUDE_DIRS: frozenset[str] = frozenset({
-    "__pycache__", ".git", "node_modules", ".venv", "venv",
-    ".aming-claw", ".claude", ".worktrees", "shared-volume", "runtime",
-    ".mypy_cache", ".pytest_cache", "build", "dist",
-})
+EXCLUDE_DIRS: frozenset[str] = frozenset(DEFAULT_LANGUAGE_POLICY.exclude_roots)
 
 # Default production directories to scan
 DEFAULT_PROD_DIRS: Tuple[str, ...] = ("agent", "scripts")
+_GRAPH_LANGUAGE_ADAPTERS: Tuple[LanguageAdapter, ...] = (PythonAdapter(),)
+_FILETREE_ADAPTER = FileTreeAdapter()
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ class FunctionMeta:
 
 @dataclass
 class ModuleInfo:
-    """Parsed information for a single Python module."""
+    """Parsed information for a single production module."""
     path: str
     module_name: str  # dotted module name
     import_map: Dict[str, str] = field(default_factory=dict)
@@ -58,6 +59,8 @@ class ModuleInfo:
     # e.g. {"get_config": "agent.config.get_config", "os": "os"}
     functions: List[FunctionMeta] = field(default_factory=list)
     source: str = ""
+    language: str = ""
+    source_kind: str = "symbol_ast"
 
 
 @dataclass
@@ -228,11 +231,60 @@ def _path_to_module(path: str, root: str) -> str:
     # Actually, root is the project root containing agent/ and scripts/
     rel = os.path.relpath(path, root)
     rel = rel.replace(os.sep, "/")
-    if rel.endswith(".py"):
-        rel = rel[:-3]
+    rel = DEFAULT_LANGUAGE_POLICY.strip_source_suffix(rel)
     if rel.endswith("/__init__"):
         rel = rel[:-9]
     return rel.replace("/", ".")
+
+
+def _adapter_for_source_file(file_path: str) -> LanguageAdapter:
+    for adapter in _GRAPH_LANGUAGE_ADAPTERS:
+        if adapter.supports(file_path):
+            return adapter
+    return _FILETREE_ADAPTER
+
+
+def _parse_python_module(fpath: str, mod_name: str, source: str) -> Optional[ModuleInfo]:
+    try:
+        tree = ast.parse(source, filename=fpath)
+    except (SyntaxError, ValueError):
+        return None
+
+    imp_ext = _ImportExtractor()
+    imp_ext.visit(tree)
+
+    func_ext = _FunctionExtractor(mod_name, imp_ext.import_map)
+    func_ext.visit(tree)
+
+    return ModuleInfo(
+        path=fpath,
+        module_name=mod_name,
+        import_map=imp_ext.import_map,
+        functions=func_ext.functions,
+        source=source,
+        language="python",
+        source_kind="python_ast",
+    )
+
+
+def _parse_filetree_module(
+    fpath: str,
+    mod_name: str,
+    source: str,
+    adapter: LanguageAdapter,
+    module_path: str,
+) -> ModuleInfo:
+    metadata = adapter.classify_file(fpath) if hasattr(adapter, "classify_file") else {}
+    language = str(metadata.get("language") or DEFAULT_LANGUAGE_POLICY.language_for_path(fpath))
+    return ModuleInfo(
+        path=module_path,
+        module_name=mod_name,
+        import_map={},
+        functions=[],
+        source=source,
+        language=language,
+        source_kind="filetree_fallback",
+    )
 
 
 def parse_production_modules(
@@ -240,7 +292,7 @@ def parse_production_modules(
     prod_dirs: Optional[Tuple[str, ...]] = None,
     profile: Optional[Any] = None,
 ) -> Dict[str, ModuleInfo]:
-    """Walk prod_dirs under project_root, parse each .py file via AST.
+    """Walk prod_dirs under project_root and dispatch source files to adapters.
 
     Returns dict keyed by dotted module name -> ModuleInfo.
     Skips excluded/test/doc directories so DFS operates on production code.
@@ -263,7 +315,7 @@ def parse_production_modules(
             kept_dirs = []
             for dirname in dirnames:
                 rel_dir = os.path.relpath(os.path.join(dirpath, dirname), project_root)
-                if dirname in EXCLUDE_DIRS:
+                if dirname.lower() in EXCLUDE_DIRS:
                     continue
                 if profile.is_excluded_path(rel_dir) or profile.is_test_path(rel_dir) or profile.is_doc_path(rel_dir):
                     continue
@@ -271,35 +323,30 @@ def parse_production_modules(
             dirnames[:] = kept_dirs
 
             for fname in filenames:
-                if not fname.endswith(".py"):
-                    continue
                 fpath = os.path.join(dirpath, fname)
                 rel_file = os.path.relpath(fpath, project_root)
                 if not profile.is_production_source_path(rel_file):
                     continue
                 try:
                     source = _read_file(fpath)
-                    tree = ast.parse(source, filename=fpath)
-                except (SyntaxError, UnicodeDecodeError, OSError):
+                except (UnicodeDecodeError, OSError):
                     continue
 
                 mod_name = _path_to_module(fpath, project_root)
-
-                # Extract imports
-                imp_ext = _ImportExtractor()
-                imp_ext.visit(tree)
-
-                # Extract functions
-                func_ext = _FunctionExtractor(mod_name, imp_ext.import_map)
-                func_ext.visit(tree)
-
-                modules[mod_name] = ModuleInfo(
-                    path=fpath,
-                    module_name=mod_name,
-                    import_map=imp_ext.import_map,
-                    functions=func_ext.functions,
-                    source=source,
-                )
+                adapter = _adapter_for_source_file(fpath)
+                if isinstance(adapter, PythonAdapter):
+                    parsed = _parse_python_module(fpath, mod_name, source)
+                    if parsed is None:
+                        continue
+                    modules[mod_name] = parsed
+                else:
+                    modules[mod_name] = _parse_filetree_module(
+                        fpath,
+                        mod_name,
+                        source,
+                        adapter,
+                        rel_file.replace(os.sep, "/"),
+                    )
 
     return modules
 
@@ -743,6 +790,8 @@ def aggregate_functions_into_nodes(
             "layer": agg_layer,
             "functions": [f.qualified_name for f in mod_info.functions],
             "function_count": len(mod_info.functions),
+            "language": mod_info.language,
+            "source_kind": mod_info.source_kind,
         })
     return nodes
 
@@ -772,39 +821,14 @@ def find_test_coverage(
     module_token = rel_without_ext.replace("/", ".")
     basename = os.path.basename(primary_file)
     compact_stem = re.sub(r"[^a-z0-9]+", "", stem)
-    skip_dirs = {
-        ".git",
-        ".claude",
-        ".hg",
-        ".svn",
-        ".worktrees",
-        ".observer-cache",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "runtime",
-        "search-workspace",
-        "shared-volume",
-        "venv",
-        ".venv",
-    }
+    skip_dirs = {name.lower() for name in DEFAULT_LANGUAGE_POLICY.exclude_roots} | {".hg", ".svn"}
 
     def _is_test_like(rel: str, fname: str) -> bool:
-        rel_norm = rel.replace("\\", "/").lower()
-        parts = {p for p in rel_norm.split("/") if p}
-        lower = fname.lower()
-        return (
-            bool(parts & {"test", "tests", "__tests__"})
-            or lower.startswith("test_")
-            or ".test." in lower
-            or ".spec." in lower
-            or lower.endswith("_test.py")
-        )
+        return DEFAULT_LANGUAGE_POLICY.is_test_path(rel)
 
     def _matches_primary(fname: str) -> bool:
         lower = fname.lower()
-        if primary_ext in {".py", ".pyi"}:
+        if primary_ext in DEFAULT_LANGUAGE_POLICY.python_extensions:
             if (
                 lower == f"test_{stem}.py"
                 or lower.startswith(f"test_{stem}_")
@@ -853,7 +877,7 @@ def find_test_coverage(
     for dirpath, dirnames, filenames in os.walk(project_root):
         dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
         for fname in filenames:
-            if not fname.lower().endswith((".py", ".pyi", ".js", ".jsx", ".ts", ".tsx")):
+            if not DEFAULT_LANGUAGE_POLICY.is_source_path(fname):
                 continue
             fpath = os.path.join(dirpath, fname)
             rel = _repo_relpath(project_root, fpath)
@@ -1638,12 +1662,7 @@ def append_filetree_fallback_source_nodes(
         rel = str(row.get("path") or "")
         if not rel or rel in existing:
             continue
-        module = rel
-        for suffix in (".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".cpp", ".cc", ".cxx", ".c", ".hpp", ".h"):
-            if module.endswith(suffix):
-                module = module[: -len(suffix)]
-                break
-        module = module.replace("/", ".").replace("\\", ".")
+        module = DEFAULT_LANGUAGE_POLICY.strip_source_suffix(rel).replace("/", ".").replace("\\", ".")
         node = {
             "node_id": module,
             "primary_file": rel,
@@ -3573,9 +3592,14 @@ def build_graph_v2_from_symbols(
         sccs=sccs,
         nodes=nodes,
     )
+    adapter_fallback_nodes = [
+        node for node in nodes
+        if node.get("source_kind") == "filetree_fallback"
+    ]
     fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes)
-    if fallback_nodes:
-        feature_clusters.extend(_fallback_feature_clusters(fallback_nodes))
+    all_fallback_nodes = adapter_fallback_nodes + fallback_nodes
+    if all_fallback_nodes:
+        feature_clusters.extend(_fallback_feature_clusters(all_fallback_nodes))
         feature_clusters.sort(key=lambda c: c.get("cluster_fingerprint", ""))
 
     run_id = run_id or datetime.now(timezone.utc).strftime("phase-z-v2-%Y%m%dT%H%M%SZ")

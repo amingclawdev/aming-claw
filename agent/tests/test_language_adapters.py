@@ -33,12 +33,24 @@ from agent.governance.language_adapters import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# AC1 — Protocol surface: LanguageAdapter exposes the four required methods
+# AC1 — Protocol surface: LanguageAdapter exposes legacy and graph hooks
 # ---------------------------------------------------------------------------
 
-def test_ac1_protocol_surface_has_four_required_methods():
-    """LanguageAdapter Protocol must declare all four contract methods."""
-    for name in ("supports", "collect_decorators", "find_module_root", "detect_test_pairing"):
+def test_ac1_protocol_surface_has_graph_construction_methods():
+    """LanguageAdapter Protocol must declare legacy and graph-construction methods."""
+    required = (
+        "supports",
+        "language",
+        "classify_file",
+        "collect_decorators",
+        "find_module_root",
+        "detect_test_pairing",
+        "find_test_pairing",
+        "parse_symbols",
+        "parse_imports",
+        "extract_relations",
+    )
+    for name in required:
         assert hasattr(LanguageAdapter, name), f"LanguageAdapter missing {name!r}"
 
     # And both in-tree implementations satisfy the runtime-checkable Protocol.
@@ -131,6 +143,40 @@ def test_ac5_detect_test_pairing_fallback():
     assert ft.detect_test_pairing("foo.py") is None
     assert ft.detect_test_pairing("anything.go") is None
     assert ft.detect_test_pairing("") is None
+
+
+def test_graph_hooks_return_policy_metadata_and_safe_defaults():
+    py = PythonAdapter()
+    ft = FileTreeAdapter()
+
+    assert py.language() == "python"
+    assert py.classify_file("agent/service.py") == {
+        "file_kind": "source",
+        "language": "python",
+        "adapter": "python",
+    }
+    assert py.find_test_pairing("agent/service.py") == "tests/test_service.py"
+    symbols = py.parse_symbols(
+        "agent/service.py",
+        "import os\nfrom agent.db import save\n\nclass Service:\n    pass\n\ndef run():\n    save()\n",
+    )
+    assert {"name": "Service", "kind": "class", "lineno": 4, "end_lineno": 5, "decorators": []} in symbols
+    assert any(symbol["name"] == "run" and symbol["kind"] == "function" for symbol in symbols)
+    imports = py.parse_imports("agent/service.py", "import os\nfrom agent.db import save\n")
+    assert {"local": "os", "imported": "os", "kind": "import"} in imports
+    assert {"local": "save", "imported": "agent.db.save", "kind": "from_import"} in imports
+    assert py.extract_relations("agent/service.py", "def run():\n    pass\n") == []
+
+    assert ft.language() == ""
+    assert ft.classify_file("web/src/App.tsx") == {
+        "file_kind": "source",
+        "language": "typescript",
+        "adapter": "filetree",
+    }
+    assert ft.find_test_pairing("web/src/App.tsx") is None
+    assert ft.parse_symbols("web/src/App.tsx", "export function App() {}") == []
+    assert ft.parse_imports("web/src/App.tsx", "import React from 'react'") == []
+    assert ft.extract_relations("web/src/App.tsx", "") == []
 
 
 # ---------------------------------------------------------------------------
