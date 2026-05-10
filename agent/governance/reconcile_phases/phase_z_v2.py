@@ -19,7 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from agent.governance.language_adapters import FileTreeAdapter, LanguageAdapter, PythonAdapter
+from agent.governance.language_adapters import (
+    FileTreeAdapter,
+    JavaScriptTypescriptAdapter,
+    LanguageAdapter,
+    PythonAdapter,
+)
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 # ---------------------------------------------------------------------------
@@ -29,8 +34,12 @@ EXCLUDE_DIRS: frozenset[str] = frozenset(DEFAULT_LANGUAGE_POLICY.exclude_roots)
 
 # Default production directories to scan
 DEFAULT_PROD_DIRS: Tuple[str, ...] = ("agent", "scripts")
-_GRAPH_LANGUAGE_ADAPTERS: Tuple[LanguageAdapter, ...] = (PythonAdapter(),)
+_GRAPH_LANGUAGE_ADAPTERS: Tuple[LanguageAdapter, ...] = (
+    PythonAdapter(),
+    JavaScriptTypescriptAdapter(),
+)
 _FILETREE_ADAPTER = FileTreeAdapter()
+_IMPORT_RESOLUTION_SUFFIXES: Tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx")
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +70,9 @@ class ModuleInfo:
     source: str = ""
     language: str = ""
     source_kind: str = "symbol_ast"
+    adapter_symbols: List[Dict[str, Any]] = field(default_factory=list)
+    adapter_imports: List[Dict[str, Any]] = field(default_factory=list)
+    adapter_relations: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -268,6 +280,7 @@ def _parse_python_module(fpath: str, mod_name: str, source: str) -> Optional[Mod
 
 
 def _parse_filetree_module(
+    project_root: str,
     fpath: str,
     mod_name: str,
     source: str,
@@ -276,15 +289,141 @@ def _parse_filetree_module(
 ) -> ModuleInfo:
     metadata = adapter.classify_file(fpath) if hasattr(adapter, "classify_file") else {}
     language = str(metadata.get("language") or DEFAULT_LANGUAGE_POLICY.language_for_path(fpath))
+    symbols = _safe_adapter_symbols(adapter, fpath, source)
+    imports = _safe_adapter_imports(adapter, fpath, source)
+    relations = _safe_adapter_relations(adapter, fpath, source, symbols=symbols, imports=imports)
     return ModuleInfo(
         path=module_path,
         module_name=mod_name,
-        import_map={},
-        functions=[],
+        import_map=_adapter_import_map(project_root, module_path, imports),
+        functions=_function_meta_from_adapter_symbols(mod_name, symbols),
         source=source,
         language=language,
-        source_kind="filetree_fallback",
+        source_kind="filetree_fallback" if isinstance(adapter, FileTreeAdapter) else "adapter_static",
+        adapter_symbols=symbols,
+        adapter_imports=imports,
+        adapter_relations=relations,
     )
+
+
+def _safe_adapter_symbols(
+    adapter: LanguageAdapter,
+    file_path: str,
+    source: str,
+) -> List[Dict[str, Any]]:
+    try:
+        return [
+            item for item in adapter.parse_symbols(file_path, source)
+            if isinstance(item, dict)
+        ]
+    except Exception:
+        return []
+
+
+def _safe_adapter_imports(
+    adapter: LanguageAdapter,
+    file_path: str,
+    source: str,
+) -> List[Dict[str, Any]]:
+    try:
+        return [
+            item for item in adapter.parse_imports(file_path, source)
+            if isinstance(item, dict)
+        ]
+    except Exception:
+        return []
+
+
+def _safe_adapter_relations(
+    adapter: LanguageAdapter,
+    file_path: str,
+    source: str,
+    *,
+    symbols: List[Dict[str, Any]],
+    imports: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    try:
+        return [
+            item for item in adapter.extract_relations(
+                file_path,
+                source,
+                symbols=symbols,
+                imports=imports,
+            )
+            if isinstance(item, dict)
+        ]
+    except Exception:
+        return []
+
+
+def _function_meta_from_adapter_symbols(
+    module_name: str,
+    symbols: List[Dict[str, Any]],
+) -> List[FunctionMeta]:
+    functions: List[FunctionMeta] = []
+    for symbol in symbols or []:
+        name = str(symbol.get("name") or "").strip()
+        if not name:
+            continue
+        lineno = int(symbol.get("lineno") or 1)
+        end_lineno = int(symbol.get("end_lineno") or lineno)
+        decorators = [
+            str(item)
+            for item in (symbol.get("decorators") if isinstance(symbol.get("decorators"), list) else [])
+            if str(item)
+        ]
+        functions.append(FunctionMeta(
+            module=module_name,
+            name=name,
+            qualified_name=f"{module_name}::{name}",
+            lineno=lineno,
+            end_lineno=end_lineno,
+            decorators=decorators,
+            calls=[],
+            is_entry=name in {"main", "App", "handler"},
+        ))
+    return functions
+
+
+def _adapter_import_map(
+    project_root: str,
+    source_file: str,
+    imports: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    import_map: Dict[str, str] = {}
+    for row in imports or []:
+        specifier = str(row.get("specifier") or row.get("imported") or "").strip()
+        if not specifier:
+            continue
+        imported = _resolve_source_import(project_root, source_file, specifier)
+        local = str(row.get("local") or specifier).strip() or specifier
+        import_map[local] = imported
+    return import_map
+
+
+def _resolve_source_import(project_root: str, source_file: str, specifier: str) -> str:
+    specifier = str(specifier or "").replace("\\", "/").strip()
+    if not specifier.startswith("."):
+        return specifier
+    root = Path(project_root)
+    source_path = Path(source_file.replace("\\", "/"))
+    if not source_path.is_absolute():
+        source_path = root / source_path
+    target = (source_path.parent / specifier).resolve()
+    candidates: List[Path] = []
+    if target.suffix.lower() in DEFAULT_LANGUAGE_POLICY.source_extensions:
+        candidates.append(target)
+    else:
+        candidates.extend(target.with_suffix(suffix) for suffix in _IMPORT_RESOLUTION_SUFFIXES)
+        candidates.extend(target / f"index{suffix}" for suffix in _IMPORT_RESOLUTION_SUFFIXES)
+    for candidate in candidates:
+        if candidate.is_file():
+            return _path_to_module(str(candidate), project_root)
+    try:
+        rel = str(target.relative_to(root.resolve())).replace("\\", "/")
+    except ValueError:
+        rel = str(target).replace("\\", "/")
+    return DEFAULT_LANGUAGE_POLICY.strip_source_suffix(rel).replace("/", ".")
 
 
 def parse_production_modules(
@@ -341,6 +480,7 @@ def parse_production_modules(
                     modules[mod_name] = parsed
                 else:
                     modules[mod_name] = _parse_filetree_module(
+                        project_root,
                         fpath,
                         mod_name,
                         source,
@@ -1356,6 +1496,20 @@ def extract_typed_relations(project_root: str, modules: Dict[str, ModuleInfo]) -
                                            "task_metadata", "task_metadata",
                                            "metadata contract", rel_file))
         relations.extend(_route_relations(module, project_root))
+        for adapter_rel in module.adapter_relations or []:
+            relation_type = str(adapter_rel.get("relation_type") or "")
+            target = str(adapter_rel.get("target") or "")
+            target_kind = str(adapter_rel.get("target_kind") or "")
+            if not relation_type or not target or not target_kind:
+                continue
+            relations.append(TypedRelation(
+                module.module_name,
+                relation_type,
+                target,
+                target_kind,
+                str(adapter_rel.get("evidence") or "adapter relation"),
+                rel_file,
+            ))
 
     return [r.__dict__ for r in _dedupe_typed_relations(relations)]
 

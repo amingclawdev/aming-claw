@@ -187,6 +187,9 @@ def test_inventory_uses_shared_language_policy_for_mixed_js_ts_fixture(tmp_path)
     _write(str(project / "web" / "src" / "App.tsx"), "export function App() { return null }\n")
     _write(str(project / "web" / "src" / "App.test.tsx"), "test('app', () => {})\n")
     _write(str(project / "web" / "src" / "config.json"), "{}\n")
+    _write(str(project / "web" / "vite.config.ts"), "export default {}\n")
+    _write(str(project / "web" / "eslint.config.js"), "export default []\n")
+    _write(str(project / "web" / "package-lock.json"), "{}\n")
     _write(str(project / "docs" / "README.md"), "# docs\n")
     _write(str(project / "web" / "node_modules" / "pkg" / "index.js"), "ignored();\n")
     _write(str(project / "web" / "dist" / "bundle.js"), "ignored();\n")
@@ -208,6 +211,10 @@ def test_inventory_uses_shared_language_policy_for_mixed_js_ts_fixture(tmp_path)
     assert rows_by_path["web/src/App.test.tsx"]["language"] == "typescript"
     assert rows_by_path["web/src/config.json"]["file_kind"] == "config"
     assert rows_by_path["web/src/config.json"]["language"] == "json"
+    assert rows_by_path["web/vite.config.ts"]["file_kind"] == "config"
+    assert rows_by_path["web/eslint.config.js"]["file_kind"] == "config"
+    assert rows_by_path["web/package-lock.json"]["file_kind"] == "generated"
+    assert rows_by_path["web/package-lock.json"]["scan_status"] == "ignored"
     assert rows_by_path["docs/README.md"]["file_kind"] == "index_doc"
     assert "web/node_modules/pkg/index.js" not in rows_by_path
     assert "web/dist/bundle.js" not in rows_by_path

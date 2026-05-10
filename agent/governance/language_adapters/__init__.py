@@ -7,6 +7,12 @@ from __future__ import annotations
 
 from .base import LanguageAdapter
 from .filetree_adapter import FileTreeAdapter
+from .javascript_typescript_adapter import JavaScriptTypescriptAdapter
 from .python_adapter import PythonAdapter
 
-__all__ = ["LanguageAdapter", "PythonAdapter", "FileTreeAdapter"]
+__all__ = [
+    "LanguageAdapter",
+    "PythonAdapter",
+    "JavaScriptTypescriptAdapter",
+    "FileTreeAdapter",
+]

@@ -159,6 +159,8 @@ class LanguagePolicy:
         rel = str(rel_path or "").replace("\\", "/").strip("/")
         return (
             self.is_source_path(rel)
+            and not self.is_config_path(rel)
+            and not self.is_generated_path(rel)
             and not self.is_excluded_path(rel, exclude_roots)
             and not self.is_test_path(rel, test_roots)
             and not self.is_doc_path(rel, doc_roots)
@@ -192,11 +194,25 @@ class LanguagePolicy:
     def is_config_path(self, rel_path: str) -> bool:
         rel = str(rel_path or "").replace("\\", "/").strip("/")
         name = Path(rel).name
+        lower_name = name.lower()
         suffix = Path(rel).suffix.lower()
+        frontend_config_prefixes = (
+            "vite.config.",
+            "vitest.config.",
+            "jest.config.",
+            "eslint.config.",
+            "prettier.config.",
+            "next.config.",
+            "webpack.config.",
+            "rollup.config.",
+        )
         return (
             name in self.config_filenames
             or name.startswith("Dockerfile")
             or suffix in self.config_extensions
+            or lower_name in {".eslintrc", ".prettierrc"}
+            or lower_name.startswith((".eslintrc.", ".prettierrc."))
+            or lower_name.startswith(frontend_config_prefixes)
         )
 
     def is_script_path(self, rel_path: str) -> bool:

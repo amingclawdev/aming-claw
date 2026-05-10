@@ -196,14 +196,88 @@ def test_filetree_fallback_covers_non_python_and_root_sources(tmp_path):
     assert any(path.endswith("agent/service.py") for path in primaries)
     assert "dbservice/index.js" in primaries
     assert by_primary["dbservice/index.js"]["language"] == "javascript"
-    assert by_primary["dbservice/index.js"]["source_kind"] == "filetree_fallback"
+    assert by_primary["dbservice/index.js"]["source_kind"] == "adapter_static"
+    assert by_primary["dbservice/index.js"]["function_count"] == 1
     assert any(path.endswith("start_governance.py") for path in primaries)
-    fallback_clusters = [
-        cluster for cluster in result["feature_clusters"]
-        if cluster["synthesis"]["strategy"] == "filetree_fallback_source"
-    ]
-    assert fallback_clusters
-    assert any("dbservice/index.js" in cluster["primary_files"] for cluster in fallback_clusters)
+
+
+def test_js_ts_adapter_edges_api_relations_tests_config_and_ignores(tmp_path):
+    project = tmp_path / "project"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    _write(
+        str(project / "web" / "src" / "api" / "client.ts"),
+        "export function getNodes() {\n"
+        "  return fetch('/api/graph-governance/aming-claw/status')\n"
+        "}\n",
+    )
+    _write(
+        str(project / "web" / "src" / "hooks" / "useNodes.ts"),
+        "import { getNodes } from '../api/client'\n"
+        "export const useNodes = () => getNodes()\n",
+    )
+    _write(
+        str(project / "web" / "src" / "App.tsx"),
+        "import { useNodes } from './hooks/useNodes'\n"
+        "import axios from 'axios'\n"
+        "export function App() {\n"
+        "  axios.post('/api/graph-governance/aming-claw/query', {})\n"
+        "  return useNodes()\n"
+        "}\n",
+    )
+    _write(str(project / "web" / "src" / "App.test.tsx"), "import { App } from './App'\n")
+    _write(str(project / "web" / "package.json"), "{\"name\":\"dashboard\"}\n")
+    _write(str(project / "web" / "tsconfig.json"), "{\"compilerOptions\":{}}\n")
+    _write(str(project / "web" / "vite.config.ts"), "export default {}\n")
+    _write(str(project / "web" / "package-lock.json"), "{}\n")
+    _write(str(project / "web" / "node_modules" / "pkg" / "index.js"), "ignored();\n")
+
+    result = build_graph_v2_from_symbols(
+        str(project),
+        dry_run=True,
+        scratch_dir=str(scratch),
+    )
+
+    nodes_by_module = {node["module"]: node for node in result["nodes"]}
+    assert nodes_by_module["web.src.api.client"]["source_kind"] == "adapter_static"
+    assert nodes_by_module["web.src.api.client"]["language"] == "typescript"
+    assert nodes_by_module["web.src.App"]["function_count"] == 1
+    assert "web.src.App.test" not in nodes_by_module
+    assert "web.vite.config" not in nodes_by_module
+    assert not any("node_modules" in node["primary_file"].replace("\\", "/") for node in result["nodes"])
+
+    dep_edges = {
+        (edge["source_module"], edge["target_module"], edge["relation_type"])
+        for edge in result["module_dependency_edges"]
+    }
+    assert ("web.src.api.client", "web.src.hooks.useNodes", "imports_module") in dep_edges
+    assert ("web.src.hooks.useNodes", "web.src.App", "imports_module") in dep_edges
+
+    api_relations = {
+        (rel["source_module"], rel["relation_type"], rel["target"], rel["target_kind"])
+        for rel in result["typed_relations"]
+    }
+    assert (
+        "web.src.api.client",
+        "calls_api",
+        "/api/graph-governance/aming-claw/status",
+        "interface",
+    ) in api_relations
+    assert (
+        "web.src.App",
+        "calls_api",
+        "/api/graph-governance/aming-claw/query",
+        "interface",
+    ) in api_relations
+
+    rows = {row["path"]: row for row in result["file_inventory"]}
+    assert rows["web/src/App.test.tsx"]["file_kind"] == "test"
+    assert rows["web/package.json"]["file_kind"] == "config"
+    assert rows["web/tsconfig.json"]["file_kind"] == "config"
+    assert rows["web/vite.config.ts"]["file_kind"] == "config"
+    assert rows["web/package-lock.json"]["file_kind"] == "generated"
+    assert rows["web/package-lock.json"]["scan_status"] == "ignored"
+    assert "web/node_modules/pkg/index.js" not in rows
 
 
 def test_config_files_materialize_as_first_class_graph_relations(tmp_path):

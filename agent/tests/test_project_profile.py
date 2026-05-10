@@ -26,6 +26,7 @@ def test_project_profile_discovers_python_boundaries(tmp_path):
     _write(str(project / "web" / "src" / "index.js"), "export function main() {}\n")
     _write(str(project / "web" / "src" / "App.tsx"), "export function App() { return null }\n")
     _write(str(project / "web" / "src" / "App.test.tsx"), "test('app', () => {})\n")
+    _write(str(project / "web" / "vite.config.ts"), "export default {}\n")
     _write(str(project / "web" / "node_modules" / "pkg" / "index.js"), "ignored();\n")
     _write(str(project / "web" / ".next" / "server.js"), "ignored();\n")
 
@@ -49,6 +50,7 @@ def test_project_profile_discovers_python_boundaries(tmp_path):
     assert not profile.is_production_source_path("agent/tests/test_service.py")
     assert not profile.is_production_source_path("tests/test_external.py")
     assert not profile.is_production_source_path("web/src/App.test.tsx")
+    assert not profile.is_production_source_path("web/vite.config.ts")
     assert not profile.is_production_source_path("web/node_modules/pkg/index.js")
     assert not profile.is_production_source_path("web/.next/server.js")
     assert not profile.is_production_source_path("docs/service.md")

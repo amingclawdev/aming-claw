@@ -27,6 +27,7 @@ if _repo_root not in sys.path:
 
 from agent.governance.language_adapters import (  # noqa: E402
     FileTreeAdapter,
+    JavaScriptTypescriptAdapter,
     LanguageAdapter,
     PythonAdapter,
 )
@@ -53,8 +54,9 @@ def test_ac1_protocol_surface_has_graph_construction_methods():
     for name in required:
         assert hasattr(LanguageAdapter, name), f"LanguageAdapter missing {name!r}"
 
-    # And both in-tree implementations satisfy the runtime-checkable Protocol.
+    # And all in-tree implementations satisfy the runtime-checkable Protocol.
     assert isinstance(PythonAdapter(), LanguageAdapter)
+    assert isinstance(JavaScriptTypescriptAdapter(), LanguageAdapter)
     assert isinstance(FileTreeAdapter(), LanguageAdapter)
 
 
@@ -62,11 +64,11 @@ def test_ac1_protocol_surface_has_graph_construction_methods():
 # AC2 — Package re-exports the three public symbols
 # ---------------------------------------------------------------------------
 
-def test_ac2_package_reexports_three_symbols():
+def test_ac2_package_reexports_public_symbols():
     """LanguageAdapter, PythonAdapter, FileTreeAdapter importable from package root."""
     import agent.governance.language_adapters as pkg
 
-    for sym in ("LanguageAdapter", "PythonAdapter", "FileTreeAdapter"):
+    for sym in ("LanguageAdapter", "PythonAdapter", "JavaScriptTypescriptAdapter", "FileTreeAdapter"):
         assert hasattr(pkg, sym), f"language_adapters package missing {sym!r}"
         assert sym in getattr(pkg, "__all__", ()), f"{sym!r} not declared in __all__"
 

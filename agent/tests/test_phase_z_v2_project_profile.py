@@ -31,7 +31,7 @@ def test_parse_production_modules_excludes_tests_and_docs(tmp_path):
     assert "agent.service" in modules
     assert "web.src.index" in modules
     assert modules["web.src.index"].language == "typescript"
-    assert modules["web.src.index"].source_kind == "filetree_fallback"
+    assert modules["web.src.index"].source_kind == "adapter_static"
     assert "scripts.cli" in modules
     assert "web.src.index.test" not in modules
     assert "web.node_modules.pkg.index" not in modules
