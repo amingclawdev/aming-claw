@@ -646,6 +646,16 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
     assert projected["health"]["edge_semantic_current_count"] == 1
     assert projected["health"]["edge_semantic_coverage_ratio"] == 1.0
 
+    summary = server.handle_graph_governance_snapshot_summary(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+    semantic_health = summary["health"]["semantic_health"]
+    assert semantic_health["edge_semantic_eligible_count"] == 1
+    assert semantic_health["edge_semantic_current_count"] == 1
+    assert semantic_health["edge_semantic_requested_count"] == 0
+    assert semantic_health["edge_semantic_missing_count"] == 0
+    assert semantic_health["edge_semantic_coverage_ratio"] == 1.0
+
 
 def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware(conn, monkeypatch):
     monkeypatch.setattr(
