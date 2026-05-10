@@ -625,6 +625,84 @@ def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware
     assert changed_projected["health"]["semantic_stale_count"] == 1
 
 
+def test_graph_governance_semantic_projection_excludes_package_markers_from_feature_health(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph()
+    graph["deps_graph"]["nodes"].append({
+        "id": "L7.2",
+        "layer": "L7",
+        "title": "agent.governance",
+        "kind": "service_runtime",
+        "primary": ["agent/governance/__init__.py"],
+        "secondary": [],
+        "test": [],
+        "metadata": {
+            "exclude_as_feature": True,
+            "file_role": "package_marker",
+        },
+    })
+    graph["deps_graph"]["edges"].append({
+        "source": "L7.2",
+        "target": "L3.1",
+        "edge_type": "contains",
+        "direction": "hierarchy",
+        "evidence": {"source": "test"},
+    })
+    feature_hash = graph_events.feature_hash_for_node(graph["deps_graph"]["nodes"][0])
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-exclude-marker",
+        commit_sha="commit-marker",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', ?, '{}',
+                ?, 1, 0, '2026-05-10T00:00:00Z')
+        """,
+        (
+            PID,
+            snapshot["snapshot_id"],
+            feature_hash,
+            json.dumps({"feature_name": "Governed feature"}),
+        ),
+    )
+    conn.commit()
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer"},
+        )
+    )
+
+    assert projected["health"]["raw_feature_count"] == 2
+    assert projected["health"]["governed_feature_count"] == 1
+    assert projected["health"]["excluded_feature_count"] == 1
+    assert projected["health"]["feature_count"] == 1
+    assert projected["health"]["semantic_current_count"] == 1
+    assert projected["health"]["doc_coverage_ratio"] == 1.0
+    assert projected["health"]["test_coverage_ratio"] == 1.0
+
+
 def test_graph_governance_events_lifecycle_and_materialize_candidate_snapshot(conn, monkeypatch):
     monkeypatch.setattr(
         server,
@@ -915,6 +993,11 @@ def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
     assert summary["counts"]["edges"] == 1
     assert summary["counts"]["files"] == 2
     assert summary["health"]["semantic_coverage_ratio"] == 0.5
+    assert summary["health"]["structure_health_score"] is not None
+    assert summary["health"]["structure_health"]["governed_feature_count"] == 1
+    assert summary["health"]["structure_health"]["l4_asset_health"]["asset_count"] == 0
+    assert summary["health"]["semantic_health"]["status"] == "metadata_only"
+    assert summary["health"]["project_insight_health"]["status"] == "metadata_only"
     assert summary["graph_correction_patches"]["total"] == 2
     assert summary["graph_correction_patches"]["replayable_count"] == 1
     assert summary["graph_correction_patches"]["high_risk_proposed_count"] == 1

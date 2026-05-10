@@ -257,6 +257,23 @@ def _metadata(node: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _node_metadata(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _is_governed_feature_node(node: dict[str, Any]) -> bool:
+    if str(node.get("layer") or "").upper() != "L7":
+        return False
+    metadata = _node_metadata(node)
+    if metadata.get("exclude_as_feature") is True:
+        return False
+    file_role = str(metadata.get("file_role") or node.get("kind") or "").strip().lower()
+    if file_role == "package_marker":
+        return False
+    return True
+
+
 def _hash_payload(payload: Any) -> str:
     import hashlib
 
@@ -1383,7 +1400,8 @@ def _projection_health(
     nodes: list[dict[str, Any]],
     node_semantics: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    l7_nodes = [node for node in nodes if str(node.get("layer") or "").upper() == "L7"]
+    raw_l7_nodes = [node for node in nodes if str(node.get("layer") or "").upper() == "L7"]
+    l7_nodes = [node for node in raw_l7_nodes if _is_governed_feature_node(node)]
     total = len(l7_nodes)
     status_counts: dict[str, int] = {}
     current_count = 0
@@ -1456,6 +1474,9 @@ def _projection_health(
     return {
         "score_version": "semantic_projection_v1_event_source_hash_validity",
         "feature_count": total,
+        "raw_feature_count": len(raw_l7_nodes),
+        "governed_feature_count": total,
+        "excluded_feature_count": max(0, len(raw_l7_nodes) - total),
         "semantic_current_count": current_count,
         "semantic_stale_count": stale_count,
         "semantic_missing_count": missing_count,

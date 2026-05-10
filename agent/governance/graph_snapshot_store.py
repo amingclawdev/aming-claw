@@ -1174,12 +1174,280 @@ def _latest_global_review_from_notes(notes: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _health_from_snapshot_notes(notes: dict[str, Any]) -> dict[str, Any]:
-    latest_review = _latest_global_review_from_notes(notes)
+def _as_float(value: Any, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 4) if denominator else 0.0
+
+
+def _node_metadata(node: dict[str, Any]) -> dict[str, Any]:
+    metadata = node.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _string_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, Iterable):
+        values = list(raw)
+    else:
+        values = [raw]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip().replace("\\", "/")
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
+def _is_governed_feature_node(node: dict[str, Any]) -> bool:
+    if str(node.get("layer") or "").upper() != "L7":
+        return False
+    metadata = _node_metadata(node)
+    if metadata.get("exclude_as_feature") is True:
+        return False
+    file_role = str(metadata.get("file_role") or node.get("kind") or "").strip().lower()
+    if file_role == "package_marker":
+        return False
+    return True
+
+
+def _feature_coverage_picture(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    raw_features = [
+        node for node in nodes
+        if str(node.get("layer") or "").upper() == "L7"
+    ]
+    governed_features = [node for node in raw_features if _is_governed_feature_node(node)]
+    doc_bound = sum(1 for node in governed_features if _string_list(node.get("secondary_files")))
+    test_bound = sum(1 for node in governed_features if _string_list(node.get("test_files")))
+    config_bound = sum(
+        1 for node in governed_features
+        if _string_list(_node_metadata(node).get("config_files"))
+    )
+    return {
+        "raw_feature_count": len(raw_features),
+        "governed_feature_count": len(governed_features),
+        "excluded_feature_count": max(0, len(raw_features) - len(governed_features)),
+        "doc_bound_count": doc_bound,
+        "doc_coverage_ratio": _ratio(doc_bound, len(governed_features)),
+        "test_bound_count": test_bound,
+        "test_coverage_ratio": _ratio(test_bound, len(governed_features)),
+        "config_bound_count": config_bound,
+        "config_coverage_ratio": _ratio(config_bound, len(governed_features)),
+    }
+
+
+def _l4_asset_picture(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    l4_nodes = [
+        node for node in nodes
+        if str(node.get("layer") or "").upper() == "L4"
+    ]
+    by_kind: dict[str, int] = {}
+    by_file_role: dict[str, int] = {}
+    aggregate_count = 0
+    no_primary_count = 0
+    for node in l4_nodes:
+        metadata = _node_metadata(node)
+        kind = str(node.get("kind") or metadata.get("kind") or "asset").strip() or "asset"
+        role = str(metadata.get("file_role") or "asset").strip() or "asset"
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        by_file_role[role] = by_file_role.get(role, 0) + 1
+        if metadata.get("aggregate_asset") is True:
+            aggregate_count += 1
+        if not _string_list(node.get("primary_files")):
+            no_primary_count += 1
+    return {
+        "score_version": "l4_asset_contract_v1_role_aware",
+        "score": 100.0,
+        "asset_count": len(l4_nodes),
+        "aggregate_asset_count": aggregate_count,
+        "no_primary_asset_count": no_primary_count,
+        "by_kind": dict(sorted(by_kind.items())),
+        "by_file_role": dict(sorted(by_file_role.items())),
+        "policy": "L4 nodes are state/contract/asset nodes; direct files may be intentionally empty and are not scored as L7 feature coverage gaps.",
+    }
+
+
+def _structure_health_picture(
+    *,
+    nodes: list[dict[str, Any]],
+    counts: dict[str, Any],
+    file_summary: dict[str, Any],
+    graph_corrections: dict[str, Any],
+) -> dict[str, Any]:
+    coverage = _feature_coverage_picture(nodes)
+    feature_count = int(coverage["governed_feature_count"])
+    missing_docs = max(0, feature_count - int(coverage["doc_bound_count"]))
+    missing_tests = max(0, feature_count - int(coverage["test_bound_count"]))
+    file_total = max(1, int(counts.get("files") or 0))
+    orphan_files = int(counts.get("orphan_files") or 0)
+    pending_files = int(counts.get("pending_decision_files") or 0)
+    cleanup_candidates = int(counts.get("cleanup_candidates") or 0)
+    proposed_patches = int(graph_corrections.get("proposed_count") or 0)
+    high_risk_patches = int(graph_corrections.get("high_risk_proposed_count") or 0)
+
+    coverage_penalty = 0.0
+    if feature_count:
+        coverage_penalty = ((missing_docs * 6.0) + (missing_tests * 8.0)) / feature_count
+    file_penalty = min(
+        12.0,
+        ((orphan_files * 4.0) + (pending_files * 0.5) + (cleanup_candidates * 0.5)) / file_total * 100.0,
+    )
+    correction_penalty = min(8.0, proposed_patches * 1.5 + high_risk_patches * 3.0)
+    score = round(max(0.0, 100.0 - coverage_penalty - file_penalty - correction_penalty), 2)
+    return {
+        "score_version": "structure_health_v1_algorithmic_coverage_inventory",
+        "score": score,
+        "status": "current",
+        **coverage,
+        "file_hygiene": {
+            "total_files": counts.get("files", 0),
+            "orphan_files": orphan_files,
+            "pending_decision_files": pending_files,
+            "cleanup_candidates": cleanup_candidates,
+            "summary": file_summary,
+        },
+        "graph_correction_patches": {
+            "proposed_count": proposed_patches,
+            "high_risk_proposed_count": high_risk_patches,
+        },
+        "penalties": {
+            "coverage": round(coverage_penalty, 2),
+            "file_hygiene": round(file_penalty, 2),
+            "graph_corrections": round(correction_penalty, 2),
+        },
+        "l4_asset_health": _l4_asset_picture(nodes),
+    }
+
+
+def _latest_projection_health(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    if not _table_exists(conn, "graph_semantic_projections"):
+        return {}
+    try:
+        row = conn.execute(
+            """
+            SELECT projection_id, health_json, created_at
+            FROM graph_semantic_projections
+            WHERE project_id = ? AND snapshot_id = ?
+            ORDER BY event_watermark DESC, created_at DESC
+            LIMIT 1
+            """,
+            (project_id, snapshot_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    health = _decode_json(row["health_json"], {})
+    if not isinstance(health, dict):
+        health = {}
+    return {
+        **health,
+        "projection_id": row["projection_id"],
+        "projection_created_at": row["created_at"],
+    }
+
+
+def _semantic_health_picture(
+    *,
+    projection_health: dict[str, Any],
+    legacy_health: dict[str, Any],
+    review_meta: dict[str, Any],
+) -> dict[str, Any]:
+    if projection_health:
+        score = _as_float(projection_health.get("project_health_score"), None)
+        return {
+            "score_version": projection_health.get("score_version") or "semantic_projection",
+            "score": score,
+            "status": "current",
+            "source": "semantic_projection",
+            "projection_id": projection_health.get("projection_id", ""),
+            "feature_count": projection_health.get("feature_count"),
+            "semantic_current_count": projection_health.get("semantic_current_count"),
+            "semantic_missing_count": projection_health.get("semantic_missing_count"),
+            "semantic_stale_count": projection_health.get("semantic_stale_count"),
+            "semantic_unverified_hash_count": projection_health.get("semantic_unverified_hash_count"),
+            "semantic_current_ratio": projection_health.get("semantic_current_ratio"),
+            "doc_coverage_ratio": projection_health.get("doc_coverage_ratio"),
+            "test_coverage_ratio": projection_health.get("test_coverage_ratio"),
+            "low_health_count": projection_health.get("low_health_count"),
+        }
+    coverage = legacy_health.get("semantic_coverage_ratio")
+    if coverage is None:
+        coverage = review_meta.get("latest_full_semantic_coverage_ratio")
+    if coverage is not None:
+        return {
+            "score_version": "semantic_metadata_fallback_v1",
+            "score": _as_float(legacy_health.get("governance_observability_score"), None),
+            "status": "metadata_only",
+            "source": "snapshot_notes",
+            "semantic_current_ratio": coverage,
+            "semantic_coverage_ratio": coverage,
+        }
+    return {
+        "score_version": "semantic_health_v1",
+        "score": None,
+        "status": "pending",
+        "source": "none",
+    }
+
+
+def _project_insight_health_picture(
+    *,
+    latest_review: dict[str, Any],
+    review_meta: dict[str, Any],
+) -> dict[str, Any]:
+    health = latest_review.get("health_picture") if isinstance(latest_review, dict) else {}
+    if isinstance(health, dict) and health:
+        return {
+            "score_version": "project_insight_health_v1_global_review",
+            "score": _as_float(health.get("project_health_score"), None),
+            "status": "reviewed",
+            "source": "global_semantic_review",
+            "latest_run_id": review_meta.get("latest_full_run_id", ""),
+            "latest_status": review_meta.get("latest_full_status", ""),
+            "low_health_count": health.get("low_health_count"),
+            "issue_counts": health.get("project_health_issue_counts", {}),
+        }
+    if review_meta:
+        return {
+            "score_version": "project_insight_health_v1_global_review",
+            "score": None,
+            "status": "metadata_only",
+            "source": "snapshot_notes",
+            "latest_run_id": review_meta.get("latest_full_run_id", ""),
+            "latest_status": review_meta.get("latest_full_status", ""),
+        }
+    return {
+        "score_version": "project_insight_health_v1_global_review",
+        "score": None,
+        "status": "pending",
+        "source": "none",
+    }
+
+
+def _legacy_health_from_review(
+    latest_review: dict[str, Any],
+    review_meta: dict[str, Any],
+) -> dict[str, Any]:
     health = latest_review.get("health_picture") if isinstance(latest_review, dict) else {}
     if not isinstance(health, dict):
         health = {}
-    review_meta = notes.get("global_semantic_review") if isinstance(notes.get("global_semantic_review"), dict) else {}
     return {
         "project_health_score": health.get("project_health_score"),
         "raw_project_health_score": health.get("raw_project_health_score"),
@@ -1193,6 +1461,61 @@ def _health_from_snapshot_notes(notes: dict[str, Any]) -> dict[str, Any]:
             if health.get("semantic_coverage_ratio") is not None
             else review_meta.get("latest_full_semantic_coverage_ratio")
         ),
+    }
+
+
+def _health_from_snapshot_notes(notes: dict[str, Any]) -> dict[str, Any]:
+    latest_review = _latest_global_review_from_notes(notes)
+    review_meta = notes.get("global_semantic_review") if isinstance(notes.get("global_semantic_review"), dict) else {}
+    return _legacy_health_from_review(latest_review, review_meta)
+
+
+def _dashboard_health(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    nodes: list[dict[str, Any]],
+    counts: dict[str, Any],
+    file_summary: dict[str, Any],
+    graph_corrections: dict[str, Any],
+    notes: dict[str, Any],
+) -> dict[str, Any]:
+    latest_review = _latest_global_review_from_notes(notes)
+    review_meta = notes.get("global_semantic_review") if isinstance(notes.get("global_semantic_review"), dict) else {}
+    legacy = _legacy_health_from_review(latest_review, review_meta)
+    structure = _structure_health_picture(
+        nodes=nodes,
+        counts=counts,
+        file_summary=file_summary,
+        graph_corrections=graph_corrections,
+    )
+    projection = _latest_projection_health(conn, project_id, snapshot_id)
+    semantic = _semantic_health_picture(
+        projection_health=projection,
+        legacy_health=legacy,
+        review_meta=review_meta,
+    )
+    insight = _project_insight_health_picture(
+        latest_review=latest_review,
+        review_meta=review_meta,
+    )
+    legacy_score = (
+        legacy.get("project_health_score")
+        if legacy.get("project_health_score") is not None
+        else semantic.get("score")
+        if semantic.get("score") is not None
+        else structure.get("score")
+    )
+    return {
+        **legacy,
+        "project_health_score": legacy_score,
+        "structure_health_score": structure.get("score"),
+        "semantic_health_score": semantic.get("score"),
+        "project_insight_health_score": insight.get("score"),
+        "structure_health": structure,
+        "semantic_health": semantic,
+        "project_insight_health": insight,
     }
 
 
@@ -1244,6 +1567,16 @@ def summarize_graph_snapshot(
     except Exception:
         file_summary = {}
         file_total = 0
+    try:
+        summary_nodes = list_graph_snapshot_nodes(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=100000,
+            include_semantic=False,
+        )
+    except Exception:
+        summary_nodes = []
 
     notes = _snapshot_notes(snapshot)
     semantic_state = {}
@@ -1279,7 +1612,16 @@ def summarize_graph_snapshot(
         "inventory_sha256": snapshot.get("inventory_sha256", ""),
         "drift_sha256": snapshot.get("drift_sha256", ""),
         "counts": counts,
-        "health": _health_from_snapshot_notes(notes),
+        "health": _dashboard_health(
+            conn,
+            project_id,
+            snapshot_id,
+            nodes=summary_nodes,
+            counts=counts,
+            file_summary=file_summary,
+            graph_corrections=graph_corrections,
+            notes=notes,
+        ),
         "semantic": semantic,
         "graph_correction_patches": graph_corrections,
         "file_inventory_summary": file_summary,
