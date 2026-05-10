@@ -61,11 +61,27 @@ class SemanticAutomationPolicy:
 
 
 @dataclass
+class SemanticJobProfile:
+    analyzer_role: str = ""
+    provider: str = ""
+    model: str = ""
+    prompt_template: str = ""
+    use_ai_default: bool | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+
+
+@dataclass
 class SemanticAnalyzerConfig:
     version: str
     analyzer: str
     provider: str = "anthropic"
     model: str = "claude-opus-4-7"
+    analyzer_role: str = "reconcile_semantic_analyzer"
+    chain_role: str = "pm"
+    # Deprecated alias: historically this meant the chain/pipeline role used
+    # only for model routing. Keep it loaded for old callers, but do not expose
+    # it as the semantic analyzer identity in prompts.
     role: str = "pm"
     executables: dict[str, str] = field(default_factory=dict)
     use_ai_default: bool = False
@@ -76,6 +92,7 @@ class SemanticAnalyzerConfig:
     input_policy: SemanticInputPolicy = field(default_factory=SemanticInputPolicy)
     execution_policy: SemanticExecutionPolicy = field(default_factory=SemanticExecutionPolicy)
     automation_policy: SemanticAutomationPolicy = field(default_factory=SemanticAutomationPolicy)
+    job_profiles: dict[str, SemanticJobProfile] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     source_path: str = ""
@@ -187,12 +204,33 @@ class SemanticAnalyzerConfig:
             executables["anthropic"] = str(data.get("claude_bin")).strip()
         if data.get("codex_bin"):
             executables["openai"] = str(data.get("codex_bin")).strip()
+        legacy_role = str(data.get("role") or "").strip()
+        analyzer_role = str(
+            data.get("analyzer_role")
+            or data.get("reconcile_role")
+            or data.get("semantic_role")
+            or data.get("role_name")
+            or "reconcile_semantic_analyzer"
+        ).strip()
+        if not analyzer_role:
+            raise SemanticConfigValidationError("'analyzer_role' cannot be empty")
+        chain_role = str(
+            data.get("chain_role")
+            or data.get("pipeline_role")
+            or legacy_role
+            or "pm"
+        ).strip()
+        if not chain_role:
+            raise SemanticConfigValidationError("'chain_role' cannot be empty")
+        job_profiles = _parse_job_profiles(data.get("job_profiles") or data.get("job_profile") or {})
         return cls(
             version=str(data.get("version") or ""),
             analyzer=analyzer,
             provider=str(data.get("provider") or "anthropic"),
             model=str(data.get("model") or ""),
-            role=str(data.get("role") or "pm"),
+            analyzer_role=analyzer_role,
+            chain_role=chain_role,
+            role=legacy_role or chain_role,
             executables=executables,
             use_ai_default=bool(data.get("use_ai_default", False)),
             temperature=temperature,
@@ -202,19 +240,34 @@ class SemanticAnalyzerConfig:
             input_policy=input_policy,
             execution_policy=execution_policy,
             automation_policy=automation_policy,
+            job_profiles=job_profiles,
             output_schema=data.get("output_schema") if isinstance(data.get("output_schema"), dict) else {},
             prompt_template=prompt_template,
             source_path=source_path,
             override_path=override_path,
         )
 
-    def to_instruction_payload(self) -> dict[str, Any]:
+    def job_profile(self, job_type: str | None) -> SemanticJobProfile:
+        normalized = _normalize_semantic_job_type(job_type)
+        if normalized and normalized in self.job_profiles:
+            return self.job_profiles[normalized]
+        return SemanticJobProfile(analyzer_role=self.analyzer_role)
+
+    def to_instruction_payload(self, job_type: str | None = None) -> dict[str, Any]:
+        profile = self.job_profile(job_type)
+        analyzer_role = profile.analyzer_role or self.analyzer_role
         return {
             "mode": "state_only_semantic_enrichment",
             "analyzer": self.analyzer,
+            "analyzer_role": analyzer_role,
+            "chain_role": self.chain_role,
+            "pipeline_role": self.chain_role,
+            "legacy_role_alias": self.role,
+            "job_type": _normalize_semantic_job_type(job_type) or "node",
+            "job_profile": asdict(profile),
             "provider": self.provider,
             "model": self.model,
-            "role": self.role,
+            "role": analyzer_role,
             "executables": dict(self.executables),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -238,14 +291,21 @@ class SemanticAnalyzerConfig:
             "analyzer": self.analyzer,
             "provider": self.provider,
             "model": self.model,
-            "role": self.role,
             "executables": dict(self.executables),
             "use_ai_default": self.use_ai_default,
             "source_path": self.source_path,
             "override_path": self.override_path,
+            "analyzer_role": self.analyzer_role,
+            "chain_role": self.chain_role,
+            "legacy_role_alias": self.role,
+            "role": self.analyzer_role,
             "input_policy": asdict(self.input_policy),
             "execution_policy": asdict(self.execution_policy),
             "automation_policy": asdict(self.automation_policy),
+            "job_profiles": {
+                name: asdict(profile)
+                for name, profile in sorted(self.job_profiles.items())
+            },
         }
 
 
@@ -282,13 +342,108 @@ def _normalize_graph_apply_mode(value: Any) -> str:
     return mode
 
 
+def _normalize_semantic_job_type(value: Any) -> str:
+    mode = str(value or "node").strip().lower().replace("-", "_")
+    if not mode:
+        return "node"
+    if mode in {"node", "nodes", "feature", "features", "l7", "semantic_feature"}:
+        return "node"
+    if "edge" in mode or mode in {"relation", "relations", "dependency"}:
+        return "edge"
+    if "global" in mode or mode in {"project_review", "health_review", "semantic_review"}:
+        return "global_review"
+    if "retry" in mode or "feedback" in mode or mode in {"repair", "refine"}:
+        return "retry"
+    if "dry_run" in mode or "preview" in mode:
+        return "dry_run"
+    if "feature" in mode or mode.startswith("reconcile_semantic"):
+        return "node"
+    return mode
+
+
+def _default_job_profiles() -> dict[str, SemanticJobProfile]:
+    return {
+        "node": SemanticJobProfile(analyzer_role="reconcile_node_semantic_analyzer"),
+        "edge": SemanticJobProfile(analyzer_role="reconcile_edge_semantic_analyzer"),
+        "global_review": SemanticJobProfile(analyzer_role="reconcile_global_semantic_reviewer"),
+        "retry": SemanticJobProfile(analyzer_role="reconcile_semantic_retry_reviewer"),
+        "dry_run": SemanticJobProfile(analyzer_role="reconcile_semantic_dry_run"),
+    }
+
+
+def _job_profile_from_raw(
+    raw: Any,
+    *,
+    default: SemanticJobProfile,
+) -> SemanticJobProfile:
+    if isinstance(raw, str):
+        role = raw.strip()
+        if not role:
+            raise SemanticConfigValidationError("job profile analyzer_role cannot be empty")
+        return SemanticJobProfile(analyzer_role=role)
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise SemanticConfigValidationError("job profile entries must be mappings or strings")
+    analyzer_role = str(
+        raw.get("analyzer_role")
+        or raw.get("reconcile_role")
+        or raw.get("semantic_role")
+        or raw.get("role_name")
+        or default.analyzer_role
+        or ""
+    ).strip()
+    if not analyzer_role:
+        raise SemanticConfigValidationError("job profile analyzer_role cannot be empty")
+    max_tokens = raw.get("max_tokens", default.max_tokens)
+    if max_tokens is not None:
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise SemanticConfigValidationError("job_profiles.*.max_tokens must be an integer") from exc
+        if max_tokens <= 0:
+            raise SemanticConfigValidationError("job_profiles.*.max_tokens must be > 0")
+    temperature = raw.get("temperature", default.temperature)
+    if temperature is not None:
+        try:
+            temperature = float(temperature)
+        except (TypeError, ValueError) as exc:
+            raise SemanticConfigValidationError("job_profiles.*.temperature must be numeric") from exc
+    use_ai_default = raw.get("use_ai_default", default.use_ai_default)
+    if use_ai_default is not None:
+        use_ai_default = bool(use_ai_default)
+    return SemanticJobProfile(
+        analyzer_role=analyzer_role,
+        provider=str(raw.get("provider") or default.provider or "").strip(),
+        model=str(raw.get("model") or default.model or "").strip(),
+        prompt_template=str(raw.get("prompt_template") or default.prompt_template or "").strip(),
+        use_ai_default=use_ai_default,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+
+def _parse_job_profiles(raw: Any) -> dict[str, SemanticJobProfile]:
+    profiles = _default_job_profiles()
+    if raw in (None, ""):
+        return profiles
+    if not isinstance(raw, dict):
+        raise SemanticConfigValidationError("'job_profiles' must be a mapping")
+    for key, value in raw.items():
+        normalized = _normalize_semantic_job_type(key)
+        default = profiles.get(normalized, SemanticJobProfile(analyzer_role=f"reconcile_{normalized}_semantic_analyzer"))
+        profiles[normalized] = _job_profile_from_raw(value, default=default)
+    return profiles
+
+
 def _default_config_dict() -> dict[str, Any]:
     return {
         "version": "1.0",
         "analyzer": "reconcile_semantic",
         "provider": "anthropic",
         "model": "claude-opus-4-7",
-        "role": "pm",
+        "analyzer_role": "reconcile_semantic_analyzer",
+        "chain_role": "pm",
         "executables": {
             "anthropic": "claude",
             "openai": "codex",
@@ -310,6 +465,10 @@ def _default_config_dict() -> dict[str, Any]:
         "input_policy": asdict(SemanticInputPolicy()),
         "execution_policy": asdict(SemanticExecutionPolicy()),
         "automation_policy": asdict(SemanticAutomationPolicy()),
+        "job_profiles": {
+            name: asdict(profile)
+            for name, profile in _default_job_profiles().items()
+        },
         "output_schema": {
             "required": [
                 "feature_name",
@@ -386,5 +545,6 @@ __all__ = [
     "SemanticExecutionPolicy",
     "SemanticAutomationPolicy",
     "SemanticInputPolicy",
+    "SemanticJobProfile",
     "load_semantic_enrichment_config",
 ]

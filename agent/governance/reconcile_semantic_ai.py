@@ -138,18 +138,23 @@ def _semantic_error_message(parsed: dict[str, Any], config: SemanticAnalyzerConf
 
 def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
     """Resolve provider/model for semantic AI from config/env/pipeline."""
+    chain_role = config.chain_role or config.role or "pm"
+    base_meta = {
+        "analyzer_role": config.analyzer_role,
+        "chain_role": chain_role,
+    }
     env_provider = os.getenv("RECONCILE_SEMANTIC_AI_PROVIDER", "").strip()
     env_model = os.getenv("RECONCILE_SEMANTIC_AI_MODEL", "").strip()
     if env_provider or env_model:
         model = env_model or config.model
         provider = _infer_provider(model, env_provider or config.provider)
         model = _normalize_model_id(provider, model)
-        return {"provider": provider, "model": model, "source": "env"}
+        return {"provider": provider, "model": model, "source": "env", **base_meta}
 
     provider = _normalize_provider(config.provider)
     model = _normalize_model_id(provider, (config.model or "").strip())
     if provider in {"", "injected", "none", "off"}:
-        return {"provider": "", "model": model, "source": "disabled"}
+        return {"provider": "", "model": model, "source": "disabled", **base_meta}
     if provider in {"pipeline", "role"}:
         agent_dir = Path(__file__).resolve().parents[1]
         if str(agent_dir) not in sys.path:
@@ -162,7 +167,7 @@ def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
         if get_effective_pipeline_config and resolve_role_config:
             try:
                 pipeline = get_effective_pipeline_config()
-                resolved = resolve_role_config(config.role or "pm", pipeline)
+                resolved = resolve_role_config(chain_role, pipeline)
                 model = model or (resolved.get("model") or "")
                 provider = _infer_provider(model, resolved.get("provider") or "")
                 model = _normalize_model_id(provider, model)
@@ -176,8 +181,8 @@ def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
                 model = _normalize_model_id(provider, model)
             except Exception:
                 pass
-        return {"provider": provider, "model": model, "source": "pipeline"}
-    return {"provider": _infer_provider(model, provider), "model": model, "source": "config"}
+        return {"provider": provider, "model": model, "source": "pipeline", **base_meta}
+    return {"provider": _infer_provider(model, provider), "model": model, "source": "config", **base_meta}
 
 
 def build_semantic_ai_call(
@@ -216,6 +221,25 @@ def build_semantic_ai_call(
         return changed
 
     def call(stage: str, payload: dict[str, Any]) -> dict[str, Any]:
+        stage_profile = semantic_config.job_profile(stage)
+        stage_route = dict(route)
+        if stage_profile.provider or stage_profile.model:
+            stage_model = stage_profile.model or model
+            stage_provider = _infer_provider(stage_model, stage_profile.provider or provider)
+            stage_route.update(
+                {
+                    "provider": stage_provider,
+                    "model": _normalize_model_id(stage_provider, stage_model),
+                    "source": f"{route.get('source', 'config')}+job_profile",
+                }
+            )
+        stage_route["analyzer_role"] = stage_profile.analyzer_role or semantic_config.analyzer_role
+        stage_route["chain_role"] = semantic_config.chain_role or semantic_config.role or "pm"
+        stage_route["job_type"] = semantic_config.to_instruction_payload(stage).get("job_type", "node")
+        call_provider = stage_route.get("provider", "")
+        call_model = stage_route.get("model", "")
+        if call_provider not in {"openai", "anthropic"}:
+            raise RuntimeError(f"semantic AI provider is not configured for stage {stage!r}")
         batch_hint = ""
         if isinstance(payload.get("features"), list):
             batch_hint = (
@@ -223,8 +247,9 @@ def build_semantic_ai_call(
                 "'features' array. Include one object for every input "
                 "feature.node_id, and include node_id on each output object. "
             )
+        prompt_template = stage_profile.prompt_template or semantic_config.prompt_template
         prompt = (
-            f"{semantic_config.prompt_template}\n\n"
+            f"{prompt_template}\n\n"
             "Return exactly one JSON object matching the requested semantic fields. "
             f"{batch_hint}"
             "Do not modify files, create tasks, or inspect project files outside the supplied payload.\n\n"
@@ -236,7 +261,7 @@ def build_semantic_ai_call(
         timeout_sec = int(os.getenv("RECONCILE_SEMANTIC_AI_TIMEOUT_SEC", os.getenv("CODEX_TIMEOUT_SEC", "900")))
         before = git_changed()
         t0 = time.perf_counter()
-        if provider == "openai":
+        if call_provider == "openai":
             codex_bin, executable_source = _resolve_cli_binary(
                 "CODEX_BIN",
                 semantic_config.executables.get("openai", ""),
@@ -256,8 +281,8 @@ def build_semantic_ai_call(
                 "-o",
                 str(output_last),
             ]
-            if model:
-                cmd.extend(["--model", model])
+            if call_model:
+                cmd.extend(["--model", call_model])
             cmd.append("-")
             proc = subprocess.run(
                 cmd,
@@ -277,8 +302,8 @@ def build_semantic_ai_call(
                 "claude",
             )
             cmd = [claude_bin, "-p", "--output-format", "json"]
-            if model:
-                cmd.extend(["--model", model])
+            if call_model:
+                cmd.extend(["--model", call_model])
             if os.getenv("CLAUDE_DANGEROUS", "1").strip().lower() not in {"0", "false", "no"}:
                 cmd.append("--dangerously-skip-permissions")
             env = {
@@ -324,7 +349,7 @@ def build_semantic_ai_call(
         if error_message:
             raise RuntimeError(f"semantic AI returned error response: {error_message}")
         parsed["_ai_route"] = {
-            **route,
+            **stage_route,
             "executable": str(cmd[0]) if cmd else "",
             "executable_source": executable_source,
         }

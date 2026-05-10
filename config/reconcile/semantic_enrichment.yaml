@@ -2,7 +2,10 @@ version: "1.0"
 analyzer: reconcile_semantic
 provider: anthropic
 model: "claude-opus-4-7"
-role: pm
+analyzer_role: reconcile_semantic_analyzer
+# chain_role is only used when provider is "pipeline" or "role" to reuse
+# standard chain model routing. It does not mean this analyzer is the PM stage.
+chain_role: pm
 # Machine-specific projects can override these with absolute paths in
 # .aming-claw/reconcile/semantic_enrichment.yaml.
 executables:
@@ -55,6 +58,18 @@ automation_policy:
   review_lanes:
     - graph_patch_candidate
     - review_required
+
+job_profiles:
+  node:
+    analyzer_role: reconcile_node_semantic_analyzer
+  edge:
+    analyzer_role: reconcile_edge_semantic_analyzer
+  global_review:
+    analyzer_role: reconcile_global_semantic_reviewer
+  retry:
+    analyzer_role: reconcile_semantic_retry_reviewer
+  dry_run:
+    analyzer_role: reconcile_semantic_dry_run
 
 output_schema:
   required:

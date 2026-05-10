@@ -1772,8 +1772,21 @@ def _semantic_ai_call_from_body(project_id: str, root: Path, body: dict):
             semantic_config.provider = str(body.get("semantic_ai_provider") or "")
         if body.get("semantic_ai_model") is not None:
             semantic_config.model = str(body.get("semantic_ai_model") or "")
+        if body.get("semantic_analyzer_role") is not None:
+            semantic_config.analyzer_role = str(body.get("semantic_analyzer_role") or "")
+        elif body.get("reconcile_analyzer_role") is not None:
+            semantic_config.analyzer_role = str(body.get("reconcile_analyzer_role") or "")
+        if body.get("semantic_ai_chain_role") is not None:
+            semantic_config.chain_role = str(body.get("semantic_ai_chain_role") or "")
+            semantic_config.role = semantic_config.chain_role
+        elif body.get("semantic_ai_pipeline_role") is not None:
+            semantic_config.chain_role = str(body.get("semantic_ai_pipeline_role") or "")
+            semantic_config.role = semantic_config.chain_role
         if body.get("semantic_ai_role") is not None:
-            semantic_config.role = str(body.get("semantic_ai_role") or "")
+            # Backward compatibility: semantic_ai_role historically selected the
+            # chain/pipeline model-routing role, not the reconcile analyzer identity.
+            semantic_config.chain_role = str(body.get("semantic_ai_role") or "")
+            semantic_config.role = semantic_config.chain_role
         effective_use_ai = semantic_config.use_ai_default if use_ai is None else use_ai
         if not effective_use_ai:
             return None
@@ -1885,6 +1898,16 @@ def _semantic_ai_config_kwargs_from_body(body: dict) -> dict:
         "semantic_ai_role": (
             str(body.get("semantic_ai_role"))
             if body.get("semantic_ai_role") is not None
+            else None
+        ),
+        "semantic_ai_chain_role": (
+            str(body.get("semantic_ai_chain_role") or body.get("semantic_ai_pipeline_role"))
+            if body.get("semantic_ai_chain_role") is not None or body.get("semantic_ai_pipeline_role") is not None
+            else None
+        ),
+        "semantic_analyzer_role": (
+            str(body.get("semantic_analyzer_role") or body.get("reconcile_analyzer_role"))
+            if body.get("semantic_analyzer_role") is not None or body.get("reconcile_analyzer_role") is not None
             else None
         ),
     }

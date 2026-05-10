@@ -21,7 +21,14 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.analyzer == "reconcile_semantic"
     assert config.provider == "anthropic"
     assert config.model == "claude-opus-4-7"
+    assert config.analyzer_role == "reconcile_semantic_analyzer"
+    assert config.chain_role == "pm"
     assert config.role == "pm"
+    assert config.job_profiles["node"].analyzer_role == "reconcile_node_semantic_analyzer"
+    assert config.job_profiles["edge"].analyzer_role == "reconcile_edge_semantic_analyzer"
+    assert config.job_profiles["global_review"].analyzer_role == "reconcile_global_semantic_reviewer"
+    assert config.job_profiles["retry"].analyzer_role == "reconcile_semantic_retry_reviewer"
+    assert config.job_profiles["dry_run"].analyzer_role == "reconcile_semantic_dry_run"
     assert config.executables["anthropic"] == "claude"
     assert config.executables["openai"] == "codex"
     assert config.use_ai_default is False
@@ -35,10 +42,77 @@ def test_default_semantic_config_loads_state_only_profile():
     payload = config.to_instruction_payload()
     assert payload["mutate_project_files"] is False
     assert payload["mutate_graph_topology"] is False
+    assert payload["role"] == "reconcile_node_semantic_analyzer"
+    assert payload["analyzer_role"] == "reconcile_node_semantic_analyzer"
+    assert payload["chain_role"] == "pm"
+    assert payload["legacy_role_alias"] == "pm"
+    assert payload["job_type"] == "node"
     assert payload["execution_policy"]["ai_input_mode"] == "feature"
     assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"
     assert payload["prompt_template"]
     assert Path(DEFAULT_CONFIG_PATH).exists()
+
+
+def test_legacy_role_field_maps_to_chain_role_not_analyzer(tmp_path):
+    cfg = tmp_path / "legacy-semantic.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                'version: "1.0"',
+                "analyzer: reconcile_semantic",
+                "role: qa",
+                "prompt_template: legacy route config",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_semantic_enrichment_config(config_path=cfg)
+
+    assert config.analyzer_role == "reconcile_semantic_analyzer"
+    assert config.chain_role == "qa"
+    assert config.role == "qa"
+    payload = config.to_instruction_payload()
+    assert payload["role"] == "reconcile_node_semantic_analyzer"
+    assert payload["chain_role"] == "qa"
+    assert payload["legacy_role_alias"] == "qa"
+
+
+def test_job_profile_aliases_support_per_job_overrides(tmp_path):
+    cfg = tmp_path / "profiles.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                'version: "1.0"',
+                "analyzer: reconcile_semantic",
+                "analyzer_role: reconcile_semantic_analyzer",
+                "chain_role: pm",
+                "provider: anthropic",
+                "model: claude-opus-4-7",
+                "job_profiles:",
+                "  features:",
+                "    analyzer_role: custom_node_analyzer",
+                "    prompt_template: Node-only prompt",
+                "  edges:",
+                "    analyzer_role: custom_edge_analyzer",
+                "    model: gpt-edge",
+                "    provider: openai",
+                "  global:",
+                "    analyzer_role: custom_global_reviewer",
+                "prompt_template: base prompt",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_semantic_enrichment_config(config_path=cfg)
+
+    assert config.job_profile("reconcile_semantic_feature").analyzer_role == "custom_node_analyzer"
+    assert config.job_profile("edge_semantic_requested").analyzer_role == "custom_edge_analyzer"
+    assert config.job_profile("edge").provider == "openai"
+    assert config.job_profile("edge").model == "gpt-edge"
+    assert config.job_profile("reconcile_global_semantic_review").analyzer_role == "custom_global_reviewer"
+    assert config.to_instruction_payload("edge")["job_profile"]["model"] == "gpt-edge"
 
 
 def test_project_override_merges_with_default(tmp_path):

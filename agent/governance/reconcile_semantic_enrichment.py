@@ -1990,6 +1990,8 @@ def run_semantic_enrichment(
     semantic_ai_provider: str | None = None,
     semantic_ai_model: str | None = None,
     semantic_ai_role: str | None = None,
+    semantic_ai_chain_role: str | None = None,
+    semantic_analyzer_role: str | None = None,
     ai_feature_limit: int | None = None,
     semantic_ai_scope: str | None = None,
     semantic_node_ids: Any = None,
@@ -2030,8 +2032,16 @@ def run_semantic_enrichment(
         semantic_config.provider = str(semantic_ai_provider or "")
     if semantic_ai_model is not None:
         semantic_config.model = str(semantic_ai_model or "")
+    if semantic_analyzer_role is not None:
+        semantic_config.analyzer_role = str(semantic_analyzer_role or "")
+    if semantic_ai_chain_role is not None:
+        semantic_config.chain_role = str(semantic_ai_chain_role or "")
+        semantic_config.role = semantic_config.chain_role
     if semantic_ai_role is not None:
-        semantic_config.role = str(semantic_ai_role or "")
+        # Legacy alias: semantic_ai_role is the pipeline/chain role used for
+        # model routing, not the semantic analyzer identity.
+        semantic_config.chain_role = str(semantic_ai_role or "")
+        semantic_config.role = semantic_config.chain_role
     effective_use_ai = semantic_config.use_ai_default if use_ai is None else bool(use_ai)
     effective_excerpt_chars = (
         semantic_config.input_policy.max_excerpt_chars
@@ -2203,7 +2213,7 @@ def run_semantic_enrichment(
             "feedback_round": round_number,
             "feature": payload_feature,
             "review_feedback": payload_feedback,
-            "instructions": semantic_config.to_instruction_payload(),
+            "instructions": semantic_config.to_instruction_payload("node"),
             "semantic_selector": selector,
             "semantic_ai_input_mode": ai_input_mode,
             "dynamic_semantic_graph_state": bool(dynamic_graph_state and semantic_state_enabled),
@@ -2476,7 +2486,7 @@ def run_semantic_enrichment(
                     "semantic_graph_state": graph_state_summary,
                     "batch_memory": memory_summary,
                     "instructions": {
-                        **semantic_config.to_instruction_payload(),
+                        **semantic_config.to_instruction_payload("node"),
                         "batch_mode": True,
                         "semantic_ai_input_mode": ai_input_mode,
                         "use_semantic_graph_state": bool(semantic_state_enabled),
