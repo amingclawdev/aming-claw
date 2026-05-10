@@ -29,6 +29,7 @@ from .reconcile_semantic_config import load_semantic_enrichment_config
 
 
 SEMANTIC_ENRICHMENT_SCHEMA_VERSION = 1
+SEMANTIC_HEALTH_ISSUE_SCHEMA_VERSION = 1
 SEMANTIC_ARTIFACT_DIR = "semantic-enrichment"
 SEMANTIC_INDEX_NAME = "semantic-index.json"
 SEMANTIC_REVIEW_REPORT_NAME = "semantic-review-report.json"
@@ -724,6 +725,7 @@ def _heuristic_semantic_entry(
         },
         "dead_code_candidates": ai_response.get("dead_code_candidates") or [],
         "quality_flags": _quality_flags(feature, feedback),
+        "health_issues": ai_response.get("health_issues") or [],
         "applied_feedback_ids": applied,
         "rejected_feedback_ids": rejected,
         "unresolved_feedback_ids": unresolved,
@@ -975,6 +977,26 @@ def _compact_memory_conflict(conflict: Any) -> dict[str, Any]:
     }
 
 
+def _compact_health_issue(issue: Any) -> dict[str, Any]:
+    if not isinstance(issue, dict):
+        return {"summary": _shorten_text(issue, 240)}
+    return {
+        key: value
+        for key, value in {
+            "issue_id": str(issue.get("issue_id") or ""),
+            "node_id": str(issue.get("node_id") or ""),
+            "category": str(issue.get("category") or ""),
+            "severity": str(issue.get("severity") or ""),
+            "confidence": issue.get("confidence"),
+            "source": str(issue.get("source") or ""),
+            "summary": _shorten_text(issue.get("summary"), 300),
+            "suggested_action": _shorten_text(issue.get("suggested_action"), 300),
+            "affected_node_ids": _path_list(issue.get("affected_node_ids"))[:10],
+        }.items()
+        if value not in ("", [], {}, None)
+    }
+
+
 def _semantic_batch_memory_summary(batch: dict[str, Any]) -> dict[str, Any]:
     memory = batch.get("memory") if isinstance(batch, dict) else {}
     memory = memory if isinstance(memory, dict) else {}
@@ -1020,6 +1042,7 @@ def _empty_semantic_graph_state(
         "accepted_features": {},
         "file_ownership": {},
         "open_issues": [],
+        "health_issues": [],
         "completed_node_ids": [],
         "semantic_jobs": {},
         "semantic_job_counts": {},
@@ -1501,6 +1524,11 @@ def _semantic_review_status(review: Any) -> str:
 
 def _semantic_open_issues(node_id: str, ai_response: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
+    for item in ai_response.get("open_issues") or []:
+        if isinstance(item, dict):
+            issue = dict(item)
+            issue.setdefault("node_id", node_id)
+            issues.append(issue)
     for key in (
         "merge_suggestions",
         "split_suggestions",
@@ -1535,6 +1563,218 @@ def _semantic_open_issues(node_id: str, ai_response: dict[str, Any]) -> list[dic
     return issues
 
 
+def _short_issue_id(payload: dict[str, Any]) -> str:
+    return "shi-" + hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()[:12]
+
+
+def _issue_nodes(node_id: str, raw: dict[str, Any]) -> list[str]:
+    nodes = _path_list(
+        raw.get("affected_node_ids")
+        or raw.get("source_node_ids")
+        or raw.get("node_ids")
+        or raw.get("nodes")
+    )
+    for key in ("node_id", "source_node_id", "target", "target_id"):
+        value = str(raw.get(key) or "").strip()
+        if value.startswith(("L", "graph.", "agent.", "governance.")) and value not in nodes:
+            nodes.append(value)
+    if node_id and node_id not in nodes:
+        nodes.insert(0, node_id)
+    return nodes[:20]
+
+
+def _issue_confidence(value: Any, default: float = 0.6) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = default
+    return max(0.0, min(1.0, round(confidence, 3)))
+
+
+def _issue_severity(value: Any, *, default: str = "low") -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"info", "low", "medium", "high", "critical"}:
+        return text
+    return default
+
+
+def _issue_category(raw: dict[str, Any], text: str) -> str:
+    explicit = str(raw.get("category") or raw.get("issue_category") or "").strip().lower()
+    if explicit:
+        return explicit.replace("-", "_")
+    lowered = text.lower()
+    if "duplicate" in lowered or "overlap" in lowered or "merge_suggestions" in lowered:
+        return "duplicate_or_overlap"
+    if "split" in lowered or "broad" in lowered:
+        return "broad_responsibility"
+    if "test" in lowered:
+        return "test_gap"
+    if "doc" in lowered:
+        return "doc_gap"
+    if "config" in lowered:
+        return "config_gap"
+    if "relation" in lowered or "dependency" in lowered or "edge" in lowered:
+        return "dependency_gap"
+    if "hash" in lowered or "drift" in lowered:
+        return "semantic_drift"
+    if "observer" in lowered or "signoff" in lowered:
+        return "observer_decision"
+    if "code_review" in lowered:
+        return "code_review"
+    return "semantic_review"
+
+
+def _category_default_severity(category: str) -> str:
+    return {
+        "duplicate_or_overlap": "medium",
+        "broad_responsibility": "medium",
+        "test_gap": "medium",
+        "doc_gap": "low",
+        "config_gap": "low",
+        "dependency_gap": "low",
+        "semantic_drift": "high",
+        "observer_decision": "high",
+        "code_review": "medium",
+        "semantic_ai": "medium",
+        "semantic_review": "low",
+    }.get(category, "low")
+
+
+def _normalize_health_issue(
+    node_id: str,
+    raw: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    issue_type = str(raw.get("type") or raw.get("kind") or raw.get("issue_type") or "").strip()
+    reason = str(raw.get("reason") or "").strip()
+    summary = _shorten_text(
+        raw.get("summary")
+        or raw.get("issue")
+        or raw.get("message")
+        or raw.get("suggested_action")
+        or raw.get("suggestion")
+        or reason
+        or issue_type,
+        700,
+    )
+    text = " ".join(item for item in (issue_type, reason, summary) if item)
+    category = _issue_category(raw, text)
+    severity = _issue_severity(raw.get("severity"), default=_category_default_severity(category))
+    evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+    evidence = {
+        **evidence,
+        "reason": reason,
+        "source": source,
+    }
+    action = _shorten_text(
+        raw.get("suggested_action")
+        or raw.get("proposed_action")
+        or raw.get("action")
+        or summary,
+        700,
+    )
+    issue = {
+        "schema_version": SEMANTIC_HEALTH_ISSUE_SCHEMA_VERSION,
+        "issue_id": str(raw.get("issue_id") or raw.get("id") or ""),
+        "node_id": node_id,
+        "category": category,
+        "severity": severity,
+        "confidence": _issue_confidence(raw.get("confidence"), default=0.6),
+        "evidence": {key: value for key, value in evidence.items() if value not in ("", [], {})},
+        "affected_node_ids": _issue_nodes(node_id, raw),
+        "suggested_action": action,
+        "source": str(raw.get("source") or source),
+        "type": issue_type,
+        "reason": reason,
+        "summary": summary,
+    }
+    if not issue["issue_id"]:
+        issue["issue_id"] = _short_issue_id({
+            "node_id": node_id,
+            "category": category,
+            "severity": severity,
+            "source": issue["source"],
+            "type": issue_type,
+            "reason": reason,
+            "summary": summary,
+            "affected_node_ids": issue["affected_node_ids"],
+        })
+    return {
+        key: value
+        for key, value in issue.items()
+        if value not in ("", [], {}, None)
+    }
+
+
+def _health_issue_from_quality_flag(node_id: str, flag: str) -> dict[str, Any]:
+    text = str(flag or "").strip()
+    category = {
+        "missing_doc_binding": "doc_gap",
+        "missing_test_binding": "test_gap",
+        "missing_symbol_refs": "symbol_gap",
+        "has_review_feedback": "observer_review",
+        "semantic_hash_mismatch": "semantic_drift",
+        "semantic_ai_error": "semantic_ai",
+        "review_required": "observer_review",
+    }.get(text, "semantic_review")
+    severity = {
+        "missing_test_binding": "medium",
+        "semantic_hash_mismatch": "high",
+        "semantic_ai_error": "medium",
+        "has_review_feedback": "low",
+    }.get(text, _category_default_severity(category))
+    return _normalize_health_issue(
+        node_id,
+        {
+            "type": text,
+            "category": category,
+            "severity": severity,
+            "confidence": 0.8,
+            "summary": text,
+            "suggested_action": f"Review semantic quality flag: {text}.",
+        },
+        source="quality_flag",
+    )
+
+
+def _semantic_health_issues(
+    node_id: str,
+    semantic_entry: dict[str, Any],
+    *,
+    open_issues: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(raw: dict[str, Any], source: str) -> None:
+        if not isinstance(raw, dict):
+            return
+        normalized = _normalize_health_issue(node_id, raw, source=source)
+        fingerprint = _short_issue_id({
+            "node_id": normalized.get("node_id"),
+            "category": normalized.get("category"),
+            "type": normalized.get("type"),
+            "reason": normalized.get("reason"),
+            "summary": normalized.get("summary"),
+            "affected_node_ids": normalized.get("affected_node_ids"),
+        })
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        issues.append(normalized)
+
+    for raw in semantic_entry.get("health_issues") or []:
+        if isinstance(raw, dict):
+            add(raw, "ai_health_issue")
+    for raw in (open_issues if open_issues is not None else _semantic_open_issues(node_id, semantic_entry)):
+        if isinstance(raw, dict):
+            add(raw, "legacy_open_issue")
+    for flag in _path_list(semantic_entry.get("quality_flags")):
+        add(_health_issue_from_quality_flag(node_id, flag), "quality_flag")
+    return issues
+
+
 def _semantic_state_entry(
     feature: dict[str, Any],
     semantic_entry: dict[str, Any],
@@ -1545,6 +1785,8 @@ def _semantic_state_entry(
 ) -> dict[str, Any]:
     node_id = str(feature.get("node_id") or semantic_entry.get("node_id") or "")
     ai_route = semantic_entry.get("semantic_ai_route")
+    open_issues = _semantic_open_issues(node_id, semantic_entry)
+    health_issues = _semantic_health_issues(node_id, semantic_entry, open_issues=open_issues)
     return {
         "node_id": node_id,
         "source_title": semantic_entry.get("source_title") or feature.get("title") or "",
@@ -1563,7 +1805,8 @@ def _semantic_state_entry(
         "doc_status": _semantic_review_status(semantic_entry.get("doc_coverage_review")),
         "test_status": _semantic_review_status(semantic_entry.get("test_coverage_review")),
         "config_status": _semantic_review_status(semantic_entry.get("config_coverage_review")),
-        "open_issues": _semantic_open_issues(node_id, semantic_entry),
+        "open_issues": open_issues,
+        "health_issues": health_issues,
         "feedback_round": feedback_round,
         "batch_index": batch_index,
         "updated_at": updated_at,
@@ -1576,13 +1819,15 @@ def _rebuild_semantic_graph_state_indexes(state: dict[str, Any]) -> None:
     accepted: dict[str, dict[str, Any]] = {}
     file_ownership: dict[str, str] = {}
     open_issues: list[dict[str, Any]] = []
+    health_issues: list[dict[str, Any]] = []
     completed: list[str] = []
     for node_id, raw in nodes.items():
         if not isinstance(raw, dict):
             continue
+        node_id = str(node_id)
         status = str(raw.get("status") or "")
         if status == "ai_complete":
-            completed.append(str(node_id))
+            completed.append(node_id)
         feature_name = str(raw.get("feature_name") or raw.get("source_title") or node_id)
         feature = accepted.setdefault(
             feature_name,
@@ -1607,6 +1852,25 @@ def _rebuild_semantic_graph_state_indexes(state: dict[str, Any]) -> None:
         for issue in raw.get("open_issues") or []:
             if isinstance(issue, dict):
                 open_issues.append(issue)
+        raw_health_issues = raw.get("health_issues")
+        if isinstance(raw_health_issues, list) and raw_health_issues:
+            node_health_issues = [
+                _normalize_health_issue(node_id, issue, source=str(issue.get("source") or "semantic_state"))
+                for issue in raw_health_issues
+                if isinstance(issue, dict)
+            ]
+        else:
+            node_health_issues = _semantic_health_issues(
+                node_id,
+                raw,
+                open_issues=[
+                    issue for issue in (raw.get("open_issues") or [])
+                    if isinstance(issue, dict)
+                ],
+            )
+            if node_health_issues:
+                raw["health_issues"] = node_health_issues
+        health_issues.extend(node_health_issues)
     for feature in accepted.values():
         for key in ("node_ids", "owned_files", "candidate_docs", "candidate_tests", "candidate_configs"):
             feature[key] = sorted(set(_path_list(feature.get(key))))
@@ -1614,6 +1878,7 @@ def _rebuild_semantic_graph_state_indexes(state: dict[str, Any]) -> None:
     state["accepted_features"] = dict(sorted(accepted.items()))
     state["file_ownership"] = dict(sorted(file_ownership.items()))
     state["open_issues"] = open_issues[-200:]
+    state["health_issues"] = health_issues[-300:]
     state["completed_node_ids"] = sorted(set(completed))
     jobs = state.get("semantic_jobs") if isinstance(state.get("semantic_jobs"), dict) else {}
     job_counts: dict[str, int] = {}
@@ -1758,10 +2023,16 @@ def _semantic_graph_state_summary(state: dict[str, Any]) -> dict[str, Any]:
         "accepted_feature_count": len(features),
         "file_ownership_count": len(state.get("file_ownership") or {}),
         "open_issue_count": len(state.get("open_issues") or []),
+        "health_issue_count": len(state.get("health_issues") or []),
         "semantic_job_counts": state.get("semantic_job_counts") or {},
         "completed_node_ids": _path_list(state.get("completed_node_ids"))[:300],
         "accepted_features": features,
         "open_issues": [_compact_memory_conflict(item) for item in (state.get("open_issues") or [])[-30:]],
+        "health_issues": [
+            _compact_health_issue(item)
+            for item in (state.get("health_issues") or [])[-30:]
+            if isinstance(item, dict)
+        ],
     }
 
 
@@ -1807,6 +2078,14 @@ def _semantic_entry_from_state(feature: dict[str, Any], state_entry: dict[str, A
         },
     )
     entry["quality_flags"] = _path_list(state_entry.get("quality_flags"))
+    entry["open_issues"] = [
+        item for item in (state_entry.get("open_issues") or [])
+        if isinstance(item, dict)
+    ]
+    entry["health_issues"] = [
+        item for item in (state_entry.get("health_issues") or [])
+        if isinstance(item, dict)
+    ]
     entry["semantic_graph_state_status"] = state_entry.get("status") or ""
     entry["semantic_graph_state_updated_at"] = state_entry.get("updated_at") or ""
     return entry
@@ -2669,6 +2948,11 @@ def run_semantic_enrichment(
                     semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
         semantic_entry["semantic_selection_status"] = "selected" if selected_for_ai else "not_selected"
         semantic_entry["semantic_selection_reasons"] = selection_reasons
+        semantic_entry["health_issues"] = _semantic_health_issues(
+            node_id,
+            semantic_entry,
+            open_issues=_semantic_open_issues(node_id, semantic_entry),
+        )
         if persist_feature_payloads:
             payload_output_paths.append(write_json(
                 payload_trace_base / "feature-outputs" / f"{node_name}.json",
@@ -2718,6 +3002,7 @@ def run_semantic_enrichment(
         "accepted_feature_count": len(semantic_state.get("accepted_features") or {}),
         "file_ownership_count": len(semantic_state.get("file_ownership") or {}),
         "open_issue_count": len(semantic_state.get("open_issues") or []),
+        "health_issue_count": len(semantic_state.get("health_issues") or []),
         "semantic_job_counts": semantic_state.get("semantic_job_counts") or {},
         "hash_mismatch_count": semantic_hash_mismatch_count,
         "base_snapshot_id": carry_forward_report.get("base_snapshot_id", ""),
@@ -2813,6 +3098,7 @@ def run_semantic_enrichment(
         "unresolved_feedback_count": len(unresolved_feedback),
         "unresolved_feedback_ids": unresolved_feedback,
         "quality_flag_counts": _count_quality_flags(semantic_features),
+        "health_issue_counts": _count_health_issues(semantic_features),
         "feature_payload_input_count": len(payload_input_paths),
         "feature_payload_output_count": len(payload_output_paths),
         "feature_payload_input_dir": str(payload_trace_base / "feature-inputs") if persist_feature_payloads else "",
@@ -2880,6 +3166,17 @@ def _count_quality_flags(features: list[dict[str, Any]]) -> dict[str, int]:
     for feature in features:
         for flag in feature.get("quality_flags") or []:
             key = str(flag)
+            counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _count_health_issues(features: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for feature in features:
+        for issue in feature.get("health_issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            key = str(issue.get("category") or "semantic_review")
             counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))
 

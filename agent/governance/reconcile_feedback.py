@@ -1247,15 +1247,33 @@ def _string_list(raw: Any) -> list[str]:
 
 
 def _issue_type(issue: dict[str, Any]) -> str:
-    return str(issue.get("type") or issue.get("kind") or "").strip()
+    return str(
+        issue.get("type")
+        or issue.get("kind")
+        or issue.get("issue_type")
+        or issue.get("category")
+        or ""
+    ).strip()
 
 
 def _issue_summary(issue: dict[str, Any]) -> str:
-    return str(issue.get("summary") or issue.get("issue") or issue.get("detail") or "").strip()
+    return str(
+        issue.get("summary")
+        or issue.get("issue")
+        or issue.get("detail")
+        or issue.get("message")
+        or issue.get("suggested_action")
+        or ""
+    ).strip()
 
 
 def _source_nodes(issue: dict[str, Any]) -> list[str]:
-    nodes = _string_list(issue.get("source_node_ids") or issue.get("node_ids") or issue.get("nodes"))
+    nodes = _string_list(
+        issue.get("source_node_ids")
+        or issue.get("affected_node_ids")
+        or issue.get("node_ids")
+        or issue.get("nodes")
+    )
     source_node_id = str(issue.get("source_node_id") or "").strip()
     if source_node_id and source_node_id not in nodes:
         nodes.insert(0, source_node_id)
@@ -1263,6 +1281,30 @@ def _source_nodes(issue: dict[str, Any]) -> list[str]:
     if node_id and node_id not in nodes:
         nodes.insert(0, node_id)
     return nodes
+
+
+def _health_issue_to_open_issue(issue: dict[str, Any], *, node_id: str = "") -> dict[str, Any]:
+    converted = dict(issue)
+    converted.setdefault("reason", str(issue.get("source") or "health_issues"))
+    converted.setdefault("type", str(issue.get("type") or issue.get("category") or "semantic_health_issue"))
+    converted.setdefault("summary", _issue_summary(issue) or str(issue.get("category") or "Semantic health issue."))
+    if node_id and not _source_nodes(converted):
+        converted["node_id"] = node_id
+    return converted
+
+
+def _entry_review_issues(entry: dict[str, Any], *, node_id: str = "") -> list[dict[str, Any]]:
+    open_issues = [
+        item for item in (entry.get("open_issues") or [])
+        if isinstance(item, dict)
+    ]
+    if open_issues:
+        return open_issues
+    return [
+        _health_issue_to_open_issue(item, node_id=node_id)
+        for item in (entry.get("health_issues") or [])
+        if isinstance(item, dict)
+    ]
 
 
 def _round_number(value: Any) -> int | None:
@@ -1312,9 +1354,7 @@ def _select_semantic_state_issues(
             entry_round = _round_number(raw_entry.get("feedback_round"))
             if requested_round is not None and entry_round != requested_round:
                 continue
-            for raw_issue in raw_entry.get("open_issues") or []:
-                if not isinstance(raw_issue, dict):
-                    continue
+            for raw_issue in _entry_review_issues(raw_entry, node_id=node_id):
                 issue = dict(raw_issue)
                 if not _source_nodes(issue):
                     issue["node_id"] = node_id
@@ -1322,6 +1362,12 @@ def _select_semantic_state_issues(
         return selected
 
     raw_issues = semantic_state.get("open_issues")
+    if not isinstance(raw_issues, list) or not raw_issues:
+        raw_issues = [
+            _health_issue_to_open_issue(item)
+            for item in (semantic_state.get("health_issues") or [])
+            if isinstance(item, dict)
+        ]
     if not isinstance(raw_issues, list):
         return []
     selected = []
@@ -1343,12 +1389,14 @@ def _semantic_state_feedback_rounds(semantic_state: dict[str, Any]) -> list[int]
     node_semantics = semantic_state.get("node_semantics")
     if isinstance(node_semantics, dict):
         for raw_entry in node_semantics.values():
-            if not isinstance(raw_entry, dict) or not raw_entry.get("open_issues"):
+            if not isinstance(raw_entry, dict) or not _entry_review_issues(raw_entry):
                 continue
             entry_round = _round_number(raw_entry.get("feedback_round"))
             if entry_round is not None:
                 rounds.add(entry_round)
     raw_issues = semantic_state.get("open_issues")
+    if not isinstance(raw_issues, list) or not raw_issues:
+        raw_issues = semantic_state.get("health_issues")
     if isinstance(raw_issues, list):
         for raw_issue in raw_issues:
             if not isinstance(raw_issue, dict):
@@ -1426,6 +1474,9 @@ def infer_status_observation_category(item: dict[str, Any]) -> str:
     if (
         "missing_doc" in text
         or "missing_test" in text
+        or "doc_gap" in text
+        or "test_gap" in text
+        or "config_gap" in text
         or "coverage" in text
     ):
         return STATUS_CATEGORY_COVERAGE_GAP
@@ -1490,6 +1541,9 @@ def classify_open_issue(issue: dict[str, Any]) -> str:
         "missing_test_binding" in text
         or "missing_doc_binding" in text
         or "missing_config_binding" in text
+        or "test_gap" in text
+        or "doc_gap" in text
+        or "config_gap" in text
         or "coverage" in text
         or "drift" in text
         or "orphan" in text

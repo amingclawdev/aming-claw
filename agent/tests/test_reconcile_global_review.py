@@ -347,6 +347,56 @@ def test_full_global_review_scores_project_health_from_existing_signals(conn, pr
     ]
 
 
+def test_full_global_review_scores_structured_health_issues(conn, project):
+    _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
+    reconcile_global_review.semantic._ensure_semantic_state_schema(conn)
+    semantic_json = {
+        "status": "ai_complete",
+        "doc_status": "covered",
+        "test_status": "covered",
+        "health_issues": [
+            {
+                "category": "duplicate_or_overlap",
+                "severity": "high",
+                "confidence": 0.88,
+                "source": "ai_health_issue",
+                "summary": "Feature overlaps with another runtime node.",
+                "affected_node_ids": ["L7.1", "L7.2"],
+            }
+        ],
+        "open_issues": [
+            {"reason": "split_suggestions", "summary": "Legacy issue should not double count."},
+        ],
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           semantic_json, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', 'sha256:test', '{}', ?, 0, 0, 'now')
+        """,
+        (PID, snapshot_id, json.dumps(semantic_json)),
+    )
+    conn.commit()
+
+    result = reconcile_global_review.run_full_global_review(
+        conn,
+        PID,
+        snapshot_id,
+        project,
+        actor="observer",
+        run_id="full-picture-health-schema",
+    )
+
+    health = result["health_picture"]
+    assert health["project_health_issue_counts"]["duplicate_or_overlap_issue_reported"] == 1
+    assert "broad_responsibility_issue_reported" not in health["project_health_issue_counts"]
+    assert health["project_health_schema_issue_counts"]["by_category"]["duplicate_or_overlap"] == 1
+    assert health["project_health_schema_issue_counts"]["by_severity"]["high"] == 1
+    assert health["project_health_schema_issue_counts"]["by_source"]["ai_health_issue"] == 1
+    assert health["low_health_nodes"][0]["health_issues"][0]["category"] == "duplicate_or_overlap"
+
+
 def test_full_global_review_includes_file_hygiene_from_existing_inventory(conn, project):
     _base_snapshot_id, snapshot_id = _create_scope_pair(conn)
     snapshot = store.get_graph_snapshot(conn, PID, snapshot_id)

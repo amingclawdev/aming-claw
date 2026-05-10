@@ -199,6 +199,84 @@ def _open_issue_penalties(open_issues: Any) -> tuple[dict[str, int], dict[str, i
     return penalties, raw_counts
 
 
+def _health_issue_label(category: str) -> str:
+    value = re.sub(r"[^a-z0-9]+", "_", str(category or "").strip().lower()).strip("_")
+    if not value:
+        value = "semantic_health"
+    if value.endswith("_issue"):
+        return value
+    return f"{value}_issue"
+
+
+def _health_issue_penalties(
+    health_issues: Any,
+) -> tuple[dict[str, int], dict[str, int], dict[str, dict[str, int]]]:
+    if not isinstance(health_issues, list):
+        return {}, {}, {"by_category": {}, "by_severity": {}, "by_source": {}}
+    raw_counts: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    by_severity: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    severity_weights = {
+        "info": 0,
+        "low": 2,
+        "medium": 5,
+        "high": 8,
+        "critical": 12,
+    }
+    severity_caps = {
+        "info": 0,
+        "low": 6,
+        "medium": 15,
+        "high": 24,
+        "critical": 36,
+    }
+    weighted: dict[str, int] = {}
+    for raw in health_issues:
+        if not isinstance(raw, dict):
+            continue
+        category = str(raw.get("category") or "semantic_health").strip().lower().replace("-", "_")
+        severity = str(raw.get("severity") or "low").strip().lower().replace("-", "_")
+        if severity not in severity_weights:
+            severity = "low"
+        source = str(raw.get("source") or "semantic_state").strip().lower().replace("-", "_")
+        label = _health_issue_label(category)
+        raw_counts[label] = raw_counts.get(label, 0) + 1
+        by_category[category] = by_category.get(category, 0) + 1
+        by_severity[severity] = by_severity.get(severity, 0) + 1
+        by_source[source] = by_source.get(source, 0) + 1
+        weighted[label] = weighted.get(label, 0) + severity_weights[severity]
+    penalties = {
+        label: min(value, severity_caps.get("high", 24))
+        for label, value in weighted.items()
+        if value > 0
+    }
+    return penalties, raw_counts, {
+        "by_category": dict(sorted(by_category.items())),
+        "by_severity": dict(sorted(by_severity.items())),
+        "by_source": dict(sorted(by_source.items())),
+    }
+
+
+def _compact_health_issue(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"summary": str(raw)[:240]}
+    return {
+        key: value
+        for key, value in {
+            "issue_id": str(raw.get("issue_id") or raw.get("id") or ""),
+            "category": str(raw.get("category") or ""),
+            "severity": str(raw.get("severity") or ""),
+            "confidence": raw.get("confidence"),
+            "source": str(raw.get("source") or ""),
+            "summary": str(raw.get("summary") or raw.get("issue") or "")[:360],
+            "suggested_action": str(raw.get("suggested_action") or "")[:360],
+            "affected_node_ids": _string_list(raw.get("affected_node_ids"))[:10],
+        }.items()
+        if value not in ("", [], {}, None)
+    }
+
+
 def _inventory_run_id_from_notes(notes: dict[str, Any]) -> str:
     for container_key in ("governance_index", "pending_scope_reconcile"):
         container = notes.get(container_key)
@@ -566,6 +644,11 @@ def _semantic_coverage_picture(
     status_counts: dict[str, int] = {}
     quality_flag_counts: dict[str, int] = {}
     health_issue_counts: dict[str, int] = {}
+    health_issue_schema_counts: dict[str, dict[str, int]] = {
+        "by_category": {},
+        "by_severity": {},
+        "by_source": {},
+    }
     artifact_issue_counts: dict[str, int] = {}
     penalty_by_category: dict[str, int] = {}
     low_health: list[dict[str, Any]] = []
@@ -640,15 +723,32 @@ def _semantic_coverage_picture(
             and any(role in {"orchestration", "state", "domain_contract", "gateway_entry"} for role in roles)
         ):
             add_penalty("important_node_without_typed_relations", 4, "dependency_model")
+        structured_health_issues = [
+            issue for issue in (semantic_entry.get("health_issues") or [])
+            if isinstance(issue, dict)
+        ]
         for flag in _string_list(semantic_entry.get("quality_flags")):
             quality_flag_counts[flag] = quality_flag_counts.get(flag, 0) + 1
-            penalty, issue, category = _quality_flag_penalty(flag)
-            add_penalty(issue, penalty, category, artifact=category == "artifact_binding")
-        open_issue_penalties, open_issue_counts = _open_issue_penalties(semantic_entry.get("open_issues"))
-        for issue, count in open_issue_counts.items():
-            health_issue_counts[f"{issue}_reported"] = health_issue_counts.get(f"{issue}_reported", 0) + count
-        for issue, penalty in open_issue_penalties.items():
-            add_penalty(issue, penalty, "semantic_open_issues")
+            if not structured_health_issues:
+                penalty, issue, category = _quality_flag_penalty(flag)
+                add_penalty(issue, penalty, category, artifact=category == "artifact_binding")
+        if structured_health_issues:
+            health_penalties, health_counts, schema_counts = _health_issue_penalties(structured_health_issues)
+            for bucket, counts in schema_counts.items():
+                target = health_issue_schema_counts.setdefault(bucket, {})
+                for key, count in counts.items():
+                    target[key] = target.get(key, 0) + count
+            for issue, count in health_counts.items():
+                key = f"{issue}_reported"
+                health_issue_counts[key] = health_issue_counts.get(key, 0) + count
+            for issue, penalty in health_penalties.items():
+                add_penalty(issue, penalty, "semantic_health_issues")
+        else:
+            open_issue_penalties, open_issue_counts = _open_issue_penalties(semantic_entry.get("open_issues"))
+            for issue, count in open_issue_counts.items():
+                health_issue_counts[f"{issue}_reported"] = health_issue_counts.get(f"{issue}_reported", 0) + count
+            for issue, penalty in open_issue_penalties.items():
+                add_penalty(issue, penalty, "semantic_open_issues")
         score = max(0, score)
         artifact_score = max(0, artifact_score)
         health_scores.append(score)
@@ -662,6 +762,7 @@ def _semantic_coverage_picture(
                 "semantic_status": semantic_status or "missing",
                 "issues": sorted(set(issues)),
                 "artifact_issues": sorted(set(artifact_issues)),
+                "health_issues": [_compact_health_issue(item) for item in structured_health_issues[:20]],
                 "primary_files": _string_list(node.get("primary_files"))[:10],
                 "doc_files": _string_list(node.get("secondary_files"))[:10],
                 "test_files": _string_list(node.get("test_files"))[:10],
@@ -698,6 +799,10 @@ def _semantic_coverage_picture(
         "quality_flag_counts": dict(sorted(quality_flag_counts.items())),
         "artifact_issue_counts": dict(sorted(artifact_issue_counts.items())),
         "project_health_issue_counts": dict(sorted(health_issue_counts.items())),
+        "project_health_schema_issue_counts": {
+            key: dict(sorted(value.items()))
+            for key, value in health_issue_schema_counts.items()
+        },
         "project_health_penalty_by_category": dict(sorted(penalty_by_category.items())),
         "project_health_global_penalties": {
             "file_hygiene": file_hygiene_penalty,
@@ -997,13 +1102,19 @@ def run_full_global_review(
             "instructions": [
                 "Review the entire semantic graph picture, not individual feature implementation.",
                 "Identify global architecture risks such as duplicate capabilities, unclear ownership, missing semantic coverage, or unhealthy doc/test/config bindings.",
+                "Prefer health_issues[] using fields category, severity, confidence, evidence, affected_node_ids, and suggested_action.",
                 "Return open_issues only for graph corrections or project improvements supported by evidence.",
                 "Represent coverage/doc/test drift as status observations unless the user explicitly requests backlog filing.",
             ],
         }
         ai_response = _call_ai(global_review_ai_call, payload)
-        raw_issues = ai_response.get("open_issues") if isinstance(ai_response, dict) else []
-        ai_issues = [item for item in (raw_issues or []) if isinstance(item, dict)]
+        raw_open_issues = ai_response.get("open_issues") if isinstance(ai_response, dict) else []
+        raw_health_issues = ai_response.get("health_issues") if isinstance(ai_response, dict) else []
+        ai_issues = [item for item in (raw_open_issues or []) if isinstance(item, dict)]
+        ai_issues.extend(
+            item for item in (raw_health_issues or [])
+            if isinstance(item, dict)
+        )
 
     classification: dict[str, Any] = {}
     if classify_feedback and ai_issues:
@@ -1318,13 +1429,19 @@ def run_incremental_global_review(
             "graph_query_trace": context,
             "instructions": [
                 "Review only the incremental change against the prior global picture.",
+                "Prefer health_issues[] using fields category, severity, confidence, evidence, affected_node_ids, and suggested_action.",
                 "Return open_issues for graph corrections or project improvements only when evidence supports action.",
                 "Represent coverage/doc/test drift as status observations unless the user explicitly requests backlog filing.",
             ],
         }
         ai_response = _call_ai(global_review_ai_call, payload)
-        raw_issues = ai_response.get("open_issues") if isinstance(ai_response, dict) else []
-        ai_issues = [item for item in (raw_issues or []) if isinstance(item, dict)]
+        raw_open_issues = ai_response.get("open_issues") if isinstance(ai_response, dict) else []
+        raw_health_issues = ai_response.get("health_issues") if isinstance(ai_response, dict) else []
+        ai_issues = [item for item in (raw_open_issues or []) if isinstance(item, dict)]
+        ai_issues.extend(
+            item for item in (raw_health_issues or [])
+            if isinstance(item, dict)
+        )
 
     classification: dict[str, Any] = {}
     if classify_feedback and not blocked:

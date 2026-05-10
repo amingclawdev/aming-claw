@@ -862,6 +862,56 @@ def test_append_review_feedback_normalizes_append_only_items(conn, tmp_path):
     assert feedback[0]["created_by"] == "observer"
 
 
+def test_semantic_enrichment_normalizes_structured_health_issues(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        assert stage == "reconcile_semantic_feature"
+        return {
+            "feature_name": "Backlog runtime",
+            "semantic_summary": "Claims and records backlog runtime work.",
+            "health_issues": [
+                {
+                    "category": "test_gap",
+                    "severity": "high",
+                    "confidence": 0.91,
+                    "affected_node_ids": ["L7.1"],
+                    "summary": "Focused retry-state regression tests are missing.",
+                    "suggested_action": "Add a retry-state regression test.",
+                }
+            ],
+            "open_issues": [],
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+    )
+
+    assert result["summary"]["ai_complete_count"] == 1
+    assert result["summary"]["health_issue_counts"]["test_gap"] == 1
+    row = conn.execute(
+        """
+        SELECT semantic_json FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'
+        """,
+        (PID, "full-semantic-test"),
+    ).fetchone()
+    semantic_json = json.loads(row["semantic_json"])
+    health_issue = semantic_json["health_issues"][0]
+    assert health_issue["schema_version"] == 1
+    assert health_issue["category"] == "test_gap"
+    assert health_issue["severity"] == "high"
+    assert health_issue["confidence"] == 0.91
+    assert health_issue["affected_node_ids"] == ["L7.1"]
+    assert health_issue["suggested_action"] == "Add a retry-state regression test."
+
+
 def test_reconcile_feedback_classifies_reviews_and_files_state(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)
@@ -1044,6 +1094,49 @@ def test_reconcile_feedback_filters_semantic_state_by_round_and_nodes(conn, tmp_
         for item in reconcile_feedback.list_feedback_items(PID, "full-semantic-test")
     }
     assert items == {"L7.new", "L7.sibling"}
+
+
+def test_reconcile_feedback_classifies_health_issues_when_open_issues_absent(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    state_path = reconcile_feedback.semantic_graph_state_path(PID, "full-semantic-test")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "node_semantics": {
+            "L7.1": {
+                "feedback_round": 3,
+                "health_issues": [
+                    {
+                        "category": "test_gap",
+                        "severity": "medium",
+                        "summary": "Missing focused tests for retry-state behavior.",
+                        "affected_node_ids": ["L7.1"],
+                        "suggested_action": "Add a retry-state regression test.",
+                    }
+                ],
+            }
+        },
+        "health_issues": [
+            {
+                "category": "test_gap",
+                "summary": "Missing focused tests for retry-state behavior.",
+                "affected_node_ids": ["L7.1"],
+            }
+        ],
+    }), encoding="utf-8")
+
+    result = reconcile_feedback.classify_semantic_open_issues(
+        PID,
+        "full-semantic-test",
+        source_round="round-003",
+        created_by="observer",
+    )
+
+    assert result["count"] == 1
+    item = result["items"][0]
+    assert item["source_node_ids"] == ["L7.1"]
+    assert item["feedback_kind"] == "status_observation"
+    assert item["status_observation_category"] == "coverage_gap"
 
 
 def test_reconcile_feedback_classifies_all_semantic_state_rounds(conn, tmp_path):
