@@ -164,7 +164,7 @@ export default function App() {
     }
     const ok = window.confirm(
       `Catch the active graph up to HEAD ${headCommit.slice(0, 7)}? Runs the ` +
-        "scope reconcile inline (queue → materialize+activate → projection rebuild). " +
+        "scope reconcile inline (materialize+activate → projection rebuild). " +
         "The banner shows live progress.",
     );
     if (!ok) return;

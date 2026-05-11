@@ -87,9 +87,9 @@ export default function StaleGraphBanner({
           <button
             onClick={onQueueReconcile}
             disabled={busy}
-            title="Queue + materialize + rebuild projection — runs inline"
+            title="Materialize new snapshot + rebuild projection — runs inline"
           >
-            {busy ? "Reconcile…" : "Queue scope reconcile"}
+            {busy ? "Reconcile…" : "Scope reconcile"}
           </button>
         </>
       ) : null}
