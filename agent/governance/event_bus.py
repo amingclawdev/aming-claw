@@ -40,6 +40,10 @@ class EventBus:
 
     def __init__(self):
         self._subscribers: dict[str, list[Callable]] = defaultdict(list)
+        # subscribe_all callbacks receive (event_name, payload). Used by the
+        # dashboard SSE endpoint to fan every event out to a per-connection
+        # queue without enumerating every event name.
+        self._all_subscribers: list[Callable] = []
         self._history: list[dict] = []  # Recent events for debugging
         self._max_history = 1000
         self._redis_bridge_enabled = False
@@ -67,6 +71,15 @@ class EventBus:
         if callback in subs:
             subs.remove(callback)
 
+    def subscribe_all(self, callback: Callable) -> None:
+        """Subscribe to every event (callback receives event_name + payload)."""
+        self._all_subscribers.append(callback)
+
+    def unsubscribe_all(self, callback: Callable) -> None:
+        """Remove a subscribe_all subscription."""
+        if callback in self._all_subscribers:
+            self._all_subscribers.remove(callback)
+
     def publish(self, event: str, payload: dict) -> None:
         """Publish an event to in-process subscribers AND Redis.
 
@@ -93,6 +106,15 @@ class EventBus:
                 callback(payload)
             except Exception:
                 log.exception("Wildcard subscriber error for %s", event)
+
+        # Fan out to subscribe_all listeners (they get event_name + payload).
+        # Snapshot the list so subscribers that unsubscribe themselves mid-loop
+        # don't break iteration.
+        for callback in list(self._all_subscribers):
+            try:
+                callback(event, payload)
+            except Exception:
+                log.exception("subscribe_all subscriber error for %s", event)
 
         # Forward to Redis Pub/Sub (fire-and-forget)
         if self._redis_bridge_enabled:
