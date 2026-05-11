@@ -9,6 +9,7 @@ import {
   semStatusLabel,
   type SubtreeAggregate,
 } from "../lib/semantic";
+import { healthHex } from "../lib/health";
 import type { ViewName } from "../App";
 
 interface Props {
@@ -298,9 +299,29 @@ function RowMeta({ node, idx }: { node: NodeRecord; idx: Index }) {
       return <span className="tree-meta" title="Package marker — excluded from feature scoring">pkg</span>;
     }
     const status = classifyNode(node);
+    const h = node._health;
     return (
-      <span className="tree-meta" title={`semantic: ${semStatusLabel(status)}`}>
+      <span
+        className="tree-meta"
+        title={`semantic: ${semStatusLabel(status)}\nhealth: ${h ?? "—"}`}
+      >
         <span className={`sem-dot ${semStatusDotClass(status)}`} />
+        <span
+          className="pdot"
+          style={{ background: healthHex(h), marginLeft: 4 }}
+          title={`health score: ${h ?? "—"}`}
+        />
+        <span
+          className="mono"
+          style={{
+            fontSize: 10,
+            fontWeight: 600,
+            color: healthHex(h),
+            marginLeft: 3,
+          }}
+        >
+          {h != null ? h : "—"}
+        </span>
       </span>
     );
   }
@@ -309,7 +330,27 @@ function RowMeta({ node, idx }: { node: NodeRecord; idx: Index }) {
   if (!a || a.total === 0) {
     // L4 leaves and other containers without governed L7 descendants.
     if (node.layer === "L4") {
-      return <span className="tree-meta" title="L4 asset — state/contract/asset node">asset</span>;
+      const ab = node._asset_binding;
+      return (
+        <span
+          className="tree-meta"
+          title={`L4 asset — state/contract/asset node\nasset_binding: ${ab ?? "—"}`}
+        >
+          {ab != null ? (
+            <>
+              <span className="pdot" style={{ background: healthHex(ab) }} />
+              <span
+                className="mono"
+                style={{ fontSize: 10, fontWeight: 600, color: healthHex(ab), marginLeft: 3 }}
+              >
+                {ab}
+              </span>
+            </>
+          ) : (
+            <span>asset</span>
+          )}
+        </span>
+      );
     }
     return null;
   }
@@ -317,6 +358,25 @@ function RowMeta({ node, idx }: { node: NodeRecord; idx: Index }) {
   const total = a.total;
   const curClass = cur === total ? "full" : cur === 0 ? "empty" : "";
   const parts: React.ReactNode[] = [];
+  // Container health rollup (recursive avg of L7 descendants). Lead with the
+  // dot so the operator scans the tree by color before reading numbers.
+  if (node._health != null) {
+    parts.push(
+      <span
+        key="h"
+        title={`feature health: ${node._health}`}
+        style={{ display: "inline-flex", alignItems: "center", gap: 3, marginRight: 4 }}
+      >
+        <span className="pdot" style={{ background: healthHex(node._health) }} />
+        <span
+          className="mono"
+          style={{ fontSize: 10, fontWeight: 600, color: healthHex(node._health) }}
+        >
+          {node._health}
+        </span>
+      </span>,
+    );
+  }
   parts.push(
     <span key="cur" className={`num-cur ${curClass}`} title={`${cur} current of ${total} governed L7`}>
       {cur}/{total}

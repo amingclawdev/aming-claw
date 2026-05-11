@@ -3094,6 +3094,17 @@ svg.graph-svg path.ghit:hover {
   padding: 6px 14px;
 }
 
+/* Per-node feature-health dot (prototype port). 6px solid circle, colored
+   by healthHex(score). Used in tree rows + drawer + breadcrumb. */
+.pdot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #cbd5e1;
+  vertical-align: middle;
+}
+
 /* MF-016/017: candidate semantic block — surfaces the AI's proposed
    semantic_payload inside the drawer when a target has a pending review.
    The block holds long-form AI text (purpose, intent, risk, evidence) and

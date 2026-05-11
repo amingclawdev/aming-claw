@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "./lib/api";
 import { mergeProjection } from "./lib/semantic";
+import { computeNodeHealth } from "./lib/health";
 import type {
   ActiveSummaryResponse,
   EdgeRecord,
@@ -85,12 +86,21 @@ export default function App() {
       // the semantic projection hasn't been computed yet. mergeProjection
       // tolerates an empty map.
       const merged = mergeProjection(nodesRes.nodes, projection?.projection?.node_semantics ?? {});
+      // Per-node feature health (prototype algorithm — leafScore for L7 leaves,
+      // recursive average for containers, L4 leaves get _asset_binding only).
+      const healthMap = computeNodeHealth(merged, edgesRes.edges);
+      const mergedWithHealth = merged.map((n) => {
+        const h = healthMap.get(n.node_id);
+        return h
+          ? { ...n, _health: h._health, _asset_binding: h._asset_binding }
+          : n;
+      });
       setData({
         health,
         status,
         summary,
         projection,
-        nodes: merged,
+        nodes: mergedWithHealth,
         edges: edgesRes.edges,
         ops,
         feedback,

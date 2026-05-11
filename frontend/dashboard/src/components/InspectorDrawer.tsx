@@ -22,6 +22,7 @@ import type { PinnedEdge } from "./FocusCard";
 import type { ActionKind, ActionTarget } from "./ActionControlPanel";
 import RetryFeedbackModal from "./RetryFeedbackModal";
 import CandidateSemanticBlock from "./CandidateSemanticBlock";
+import { healthHex, healthTone } from "../lib/health";
 
 interface Props {
   node: NodeRecord | null;
@@ -387,6 +388,70 @@ function OverviewTab({
           ) : null}
         </section>
       ) : null}
+
+      <section className="inspector-section">
+        <div className="inspector-section-title">
+          Feature health{" "}
+          <span style={{ fontWeight: 400, color: "var(--ink-400)", fontSize: 11 }}>
+            {node._health != null
+              ? "leaf score = 35 src + 30 tests + 20 fns + 10 docs + 5 parent"
+              : node._asset_binding != null
+                ? "L4 asset · separate binding score"
+                : "no scoreable descendants"}
+          </span>
+        </div>
+        <div
+          className="kv"
+          style={{ gridTemplateColumns: "100px 1fr", alignItems: "center" }}
+        >
+          <span className="k">health</span>
+          <span className="v">
+            {node._health != null ? (
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <span className="pdot" style={{ background: healthHex(node._health) }} />
+                <span
+                  className="mono"
+                  style={{
+                    fontWeight: 700,
+                    color: healthHex(node._health),
+                    fontSize: 13,
+                  }}
+                >
+                  {node._health}
+                </span>
+                <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
+                  / 100 · {healthTone(node._health)}
+                </span>
+              </span>
+            ) : (
+              <span className="mono" style={{ color: "var(--ink-400)" }}>—</span>
+            )}
+          </span>
+          {node._asset_binding != null ? (
+            <>
+              <span className="k">asset binding</span>
+              <span className="v">
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <span
+                    className="pdot"
+                    style={{ background: healthHex(node._asset_binding) }}
+                  />
+                  <span
+                    className="mono"
+                    style={{
+                      fontWeight: 600,
+                      color: healthHex(node._asset_binding),
+                    }}
+                  >
+                    {node._asset_binding}
+                  </span>
+                  <span style={{ fontSize: 11, color: "var(--ink-400)" }}>/ 100</span>
+                </span>
+              </span>
+            </>
+          ) : null}
+        </div>
+      </section>
 
       <section className="inspector-section">
         <div className="inspector-section-title">Coverage signals</div>
