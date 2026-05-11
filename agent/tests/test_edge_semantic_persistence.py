@@ -313,6 +313,55 @@ def test_build_edge_semantics_keeps_structural_edges():
     assert out["L7.1->L7.3:depends_on"]["validity"]["status"] == "edge_semantic_missing"
 
 
+def test_edge_semantic_job_status_maps_ai_reviewing_to_running():
+    """MF 2026-05-11 state-coverage: ai_reviewing event status (set by the
+    worker before calling AI) must surface as 'running' in the operations
+    queue, otherwise the row stays on ai_pending and the operator never
+    sees the in-flight state."""
+    from agent.governance import server
+    assert server._edge_semantic_job_status({"status": "ai_reviewing"}) == "running"
+    # Non-terminal default still maps to ai_pending.
+    assert server._edge_semantic_job_status({"status": "observed", "event_type": "edge_semantic_requested"}) == "ai_pending"
+    # Terminal statuses pass through.
+    for s in ("cancelled", "failed", "rejected", "stale"):
+        assert server._edge_semantic_job_status({"status": s}) == s
+
+
+def test_activate_graph_snapshot_publishes_dashboard_changed(conn):
+    """MF 2026-05-11: activate hook must publish dashboard.changed so SSE
+    clients refetch when a new snapshot becomes active (no HTTP request
+    triggers it otherwise)."""
+    from agent.governance import event_bus
+
+    # Set up two snapshots so activation has a real transition.
+    snap_a = store.create_graph_snapshot(
+        conn, PID, snapshot_id="snap-a-act", commit_sha="ca",
+        snapshot_kind="full",
+    )
+    snap_b = store.create_graph_snapshot(
+        conn, PID, snapshot_id="snap-b-act", commit_sha="cb",
+        snapshot_kind="full",
+    )
+    store.activate_graph_snapshot(conn, PID, snap_a["snapshot_id"])
+
+    received: list[tuple[str, dict]] = []
+    def cb(event_name, payload):
+        received.append((event_name, payload))
+    event_bus.get_event_bus().subscribe_all(cb)
+    try:
+        store.activate_graph_snapshot(conn, PID, snap_b["snapshot_id"])
+    finally:
+        event_bus.get_event_bus().unsubscribe_all(cb)
+
+    names = [n for n, _ in received]
+    assert "snapshot.activated" in names, f"expected snapshot.activated, got {names}"
+    assert "dashboard.changed" in names, f"expected dashboard.changed, got {names}"
+    # snapshot.activated payload carries previous + new snapshot ids.
+    sa_payload = next(p for n, p in received if n == "snapshot.activated")
+    assert sa_payload["snapshot_id"] == "snap-b-act"
+    assert sa_payload["previous_snapshot_id"] == "snap-a-act"
+
+
 def test_latest_edge_semantic_events_finds_cross_snapshot(conn):
     """Event in snap-A must be findable from snap-B via stable_edge_key."""
     snap_a, _ = _create_snapshot(

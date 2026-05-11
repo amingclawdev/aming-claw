@@ -734,6 +734,29 @@ def activate_graph_snapshot(
         except Exception as exc:  # noqa: BLE001 - advisory; activation already committed
             projection_status = f"rebuild_failed: {exc}"
     result["projection_status"] = projection_status
+    # MF 2026-05-11: snapshot activation is an in-process hook (no HTTP),
+    # so _emit_dashboard_changed never fires for it. Publish here so the
+    # dashboard's SSE subscribers refetch when a new snapshot becomes
+    # active (reconcile / pending-scope materialize, etc.).
+    try:
+        from . import event_bus
+        event_bus.publish("snapshot.activated", {
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "previous_snapshot_id": old_id,
+            "commit_sha": snapshot["commit_sha"],
+            "ref_name": ref_name,
+            "projection_status": projection_status,
+            "source": "activate_graph_snapshot",
+        })
+        event_bus.publish("dashboard.changed", {
+            "project_id": project_id,
+            "path": "/internal/snapshot/activate",
+            "method": "WORKER",
+            "source": "activate_graph_snapshot",
+        })
+    except Exception:  # noqa: BLE001 - advisory
+        pass
     return result
 
 

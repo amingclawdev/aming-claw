@@ -6497,6 +6497,14 @@ def _edge_semantic_job_status(event: dict) -> str:
     event_status = str(event.get("status") or "").strip()
     if event_status in {"cancelled", "failed", "rejected", "stale"}:
         return event_status
+    # MF 2026-05-11: ai_reviewing is the worker's interstitial state between
+    # claim and AI completion. Expose it as "running" so the dashboard's
+    # operations queue shows the row as in flight instead of stuck on
+    # ai_pending. semantic_worker.update_event_status sets this before
+    # calling AI and the post-AI create_event writes a fresh row with
+    # status=proposed.
+    if event_status == "ai_reviewing":
+        return "running"
     event_type = str(event.get("event_type") or "").strip()
     if event_type == "edge_semantic_enriched":
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}

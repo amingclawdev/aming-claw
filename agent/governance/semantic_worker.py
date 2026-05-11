@@ -145,6 +145,29 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                 node_id_s = str(node_id or "").strip()
                 if not node_id_s:
                     continue
+                # MF 2026-05-11: emit ai_reviewing interstitial publish for
+                # the dashboard's operations queue. There's no per-node
+                # graph_events row to update at claim time (run_semantic_
+                # enrichment writes the enriched event itself), so this is
+                # publish-only — the dashboard derives "running" from
+                # the bare event presence + downstream count rollup.
+                try:
+                    from . import event_bus
+                    event_bus.publish("semantic_node.running", {
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "node_id": node_id_s,
+                        "source": "semantic_worker_inproc",
+                    })
+                    event_bus.publish("dashboard.changed", {
+                        "project_id": project_id,
+                        "path": "/semantic_worker/node_running",
+                        "method": "WORKER",
+                        "source": "semantic_worker_inproc",
+                    })
+                except Exception as exc:  # noqa: BLE001 - advisory
+                    log.debug("semantic_worker: node running publish failed for %s: %s",
+                              node_id_s, exc)
                 try:
                     result = semantic.run_semantic_enrichment(
                         conn, project_id, snapshot_id, str(root),
@@ -386,6 +409,39 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
                         "optional": ["risk", "directionality", "semantic_label", "open_issues"],
                     },
                 }
+                # MF 2026-05-11: emit an ai_reviewing interstitial event +
+                # dashboard.changed publish so the dashboard's operations
+                # queue can show this edge as "running" during the 5-30s
+                # AI call. Without this the operator sees ai_pending stuck
+                # and then a sudden jump to proposed.
+                try:
+                    graph_events.update_event_status(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        str(row["event_id"] or ""),
+                        status=graph_events.EVENT_STATUS_AI_REVIEWING,
+                        actor="semantic_worker_inproc_edge",
+                        evidence={"source": "semantic_worker_inproc_edge", "transition": "ai_start"},
+                    )
+                    conn.commit()
+                    from . import event_bus
+                    event_bus.publish("edge_semantic.running", {
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "edge_id": edge_id,
+                        "event_id": str(row["event_id"] or ""),
+                        "source": "semantic_worker_inproc_edge",
+                    })
+                    event_bus.publish("dashboard.changed", {
+                        "project_id": project_id,
+                        "path": "/semantic_worker/edge_running",
+                        "method": "WORKER",
+                        "source": "semantic_worker_inproc_edge",
+                    })
+                except Exception as exc:  # noqa: BLE001 - advisory
+                    log.debug("semantic_worker: edge running publish failed for %s: %s",
+                              edge_id, exc)
                 try:
                     ai_response = ai_call("edge", ai_payload)
                 except Exception as exc:  # noqa: BLE001 - record + skip
