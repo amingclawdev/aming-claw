@@ -180,11 +180,18 @@ export default function CandidateSemanticBlock({ snapshotId, targetType, targetI
       {openIssues.length > 0 ? (
         <div className="candidate-block-row">
           <span className="candidate-block-key">open issues</span>
-          <ul className="candidate-block-issues">
-            {openIssues.slice(0, 6).map((it, i) => (
-              <li key={i}>{typeof it === "string" ? it : JSON.stringify(it).slice(0, 240)}</li>
-            ))}
-          </ul>
+          <div>
+            <ul className="candidate-block-issues">
+              {openIssues.slice(0, 3).map((it, i) => (
+                <li key={i}>{typeof it === "string" ? it : JSON.stringify(it).slice(0, 240)}</li>
+              ))}
+            </ul>
+            {openIssues.length > 3 ? (
+              <div className="candidate-block-issues-more">
+                +{openIssues.length - 3} more
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
     </div>

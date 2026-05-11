@@ -3095,7 +3095,11 @@ svg.graph-svg path.ghit:hover {
 }
 
 /* MF-016/017: candidate semantic block — surfaces the AI's proposed
-   semantic_payload inside the drawer when a target has a pending review. */
+   semantic_payload inside the drawer when a target has a pending review.
+   The block holds long-form AI text (purpose, intent, risk, evidence) and
+   can easily reach >1000px tall — cap it with a scroller so the
+   Accept/Retry/Reject buttons stay visible without scrolling the whole
+   drawer chrome away. */
 .candidate-block {
   margin-top: 8px;
   padding: 10px 12px;
@@ -3105,6 +3109,17 @@ svg.graph-svg path.ghit:hover {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  max-height: 460px;
+  overflow-y: auto;
+  /* Slim purple scrollbar so the block reads as a coherent panel */
+  scrollbar-width: thin;
+  scrollbar-color: #c4b5fd transparent;
+}
+.candidate-block::-webkit-scrollbar { width: 6px; }
+.candidate-block::-webkit-scrollbar-track { background: transparent; }
+.candidate-block::-webkit-scrollbar-thumb {
+  background: #c4b5fd;
+  border-radius: 999px;
 }
 .candidate-loading, .candidate-empty, .candidate-error {
   font-size: 11.5px;
@@ -3117,6 +3132,13 @@ svg.graph-svg path.ghit:hover {
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
+  position: sticky;
+  top: -10px;
+  margin: -10px -12px 0;
+  padding: 10px 12px 6px;
+  background: #f5f3ff;
+  border-bottom: 1px solid #ede9fe;
+  z-index: 1;
 }
 .candidate-block-title {
   font-size: 11.5px;
@@ -3131,7 +3153,7 @@ svg.graph-svg path.ghit:hover {
 }
 .candidate-block-row {
   display: grid;
-  grid-template-columns: 90px 1fr;
+  grid-template-columns: 84px 1fr;
   gap: 8px;
   font-size: 11.5px;
   line-height: 1.45;
@@ -3145,7 +3167,17 @@ svg.graph-svg path.ghit:hover {
   align-self: start;
   padding-top: 2px;
 }
-.candidate-block-val { color: var(--ink-800); }
+.candidate-block-val {
+  color: var(--ink-800);
+  /* Defensive char-level wrap so long IDs / URLs / no-space strings stay
+     inside the column instead of bleeding out. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+.candidate-block-val.mono {
+  word-break: break-all;
+}
 .candidate-block-issues {
   margin: 0;
   padding-left: 18px;
@@ -3153,6 +3185,11 @@ svg.graph-svg path.ghit:hover {
   font-size: 11px;
 }
 .candidate-block-issues li { margin-bottom: 2px; }
+.candidate-block-issues-more {
+  font-size: 10.5px;
+  color: var(--ink-400);
+  margin-top: 2px;
+}
 
 /* Drawer pending-review banner */
 .drawer-review-banner {
