@@ -1410,9 +1410,18 @@ def backfill_existing_semantic_events(
             node = nodes_by_id.get(node_id, {"node_id": node_id})
             semantic_payload = _json_load(row["semantic_json"], {})
             status = str(row["status"] or "")
-            if status not in {"ai_complete", "semantic_graph_state", "reviewed"} and not semantic_payload:
+            # MF-2026-05-10-016: `pending_review` is the worker's
+            # "submit for review" outcome. Backfill that as a PROPOSED event
+            # so the projection (which filters for observed/materialized/accepted)
+            # stays blind until an operator accepts via accept_semantic_enrichment.
+            if status not in {"ai_complete", "semantic_graph_state", "reviewed", "pending_review"} and not semantic_payload:
                 skipped += 1
                 continue
+            event_status = (
+                EVENT_STATUS_PROPOSED
+                if status == "pending_review"
+                else EVENT_STATUS_OBSERVED
+            )
             event_id = _safe_event_id(
                 "semnode",
                 snapshot_id,
@@ -1429,7 +1438,7 @@ def backfill_existing_semantic_events(
                 event_kind="imported_semantic_cache",
                 target_type="node",
                 target_id=node_id,
-                status=EVENT_STATUS_OBSERVED,
+                status=event_status,
                 stable_node_key=stable_node_key_for_node(node),
                 feature_hash=str(row["feature_hash"] or ""),
                 file_hashes=_json_load(row["file_hashes_json"], {}),

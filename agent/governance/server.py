@@ -4735,6 +4735,102 @@ def handle_graph_governance_snapshot_feedback_queue_claim(ctx: RequestContext):
         conn.close()
 
 
+def _accept_semantic_enrichment_for_feedback_items(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    feedback_ids: list[str],
+    *,
+    actor: str = "observer",
+) -> dict[str, Any]:
+    """MF-2026-05-10-016 helper: promote worker-produced semantic from
+    pending_review to ai_complete and flip the linked PROPOSED event(s)
+    to ACCEPTED so the projection picks them up.
+
+    Reads each feedback item's evidence to find linked event_id + node_id,
+    then performs two writes:
+      1. graph_semantic_nodes.status: pending_review → ai_complete
+      2. graph_events.status: proposed → accepted
+
+    Returns a summary dict with `node_ids_flipped`, `event_ids_flipped`,
+    `errors`. Caller is responsible for triggering a projection rebuild.
+    """
+    from . import graph_events
+    from . import reconcile_feedback
+
+    items = reconcile_feedback.list_feedback_items(project_id, snapshot_id)
+    by_id = {str(item.get("feedback_id") or ""): item for item in items}
+    node_ids_flipped: list[str] = []
+    event_ids_flipped: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for fid in feedback_ids:
+        item = by_id.get(fid)
+        if not item:
+            errors.append({"feedback_id": fid, "error": "feedback_not_found"})
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        # reconcile_feedback.normalize_open_issue wraps caller-supplied issue
+        # under evidence.raw_issue (with the original issue dict intact). The
+        # worker stores linked_event_ids inside the caller-supplied
+        # issue.evidence, so they end up at evidence.raw_issue.evidence.
+        raw_issue = evidence.get("raw_issue") if isinstance(evidence.get("raw_issue"), dict) else {}
+        worker_evidence = (
+            raw_issue.get("evidence") if isinstance(raw_issue.get("evidence"), dict) else {}
+        )
+        node_id = (
+            str(item.get("target_id") or "").strip()
+            or str(worker_evidence.get("node_id") or "").strip()
+            or str(evidence.get("node_id") or "").strip()
+        )
+        event_ids = (
+            worker_evidence.get("linked_event_ids")
+            or evidence.get("linked_event_ids")
+            or []
+        )
+        if not isinstance(event_ids, list):
+            event_ids = [event_ids]
+        if not node_id and not event_ids:
+            errors.append({"feedback_id": fid, "error": "missing_node_id_and_event_ids"})
+            continue
+        if node_id:
+            try:
+                conn.execute(
+                    """
+                    UPDATE graph_semantic_nodes
+                    SET status = 'ai_complete'
+                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                      AND status = 'pending_review'
+                    """,
+                    (project_id, snapshot_id, node_id),
+                )
+                node_ids_flipped.append(node_id)
+            except Exception as exc:  # noqa: BLE001 - advisory; record + keep going
+                errors.append({"feedback_id": fid, "node_id": node_id, "error": str(exc)})
+        for eid in event_ids:
+            eid_s = str(eid or "").strip()
+            if not eid_s:
+                continue
+            try:
+                graph_events.update_event_status(
+                    conn, project_id, snapshot_id, eid_s,
+                    status=graph_events.EVENT_STATUS_ACCEPTED,
+                    actor=actor,
+                    evidence={
+                        "source": "accept_semantic_enrichment",
+                        "feedback_id": fid,
+                    },
+                )
+                event_ids_flipped.append(eid_s)
+            except Exception as exc:  # noqa: BLE001 - advisory
+                errors.append({"feedback_id": fid, "event_id": eid_s, "error": str(exc)})
+    conn.commit()
+    return {
+        "node_ids_flipped": node_ids_flipped,
+        "event_ids_flipped": event_ids_flipped,
+        "errors": errors,
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/decision")
 def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
     """Apply explicit user/observer decisions to feedback items."""
@@ -4796,6 +4892,33 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
                     allow_high_risk_accept=bool(body.get("allow_high_risk_patch_accept")),
                     base_commit=str(body.get("base_commit") or snapshot.get("commit_sha") or ""),
                 )
+            elif action == "accept_semantic_enrichment":
+                # MF-2026-05-10-016: promote worker-produced semantic from
+                # pending_review (PROPOSED event) to ai_complete (ACCEPTED
+                # event). The persistent layer flip is what
+                # `backfill_existing_semantic_events` will read on the next
+                # projection rebuild; we also flip live event status now and
+                # rebuild projection so dashboard reflects the change without
+                # waiting for the next reconcile.
+                from . import graph_events
+                accepted = _accept_semantic_enrichment_for_feedback_items(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    feedback_ids,
+                    actor=str(body.get("actor") or "observer"),
+                )
+                result["semantic_enrichment_accepted"] = accepted
+                if accepted.get("event_ids_flipped"):
+                    try:
+                        graph_events.build_semantic_projection(
+                            conn, project_id, snapshot_id,
+                            actor=str(body.get("actor") or "observer"),
+                        )
+                        result["projection_rebuilt"] = True
+                    except Exception as exc:  # noqa: BLE001 - advisory
+                        result["projection_rebuilt"] = False
+                        result["projection_rebuild_error"] = str(exc)
         except ValueError as exc:
             _raise_graph_api_validation(exc)
         try:
@@ -7521,6 +7644,23 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
         progress = _semantic_job_progress(counts)
         queued_count = int(result_summary.get("ai_selected_count") or 0)
         queued_ops = _semantic_queued_ops(jobs[:queued_count], "node_semantic") if queued_count else []
+        # MF-2026-05-10-016: kick the event-driven semantic worker so it
+        # immediately drains the newly enqueued ai_pending rows. Best-effort —
+        # if EventBus or worker fails the rows still wait for startup catchup.
+        if queued_count > 0:
+            try:
+                from . import event_bus
+                event_bus.publish(
+                    "semantic_job.enqueued",
+                    {
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "queued_count": queued_count,
+                        "source": "semantic_jobs_create_api",
+                    },
+                )
+            except Exception:
+                pass
         return 202, {
             "ok": True,
             "project_id": project_id,
@@ -11169,6 +11309,17 @@ def main():
         print("DocGenerator: listening for node.created events")
     except Exception as e:
         print(f"DocGenerator: failed to start ({e})")
+
+    # MF-2026-05-10-016: event-driven in-process semantic worker.
+    # Subscribes to semantic_job.enqueued + system.startup. Drains the
+    # /semantic/jobs queue (node_semantic only) into pending_review state
+    # so dashboard Review Queue can gate operator acceptance.
+    try:
+        from .semantic_worker import register as register_semantic_worker
+        register_semantic_worker()
+        print("SemanticWorker: registered (event-driven, in-process)")
+    except Exception as e:
+        print(f"SemanticWorker: failed to start ({e})")
 
     # Start outbox worker for reliable event delivery
     try:

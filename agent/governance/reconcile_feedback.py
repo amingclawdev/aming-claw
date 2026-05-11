@@ -55,6 +55,7 @@ STATUS_NEEDS_HUMAN_SIGNOFF = "needs_human_signoff"
 FEEDBACK_DECISION_ACTIONS = {
     "accept_graph_correction",
     "accept_project_improvement",
+    "accept_semantic_enrichment",  # MF-2026-05-10-016: gates semantic worker output
     "keep_status_observation",
     "reject_false_positive",
     "needs_human_signoff",

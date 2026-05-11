@@ -1146,12 +1146,24 @@ def _persist_semantic_state_to_db(
     project_id: str,
     snapshot_id: str,
     state: dict[str, Any],
+    *,
+    submit_for_review: bool = False,
 ) -> None:
+    """Persist node_semantics + semantic_jobs into the per-snapshot tables.
+
+    MF-2026-05-10-016: when `submit_for_review` is True, force the
+    graph_semantic_nodes status to `pending_review` regardless of the
+    record's own status. `backfill_existing_semantic_events` then maps
+    `pending_review` to `EVENT_STATUS_PROPOSED`, keeping the projection
+    blind until an operator explicitly accepts via
+    `accept_semantic_enrichment` decision.
+    """
     _ensure_semantic_state_schema(conn)
     node_semantics = state.get("node_semantics") if isinstance(state.get("node_semantics"), dict) else {}
     for node_id, raw_entry in node_semantics.items():
         if not isinstance(raw_entry, dict):
             continue
+        row_status = "pending_review" if submit_for_review else str(raw_entry.get("status") or "")
         conn.execute(
             """
             INSERT INTO graph_semantic_nodes
@@ -1171,7 +1183,7 @@ def _persist_semantic_state_to_db(
                 project_id,
                 snapshot_id,
                 str(node_id),
-                str(raw_entry.get("status") or ""),
+                row_status,
                 str(raw_entry.get("feature_hash") or ""),
                 _json(raw_entry.get("file_hashes") or {}),
                 _json(raw_entry),
@@ -2194,6 +2206,7 @@ def _write_semantic_graph_state_artifacts(
     *,
     round_number: int,
     feature_index: dict[str, dict[str, Any]] | None = None,
+    submit_for_review: bool = False,
 ) -> tuple[Path, Path, Path, Path]:
     base = _semantic_base_dir(project_id, snapshot_id)
     rdir = _round_dir(project_id, snapshot_id, round_number)
@@ -2202,7 +2215,10 @@ def _write_semantic_graph_state_artifacts(
     round_state_path = rdir / SEMANTIC_GRAPH_STATE_NAME
     round_graph_path = rdir / SEMANTIC_GRAPH_NAME
     with _semantic_write_lock():
-        _persist_semantic_state_to_db(conn, project_id, snapshot_id, state)
+        _persist_semantic_state_to_db(
+            conn, project_id, snapshot_id, state,
+            submit_for_review=submit_for_review,
+        )
         _commit_semantic_write(conn)
     semantic_graph = _materialize_semantic_graph(
         graph_json,
@@ -2341,11 +2357,19 @@ def run_semantic_enrichment(
     semantic_base_snapshot_id: str | None = None,
     trace_dir: str | Path | None = None,
     persist_feature_payloads: bool = True,
+    submit_for_review: bool = False,
 ) -> dict[str, Any]:
     """Create semantic companion artifacts for a graph snapshot.
 
     The same function is intentionally snapshot-kind agnostic; callers can use
     it for full, scope, imported, or future graph snapshot kinds.
+
+    MF-2026-05-10-016: when `submit_for_review=True`, the persistent layer
+    writes graph_semantic_nodes rows with status="pending_review". The
+    backfill→event step then maps that to event status=PROPOSED, keeping the
+    projection blind until an operator accepts via /feedback/decision with
+    action="accept_semantic_enrichment". Default False preserves the existing
+    reconcile-chain behavior (immediate ai_complete + observed events).
     """
     ensure_schema(conn)
     snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
@@ -2646,6 +2670,7 @@ def run_semantic_enrichment(
                 semantic_state,
                 round_number=round_number,
                 feature_index=feature_index,
+                submit_for_review=submit_for_review,
             )
         if ai_batch_size <= 1:
             for record in allowed_records:
