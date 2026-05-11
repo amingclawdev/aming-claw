@@ -287,6 +287,33 @@ export const api = {
       signal,
     );
   },
+  // POST /semantic-feedback — appends to the JSONL artifact that
+  // run_semantic_enrichment reads (and pipes per-node into the AI payload's
+  // `review_feedback` array). Separate from graph_feedback_items table.
+  // Used by Retry: operator's rationale flows into the next AI call.
+  appendSemanticFeedback(
+    snapshotId: string,
+    items: Array<{
+      target_type: "node" | "edge" | "path" | "snapshot";
+      target_id?: string;
+      issue: string;
+      priority?: "P0" | "P1" | "P2" | "P3";
+      reason?: string;
+      source_node_ids?: string[];
+    }>,
+    actor?: string,
+    signal?: AbortSignal,
+  ) {
+    return postJSON<{
+      ok: boolean;
+      added_count?: number;
+      feedback_path?: string;
+    }>(
+      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/semantic-feedback`,
+      { feedback_items: items, actor: actor ?? "dashboard_user" },
+      signal,
+    );
+  },
   submitProposedEvent(snapshotId: string, payload: Record<string, unknown>, signal?: AbortSignal) {
     // Backend wraps the event row under `event`; older builds returned a flat
     // `event_id` field. Keep both shapes resilient.

@@ -260,6 +260,75 @@ export default function App() {
     [data, fetchAll],
   );
 
+  const handleFeedbackRetry = useCallback(
+    async (feedbackIds: string[], nodeId: string, rationale: string) => {
+      const snapshotId = data?.status?.active_snapshot_id;
+      if (!snapshotId) {
+        setToast({ kind: "error", msg: "No active snapshot." });
+        return;
+      }
+      const reason = rationale.trim();
+      if (!reason) {
+        setToast({ kind: "error", msg: "Retry needs a rationale." });
+        return;
+      }
+      try {
+        // Step 1: close the current feedback row as rejected with the operator
+        // rationale so the Review Queue stops showing the stale proposal.
+        await api.decideFeedback(snapshotId, {
+          feedback_ids: feedbackIds,
+          action: "reject_false_positive",
+          rationale: reason,
+        });
+        // Step 2: append the rationale to the JSONL semantic-feedback store
+        // that run_semantic_enrichment reads — this is what the next AI run
+        // sees in its `review_feedback` array alongside `existing_semantic`.
+        await api.appendSemanticFeedback(
+          snapshotId,
+          [
+            {
+              target_type: "node",
+              target_id: nodeId,
+              issue: reason,
+              priority: "P2",
+              source_node_ids: [nodeId],
+              reason,
+            },
+          ],
+          "dashboard_user",
+        );
+        // Step 3: re-enqueue the node. Worker picks it up via EventBus and the
+        // AI call now has the prior rejected semantic + new rationale.
+        await api.submitSemanticJob(snapshotId, {
+          job_type: "semantic_enrichment",
+          target_scope: "node",
+          target_ids: [nodeId],
+          options: { mode: "retry", target: "nodes" },
+          created_by: "dashboard_user",
+        });
+        setToast({
+          kind: "success",
+          msg: `Retry queued for ${nodeId} · prior proposal rejected · rationale forwarded to next AI run`,
+        });
+        fetchAll();
+      } catch (e) {
+        const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
+        setToast({ kind: "error", msg: `Retry failed: ${msg}` });
+      }
+    },
+    [data, fetchAll],
+  );
+
+  const handleSelectNodeFromReview = useCallback(
+    (id: string) => {
+      setSelectedNodeId(id);
+      setPinnedEdge(null);
+      setView("graph");
+      setDrawerTab("overview");
+    },
+    [],
+  );
+
   const handleCancelOperation = useCallback(
     async (opType: string, opId: string, targetId: string) => {
       const snapshotId = data?.status?.active_snapshot_id;
@@ -438,6 +507,8 @@ export default function App() {
                   onClearEdge={() => setPinnedEdge(null)}
                   onOpenAction={handleOpenAction}
                   onOpenBacklog={handleOpenBacklog}
+                  onDecide={handleFeedbackDecision}
+                  onRetry={handleFeedbackRetry}
                   tab={drawerTab}
                   onTabChange={setDrawerTab}
                 />
@@ -453,7 +524,12 @@ export default function App() {
             />
           ) : null}
           {view === "review" && data ? (
-            <ReviewQueueView feedback={data.feedback} onDecide={handleFeedbackDecision} />
+            <ReviewQueueView
+              feedback={data.feedback}
+              onDecide={handleFeedbackDecision}
+              onRetry={handleFeedbackRetry}
+              onOpenNodeInGraph={handleSelectNodeFromReview}
+            />
           ) : null}
           {!data && !error ? (
             <div className="view">

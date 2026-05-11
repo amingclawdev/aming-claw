@@ -1,22 +1,30 @@
 import { useState } from "react";
 import type { FeedbackQueueGroup, FeedbackQueueResponse } from "../types";
+import RetryFeedbackModal from "../components/RetryFeedbackModal";
 
 interface Props {
   feedback: FeedbackQueueResponse;
   onDecide?: (feedbackIds: string[], action: string, summaryHint?: string) => void;
+  onRetry?: (feedbackIds: string[], nodeId: string, rationale: string) => Promise<void> | void;
+  onOpenNodeInGraph?: (nodeId: string) => void;
 }
 
-// MF-2026-05-10-016 P1: per-item review surface for needs_observer_decision
-// items emitted by the event-driven semantic worker. Each row maps 1:1 to a
-// feedback row in graph_feedback_items; the Accept button dispatches the
-// `accept_semantic_enrichment` verb (flips graph_semantic_nodes.status
-// pending_review→ai_complete + graph_events PROPOSED→ACCEPTED + rebuilds
-// projection), Reject dispatches `reject_false_positive`.
-export default function ReviewQueueView({ feedback, onDecide }: Props) {
+// MF-2026-05-10-016 P2: per-item review surface with clickable target +
+// Accept/Retry/Reject actions. Retry opens a modal for a rationale, then
+// orchestrates reject_false_positive → append /semantic-feedback (JSONL) →
+// re-enqueue /semantic/jobs. The next AI run sees the rationale in
+// review_feedback alongside the rejected proposal in existing_semantic.
+export default function ReviewQueueView({
+  feedback,
+  onDecide,
+  onRetry,
+  onOpenNodeInGraph,
+}: Props) {
   const s = feedback.summary;
   const groups = feedback.groups ?? [];
   const empty = groups.length === 0 && s.raw_count === 0;
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [retryGroup, setRetryGroup] = useState<FeedbackQueueGroup | null>(null);
 
   const dispatch = async (group: FeedbackQueueGroup, action: string) => {
     if (!onDecide) return;
@@ -54,7 +62,7 @@ export default function ReviewQueueView({ feedback, onDecide }: Props) {
         <div className="section-head">
           Items{" "}
           <span style={{ fontWeight: 400, color: "var(--ink-400)", fontSize: 11 }}>
-            — click Accept to promote AI semantic into the projection, Reject to discard
+            — Accept promotes semantic, Retry re-runs AI with your rationale, Reject discards
           </span>
         </div>
         {empty ? (
@@ -70,11 +78,11 @@ export default function ReviewQueueView({ feedback, onDecide }: Props) {
                 <tr>
                   <th style={{ width: 110 }}>Lane</th>
                   <th style={{ width: 60 }}>Type</th>
-                  <th style={{ width: 130 }}>Target</th>
+                  <th style={{ width: 140 }}>Target</th>
                   <th>Issue</th>
                   <th style={{ width: 130 }}>Semantic gate</th>
                   <th style={{ width: 70 }}>Priority</th>
-                  <th style={{ width: 220 }}>Actions</th>
+                  <th style={{ width: 260 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -83,6 +91,7 @@ export default function ReviewQueueView({ feedback, onDecide }: Props) {
                   const gate = g.semantic_review_gate;
                   const gateReason = gate?.reason ?? "—";
                   const gateReady = gate?.ready;
+                  const isNode = g.target_type === "node";
                   return (
                     <tr key={g.queue_id}>
                       <td>
@@ -92,7 +101,17 @@ export default function ReviewQueueView({ feedback, onDecide }: Props) {
                         <span className="mono">{g.target_type}</span>
                       </td>
                       <td>
-                        <span className="mono">{g.target_id}</span>
+                        {isNode && onOpenNodeInGraph ? (
+                          <button
+                            className="link-btn mono"
+                            title={`Jump to ${g.target_id} in the graph view`}
+                            onClick={() => onOpenNodeInGraph(g.target_id)}
+                          >
+                            {g.target_id}
+                          </button>
+                        ) : (
+                          <span className="mono">{g.target_id}</span>
+                        )}
                       </td>
                       <td>
                         <div>{g.representative_issue}</div>
@@ -130,20 +149,20 @@ export default function ReviewQueueView({ feedback, onDecide }: Props) {
                             {busy ? "…" : "Accept"}
                           </button>
                           <button
+                            className="action-btn"
+                            disabled={busy || !onRetry || !isNode}
+                            title="Reject + re-enqueue with rationale (next AI run sees the prior proposal + your reason)"
+                            onClick={() => setRetryGroup(g)}
+                          >
+                            Retry
+                          </button>
+                          <button
                             className="action-btn action-btn-danger"
                             disabled={busy || !onDecide}
                             title="POST /feedback/decision action=reject_false_positive"
                             onClick={() => dispatch(g, "reject_false_positive")}
                           >
                             {busy ? "…" : "Reject"}
-                          </button>
-                          <button
-                            className="action-btn"
-                            disabled={busy || !onDecide}
-                            title="POST /feedback/decision action=needs_human_signoff"
-                            onClick={() => dispatch(g, "needs_human_signoff")}
-                          >
-                            Defer
                           </button>
                         </div>
                       </td>
@@ -202,6 +221,25 @@ export default function ReviewQueueView({ feedback, onDecide }: Props) {
           </div>
         </div>
       </div>
+
+      {retryGroup && onRetry ? (
+        <RetryFeedbackModal
+          targetType={retryGroup.target_type}
+          targetId={retryGroup.target_id}
+          feedbackIds={retryGroup.feedback_ids}
+          priorIssue={retryGroup.representative_issue}
+          onCancel={() => setRetryGroup(null)}
+          onSubmit={async (rationale) => {
+            setBusyId(retryGroup.queue_id);
+            try {
+              await onRetry(retryGroup.feedback_ids, retryGroup.target_id, rationale);
+              setRetryGroup(null);
+            } finally {
+              setBusyId(null);
+            }
+          }}
+        />
+      ) : null}
     </div>
   );
 }

@@ -1,5 +1,11 @@
 import { useMemo, useState } from "react";
-import type { EdgeRecord, FeedbackQueueResponse, Layer, NodeRecord } from "../types";
+import type {
+  EdgeRecord,
+  FeedbackQueueGroup,
+  FeedbackQueueResponse,
+  Layer,
+  NodeRecord,
+} from "../types";
 import {
   aggregateNode,
   classifyNode,
@@ -14,6 +20,7 @@ import FileLink from "./FileLink";
 import { editorConfigured, editorScheme, editorUrl } from "../lib/editor";
 import type { PinnedEdge } from "./FocusCard";
 import type { ActionKind, ActionTarget } from "./ActionControlPanel";
+import RetryFeedbackModal from "./RetryFeedbackModal";
 
 interface Props {
   node: NodeRecord | null;
@@ -26,6 +33,8 @@ interface Props {
   onClearEdge?(): void;
   onOpenAction?(kind: ActionKind, target: ActionTarget): void;
   onOpenBacklog?(target: ActionTarget): void;
+  onDecide?(feedbackIds: string[], action: string, summaryHint?: string): void;
+  onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
   tab?: Tab;
   onTabChange?(tab: Tab): void;
 }
@@ -44,6 +53,21 @@ interface EdgeProps {
 }
 
 export type Tab = "overview" | "files" | "relations" | "feedback" | "backlog";
+
+// MF-2026-05-10-016 P2: surface needs_observer_decision feedback for the
+// inspected node so the drawer can show Accept / Retry / Reject inline.
+function findPendingReviewGroup(
+  feedback: FeedbackQueueResponse | null | undefined,
+  nodeId: string,
+): FeedbackQueueGroup | null {
+  if (!feedback || !nodeId) return null;
+  const groups = feedback.groups ?? [];
+  for (const g of groups) {
+    if (g.target_type !== "node") continue;
+    if (g.target_id === nodeId) return g;
+  }
+  return null;
+}
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -64,6 +88,8 @@ export default function InspectorDrawer({
   onClearEdge,
   onOpenAction,
   onOpenBacklog,
+  onDecide,
+  onRetry,
   tab: controlledTab,
   onTabChange,
 }: Props) {
@@ -189,6 +215,9 @@ export default function InspectorDrawer({
             childrenByLayer={childrenByLayer}
             importantChildren={importantChildren}
             onSelectNode={onSelectNode}
+            pendingReview={findPendingReviewGroup(feedback, node.node_id)}
+            onDecide={onDecide}
+            onRetry={onRetry}
           />
         ) : null}
         {tab === "files" ? <FilesTab node={node} /> : null}
@@ -224,6 +253,9 @@ function OverviewTab({
   childrenByLayer,
   importantChildren,
   onSelectNode,
+  pendingReview,
+  onDecide,
+  onRetry,
 }: {
   node: NodeRecord;
   isContainer: boolean;
@@ -231,13 +263,92 @@ function OverviewTab({
   childrenByLayer: Record<string, number>;
   importantChildren: NodeRecord[];
   onSelectNode(id: string): void;
+  pendingReview?: FeedbackQueueGroup | null;
+  onDecide?(feedbackIds: string[], action: string, summaryHint?: string): void;
+  onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
 }) {
   const sem = node.semantic ?? {};
   const v = sem.validity ?? {};
   const signals = isContainer ? containerSignals(node, aggregate) : leafSignals(node);
+  const [showRetry, setShowRetry] = useState(false);
+  const [reviewBusy, setReviewBusy] = useState(false);
+
+  const dispatchDecide = async (action: string) => {
+    if (!onDecide || !pendingReview) return;
+    setReviewBusy(true);
+    try {
+      await onDecide(
+        pendingReview.feedback_ids,
+        action,
+        `node ${pendingReview.target_id}`,
+      );
+    } finally {
+      setReviewBusy(false);
+    }
+  };
 
   return (
     <>
+      {pendingReview ? (
+        <section className="drawer-review-banner">
+          <div className="drawer-review-banner-head">
+            <span className="drawer-review-banner-title">
+              ⚖ 待审核语义 · {pendingReview.target_id}
+            </span>
+            <span className="mono" style={{ fontSize: 10.5, color: "var(--ink-400)" }}>
+              {pendingReview.representative_feedback_id}
+              {pendingReview.feedback_ids.length > 1 ? ` +${pendingReview.feedback_ids.length - 1}` : ""}
+            </span>
+          </div>
+          <div className="drawer-review-banner-body">{pendingReview.representative_issue}</div>
+          <div className="drawer-review-banner-actions">
+            <button
+              className="action-btn"
+              disabled={reviewBusy || !onDecide}
+              title="POST /feedback/decision action=accept_semantic_enrichment"
+              onClick={() => dispatchDecide("accept_semantic_enrichment")}
+            >
+              {reviewBusy ? "…" : "Accept"}
+            </button>
+            <button
+              className="action-btn"
+              disabled={reviewBusy || !onRetry}
+              title="Reject + re-enqueue with rationale (next AI run sees the prior proposal + your reason)"
+              onClick={() => setShowRetry(true)}
+            >
+              Retry
+            </button>
+            <button
+              className="action-btn action-btn-danger"
+              disabled={reviewBusy || !onDecide}
+              title="POST /feedback/decision action=reject_false_positive"
+              onClick={() => dispatchDecide("reject_false_positive")}
+            >
+              {reviewBusy ? "…" : "Reject"}
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {showRetry && pendingReview && onRetry ? (
+        <RetryFeedbackModal
+          targetType={pendingReview.target_type}
+          targetId={pendingReview.target_id}
+          feedbackIds={pendingReview.feedback_ids}
+          priorIssue={pendingReview.representative_issue}
+          onCancel={() => setShowRetry(false)}
+          onSubmit={async (rationale) => {
+            setReviewBusy(true);
+            try {
+              await onRetry(pendingReview.feedback_ids, pendingReview.target_id, rationale);
+              setShowRetry(false);
+            } finally {
+              setReviewBusy(false);
+            }
+          }}
+        />
+      ) : null}
+
       {sem.semantic_summary || sem.intent || sem.feature_name || sem.domain_label ? (
         <section className="inspector-section">
           <div className="inspector-section-title">About</div>
