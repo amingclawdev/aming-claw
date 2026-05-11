@@ -136,7 +136,7 @@ function NodeFocusCard({
       <div className="focus-foot">
         <button
           className={`focus-cta cta-${cta.kind}`}
-          onClick={() => onOpenAction(cta.kind, { node })}
+          onClick={() => onOpenAction(cta.kind, { node, forceMode: cta.forceMode })}
           title={cta.hint}
         >
           {cta.label}
@@ -209,7 +209,7 @@ function EdgeFocusCard({
       <div className="focus-foot focus-foot-edge">
         <button
           className={`focus-cta cta-${cta.kind}`}
-          onClick={() => onOpenAction(cta.kind, { edge })}
+          onClick={() => onOpenAction(cta.kind, { edge, forceMode: cta.forceMode })}
         >
           {cta.label}
         </button>
@@ -230,35 +230,49 @@ function ctaFor(status: SemanticStatus): {
   kind: ActionKind;
   label: string;
   hint: string;
+  forceMode?: "semanticize" | "retry" | "review";
 } {
-  // User-driven contract: stale OR structure-only / missing / hash-unverified
-  // / failed → AI enrich is the natural next step. current OR reviewed → submit
-  // feedback (challenge or accept the AI semantic).
+  // CTA always launches the AI enrich modal — when the AI semantic is already
+  // current/reviewed the CTA becomes "Retry AI enrich" (operator wants the
+  // model to take another pass, possibly with a note to course-correct).
+  // Feedback as a separate verb is deferred (Feedback/Backlog tabs were
+  // removed; will be redone later).
   switch (status) {
     case "semantic_complete":
     case "reviewed":
       return {
-        kind: "feedback",
-        label: "Submit feedback",
-        hint: "AI semantic exists — challenge or accept it",
+        kind: "enrich",
+        label: "↻ Retry AI enrich",
+        hint: "AI semantic exists — retry to refine or course-correct",
+        forceMode: "retry",
       };
     case "semantic_pending":
     case "semantic_running":
       return {
-        kind: "feedback",
-        label: "Open in operations",
-        hint: "AI semantic is in flight — track in Operations Queue",
+        kind: "enrich",
+        label: "↻ Retry AI enrich",
+        hint: "AI semantic is in flight — queue another pass",
+        forceMode: "retry",
+      };
+    case "semantic_stale":
+      return {
+        kind: "enrich",
+        label: "↻ Retry AI enrich",
+        hint: "Source drifted — re-enrich to refresh",
+        forceMode: "retry",
+      };
+    case "semantic_hash_unverified":
+      return {
+        kind: "enrich",
+        label: "↻ Retry AI enrich",
+        hint: "Hash mismatch — re-enrich to verify",
+        forceMode: "retry",
       };
     default:
       return {
         kind: "enrich",
         label: "⚡ AI enrich",
-        hint:
-          status === "semantic_stale"
-            ? "Source drifted — re-enrich to refresh"
-            : status === "semantic_hash_unverified"
-              ? "Hash mismatch — re-enrich to verify"
-              : "No AI semantic yet — enrich to populate",
+        hint: "No AI semantic yet — enrich to populate",
       };
   }
 }

@@ -26,6 +26,10 @@ export interface ActionTarget {
   node?: NodeRecord;
   edge?: PinnedEdge;
   preset?: EnrichPreset;
+  // Optional explicit mode override — e.g. the "Retry AI enrich" CTA passes
+  // forceMode="retry" so the modal lands directly on retry without showing
+  // the mode selector.
+  forceMode?: "semanticize" | "retry" | "review";
 }
 
 interface Props {
@@ -137,7 +141,10 @@ export default function ActionControlPanel({
     if (!open) return;
     setBusy(false);
     setNote("");
-    setEnrichExec("dry_run");
+    // Per-target enrich from the FocusCard / drawer goes straight to apply —
+    // dry-run only makes sense for the global Action Panel preset flows
+    // (full-graph plans where the operator wants a queue tally first).
+    setEnrichExec(target?.preset ? "dry_run" : "apply");
     setFeedbackKind("graph_correction");
     setPriority("P2");
     const preset = target?.preset;
@@ -184,18 +191,16 @@ export default function ActionControlPanel({
     } else if (target?.edge) {
       setEnrichTarget("edges");
       setEnrichScope("selected_node");
-      setEnrichMode("semanticize");
+      setEnrichMode(target.forceMode ?? "semanticize");
     } else if (target?.node) {
       const status = classifyNode(target.node);
       setEnrichTarget("nodes");
-      if (status === "semantic_stale" || status === "semantic_hash_unverified") {
-        setEnrichScope("selected_node");
+      setEnrichScope("selected_node");
+      if (target.forceMode) {
+        setEnrichMode(target.forceMode);
+      } else if (status === "semantic_stale" || status === "semantic_hash_unverified") {
         setEnrichMode("retry");
-      } else if (status === "structure_only" || status === "semantic_failed") {
-        setEnrichScope("selected_node");
-        setEnrichMode("semanticize");
       } else {
-        setEnrichScope("selected_node");
         setEnrichMode("semanticize");
       }
     }
@@ -354,7 +359,11 @@ export default function ActionControlPanel({
       >
         <header className="action-panel-head">
           <span className={`action-panel-kind kind-${kind}`}>
-            {kind === "enrich" ? "⚡ AI enrich" : "Feedback"}
+            {kind === "enrich"
+              ? target?.forceMode === "retry"
+                ? "↻ Retry AI enrich"
+                : "⚡ AI enrich"
+              : "Feedback"}
           </span>
           <button className="btn-close" onClick={onClose} aria-label="Close">
             ×
@@ -379,34 +388,45 @@ export default function ActionControlPanel({
         <div className="action-panel-body">
           {kind === "enrich" ? (
             <>
-              <RadioGroup
-                legend="Target"
-                name="enrich-target"
-                value={enrichTarget}
-                onChange={(v) => setEnrichTarget(v as EnrichTarget)}
-                options={ENRICH_TARGETS}
-              />
-              <RadioGroup
-                legend="Scope"
-                name="enrich-scope"
-                value={enrichScope}
-                onChange={(v) => setEnrichScope(v as EnrichScope)}
-                options={ENRICH_SCOPES}
-              />
-              <RadioGroup
-                legend="Mode"
-                name="enrich-mode"
-                value={enrichMode}
-                onChange={(v) => setEnrichMode(v as EnrichMode)}
-                options={ENRICH_MODES}
-              />
-              <RadioGroup
-                legend="Execution"
-                name="enrich-exec"
-                value={enrichExec}
-                onChange={(v) => setEnrichExec(v as EnrichExec)}
-                options={ENRICH_EXEC}
-              />
+              {/* Simple per-target enrich (FocusCard / drawer CTA, no preset)
+                  hides the radio knobs: target type is derived from the
+                  selected target, scope=this target only, mode is set by
+                  forceMode or inferred from status, exec=apply. Operator
+                  just types a note and clicks Apply. The full radio form
+                  is only shown for preset-driven flows (global Action
+                  Panel "Run scope reconcile" / "Run global review" etc.). */}
+              {target?.preset ? (
+                <>
+                  <RadioGroup
+                    legend="Target"
+                    name="enrich-target"
+                    value={enrichTarget}
+                    onChange={(v) => setEnrichTarget(v as EnrichTarget)}
+                    options={ENRICH_TARGETS}
+                  />
+                  <RadioGroup
+                    legend="Scope"
+                    name="enrich-scope"
+                    value={enrichScope}
+                    onChange={(v) => setEnrichScope(v as EnrichScope)}
+                    options={ENRICH_SCOPES}
+                  />
+                  <RadioGroup
+                    legend="Mode"
+                    name="enrich-mode"
+                    value={enrichMode}
+                    onChange={(v) => setEnrichMode(v as EnrichMode)}
+                    options={ENRICH_MODES}
+                  />
+                  <RadioGroup
+                    legend="Execution"
+                    name="enrich-exec"
+                    value={enrichExec}
+                    onChange={(v) => setEnrichExec(v as EnrichExec)}
+                    options={ENRICH_EXEC}
+                  />
+                </>
+              ) : null}
               <fieldset className="action-fieldset">
                 <legend>
                   Note <span className="action-optional">optional</span>
@@ -496,7 +516,9 @@ export default function ActionControlPanel({
               : kind === "enrich"
                 ? enrichExec === "dry_run"
                   ? "⚡ Dry-run enrich"
-                  : "⚡ Apply enrich"
+                  : target?.forceMode === "retry"
+                    ? "↻ Apply retry"
+                    : "⚡ Apply enrich"
                 : "Submit feedback"}
           </button>
         </footer>
