@@ -20,14 +20,27 @@ const TERMINAL_STATUSES = new Set([
   "rule_complete",
 ]);
 
+// Operation types that have their own dedicated tab/surface and should NOT
+// crowd the Operations Queue. feedback_review is shown in the Review Queue
+// tab — surfacing it here too creates a duplicate "queued" entry every time
+// the dashboard reloads.
+const HIDDEN_OP_TYPES = new Set<string>(["feedback_review"]);
+
 export default function OperationsQueueView({
   ops,
   onCancelOperation,
   onCancelAllByType,
   onClearTerminal,
 }: Props) {
-  const rows = ops.operations ?? [];
+  const allRows = ops.operations ?? [];
+  const rows = allRows.filter((r) => !HIDDEN_OP_TYPES.has(String(r.operation_type || "")));
+  const hiddenCount = allRows.length - rows.length;
   const summary = ops.summary;
+  // Drop hidden operation types from the by_type card grid as well so the
+  // top-of-page summary matches the rows shown below.
+  const byType = Object.fromEntries(
+    Object.entries(summary?.by_type ?? {}).filter(([k]) => !HIDDEN_OP_TYPES.has(k)),
+  );
 
   return (
     <div className="view">
@@ -35,14 +48,20 @@ export default function OperationsQueueView({
         <h2 className="view-title">Operations Queue</h2>
         <span className="view-subtitle">
           source <span className="mono">/operations/queue</span> ·{" "}
-          <span className="mono">{ops.snapshot_id}</span> · {ops.count} row{ops.count === 1 ? "" : "s"}
+          <span className="mono">{ops.snapshot_id}</span> · {rows.length} row{rows.length === 1 ? "" : "s"}
+          {hiddenCount > 0 ? (
+            <span style={{ color: "var(--ink-400)" }}>
+              {" "}
+              · {hiddenCount} feedback_review row{hiddenCount === 1 ? "" : "s"} shown in Review Queue
+            </span>
+          ) : null}
         </span>
       </div>
 
       <div className="section">
         <div className="section-head">By type</div>
         <div className="score-grid">
-          {Object.entries(summary?.by_type ?? {}).map(([k, v]) => {
+          {Object.entries(byType).map(([k, v]) => {
             const canCancel =
               (k === "node_semantic" || k === "edge_semantic") &&
               !!onCancelAllByType &&
