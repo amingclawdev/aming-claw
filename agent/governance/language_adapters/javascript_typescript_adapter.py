@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 
-_JS_TS_EXTENSIONS = (".js", ".jsx", ".ts", ".tsx")
+_JS_TS_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
 _IMPORT_FROM_RE = re.compile(
     r"""(?m)^\s*import\s+(?P<body>[\s\S]*?)\s+from\s+["'](?P<specifier>[^"']+)["']\s*;?"""
 )

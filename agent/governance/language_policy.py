@@ -16,7 +16,14 @@ class LanguagePolicy:
     """Single source for source, test, config, doc, generated, and ignore rules."""
 
     source_extensions: frozenset[str] = frozenset({
-        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs",
+        ".py", ".pyi",
+        # Node.js variants: .js (default), .jsx (React), .mjs (ESM),
+        # .cjs (CommonJS). All four are production source per ESM spec.
+        # Adding .mjs/.cjs lets reconcile_file_inventory + graph adapter
+        # discovery pick up node scripts that ship under frontend/.
+        ".js", ".jsx", ".mjs", ".cjs",
+        ".ts", ".tsx",
+        ".go", ".rs",
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
     })
     python_extensions: frozenset[str] = frozenset({".py", ".pyi"})
@@ -45,6 +52,8 @@ class LanguagePolicy:
         ".pyi": "python",
         ".js": "javascript",
         ".jsx": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
         ".ts": "typescript",
         ".tsx": "typescript",
         ".go": "go",
