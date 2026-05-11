@@ -585,7 +585,6 @@ function EdgeInspector({
   onSelectNode,
   onClose,
   onOpenAction,
-  onOpenBacklog,
   onDecide,
   onRetry,
   tab,
@@ -1469,36 +1468,6 @@ function RelationsTab({
 // opens the action modal pre-filled with this target.
 // ===========================================================================
 
-interface QueueGroup {
-  id?: string;
-  lane?: string;
-  priority?: string;
-  target_type?: string;
-  target_id?: string;
-  event_type?: string;
-  issue_type?: string;
-  requires_human_signoff?: boolean;
-  semantic_review_ready?: boolean;
-  representative_issue?: string;
-  source_node_ids?: string[];
-  item_count?: number;
-  suppressed_count?: number;
-  confidence?: number;
-}
-
-function selectQueueGroups(
-  feedback: FeedbackQueueResponse | null | undefined,
-  targetIds: string[],
-): QueueGroup[] {
-  if (!feedback || !Array.isArray(feedback.groups)) return [];
-  const idSet = new Set(targetIds);
-  return (feedback.groups as QueueGroup[]).filter((g) => {
-    if (g.target_id && idSet.has(g.target_id)) return true;
-    if (g.source_node_ids && g.source_node_ids.some((n) => idSet.has(n))) return true;
-    return false;
-  });
-}
-
 // Functions tab — for L7 leaves with functions, hands off to FunctionsSection
 // so the rich "jump to <editor>" links are reused. For L4 / no-function
 // cases falls back to a helpful "n/a" message explaining why.
@@ -1815,66 +1784,6 @@ function EdgeProblemsTab({
       </section>
     </>
   );
-}
-
-function QueueGroupRow({
-  group,
-  onSelectNode,
-}: {
-  group: QueueGroup;
-  onSelectNode(id: string): void;
-}) {
-  const conf = typeof group.confidence === "number" ? group.confidence.toFixed(2) : "—";
-  const peer = group.target_id ?? "";
-  return (
-    <button
-      className="link-row"
-      onClick={() => peer && onSelectNode(peer)}
-      style={{ alignItems: "flex-start", flexDirection: "column", gap: 3 }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", width: "100%" }}>
-        {group.lane ? <span className={`status-badge status-${laneToTone(group.lane)}`}>{group.lane}</span> : null}
-        {group.priority ? <span className="pill pill-mono">{group.priority}</span> : null}
-        {group.event_type ? <span className="pill pill-mono">{group.event_type}</span> : null}
-        {group.issue_type ? <span className="pill pill-mono">{group.issue_type}</span> : null}
-        {group.requires_human_signoff ? (
-          <span className="status-badge status-failed">requires signoff</span>
-        ) : null}
-        <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--ink-500)" }}>
-          conf <strong>{conf}</strong> · items <strong>{group.item_count ?? 1}</strong>
-        </span>
-      </div>
-      {group.representative_issue ? (
-        <div style={{ fontSize: 11.5, color: "var(--ink-800)", fontWeight: 500, whiteSpace: "normal" }}>
-          {group.representative_issue}
-        </div>
-      ) : null}
-      {group.target_id ? (
-        <div className="mono" style={{ fontSize: 9.5, color: "var(--ink-500)" }}>
-          {group.target_type}: {group.target_id}
-        </div>
-      ) : null}
-    </button>
-  );
-}
-
-function laneToTone(lane: string): string {
-  switch (lane) {
-    case "graph_patch_candidate":
-      return "failed";
-    case "review_required":
-      return "pending";
-    case "candidate_backlog":
-      return "pending";
-    case "status_only":
-      return "unknown";
-    case "resolved":
-      return "complete";
-    case "stale":
-      return "not-queued";
-    default:
-      return "unknown";
-  }
 }
 
 // ---------------- Helpers ----------------

@@ -169,7 +169,11 @@ function EdgeFocusCard({
   const desc = EDGE_TYPE_DESC[edge.type] ?? "structure-derived typed relation";
   // Edges currently have no per-edge semantic state in the snapshot, so the
   // primary CTA is always 'enrich' until the backend surfaces edge_semantic.
-  const cta: { kind: ActionKind; label: string } = {
+  const cta: {
+    kind: ActionKind;
+    label: string;
+    forceMode?: "semanticize" | "retry" | "review";
+  } = {
     kind: "enrich",
     label: "⚡ AI enrich edge",
   };

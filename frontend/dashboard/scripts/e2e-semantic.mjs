@@ -170,17 +170,18 @@ curl -s -X ${err.method} \\
 
 // ---------- Cancel capability table ----------
 //
-// Probed against localhost:40000 on 2026-05-10 (post codex MF d34019a).
+// Probed against localhost:40000 on 2026-05-11 (post MF-2026-05-10-011).
 // Re-run --probe-cancel to refresh.
 //
-// All four gaps from the prior audit are now filled:
+// Dashboard-cancellable paths:
 //   node_semantic    -> POST /semantic/jobs/{node_id}/cancel    (per-row)
 //   edge_semantic    -> POST /semantic/jobs/{edge_id}/cancel    (accepts pipe `|`,
 //                       arrow `src->dst:type`, or event id)
-//   scope_reconcile  -> POST /reconcile/scope/cancel            (commit_sha or
-//                       operation_id; soft via waive_pending_scope_reconcile)
 //   feedback_review  -> POST /feedback/cancel                   (soft, returns
 //                       feedback_cancel_contract: "keep_status_observation")
+//   scope_reconcile  -> intentionally NOT cancellable. POST /reconcile/scope/cancel
+//                       returns 410 scope_reconcile_cancel_disabled because waiving
+//                       pending-scope rows poisoned future HEAD reconciles.
 // Bulk:
 //   POST /semantic/jobs/cancel-all  (AND-combined filters; returns
 //   cancelled_count + skipped_terminal + cancelled_ops)
@@ -202,9 +203,9 @@ const CANCEL_CAPS = {
     idShape: "edge id — pipe `src|dst|type`, arrow `src->dst:type`, or event id all accepted",
   },
   scope_reconcile: {
-    kind: "per-row",
+    kind: "missing",
     cancelPath: () => `/api/graph-governance/${PROJECT}/reconcile/scope/cancel`,
-    idShape: "POST body with operation_id=`scope-reconcile:{commit_sha}` or commit_sha directly",
+    reason: "disabled by MF-2026-05-10-011; recover by materializing graph or starting a fresh reconcile",
   },
   feedback_review: {
     kind: "soft",
@@ -305,6 +306,7 @@ async function probeCancelEndpoints(snapshotId) {
       op_type: t,
       target_id: op.target_id,
       operation_id: op.operation_id,
+      status: op.status,
       supported_actions: op.supported_actions || [],
     });
   }
@@ -437,15 +439,9 @@ function isPackageMarker(n) {
   );
 }
 
-// Mirrors the dashboard's "Queue scope reconcile" → click "cancel" on the
-// scope_reconcile row in OperationsQueueView. Pure HTTP — does not drive the UI.
-//
-// Uses a SYNTHETIC test commit (e.g. "e2e0000…") rather than the real HEAD,
-// because the store's queue_pending_scope_reconcile upsert permanently preserves
-// `waived` state. If we tested with the real HEAD, the dashboard's own "Queue
-// scope reconcile" button would be silently no-op'd until the user makes a
-// fresh commit on main. Synthetic commits keep the test isolated from the live
-// pending table.
+// Verifies the current scope_reconcile contract without mutating pending-scope
+// rows. MF-2026-05-10-011 deliberately disabled cancel because the old soft
+// cancel wrote `waived` state that could poison future HEAD reconciles.
 function syntheticReconcileCommit() {
   // Stable per-day so re-running the test the same day reuses the same row;
   // a new day yields a fresh commit so cancel can be exercised end-to-end.
@@ -454,103 +450,40 @@ function syntheticReconcileCommit() {
 }
 
 async function phaseScopeReconcileClick(status) {
-  phase("scope reconcile click flow");
+  phase("scope reconcile cancel-disabled contract");
   const realHead = status?.current_state?.graph_stale?.head_commit;
   const snap = status?.graph_snapshot_commit;
   const synth = syntheticReconcileCommit();
-  info(`real HEAD=${(realHead || "").slice(0, 7)} · synthetic test commit=${synth.slice(0, 16)}…`);
-  info("using synthetic commit so the test does not waive the real HEAD's pending row");
+  info(`real HEAD=${(realHead || "").slice(0, 7)} · graph=${(snap || "").slice(0, 7)} · synthetic op=${synth.slice(0, 16)}…`);
 
-  // 1. Queue a pending-scope row using the synthetic commit
-  let queued;
-  try {
-    queued = await http(
-      "POST",
-      `/api/graph-governance/${PROJECT}/pending-scope`,
-      {
-        commit_sha: synth,
-        parent_commit_sha: snap,
-        status: "queued",
-        actor: "dashboard_e2e",
-        evidence: { source: "e2e_scope_reconcile_test", note: "synthetic test commit" },
-      },
-    );
-  } catch (e) {
-    fail(`queue pending-scope failed: ${e.message}`);
-    emitBugPrompt(e, 0, "201 with pending_scope_reconcile.status=queued", "Queue scope reconcile",
-      "StaleGraphBanner", "at `agent/governance/server.py:3897` (pending_scope_queue)");
-    throw e;
+  // 1. Current operations rows must not advertise cancel for scope_reconcile.
+  const ops1 = await http("GET", `/api/graph-governance/${PROJECT}/operations/queue`);
+  const badRow = (ops1.operations || []).find(
+    (o) => o.operation_type === "scope_reconcile" && (o.supported_actions || []).includes("cancel"),
+  );
+  if (badRow) {
+    fail(`scope_reconcile row incorrectly advertises cancel: ${JSON.stringify(badRow)}`);
+    return { skipped: false, ok: false };
   }
-  const pending = queued?.pending_scope_reconcile;
-  // Even on a synthetic commit, a same-day re-run could land on a waived row.
-  // Treat "already waived" as a clean assertion that cancel did its job in
-  // this same UTC day — accept it without failing.
-  if (pending?.status === "waived") {
-    ok(`synthetic commit already waived from earlier same-day run · pending_count consistent`);
-    const status3 = await http("GET", `/api/graph-governance/${PROJECT}/status`);
-    if (status3.pending_scope_reconcile_count !== 0) {
-      fail(`pending=waived but status.pending_scope_reconcile_count=${status3.pending_scope_reconcile_count} (expected 0)`);
+  ok("operations/queue omits cancel for scope_reconcile rows");
+
+  // 2. Direct POST remains available as a clear disabled contract: 410.
+  try {
+    const url = `${BACKEND}/api/graph-governance/${PROJECT}/reconcile/scope/cancel`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation_id: `scope-reconcile:${synth}`, actor: "dashboard_e2e", reason: "e2e_contract_probe" }),
+    });
+    if (res.status !== 410) {
+      fail(`scope_reconcile cancel returned ${res.status}; expected 410 disabled`);
       return { skipped: false, ok: false };
     }
-    return { skipped: false, ok: true, note: "already_waived_today" };
-  }
-  if (pending?.status !== "queued") {
-    warn(`unexpected pending status: ${pending?.status} (continuing)`);
-  } else {
-    ok(`pending row queued · commit=${synth.slice(0, 16)} · status=queued`);
-  }
-
-  // 2. Confirm the row is visible to the dashboard via /operations/queue
-  const ops1 = await http("GET", `/api/graph-governance/${PROJECT}/operations/queue`);
-  const opRow = (ops1.operations || []).find(
-    (o) => o.operation_type === "scope_reconcile" && o.target_id === synth,
-  );
-  if (!opRow) {
-    fail(`operations/queue did not surface scope_reconcile row for synth ${synth.slice(0, 16)}`);
-    return { skipped: false, ok: false };
-  }
-  if (!(opRow.supported_actions || []).includes("cancel")) {
-    fail(`scope_reconcile row missing 'cancel' in supported_actions: ${JSON.stringify(opRow.supported_actions)}`);
-    return { skipped: false, ok: false };
-  }
-  ok(`ops queue row visible · operation_id=${opRow.operation_id} · cancel offered`);
-
-  // 3. Click cancel (mirrors OperationsQueueView Row's cancel button)
-  let cancelled;
-  try {
-    cancelled = await http(
-      "POST",
-      `/api/graph-governance/${PROJECT}/reconcile/scope/cancel`,
-      { operation_id: opRow.operation_id, actor: "dashboard_e2e", reason: "e2e_test" },
-    );
+    ok("POST /reconcile/scope/cancel returns 410 disabled");
   } catch (e) {
-    fail(`cancel POST failed: ${e.message}`);
-    emitBugPrompt(e, 0, "200 with status=cancelled and cancelled_count=1", "Cancel button on scope_reconcile row",
-      "OperationsQueueView", "at `agent/governance/server.py:2729` (reconcile_scope_cancel)");
-    throw e;
-  }
-  if (cancelled.status !== "cancelled" || (cancelled.cancelled_count || 0) < 1) {
-    fail(`cancel returned unexpected payload: status=${cancelled.status} cancelled_count=${cancelled.cancelled_count}`);
+    fail(`disabled-cancel POST probe failed: ${e.message}`);
     return { skipped: false, ok: false };
   }
-  ok(`cancel ok · status=${cancelled.status} · cancelled_count=${cancelled.cancelled_count}`);
-
-  // 4. Verify pending count back to 0 + ops row gone (or status=cancelled)
-  const status2 = await http("GET", `/api/graph-governance/${PROJECT}/status`);
-  if (status2.pending_scope_reconcile_count !== 0) {
-    warn(`pending_scope_reconcile_count expected 0, got ${status2.pending_scope_reconcile_count}`);
-  } else {
-    ok(`status.pending_scope_reconcile_count = 0`);
-  }
-  const ops2 = await http("GET", `/api/graph-governance/${PROJECT}/operations/queue`);
-  const opRow2 = (ops2.operations || []).find(
-    (o) => o.operation_type === "scope_reconcile" && o.target_id === synth && o.status === "queued",
-  );
-  if (opRow2) {
-    fail(`scope_reconcile row still queued after cancel: ${JSON.stringify(opRow2)}`);
-    return { skipped: false, ok: false };
-  }
-  ok(`ops queue scope_reconcile row no longer queued for ${synth.slice(0, 16)}`);
   return { skipped: false, ok: true };
 }
 
@@ -1360,12 +1293,16 @@ async function main() {
       const declared = (s.supported_actions || []).includes("cancel");
       const cap = CANCEL_CAPS[s.op_type];
       const verified = cap?.kind === "per-row";
+      const disabled = cap?.kind === "missing";
+      const suggestionOnly = s.status === "not_queued" && !declared;
       let tag;
       if (declared && verified) tag = c("green", "declared+verified");
       else if (declared && !verified) tag = c("red", "DECLARED BUT BROKEN");
-      else if (!declared && verified) tag = c("yellow", "undocumented works");
+      else if (disabled) tag = c("dim", "disabled");
+      else if (suggestionOnly) tag = c("dim", "not queued");
+      else if (!declared && verified) tag = c("yellow", "available when queued");
       else tag = c("dim", "absent");
-      console.log(`    ${tag.padEnd(28)}  ${s.op_type.padEnd(18)}  example: target_id=${s.target_id}  actions=[${(s.supported_actions || []).join(",")}]`);
+      console.log(`    ${tag.padEnd(28)}  ${s.op_type.padEnd(18)}  example: target_id=${s.target_id}  status=${s.status}  actions=[${(s.supported_actions || []).join(",")}]`);
     }
     console.log("");
     console.log(c("bold", "  Static capability table (CANCEL_CAPS):"));
@@ -1376,7 +1313,12 @@ async function main() {
       console.log(`    ${tag.padEnd(20)} ${k}${cap.reason ? "  — " + cap.reason : ""}`);
     }
     console.log("");
-    const anyMissing = sampleOps.some(s => !(s.supported_actions || []).includes("cancel") && s.op_type !== "feedback_review");
+    const anyMissing = sampleOps.some((s) => {
+      const cap = CANCEL_CAPS[s.op_type];
+      if (cap?.kind === "missing") return false;
+      if (s.status === "not_queued") return false;
+      return !(s.supported_actions || []).includes("cancel") && s.op_type !== "feedback_review";
+    });
     if (anyMissing) {
       console.log(c("yellow", "PROBE-CANCEL: some op types lack cancel; full E2E will gate."));
     } else {
