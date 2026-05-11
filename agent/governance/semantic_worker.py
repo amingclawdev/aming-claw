@@ -400,6 +400,45 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
                 enriched_payload = dict(payload)
                 enriched_payload["semantic_payload"] = semantic_payload
                 enriched_payload["enriched_by"] = "semantic_worker_inproc_edge"
+                # MF 2026-05-11: compute stable_edge_key + edge_signature_hash
+                # before writing the event so the event row carries the
+                # cross-snapshot identity (stable_node_key column reused).
+                edge_struct = edge_context if isinstance(edge_context, dict) else {}
+                src_node_id = str(edge_struct.get("src") or "")
+                dst_node_id = str(edge_struct.get("dst") or "")
+                # Best-effort endpoint node lookup. Worker has the snapshot id
+                # so we can query graph_snapshot_store; failure leaves the
+                # endpoint dict empty and the hash falls back to raw id-based.
+                src_node_meta: dict | None = None
+                dst_node_meta: dict | None = None
+                try:
+                    from . import graph_snapshot_store as _store
+                    snap_nodes = _store.list_graph_snapshot_nodes(
+                        conn, project_id, snapshot_id,
+                        include_semantic=False, limit=2000,
+                    )
+                    nodes_by_id = {
+                        str(n.get("node_id") or n.get("id") or ""): n
+                        for n in snap_nodes
+                    }
+                    src_node_meta = nodes_by_id.get(src_node_id)
+                    dst_node_meta = nodes_by_id.get(dst_node_id)
+                except Exception:
+                    pass
+                edge_for_hash = dict(raw_edge or {})
+                edge_for_hash.setdefault("src", src_node_id)
+                edge_for_hash.setdefault("dst", dst_node_id)
+                edge_for_hash.setdefault(
+                    "edge_type",
+                    str(edge_context.get("edge_type") or "depends_on")
+                    if isinstance(edge_context, dict) else "depends_on",
+                )
+                stable_edge_key = graph_events.stable_edge_key_for_edge(
+                    edge_for_hash, src_node_meta, dst_node_meta,
+                )
+                edge_sig_hash = graph_events.edge_signature_hash_for_edge(
+                    edge_for_hash, src_node_meta, dst_node_meta,
+                )
                 try:
                     enriched = graph_events.create_event(
                         conn,
@@ -410,6 +449,8 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
                         target_type="edge",
                         target_id=edge_id,
                         status=graph_events.EVENT_STATUS_PROPOSED,
+                        stable_node_key=stable_edge_key,  # reused column
+                        feature_hash=edge_sig_hash,        # reused column
                         payload=enriched_payload,
                         evidence={"source": "semantic_worker_inproc_edge"},
                         created_by="semantic_worker_inproc",
@@ -419,6 +460,48 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
                                   edge_id, exc)
                     continue
                 event_id = str(enriched.get("event_id") or "")
+                # MF 2026-05-11: also write graph_semantic_edges so the next
+                # scope-catchup snapshot can carry this enrichment forward.
+                try:
+                    from . import reconcile_semantic_enrichment as _semantic
+                    _semantic._ensure_semantic_state_schema(conn)
+                    import json as _json
+                    semantic_entry = {
+                        "edge_id": edge_id,
+                        "stable_edge_key": stable_edge_key,
+                        "edge_signature_hash": edge_sig_hash,
+                        "semantic_payload": semantic_payload,
+                        "status": "pending_review",
+                        "updated_at": "",
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO graph_semantic_edges
+                          (project_id, snapshot_id, edge_id, status,
+                           edge_signature_hash, semantic_json,
+                           feedback_round, batch_index, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(project_id, snapshot_id, edge_id) DO UPDATE SET
+                          status = excluded.status,
+                          edge_signature_hash = excluded.edge_signature_hash,
+                          semantic_json = excluded.semantic_json,
+                          updated_at = excluded.updated_at
+                        """,
+                        (
+                            project_id,
+                            snapshot_id,
+                            edge_id,
+                            "pending_review",
+                            edge_sig_hash,
+                            _json.dumps(semantic_entry, ensure_ascii=False),
+                            0,
+                            None,
+                            "",
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - state write is advisory
+                    log.warning("semantic_worker: graph_semantic_edges write failed for %s: %s",
+                                edge_id, exc)
                 try:
                     reconcile_feedback.submit_feedback_item(
                         project_id,

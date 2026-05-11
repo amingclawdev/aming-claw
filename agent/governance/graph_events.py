@@ -351,6 +351,62 @@ def feature_hash_for_node(node: dict[str, Any]) -> str:
     })
 
 
+def stable_edge_key_for_edge(
+    edge: dict[str, Any],
+    src_node: dict[str, Any] | None,
+    dst_node: dict[str, Any] | None,
+) -> str:
+    """Hash that survives node L-id renumbering — pairs the endpoints'
+    stable_node_keys with the edge_type. Used to find an edge's latest
+    semantic event across snapshots even when src/dst node_ids were
+    renumbered by the graph adapter.
+
+    Falls back to raw src/dst when stable keys can't be derived (e.g.
+    the endpoint node isn't in the current snapshot's node set yet).
+    """
+    src_key = stable_node_key_for_node(src_node) if src_node else ""
+    dst_key = stable_node_key_for_node(dst_node) if dst_node else ""
+    edge_type = str(edge.get("edge_type") or edge.get("type") or "depends_on").strip() or "depends_on"
+    return _hash_payload({
+        "src_stable": src_key or str(edge.get("src") or edge.get("source") or ""),
+        "dst_stable": dst_key or str(edge.get("dst") or edge.get("target") or ""),
+        "edge_type": edge_type,
+    })
+
+
+def edge_signature_hash_for_edge(
+    edge: dict[str, Any],
+    src_node: dict[str, Any] | None,
+    dst_node: dict[str, Any] | None,
+) -> str:
+    """Drift detector — the edge analog of feature_hash for nodes. Carry-
+    forward compares this hash between snapshots; if it differs, the edge
+    needs re-enrichment. Composed of:
+      - stable_edge_key (identity)
+      - both endpoints' feature_hash (so endpoint content drift triggers)
+      - edge_type
+      - sorted evidence keys (so evidence shape change triggers)
+    Adapters that pre-compute this and stash it in edge.metadata.
+    edge_signature_hash should win — that's the indexed value used at
+    snapshot build time.
+    """
+    metadata = edge.get("metadata") if isinstance(edge.get("metadata"), dict) else {}
+    indexed_hash = str(metadata.get("edge_signature_hash") or "").strip()
+    if indexed_hash:
+        return indexed_hash
+    src_hash = feature_hash_for_node(src_node) if src_node else ""
+    dst_hash = feature_hash_for_node(dst_node) if dst_node else ""
+    evidence = edge.get("evidence") if isinstance(edge.get("evidence"), dict) else {}
+    return _feature_hash_payload({
+        "stable_edge_key": stable_edge_key_for_edge(edge, src_node, dst_node),
+        "src_feature_hash": src_hash,
+        "dst_feature_hash": dst_hash,
+        "edge_type": str(edge.get("edge_type") or edge.get("type") or "depends_on"),
+        "direction": str(edge.get("direction") or ""),
+        "evidence_keys": sorted(evidence.keys()),
+    })
+
+
 def _node_files(node: dict[str, Any], key: str) -> list[str]:
     aliases = {
         "primary": ("primary", "primary_files"),
@@ -1504,6 +1560,99 @@ def backfill_existing_semantic_events(
                 created_by=actor,
             )
             job_created += 1
+    # MF 2026-05-11: backfill edge_semantic_enriched events from the new
+    # graph_semantic_edges table, mirroring the node loop above. Lets a
+    # carry-forward'd edge_semantics row produce a PROPOSED/OBSERVED event
+    # in the new snapshot's graph_events without re-running AI.
+    edge_event_created = 0
+    edge_event_updated = 0
+    edge_event_skipped = 0
+    edges_by_id: dict[str, dict[str, Any]] = {}
+    for edge in store.list_graph_snapshot_edges(conn, project_id, snapshot_id, limit=5000):
+        eid = _edge_id(edge)
+        if eid:
+            edges_by_id[eid] = edge
+    if _table_exists(conn, "graph_semantic_edges"):
+        rows = conn.execute(
+            """
+            SELECT edge_id, status, edge_signature_hash, semantic_json,
+                   feedback_round, batch_index, updated_at
+            FROM graph_semantic_edges
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+        for row in rows:
+            edge_id = str(row["edge_id"] or "")
+            if not edge_id:
+                edge_event_skipped += 1
+                continue
+            semantic_entry = _json_load(row["semantic_json"], {})
+            semantic_payload = semantic_entry.get("semantic_payload") if isinstance(semantic_entry, dict) else None
+            if not isinstance(semantic_payload, dict):
+                # graph_semantic_edges stores the FULL entry (state-shaped);
+                # the AI semantic payload is under semantic_entry itself if
+                # the worker wrote it flat. Accept either shape.
+                semantic_payload = semantic_entry if isinstance(semantic_entry, dict) else {}
+            status = str(row["status"] or "")
+            if status not in {"ai_complete", "semantic_graph_state", "reviewed", "pending_review"} and not semantic_payload:
+                edge_event_skipped += 1
+                continue
+            event_status = (
+                EVENT_STATUS_PROPOSED
+                if status == "pending_review"
+                else EVENT_STATUS_OBSERVED
+            )
+            event_id = _safe_event_id(
+                "semedge",
+                snapshot_id,
+                edge_id,
+                str(row["edge_signature_hash"] or "")[:12],
+            )
+            existed = get_event(conn, project_id, snapshot_id, event_id)
+            edge_struct = edges_by_id.get(edge_id, {})
+            create_event(
+                conn,
+                project_id,
+                snapshot_id,
+                event_id=event_id,
+                event_type="edge_semantic_enriched",
+                event_kind="imported_semantic_cache",
+                target_type="edge",
+                target_id=edge_id,
+                status=event_status,
+                # MF 2026-05-11: stash stable_edge_key into the existing
+                # stable_node_key column so _latest_edge_semantic_events
+                # can find this event cross-snapshot. Column name is
+                # legacy node-only; semantic content here is the edge's
+                # stable key.
+                stable_node_key=str(semantic_entry.get("stable_edge_key") or "") if isinstance(semantic_entry, dict) else "",
+                feature_hash=str(row["edge_signature_hash"] or ""),
+                file_hashes={},
+                baseline_commit=commit_sha,
+                target_commit=commit_sha,
+                payload={
+                    "edge": dict(edge_struct) if edge_struct else {},
+                    "edge_context": {
+                        "edge_id": edge_id,
+                        "src": str(edge_struct.get("src") or edge_struct.get("source") or ""),
+                        "dst": str(edge_struct.get("dst") or edge_struct.get("target") or ""),
+                        "edge_type": str(edge_struct.get("edge_type") or edge_struct.get("type") or ""),
+                        "evidence": edge_struct.get("evidence") if isinstance(edge_struct.get("evidence"), dict) else {},
+                    },
+                    "semantic_payload": semantic_payload,
+                    "semantic_status": status,
+                    "feedback_round": row["feedback_round"],
+                    "batch_index": row["batch_index"],
+                    "source_updated_at": row["updated_at"],
+                },
+                evidence={"source": "graph_semantic_edges_backfill"},
+                created_by=actor,
+            )
+            if existed:
+                edge_event_updated += 1
+            else:
+                edge_event_created += 1
     return {
         "project_id": project_id,
         "snapshot_id": snapshot_id,
@@ -1511,6 +1660,9 @@ def backfill_existing_semantic_events(
         "semantic_node_events_updated": updated,
         "semantic_rows_skipped": skipped,
         "semantic_job_events_created": job_created,
+        "edge_semantic_events_created": edge_event_created,
+        "edge_semantic_events_updated": edge_event_updated,
+        "edge_semantic_rows_skipped": edge_event_skipped,
     }
 
 
@@ -1573,27 +1725,59 @@ def _latest_edge_semantic_events(
     conn: sqlite3.Connection,
     project_id: str,
     snapshot_id: str,
+    *,
+    edge_index: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    """Latest edge_semantic_* event per edge_id.
+
+    MF 2026-05-11: previously this filtered by snapshot_id, which meant
+    every fresh snapshot started with zero edge_semantic events even when
+    the backfill had populated graph_semantic_edges from a carry-forward.
+    The query now walks ALL snapshots for the project, preferring events
+    whose `stable_node_key` (legacy column reused for stable_edge_key)
+    matches the current snapshot's edge_index entry — same cross-snapshot
+    pattern as `_latest_semantic_event_for_node`. Per-snapshot rows still
+    win when they exist (event_seq ordering puts them last).
+    """
     ensure_schema(conn)
     rows = conn.execute(
         """
         SELECT * FROM graph_events
         WHERE project_id = ?
-          AND snapshot_id = ?
           AND target_type = 'edge'
           AND event_type IN ('edge_semantic_requested', 'edge_semantic_enriched')
           AND status IN ('observed', 'materialized', 'accepted')
         ORDER BY event_seq ASC, updated_at ASC, created_at ASC
         """,
-        (project_id, snapshot_id),
+        (project_id,),
     ).fetchall()
-    latest: dict[str, dict[str, Any]] = {}
+    # Build lookup by target_id and (if available) by stable_edge_key.
+    by_target_id: dict[str, dict[str, Any]] = {}
+    by_stable_key: dict[str, dict[str, Any]] = {}
     for row in rows:
         event = _row_to_event(row)
-        edge_id = str(event.get("target_id") or "").strip()
-        if edge_id:
-            latest[edge_id] = event
-    return latest
+        target_id = str(event.get("target_id") or "").strip()
+        stable_key = str(event.get("stable_node_key") or "").strip()
+        if target_id:
+            by_target_id[target_id] = event
+        if stable_key:
+            by_stable_key[stable_key] = event
+    # If the caller provided edge_index, prefer stable_edge_key matches —
+    # this is what lets a carry-forward'd edge in the new snapshot find
+    # the latest semantic event even when target_id was renumbered.
+    latest: dict[str, dict[str, Any]] = {}
+    if edge_index:
+        for edge_id, meta in edge_index.items():
+            stable_key = str(meta.get("stable_edge_key") or "")
+            if stable_key and stable_key in by_stable_key:
+                latest[edge_id] = by_stable_key[stable_key]
+            elif edge_id in by_target_id:
+                latest[edge_id] = by_target_id[edge_id]
+        return latest
+    # Backwards-compat path: no edge_index → return target_id-keyed
+    # latest events. Used by older callers that didn't compute the
+    # edge_index.
+    return by_target_id
 
 
 def _edge_semantic_status(edge: dict[str, Any] | None, event: dict[str, Any] | None) -> str:
@@ -1615,7 +1799,14 @@ def _build_edge_semantics(
     edge_events: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     eligible_edges = _eligible_semantic_edges(edges)
-    edge_ids = sorted(set(eligible_edges) | set(edge_events))
+    # MF 2026-05-11: drop the previous `set(eligible) | set(edge_events)`
+    # union so orphans (semantic event exists but structural edge is
+    # gone) DON'T appear in the projection. Matches the node-side
+    # `for node in nodes` loop in build_semantic_projection that scopes
+    # node_semantics to the current snapshot's structural nodes.
+    # Orphan history is still in graph_events for audit; just hidden from
+    # the projection view.
+    edge_ids = sorted(eligible_edges)
     out: dict[str, dict[str, Any]] = {}
     for edge_id in edge_ids:
         edge = eligible_edges.get(edge_id)
@@ -1940,9 +2131,37 @@ def build_semantic_projection(
                 "updated_at": (event or {}).get("updated_at", ""),
             },
         }
+    # MF 2026-05-11: build an edge_index keyed by edge_id with stable_edge_key
+    # so _latest_edge_semantic_events can find events cross-snapshot when an
+    # edge was carried forward but its event row sits in a previous snapshot.
+    edge_carry_index: dict[str, dict[str, Any]] = {}
+    node_lookup_for_edges: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        nid = str(node.get("node_id") or node.get("id") or "").strip()
+        if nid:
+            node_lookup_for_edges[nid] = node
+    for edge in edges:
+        edge_type = str(edge.get("edge_type") or edge.get("type") or "").strip()
+        if edge_type == "contains":
+            continue
+        eid = _edge_id(edge)
+        if not eid:
+            continue
+        src = str(edge.get("src") or edge.get("source") or "")
+        dst = str(edge.get("dst") or edge.get("target") or "")
+        edge_carry_index[eid] = {
+            "edge_id": eid,
+            "stable_edge_key": stable_edge_key_for_edge(
+                edge,
+                node_lookup_for_edges.get(src),
+                node_lookup_for_edges.get(dst),
+            ),
+        }
     edge_semantics = _build_edge_semantics(
         edges,
-        _latest_edge_semantic_events(conn, project_id, snapshot_id),
+        _latest_edge_semantic_events(
+            conn, project_id, snapshot_id, edge_index=edge_carry_index,
+        ),
     )
     watermark_row = conn.execute(
         "SELECT COALESCE(MAX(event_seq), 0) AS watermark FROM graph_events WHERE project_id = ? AND snapshot_id = ?",
@@ -2079,5 +2298,7 @@ __all__ = [
     "refine_event",
     "status_counts",
     "stable_node_key_for_node",
+    "stable_edge_key_for_edge",
+    "edge_signature_hash_for_edge",
     "update_event_status",
 ]

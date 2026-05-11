@@ -57,6 +57,26 @@ CREATE TABLE IF NOT EXISTS graph_semantic_nodes (
 CREATE INDEX IF NOT EXISTS idx_graph_semantic_nodes_status
   ON graph_semantic_nodes(project_id, snapshot_id, status);
 
+-- MF 2026-05-11 (observer-hotfix): edge semantic persistent-state parity.
+-- Mirrors graph_semantic_nodes minus file_hashes (edges have no files of
+-- their own). `edge_signature_hash` plays the role `feature_hash` plays
+-- for nodes — it's the drift detector that carry-forward compares.
+CREATE TABLE IF NOT EXISTS graph_semantic_edges (
+  project_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  edge_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT '',
+  edge_signature_hash TEXT NOT NULL DEFAULT '',
+  semantic_json TEXT NOT NULL DEFAULT '{}',
+  feedback_round INTEGER NOT NULL DEFAULT 0,
+  batch_index INTEGER,
+  updated_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(project_id, snapshot_id, edge_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_semantic_edges_status
+  ON graph_semantic_edges(project_id, snapshot_id, status);
+
 CREATE TABLE IF NOT EXISTS graph_semantic_jobs (
   project_id TEXT NOT NULL,
   snapshot_id TEXT NOT NULL,
@@ -252,6 +272,55 @@ def _graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
     deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
     nodes = deps.get("nodes") if isinstance(deps, dict) else None
     return [dict(node) for node in nodes or [] if isinstance(node, dict)]
+
+
+def _graph_edges(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
+    deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
+    edges = deps.get("edges") if isinstance(deps, dict) else None
+    return [dict(edge) for edge in edges or [] if isinstance(edge, dict)]
+
+
+def _build_edge_carry_index(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Index current snapshot's edges by edge_id with edge_signature_hash
+    precomputed. Used by `_carry_forward_semantic_graph_state` to decide
+    whether a base-snapshot edge_semantic entry can be reused in the new
+    snapshot. Same shape as the node `feature_index`.
+    """
+    from . import graph_events
+    node_by_id: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        nid = str(node.get("id") or node.get("node_id") or "").strip()
+        if nid:
+            node_by_id[nid] = node
+    out: dict[str, dict[str, Any]] = {}
+    for edge in edges:
+        edge_type = str(edge.get("edge_type") or edge.get("type") or "").strip()
+        if edge_type == "contains":
+            # contains edges aren't semantically enriched
+            continue
+        src = str(edge.get("src") or edge.get("source") or "").strip()
+        dst = str(edge.get("dst") or edge.get("target") or "").strip()
+        if not src or not dst or not edge_type:
+            continue
+        edge_id = f"{src}->{dst}:{edge_type}"
+        src_node = node_by_id.get(src)
+        dst_node = node_by_id.get(dst)
+        out[edge_id] = {
+            "edge_id": edge_id,
+            "edge": edge,
+            "src_node": src_node,
+            "dst_node": dst_node,
+            "edge_signature_hash": graph_events.edge_signature_hash_for_edge(
+                edge, src_node, dst_node
+            ),
+            "stable_edge_key": graph_events.stable_edge_key_for_edge(
+                edge, src_node, dst_node
+            ),
+        }
+    return out
 
 
 def _load_feature_index(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1202,6 +1271,44 @@ def _persist_semantic_state_to_db(
                 str(raw_entry.get("updated_at") or state.get("updated_at") or ""),
             ),
         )
+    # MF 2026-05-11: edge_semantics mirror — same UPSERT shape as nodes,
+    # keyed by edge_id, drift detector is edge_signature_hash (computed
+    # by the adapter, stashed in entry['edge_signature_hash']).
+    edge_semantics = state.get("edge_semantics") if isinstance(state.get("edge_semantics"), dict) else {}
+    for edge_id, raw_entry in edge_semantics.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        is_carried_forward = bool(raw_entry.get("carried_forward_from_snapshot_id"))
+        if submit_for_review and not is_carried_forward:
+            edge_row_status = "pending_review"
+        else:
+            edge_row_status = str(raw_entry.get("status") or "")
+        conn.execute(
+            """
+            INSERT INTO graph_semantic_edges
+              (project_id, snapshot_id, edge_id, status, edge_signature_hash,
+               semantic_json, feedback_round, batch_index, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, snapshot_id, edge_id) DO UPDATE SET
+              status = excluded.status,
+              edge_signature_hash = excluded.edge_signature_hash,
+              semantic_json = excluded.semantic_json,
+              feedback_round = excluded.feedback_round,
+              batch_index = excluded.batch_index,
+              updated_at = excluded.updated_at
+            """,
+            (
+                project_id,
+                snapshot_id,
+                str(edge_id),
+                edge_row_status,
+                str(raw_entry.get("edge_signature_hash") or ""),
+                _json(raw_entry),
+                int(raw_entry.get("feedback_round") or 0),
+                raw_entry.get("batch_index"),
+                str(raw_entry.get("updated_at") or state.get("updated_at") or ""),
+            ),
+        )
     semantic_jobs = state.get("semantic_jobs") if isinstance(state.get("semantic_jobs"), dict) else {}
     for node_id, raw_job in semantic_jobs.items():
         if not isinstance(raw_job, dict):
@@ -1521,54 +1628,104 @@ def _carry_forward_semantic_graph_state(
     *,
     base_snapshot_id: str,
     updated_at: str,
+    edge_index: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Reuse semantic entries whose structural feature hash is unchanged."""
+    """Reuse semantic entries whose structural feature hash is unchanged.
+
+    MF 2026-05-11: extended to also carry forward `state.edge_semantics`
+    when `edge_index` is provided. Edge carry-forward compares
+    `edge_signature_hash` (the drift detector composed by the adapter
+    from endpoint feature_hashes + edge_type + evidence keys); edges
+    whose endpoints are no longer in the snapshot are skipped naturally
+    because `edge_index` only contains edges from the current structure.
+    """
     current = state.setdefault("node_semantics", {})
     if not isinstance(current, dict):
         current = {}
         state["node_semantics"] = current
     base_nodes = base_state.get("node_semantics")
-    if not isinstance(base_nodes, dict):
+    base_edges = base_state.get("edge_semantics") if isinstance(base_state.get("edge_semantics"), dict) else {}
+    if not isinstance(base_nodes, dict) and not base_edges:
         return {
             "base_snapshot_id": base_snapshot_id,
             "carried_forward_count": 0,
             "skipped_existing_count": 0,
             "skipped_missing_node_count": 0,
             "skipped_hash_mismatch_count": 0,
+            "edge_carried_forward_count": 0,
+            "edge_skipped_existing_count": 0,
+            "edge_skipped_missing_count": 0,
+            "edge_skipped_hash_mismatch_count": 0,
         }
 
     carried = 0
     skipped_existing = 0
     skipped_missing = 0
     skipped_hash = 0
-    for node_id, raw_entry in sorted(base_nodes.items()):
-        node_id = str(node_id or "")
-        if not node_id or not isinstance(raw_entry, dict):
-            continue
-        if node_id in current:
-            skipped_existing += 1
-            continue
-        feature = feature_index.get(node_id)
-        if not feature:
-            skipped_missing += 1
-            continue
-        base_hash = str(raw_entry.get("feature_hash") or "")
-        current_hash = str(feature.get("feature_hash") or "")
-        if not base_hash or not current_hash or base_hash != current_hash:
-            skipped_hash += 1
-            continue
-        entry = dict(raw_entry)
-        entry["carried_forward_from_snapshot_id"] = base_snapshot_id
-        entry["carried_forward_at"] = updated_at
-        entry["feature_hash"] = current_hash
-        entry["primary"] = _path_list(feature.get("primary"))
-        entry["secondary"] = _path_list(feature.get("secondary"))
-        entry["test"] = _path_list(feature.get("test"))
-        entry["config"] = _path_list(feature.get("config"))
-        entry["file_hashes"] = feature.get("file_hashes") or entry.get("file_hashes") or {}
-        current[node_id] = entry
-        carried += 1
-    if carried:
+    if isinstance(base_nodes, dict):
+        for node_id, raw_entry in sorted(base_nodes.items()):
+            node_id = str(node_id or "")
+            if not node_id or not isinstance(raw_entry, dict):
+                continue
+            if node_id in current:
+                skipped_existing += 1
+                continue
+            feature = feature_index.get(node_id)
+            if not feature:
+                skipped_missing += 1
+                continue
+            base_hash = str(raw_entry.get("feature_hash") or "")
+            current_hash = str(feature.get("feature_hash") or "")
+            if not base_hash or not current_hash or base_hash != current_hash:
+                skipped_hash += 1
+                continue
+            entry = dict(raw_entry)
+            entry["carried_forward_from_snapshot_id"] = base_snapshot_id
+            entry["carried_forward_at"] = updated_at
+            entry["feature_hash"] = current_hash
+            entry["primary"] = _path_list(feature.get("primary"))
+            entry["secondary"] = _path_list(feature.get("secondary"))
+            entry["test"] = _path_list(feature.get("test"))
+            entry["config"] = _path_list(feature.get("config"))
+            entry["file_hashes"] = feature.get("file_hashes") or entry.get("file_hashes") or {}
+            current[node_id] = entry
+            carried += 1
+    # Edge carry-forward (mirror of the node loop above).
+    edge_current = state.setdefault("edge_semantics", {})
+    if not isinstance(edge_current, dict):
+        edge_current = {}
+        state["edge_semantics"] = edge_current
+    edge_carried = 0
+    edge_skipped_existing = 0
+    edge_skipped_missing = 0
+    edge_skipped_hash = 0
+    if edge_index is not None:
+        for edge_id, raw_entry in sorted(base_edges.items()):
+            edge_id = str(edge_id or "")
+            if not edge_id or not isinstance(raw_entry, dict):
+                continue
+            if edge_id in edge_current:
+                edge_skipped_existing += 1
+                continue
+            edge_meta = edge_index.get(edge_id)
+            if not edge_meta:
+                # Endpoint deleted OR edge_type changed → no structural row,
+                # don't carry semantic forward. Same cascade as nodes.
+                edge_skipped_missing += 1
+                continue
+            base_hash = str(raw_entry.get("edge_signature_hash") or "")
+            current_hash = str(edge_meta.get("edge_signature_hash") or "")
+            if not base_hash or not current_hash or base_hash != current_hash:
+                edge_skipped_hash += 1
+                continue
+            entry = dict(raw_entry)
+            entry["carried_forward_from_snapshot_id"] = base_snapshot_id
+            entry["carried_forward_at"] = updated_at
+            entry["edge_signature_hash"] = current_hash
+            entry["stable_edge_key"] = str(edge_meta.get("stable_edge_key") or "")
+            edge_current[edge_id] = entry
+            edge_carried += 1
+    if carried or edge_carried:
         state["updated_at"] = updated_at
     _rebuild_semantic_graph_state_indexes(state)
     return {
@@ -1577,6 +1734,10 @@ def _carry_forward_semantic_graph_state(
         "skipped_existing_count": skipped_existing,
         "skipped_missing_node_count": skipped_missing,
         "skipped_hash_mismatch_count": skipped_hash,
+        "edge_carried_forward_count": edge_carried,
+        "edge_skipped_existing_count": edge_skipped_existing,
+        "edge_skipped_missing_count": edge_skipped_missing,
+        "edge_skipped_hash_mismatch_count": edge_skipped_hash,
     }
 
 
@@ -2456,6 +2617,15 @@ def run_semantic_enrichment(
         for node in nodes
         if _node_id(node)
     }
+    # MF 2026-05-11: edge carry-forward index. We use the full nodes list
+    # (not just enrichment candidates) so endpoint metadata for stable_key
+    # lookup is available; edges with deleted endpoints naturally drop out
+    # because _graph_edges only returns edges from the current structure.
+    all_nodes_for_edges = _graph_nodes(graph_json)
+    carry_forward_edges = _build_edge_carry_index(
+        all_nodes_for_edges,
+        _graph_edges(graph_json),
+    )
     existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
     round_number = int(feedback_round) if feedback_round is not None else len(existing_rounds)
     generated_at = utc_now()
@@ -2490,6 +2660,7 @@ def run_semantic_enrichment(
                     carry_forward_features,
                     base_snapshot_id=str(semantic_base_snapshot_id),
                     updated_at=generated_at,
+                    edge_index=carry_forward_edges,
                 ))
             else:
                 carry_forward_report["error"] = "base_snapshot_not_found"
