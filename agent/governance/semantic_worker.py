@@ -238,6 +238,35 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                     log.warning("semantic_worker: feedback submit failed for %s: %s",
                                 node_id_s, exc)
                 conn.commit()
+                # Notify EventBus so dashboard SSE clients refetch. See the
+                # mirror publish in _drain_edge for context — the worker runs
+                # entirely in-process, never goes through HTTP, and therefore
+                # never fires _emit_dashboard_changed on its own. We publish
+                # both a typed `semantic_node.proposed` (so future programmatic
+                # subscribers can listen for the specific transition) AND
+                # `dashboard.changed` because the frontend SSE hook only
+                # explicitly subscribes to known names — the latter is what
+                # actually wakes up the dashboard.
+                try:
+                    from . import event_bus
+                    payload = {
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "node_id": node_id_s,
+                        "event_id": event_id,
+                        "feature_hash": feature_hash,
+                        "source": "semantic_worker_inproc",
+                    }
+                    event_bus.publish("semantic_node.proposed", payload)
+                    event_bus.publish("dashboard.changed", {
+                        "project_id": project_id,
+                        "path": "/semantic_worker/node_proposed",
+                        "method": "WORKER",
+                        "source": "semantic_worker_inproc",
+                    })
+                except Exception as exc:  # noqa: BLE001 - notification is advisory
+                    log.debug("semantic_worker: node eventbus publish failed for %s: %s",
+                              node_id_s, exc)
         finally:
             conn.close()
     finally:
@@ -271,25 +300,35 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
 
         conn = governance_db.get_connection(project_id)
         try:
+            # The dedup compares event_seq (monotonic insertion order). The
+            # old query was `target_id NOT IN (any enriched event)` which
+            # silently dropped legitimate re-enrich requests — operator submits
+            # a second AI enrich for an edge that already has a proposed
+            # (and possibly garbage) enrichment, and the worker treats it as
+            # already-handled. With event_seq we only skip if there's an
+            # enriched event NEWER than the request itself, which lets the
+            # re-request go through.
             rows = conn.execute(
                 """
-                SELECT event_id, target_id, payload_json
-                FROM graph_events
-                WHERE project_id = ?
-                  AND snapshot_id = ?
-                  AND event_type = 'edge_semantic_requested'
-                  AND status = 'observed'
-                  AND target_id NOT IN (
-                    SELECT target_id FROM graph_events
-                    WHERE project_id = ?
-                      AND snapshot_id = ?
-                      AND event_type = 'edge_semantic_enriched'
-                      AND status IN ('observed', 'proposed', 'accepted', 'materialized')
+                SELECT r.event_id, r.target_id, r.payload_json, r.event_seq
+                FROM graph_events r
+                WHERE r.project_id = ?
+                  AND r.snapshot_id = ?
+                  AND r.event_type = 'edge_semantic_requested'
+                  AND r.status = 'observed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM graph_events e
+                    WHERE e.project_id = r.project_id
+                      AND e.snapshot_id = r.snapshot_id
+                      AND e.event_type = 'edge_semantic_enriched'
+                      AND e.target_id = r.target_id
+                      AND e.status IN ('observed', 'proposed', 'accepted', 'materialized')
+                      AND e.event_seq > r.event_seq
                   )
-                ORDER BY created_at
+                ORDER BY r.created_at
                 LIMIT ?
                 """,
-                (project_id, snapshot_id, project_id, snapshot_id, _DRAIN_BATCH_SIZE),
+                (project_id, snapshot_id, _DRAIN_BATCH_SIZE),
             ).fetchall()
             if not rows:
                 log.info("semantic_worker: no edges to drain for %s/%s",
@@ -402,6 +441,34 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
                     log.warning("semantic_worker: edge feedback submit failed for %s: %s",
                                 edge_id, exc)
                 conn.commit()
+                # Notify EventBus so dashboard SSE clients refetch. The
+                # worker writes graph_events rows + feedback rows entirely
+                # in-process, which never goes through HTTP and therefore
+                # never fires _emit_dashboard_changed. Without this publish
+                # the dashboard sits on the stale "queued" snapshot until
+                # the operator hits ↻ Refresh manually. We publish both a
+                # typed `edge_semantic.proposed` and a generic
+                # `dashboard.changed` — the latter is what the dashboard
+                # SSE hook actually subscribes to.
+                try:
+                    from . import event_bus
+                    payload = {
+                        "project_id": project_id,
+                        "snapshot_id": snapshot_id,
+                        "edge_id": edge_id,
+                        "event_id": event_id,
+                        "source": "semantic_worker_inproc_edge",
+                    }
+                    event_bus.publish("edge_semantic.proposed", payload)
+                    event_bus.publish("dashboard.changed", {
+                        "project_id": project_id,
+                        "path": "/semantic_worker/edge_proposed",
+                        "method": "WORKER",
+                        "source": "semantic_worker_inproc_edge",
+                    })
+                except Exception as exc:  # noqa: BLE001 - notification is advisory
+                    log.debug("semantic_worker: edge eventbus publish failed for %s: %s",
+                              edge_id, exc)
         finally:
             conn.close()
     finally:

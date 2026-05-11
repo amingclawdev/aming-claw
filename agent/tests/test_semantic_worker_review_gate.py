@@ -453,6 +453,76 @@ def test_f2_drain_edge_skips_already_enriched(conn, monkeypatch):
     assert called == [], "AI must not run for an already-enriched edge"
 
 
+def test_f2b_drain_edge_processes_request_newer_than_prior_enrichment(conn, monkeypatch):
+    """Regression for observer-hotfix 2026-05-11: when the operator re-clicks
+    "AI enrich edge" after a bad/garbage enrichment, the new
+    edge_semantic_requested event has a HIGHER event_seq than the prior
+    edge_semantic_enriched. The old query `target_id NOT IN (any enriched)`
+    excluded the request entirely — the worker silently dropped legitimate
+    re-enrich submissions. The new query compares event_seq and only skips
+    when there's an enriched event STRICTLY NEWER than the request.
+    """
+    snap = _create_snapshot_with_node(conn, "edge-rerequest", node_id="L7.5")
+    sid = snap["snapshot_id"]
+    edge_id = "L7.5->L4.1:reads_state"
+    # 1. operator submits enrich → request lands
+    graph_events.create_event(
+        conn, PID, sid, event_type="edge_semantic_requested",
+        event_kind="semantic_job", target_type="edge", target_id=edge_id,
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        payload={"edge": {"src": "L7.5", "dst": "L4.1"}},
+    )
+    # 2. worker runs AI → enriched row written
+    graph_events.create_event(
+        conn, PID, sid, event_type="edge_semantic_enriched",
+        event_kind="semantic_job", target_type="edge", target_id=edge_id,
+        status=graph_events.EVENT_STATUS_PROPOSED,
+        payload={"semantic_payload": {"relation_purpose": "garbage v1"}},
+    )
+    # 3. operator re-submits enrich → NEW request lands (higher event_seq)
+    graph_events.create_event(
+        conn, PID, sid, event_type="edge_semantic_requested",
+        event_kind="semantic_job", target_type="edge", target_id=edge_id,
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        payload={"edge": {"src": "L7.5", "dst": "L4.1"}, "rev": 2},
+    )
+    conn.commit()
+
+    called = []
+    def _stub_build(**kw):
+        def _ai(stage, payload):
+            called.append((stage, payload.get("edge", {}).get("src")))
+            return {"relation_purpose": "fixed v2", "confidence": 0.9, "evidence": {}}
+        return _ai
+
+    monkeypatch.setattr(semantic_worker, "_project_root_for", lambda pid: Path("."))
+    wrapped = _NoCloseConn(conn)
+    monkeypatch.setattr("agent.governance.db.get_connection", lambda pid: wrapped)
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.load_semantic_enrichment_config",
+        lambda *, project_root=None: object(),
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call", _stub_build,
+    )
+
+    semantic_worker._drain_edge(PID, sid)
+    assert called, "AI must run for the new (post-enrichment) request"
+
+    # A second enriched event should now exist for the same edge.
+    enriched_rows = conn.execute(
+        """
+        SELECT event_id, status FROM graph_events
+        WHERE project_id=? AND snapshot_id=? AND event_type='edge_semantic_enriched'
+          AND target_id=?
+        ORDER BY event_seq ASC
+        """,
+        (PID, sid, edge_id),
+    ).fetchall()
+    assert len(enriched_rows) == 2, \
+        "re-request must yield a second enriched event, not silently drop"
+
+
 def test_f3_accept_helper_handles_edge_target_type(conn):
     """F3 (MF-2026-05-10-017): accept_semantic_enrichment flips the linked
     edge event from PROPOSED to ACCEPTED and reports the edge id in
