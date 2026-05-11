@@ -60,7 +60,7 @@ interface EdgeProps {
   onTabChange(tab: Tab): void;
 }
 
-export type Tab = "overview" | "files" | "relations" | "feedback" | "backlog";
+export type Tab = "overview" | "files" | "relations" | "functions" | "problems";
 
 // MF-2026-05-10-016 P2: surface needs_observer_decision feedback for the
 // inspected node so the drawer can show Accept / Retry / Reject inline.
@@ -81,8 +81,8 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "files", label: "Files" },
   { id: "relations", label: "Relations" },
-  { id: "feedback", label: "Feedback" },
-  { id: "backlog", label: "Backlog" },
+  { id: "functions", label: "Functions" },
+  { id: "problems", label: "Problems" },
 ];
 
 export default function InspectorDrawer({
@@ -233,28 +233,16 @@ export default function InspectorDrawer({
             onDecide={onDecide}
             onRetry={onRetry}
             snapshotId={snapshotId ?? null}
+            onOpenProblems={() => setTab("problems")}
           />
         ) : null}
         {tab === "files" ? <FilesTab node={node} /> : null}
         {tab === "relations" ? (
           <RelationsTab node={node} edges={edges} byId={byId} onSelectNode={onSelectNode} />
         ) : null}
-        {tab === "feedback" ? (
-          <FeedbackTab
-            target={{ node }}
-            targetIds={[node.node_id]}
-            feedback={feedback ?? null}
-            onOpenAction={onOpenAction}
-            onSelectNode={onSelectNode}
-          />
-        ) : null}
-        {tab === "backlog" ? (
-          <BacklogTab
-            target={{ node }}
-            targetIds={[node.node_id]}
-            feedback={feedback ?? null}
-            onOpenBacklog={onOpenBacklog}
-          />
+        {tab === "functions" ? <NodeFunctionsTab node={node} /> : null}
+        {tab === "problems" ? (
+          <NodeProblemsTab node={node} allNodes={allNodes} byParent={byParent} />
         ) : null}
       </div>
     </aside>
@@ -272,6 +260,7 @@ function OverviewTab({
   onDecide,
   onRetry,
   snapshotId,
+  onOpenProblems,
 }: {
   node: NodeRecord;
   isContainer: boolean;
@@ -283,6 +272,7 @@ function OverviewTab({
   onDecide?(feedbackIds: string[], action: string, summaryHint?: string): void;
   onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
   snapshotId?: string | null;
+  onOpenProblems?(): void;
 }) {
   const sem = node.semantic ?? {};
   const v = sem.validity ?? {};
@@ -407,22 +397,49 @@ function OverviewTab({
           <span className="k">health</span>
           <span className="v">
             {node._health != null ? (
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <span className="pdot" style={{ background: healthHex(node._health) }} />
-                <span
-                  className="mono"
-                  style={{
-                    fontWeight: 700,
-                    color: healthHex(node._health),
-                    fontSize: 13,
-                  }}
+              onOpenProblems ? (
+                <button
+                  className="link-btn"
+                  onClick={onOpenProblems}
+                  title="See score deductions on the Problems tab"
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "inherit", textDecoration: "none" }}
                 >
-                  {node._health}
+                  <span className="pdot" style={{ background: healthHex(node._health) }} />
+                  <span
+                    className="mono"
+                    style={{
+                      fontWeight: 700,
+                      color: healthHex(node._health),
+                      fontSize: 13,
+                      textDecoration: "underline",
+                      textDecorationStyle: "dotted",
+                      textUnderlineOffset: 3,
+                    }}
+                  >
+                    {node._health}
+                  </span>
+                  <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
+                    / 100 · {healthTone(node._health)} →
+                  </span>
+                </button>
+              ) : (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <span className="pdot" style={{ background: healthHex(node._health) }} />
+                  <span
+                    className="mono"
+                    style={{
+                      fontWeight: 700,
+                      color: healthHex(node._health),
+                      fontSize: 13,
+                    }}
+                  >
+                    {node._health}
+                  </span>
+                  <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
+                    / 100 · {healthTone(node._health)}
+                  </span>
                 </span>
-                <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
-                  / 100 · {healthTone(node._health)}
-                </span>
-              </span>
+              )
             ) : (
               <span className="mono" style={{ color: "var(--ink-400)" }}>—</span>
             )}
@@ -777,23 +794,8 @@ function EdgeInspector({
         {tab === "relations" ? (
           <EdgeRelationsTab edge={edge} edges={edges} byId={byId} onSelectNode={onSelectNode} />
         ) : null}
-        {tab === "feedback" ? (
-          <FeedbackTab
-            target={{ edge }}
-            targetIds={[edge.src, edge.dst]}
-            feedback={feedback}
-            onOpenAction={onOpenAction}
-            onSelectNode={onSelectNode}
-          />
-        ) : null}
-        {tab === "backlog" ? (
-          <BacklogTab
-            target={{ edge }}
-            targetIds={[edge.src, edge.dst]}
-            feedback={feedback}
-            onOpenBacklog={onOpenBacklog}
-          />
-        ) : null}
+        {tab === "functions" ? <EdgeFunctionsTab edge={edge} src={src} dst={dst} /> : null}
+        {tab === "problems" ? <EdgeProblemsTab edge={edge} sem={edgeSemEntry} /> : null}
       </div>
     </aside>
   );
@@ -1454,58 +1456,278 @@ function selectQueueGroups(
   });
 }
 
-function FeedbackTab({
-  target,
-  targetIds,
-  feedback,
-  onOpenAction,
-  onSelectNode,
+// Functions tab — for L7 leaves shows metadata.functions with line ranges
+// when function_lines is present. For containers / L4 falls back to a
+// helpful "n/a" message describing why.
+function NodeFunctionsTab({ node }: { node: NodeRecord }) {
+  const functions = node.metadata?.functions ?? [];
+  const lines = node.metadata?.function_lines ?? {};
+  const isL4 = node.layer === "L4";
+  return (
+    <section className="inspector-section">
+      <div className="inspector-section-title">
+        Functions <span className="head-hint">{functions.length}</span>
+      </div>
+      {isL4 ? (
+        <div className="empty">
+          L4 nodes are state / contract / asset / config — no function definitions.
+        </div>
+      ) : functions.length === 0 ? (
+        <div className="empty">
+          No functions captured for this node.
+          <div className="empty-hint">
+            Graph adapter populates <span className="mono">metadata.functions</span> when source
+            files are scanned and symbols are extracted.
+          </div>
+        </div>
+      ) : (
+        <ul className="link-list">
+          {functions.map((fn) => {
+            const pair = lines[fn];
+            return (
+              <li key={fn}>
+                <div
+                  className="link-row"
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "baseline",
+                    justifyContent: "space-between",
+                    gap: 8,
+                    padding: "4px 6px",
+                  }}
+                >
+                  <span className="mono" style={{ fontSize: 12 }}>{fn}</span>
+                  {pair ? (
+                    <span className="mono" style={{ fontSize: 10.5, color: "var(--ink-400)" }}>
+                      L{pair[0]}-{pair[1]}
+                    </span>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// Problems tab — explains the feature-health deductions for this node.
+// L7 leaf: list missing signals (-35 src / -30 tests / -20 fns / -10 docs /
+// -5 parent). Container: list the 5 lowest-scoring descendants so the
+// operator can drill into the weakest link. L4: list asset_binding gaps
+// (no consumers / no producers / no owner / no backing file).
+function NodeProblemsTab({
+  node,
+  allNodes,
+  byParent,
 }: {
-  target: ActionTarget;
-  targetIds: string[];
-  feedback: FeedbackQueueResponse | null;
-  onOpenAction?(kind: ActionKind, target: ActionTarget): void;
-  onSelectNode(id: string): void;
+  node: NodeRecord;
+  allNodes: NodeRecord[];
+  byParent: Map<string, NodeRecord[]>;
 }) {
-  const matched = selectQueueGroups(feedback, targetIds);
-  const summary = feedback?.summary;
+  const isLeaf = (byParent.get(node.node_id) ?? []).length === 0;
+  const isL4 = node.layer === "L4";
+
+  if (isLeaf && !isL4) {
+    const missing: Array<{ label: string; deduct: number; tone: string; hint: string }> = [];
+    if (!node.primary_files?.length) {
+      missing.push({ label: "source files missing", deduct: 35, tone: "red", hint: "no primary_files attached" });
+    }
+    if (!node.test_files?.length) {
+      missing.push({ label: "tests missing", deduct: 30, tone: "red", hint: "no test_files attached" });
+    }
+    if (!node.metadata?.functions?.length) {
+      missing.push({ label: "function definitions missing", deduct: 20, tone: "amber", hint: "graph adapter found no functions" });
+    }
+    if (!node.secondary_files?.length) {
+      missing.push({ label: "documentation missing", deduct: 10, tone: "amber", hint: "no secondary_files (docs) bound" });
+    }
+    if (node.metadata?.hierarchy_parent == null) {
+      missing.push({ label: "no parent container", deduct: 5, tone: "amber", hint: "orphan node — hierarchy_parent unset" });
+    }
+    return (
+      <section className="inspector-section">
+        <div className="inspector-section-title">
+          Score deductions <span className="head-hint">{missing.length}</span>
+        </div>
+        {missing.length === 0 ? (
+          <div className="empty">No deductions — full 100/100.</div>
+        ) : (
+          <ul className="link-list">
+            {missing.map((m, i) => (
+              <li key={i}>
+                <div className="link-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 2, padding: "6px 8px" }}>
+                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+                    <span style={{ fontWeight: 600, fontSize: 12 }}>{m.label}</span>
+                    <span className={`status-badge status-${m.tone}`}>−{m.deduct}</span>
+                  </div>
+                  <span style={{ fontSize: 10.5, color: "var(--ink-400)" }}>{m.hint}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    );
+  }
+
+  if (isL4) {
+    const ab = node._asset_binding;
+    const flags: Array<{ label: string; deduct: number; hint: string }> = [];
+    // Mirror lib/health.ts assetBindingScore: 50 ins + 20 outs + 20 parent + 10 file
+    // We can't easily recompute here without edges; use the score gap as a hint.
+    const present = ab ?? 0;
+    const missingTotal = 100 - present;
+    if (missingTotal === 0) {
+      return (
+        <section className="inspector-section">
+          <div className="inspector-section-title">Asset binding</div>
+          <div className="empty">Full 100/100 — asset is fully bound.</div>
+        </section>
+      );
+    }
+    flags.push({ label: "asset binding gap", deduct: missingTotal, hint: "+50 in / +20 out / +20 parent / +10 file" });
+    return (
+      <section className="inspector-section">
+        <div className="inspector-section-title">Asset binding deductions</div>
+        <ul className="link-list">
+          {flags.map((m, i) => (
+            <li key={i}>
+              <div className="link-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 2, padding: "6px 8px" }}>
+                <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+                  <span style={{ fontWeight: 600, fontSize: 12 }}>{m.label}</span>
+                  <span className="status-badge status-amber">−{m.deduct}</span>
+                </div>
+                <span style={{ fontSize: 10.5, color: "var(--ink-400)" }}>{m.hint}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+    );
+  }
+
+  // Container — show lowest-scoring descendants so operator knows where to drill.
+  const descendants = collectDescendants(node.node_id, byParent, allNodes).filter(
+    (n) => n._health != null,
+  );
+  const worst = descendants
+    .slice()
+    .sort((a, b) => (a._health ?? 100) - (b._health ?? 100))
+    .slice(0, 8);
+  return (
+    <section className="inspector-section">
+      <div className="inspector-section-title">
+        Weakest descendants <span className="head-hint">{descendants.length} L7</span>
+      </div>
+      {worst.length === 0 ? (
+        <div className="empty">No scoreable L7 descendants in this subtree.</div>
+      ) : (
+        <ul className="link-list">
+          {worst.map((n) => (
+            <li key={n.node_id}>
+              <div
+                className="link-row"
+                style={{
+                  flexDirection: "row",
+                  alignItems: "baseline",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  padding: "4px 6px",
+                }}
+              >
+                <span className="mono" style={{ fontSize: 11.5 }}>{n.node_id} · {n.title}</span>
+                <span
+                  className="mono"
+                  style={{
+                    fontWeight: 700,
+                    color: healthHex(n._health ?? null),
+                    fontSize: 12,
+                  }}
+                >
+                  {n._health}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function collectDescendants(
+  rootId: string,
+  byParent: Map<string, NodeRecord[]>,
+  _allNodes: NodeRecord[],
+): NodeRecord[] {
+  const out: NodeRecord[] = [];
+  const stack: string[] = [rootId];
+  const seen = new Set<string>();
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const kids = byParent.get(id) ?? [];
+    for (const k of kids) {
+      out.push(k);
+      stack.push(k.node_id);
+    }
+  }
+  return out;
+}
+
+function EdgeFunctionsTab({
+  edge,
+  src,
+  dst,
+}: {
+  edge: PinnedEdge;
+  src: NodeRecord | null;
+  dst: NodeRecord | null;
+}) {
+  const srcFns = src?.metadata?.functions ?? [];
+  const dstFns = dst?.metadata?.functions ?? [];
   return (
     <>
       <section className="inspector-section">
-        <div className="inspector-section-title">Submit feedback</div>
-        <div className="action-form-hint" style={{ marginBottom: 8 }}>
-          Sends to <span className="mono">POST /feedback</span> with this target attached. Use{" "}
-          <strong>graph_correction</strong> for structural issues; the backend auto-creates a graph
-          event for that kind.
-        </div>
-        <button
-          className="focus-cta cta-feedback"
-          style={{ width: "100%" }}
-          onClick={() => onOpenAction?.("feedback", target)}
-          disabled={!onOpenAction}
-        >
-          Submit feedback for this {target.edge ? "edge" : "node"}
-        </button>
-      </section>
-
-      <section className="inspector-section">
         <div className="inspector-section-title">
-          Items targeting this {target.edge ? "edge" : "node"}{" "}
-          <span className="head-hint">{matched.length}</span>
+          Source functions{" "}
+          <span className="head-hint">
+            {src?.node_id ?? edge.src} · {srcFns.length}
+          </span>
         </div>
-        {matched.length === 0 ? (
-          <div className="empty">
-            No feedback items targeting this {target.edge ? "edge endpoints" : "node"} yet.
-            <div className="empty-hint">
-              Live queue holds {summary?.visible_group_count ?? 0} visible · {summary?.raw_count ?? 0} raw
-              items snapshot-wide.
-            </div>
-          </div>
+        {srcFns.length === 0 ? (
+          <div className="empty">Source has no captured functions.</div>
         ) : (
           <ul className="link-list">
-            {matched.map((g, i) => (
-              <li key={g.id ?? `${g.target_id}-${i}`}>
-                <QueueGroupRow group={g} onSelectNode={onSelectNode} />
+            {srcFns.slice(0, 30).map((fn) => (
+              <li key={fn}>
+                <div className="link-row" style={{ padding: "4px 6px" }}>
+                  <span className="mono" style={{ fontSize: 12 }}>{fn}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      <section className="inspector-section">
+        <div className="inspector-section-title">
+          Target functions{" "}
+          <span className="head-hint">
+            {dst?.node_id ?? edge.dst} · {dstFns.length}
+          </span>
+        </div>
+        {dstFns.length === 0 ? (
+          <div className="empty">Target has no captured functions.</div>
+        ) : (
+          <ul className="link-list">
+            {dstFns.slice(0, 30).map((fn) => (
+              <li key={fn}>
+                <div className="link-row" style={{ padding: "4px 6px" }}>
+                  <span className="mono" style={{ fontSize: 12 }}>{fn}</span>
+                </div>
               </li>
             ))}
           </ul>
@@ -1515,66 +1737,69 @@ function FeedbackTab({
   );
 }
 
-function BacklogTab({
-  target,
-  targetIds,
-  feedback,
-  onOpenBacklog,
+function EdgeProblemsTab({
+  edge,
+  sem,
 }: {
-  target: ActionTarget;
-  targetIds: string[];
-  feedback: FeedbackQueueResponse | null;
-  onOpenBacklog?(target: ActionTarget): void;
+  edge: PinnedEdge;
+  sem: Record<string, unknown> | null;
 }) {
-  const matched = selectQueueGroups(feedback, targetIds);
-  const candidateBacklog = matched.filter((g) => g.lane === "candidate_backlog");
+  if (!sem) {
+    return (
+      <section className="inspector-section">
+        <div className="inspector-section-title">Problems</div>
+        <div className="empty">
+          No accepted edge semantic yet.
+          <div className="empty-hint">
+            Run <span className="mono">AI enrich edge</span> to generate a candidate, then accept
+            it on the review queue to populate this tab with the AI-detected open_issues + risk.
+          </div>
+        </div>
+      </section>
+    );
+  }
+  const conf = typeof sem.confidence === "number" ? (sem.confidence as number) : null;
+  const risk = typeof sem.risk === "string" ? (sem.risk as string) : "";
+  const openIssues = Array.isArray(sem.open_issues) ? (sem.open_issues as unknown[]) : [];
   return (
     <>
-      <section className="inspector-section">
-        <div className="inspector-section-title">File backlog</div>
-        <div className="action-form-hint" style={{ marginBottom: 8 }}>
-          Pre-fills the backlog draft with this target's primary file(s) and node id, then opens
-          the global Action Panel on the File backlog tab. Two-step flow: <span className="mono">POST /events</span>{" "}
-          → <span className="mono">POST /events/{"{id}"}/file-backlog</span>.
-        </div>
-        <button
-          className="focus-cta cta-enrich"
-          style={{ width: "100%" }}
-          onClick={() => onOpenBacklog?.(target)}
-          disabled={!onOpenBacklog}
-        >
-          File backlog for this {target.edge ? "edge" : "node"}
-        </button>
-      </section>
-
-      {candidateBacklog.length > 0 ? (
+      {conf != null && conf < 0.5 ? (
         <section className="inspector-section">
-          <div className="inspector-section-title">
-            Existing backlog candidates <span className="head-hint">{candidateBacklog.length}</span>
+          <div className="inspector-section-title">Low confidence</div>
+          <div className="link-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 2, padding: "6px 8px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+              <span style={{ fontWeight: 600, fontSize: 12 }}>AI confidence below 0.5</span>
+              <span className="status-badge status-amber">{conf.toFixed(2)}</span>
+            </div>
+            <span style={{ fontSize: 10.5, color: "var(--ink-400)" }}>
+              Operator review recommended — AI flagged uncertainty in the {edge.type} relation.
+            </span>
           </div>
-          <ul className="link-list">
-            {candidateBacklog.map((g, i) => (
-              <li key={g.id ?? `${g.target_id}-${i}`}>
-                <QueueGroupRow group={g} onSelectNode={() => {}} />
-              </li>
-            ))}
-          </ul>
         </section>
       ) : null}
-
+      {risk ? (
+        <section className="inspector-section">
+          <div className="inspector-section-title">Risk</div>
+          <div className="inspector-paragraph" style={{ fontSize: 11.5 }}>{risk}</div>
+        </section>
+      ) : null}
       <section className="inspector-section">
-        <div className="inspector-section-title">Other items in queue lanes</div>
-        {matched.length - candidateBacklog.length === 0 ? (
-          <div className="empty">No related queue items in other lanes.</div>
+        <div className="inspector-section-title">
+          Open issues <span className="head-hint">{openIssues.length}</span>
+        </div>
+        {openIssues.length === 0 ? (
+          <div className="empty">No open issues flagged by the AI for this edge.</div>
         ) : (
           <ul className="link-list">
-            {matched
-              .filter((g) => g.lane !== "candidate_backlog")
-              .map((g, i) => (
-                <li key={g.id ?? `${g.target_id}-${i}`}>
-                  <QueueGroupRow group={g} onSelectNode={() => {}} />
-                </li>
-              ))}
+            {openIssues.map((it, i) => (
+              <li key={i}>
+                <div className="link-row" style={{ padding: "6px 8px" }}>
+                  <span style={{ fontSize: 11.5 }}>
+                    {typeof it === "string" ? it : JSON.stringify(it).slice(0, 240)}
+                  </span>
+                </div>
+              </li>
+            ))}
           </ul>
         )}
       </section>
