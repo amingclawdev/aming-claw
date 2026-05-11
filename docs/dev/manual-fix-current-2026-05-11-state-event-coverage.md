@@ -78,4 +78,22 @@ trailer. Frontend changes go on `frontend/dashboard-p0` (separate commit).
 
 ## Result
 
-(filled at the end)
+**LANDED + LIVE** — state-transition event coverage complete.
+
+- **Backend commit**: `3fe3cb1` on main with `Chain-Source-Stage:
+  observer-hotfix` trailer.
+- **Frontend commit**: `00f22f2` on `frontend/dashboard-p0` (SSE
+  subscription only).
+- **Tests**: 13 in `test_edge_semantic_persistence.py` (2 new) +
+  existing suites — 88 total pass.
+- **Restart**: governance now on `version: 3fe3cb1, pid: 32220`.
+- **SSE tap verification** (live, 17:20:04Z fresh enrich):
+  - `ready`
+  - `semantic_job.enqueued` + `dashboard.changed` (POST)
+  - **`edge_semantic.running` + `dashboard.changed`** ← NEW, fires ~30ms after POST
+  - `edge_semantic.proposed` + `dashboard.changed` (worker post-AI, 25s later)
+  Full lifecycle visible end-to-end.
+- **Backlog closure**: `task-1778519683-cb18ec`
+  (BACKLOG-STATE-TRANSITION-EVENT-COVERAGE) — closed.
+- **MF closure task**: see PHASE 5 log.
+- No new preflight blockers.
