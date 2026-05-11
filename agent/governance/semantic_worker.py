@@ -77,6 +77,12 @@ def _project_root_for(project_id: str) -> Path:
 
 
 def _drain(project_id: str, snapshot_id: str) -> None:
+    """Backwards-compat shim. Pre MF-2026-05-10-017 the worker only handled
+    nodes; callers expecting `_drain(project_id, snapshot_id)` still work."""
+    _drain_node(project_id, snapshot_id)
+
+
+def _drain_node(project_id: str, snapshot_id: str) -> None:
     """Drain ai_pending semantic jobs for one snapshot.
 
     Runs at most one node enrichment per call to keep worker threads
@@ -238,8 +244,177 @@ def _drain(project_id: str, snapshot_id: str) -> None:
         lock.release()
 
 
+def _drain_edge(project_id: str, snapshot_id: str) -> None:
+    """MF-2026-05-10-017: drain unenriched edge_semantic_requested events.
+
+    Edges don't live in graph_semantic_jobs — the queue substrate for edges is
+    graph_events. A request lands as `edge_semantic_requested status=observed`;
+    once an `edge_semantic_enriched` event for the same target_id exists
+    (proposed/observed/accepted/materialized), the edge is considered handled.
+    This drain claims unenriched requests one batch at a time, runs AI, writes
+    a PROPOSED enriched event, and submits a needs_observer_decision feedback
+    row so the Review Queue picks it up — same review gate as the node path.
+    """
+    # Use a separate lock from the node drain so node + edge work in parallel.
+    lock = _drain_lock_for(project_id, snapshot_id + ":edge")
+    if not lock.acquire(blocking=False):
+        log.debug("semantic_worker: edge drain skipped (busy) %s/%s",
+                  project_id, snapshot_id)
+        return
+    try:
+        import json
+        from . import db as governance_db
+        from . import graph_events
+        from . import reconcile_feedback
+        from .reconcile_semantic_ai import build_semantic_ai_call
+        from .reconcile_semantic_config import load_semantic_enrichment_config
+
+        conn = governance_db.get_connection(project_id)
+        try:
+            rows = conn.execute(
+                """
+                SELECT event_id, target_id, payload_json
+                FROM graph_events
+                WHERE project_id = ?
+                  AND snapshot_id = ?
+                  AND event_type = 'edge_semantic_requested'
+                  AND status = 'observed'
+                  AND target_id NOT IN (
+                    SELECT target_id FROM graph_events
+                    WHERE project_id = ?
+                      AND snapshot_id = ?
+                      AND event_type = 'edge_semantic_enriched'
+                      AND status IN ('observed', 'proposed', 'accepted', 'materialized')
+                  )
+                ORDER BY created_at
+                LIMIT ?
+                """,
+                (project_id, snapshot_id, project_id, snapshot_id, _DRAIN_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                log.info("semantic_worker: no edges to drain for %s/%s",
+                         project_id, snapshot_id)
+                return
+            log.info("semantic_worker: edge drain %s/%s candidates=%d",
+                     project_id, snapshot_id, len(rows))
+            root = _project_root_for(project_id)
+            cfg = load_semantic_enrichment_config(project_root=root)
+            try:
+                ai_call = build_semantic_ai_call(
+                    semantic_config=cfg,
+                    project_id=project_id,
+                    snapshot_id=snapshot_id,
+                    project_root=root,
+                )
+            except Exception as exc:  # noqa: BLE001 - record + leave events for next drain
+                log.error("semantic_worker: edge build_semantic_ai_call failed: %s", exc)
+                return
+            if ai_call is None:
+                log.warning("semantic_worker: edge AI not configured for %s", project_id)
+                return
+            for row in rows:
+                edge_id = str(row["target_id"] or "").strip()
+                if not edge_id:
+                    continue
+                payload = {}
+                try:
+                    if row["payload_json"]:
+                        payload = json.loads(row["payload_json"]) or {}
+                except Exception:  # noqa: BLE001 - payload is advisory
+                    payload = {}
+                raw_edge = payload.get("edge") or {}
+                edge_context = (
+                    payload.get("edge_context") if isinstance(payload.get("edge_context"), dict) else {}
+                )
+                operator_request = (
+                    payload.get("operator_request")
+                    if isinstance(payload.get("operator_request"), dict)
+                    else {}
+                )
+                instructions = (
+                    payload.get("instructions") if isinstance(payload.get("instructions"), dict) else {}
+                )
+                ai_payload = {
+                    "schema_version": 1,
+                    "project_id": project_id,
+                    "snapshot_id": snapshot_id,
+                    "edge": raw_edge,
+                    "edge_context": edge_context,
+                    "operator_request": operator_request,
+                    "instructions": instructions,
+                    "output_contract": {
+                        "required": ["relation_purpose", "confidence", "evidence"],
+                        "optional": ["risk", "directionality", "semantic_label", "open_issues"],
+                    },
+                }
+                try:
+                    ai_response = ai_call("edge", ai_payload)
+                except Exception as exc:  # noqa: BLE001 - record + skip
+                    log.exception("semantic_worker: edge AI failed for %s: %s",
+                                  edge_id, exc)
+                    continue
+                semantic_payload = ai_response if isinstance(ai_response, dict) else {}
+                if "_ai_error" in semantic_payload:
+                    log.warning("semantic_worker: edge AI error for %s: %s",
+                                edge_id, semantic_payload.get("_ai_error"))
+                    continue
+                enriched_payload = dict(payload)
+                enriched_payload["semantic_payload"] = semantic_payload
+                enriched_payload["enriched_by"] = "semantic_worker_inproc_edge"
+                try:
+                    enriched = graph_events.create_event(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        event_type="edge_semantic_enriched",
+                        event_kind="semantic_job",
+                        target_type="edge",
+                        target_id=edge_id,
+                        status=graph_events.EVENT_STATUS_PROPOSED,
+                        payload=enriched_payload,
+                        evidence={"source": "semantic_worker_inproc_edge"},
+                        created_by="semantic_worker_inproc",
+                    )
+                except Exception as exc:  # noqa: BLE001 - record + carry on
+                    log.exception("semantic_worker: create edge enriched event failed for %s: %s",
+                                  edge_id, exc)
+                    continue
+                event_id = str(enriched.get("event_id") or "")
+                try:
+                    reconcile_feedback.submit_feedback_item(
+                        project_id,
+                        snapshot_id,
+                        feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+                        issue={
+                            "issue": f"AI edge semantic enrichment generated for {edge_id} — awaiting operator review",
+                            "target_id": edge_id,
+                            "target_type": "edge",
+                            "priority": "P3",
+                            "evidence": {
+                                "source": "semantic_worker_inproc_edge",
+                                "edge_id": edge_id,
+                                "linked_event_ids": [event_id] if event_id else [],
+                            },
+                        },
+                        actor="semantic_worker_inproc",
+                    )
+                except Exception as exc:  # noqa: BLE001 - feedback is advisory
+                    log.warning("semantic_worker: edge feedback submit failed for %s: %s",
+                                edge_id, exc)
+                conn.commit()
+        finally:
+            conn.close()
+    finally:
+        lock.release()
+
+
 def on_semantic_job_enqueued(payload: Any) -> None:
-    """EventBus listener for `semantic_job.enqueued`. Spawns a drain task."""
+    """EventBus listener for `semantic_job.enqueued`. Spawns a drain task.
+
+    MF-2026-05-10-017: payload may include `target_scope` ("node" | "edge").
+    Default is "node" for backwards compatibility with existing publish sites
+    that don't set the field.
+    """
     try:
         if not isinstance(payload, dict):
             return
@@ -247,7 +422,15 @@ def on_semantic_job_enqueued(payload: Any) -> None:
         snapshot_id = str(payload.get("snapshot_id") or "").strip()
         if not project_id or not snapshot_id:
             return
-        log.info("semantic_worker: enqueue event %s/%s", project_id, snapshot_id)
+        target_scope = str(payload.get("target_scope") or "node").strip().lower()
+        log.info(
+            "semantic_worker: enqueue event %s/%s scope=%s",
+            project_id, snapshot_id, target_scope,
+        )
+        if target_scope == "edge":
+            _get_executor().submit(_drain_edge, project_id, snapshot_id)
+        else:
+            _get_executor().submit(_drain_node, project_id, snapshot_id)
         _get_executor().submit(_drain, project_id, snapshot_id)
     except Exception as exc:  # noqa: BLE001 - listener must not raise
         log.exception("semantic_worker: on_semantic_job_enqueued failed: %s", exc)
@@ -297,13 +480,37 @@ def on_governance_startup(payload: Any = None) -> None:
                         (project_id, sid),
                     ).fetchone()
                     n = int(pending["n"] if pending else 0)
-                    if n <= 0:
+                    if n > 0:
+                        log.info(
+                            "semantic_worker: startup catchup %s/%s nodes=%d",
+                            project_id, sid, n,
+                        )
+                        _get_executor().submit(_drain_node, project_id, sid)
+                    # MF-2026-05-10-017: also drain unenriched edge requests.
+                    edge_pending = conn.execute(
+                        """
+                        SELECT COUNT(*) AS n FROM graph_events
+                        WHERE project_id = ? AND snapshot_id = ?
+                          AND event_type = 'edge_semantic_requested'
+                          AND status = 'observed'
+                          AND target_id NOT IN (
+                            SELECT target_id FROM graph_events
+                            WHERE project_id = ? AND snapshot_id = ?
+                              AND event_type = 'edge_semantic_enriched'
+                              AND status IN ('observed', 'proposed', 'accepted', 'materialized')
+                          )
+                        """,
+                        (project_id, sid, project_id, sid),
+                    ).fetchone()
+                    en = int(edge_pending["n"] if edge_pending else 0)
+                    if en > 0:
+                        log.info(
+                            "semantic_worker: startup catchup %s/%s edges=%d",
+                            project_id, sid, en,
+                        )
+                        _get_executor().submit(_drain_edge, project_id, sid)
+                    if n <= 0 and en <= 0:
                         continue
-                    log.info(
-                        "semantic_worker: startup catchup %s/%s (%d pending)",
-                        project_id, sid, n,
-                    )
-                    _get_executor().submit(_drain, project_id, sid)
                 finally:
                     conn.close()
             except Exception as exc:  # noqa: BLE001 - per-project failure shouldn't abort

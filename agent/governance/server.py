@@ -4761,6 +4761,7 @@ def _accept_semantic_enrichment_for_feedback_items(
     items = reconcile_feedback.list_feedback_items(project_id, snapshot_id)
     by_id = {str(item.get("feedback_id") or ""): item for item in items}
     node_ids_flipped: list[str] = []
+    edge_ids_flipped: list[str] = []
     event_ids_flipped: list[str] = []
     errors: list[dict[str, Any]] = []
     for fid in feedback_ids:
@@ -4777,9 +4778,15 @@ def _accept_semantic_enrichment_for_feedback_items(
         worker_evidence = (
             raw_issue.get("evidence") if isinstance(raw_issue.get("evidence"), dict) else {}
         )
-        node_id = (
+        target_type_hint = str(
+            item.get("target_type")
+            or raw_issue.get("target_type")
+            or ""
+        ).strip().lower()
+        target_id = (
             str(item.get("target_id") or "").strip()
             or str(worker_evidence.get("node_id") or "").strip()
+            or str(worker_evidence.get("edge_id") or "").strip()
             or str(evidence.get("node_id") or "").strip()
         )
         event_ids = (
@@ -4789,23 +4796,36 @@ def _accept_semantic_enrichment_for_feedback_items(
         )
         if not isinstance(event_ids, list):
             event_ids = [event_ids]
-        if not node_id and not event_ids:
-            errors.append({"feedback_id": fid, "error": "missing_node_id_and_event_ids"})
+        if not target_id and not event_ids:
+            errors.append({"feedback_id": fid, "error": "missing_target_id_and_event_ids"})
             continue
-        if node_id:
+        # MF-2026-05-10-017: try the persistent-layer UPDATE for nodes; the
+        # UPDATE no-ops cleanly for edge targets (no row matches). Use rowcount
+        # to decide which bucket the target landed in. Operator-supplied
+        # target_type_hint is used as a fallback when rowcount is 0 to
+        # distinguish a fresh edge (correctly bucketed) from a stale node
+        # whose pending_review row was already flipped by an earlier accept.
+        if target_id:
             try:
-                conn.execute(
+                cur = conn.execute(
                     """
                     UPDATE graph_semantic_nodes
                     SET status = 'ai_complete'
                     WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
                       AND status = 'pending_review'
                     """,
-                    (project_id, snapshot_id, node_id),
+                    (project_id, snapshot_id, target_id),
                 )
-                node_ids_flipped.append(node_id)
+                if cur.rowcount > 0:
+                    node_ids_flipped.append(target_id)
+                elif target_type_hint == "edge":
+                    edge_ids_flipped.append(target_id)
+                else:
+                    # Best-effort default — assume node target so callers that
+                    # don't tag target_type don't lose accounting.
+                    node_ids_flipped.append(target_id)
             except Exception as exc:  # noqa: BLE001 - advisory; record + keep going
-                errors.append({"feedback_id": fid, "node_id": node_id, "error": str(exc)})
+                errors.append({"feedback_id": fid, "target_id": target_id, "error": str(exc)})
         for eid in event_ids:
             eid_s = str(eid or "").strip()
             if not eid_s:
@@ -4818,6 +4838,7 @@ def _accept_semantic_enrichment_for_feedback_items(
                     evidence={
                         "source": "accept_semantic_enrichment",
                         "feedback_id": fid,
+                        "target_type": target_type_hint or "node",
                     },
                 )
                 event_ids_flipped.append(eid_s)
@@ -4826,6 +4847,7 @@ def _accept_semantic_enrichment_for_feedback_items(
     conn.commit()
     return {
         "node_ids_flipped": node_ids_flipped,
+        "edge_ids_flipped": edge_ids_flipped,
         "event_ids_flipped": event_ids_flipped,
         "errors": errors,
     }
@@ -7464,6 +7486,27 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             jobs = _edge_semantic_job_rows(conn, project_id, snapshot_id, limit=int(body.get("limit") or 200))
             target_edge_ids = {str(edge.get("edge_id") or "") for edge in edge_targets}
             jobs = [job for job in jobs if str(job.get("edge_id") or "") in target_edge_ids]
+            # MF-2026-05-10-017: publish semantic_job.enqueued so the
+            # event-driven worker picks up unenriched edge_semantic_requested
+            # events. Only fires when at least one edge was requested without
+            # being inline-enriched (otherwise the worker would have nothing
+            # left to do — the enriched events are already OBSERVED).
+            unenriched_count = requested_count - enriched_count
+            if unenriched_count > 0:
+                try:
+                    from . import event_bus
+                    event_bus.publish(
+                        "semantic_job.enqueued",
+                        {
+                            "project_id": project_id,
+                            "snapshot_id": snapshot_id,
+                            "queued_count": unenriched_count,
+                            "target_scope": "edge",
+                            "source": "semantic_jobs_create_api_edge",
+                        },
+                    )
+                except Exception:
+                    pass
             return 202, {
                 "ok": True,
                 "project_id": project_id,

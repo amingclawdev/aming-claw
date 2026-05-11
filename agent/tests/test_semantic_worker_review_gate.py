@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,22 @@ from agent.governance.db import _ensure_schema
 
 
 PID = "semantic-worker-test"
+
+
+class _NoCloseConn:
+    """Wraps a sqlite3.Connection but no-ops close() so the worker's `finally`
+    block doesn't drop the connection the test fixture is still using.
+    sqlite3.Connection.close is a read-only C attribute and can't be
+    monkeypatched directly."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 @pytest.fixture()
@@ -255,6 +272,191 @@ def test_d_worker_register_is_idempotent_and_subscribes(monkeypatch):
     semantic_worker.register()  # idempotent — should not add duplicate subscribers
     topics = sorted({t for t, _ in subs})
     assert topics == ["semantic_job.enqueued", "system.startup"]
+
+
+def test_f_drain_edge_creates_proposed_event_and_feedback(conn, monkeypatch):
+    """F (MF-2026-05-10-017): _drain_edge picks up an unenriched
+    edge_semantic_requested event, runs AI (stubbed), writes a PROPOSED
+    edge_semantic_enriched event, and submits a needs_observer_decision
+    feedback row pointing at it."""
+    snap = _create_snapshot_with_node(conn, "edge-drain-1", node_id="L7.1")
+    sid = snap["snapshot_id"]
+    edge_id = "L7.1->L4.1:creates_task"
+    # Plant an unenriched edge request event.
+    graph_events.create_event(
+        conn, PID, sid,
+        event_type="edge_semantic_requested",
+        event_kind="semantic_job",
+        target_type="edge",
+        target_id=edge_id,
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        payload={
+            "edge": {"src": "L7.1", "dst": "L4.1", "edge_type": "creates_task"},
+            "edge_context": {"edge_id": edge_id, "src": "L7.1", "dst": "L4.1"},
+            "operator_request": {},
+            "instructions": {},
+        },
+        evidence={"source": "test_setup"},
+    )
+    conn.commit()
+
+    # Stub config + ai_call so no real subprocess fires.
+    stub_ai_payload = {
+        "relation_purpose": "test relation purpose",
+        "confidence": 0.7,
+        "evidence": {"source": "stub"},
+    }
+
+    class _StubCfg:
+        pass
+
+    def _stub_load_cfg(*, project_root=None):
+        return _StubCfg()
+
+    def _stub_build_ai_call(*, semantic_config, project_id, snapshot_id, project_root):
+        def _ai(stage, payload):
+            assert stage == "edge"
+            assert payload["edge"]["src"] == "L7.1"
+            return dict(stub_ai_payload)
+        return _ai
+
+    # Stub the worker's per-project root so it points at the temp DB scope.
+    monkeypatch.setattr(semantic_worker, "_project_root_for", lambda pid: Path("."))
+    # Wrap test conn so worker's finally `conn.close()` doesn't kill the
+    # connection the test still owns (sqlite3.Connection.close is read-only).
+    wrapped = _NoCloseConn(conn)
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        lambda pid: wrapped,
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.load_semantic_enrichment_config",
+        _stub_load_cfg,
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        _stub_build_ai_call,
+    )
+
+    semantic_worker._drain_edge(PID, sid)
+
+    # Verify PROPOSED enriched event landed.
+    ev_row = conn.execute(
+        """
+        SELECT event_id, status FROM graph_events
+        WHERE project_id=? AND snapshot_id=? AND event_type='edge_semantic_enriched'
+          AND target_id=?
+        ORDER BY event_seq DESC LIMIT 1
+        """,
+        (PID, sid, edge_id),
+    ).fetchone()
+    assert ev_row is not None, "enriched event should exist"
+    assert ev_row["status"] == graph_events.EVENT_STATUS_PROPOSED, \
+        "enriched event must be PROPOSED so the review gate holds"
+
+    # Verify feedback row points at it with target_type=edge.
+    items = reconcile_feedback.list_feedback_items(PID, sid)
+    edge_items = [i for i in items if str(i.get("target_id") or "") == edge_id]
+    assert edge_items, "feedback row for the edge should exist"
+    fb = edge_items[0]
+    assert (
+        str(fb.get("target_type") or "")
+        or str((fb.get("evidence") or {}).get("raw_issue", {}).get("target_type") or "")
+    ) == "edge"
+    raw = (fb.get("evidence") or {}).get("raw_issue", {}).get("evidence") or {}
+    linked = raw.get("linked_event_ids") or []
+    assert ev_row["event_id"] in linked, \
+        "feedback evidence must link to the newly-created enriched event id"
+
+
+def test_f2_drain_edge_skips_already_enriched(conn, monkeypatch):
+    """F2: edges that already have an enriched event (any non-terminal status)
+    are not re-enriched by _drain_edge."""
+    snap = _create_snapshot_with_node(conn, "edge-drain-2", node_id="L7.2")
+    sid = snap["snapshot_id"]
+    edge_id = "L7.2->L4.1:reads_state"
+    graph_events.create_event(
+        conn, PID, sid, event_type="edge_semantic_requested",
+        event_kind="semantic_job", target_type="edge", target_id=edge_id,
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        payload={"edge": {"src": "L7.2", "dst": "L4.1"}},
+    )
+    graph_events.create_event(
+        conn, PID, sid, event_type="edge_semantic_enriched",
+        event_kind="semantic_job", target_type="edge", target_id=edge_id,
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        payload={"semantic_payload": {"relation_purpose": "already done"}},
+    )
+    conn.commit()
+
+    called = []
+    def _stub_build(**kw):
+        def _ai(stage, payload):
+            called.append((stage, payload.get("edge", {}).get("src")))
+            return {}
+        return _ai
+
+    monkeypatch.setattr(semantic_worker, "_project_root_for", lambda pid: Path("."))
+    wrapped = _NoCloseConn(conn)
+    monkeypatch.setattr("agent.governance.db.get_connection", lambda pid: wrapped)
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.load_semantic_enrichment_config",
+        lambda *, project_root=None: object(),
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call", _stub_build,
+    )
+
+    semantic_worker._drain_edge(PID, sid)
+    assert called == [], "AI must not run for an already-enriched edge"
+
+
+def test_f3_accept_helper_handles_edge_target_type(conn):
+    """F3 (MF-2026-05-10-017): accept_semantic_enrichment flips the linked
+    edge event from PROPOSED to ACCEPTED and reports the edge id in
+    edge_ids_flipped (not node_ids_flipped)."""
+    snap = _create_snapshot_with_node(conn, "edge-accept-1", node_id="L7.3")
+    sid = snap["snapshot_id"]
+    edge_id = "L7.3->L4.1:emits_event"
+    enriched = graph_events.create_event(
+        conn, PID, sid,
+        event_type="edge_semantic_enriched",
+        event_kind="semantic_job",
+        target_type="edge",
+        target_id=edge_id,
+        status=graph_events.EVENT_STATUS_PROPOSED,
+        payload={"semantic_payload": {"relation_purpose": "test"}},
+    )
+    ev_id = enriched["event_id"]
+    submitted = reconcile_feedback.submit_feedback_item(
+        PID, sid,
+        feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+        issue={
+            "issue": "AI edge semantic enrichment generated — awaiting review",
+            "target_id": edge_id,
+            "target_type": "edge",
+            "priority": "P3",
+            "evidence": {
+                "edge_id": edge_id,
+                "linked_event_ids": [ev_id],
+            },
+        },
+        actor="test",
+    )
+    feedback_id = submitted["items"][0]["feedback_id"]
+    result = server._accept_semantic_enrichment_for_feedback_items(
+        conn, PID, sid, [feedback_id], actor="test",
+    )
+    assert result["edge_ids_flipped"] == [edge_id], \
+        "edge target should land in edge_ids_flipped, not node_ids_flipped"
+    assert result["node_ids_flipped"] == []
+    assert ev_id in result["event_ids_flipped"]
+    assert result["errors"] == []
+    row = conn.execute(
+        "SELECT status FROM graph_events WHERE event_id = ?",
+        (ev_id,),
+    ).fetchone()
+    assert row["status"] == graph_events.EVENT_STATUS_ACCEPTED
 
 
 def test_e_publish_helper_does_not_raise_when_eventbus_absent(monkeypatch):
