@@ -379,96 +379,77 @@ function OverviewTab({
         </section>
       ) : null}
 
-      <section className="inspector-section">
-        <div className="inspector-section-title">
-          Feature health{" "}
-          <span style={{ fontWeight: 400, color: "var(--ink-400)", fontSize: 11 }}>
-            {node._health != null
-              ? "leaf score = 35 src + 30 tests + 20 fns + 10 docs + 5 parent"
-              : node._asset_binding != null
-                ? "L4 asset · separate binding score"
+      {/* Feature health section — hidden for L4 leaves; they're config /
+          asset files and don't have a scoreable signal set. Containers and
+          L7 leaves show their health number; empty containers fall through
+          with a "no scoreable descendants" caption. */}
+      {node.layer !== "L4" ? (
+        <section className="inspector-section">
+          <div className="inspector-section-title">
+            Feature health{" "}
+            <span style={{ fontWeight: 400, color: "var(--ink-400)", fontSize: 11 }}>
+              {node._health != null
+                ? "leaf score = 35 src + 30 tests + 20 fns + 10 docs + 5 parent"
                 : "no scoreable descendants"}
-          </span>
-        </div>
-        <div
-          className="kv"
-          style={{ gridTemplateColumns: "100px 1fr", alignItems: "center" }}
-        >
-          <span className="k">health</span>
-          <span className="v">
-            {node._health != null ? (
-              onOpenProblems ? (
-                <button
-                  className="link-btn"
-                  onClick={onOpenProblems}
-                  title="See score deductions on the Problems tab"
-                  style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "inherit", textDecoration: "none" }}
-                >
-                  <span className="pdot" style={{ background: healthHex(node._health) }} />
-                  <span
-                    className="mono"
-                    style={{
-                      fontWeight: 700,
-                      color: healthHex(node._health),
-                      fontSize: 13,
-                      textDecoration: "underline",
-                      textDecorationStyle: "dotted",
-                      textUnderlineOffset: 3,
-                    }}
+            </span>
+          </div>
+          <div
+            className="kv"
+            style={{ gridTemplateColumns: "100px 1fr", alignItems: "center" }}
+          >
+            <span className="k">health</span>
+            <span className="v">
+              {node._health != null ? (
+                onOpenProblems ? (
+                  <button
+                    className="link-btn"
+                    onClick={onOpenProblems}
+                    title="See score deductions on the Problems tab"
+                    style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "inherit", textDecoration: "none" }}
                   >
-                    {node._health}
+                    <span className="pdot" style={{ background: healthHex(node._health) }} />
+                    <span
+                      className="mono"
+                      style={{
+                        fontWeight: 700,
+                        color: healthHex(node._health),
+                        fontSize: 13,
+                        textDecoration: "underline",
+                        textDecorationStyle: "dotted",
+                        textUnderlineOffset: 3,
+                      }}
+                    >
+                      {node._health}
+                    </span>
+                    <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
+                      / 100 · {healthTone(node._health)} →
+                    </span>
+                  </button>
+                ) : (
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <span className="pdot" style={{ background: healthHex(node._health) }} />
+                    <span
+                      className="mono"
+                      style={{
+                        fontWeight: 700,
+                        color: healthHex(node._health),
+                        fontSize: 13,
+                      }}
+                    >
+                      {node._health}
+                    </span>
+                    <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
+                      / 100 · {healthTone(node._health)}
+                    </span>
                   </span>
-                  <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
-                    / 100 · {healthTone(node._health)} →
-                  </span>
-                </button>
+                )
               ) : (
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                  <span className="pdot" style={{ background: healthHex(node._health) }} />
-                  <span
-                    className="mono"
-                    style={{
-                      fontWeight: 700,
-                      color: healthHex(node._health),
-                      fontSize: 13,
-                    }}
-                  >
-                    {node._health}
-                  </span>
-                  <span style={{ fontSize: 11, color: "var(--ink-400)" }}>
-                    / 100 · {healthTone(node._health)}
-                  </span>
-                </span>
-              )
-            ) : (
-              <span className="mono" style={{ color: "var(--ink-400)" }}>—</span>
-            )}
-          </span>
-          {node._asset_binding != null ? (
-            <>
-              <span className="k">asset binding</span>
-              <span className="v">
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                  <span
-                    className="pdot"
-                    style={{ background: healthHex(node._asset_binding) }}
-                  />
-                  <span
-                    className="mono"
-                    style={{
-                      fontWeight: 600,
-                      color: healthHex(node._asset_binding),
-                    }}
-                  >
-                    {node._asset_binding}
-                  </span>
-                  <span style={{ fontSize: 11, color: "var(--ink-400)" }}>/ 100</span>
-                </span>
-              </span>
-            </>
-          ) : null}
-        </div>
-      </section>
+                <span className="mono" style={{ color: "var(--ink-400)" }}>—</span>
+              )}
+            </span>
+          </div>
+        </section>
+      ) : null}
 
       <section className="inspector-section">
         <div className="inspector-section-title">Coverage signals</div>
@@ -1560,8 +1541,8 @@ function NodeFunctionsTab({ node }: { node: NodeRecord }) {
 // Problems tab — explains the feature-health deductions for this node.
 // L7 leaf: list missing signals (-35 src / -30 tests / -20 fns / -10 docs /
 // -5 parent). Container: list the 5 lowest-scoring descendants so the
-// operator can drill into the weakest link. L4: list asset_binding gaps
-// (no consumers / no producers / no owner / no backing file).
+// operator can drill into the weakest link. L4: unscored — show a
+// placeholder pointing to Files/Relations tabs.
 function NodeProblemsTab({
   node,
   allNodes,
@@ -1618,37 +1599,21 @@ function NodeProblemsTab({
   }
 
   if (isL4) {
-    const ab = node._asset_binding;
-    const flags: Array<{ label: string; deduct: number; hint: string }> = [];
-    // Mirror lib/health.ts assetBindingScore: 50 ins + 20 outs + 20 parent + 10 file
-    // We can't easily recompute here without edges; use the score gap as a hint.
-    const present = ab ?? 0;
-    const missingTotal = 100 - present;
-    if (missingTotal === 0) {
-      return (
-        <section className="inspector-section">
-          <div className="inspector-section-title">Asset binding</div>
-          <div className="empty">Full 100/100 — asset is fully bound.</div>
-        </section>
-      );
-    }
-    flags.push({ label: "asset binding gap", deduct: missingTotal, hint: "+50 in / +20 out / +20 parent / +10 file" });
+    // L4 nodes (config / state / contract / asset) are unscored — the
+    // dashboard intentionally doesn't apply feature-health or
+    // asset-binding deductions here. Operators inspect bindings via the
+    // Files and Relations tabs.
     return (
       <section className="inspector-section">
-        <div className="inspector-section-title">Asset binding deductions</div>
-        <ul className="link-list">
-          {flags.map((m, i) => (
-            <li key={i}>
-              <div className="link-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 2, padding: "6px 8px" }}>
-                <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-                  <span style={{ fontWeight: 600, fontSize: 12 }}>{m.label}</span>
-                  <span className="status-badge status-amber">−{m.deduct}</span>
-                </div>
-                <span style={{ fontSize: 10.5, color: "var(--ink-400)" }}>{m.hint}</span>
-              </div>
-            </li>
-          ))}
-        </ul>
+        <div className="inspector-section-title">Problems</div>
+        <div className="empty">
+          L4 asset nodes are not health-scored.
+          <div className="empty-hint">
+            These are config / state / contract files. See the{" "}
+            <span className="mono">Files</span> and <span className="mono">Relations</span>
+            {" "}tabs to inspect bindings.
+          </div>
+        </div>
       </section>
     );
   }

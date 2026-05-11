@@ -84,13 +84,19 @@ function NodeFocusCard({
       </div>
 
       <div className="focus-rows">
-        <StatusRow
-          label="Health"
-          value={meta.health == null ? "—" : `${meta.health}`}
-          tone={meta.healthTone}
-          hint={meta.healthHint}
-          onClick={() => onOpenDrawerTab("problems")}
-        />
+        {/* Health row is hidden for L4 assets — they're config/state files
+            with no scoreable signals. Per-operator decision: no health and
+            no asset_binding score (which used to show here as a "—" with
+            a binding hint). */}
+        {node.layer !== "L4" ? (
+          <StatusRow
+            label="Health"
+            value={meta.health == null ? "—" : `${meta.health}`}
+            tone={meta.healthTone}
+            hint={meta.healthHint}
+            onClick={() => onOpenDrawerTab("problems")}
+          />
+        ) : null}
         <StatusRow
           label="Semantic"
           value={meta.semanticBadge.value}
@@ -336,20 +342,14 @@ function nodeMetrics(
 
   // Feature health — single source of truth is node._health computed by
   // lib/health.ts (leafScore = 35 src + 30 tests + 20 fns + 10 docs + 5
-  // parent; container = recursive avg of L7 descendants; L4 = null with a
-  // separate asset_binding score). The old semantic-status heuristic
-  // (semantic_complete → 100, semantic_stale → 60, etc.) was different from
-  // the tree + drawer's number and caused the FocusCard to show 100 for
-  // nodes the rest of the UI marked as 70 because tests were missing.
+  // parent; container = recursive avg of L7 descendants). L4 leaves are
+  // intentionally unscored — they're config/asset files and the row is
+  // hidden in the FocusCard above; this hint is only used for L7/container.
   const health: number | null = node._health ?? null;
   const healthTone: BadgeTone =
     health == null ? "unknown" : health >= 85 ? "complete" : health >= 70 ? "pending" : "failed";
   const healthHint =
-    health == null
-      ? node._asset_binding != null
-        ? `L4 asset · binding ${node._asset_binding}/100`
-        : "no scoreable signals — structure only"
-      : `score ${health}/100`;
+    health == null ? "no scoreable signals — structure only" : `score ${health}/100`;
 
   // Semantic badge — exposes the classified status
   const semanticBadge: StatusBadge = {

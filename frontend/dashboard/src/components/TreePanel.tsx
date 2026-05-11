@@ -328,27 +328,15 @@ function RowMeta({ node, idx }: { node: NodeRecord; idx: Index }) {
   // Container row — render aggregated semantic chip plus subtree size hint.
   const a = idx.agg.get(node.node_id);
   if (!a || a.total === 0) {
-    // L4 leaves and other containers without governed L7 descendants.
+    // L4 leaves are unscored — render a plain "asset" label, no number,
+    // no health dot. asset_binding got retired (no health concept for L4).
     if (node.layer === "L4") {
-      const ab = node._asset_binding;
       return (
         <span
           className="tree-meta"
-          title={`L4 asset — state/contract/asset node\nasset_binding: ${ab ?? "—"}`}
+          title="L4 asset — config / state / contract / artifact (unscored)"
         >
-          {ab != null ? (
-            <>
-              <span className="pdot" style={{ background: healthHex(ab) }} />
-              <span
-                className="mono"
-                style={{ fontSize: 10, fontWeight: 600, color: healthHex(ab), marginLeft: 3 }}
-              >
-                {ab}
-              </span>
-            </>
-          ) : (
-            <span>asset</span>
-          )}
+          <span style={{ color: "var(--ink-400)", fontSize: 10 }}>asset</span>
         </span>
       );
     }

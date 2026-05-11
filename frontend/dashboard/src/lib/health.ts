@@ -3,8 +3,10 @@ import type { EdgeRecord, NodeRecord } from "../types";
 // Per-node "feature health" — port of the docs/dev/dashboard-prototype.html
 // algorithm.
 //
-//   - L4 leaves (state / contract / artifact / config): EXCLUDED from feature
-//     health. They get a separate `_asset_binding` score and do NOT
+//   - L4 leaves (state / contract / artifact / config): NOT SCORED. They have
+//     no concept of feature health (and no asset_binding either — we used to
+//     track that as a separate score but it's been retired per operator
+//     feedback: "L4 are config/asset files, don't score them"). They do not
 //     participate in their container's feature-health rollup.
 //   - L7 leaf: definition score (35 source + 30 tests + 20 fns + 10 docs + 5
 //     has parent), capped at 100.
@@ -20,42 +22,16 @@ export function leafScore(n: NodeRecord): number {
   return Math.min(100, s);
 }
 
-// L4 asset binding score (0..100). Separate from feature health.
-//   - +50 if any non-contains edge consumes this node (incoming)
-//   - +20 if any non-contains edge produced by this node (outgoing)
-//   - +20 if has hierarchy_parent (owner container)
-//   - +10 if has any backing file (config_files / primary_files)
-export function assetBindingScore(
-  n: NodeRecord,
-  edgesBySrc: Map<string, EdgeRecord[]>,
-  edgesByDst: Map<string, EdgeRecord[]>,
-): number {
-  const isContains = (e: EdgeRecord) => (e.type ?? e.edge_type) === "contains";
-  const outs = (edgesBySrc.get(n.node_id) ?? []).filter((e) => !isContains(e));
-  const ins = (edgesByDst.get(n.node_id) ?? []).filter((e) => !isContains(e));
-  let s = 0;
-  if (ins.length > 0) s += 50;
-  if (outs.length > 0) s += 20;
-  if (n.metadata?.hierarchy_parent) s += 20;
-  if (
-    (n.config_files?.length ?? 0) + (n.primary_files?.length ?? 0) > 0
-  ) {
-    s += 10;
-  }
-  return Math.min(100, s);
-}
-
 export interface HealthScored {
   node_id: string;
   _health: number | null;
-  _asset_binding: number | null;
 }
 
-// Compute health for every node and return a map of node_id → {_health, _asset_binding}.
+// Compute health for every node and return a map of node_id → {_health}.
 // _health is null for L4 leaves and for empty containers (no L7 descendants).
 export function computeNodeHealth(
   nodes: NodeRecord[],
-  edges: EdgeRecord[],
+  _edges: EdgeRecord[],
 ): Map<string, HealthScored> {
   const byId = new Map(nodes.map((n) => [n.node_id, n]));
   const byParent = new Map<string, NodeRecord[]>();
@@ -66,16 +42,6 @@ export function computeNodeHealth(
     arr.push(n);
     byParent.set(p, arr);
   });
-  const edgesBySrc = new Map<string, EdgeRecord[]>();
-  const edgesByDst = new Map<string, EdgeRecord[]>();
-  edges.forEach((e) => {
-    const a = edgesBySrc.get(e.src) ?? [];
-    a.push(e);
-    edgesBySrc.set(e.src, a);
-    const b = edgesByDst.get(e.dst) ?? [];
-    b.push(e);
-    edgesByDst.set(e.dst, b);
-  });
 
   const memo = new Map<string, HealthScored>();
   function visit(id: string): HealthScored {
@@ -83,55 +49,38 @@ export function computeNodeHealth(
     if (cached) return cached;
     const n = byId.get(id);
     if (!n) {
-      const result: HealthScored = { node_id: id, _health: null, _asset_binding: null };
+      const result: HealthScored = { node_id: id, _health: null };
       memo.set(id, result);
       return result;
     }
     const kids = byParent.get(id) ?? [];
     let h: number | null;
-    let assetBinding: number | null = null;
     if (kids.length === 0) {
-      if (n.layer === "L4") {
-        assetBinding = assetBindingScore(n, edgesBySrc, edgesByDst);
-        h = null;
-      } else {
-        h = leafScore(n);
-      }
+      // Leaf. L4 nodes are unscored on purpose; everything else gets the
+      // leafScore breakdown.
+      h = n.layer === "L4" ? null : leafScore(n);
     } else {
+      // Container — recursive average of L7 descendants. L4 children are
+      // skipped entirely (no contribution, no separate rollup).
       let sum = 0;
       let count = 0;
-      let assetSum = 0;
-      let assetCount = 0;
       kids.forEach((c) => {
         const grandChildren = byParent.get(c.node_id) ?? [];
         if (grandChildren.length === 0) {
-          if (c.layer === "L4") {
-            assetSum += assetBindingScore(c, edgesBySrc, edgesByDst);
-            assetCount++;
-          } else {
-            sum += leafScore(c);
-            count++;
-          }
+          if (c.layer === "L4") return; // skip L4 leaves
+          sum += leafScore(c);
+          count++;
         } else {
           const childResult = visit(c.node_id);
           if (childResult._health != null) {
             sum += childResult._health;
             count++;
           }
-          if (childResult._asset_binding != null) {
-            assetSum += childResult._asset_binding;
-            assetCount++;
-          }
         }
       });
       h = count > 0 ? Math.round(sum / count) : null;
-      assetBinding = assetCount > 0 ? Math.round(assetSum / assetCount) : null;
     }
-    const result: HealthScored = {
-      node_id: id,
-      _health: h,
-      _asset_binding: assetBinding,
-    };
+    const result: HealthScored = { node_id: id, _health: h };
     memo.set(id, result);
     return result;
   }

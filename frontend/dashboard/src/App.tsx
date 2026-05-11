@@ -94,13 +94,11 @@ export default function App() {
       // tolerates an empty map.
       const merged = mergeProjection(nodesRes.nodes, projection?.projection?.node_semantics ?? {});
       // Per-node feature health (prototype algorithm — leafScore for L7 leaves,
-      // recursive average for containers, L4 leaves get _asset_binding only).
+      // recursive average for containers; L4 leaves are intentionally unscored).
       const healthMap = computeNodeHealth(merged, edgesRes.edges);
       const mergedWithHealth = merged.map((n) => {
         const h = healthMap.get(n.node_id);
-        return h
-          ? { ...n, _health: h._health, _asset_binding: h._asset_binding }
-          : n;
+        return h ? { ...n, _health: h._health } : n;
       });
       setData({
         health,

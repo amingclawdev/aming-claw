@@ -107,10 +107,9 @@ export interface NodeRecord {
   exclude_as_feature?: boolean;
   // MF-016/017 follow-up: per-node feature-health score (prototype algorithm).
   // null for L4 asset leaves and empty containers. Populated by lib/health.ts
-  // after the dashboard data bundle loads. Asset-side binding score lives
-  // separately so it doesn't get mixed into feature-health rollups.
+  // after the dashboard data bundle loads. L4 nodes are intentionally
+  // unscored — they're config/asset files, no health concept applies.
   _health?: number | null;
-  _asset_binding?: number | null;
 }
 
 export interface NodeMetadata {
