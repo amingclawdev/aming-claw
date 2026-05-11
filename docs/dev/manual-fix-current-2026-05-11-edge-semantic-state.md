@@ -124,4 +124,30 @@ Single MF commit on main with `Chain-Source-Stage: observer-hotfix`.
 
 ## Result
 
-(filled at the end)
+**LANDED + LIVE** — Edge semantic now follows the node persistent-state +
+carry-forward pattern. Future scope-catchup snapshots inherit edge
+enrichments.
+
+- **Commit**: `7823e05` on main, `Chain-Source-Stage: observer-hotfix`
+  trailer present.
+- **Files changed**: 5 (3 governed + 1 test + 1 doc).
+- **Tests**: 11 new (`test_edge_semantic_persistence.py`) + 75 regression
+  across `test_semantic_worker_review_gate.py`, `test_graph_governance_api.py`,
+  `test_reconcile_semantic_config.py` — total 86 pass.
+- **Restart**: `start-governance.ps1 -Takeover` →
+  `version: 7823e05, pid: 5880`.
+- **Smoke test**:
+  - Submitted edge enrich for `L7.28|L7.106|depends_on` on
+    scope-ad47a36-a5bc.
+  - Worker drained, wrote `edge_semantic_enriched` event `ge-d3b2215ecf95`
+    with `stable_node_key='30fcba3c874eb3'` and
+    `feature_hash='2cc0210fe8e2b1'` (the edge_signature_hash).
+  - Worker also wrote `graph_semantic_edges` row with matching
+    `edge_signature_hash` and status `pending_review`.
+  - Both identity primitives populated → cross-snapshot carry-forward
+    will work on the next scope-catchup.
+- **Backlog closure**: `task-1778516527-48b634`
+  (BACKLOG-EDGE-SEMANTIC-PERSISTENT-STATE-PARITY) — fully closed.
+- **MF closure task**: filed via create+complete-same-turn (see
+  task-id in PHASE 5 log).
+- **No new preflight blockers** introduced.
