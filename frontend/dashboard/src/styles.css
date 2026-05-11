@@ -1254,8 +1254,10 @@ a:hover { text-decoration: underline; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 280px;
-  overflow-y: auto;
+  /* No inner scroll cap — the Functions tab is the only place .fn-list
+     renders, and the parent `.inspector-body` already provides outer
+     overflow-y so the list extends to the full panel height instead of
+     bottoming out at 280px with empty space below. */
 }
 
 .fn-link {
