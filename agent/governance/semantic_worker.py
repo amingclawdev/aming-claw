@@ -251,7 +251,14 @@ def on_semantic_job_enqueued(payload: Any) -> None:
 
 def on_governance_startup(payload: Any = None) -> None:
     """EventBus listener for `system.startup`. Catches up on rows
-    that were enqueued before this process started."""
+    that were enqueued before this process started.
+
+    Scope guardrail: ONLY drains the active snapshot per project.
+    Superseded snapshots may have ai_pending rows from old reconcile
+    cycles — those are irrelevant to the live dashboard and would
+    waste AI calls. Operators wanting to backfill old snapshots can
+    manually re-fire enrichment.
+    """
     try:
         from . import db as governance_db
         gov_root = governance_db._governance_root()
@@ -267,21 +274,32 @@ def on_governance_startup(payload: Any = None) -> None:
             try:
                 conn = governance_db.get_connection(project_id)
                 try:
-                    rows = conn.execute(
-                        """
-                        SELECT DISTINCT snapshot_id FROM graph_semantic_jobs
-                        WHERE project_id = ? AND status IN ('ai_pending', 'pending_ai')
-                        """,
+                    # Active snapshot id only.
+                    active_row = conn.execute(
+                        "SELECT snapshot_id FROM graph_snapshot_refs WHERE project_id = ? AND ref_name = 'active'",
                         (project_id,),
-                    ).fetchall()
-                    for r in rows:
-                        sid = str(r["snapshot_id"] or "")
-                        if sid:
-                            log.info(
-                                "semantic_worker: startup catchup %s/%s",
-                                project_id, sid,
-                            )
-                            _get_executor().submit(_drain, project_id, sid)
+                    ).fetchone()
+                    if not active_row:
+                        continue
+                    sid = str(active_row["snapshot_id"] or "")
+                    if not sid:
+                        continue
+                    pending = conn.execute(
+                        """
+                        SELECT COUNT(*) AS n FROM graph_semantic_jobs
+                        WHERE project_id = ? AND snapshot_id = ?
+                          AND status IN ('ai_pending', 'pending_ai')
+                        """,
+                        (project_id, sid),
+                    ).fetchone()
+                    n = int(pending["n"] if pending else 0)
+                    if n <= 0:
+                        continue
+                    log.info(
+                        "semantic_worker: startup catchup %s/%s (%d pending)",
+                        project_id, sid, n,
+                    )
+                    _get_executor().submit(_drain, project_id, sid)
                 finally:
                     conn.close()
             except Exception as exc:  # noqa: BLE001 - per-project failure shouldn't abort
