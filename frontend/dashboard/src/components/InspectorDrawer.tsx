@@ -30,6 +30,7 @@ interface Props {
   pinnedEdge?: PinnedEdge | null;
   feedback?: FeedbackQueueResponse | null;
   snapshotId?: string | null;
+  edgeSemantics?: Record<string, unknown> | null;
   onSelectNode(id: string): void;
   onClose(): void;
   onClearEdge?(): void;
@@ -47,6 +48,7 @@ interface EdgeProps {
   edges: EdgeRecord[];
   feedback: FeedbackQueueResponse | null;
   snapshotId?: string | null;
+  edgeSemantics?: Record<string, unknown> | null;
   onSelectNode(id: string): void;
   onClose(): void;
   onOpenAction?(kind: ActionKind, target: ActionTarget): void;
@@ -89,6 +91,7 @@ export default function InspectorDrawer({
   pinnedEdge,
   feedback,
   snapshotId,
+  edgeSemantics,
   onSelectNode,
   onClose,
   onClearEdge,
@@ -141,6 +144,7 @@ export default function InspectorDrawer({
         edges={edges}
         feedback={feedback ?? null}
         snapshotId={snapshotId ?? null}
+        edgeSemantics={edgeSemantics ?? null}
         onSelectNode={onSelectNode}
         onClose={onClearEdge ?? onClose}
         onOpenAction={onOpenAction}
@@ -518,6 +522,7 @@ function EdgeInspector({
   edges,
   feedback,
   snapshotId,
+  edgeSemantics,
   onSelectNode,
   onClose,
   onOpenAction,
@@ -544,6 +549,24 @@ function EdgeInspector({
       ) ?? null
     );
   }, [edge.src, edge.dst, edge.type, feedback]);
+  // Look up the projection's edge_semantics entry for this edge — populated
+  // after Accept flips the PROPOSED event to ACCEPTED and the projection
+  // rebuilds. The key is the canonical `<src>-><dst>:<type>` form.
+  const edgeSemEntry = useMemo<Record<string, unknown> | null>(() => {
+    if (!edgeSemantics) return null;
+    const key = `${edge.src}->${edge.dst}:${edge.type}`;
+    const entry = (edgeSemantics as Record<string, unknown>)[key];
+    if (!entry || typeof entry !== "object") return null;
+    const semantic = (entry as { semantic?: unknown }).semantic;
+    if (!semantic || typeof semantic !== "object") return null;
+    const sem = semantic as Record<string, unknown>;
+    // Empty stub entries have no AI fields — skip them so the section
+    // doesn't render with all dashes.
+    const hasContent = Object.keys(sem).some(
+      (k) => !k.startsWith("_") && sem[k] != null && sem[k] !== "",
+    );
+    return hasContent ? sem : null;
+  }, [edgeSemantics, edge.src, edge.dst, edge.type]);
   const [edgeReviewBusy, setEdgeReviewBusy] = useState(false);
   const [edgeShowRetry, setEdgeShowRetry] = useState(false);
   const dispatchEdgeDecide = async (action: string) => {
@@ -677,7 +700,13 @@ function EdgeInspector({
         ) : null}
 
         {tab === "overview" ? (
-          <EdgeOverviewTab edge={edge} src={src} dst={dst} onSelectNode={onSelectNode} />
+          <EdgeOverviewTab
+            edge={edge}
+            src={src}
+            dst={dst}
+            onSelectNode={onSelectNode}
+            edgeSemantic={edgeSemEntry}
+          />
         ) : null}
         {tab === "files" ? <EdgeFilesTab src={src} dst={dst} /> : null}
         {tab === "relations" ? (
@@ -710,14 +739,18 @@ function EdgeOverviewTab({
   src,
   dst,
   onSelectNode,
+  edgeSemantic,
 }: {
   edge: PinnedEdge;
   src: NodeRecord | null;
   dst: NodeRecord | null;
   onSelectNode(id: string): void;
+  edgeSemantic?: Record<string, unknown> | null;
 }) {
   return (
     <>
+      {edgeSemantic ? <EdgeSemanticSection sem={edgeSemantic} /> : null}
+
       <section className="inspector-section">
         <div className="inspector-section-title">Edge attributes</div>
         <div className="kv">
@@ -749,6 +782,90 @@ function EdgeOverviewTab({
         onSelectNode={onSelectNode}
       />
     </>
+  );
+}
+
+// MF-016/017: read-only render of the accepted edge semantic (the AI's
+// proposal after the operator clicked Accept). Sources fields from
+// projection.edge_semantics[edge_id].semantic. Same fields the
+// CandidateSemanticBlock renders, just labelled as the current accepted
+// state instead of a pending proposal.
+function EdgeSemanticSection({ sem }: { sem: Record<string, unknown> }) {
+  const str = (k: string): string => {
+    const v = sem[k];
+    return typeof v === "string" ? v : v == null ? "" : String(v);
+  };
+  const relationPurpose = str("relation_purpose");
+  const semanticLabel = str("semantic_label");
+  const directionality = str("directionality");
+  const risk = str("risk");
+  const confidence = typeof sem.confidence === "number" ? (sem.confidence as number) : null;
+  const evidence = sem.evidence as Record<string, unknown> | undefined;
+  const openIssues = Array.isArray(sem.open_issues) ? (sem.open_issues as unknown[]) : [];
+  if (!relationPurpose && !semanticLabel && !directionality && !risk && !evidence) {
+    return null;
+  }
+  return (
+    <section className="inspector-section">
+      <div className="inspector-section-title">
+        Edge semantic{" "}
+        <span style={{ fontWeight: 400, color: "var(--ink-400)", fontSize: 11 }}>
+          accepted
+          {confidence != null ? ` · conf=${confidence.toFixed(2)}` : ""}
+        </span>
+      </div>
+      <div className="candidate-block" style={{ marginTop: 0, background: "#f0fdf4", borderColor: "#bbf7d0" }}>
+        {semanticLabel ? (
+          <div className="candidate-block-row">
+            <span className="candidate-block-key">label</span>
+            <span className="candidate-block-val mono">{semanticLabel}</span>
+          </div>
+        ) : null}
+        {relationPurpose ? (
+          <div className="candidate-block-row">
+            <span className="candidate-block-key">purpose</span>
+            <span className="candidate-block-val">{relationPurpose}</span>
+          </div>
+        ) : null}
+        {directionality ? (
+          <div className="candidate-block-row">
+            <span className="candidate-block-key">direction</span>
+            <span className="candidate-block-val">{directionality}</span>
+          </div>
+        ) : null}
+        {risk ? (
+          <div className="candidate-block-row">
+            <span className="candidate-block-key">risk</span>
+            <span className="candidate-block-val">{risk}</span>
+          </div>
+        ) : null}
+        {evidence && typeof evidence === "object" ? (
+          <div className="candidate-block-row">
+            <span className="candidate-block-key">evidence</span>
+            <span className="candidate-block-val">
+              {typeof (evidence as { basis?: unknown }).basis === "string"
+                ? ((evidence as { basis: string }).basis)
+                : JSON.stringify(evidence).slice(0, 240)}
+            </span>
+          </div>
+        ) : null}
+        {openIssues.length > 0 ? (
+          <div className="candidate-block-row">
+            <span className="candidate-block-key">open issues</span>
+            <div>
+              <ul className="candidate-block-issues">
+                {openIssues.slice(0, 3).map((it, i) => (
+                  <li key={i}>{typeof it === "string" ? it : JSON.stringify(it).slice(0, 240)}</li>
+                ))}
+              </ul>
+              {openIssues.length > 3 ? (
+                <div className="candidate-block-issues-more">+{openIssues.length - 3} more</div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </section>
   );
 }
 

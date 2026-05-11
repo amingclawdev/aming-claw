@@ -583,6 +583,11 @@ export default function App() {
                   edges={data.edges}
                   feedback={data.feedback}
                   snapshotId={data.status?.active_snapshot_id ?? data.summary?.snapshot_id ?? null}
+                  edgeSemantics={
+                    (data.projection?.projection?.edge_semantics as
+                      | Record<string, unknown>
+                      | undefined) ?? null
+                  }
                   onSelectNode={handleSelectNode}
                   onClose={() => {
                     setSelectedNodeId(null);
