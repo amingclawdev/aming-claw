@@ -320,39 +320,22 @@ function nodeMetrics(
   const sem = node.semantic ?? {};
   const v = sem.validity ?? {};
 
-  // Health rough heuristic when backend doesn't surface a per-node score:
-  //   complete + reviewed = 100, stale = 60, hash-unverified = 65, pending/running = 50,
-  //   review_pending = 70, structure_only = null, failed = 25, missing = 0.
-  let health: number | null;
-  switch (status) {
-    case "semantic_complete":
-    case "reviewed":
-      health = 100;
-      break;
-    case "semantic_stale":
-      health = 60;
-      break;
-    case "semantic_hash_unverified":
-      health = 65;
-      break;
-    case "semantic_pending":
-    case "semantic_running":
-      health = 50;
-      break;
-    case "review_pending":
-      health = 70;
-      break;
-    case "semantic_failed":
-      health = 25;
-      break;
-    case "structure_only":
-    default:
-      health = null;
-  }
-
+  // Feature health — single source of truth is node._health computed by
+  // lib/health.ts (leafScore = 35 src + 30 tests + 20 fns + 10 docs + 5
+  // parent; container = recursive avg of L7 descendants; L4 = null with a
+  // separate asset_binding score). The old semantic-status heuristic
+  // (semantic_complete → 100, semantic_stale → 60, etc.) was different from
+  // the tree + drawer's number and caused the FocusCard to show 100 for
+  // nodes the rest of the UI marked as 70 because tests were missing.
+  const health: number | null = node._health ?? null;
   const healthTone: BadgeTone =
-    health == null ? "unknown" : health >= 85 ? "complete" : health >= 60 ? "pending" : "failed";
-  const healthHint = health == null ? "no AI semantic yet — structure only" : `score ${health}/100`;
+    health == null ? "unknown" : health >= 85 ? "complete" : health >= 70 ? "pending" : "failed";
+  const healthHint =
+    health == null
+      ? node._asset_binding != null
+        ? `L4 asset · binding ${node._asset_binding}/100`
+        : "no scoreable signals — structure only"
+      : `score ${health}/100`;
 
   // Semantic badge — exposes the classified status
   const semanticBadge: StatusBadge = {
