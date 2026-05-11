@@ -585,3 +585,72 @@ def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(
 
     after = {str(path): _file_sha(path) for path in files}
     assert after == before
+
+
+def test_update_pending_scope_candidate_materializes_when_activated(conn):
+    """OPT-BACKLOG-PENDING-SCOPE-TRANSITION-MISSING regression: when the
+    candidate snapshot was activated, pending_scope_reconcile rows must
+    transition from queued → materialized, not be left in `running`."""
+    store.ensure_schema(conn)
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    conn.execute(
+        """
+        INSERT INTO pending_scope_reconcile
+          (project_id, commit_sha, parent_commit_sha, queued_at, status,
+           retry_count, snapshot_id, evidence_json)
+        VALUES (?, ?, '', '2026-01-01T00:00:00Z', 'queued', 0, '', '{}'),
+               (?, ?, '', '2026-01-02T00:00:00Z', 'queued', 0, '', '{}')
+        """,
+        (PID, commit_a, PID, commit_b),
+    )
+    conn.commit()
+
+    updated = state_reconcile._update_pending_scope_candidate(
+        conn, PID,
+        covered_commit_shas=[commit_a, commit_b],
+        snapshot_id="scope-test-1",
+        target_commit_sha=commit_b,
+        run_id="run-1",
+        activated=True,
+    )
+    assert updated == 2
+    rows = conn.execute(
+        "SELECT commit_sha, status, snapshot_id FROM pending_scope_reconcile WHERE project_id=? ORDER BY commit_sha",
+        (PID,),
+    ).fetchall()
+    statuses = [r["status"] for r in rows]
+    assert statuses == [store.PENDING_STATUS_MATERIALIZED, store.PENDING_STATUS_MATERIALIZED]
+    assert all(r["snapshot_id"] == "scope-test-1" for r in rows)
+
+
+def test_update_pending_scope_candidate_keeps_running_when_not_activated(conn):
+    """When the candidate was built but NOT activated (activate=False), the
+    pending row stays in `running` so the next cycle can pick it back up."""
+    store.ensure_schema(conn)
+    commit_a = "c" * 40
+    conn.execute(
+        """
+        INSERT INTO pending_scope_reconcile
+          (project_id, commit_sha, parent_commit_sha, queued_at, status,
+           retry_count, snapshot_id, evidence_json)
+        VALUES (?, ?, '', '2026-01-01T00:00:00Z', 'queued', 0, '', '{}')
+        """,
+        (PID, commit_a),
+    )
+    conn.commit()
+
+    updated = state_reconcile._update_pending_scope_candidate(
+        conn, PID,
+        covered_commit_shas=[commit_a],
+        snapshot_id="scope-test-2",
+        target_commit_sha=commit_a,
+        run_id="run-2",
+        activated=False,
+    )
+    assert updated == 1
+    row = conn.execute(
+        "SELECT status FROM pending_scope_reconcile WHERE project_id=? AND commit_sha=?",
+        (PID, commit_a),
+    ).fetchone()
+    assert row["status"] == store.PENDING_STATUS_RUNNING

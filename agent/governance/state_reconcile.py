@@ -17,6 +17,7 @@ from typing import Any
 from agent.governance import graph_events
 from agent.governance.graph_snapshot_store import (
     PENDING_STATUS_FAILED,
+    PENDING_STATUS_MATERIALIZED,
     PENDING_STATUS_QUEUED,
     PENDING_STATUS_RUNNING,
     SNAPSHOT_STATUS_CANDIDATE,
@@ -1156,17 +1157,29 @@ def _update_pending_scope_candidate(
     snapshot_id: str,
     target_commit_sha: str,
     run_id: str,
+    activated: bool = False,
 ) -> int:
+    """Mark pending_scope_reconcile rows bound to the just-built candidate.
+
+    OPT-BACKLOG-PENDING-SCOPE-TRANSITION-MISSING: when `activated` is True the
+    candidate snapshot has already replaced the active snapshot, so the
+    pending row is fully materialized and shouldn't stay in `running`. When
+    False the candidate is parked awaiting an explicit activate call, so
+    `running` is the correct interim state.
+    """
     commits = [c for c in covered_commit_shas if c]
     if not commits:
         return 0
     placeholders = ",".join("?" for _ in commits)
+    final_status = PENDING_STATUS_MATERIALIZED if activated else PENDING_STATUS_RUNNING
     evidence = {
         "source": "pending_scope_materializer",
         "snapshot_id": snapshot_id,
         "target_commit_sha": target_commit_sha,
         "run_id": run_id,
         "covered_commit_shas": commits,
+        "activated": bool(activated),
+        "final_status": final_status,
     }
     cur = conn.execute(
         f"""
@@ -1179,7 +1192,7 @@ def _update_pending_scope_candidate(
           AND status IN (?, ?, ?)
         """,
         (
-            PENDING_STATUS_RUNNING,
+            final_status,
             snapshot_id,
             json.dumps(evidence, ensure_ascii=False, sort_keys=True),
             project_id,
@@ -1409,6 +1422,12 @@ def run_pending_scope_reconcile_candidate(
             created_by=created_by,
         )
         pending_notes["scope_graph_events"] = scope_event_summary
+        # OPT-BACKLOG-PENDING-SCOPE-TRANSITION-MISSING: when activate=True the
+        # candidate is now the active snapshot, so the pending row should land
+        # in `materialized` not `running`. result.get("activation") is set by
+        # run_state_only_full_reconcile when it successfully ran
+        # activate_graph_snapshot earlier in the flow.
+        activation_succeeded = bool(result.get("activation"))
         updated = _update_pending_scope_candidate(
             conn,
             project_id,
@@ -1416,6 +1435,7 @@ def run_pending_scope_reconcile_candidate(
             snapshot_id=sid,
             target_commit_sha=target,
             run_id=rid,
+            activated=activation_succeeded,
         )
         if row:
             try:
