@@ -4085,6 +4085,15 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
+                # OPT-BACKLOG-MATERIALIZE-NO-WORKER-NOTIFY: default to NOT
+                # auto-enqueueing stale nodes for AI on materialize. The
+                # MF-016 in-process worker isn't notified by the persistence
+                # path, so silent enqueues would just sit unfinished in
+                # graph_semantic_jobs. Operators trigger enrichment
+                # explicitly via POST /semantic/jobs (which DOES publish to
+                # the EventBus). Caller can opt back into the legacy behavior
+                # by passing `enqueue_stale: true` in the body.
+                semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)

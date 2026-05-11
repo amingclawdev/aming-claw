@@ -654,3 +654,95 @@ def test_update_pending_scope_candidate_keeps_running_when_not_activated(conn):
         (PID, commit_a),
     ).fetchone()
     assert row["status"] == store.PENDING_STATUS_RUNNING
+
+
+def test_pending_scope_materializer_semantic_enqueue_stale_false_keeps_jobs_empty(
+    conn, tmp_path, monkeypatch,
+):
+    """OPT-BACKLOG-MATERIALIZE-NO-WORKER-NOTIFY: when caller passes
+    semantic_enqueue_stale=False, the materialize path must NOT write
+    ai_pending rows to graph_semantic_jobs. Operator drives enrichment via
+    POST /semantic/jobs which publishes to the EventBus and triggers the
+    worker. Carry-forward of prior semantic state is unaffected."""
+    project = tmp_path / "project"
+    _write_project(project)
+
+    old = store.create_graph_snapshot(
+        conn, PID,
+        snapshot_id="imported-old-no-enqueue",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    store.queue_pending_scope_reconcile(
+        conn, PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+        evidence={"source": "test"},
+    )
+    monkeypatch.setattr("agent.governance.state_reconcile._git_commit", lambda *_a, **_k: "head")
+
+    result = run_pending_scope_reconcile_candidate(
+        conn, PID, project,
+        run_id="scope-no-enqueue-test",
+        snapshot_id="scope-no-enqueue-test",
+        semantic_enqueue_stale=False,
+    )
+    assert result["ok"] is True
+    # Carry-forward / state path still ran (semantic_enrichment block executed)
+    assert result["semantic_enrichment"]["feature_count"] > 0
+    # But no ai_pending rows landed in graph_semantic_jobs.
+    rows = conn.execute(
+        """
+        SELECT node_id, status FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ? AND status IN ('ai_pending', 'pending_ai')
+        """,
+        (PID, "scope-no-enqueue-test"),
+    ).fetchall()
+    assert rows == [], f"expected no ai_pending rows, got {[dict(r) for r in rows]}"
+    # The pending_scope notes record the flag for auditability.
+    notes = json.loads(conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id=? AND snapshot_id=?",
+        (PID, "scope-no-enqueue-test"),
+    ).fetchone()["notes"])
+    assert notes["pending_scope_reconcile"]["semantic_enqueue_stale"] is False
+
+
+def test_pending_scope_materializer_default_still_enqueues(conn, tmp_path, monkeypatch):
+    """Regression / backwards-compat: when semantic_enqueue_stale is not
+    overridden (defaults to True), the materialize still queues ai_pending
+    rows so legacy reconcile pipelines that rely on the auto-enqueue
+    continue to work."""
+    project = tmp_path / "project"
+    _write_project(project)
+
+    old = store.create_graph_snapshot(
+        conn, PID,
+        snapshot_id="imported-old-default-enqueue",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    store.queue_pending_scope_reconcile(
+        conn, PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+        evidence={"source": "test"},
+    )
+    monkeypatch.setattr("agent.governance.state_reconcile._git_commit", lambda *_a, **_k: "head")
+
+    result = run_pending_scope_reconcile_candidate(
+        conn, PID, project,
+        run_id="scope-default-enqueue-test",
+        snapshot_id="scope-default-enqueue-test",
+        # semantic_enqueue_stale omitted — default True
+    )
+    assert result["ok"] is True
+    rows = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ? AND status = 'ai_pending'
+        """,
+        (PID, "scope-default-enqueue-test"),
+    ).fetchone()
+    assert rows["n"] > 0, "default path must still enqueue ai_pending rows"

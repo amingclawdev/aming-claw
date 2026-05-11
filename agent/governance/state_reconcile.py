@@ -717,6 +717,7 @@ def run_state_only_full_reconcile(
     semantic_batch_memory_id: str | None = None,
     semantic_base_snapshot_id: str | None = None,
     semantic_config_path: str | Path | None = None,
+    semantic_enqueue_stale: bool = True,
 ) -> dict[str, Any]:
     """Create a candidate full-reconcile graph snapshot from current files.
 
@@ -1032,6 +1033,7 @@ def run_state_only_full_reconcile(
             semantic_include_structural=semantic_include_structural,
             semantic_config_path=semantic_config_path,
             trace_dir=trace.trace_dir / "semantic-enrichment",
+            enqueue_stale=semantic_enqueue_stale,
         )
         semantic_enrichment = _semantic_enrichment_summary(semantic_result)
         if semantic_classify_feedback:
@@ -1259,12 +1261,20 @@ def run_pending_scope_reconcile_candidate(
     semantic_batch_memory_id: str | None = None,
     semantic_base_snapshot_id: str | None = None,
     semantic_config_path: str | Path | None = None,
+    semantic_enqueue_stale: bool = True,
 ) -> dict[str, Any]:
     """Materialize pending scope rows as a reviewable candidate snapshot.
 
     The current MVP rebuilds a state-only candidate graph from the current
     worktree, then binds pending commits up to the target commit to that
     candidate. It intentionally does not activate the snapshot.
+
+    OPT-BACKLOG-MATERIALIZE-NO-WORKER-NOTIFY: when called from the dashboard
+    flow, the caller can set `semantic_enqueue_stale=False` so the materialize
+    does not silently fill graph_semantic_jobs with ai_pending rows the
+    in-process worker won't auto-drain. Operators then explicitly enqueue
+    enrichment via POST /semantic/jobs (which publishes
+    semantic_job.enqueued).
     """
     ensure_graph_snapshot_schema(conn)
     root = Path(project_root).resolve()
@@ -1370,6 +1380,7 @@ def run_pending_scope_reconcile_candidate(
         semantic_selector_match=effective_semantic_selector_match,
         semantic_include_structural=semantic_include_structural,
         semantic_config_path=semantic_config_path,
+        semantic_enqueue_stale=semantic_enqueue_stale,
         notes_extra={
             "pending_scope_reconcile": {
                 "covered_commit_shas": covered,
@@ -1379,6 +1390,7 @@ def run_pending_scope_reconcile_candidate(
                 "semantic_selector_defaulted_to_changed_files": bool(
                     changed_files and not has_semantic_selector_override
                 ),
+                "semantic_enqueue_stale": bool(semantic_enqueue_stale),
             }
         },
     )
@@ -1403,6 +1415,7 @@ def run_pending_scope_reconcile_candidate(
         "active_snapshot_id": active.get("snapshot_id", ""),
         "active_graph_commit": active.get("commit_sha", ""),
         "scope_file_delta": scope_file_delta,
+        "semantic_enqueue_stale": bool(semantic_enqueue_stale),
     }
     row = conn.execute(
         "SELECT notes FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",

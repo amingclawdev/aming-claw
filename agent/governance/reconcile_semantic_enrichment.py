@@ -2368,6 +2368,7 @@ def run_semantic_enrichment(
     trace_dir: str | Path | None = None,
     persist_feature_payloads: bool = True,
     submit_for_review: bool = False,
+    enqueue_stale: bool = True,
 ) -> dict[str, Any]:
     """Create semantic companion artifacts for a graph snapshot.
 
@@ -2380,6 +2381,15 @@ def run_semantic_enrichment(
     projection blind until an operator accepts via /feedback/decision with
     action="accept_semantic_enrichment". Default False preserves the existing
     reconcile-chain behavior (immediate ai_complete + observed events).
+
+    OPT-BACKLOG-MATERIALIZE-NO-WORKER-NOTIFY: when `enqueue_stale=False`, the
+    function still carries forward existing semantic state (so the projection
+    keeps showing prior enrichment) but does NOT write fresh ai_pending rows
+    for stale nodes selected for AI. Default True preserves the legacy
+    "queue everything stale" behavior used by full reconcile cycles. The
+    dashboard's /reconcile/pending-scope handler flips this to False so an
+    operator-driven catchup doesn't silently fill graph_semantic_jobs with
+    work the worker won't auto-drain.
     """
     ensure_schema(conn)
     snapshot = get_graph_snapshot(conn, project_id, snapshot_id)
@@ -2622,7 +2632,14 @@ def run_semantic_enrichment(
     projection_current_ids = _projection_current_node_ids(
         conn, project_id, semantic_base_snapshot_id
     ) if semantic_state_enabled else set()
-    if semantic_state_enabled:
+    # OPT-BACKLOG-MATERIALIZE-NO-WORKER-NOTIFY: the auto-enqueue below writes
+    # ai_pending rows for every stale node when use_ai=False (the dashboard's
+    # incremental reconcile path). The MF-016 worker doesn't auto-drain those
+    # rows because no semantic_job.enqueued event fires from this code path,
+    # so the rows sit silently until an operator manually triggers POST
+    # /semantic/jobs. Skip the whole block when the caller said
+    # enqueue_stale=False — they want operator-driven enqueueing instead.
+    if semantic_state_enabled and enqueue_stale:
         for record in records:
             if not record.get("selected_for_ai"):
                 continue
