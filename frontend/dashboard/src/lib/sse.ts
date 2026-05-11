@@ -118,6 +118,13 @@ export function useEventStream(
         "gate.satisfied",
         "backfill.promoted",
         "rollback.executed",
+        // MF 2026-05-11 state-transition coverage — worker AI lifecycle.
+        "semantic_job.enqueued",
+        "semantic_node.running",
+        "semantic_node.proposed",
+        "edge_semantic.running",
+        "edge_semantic.proposed",
+        "snapshot.activated",
       ];
       for (const n of known) es.addEventListener(n, dispatch);
       es.onmessage = dispatch;
