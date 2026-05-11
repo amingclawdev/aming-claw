@@ -2,6 +2,11 @@ import type { HealthResponse, StatusResponse } from "../types";
 
 export type ReconcilePhase =
   | "idle"
+  // "queueing" used to be a visible step but the queue API call is too
+  // fast for the chip to mean anything — operator just saw it flash by.
+  // App.tsx now starts at "materializing"; the union keeps queueing for
+  // any older callers that haven't migrated, but PHASE_STEPS no longer
+  // surfaces it.
   | "queueing"
   | "materializing"
   | "rebuilding"
@@ -92,8 +97,11 @@ export default function StaleGraphBanner({
   );
 }
 
+// Operator-visible steps. `queueing` is intentionally not here — the
+// queue API completes in ~100ms and the chip just flashed by, adding
+// no signal. Phase=queueing maps to currentIdx=-1, which the label
+// fallback below treats as "Starting…" until materializing fires.
 const PHASE_STEPS: { id: ReconcilePhase; label: string }[] = [
-  { id: "queueing", label: "Queueing" },
   { id: "materializing", label: "Build snapshot" },
   { id: "rebuilding", label: "Rebuild projection" },
   { id: "done", label: "Done" },
@@ -119,6 +127,8 @@ function ReconcileProgress({
     ? "Failed"
     : phase === "done"
     ? "Done"
+    : phase === "queueing"
+    ? "Starting…"
     : PHASE_STEPS[currentIdx]?.label ?? "Running";
 
   return (

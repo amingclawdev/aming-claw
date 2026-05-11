@@ -169,7 +169,10 @@ export default function App() {
     );
     if (!ok) return;
     setReconcileBusy(true);
-    setReconcilePhase("queueing");
+    // Skip the "queueing" phase chip — the queue API call is ~100ms and the
+    // visible step just flashed by. Start at "materializing" which covers
+    // the queue + build round-trip from the operator's POV.
+    setReconcilePhase("materializing");
     setReconcileDetail(`target ${headCommit.slice(0, 7)}`);
     try {
       // Step 1: enqueue the pending-scope row.
