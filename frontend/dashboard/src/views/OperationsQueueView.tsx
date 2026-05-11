@@ -68,10 +68,8 @@ export default function OperationsQueueView({
       </div>
 
       {/* Compact KPI strip — four cells for the four numbers the operator
-          actually scans for. Bulk-cancel actions live in a separate slot at
-          the right of the strip so they sit next to Queued instead of being
-          buried inside a per-type KPI sub line. The slot wraps below when
-          the viewport is narrow. */}
+          actually scans for. Bulk-cancel actions live next to the Queued
+          section header (not in the strip), per operator feedback. */}
       <div className="ops-kpi-strip">
         {Object.entries(byType).map(([k, v]) => (
           <div className="ops-kpi" key={`type-${k}`}>
@@ -90,25 +88,6 @@ export default function OperationsQueueView({
           <div className="ops-kpi-value">{runningCount}</div>
           <div className="ops-kpi-sub">in flight</div>
         </div>
-        {/* Right-side action slot. Renders one chip per type with queued
-            work so the operator can drain queues per type. At narrow widths
-            the .ops-kpi-strip grid wraps and this slot drops below. */}
-        {onCancelAllByType ? (
-          <div className="ops-kpi-actions">
-            {(["edge_semantic", "node_semantic"] as const)
-              .filter((t) => hasQueuedOrRunning(rows, t))
-              .map((t) => (
-                <button
-                  key={`cancel-${t}`}
-                  className="action-btn action-btn-danger"
-                  title={`POST /semantic/jobs/cancel-all (operation_type=${t}, status=queued)`}
-                  onClick={() => onCancelAllByType(t)}
-                >
-                  cancel queued {t === "edge_semantic" ? "edges" : "nodes"}
-                </button>
-              ))}
-          </div>
-        ) : null}
       </div>
 
       {/* Running + Queued always render so the operator can see "0 in flight"
@@ -128,6 +107,24 @@ export default function OperationsQueueView({
         rows={queuedRows}
         emptyMsg="No tasks queued."
         onCancelOperation={onCancelOperation}
+        headerExtra={
+          onCancelAllByType ? (
+            <div style={{ display: "flex", gap: 6 }}>
+              {(["edge_semantic", "node_semantic"] as const)
+                .filter((t) => hasQueuedOrRunning(rows, t))
+                .map((t) => (
+                  <button
+                    key={`cancel-${t}`}
+                    className="action-btn action-btn-danger"
+                    title={`POST /semantic/jobs/cancel-all (operation_type=${t}, status=queued)`}
+                    onClick={() => onCancelAllByType(t)}
+                  >
+                    cancel queued {t === "edge_semantic" ? "edges" : "nodes"}
+                  </button>
+                ))}
+            </div>
+          ) : null
+        }
       />
 
       <QueueSection

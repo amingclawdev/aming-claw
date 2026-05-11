@@ -677,8 +677,13 @@ a:hover { text-decoration: underline; }
 /* ---------- Main view shell ---------- */
 
 .view {
+  /* Centered with a comfortable cap. The dashboard's primary user has a
+     2048px-wide screen — without margin auto the content hugs the left
+     side and leaves ~700px of dead space on the right. 1600px keeps line
+     length sane for tables and KPI strips. */
   padding: 18px 24px 36px;
-  max-width: 1320px;
+  max-width: 1600px;
+  margin: 0 auto;
 }
 
 .view-head {
@@ -788,25 +793,6 @@ a:hover { text-decoration: underline; }
   flex-wrap: wrap;
 }
 
-.ops-kpi-action {
-  color: var(--red-fg);
-  font-weight: 500;
-  cursor: pointer;
-}
-.ops-kpi-action:hover { text-decoration: underline; }
-
-/* Right-side action slot in the KPI strip. Holds per-type "cancel queued
-   N" buttons. Vertically aligned with the KPI cells; wraps below when the
-   grid runs out of horizontal room. */
-.ops-kpi-actions {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 6px;
-  padding: 4px 0;
-  min-width: 0;
-}
-.ops-kpi-actions:empty { display: none; }
 
 /* ---------- Score + count cards ---------- */
 
