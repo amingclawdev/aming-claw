@@ -83,4 +83,22 @@ After commit:
 
 ## Result
 
-(filled at the end)
+**RESTORED** — edge AI enrich path no longer feeds empty edge_context to the
+AI; edge cancel no longer 500s.
+
+- MF commit: `24170de` (branch `frontend/dashboard-p0`).
+  Carries `Chain-Source-Stage: observer-hotfix` trailer per R11.
+- Tests: 3 new + 57 existing in
+  `agent/tests/test_graph_governance_api.py` and
+  `agent/tests/test_reconcile_semantic_config.py` — all 60 pass.
+- Post-commit preflight (2026-05-11T14:51Z): `ok: true`, blockers `[]`.
+  Warnings unchanged from Phase 0 baseline (297 orphan pending, 91
+  unmapped files, 208 stale worktrees — all pre-existing).
+- `chain_version` / `git_head` still report `4fe7f61` from preflight
+  because the running governance service is reading the **main** repo,
+  not this dashboard branch. The MF commit is on `frontend/dashboard-p0`
+  and will roll up to chain when the branch merges. No chain drift.
+- Backlog partial closure: `task-1778510544-d048e8` —
+  Bugs 1 + 3 fixed. Bugs 2 (wrong output_schema for edge prompts) and
+  4 (no SSE event on edge worker transition) remain open on that row.
+- MF closure task: (filed in next step — see task_create result).
