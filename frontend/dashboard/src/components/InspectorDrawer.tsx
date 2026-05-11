@@ -585,10 +585,6 @@ function OverviewTab({
           </div>
         </section>
       ) : null}
-
-      {(node.metadata?.functions?.length ?? 0) > 0 ? (
-        <FunctionsSection node={node} />
-      ) : null}
     </>
   );
 }
@@ -1456,23 +1452,30 @@ function selectQueueGroups(
   });
 }
 
-// Functions tab — for L7 leaves shows metadata.functions with line ranges
-// when function_lines is present. For containers / L4 falls back to a
-// helpful "n/a" message describing why.
+// Functions tab — for L7 leaves with functions, hands off to FunctionsSection
+// so the rich "jump to <editor>" links are reused. For L4 / no-function
+// cases falls back to a helpful "n/a" message explaining why.
 function NodeFunctionsTab({ node }: { node: NodeRecord }) {
   const functions = node.metadata?.functions ?? [];
-  const lines = node.metadata?.function_lines ?? {};
   const isL4 = node.layer === "L4";
-  return (
-    <section className="inspector-section">
-      <div className="inspector-section-title">
-        Functions <span className="head-hint">{functions.length}</span>
-      </div>
-      {isL4 ? (
+  if (isL4) {
+    return (
+      <section className="inspector-section">
+        <div className="inspector-section-title">
+          Functions <span className="head-hint">0</span>
+        </div>
         <div className="empty">
           L4 nodes are state / contract / asset / config — no function definitions.
         </div>
-      ) : functions.length === 0 ? (
+      </section>
+    );
+  }
+  if (functions.length === 0) {
+    return (
+      <section className="inspector-section">
+        <div className="inspector-section-title">
+          Functions <span className="head-hint">0</span>
+        </div>
         <div className="empty">
           No functions captured for this node.
           <div className="empty-hint">
@@ -1480,36 +1483,12 @@ function NodeFunctionsTab({ node }: { node: NodeRecord }) {
             files are scanned and symbols are extracted.
           </div>
         </div>
-      ) : (
-        <ul className="link-list">
-          {functions.map((fn) => {
-            const pair = lines[fn];
-            return (
-              <li key={fn}>
-                <div
-                  className="link-row"
-                  style={{
-                    flexDirection: "row",
-                    alignItems: "baseline",
-                    justifyContent: "space-between",
-                    gap: 8,
-                    padding: "4px 6px",
-                  }}
-                >
-                  <span className="mono" style={{ fontSize: 12 }}>{fn}</span>
-                  {pair ? (
-                    <span className="mono" style={{ fontSize: 10.5, color: "var(--ink-400)" }}>
-                      L{pair[0]}-{pair[1]}
-                    </span>
-                  ) : null}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </section>
-  );
+      </section>
+    );
+  }
+  // Populated → reuse FunctionsSection so the editor-jump UI stays consistent
+  // with the rest of the inspector. Single source of truth for function rows.
+  return <FunctionsSection node={node} />;
 }
 
 // Problems tab — explains the feature-health deductions for this node.
