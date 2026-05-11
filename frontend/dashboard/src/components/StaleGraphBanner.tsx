@@ -93,10 +93,10 @@ export default function StaleGraphBanner({
 }
 
 const PHASE_STEPS: { id: ReconcilePhase; label: string }[] = [
-  { id: "queueing", label: "排队" },
-  { id: "materializing", label: "构建快照" },
-  { id: "rebuilding", label: "重建投影" },
-  { id: "done", label: "完成" },
+  { id: "queueing", label: "Queueing" },
+  { id: "materializing", label: "Build snapshot" },
+  { id: "rebuilding", label: "Rebuild projection" },
+  { id: "done", label: "Done" },
 ];
 
 function ReconcileProgress({
@@ -116,16 +116,16 @@ function ReconcileProgress({
     ? ((currentIdx + 1) / PHASE_STEPS.length) * 100
     : 0;
   const phaseLabel = isError
-    ? "失败"
+    ? "Failed"
     : phase === "done"
-    ? "完成"
-    : PHASE_STEPS[currentIdx]?.label ?? "运行中";
+    ? "Done"
+    : PHASE_STEPS[currentIdx]?.label ?? "Running";
 
   return (
     <div className="banner-reconcile">
       <div className="banner-reconcile-head">
         <span className="banner-reconcile-status">
-          {phase === "done" ? "Reconcile complete" : isError ? "Reconcile failed" : "Reconcile 中…"}
+          {phase === "done" ? "Reconcile complete" : isError ? "Reconcile failed" : "Reconcile in progress…"}
         </span>
         <span className="banner-reconcile-phase mono">
           {phaseLabel}

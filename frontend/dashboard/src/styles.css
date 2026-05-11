@@ -2984,7 +2984,7 @@ svg.graph-svg path.ghit:hover {
 .link-btn:hover { filter: brightness(0.85); }
 
 /* Review Queue · clickable target chip. Renders the node id as a pill that
-   reads as "this jumps to the graph". Hover reveals the 查看详情 hint inline,
+   reads as "this jumps to the graph". Hover reveals the View-details hint inline,
    so the affordance is discoverable without crowding the default state. */
 .target-link {
   display: inline-flex;

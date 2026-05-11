@@ -104,12 +104,12 @@ export default function ReviewQueueView({
                         {isNode && onOpenNodeInGraph ? (
                           <button
                             className="target-link"
-                            title={`查看详情 · 在图中定位 ${g.target_id}`}
+                            title={`View details · open ${g.target_id} in the graph`}
                             onClick={() => onOpenNodeInGraph(g.target_id)}
                           >
                             <span className="mono target-link-id">{g.target_id}</span>
                             <span className="target-link-arrow" aria-hidden>↗</span>
-                            <span className="target-link-hint">查看详情</span>
+                            <span className="target-link-hint">View details</span>
                           </button>
                         ) : (
                           <span className="mono">{g.target_id}</span>

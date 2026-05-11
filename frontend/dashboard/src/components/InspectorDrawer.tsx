@@ -293,7 +293,7 @@ function OverviewTab({
         <section className="drawer-review-banner">
           <div className="drawer-review-banner-head">
             <span className="drawer-review-banner-title">
-              ⚖ 待审核语义 · {pendingReview.target_id}
+              ⚖ Pending semantic review · {pendingReview.target_id}
             </span>
             <span className="mono" style={{ fontSize: 10.5, color: "var(--ink-400)" }}>
               {pendingReview.representative_feedback_id}
