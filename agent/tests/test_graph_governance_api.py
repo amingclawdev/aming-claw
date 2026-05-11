@@ -556,6 +556,183 @@ def test_graph_governance_semantic_jobs_endpoint_records_edge_requests_as_events
     assert payload["events"][0]["payload"]["edge_context"]["edge_id"] == "L7.1->L3.1:contains"
 
 
+def test_semantic_jobs_edge_targets_hydrates_edge_dict_when_only_target_ids_given(conn):
+    """Regression for MF 2026-05-11 / BACKLOG-EDGE-AI-ENRICH-BROKEN bug 1.
+
+    Dashboard sends `target_ids: ["<src>|<dst>|<type>"]` with no `edges` array
+    and no `all_eligible: true`. Previously the backend created
+    {"edge_id": ..., "edge": {}} — an empty edge dict — and the downstream
+    event payload's `edge_context.src/dst/edge_type/evidence` were all empty
+    strings, causing the AI to reply risk=insufficient_context. The fix is
+    to look up the matching edge in the snapshot and hydrate the dict.
+    """
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="edge-targets-hydration",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    # Dashboard sends the pipe-form edge_id. Arrow-form should also work.
+    rows = server._semantic_jobs_edge_targets(
+        {"target_ids": ["L7.1|L7.2|depends_on"]},
+        conn=conn,
+        project_id=PID,
+        snapshot_id=snapshot["snapshot_id"],
+    )
+    assert len(rows) == 1
+    edge = rows[0]["edge"]
+    # Snapshot edges normalize src/dst into `src`/`dst` keys (not source/target).
+    assert (edge.get("src") or edge.get("source")) == "L7.1"
+    assert (edge.get("dst") or edge.get("target")) == "L7.2"
+    assert (edge.get("edge_type") or edge.get("type")) == "depends_on"
+
+    rows_arrow = server._semantic_jobs_edge_targets(
+        {"target_ids": ["L7.1->L7.2:depends_on"]},
+        conn=conn,
+        project_id=PID,
+        snapshot_id=snapshot["snapshot_id"],
+    )
+    assert len(rows_arrow) == 1
+    assert (rows_arrow[0]["edge"].get("src") or rows_arrow[0]["edge"].get("source")) == "L7.1"
+
+    # Unknown edge_id should fall through to {} (graceful, not a crash).
+    rows_missing = server._semantic_jobs_edge_targets(
+        {"target_ids": ["L7.99|L7.999|nonexistent"]},
+        conn=conn,
+        project_id=PID,
+        snapshot_id=snapshot["snapshot_id"],
+    )
+    assert rows_missing == [{"edge_id": "L7.99|L7.999|nonexistent", "edge": {}}]
+
+
+def test_semantic_jobs_endpoint_populates_edge_context_when_only_target_ids_given(conn, tmp_path, monkeypatch):
+    """End-to-end version of the bug-1 fix: confirm the graph_events row
+    emitted by /semantic/jobs has a non-empty edge_context."""
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="edge-context-hydrated",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    status, payload = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "target_ids": ["L7.1|L7.2|depends_on"],
+            },
+        )
+    )
+    assert status == 202
+    assert payload["queued_count"] == 1
+    edge_context = payload["events"][0]["payload"]["edge_context"]
+    assert edge_context["src"] == "L7.1"
+    assert edge_context["dst"] == "L7.2"
+    assert edge_context["edge_type"] == "depends_on"
+    # evidence should also flow through from the snapshot edge row when
+    # present (the fixture sets it to {"source": "test-dependency"}).
+    assert edge_context["evidence"] == {"source": "test-dependency"}
+
+
+def test_semantic_job_cancel_routes_edge_job_to_graph_events(conn, tmp_path, monkeypatch):
+    """Regression for MF 2026-05-11 / BACKLOG-EDGE-AI-ENRICH-BROKEN bug 3.
+
+    Edge jobs live in graph_events, not graph_semantic_jobs. The cancel
+    endpoint used to look up the job_id in graph_semantic_jobs only and
+    raise ValidationError when not found — operator clicks Cancel on an
+    edge job and gets 500. Now the endpoint detects edge-shaped job_id
+    (parseable as `<src>|<dst>|<type>` or arrow form) and updates the
+    matching graph_events row to status=stale.
+    """
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="edge-cancel-test",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+    # Submit the edge job via the public endpoint first.
+    status, _payload = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "target_ids": ["L7.1|L7.2|depends_on"],
+            },
+        )
+    )
+    assert status == 202
+    # Now cancel it — dashboard passes the edge_id as job_id.
+    result = server.handle_graph_governance_snapshot_semantic_job_cancel(
+        _ctx(
+            {
+                "project_id": PID,
+                "snapshot_id": snapshot["snapshot_id"],
+                "job_id": "L7.1|L7.2|depends_on",
+            },
+            method="POST",
+            body={"actor": "dashboard_user"},
+        )
+    )
+    assert result["ok"] is True
+    assert result["job"]["target_scope"] == "edge"
+    assert result["job"]["edge_id"] == "L7.1|L7.2|depends_on"
+    # dashboard-facing status comes from _edge_semantic_job_status, which
+    # maps event_status='stale' back to 'stale'.
+    assert result["job"]["status"] == "stale"
+    assert result["event"]["status"] == graph_events.EVENT_STATUS_STALE
+    # And the counts now reflect the cancellation.
+    assert result["summary"]["by_status"].get("stale", 0) >= 1
+
+
 def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched_edges(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         server,

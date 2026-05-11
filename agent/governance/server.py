@@ -4818,6 +4818,71 @@ def _semantic_edge_id(edge: dict) -> str:
     return f"{src}->{dst}:{edge_type}" if src and dst else ""
 
 
+def _parse_edge_id(edge_id: str) -> tuple[str, str, str] | None:
+    """Parse the two canonical edge_id formats into (src, dst, edge_type).
+
+    Worker emits `<src>-><dst>:<type>` (e.g. `L7.1->L4.1:creates_task`).
+    Dashboard ActionControlPanel emits `<src>|<dst>|<type>`. Both are
+    accepted here so callers don't need to know which producer made the id.
+    Returns None when the string doesn't match either shape.
+    """
+    if not edge_id:
+        return None
+    if "|" in edge_id:
+        parts = edge_id.split("|")
+        if len(parts) == 3 and all(p.strip() for p in parts):
+            return parts[0].strip(), parts[1].strip(), parts[2].strip()
+    if "->" in edge_id and ":" in edge_id:
+        head, _, rest = edge_id.partition("->")
+        dst, _, etype = rest.partition(":")
+        if head.strip() and dst.strip() and etype.strip():
+            return head.strip(), dst.strip(), etype.strip()
+    return None
+
+
+def _lookup_edge_for_hydration(
+    conn: sqlite3.Connection | None,
+    project_id: str,
+    snapshot_id: str,
+    edge_id: str,
+) -> dict:
+    """Fetch the full edge row from the active snapshot so downstream
+    consumers (the AI prompt builder, the event payload) get populated
+    src / dst / edge_type / evidence fields instead of empty strings.
+
+    Returns an empty dict on any lookup failure — caller falls back to
+    its previous behaviour (empty edge_context). The point of this helper
+    is to fix the case where the dashboard sends only target_ids strings
+    and the backend then built an empty edge dict, which silently fed
+    garbage to the AI (it correctly replied risk=insufficient_context).
+    """
+    if conn is None or not project_id or not snapshot_id:
+        return {}
+    parsed = _parse_edge_id(edge_id)
+    if not parsed:
+        return {}
+    src, dst, edge_type = parsed
+    from . import graph_snapshot_store as store
+
+    try:
+        # 5000 is generous — snapshots above that should provide explicit
+        # `edges` payloads, not just target_ids. We only need to find one
+        # row, so we bail early.
+        candidates = store.list_graph_snapshot_edges(
+            conn, project_id, snapshot_id, limit=5000
+        )
+    except Exception:
+        return {}
+    for edge in candidates:
+        if (
+            str(edge.get("src") or edge.get("source") or "").strip() == src
+            and str(edge.get("dst") or edge.get("target") or "").strip() == dst
+            and str(edge.get("edge_type") or edge.get("type") or "").strip() == edge_type
+        ):
+            return edge
+    return {}
+
+
 def _semantic_jobs_edge_targets(
     body: dict,
     *,
@@ -4842,7 +4907,13 @@ def _semantic_jobs_edge_targets(
         or body.get("edge_id")
     ):
         if edge_id and edge_id not in {row["edge_id"] for row in edge_rows}:
-            edge_rows.append({"edge_id": edge_id, "edge": {}})
+            # Hydrate the edge dict from the snapshot so downstream
+            # edge_context.src/dst/edge_type/evidence aren't empty strings.
+            # See _lookup_edge_for_hydration; failures fall back to {}.
+            edge_dict = _lookup_edge_for_hydration(
+                conn, project_id, snapshot_id, edge_id
+            )
+            edge_rows.append({"edge_id": edge_id, "edge": edge_dict})
     if edge_rows:
         return edge_rows
 
@@ -5758,6 +5829,109 @@ def handle_graph_governance_snapshot_semantic_job_get(ctx: RequestContext):
         conn.close()
 
 
+def _semantic_edge_job_status_update(
+    ctx: RequestContext,
+    project_id: str,
+    snapshot_id: str,
+    edge_id: str,
+    *,
+    status: str,
+    action: str,
+):
+    """Cancel / retry for edge semantic jobs.
+
+    Edge jobs are tracked as `edge_semantic_requested` / `edge_semantic_enriched`
+    rows in graph_events (not in graph_semantic_jobs which is node-only). The
+    dashboard's job_id for an edge is the edge_id itself (`<src>|<dst>|<type>`).
+
+    Status mapping (dashboard pseudo-status -> graph_events.status):
+        cancelled  -> stale     (operator opted out; mirrors node path that
+                                 emits event_type=semantic_stale on cancel)
+        pending_ai -> observed  (operator wants the worker to re-pick this
+                                 edge; observed is the initial pre-AI state)
+
+    Returns a body shaped like the node cancel/retry response so the
+    dashboard can render the same toast without branching.
+    """
+    from . import graph_events
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    body = ctx.body
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, action)
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        # Map dashboard pseudo-status onto a valid graph_events status.
+        if status == "cancelled":
+            new_event_status = graph_events.EVENT_STATUS_STALE
+        elif status == "pending_ai":
+            new_event_status = graph_events.EVENT_STATUS_OBSERVED
+        else:
+            # Defensive: shouldn't hit, but reject loudly rather than silently
+            # writing an arbitrary string.
+            raise ValidationError(
+                f"unsupported edge semantic job status transition: {status}"
+            )
+        with sqlite_write_lock():
+            events = graph_events.list_events(
+                conn,
+                project_id,
+                snapshot_id,
+                event_types=["edge_semantic_requested", "edge_semantic_enriched"],
+                target_type="edge",
+                target_id=edge_id,
+                limit=50,
+            )
+            if not events:
+                raise ValidationError(
+                    f"edge semantic job not found: {edge_id}"
+                )
+            # Take the most recently emitted event for this edge — list_events
+            # orders by event_seq ASC, so the last entry is the latest.
+            latest = events[-1]
+            updated = graph_events.update_event_status(
+                conn,
+                project_id,
+                snapshot_id,
+                str(latest.get("event_id") or ""),
+                status=new_event_status,
+                actor=str(body.get("actor") or "dashboard_user"),
+                evidence={
+                    "source": "semantic_jobs_api",
+                    "job_action": action.rsplit(".", 1)[-1],
+                    "dashboard_status": status,
+                    "previous_event_status": str(latest.get("status") or ""),
+                },
+            )
+            conn.commit()
+        # Re-derive the dashboard-facing job row from the updated event so the
+        # response shape matches the node cancel path.
+        derived_status = _edge_semantic_job_status(updated)
+        edge_counts = _edge_semantic_job_status_counts(conn, project_id, snapshot_id)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "job": {
+                "job_id": updated.get("event_id", ""),
+                "event_id": updated.get("event_id", ""),
+                "target_scope": "edge",
+                "edge_id": edge_id,
+                "target_id": edge_id,
+                "status": derived_status,
+                "event_status": updated.get("status", ""),
+            },
+            "event": updated,
+            "summary": {
+                "by_status": edge_counts,
+                "progress": _semantic_job_progress(edge_counts),
+            },
+        }
+    finally:
+        conn.close()
+
+
 def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str):
     project_id = ctx.get_project_id()
     snapshot_id = ctx.path_params["snapshot_id"]
@@ -5767,6 +5941,17 @@ def _semantic_job_status_update(ctx: RequestContext, *, status: str, action: str
     from . import reconcile_semantic_enrichment as semantic
     from .db import sqlite_write_lock
     from .errors import ValidationError
+
+    # Edge semantic jobs live in graph_events (event_type='edge_semantic_*')
+    # rather than graph_semantic_jobs — the latter is node-only. The job_id
+    # we receive from the dashboard for an edge job is the edge_id itself
+    # (e.g. `L7.28|L7.106|depends_on`). Detect by id shape and route to the
+    # graph_events update path; otherwise fall through to the original
+    # node-jobs path below.
+    if _parse_edge_id(job_id) is not None:
+        return _semantic_edge_job_status_update(
+            ctx, project_id, snapshot_id, job_id, status=status, action=action
+        )
 
     conn = get_connection(project_id)
     try:
