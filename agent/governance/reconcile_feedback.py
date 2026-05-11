@@ -2063,7 +2063,16 @@ def _normalize_reviewed_item(
     ai_review = ai_review or {}
     if not decision:
         if item.get("feedback_kind") == KIND_NEEDS_OBSERVER_DECISION:
-            decision = "needs_human_signoff"
+            # MF-2026-05-10-016 follow-up: when the caller explicitly says
+            # accept=True (e.g. dashboard accept_semantic_enrichment click),
+            # treat that as the human signoff instead of routing back to
+            # needs_human_signoff. The operator IS the human, the explicit
+            # accept IS the signoff. Without this override the row stays
+            # pending and the dashboard looks like "Accept did nothing".
+            if accept:
+                decision = KIND_PROJECT_IMPROVEMENT
+            else:
+                decision = "needs_human_signoff"
         else:
             decision = item.get("feedback_kind") or "needs_human_signoff"
     if decision not in REVIEW_DECISIONS:
@@ -2836,6 +2845,14 @@ def decide_feedback_items(
         mapped_accept = True
     elif normalized_action == "accept_project_improvement":
         mapped_decision = KIND_PROJECT_IMPROVEMENT
+        mapped_accept = True
+    elif normalized_action == "accept_semantic_enrichment":
+        # MF-2026-05-10-016 follow-up: the operator's accept_semantic_enrichment
+        # click IS the human signoff. Without this mapping the decision falls
+        # through to mapped_accept=False and the row lands in
+        # needs_human_signoff, which the dashboard surfaces as "Accept did
+        # nothing". Map the action to mapped_accept=True so the call is
+        # idempotent regardless of whether the caller also sends accept=true.
         mapped_accept = True
     elif normalized_action == "keep_status_observation":
         mapped_decision = KIND_STATUS_OBSERVATION

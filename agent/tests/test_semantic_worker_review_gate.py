@@ -196,6 +196,48 @@ def test_c_accept_semantic_enrichment_in_decision_actions():
     assert "accept_semantic_enrichment" in reconcile_feedback.FEEDBACK_DECISION_ACTIONS
 
 
+def test_c2_decide_feedback_accept_semantic_enrichment_maps_to_accept_true(
+    conn, tmp_path, monkeypatch,
+):
+    """C2 regression for "Accept does nothing on dashboard":
+    `decide_feedback_items(action="accept_semantic_enrichment")` must map to
+    `accept=True` internally so the row lands at STATUS_ACCEPTED instead of
+    falling through to needs_human_signoff (which the dashboard shows as
+    "still pending"). Previously the action wasn't in the explicit mapping
+    table so mapped_accept defaulted to False."""
+    snap = _create_snapshot_with_node(conn, "accept-decide-1")
+    sid = snap["snapshot_id"]
+    # Submit a feedback row with requires_human_signoff=True (the worker sets
+    # this on needs_observer_decision items by default).
+    submitted = reconcile_feedback.submit_feedback_item(
+        PID, sid,
+        feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+        issue={
+            "issue": "test accept-decide mapping",
+            "target_id": "L7.1",
+            "target_type": "node",
+            "priority": "P3",
+            "evidence": {"node_id": "L7.1", "linked_event_ids": []},
+        },
+        actor="test",
+    )
+    fid = submitted["items"][0]["feedback_id"]
+
+    result = reconcile_feedback.decide_feedback_items(
+        PID, sid, [fid],
+        action="accept_semantic_enrichment",
+        actor="test",
+    )
+    assert result["ok"] is True
+    assert result["decided_count"] == 1
+    item = result["items"][0]
+    assert item["status"] == reconcile_feedback.STATUS_ACCEPTED, (
+        f"accept_semantic_enrichment must land at accepted, got {item['status']}"
+    )
+    assert item["requires_human_signoff"] is False
+    assert item["accepted_by"] == "test"
+
+
 def test_c_accept_helper_flips_node_status_and_event(conn):
     """C: helper transitions pending_review → ai_complete and proposed → accepted."""
     snap = _create_snapshot_with_node(conn, "accept-helper")
