@@ -404,6 +404,89 @@ a:hover { text-decoration: underline; }
   filter: none;
 }
 
+/* MF-016 banner P3 · in-progress reconcile state. Banner expands vertically
+   to fit the progress bar + step chips. */
+.banner-stale-graph-busy { align-items: stretch; padding-top: 8px; padding-bottom: 8px; }
+.banner-reconcile { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.banner-reconcile-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.banner-reconcile-status { font-weight: 600; }
+.banner-reconcile-phase {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(217, 119, 6, 0.14);
+  color: #92400e;
+  font-weight: 600;
+}
+.banner-reconcile-detail {
+  font-size: 11px;
+  color: var(--ink-700);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.banner-reconcile-bar {
+  position: relative;
+  height: 4px;
+  background: rgba(15, 23, 42, 0.08);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.banner-reconcile-bar-fill {
+  height: 100%;
+  background: linear-gradient(to right, #f59e0b 0%, #d97706 100%);
+  transition: width 0.32s ease;
+  border-radius: inherit;
+}
+.banner-reconcile-bar.done .banner-reconcile-bar-fill {
+  background: linear-gradient(to right, #10b981 0%, #059669 100%);
+}
+.banner-reconcile-bar.err .banner-reconcile-bar-fill {
+  background: linear-gradient(to right, #ef4444 0%, #dc2626 100%);
+}
+.banner-reconcile-steps {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+.banner-reconcile-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-400);
+}
+.banner-reconcile-step-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(15, 23, 42, 0.18);
+  border: 1px solid rgba(15, 23, 42, 0.18);
+  transition: background 0.18s, border-color 0.18s, box-shadow 0.18s;
+}
+.banner-reconcile-step.reached .banner-reconcile-step-dot {
+  background: #d97706;
+  border-color: #b45309;
+}
+.banner-reconcile-step.reached { color: #92400e; font-weight: 500; }
+.banner-reconcile-step.active .banner-reconcile-step-dot {
+  background: #fbbf24;
+  border-color: #d97706;
+  box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.28);
+  animation: banner-step-pulse 1.2s ease-in-out infinite;
+}
+@keyframes banner-step-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.28); }
+  50% { box-shadow: 0 0 0 6px rgba(251, 191, 36, 0.10); }
+}
+
 /* ---------- Tree ---------- */
 
 .tree-row {

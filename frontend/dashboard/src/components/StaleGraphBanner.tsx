@@ -1,9 +1,19 @@
 import type { HealthResponse, StatusResponse } from "../types";
 
+export type ReconcilePhase =
+  | "idle"
+  | "queueing"
+  | "materializing"
+  | "rebuilding"
+  | "done"
+  | "error";
+
 interface Props {
   health?: HealthResponse;
   status?: StatusResponse;
   busy: boolean;
+  phase?: ReconcilePhase;
+  phaseDetail?: string;
   onQueueReconcile(): void;
 }
 
@@ -12,33 +22,142 @@ interface Props {
 // a banner and offer manual reconcile. Working-tree dirtiness is NOT inferred
 // here; without an explicit `dirty` flag from the API we don't pretend the
 // scope is stale.
-export default function StaleGraphBanner({ health, status, busy, onQueueReconcile }: Props) {
+//
+// MF-016 banner P3: banner has two display modes —
+// 1. **stale**: HEAD ≠ snapshot. Default state; shows the queue button.
+// 2. **in-progress / just done**: while handleQueueReconcile runs, replace the
+//    button with phase chips + progress bar so the operator can read off what
+//    is happening (queue → materialize → projection rebuild → done).
+//    Banner auto-hides once the stale condition clears (governed by the
+//    snapshot/service commit comparison below).
+export default function StaleGraphBanner({
+  health,
+  status,
+  busy,
+  phase = "idle",
+  phaseDetail = "",
+  onQueueReconcile,
+}: Props) {
   if (!health || !status) return null;
   const serviceVersion = (health.version || "").trim();
   const snapshotCommit = (status.graph_snapshot_commit || "").trim();
   if (!serviceVersion || !snapshotCommit) return null;
-  if (commitsMatch(serviceVersion, snapshotCommit)) return null;
+
+  const stale = !commitsMatch(serviceVersion, snapshotCommit);
+  const inProgress = phase !== "idle";
+  // Keep banner visible briefly after success so the operator can see "done"
+  // before it disappears on the next refresh tick.
+  if (!stale && !inProgress) return null;
 
   return (
-    <div className="banner-stale-graph" role="alert">
-      <span className="banner-icon" aria-hidden="true">!</span>
+    <div
+      className={`banner-stale-graph${inProgress ? " banner-stale-graph-busy" : ""}`}
+      role="alert"
+    >
+      <span className="banner-icon" aria-hidden="true">
+        {phase === "done" ? "✓" : phase === "error" ? "×" : "!"}
+      </span>
       <div className="banner-body">
-        <span className="banner-title">graph snapshot behind runtime</span>{" "}
-        — service is on{" "}
-        <span className="mono">{serviceVersion.slice(0, 7)}</span>, active snapshot was built from{" "}
-        <span className="mono">{snapshotCommit.slice(0, 7)}</span>. Tree counts and semantic scores reflect the
-        snapshot, not the running code.
+        {inProgress ? (
+          <ReconcileProgress phase={phase} detail={phaseDetail} />
+        ) : (
+          <>
+            <span className="banner-title">graph snapshot behind runtime</span>{" "}
+            — service is on <span className="mono">{serviceVersion.slice(0, 7)}</span>,
+            active snapshot was built from{" "}
+            <span className="mono">{snapshotCommit.slice(0, 7)}</span>. Tree counts
+            and semantic scores reflect the snapshot, not the running code.
+          </>
+        )}
       </div>
-      <button
-        className="banner-secondary"
-        onClick={() => navigator.clipboard?.writeText?.(snapshotCommit)}
-        title="Copy snapshot commit"
+      {!inProgress ? (
+        <>
+          <button
+            className="banner-secondary"
+            onClick={() => navigator.clipboard?.writeText?.(snapshotCommit)}
+            title="Copy snapshot commit"
+          >
+            Copy commit
+          </button>
+          <button
+            onClick={onQueueReconcile}
+            disabled={busy}
+            title="Queue + materialize + rebuild projection — runs inline"
+          >
+            {busy ? "Reconcile…" : "Queue scope reconcile"}
+          </button>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+const PHASE_STEPS: { id: ReconcilePhase; label: string }[] = [
+  { id: "queueing", label: "排队" },
+  { id: "materializing", label: "构建快照" },
+  { id: "rebuilding", label: "重建投影" },
+  { id: "done", label: "完成" },
+];
+
+function ReconcileProgress({
+  phase,
+  detail,
+}: {
+  phase: ReconcilePhase;
+  detail: string;
+}) {
+  const isError = phase === "error";
+  const currentIdx = isError
+    ? -1
+    : PHASE_STEPS.findIndex((s) => s.id === phase);
+  const progress = isError
+    ? 100
+    : currentIdx >= 0
+    ? ((currentIdx + 1) / PHASE_STEPS.length) * 100
+    : 0;
+  const phaseLabel = isError
+    ? "失败"
+    : phase === "done"
+    ? "完成"
+    : PHASE_STEPS[currentIdx]?.label ?? "运行中";
+
+  return (
+    <div className="banner-reconcile">
+      <div className="banner-reconcile-head">
+        <span className="banner-reconcile-status">
+          {phase === "done" ? "Reconcile complete" : isError ? "Reconcile failed" : "Reconcile 中…"}
+        </span>
+        <span className="banner-reconcile-phase mono">
+          {phaseLabel}
+        </span>
+        {detail ? (
+          <span className="banner-reconcile-detail">{detail}</span>
+        ) : null}
+      </div>
+      <div
+        className={`banner-reconcile-bar${isError ? " err" : ""}${phase === "done" ? " done" : ""}`}
+        role="progressbar"
+        aria-valuenow={Math.round(progress)}
+        aria-valuemin={0}
+        aria-valuemax={100}
       >
-        Copy commit
-      </button>
-      <button onClick={onQueueReconcile} disabled={busy} title="POST /reconcile/scope (dry-run)">
-        {busy ? "Queueing…" : "Queue scope reconcile"}
-      </button>
+        <div className="banner-reconcile-bar-fill" style={{ width: `${progress}%` }} />
+      </div>
+      <div className="banner-reconcile-steps">
+        {PHASE_STEPS.map((s, i) => {
+          const reached = !isError && currentIdx >= i;
+          const active = !isError && currentIdx === i && phase !== "done";
+          return (
+            <span
+              key={s.id}
+              className={`banner-reconcile-step${reached ? " reached" : ""}${active ? " active" : ""}`}
+            >
+              <span className="banner-reconcile-step-dot" aria-hidden />
+              <span className="banner-reconcile-step-label">{s.label}</span>
+            </span>
+          );
+        })}
+      </div>
     </div>
   );
 }

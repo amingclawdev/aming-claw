@@ -57,6 +57,12 @@ export default function App() {
   const [actionPanelPrefill, setActionPanelPrefill] = useState<Partial<BacklogDraft> | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [reconcileBusy, setReconcileBusy] = useState(false);
+  // MF-016 banner P3: surface reconcile progress inline. Each phase covers a
+  // discrete step the user can read off — no more "did the click do anything?"
+  const [reconcilePhase, setReconcilePhase] = useState<
+    "idle" | "queueing" | "materializing" | "rebuilding" | "done" | "error"
+  >("idle");
+  const [reconcileDetail, setReconcileDetail] = useState<string>("");
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -115,13 +121,14 @@ export default function App() {
       return;
     }
     const ok = window.confirm(
-      `Catch the active graph up to HEAD ${headCommit.slice(0, 7)}? This runs ` +
-        "an incremental scope reconcile (POST /pending-scope + " +
-        "/reconcile/pending-scope with activate=true) and rebuilds the " +
-        "semantic projection so the dashboard reflects the new snapshot.",
+      `Catch the active graph up to HEAD ${headCommit.slice(0, 7)}? Runs the ` +
+        "scope reconcile inline (queue → materialize+activate → projection rebuild). " +
+        "The banner shows live progress.",
     );
     if (!ok) return;
     setReconcileBusy(true);
+    setReconcilePhase("queueing");
+    setReconcileDetail(`target ${headCommit.slice(0, 7)}`);
     try {
       // Step 1: enqueue the pending-scope row.
       const queueRes = await api.queueScopeReconcile({
@@ -134,6 +141,10 @@ export default function App() {
       // .queue_pending_scope_reconcile:2313). Tell the operator clearly that
       // a previously cancelled commit will not re-queue without a new commit.
       if (queueStatus === "waived" || queueStatus === "materialized") {
+        setReconcilePhase("error");
+        setReconcileDetail(
+          `${headCommit.slice(0, 7)} is already ${queueStatus} — make a new commit to re-arm`,
+        );
         setToast({
           kind: "info",
           msg:
@@ -145,6 +156,8 @@ export default function App() {
       }
       // Step 2: materialize + activate in one round-trip (MF-2026-05-10-014).
       // MF-2026-05-10-012's activate hook auto-rebuilds the projection.
+      setReconcilePhase("materializing");
+      setReconcileDetail(`building snapshot for ${headCommit.slice(0, 7)}`);
       const runRes = await api.materializeAndActivatePendingScope({
         target_commit_sha: headCommit,
         semantic_use_ai: false, // rule-based + carry-forward only; no AI billed
@@ -152,15 +165,28 @@ export default function App() {
       });
       const newSid = runRes.snapshot_id || runRes.activation?.snapshot_id || "(unknown)";
       const projection = runRes.activation?.projection_status ?? "(unknown)";
+      setReconcilePhase("rebuilding");
+      setReconcileDetail(`activated ${newSid.slice(0, 20)} · projection ${projection}`);
       setToast({
         kind: "success",
         msg:
           `Scope reconcile complete · snapshot=${newSid.slice(0, 24)} · ` +
           `projection=${projection}. Refreshing dashboard…`,
       });
-      fetchAll();
+      await fetchAll();
+      setReconcilePhase("done");
+      setReconcileDetail(`active snapshot is now ${newSid.slice(0, 20)}`);
+      // Drop the banner status after a short visible window so the operator can
+      // confirm it succeeded; the banner itself will disappear once the stale
+      // condition clears in the refreshed status.
+      window.setTimeout(() => {
+        setReconcilePhase("idle");
+        setReconcileDetail("");
+      }, 4000);
     } catch (e) {
       const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
+      setReconcilePhase("error");
+      setReconcileDetail(msg.slice(0, 120));
       setToast({ kind: "error", msg: `Reconcile failed: ${msg}` });
     } finally {
       setReconcileBusy(false);
@@ -452,6 +478,8 @@ export default function App() {
         health={data?.health}
         status={data?.status}
         busy={reconcileBusy}
+        phase={reconcilePhase}
+        phaseDetail={reconcileDetail}
         onQueueReconcile={handleQueueReconcile}
       />
       <div className="app-body">
