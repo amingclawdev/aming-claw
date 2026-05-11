@@ -2900,6 +2900,60 @@ svg.graph-svg path.ghit:hover {
 }
 .link-btn:hover { filter: brightness(0.85); }
 
+/* Review Queue · clickable target chip. Renders the node id as a pill that
+   reads as "this jumps to the graph". Hover reveals the 查看详情 hint inline,
+   so the affordance is discoverable without crowding the default state. */
+.target-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px 3px 8px;
+  border-radius: 999px;
+  border: 1px solid #c7d2fe;
+  background: linear-gradient(to bottom, #eef2ff 0%, #e0e7ff 100%);
+  color: #3730a3;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1.2;
+  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.target-link:hover {
+  background: linear-gradient(to bottom, #e0e7ff 0%, #c7d2fe 100%);
+  border-color: #a5b4fc;
+  box-shadow: 0 1px 2px rgba(67, 56, 202, 0.18);
+}
+.target-link:focus-visible {
+  outline: 2px solid #818cf8;
+  outline-offset: 2px;
+}
+.target-link-id {
+  font-weight: 600;
+  font-size: 12px;
+}
+.target-link-arrow {
+  font-size: 11px;
+  opacity: 0.7;
+  transform: translateY(-0.5px);
+}
+.target-link-hint {
+  font-size: 10.5px;
+  font-weight: 500;
+  opacity: 0;
+  max-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: opacity 0.14s ease, max-width 0.18s ease, margin-left 0.18s ease;
+}
+.target-link:hover .target-link-hint,
+.target-link:focus-visible .target-link-hint {
+  opacity: 1;
+  max-width: 80px;
+  margin-left: 2px;
+}
+.target-link:hover .target-link-arrow {
+  opacity: 1;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
