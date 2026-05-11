@@ -20,6 +20,29 @@ Use these at session start, after commits, and before closing a backlog row.
 
 For MF work, use the backlog row as the single source of scope, target files, acceptance, and commit evidence.
 
+**HTTP fallback when the MCP backlog tools are not registered on this client**
+(observed 2026-05-10 — `mcp__aming-claw__backlog_*` not exposed by current
+MCP server). Use governance HTTP routes directly:
+
+- `GET  /api/backlog/{project_id}` — list (returns `{bugs: [...], count}`).
+- `GET  /api/backlog/{project_id}/{bug_id}` — fetch one row.
+- `POST /api/backlog/{project_id}/{bug_id}` — upsert. Body fields: `title`,
+  `status` (`OPEN`/`FIXED`/`CLOSED`/...), `priority` (`P0..P3`),
+  `mf_type`, `target_files` (semicolon-joined), `test_files`,
+  `acceptance_criteria` (semicolon-joined sentences), `commit`,
+  `fixed_at`, `details_md`. Pass `"force_admit": true` to skip the AI
+  triage duplicate-check gate when filing a known/intentional row.
+- `POST /api/backlog/{project_id}/{bug_id}/predeclare-mf` — pre-declare MF
+  intent before the commit.
+- `POST /api/backlog/{project_id}/{bug_id}/start-mf` — mark MF in progress.
+- `POST /api/backlog/{project_id}/{bug_id}/close` — close with commit
+  evidence after the MF lands.
+
+**Do not "file" backlog by writing a markdown doc into `docs/dev/`** — the
+canonical store is `backlog_bugs` table behind these routes. The
+`docs/dev/manual-fix-current-*.md` files are session scratch notes, not the
+backlog of record (and `docs/dev/` is gitignored, so they're not committed).
+
 ## Graph Governance
 
 - `graph_status`: active snapshot, graph stale state, pending scope reconcile.

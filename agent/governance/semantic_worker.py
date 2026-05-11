@@ -113,9 +113,13 @@ def _drain(project_id: str, snapshot_id: str) -> None:
                 conn.commit()
                 return
             claim_id = str(claim.get("claim_id") or "")
-            node_ids = claim.get("node_ids") or []
+            # MF-2026-05-10-016 fix: claim_semantic_jobs returns `jobs` (list
+            # of row dicts), not `node_ids`. Extract node_id per row.
+            jobs = claim.get("jobs") or []
+            node_ids = [str(j.get("node_id") or "").strip() for j in jobs if j.get("node_id")]
             if not node_ids:
-                log.debug("semantic_worker: nothing claimed %s/%s", project_id, snapshot_id)
+                log.info("semantic_worker: nothing claimed %s/%s (claim_id=%s claimed_count=%d)",
+                         project_id, snapshot_id, claim_id, int(claim.get("claimed_count") or 0))
                 return
             log.info("semantic_worker: claim_id=%s node_ids=%s",
                      claim_id, list(node_ids)[:5])

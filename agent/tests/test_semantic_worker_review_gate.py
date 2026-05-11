@@ -105,6 +105,41 @@ def test_a_persist_submit_for_review_writes_pending_review_status(conn):
     )
 
 
+def test_a2_submit_for_review_skips_carried_forward_rows(conn):
+    """A2 (regression for the 2026-05-10 first-run scoping spillover):
+    `submit_for_review=True` must NOT flip rows that came from
+    `_carry_forward_semantic_graph_state` (have `carried_forward_from_snapshot_id`
+    set). Those were already accepted in a prior snapshot — the worker just
+    happens to call run_semantic_enrichment with the gate flag for the freshly
+    enriched ones, and the persistence layer has to scope the override correctly.
+    """
+    snap = _create_snapshot_with_node(conn, "carry-forward-scope")
+    sid = snap["snapshot_id"]
+    state = {
+        "node_semantics": {
+            "L7.1": {
+                # Marker put on the entry by _carry_forward_semantic_graph_state.
+                "carried_forward_from_snapshot_id": "scope-prev",
+                "status": "ai_complete",
+                "feature_hash": "sha256:carried",
+                "semantic_summary": "carried",
+            }
+        }
+    }
+    semantic._persist_semantic_state_to_db(
+        conn, PID, sid, state, submit_for_review=True,
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT status FROM graph_semantic_nodes WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'",
+        (PID, sid),
+    ).fetchone()
+    assert row["status"] == "ai_complete", (
+        "carried-forward rows must keep their original status even when the "
+        "caller asked for submit_for_review — the gate is only for fresh enrichment"
+    )
+
+
 def test_b_backfill_maps_pending_review_to_proposed_event(conn):
     """B: backfill writes PROPOSED event for pending_review rows."""
     snap = _create_snapshot_with_node(conn, "backfill-review")

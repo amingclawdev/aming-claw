@@ -1163,7 +1163,17 @@ def _persist_semantic_state_to_db(
     for node_id, raw_entry in node_semantics.items():
         if not isinstance(raw_entry, dict):
             continue
-        row_status = "pending_review" if submit_for_review else str(raw_entry.get("status") or "")
+        # MF-2026-05-10-016 scoping: submit_for_review only affects rows that
+        # were freshly enriched in this run. Carried-forward rows (those with
+        # `carried_forward_from_snapshot_id` set by _carry_forward_semantic_graph_state)
+        # keep their original status — they were already accepted in a prior
+        # snapshot and don't need re-review just because the worker happened
+        # to call run_semantic_enrichment.
+        is_carried_forward = bool(raw_entry.get("carried_forward_from_snapshot_id"))
+        if submit_for_review and not is_carried_forward:
+            row_status = "pending_review"
+        else:
+            row_status = str(raw_entry.get("status") or "")
         conn.execute(
             """
             INSERT INTO graph_semantic_nodes
