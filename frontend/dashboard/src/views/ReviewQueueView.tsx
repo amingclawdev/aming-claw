@@ -7,6 +7,7 @@ interface Props {
   onDecide?: (feedbackIds: string[], action: string, summaryHint?: string) => void;
   onRetry?: (feedbackIds: string[], nodeId: string, rationale: string) => Promise<void> | void;
   onOpenNodeInGraph?: (nodeId: string) => void;
+  onOpenEdgeInGraph?: (edgeId: string) => void;
 }
 
 // MF-2026-05-10-016 P2: per-item review surface with clickable target +
@@ -19,6 +20,7 @@ export default function ReviewQueueView({
   onDecide,
   onRetry,
   onOpenNodeInGraph,
+  onOpenEdgeInGraph,
 }: Props) {
   const s = feedback.summary;
   const groups = feedback.groups ?? [];
@@ -106,6 +108,16 @@ export default function ReviewQueueView({
                             className="target-link"
                             title={`View details · open ${g.target_id} in the graph`}
                             onClick={() => onOpenNodeInGraph(g.target_id)}
+                          >
+                            <span className="mono target-link-id">{g.target_id}</span>
+                            <span className="target-link-arrow" aria-hidden>↗</span>
+                            <span className="target-link-hint">View details</span>
+                          </button>
+                        ) : g.target_type === "edge" && onOpenEdgeInGraph ? (
+                          <button
+                            className="target-link"
+                            title={`View details · pin edge ${g.target_id} in the graph`}
+                            onClick={() => onOpenEdgeInGraph(g.target_id)}
                           >
                             <span className="mono target-link-id">{g.target_id}</span>
                             <span className="target-link-arrow" aria-hidden>↗</span>

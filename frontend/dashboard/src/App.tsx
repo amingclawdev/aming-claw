@@ -355,6 +355,43 @@ export default function App() {
     [],
   );
 
+  // MF-016 P3 follow-up: edge feedback rows use target_id of the form
+  // `<src>-><dst>:<type>` (e.g. "L7.1->L4.1:creates_task"). Parse it and pin
+  // the matching edge on the graph view so clicking the Review Queue chip
+  // jumps the same way node clicks do.
+  const handleSelectEdgeFromReview = useCallback(
+    (edgeId: string) => {
+      const arrowIdx = edgeId.indexOf("->");
+      if (arrowIdx < 0) {
+        setToast({ kind: "error", msg: `Cannot parse edge id ${edgeId}` });
+        return;
+      }
+      const src = edgeId.slice(0, arrowIdx);
+      const rest = edgeId.slice(arrowIdx + 2);
+      const colonIdx = rest.indexOf(":");
+      const dst = colonIdx >= 0 ? rest.slice(0, colonIdx) : rest;
+      const type = colonIdx >= 0 ? rest.slice(colonIdx + 1) : "";
+      // Look up the real edge record so confidence/evidence/direction come
+      // from the live graph instead of being blanked out on the pin.
+      const real = data?.edges.find(
+        (e) =>
+          e.src === src && e.dst === dst && (e.type === type || e.edge_type === type),
+      );
+      setSelectedNodeId(null);
+      setPinnedEdge({
+        src,
+        dst,
+        type: type || real?.type || real?.edge_type || "",
+        evidence: real?.evidence,
+        direction: real?.direction,
+        confidence: real?.confidence,
+      });
+      setView("graph");
+      setDrawerTab("overview");
+    },
+    [data],
+  );
+
   const handleCancelOperation = useCallback(
     async (opType: string, opId: string, targetId: string) => {
       const snapshotId = data?.status?.active_snapshot_id;
@@ -557,6 +594,7 @@ export default function App() {
               onDecide={handleFeedbackDecision}
               onRetry={handleFeedbackRetry}
               onOpenNodeInGraph={handleSelectNodeFromReview}
+              onOpenEdgeInGraph={handleSelectEdgeFromReview}
             />
           ) : null}
           {!data && !error ? (
