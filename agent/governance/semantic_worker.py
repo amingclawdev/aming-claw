@@ -431,7 +431,6 @@ def on_semantic_job_enqueued(payload: Any) -> None:
             _get_executor().submit(_drain_edge, project_id, snapshot_id)
         else:
             _get_executor().submit(_drain_node, project_id, snapshot_id)
-        _get_executor().submit(_drain, project_id, snapshot_id)
     except Exception as exc:  # noqa: BLE001 - listener must not raise
         log.exception("semantic_worker: on_semantic_job_enqueued failed: %s", exc)
 
