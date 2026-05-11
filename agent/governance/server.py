@@ -5677,6 +5677,67 @@ def _semantic_edge_id_variants(edge_id: str) -> list[str]:
     return deduped
 
 
+def _parse_edge_id(edge_id: str) -> tuple[str, str, str] | None:
+    """Parse the two canonical edge_id formats into (src, dst, edge_type).
+
+    Worker emits `<src>-><dst>:<type>` (e.g. `L7.1->L4.1:creates_task`).
+    Dashboard ActionControlPanel emits `<src>|<dst>|<type>`. Both accepted.
+    Returns None when the string doesn't match either shape.
+    """
+    if not edge_id:
+        return None
+    if "|" in edge_id:
+        parts = edge_id.split("|")
+        if len(parts) == 3 and all(p.strip() for p in parts):
+            return parts[0].strip(), parts[1].strip(), parts[2].strip()
+    if "->" in edge_id and ":" in edge_id:
+        head, _, rest = edge_id.partition("->")
+        dst, _, etype = rest.partition(":")
+        if head.strip() and dst.strip() and etype.strip():
+            return head.strip(), dst.strip(), etype.strip()
+    return None
+
+
+def _lookup_edge_for_hydration(
+    conn: sqlite3.Connection | None,
+    project_id: str,
+    snapshot_id: str,
+    edge_id: str,
+) -> dict:
+    """Fetch the full edge row from the active snapshot so downstream
+    consumers (the AI prompt builder, the event payload) get populated
+    src / dst / edge_type / evidence fields instead of empty strings.
+
+    Returns an empty dict on any lookup failure — caller falls back to
+    its previous behaviour (empty edge_context). The point of this helper
+    is to fix the case where the dashboard sends only target_ids strings
+    and the backend then built an empty edge dict, which silently fed
+    garbage to the AI (it correctly replied risk=insufficient_context).
+    """
+    if conn is None or not project_id or not snapshot_id:
+        return {}
+    parsed = _parse_edge_id(edge_id)
+    if not parsed:
+        return {}
+    src, dst, edge_type = parsed
+    from . import graph_snapshot_store as store
+
+    try:
+        candidates = store.list_graph_snapshot_edges(
+            conn, project_id, snapshot_id, limit=5000
+        )
+    except Exception:
+        return {}
+    for edge in candidates:
+        if (
+            str(edge.get("src") or edge.get("source") or "").strip() == src
+            and str(edge.get("dst") or edge.get("target") or "").strip() == dst
+            and str(edge.get("edge_type") or edge.get("type") or "").strip() == edge_type
+        ):
+            return edge
+    return {}
+
+
 def _semantic_jobs_edge_targets(
     body: dict,
     *,
@@ -5701,7 +5762,16 @@ def _semantic_jobs_edge_targets(
         or body.get("edge_id")
     ):
         if edge_id and edge_id not in {row["edge_id"] for row in edge_rows}:
-            edge_rows.append({"edge_id": edge_id, "edge": {}})
+            # Hydrate the edge dict from the snapshot so downstream
+            # edge_context.src/dst/edge_type/evidence aren't empty strings.
+            # Previously this appended {"edge_id": ..., "edge": {}} which
+            # caused the AI to reply risk=insufficient_context on every
+            # dashboard-submitted edge enrich. _lookup_edge_for_hydration
+            # falls back to {} when the edge isn't in the snapshot.
+            edge_dict = _lookup_edge_for_hydration(
+                conn, project_id, snapshot_id, edge_id
+            )
+            edge_rows.append({"edge_id": edge_id, "edge": edge_dict})
     if edge_rows:
         return edge_rows
 
