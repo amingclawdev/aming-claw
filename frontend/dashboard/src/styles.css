@@ -3094,6 +3094,24 @@ svg.graph-svg path.ghit:hover {
   padding: 6px 14px;
 }
 
+/* Multi-select header bar: toggle + count badge + batch enrich button. */
+.multi-select-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+}
+.btn-action.multi-on {
+  background: linear-gradient(to bottom, #4f46e5 0%, #4338ca 100%);
+  color: #fff;
+  border-color: #3730a3;
+}
+.btn-action.multi-on .btn-action-icon,
+.btn-action.multi-on .btn-action-badge {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.22);
+}
+
 /* Per-node feature-health dot (prototype port). 6px solid circle, colored
    by healthHex(score). Used in tree rows + drawer + breadcrumb. */
 .pdot {

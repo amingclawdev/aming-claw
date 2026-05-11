@@ -64,6 +64,12 @@ export default function App() {
     "idle" | "queueing" | "materializing" | "rebuilding" | "done" | "error"
   >("idle");
   const [reconcileDetail, setReconcileDetail] = useState<string>("");
+  // Multi-select mode: operator toggles it on to batch-enrich many targets at
+  // once. Graph clicks switch from "pin / select" to "add to bucket". IDs are
+  // prefixed `node:<id>` / `edge:<id>` so the single Set can hold both.
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [multiSelectIds, setMultiSelectIds] = useState<Set<string>>(() => new Set());
+  const [batchEnrichBusy, setBatchEnrichBusy] = useState(false);
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -355,6 +361,93 @@ export default function App() {
     [data, fetchAll],
   );
 
+  // Multi-select handlers
+  const toggleMultiSelect = useCallback((kind: "node" | "edge", id: string) => {
+    setMultiSelectIds((prev) => {
+      const next = new Set(prev);
+      const key = `${kind}:${id}`;
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const clearMultiSelect = useCallback(() => {
+    setMultiSelectIds(new Set());
+  }, []);
+
+  const handleBatchEnrich = useCallback(async () => {
+    const snapshotId = data?.status?.active_snapshot_id;
+    if (!snapshotId) {
+      setToast({ kind: "error", msg: "No active snapshot." });
+      return;
+    }
+    if (multiSelectIds.size === 0) {
+      setToast({ kind: "error", msg: "Pick at least one node or edge first." });
+      return;
+    }
+    const nodeIds: string[] = [];
+    const edgeIds: string[] = [];
+    multiSelectIds.forEach((k) => {
+      const idx = k.indexOf(":");
+      const kind = k.slice(0, idx);
+      const id = k.slice(idx + 1);
+      if (kind === "node") nodeIds.push(id);
+      else if (kind === "edge") edgeIds.push(id);
+    });
+    const ok = window.confirm(
+      `Queue AI enrich for ${nodeIds.length} node(s) and ${edgeIds.length} edge(s)?`,
+    );
+    if (!ok) return;
+    setBatchEnrichBusy(true);
+    try {
+      const summary: string[] = [];
+      if (nodeIds.length > 0) {
+        const res = await api.submitSemanticJob(snapshotId, {
+          job_type: "semantic_enrichment",
+          target_scope: "node",
+          target_ids: nodeIds,
+          options: {
+            target: "nodes",
+            mode: "semanticize",
+            dry_run: false,
+            include_nodes: true,
+          },
+          created_by: "dashboard_user",
+        });
+        summary.push(`nodes ${res.queued_count ?? nodeIds.length}`);
+      }
+      if (edgeIds.length > 0) {
+        const res = await api.submitSemanticJob(snapshotId, {
+          job_type: "semantic_enrichment",
+          target_scope: "edge",
+          target_ids: edgeIds,
+          options: {
+            target: "edges",
+            mode: "semanticize",
+            dry_run: false,
+            include_edges: true,
+          },
+          created_by: "dashboard_user",
+        });
+        summary.push(`edges ${res.queued_count ?? edgeIds.length}`);
+      }
+      setToast({
+        kind: "success",
+        msg: `Batch AI enrich queued · ${summary.join(" · ")}`,
+      });
+      setMultiSelectIds(new Set());
+      // Auto-exit multi-select mode so subsequent clicks behave normally.
+      setMultiSelectMode(false);
+      fetchAll();
+    } catch (e) {
+      const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
+      setToast({ kind: "error", msg: `Batch enrich failed: ${msg}` });
+    } finally {
+      setBatchEnrichBusy(false);
+    }
+  }, [data, multiSelectIds, fetchAll]);
+
   const handleSelectNodeFromReview = useCallback(
     (id: string) => {
       setSelectedNodeId(id);
@@ -471,11 +564,39 @@ export default function App() {
   }, [data, selectedNodeId]);
 
   const handleSelectNode = useCallback((id: string) => {
+    // Tree / drawer / FocusCard navigation always sets focus, even in
+    // multi-select mode — operator needs to be able to position the graph
+    // to pick targets from. Graph-internal clicks use handleGraphSelectNode
+    // which toggles the bucket instead.
     setSelectedNodeId(id);
-    setPinnedEdge(null); // selecting a node implicitly clears the edge pin
-    // Re-route any view to the graph so the focus card + drawer line up.
+    setPinnedEdge(null);
     setView((prev) => (prev === "graph" ? prev : "graph"));
   }, []);
+
+  const handleGraphSelectNode = useCallback(
+    (id: string) => {
+      if (multiSelectMode) {
+        toggleMultiSelect("node", id);
+        return;
+      }
+      setSelectedNodeId(id);
+      setPinnedEdge(null);
+    },
+    [multiSelectMode, toggleMultiSelect],
+  );
+
+  const handlePinEdge = useCallback(
+    (edge: PinnedEdge | null) => {
+      if (multiSelectMode && edge) {
+        // Encode the canonical edge id used by the worker / projection
+        // (`<src>-><dst>:<type>`).
+        toggleMultiSelect("edge", `${edge.src}->${edge.dst}:${edge.type}`);
+        return;
+      }
+      setPinnedEdge(edge);
+    },
+    [multiSelectMode, toggleMultiSelect],
+  );
 
   const handleOpenDrawerTab = useCallback((tab: InspectorTabName) => {
     setDrawerTab(tab);
@@ -538,6 +659,15 @@ export default function App() {
         reviewBadge={data?.feedback?.summary?.visible_group_count ?? 0}
         onRefresh={handleRefresh}
         onOpenReview={() => setActionPanelOpen(true)}
+        multiSelectMode={multiSelectMode}
+        multiSelectCount={multiSelectIds.size}
+        batchEnrichBusy={batchEnrichBusy}
+        onToggleMultiSelect={() => {
+          setMultiSelectMode((prev) => !prev);
+          if (multiSelectMode) setMultiSelectIds(new Set());
+        }}
+        onBatchEnrich={handleBatchEnrich}
+        onClearMultiSelect={clearMultiSelect}
       />
       <StaleGraphBanner
         health={data?.health}
@@ -579,8 +709,10 @@ export default function App() {
                   edges={data.edges}
                   selectedNodeId={selectedNodeId}
                   pinnedEdge={pinnedEdge}
-                  onPinEdge={setPinnedEdge}
-                  onSelectNode={handleSelectNode}
+                  onPinEdge={handlePinEdge}
+                  multiSelectMode={multiSelectMode}
+                  multiSelectIds={multiSelectIds}
+                  onSelectNode={handleGraphSelectNode}
                   onOpenDrawerTab={handleOpenDrawerTab}
                   onOpenAction={handleOpenAction}
                 />

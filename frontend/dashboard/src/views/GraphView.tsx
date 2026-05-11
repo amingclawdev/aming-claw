@@ -23,6 +23,11 @@ interface Props {
   onSelectNode(id: string): void;
   onOpenDrawerTab(tab: InspectorTab): void;
   onOpenAction(kind: ActionKind, target: ActionTarget): void;
+  // Multi-select mode — when set, the graph paints selected nodes/edges with
+  // a "✓" highlight and clicks toggle the bucket via onSelectNode /
+  // onPinEdge instead of navigating.
+  multiSelectMode?: boolean;
+  multiSelectIds?: Set<string>;
 }
 
 type GraphMode = "hierarchy" | "relations";
@@ -222,6 +227,8 @@ export default function GraphView({
   onSelectNode,
   onOpenDrawerTab,
   onOpenAction,
+  multiSelectMode = false,
+  multiSelectIds,
 }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -306,6 +313,8 @@ export default function GraphView({
           });
         }
       },
+      multiSelectMode,
+      multiSelectIds: multiSelectIds ?? new Set<string>(),
     };
 
     if (mode === "hierarchy") {
@@ -323,7 +332,19 @@ export default function GraphView({
 
     // Both modes auto-fit so parent chain + focus + neighbors all fit cleanly.
     window.setTimeout(() => fitView(svg, root, zoomBehavior, width, height), 50);
-  }, [focusNode, mode, idx, edges, edgeFilter, onSelectNode]);
+  }, [
+    focusNode,
+    mode,
+    idx,
+    edges,
+    edgeFilter,
+    onSelectNode,
+    multiSelectMode,
+    // Serialize the Set so changing selection re-runs the d3 render to repaint
+    // the ✓ highlight on toggled nodes/edges. Joining keeps the dep array
+    // stable when the Set membership is identical.
+    multiSelectIds ? [...multiSelectIds].sort().join("|") : "",
+  ]);
 
   // ---------- Toolbar handlers ----------
   const toggleEdge = (t: string) =>
@@ -454,6 +475,8 @@ interface RenderArgs {
   onSelectNode(id: string): void;
   onEdgeHover(info: EdgeInfo | null): void;
   onEdgeClick(info: EdgeInfo): void;
+  multiSelectMode: boolean;
+  multiSelectIds: Set<string>;
 }
 
 function renderHierarchy(args: RenderArgs) {
@@ -873,6 +896,9 @@ function drawSvg(args: DrawArgs) {
   // Wipe + redraw shapes (deterministic, fewer than 100 nodes typically in hierarchy mode).
   nodeSel.selectAll("*").remove();
 
+  const multiOn = args.multiSelectMode;
+  const multiSet = args.multiSelectIds;
+
   nodeSel.each(function (d) {
     const g = select<SVGGElement, PlacedNode>(this);
     if (d.role === "more" || d.role === "empty") {
@@ -897,6 +923,27 @@ function drawSvg(args: DrawArgs) {
         .attr("font-family", "JetBrains Mono, ui-monospace, monospace")
         .attr("fill", "var(--ink-500)")
         .text(d.edgeMeta);
+    }
+    // Multi-select highlight: ✓ badge bottom-right when in bucket. Painted
+    // last so it sits on top of the layer pill / health ring.
+    if (multiOn && multiSet.has(`node:${d.node.node_id}`)) {
+      g.append("circle")
+        .attr("class", "gselect-badge")
+        .attr("cx", 18)
+        .attr("cy", -18)
+        .attr("r", 9)
+        .attr("fill", "#4f46e5")
+        .attr("stroke", "#fff")
+        .attr("stroke-width", 2);
+      g.append("text")
+        .attr("class", "gselect-tick")
+        .attr("x", 18)
+        .attr("y", -15)
+        .attr("text-anchor", "middle")
+        .attr("font-size", 11)
+        .attr("font-weight", 700)
+        .attr("fill", "#fff")
+        .text("✓");
     }
     g.append("title").text(`${d.node.node_id} ${d.node.title}${d.edgeMeta ? ` · ${d.edgeMeta}` : ""}`);
   });

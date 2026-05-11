@@ -16,6 +16,16 @@ interface Props {
   reviewBadge?: number;
   onRefresh(): void;
   onOpenReview?(): void;
+  // Multi-select mode (batch AI enrich many nodes/edges at once). When ON,
+  // graph clicks add/remove from a bucket and the header shows the count +
+  // Confirm / Clear / Exit controls. OFF state shows just the "Multi-select"
+  // toggle button.
+  multiSelectMode?: boolean;
+  multiSelectCount?: number;
+  batchEnrichBusy?: boolean;
+  onToggleMultiSelect?(): void;
+  onBatchEnrich?(): void;
+  onClearMultiSelect?(): void;
 }
 
 export default function Header({
@@ -28,6 +38,12 @@ export default function Header({
   reviewBadge,
   onRefresh,
   onOpenReview,
+  multiSelectMode = false,
+  multiSelectCount = 0,
+  batchEnrichBusy = false,
+  onToggleMultiSelect,
+  onBatchEnrich,
+  onClearMultiSelect,
 }: Props) {
   const projectHealth = summary?.health.project_health_score;
   const semanticHealth = summary?.health.semantic_health_score;
@@ -102,6 +118,49 @@ export default function Header({
             <span className="btn-action-badge">{reviewBadge}</span>
           ) : null}
         </button>
+      ) : null}
+
+      {onToggleMultiSelect ? (
+        <div className="multi-select-bar">
+          <button
+            className={`btn-action${multiSelectMode ? " multi-on" : ""}`}
+            onClick={onToggleMultiSelect}
+            title={
+              multiSelectMode
+                ? "Exit multi-select (graph clicks pin / navigate again)"
+                : "Enter multi-select (graph clicks add to batch bucket)"
+            }
+          >
+            <span className="btn-action-icon">{multiSelectMode ? "☑" : "☐"}</span>
+            <span>{multiSelectMode ? "Multi-select on" : "Multi-select"}</span>
+            {multiSelectMode && multiSelectCount > 0 ? (
+              <span className="btn-action-badge">{multiSelectCount}</span>
+            ) : null}
+          </button>
+          {multiSelectMode ? (
+            <>
+              <button
+                className="action-btn action-btn-primary"
+                onClick={onBatchEnrich}
+                disabled={batchEnrichBusy || multiSelectCount === 0}
+                title={`Queue AI enrich for ${multiSelectCount} selected target(s)`}
+                style={{ flex: "initial", padding: "6px 12px", marginLeft: 6 }}
+              >
+                {batchEnrichBusy ? "Queuing…" : `⚡ Enrich ${multiSelectCount}`}
+              </button>
+              {multiSelectCount > 0 ? (
+                <button
+                  className="action-btn"
+                  onClick={onClearMultiSelect}
+                  disabled={batchEnrichBusy}
+                  title="Clear selection (stays in multi-select mode)"
+                >
+                  Clear
+                </button>
+              ) : null}
+            </>
+          ) : null}
+        </div>
       ) : null}
 
       <div className="header-kpis">
