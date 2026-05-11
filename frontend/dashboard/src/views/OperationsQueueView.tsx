@@ -67,38 +67,19 @@ export default function OperationsQueueView({
         </span>
       </div>
 
-      {/* Compact KPI strip — was two stacked sections of huge .score-card grids
-          (By type + Status). At idle the page was 90% empty. Now it's one
-          strip with by-type counts + queue buckets, plus a single-row cancel
-          action chip when there's queued work to drain. */}
+      {/* Compact KPI strip — four cells for the four numbers the operator
+          actually scans for. Bulk-cancel actions live in a separate slot at
+          the right of the strip so they sit next to Queued instead of being
+          buried inside a per-type KPI sub line. The slot wraps below when
+          the viewport is narrow. */}
       <div className="ops-kpi-strip">
-        {Object.entries(byType).map(([k, v]) => {
-          const canCancel =
-            (k === "node_semantic" || k === "edge_semantic") &&
-            !!onCancelAllByType &&
-            hasQueuedOrRunning(rows, k);
-          return (
-            <div className="ops-kpi" key={`type-${k}`}>
-              <div className="ops-kpi-label">{labelOpType(k)}</div>
-              <div className="ops-kpi-value">{v}</div>
-              <div className="ops-kpi-sub">
-                operation_type
-                {canCancel ? (
-                  <>
-                    {" · "}
-                    <button
-                      className="link-btn ops-kpi-action"
-                      title={`POST /semantic/jobs/cancel-all (operation_type=${k}, status=queued)`}
-                      onClick={() => onCancelAllByType!(k as "node_semantic" | "edge_semantic")}
-                    >
-                      cancel all queued
-                    </button>
-                  </>
-                ) : null}
-              </div>
-            </div>
-          );
-        })}
+        {Object.entries(byType).map(([k, v]) => (
+          <div className="ops-kpi" key={`type-${k}`}>
+            <div className="ops-kpi-label">{labelOpType(k)}</div>
+            <div className="ops-kpi-value">{v}</div>
+            <div className="ops-kpi-sub">operation_type</div>
+          </div>
+        ))}
         <div className={`ops-kpi${queuedCount > 0 ? " ops-kpi-amber" : ""}`}>
           <div className="ops-kpi-label">Queued</div>
           <div className="ops-kpi-value">{queuedCount}</div>
@@ -109,29 +90,45 @@ export default function OperationsQueueView({
           <div className="ops-kpi-value">{runningCount}</div>
           <div className="ops-kpi-sub">in flight</div>
         </div>
+        {/* Right-side action slot. Renders one chip per type with queued
+            work so the operator can drain queues per type. At narrow widths
+            the .ops-kpi-strip grid wraps and this slot drops below. */}
+        {onCancelAllByType ? (
+          <div className="ops-kpi-actions">
+            {(["edge_semantic", "node_semantic"] as const)
+              .filter((t) => hasQueuedOrRunning(rows, t))
+              .map((t) => (
+                <button
+                  key={`cancel-${t}`}
+                  className="action-btn action-btn-danger"
+                  title={`POST /semantic/jobs/cancel-all (operation_type=${t}, status=queued)`}
+                  onClick={() => onCancelAllByType(t)}
+                >
+                  cancel queued {t === "edge_semantic" ? "edges" : "nodes"}
+                </button>
+              ))}
+          </div>
+        ) : null}
       </div>
 
-      {/* Running / Queued sections only render the section heading + table
-          when there's something to show. When the queue is empty the strip
-          above already says 0 — no need for a redundant "No tasks running"
-          banner taking 80px each. */}
-      {runningRows.length > 0 ? (
-        <QueueSection
-          title="Running"
-          hint="in flight — cancel disabled, will complete or fail on its own"
-          rows={runningRows}
-          onCancelOperation={onCancelOperation}
-        />
-      ) : null}
+      {/* Running + Queued always render so the operator can see "0 in flight"
+          and "0 queued" at a glance — confirms the worker is idle instead of
+          stuck. Empty banner is tiny (one line). */}
+      <QueueSection
+        title="Running"
+        hint="in flight — cancel disabled, will complete or fail on its own"
+        rows={runningRows}
+        emptyMsg="No tasks running."
+        onCancelOperation={onCancelOperation}
+      />
 
-      {queuedRows.length > 0 ? (
-        <QueueSection
-          title="Queued"
-          hint="waiting in queue order"
-          rows={queuedRows}
-          onCancelOperation={onCancelOperation}
-        />
-      ) : null}
+      <QueueSection
+        title="Queued"
+        hint="waiting in queue order"
+        rows={queuedRows}
+        emptyMsg="No tasks queued."
+        onCancelOperation={onCancelOperation}
+      />
 
       <QueueSection
         title="Suggestions"
@@ -209,7 +206,7 @@ function QueueSection({
         {headerExtra ? <span style={{ marginLeft: "auto" }}>{headerExtra}</span> : null}
       </div>
       {rows.length === 0 ? (
-        emptyMsg ? <div className="empty">{emptyMsg}</div> : null
+        emptyMsg ? <div className="empty empty-compact">{emptyMsg}</div> : null
       ) : (
         <div className="card">
           <table className="table">

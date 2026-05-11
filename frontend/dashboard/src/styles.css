@@ -795,6 +795,19 @@ a:hover { text-decoration: underline; }
 }
 .ops-kpi-action:hover { text-decoration: underline; }
 
+/* Right-side action slot in the KPI strip. Holds per-type "cancel queued
+   N" buttons. Vertically aligned with the KPI cells; wraps below when the
+   grid runs out of horizontal room. */
+.ops-kpi-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  padding: 4px 0;
+  min-width: 0;
+}
+.ops-kpi-actions:empty { display: none; }
+
 /* ---------- Score + count cards ---------- */
 
 .score-grid {
@@ -1080,6 +1093,15 @@ a:hover { text-decoration: underline; }
   background: #fff;
   border: 1px dashed var(--ink-200);
   border-radius: var(--radius-card);
+}
+
+/* Compact empty banner — single-line "Nothing here" status. Used by
+   Operations Queue's Running/Queued sections where the section header
+   already carries the count and we just want a small confirmation. */
+.empty.empty-compact {
+  text-align: left;
+  padding: 8px 12px;
+  font-size: 11.5px;
 }
 
 .empty .empty-hint {
