@@ -1103,8 +1103,9 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
   const r = isFocus ? 26 : 20;
   // Health ring color comes from lib/health.ts feature-health score, matching
   // the tree + drawer + FocusCard. Falls back to semantic-status color when
-  // the node has no _health (L4 leaves render via drawLeaf too).
+  // the node has no _health (L4 assets, package markers, empty placeholders).
   const healthValue = d.node._health ?? null;
+  const assetBinding = d.node._asset_binding ?? null;
   const ringColor = healthValue != null ? healthHex(healthValue) : statusDotFill(d.status);
   // Health ring
   g.append("circle")
@@ -1119,14 +1120,33 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
     .attr("fill", isFocus ? "#eef2ff" : "#ffffff")
     .attr("stroke", isFocus ? "#4f46e5" : "var(--ink-200)")
     .attr("stroke-width", isFocus ? 2.5 : 1.5);
-  // Layer letter
+  // Center label: prefer the actual health score number (red/amber/green by
+  // ring color). The layer letter (L7 / L4) was visually meaningless — the
+  // shape + position + ring already convey layer. Fall back to the layer
+  // letter only when no scoreable signal is available (package markers).
+  const centerText =
+    healthValue != null
+      ? String(healthValue)
+      : assetBinding != null
+        ? String(assetBinding)
+        : d.node.layer;
+  const centerColor =
+    healthValue != null || assetBinding != null ? ringColor : layerFg(d.node.layer);
+  const centerFontSize =
+    healthValue != null || assetBinding != null
+      ? isFocus
+        ? 14
+        : 12
+      : isFocus
+        ? 13
+        : 11;
   g.append("text")
     .attr("text-anchor", "middle")
     .attr("dy", "0.35em")
-    .attr("font-size", isFocus ? 13 : 11)
+    .attr("font-size", centerFontSize)
     .attr("font-weight", 700)
-    .attr("fill", layerFg(d.node.layer))
-    .text(d.node.layer);
+    .attr("fill", centerColor)
+    .text(centerText);
   // Title
   g.append("text")
     .attr("text-anchor", "middle")
@@ -1142,34 +1162,6 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
     .attr("fill", "var(--ink-500)")
     .attr("font-family", "JetBrains Mono, ui-monospace, monospace")
     .text(d.node.node_id);
-  // Per-node health score text under the circle. White rounded rect behind
-  // the number so the score stays readable when the graph is dense and a leaf
-  // sits over an edge line. Bigger font + 700 weight for skimming legibility.
-  if (healthValue != null) {
-    const scoreFontSize = isFocus ? 13 : 12;
-    const scoreText = String(healthValue);
-    const pillW = scoreText.length * (isFocus ? 8 : 7) + 10;
-    const pillH = isFocus ? 16 : 14;
-    g.append("rect")
-      .attr("class", "gscore-pill")
-      .attr("x", -pillW / 2)
-      .attr("y", r + 4)
-      .attr("width", pillW)
-      .attr("height", pillH)
-      .attr("rx", pillH / 2)
-      .attr("ry", pillH / 2)
-      .attr("fill", "#ffffff")
-      .attr("stroke", ringColor)
-      .attr("stroke-width", 1);
-    g.append("text")
-      .attr("class", "gscore")
-      .attr("text-anchor", "middle")
-      .attr("y", r + 4 + pillH / 2 + scoreFontSize / 3)
-      .attr("font-size", scoreFontSize)
-      .attr("font-weight", 700)
-      .attr("fill", ringColor)
-      .text(scoreText);
-  }
 }
 
 function shortTitle(t: string): string {
