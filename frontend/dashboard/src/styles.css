@@ -733,6 +733,68 @@ a:hover { text-decoration: underline; }
 
 .card-padded { padding: 14px 16px; }
 
+/* ---------- Operations queue KPI strip ---------- */
+/* Compact replacement for the old "By type" + "Status" stacked .score-card
+   grids. Four (or so) cells in a single row, neutral by default, accent
+   color when the corresponding bucket is non-zero. */
+
+.ops-kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.ops-kpi {
+  background: #fff;
+  border: 1px solid var(--ink-200);
+  border-left: 3px solid var(--ink-300);
+  border-radius: var(--radius-card);
+  padding: 8px 12px 10px;
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ops-kpi-amber { border-left-color: var(--amber); }
+.ops-kpi-blue  { border-left-color: var(--blue);  }
+
+.ops-kpi-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--ink-500);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.ops-kpi-value {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink-900);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.ops-kpi-sub {
+  font-size: 10.5px;
+  color: var(--ink-500);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.ops-kpi-action {
+  color: var(--red-fg);
+  font-weight: 500;
+  cursor: pointer;
+}
+.ops-kpi-action:hover { text-decoration: underline; }
+
 /* ---------- Score + count cards ---------- */
 
 .score-grid {

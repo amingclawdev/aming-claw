@@ -42,6 +42,15 @@ export default function OperationsQueueView({
     Object.entries(summary?.by_type ?? {}).filter(([k]) => !HIDDEN_OP_TYPES.has(k)),
   );
 
+  const queuedCount = countByBucket(rows, "queued");
+  const runningCount = countByBucket(rows, "running");
+  const runningRows = rows.filter((r) => statusBucket(r.status) === "running");
+  const queuedRows = rows
+    .filter((r) => statusBucket(r.status) === "queued")
+    .slice()
+    .sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+  const suggestionRows = rows.filter((r) => r.status === "not_queued");
+
   return (
     <div className="view">
       <div className="view-head">
@@ -58,77 +67,76 @@ export default function OperationsQueueView({
         </span>
       </div>
 
-      <div className="section">
-        <div className="section-head">By type</div>
-        <div className="score-grid">
-          {Object.entries(byType).map(([k, v]) => {
-            const canCancel =
-              (k === "node_semantic" || k === "edge_semantic") &&
-              !!onCancelAllByType &&
-              hasQueuedOrRunning(rows, k);
-            return (
-              <div className="score-card tone-blue" key={`type-${k}`}>
-                <span className="accent-bar" />
-                <div className="lbl">{labelOpType(k)}</div>
-                <div className="val">{v}</div>
-                <div className="sub">operation_type</div>
+      {/* Compact KPI strip — was two stacked sections of huge .score-card grids
+          (By type + Status). At idle the page was 90% empty. Now it's one
+          strip with by-type counts + queue buckets, plus a single-row cancel
+          action chip when there's queued work to drain. */}
+      <div className="ops-kpi-strip">
+        {Object.entries(byType).map(([k, v]) => {
+          const canCancel =
+            (k === "node_semantic" || k === "edge_semantic") &&
+            !!onCancelAllByType &&
+            hasQueuedOrRunning(rows, k);
+          return (
+            <div className="ops-kpi" key={`type-${k}`}>
+              <div className="ops-kpi-label">{labelOpType(k)}</div>
+              <div className="ops-kpi-value">{v}</div>
+              <div className="ops-kpi-sub">
+                operation_type
                 {canCancel ? (
-                  <button
-                    className="action-btn action-btn-danger"
-                    title={`POST /semantic/jobs/cancel-all (operation_type=${k}, status=queued)`}
-                    style={{ marginTop: 6, alignSelf: "flex-start" }}
-                    onClick={() => onCancelAllByType!(k as "node_semantic" | "edge_semantic")}
-                  >
-                    cancel all queued
-                  </button>
+                  <>
+                    {" · "}
+                    <button
+                      className="link-btn ops-kpi-action"
+                      title={`POST /semantic/jobs/cancel-all (operation_type=${k}, status=queued)`}
+                      onClick={() => onCancelAllByType!(k as "node_semantic" | "edge_semantic")}
+                    >
+                      cancel all queued
+                    </button>
+                  </>
                 ) : null}
               </div>
-            );
-          })}
+            </div>
+          );
+        })}
+        <div className={`ops-kpi${queuedCount > 0 ? " ops-kpi-amber" : ""}`}>
+          <div className="ops-kpi-label">Queued</div>
+          <div className="ops-kpi-value">{queuedCount}</div>
+          <div className="ops-kpi-sub">waiting to run</div>
+        </div>
+        <div className={`ops-kpi${runningCount > 0 ? " ops-kpi-blue" : ""}`}>
+          <div className="ops-kpi-label">Running</div>
+          <div className="ops-kpi-value">{runningCount}</div>
+          <div className="ops-kpi-sub">in flight</div>
         </div>
       </div>
 
-      <div className="section">
-        <div className="section-head">Status</div>
-        <div className="score-grid">
-          <div className="score-card tone-amber" key="status-queued">
-            <span className="accent-bar" />
-            <div className="lbl">Queued</div>
-            <div className="val">{countByBucket(rows, "queued")}</div>
-            <div className="sub">waiting to run</div>
-          </div>
-          <div className="score-card tone-blue" key="status-running">
-            <span className="accent-bar" />
-            <div className="lbl">Running</div>
-            <div className="val">{countByBucket(rows, "running")}</div>
-            <div className="sub">in flight</div>
-          </div>
-        </div>
-      </div>
+      {/* Running / Queued sections only render the section heading + table
+          when there's something to show. When the queue is empty the strip
+          above already says 0 — no need for a redundant "No tasks running"
+          banner taking 80px each. */}
+      {runningRows.length > 0 ? (
+        <QueueSection
+          title="Running"
+          hint="in flight — cancel disabled, will complete or fail on its own"
+          rows={runningRows}
+          onCancelOperation={onCancelOperation}
+        />
+      ) : null}
 
-      <QueueSection
-        title="Running"
-        hint="in flight — cancel disabled, will complete or fail on its own"
-        rows={rows.filter((r) => statusBucket(r.status) === "running")}
-        emptyMsg="No tasks running."
-        onCancelOperation={onCancelOperation}
-      />
-
-      <QueueSection
-        title="Queued"
-        hint="waiting in queue order"
-        rows={rows
-          .filter((r) => statusBucket(r.status) === "queued")
-          .slice()
-          .sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")))}
-        emptyMsg="No tasks queued."
-        onCancelOperation={onCancelOperation}
-      />
+      {queuedRows.length > 0 ? (
+        <QueueSection
+          title="Queued"
+          hint="waiting in queue order"
+          rows={queuedRows}
+          onCancelOperation={onCancelOperation}
+        />
+      ) : null}
 
       <QueueSection
         title="Suggestions"
         hint="not yet queued — actionable hints from the snapshot"
-        rows={rows.filter((r) => r.status === "not_queued")}
+        rows={suggestionRows}
         emptyMsg="No suggestions."
         onCancelOperation={onCancelOperation}
         headerExtra={
@@ -186,7 +194,9 @@ function QueueSection({
   title: string;
   hint?: string;
   rows: OperationRow[];
-  emptyMsg: string;
+  // Optional now — Running/Queued sections skip rendering entirely when empty,
+  // so they don't need a message. Suggestions still passes one through.
+  emptyMsg?: string;
   onCancelOperation?: (opType: string, opId: string, targetId: string) => void;
   headerExtra?: React.ReactNode;
 }) {
@@ -199,7 +209,7 @@ function QueueSection({
         {headerExtra ? <span style={{ marginLeft: "auto" }}>{headerExtra}</span> : null}
       </div>
       {rows.length === 0 ? (
-        <div className="empty">{emptyMsg}</div>
+        emptyMsg ? <div className="empty">{emptyMsg}</div> : null
       ) : (
         <div className="card">
           <table className="table">
