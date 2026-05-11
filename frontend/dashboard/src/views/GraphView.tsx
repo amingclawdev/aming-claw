@@ -9,6 +9,7 @@ import {
   type SemanticStatus,
   type SubtreeAggregate,
 } from "../lib/semantic";
+import { healthHex } from "../lib/health";
 import FocusCard, { type PinnedEdge } from "../components/FocusCard";
 import type { Tab as InspectorTab } from "../components/InspectorDrawer";
 import type { ActionKind, ActionTarget } from "../components/ActionControlPanel";
@@ -1021,7 +1022,11 @@ function drawContainer(g: GroupSel, d: PlacedNode) {
   const w = isFocus ? 132 : 108;
   const h = isFocus ? 54 : 46;
   const fill = isFocus ? "#eef2ff" : "#ffffff";
-  const stroke = isFocus ? "#4f46e5" : statusStroke(d.status);
+  // Container outline color: feature-health rollup if known, falls back to
+  // semantic status when no L7 descendants exist.
+  const healthValue = d.node._health ?? null;
+  const healthColor = healthValue != null ? healthHex(healthValue) : statusStroke(d.status);
+  const stroke = isFocus ? "#4f46e5" : healthColor;
   const strokeWidth = isFocus ? 2.5 : 1.5;
   g.append("rect")
     .attr("x", -w / 2)
@@ -1064,12 +1069,13 @@ function drawContainer(g: GroupSel, d: PlacedNode) {
     .attr("font-weight", 700)
     .attr("fill", layerFg(d.node.layer))
     .text(d.node.layer);
-  // Status dot top-right
+  // Health dot top-right — colored by feature-health rollup so the container
+  // matches the tree's color at a glance.
   g.append("circle")
     .attr("cx", w / 2 - 8)
     .attr("cy", -h / 2 + 9)
     .attr("r", 3.5)
-    .attr("fill", statusDotFill(d.status));
+    .attr("fill", healthValue != null ? healthColor : statusDotFill(d.status));
   // Big number = subtree node count
   g.append("text")
     .attr("text-anchor", "middle")
@@ -1086,17 +1092,34 @@ function drawContainer(g: GroupSel, d: PlacedNode) {
     .attr("letter-spacing", "0.1em")
     .attr("fill", "var(--ink-500)")
     .text("NODES");
+  // Container health rollup score under the layer pill (prototype line 2150
+  // pattern). Hidden for containers with no L7 descendants.
+  if (healthValue != null) {
+    g.append("text")
+      .attr("class", "gscore")
+      .attr("text-anchor", "middle")
+      .attr("x", w / 2 - 14)
+      .attr("y", -h / 2 + 14)
+      .attr("font-size", isFocus ? 11 : 10)
+      .attr("font-weight", 700)
+      .attr("fill", healthColor)
+      .text(healthValue);
+  }
 }
 
 function drawLeaf(g: GroupSel, d: PlacedNode) {
   const isFocus = d.isFocus;
   const r = isFocus ? 26 : 20;
-  const dotFill = statusDotFill(d.status);
+  // Health ring color comes from lib/health.ts feature-health score, matching
+  // the tree + drawer + FocusCard. Falls back to semantic-status color when
+  // the node has no _health (L4 leaves render via drawLeaf too).
+  const healthValue = d.node._health ?? null;
+  const ringColor = healthValue != null ? healthHex(healthValue) : statusDotFill(d.status);
   // Health ring
   g.append("circle")
     .attr("r", r + 4)
     .attr("fill", "none")
-    .attr("stroke", dotFill)
+    .attr("stroke", ringColor)
     .attr("stroke-width", 3)
     .attr("opacity", 0.85);
   // Body
@@ -1128,6 +1151,18 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
     .attr("fill", "var(--ink-500)")
     .attr("font-family", "JetBrains Mono, ui-monospace, monospace")
     .text(d.node.node_id);
+  // Per-node health score text under the circle (mirrors prototype line 2150).
+  // Only render when _health is non-null so L4 assets don't show a phantom 0.
+  if (healthValue != null) {
+    g.append("text")
+      .attr("class", "gscore")
+      .attr("text-anchor", "middle")
+      .attr("y", r + 14)
+      .attr("font-size", isFocus ? 12 : 10.5)
+      .attr("font-weight", 700)
+      .attr("fill", ringColor)
+      .text(healthValue);
+  }
 }
 
 function shortTitle(t: string): string {

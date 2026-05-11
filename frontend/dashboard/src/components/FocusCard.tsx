@@ -89,7 +89,7 @@ function NodeFocusCard({
           value={meta.health == null ? "—" : `${meta.health}`}
           tone={meta.healthTone}
           hint={meta.healthHint}
-          onClick={() => onOpenDrawerTab("overview")}
+          onClick={() => onOpenDrawerTab("problems")}
         />
         <StatusRow
           label="Semantic"
