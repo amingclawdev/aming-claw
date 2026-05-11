@@ -334,6 +334,23 @@ a:hover { text-decoration: underline; }
 .pill-active { background: var(--green-bg); color: var(--green-fg); }
 .pill-active .pill-dot { background: var(--green); }
 
+/* SSE live indicator next to the snapshot pill. Pulses while live, fades to
+   amber while reconnecting, neutral when the stream is closed. */
+.live-pill.tone-green  { background: var(--green-bg); color: var(--green-fg); }
+.live-pill.tone-green .pill-dot {
+  background: var(--green);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+.live-pill.tone-amber  { background: var(--amber-bg); color: var(--amber-fg); }
+.live-pill.tone-amber .pill-dot { background: var(--amber); }
+.live-pill.tone-neutral{ background: var(--ink-100); color: var(--ink-500); }
+.live-pill.tone-neutral .pill-dot { background: var(--ink-400); }
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.8); }
+}
+
 .pill-mono {
   background: var(--ink-100);
   color: var(--ink-600);

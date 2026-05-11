@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError } from "./lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, ApiError, projectId as PROJECT_ID } from "./lib/api";
 import { mergeProjection } from "./lib/semantic";
 import { computeNodeHealth } from "./lib/health";
+import { useEventStream } from "./lib/sse";
 import type {
   ActiveSummaryResponse,
   EdgeRecord,
@@ -127,6 +128,33 @@ export default function App() {
     fetchAll(ac.signal);
     return () => ac.abort();
   }, [fetchAll]);
+
+  // Live sync: SSE pushes a 'dashboard.changed' event whenever any mutating
+  // graph-governance endpoint succeeds (server.py:_emit_dashboard_changed),
+  // plus pass-through for node.status_changed etc. We debounce a refetch so
+  // bursts (e.g. worker draining 20 nodes in 1s) collapse into one call.
+  const refetchTimerRef = useRef<number | null>(null);
+  const scheduleLiveRefetch = useCallback(() => {
+    if (refetchTimerRef.current != null) window.clearTimeout(refetchTimerRef.current);
+    refetchTimerRef.current = window.setTimeout(() => {
+      refetchTimerRef.current = null;
+      // Only re-fetch when not already loading — avoids fetchAll re-entrancy
+      // (the in-flight load will pick up the latest server state anyway).
+      if (!loading) void fetchAll();
+    }, 600);
+  }, [fetchAll, loading]);
+
+  useEffect(
+    () => () => {
+      if (refetchTimerRef.current != null) window.clearTimeout(refetchTimerRef.current);
+    },
+    [],
+  );
+
+  const liveStatus = useEventStream(PROJECT_ID, {
+    enabled: true,
+    onEvent: scheduleLiveRefetch,
+  });
 
   const handleQueueReconcile = useCallback(async () => {
     if (reconcileBusy) return;
@@ -659,6 +687,7 @@ export default function App() {
         reviewBadge={data?.feedback?.summary?.visible_group_count ?? 0}
         onRefresh={handleRefresh}
         onOpenReview={() => setActionPanelOpen(true)}
+        liveStatus={liveStatus}
         multiSelectMode={multiSelectMode}
         multiSelectCount={multiSelectIds.size}
         batchEnrichBusy={batchEnrichBusy}

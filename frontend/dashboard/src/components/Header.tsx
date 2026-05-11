@@ -5,6 +5,7 @@ import type {
   OperationsQueueResponse,
   StatusResponse,
 } from "../types";
+import type { LiveStatus } from "../lib/sse";
 
 interface Props {
   loading: boolean;
@@ -14,6 +15,9 @@ interface Props {
   ops?: OperationsQueueResponse;
   loadedAt?: string;
   reviewBadge?: number;
+  // SSE liveness: green dot when streaming, amber while reconnecting, gray
+  // when offline. Drives the "live" pill next to the snapshot status.
+  liveStatus?: LiveStatus;
   onRefresh(): void;
   onOpenReview?(): void;
   // Multi-select mode (batch AI enrich many nodes/edges at once). When ON,
@@ -36,6 +40,7 @@ export default function Header({
   ops,
   loadedAt,
   reviewBadge,
+  liveStatus = "offline",
   onRefresh,
   onOpenReview,
   multiSelectMode = false,
@@ -76,6 +81,7 @@ export default function Header({
               <span className="pill-dot" />
               {summary?.snapshot_status ?? "—"}
             </span>
+            <LivePill status={liveStatus} />
             <span
               className="pill pill-mono"
               title="Frontend build marker"
@@ -233,6 +239,23 @@ export default function Header({
         svc {(health?.version || "—").slice(0, 7)}
       </span>
     </header>
+  );
+}
+
+function LivePill({ status }: { status: LiveStatus }) {
+  const tone = status === "live" ? "green" : status === "connecting" ? "amber" : "neutral";
+  const label = status === "live" ? "live" : status === "connecting" ? "connecting" : "offline";
+  const title =
+    status === "live"
+      ? "Connected to governance event stream — dashboard refreshes automatically"
+      : status === "connecting"
+        ? "Reconnecting to governance event stream…"
+        : "Event stream offline — refreshes are manual (↻)";
+  return (
+    <span className={`pill live-pill tone-${tone}`} title={title}>
+      <span className="pill-dot" />
+      {label}
+    </span>
   );
 }
 

@@ -268,6 +268,48 @@ def route(method: str, path: str):
     return decorator
 
 
+class _StreamedResponse:
+    """Sentinel returned by handlers that wrote the full response themselves
+    (e.g. the SSE /events/stream endpoint). _handle skips _respond when it
+    sees this so headers/body aren't written twice."""
+    __slots__ = ()
+
+
+STREAMED_RESPONSE = _StreamedResponse()
+
+
+# Regex once at module import time — _emit_dashboard_changed runs on the hot
+# path for every graph-governance mutation, no point recompiling per call.
+_GRAPH_GOV_PATH_PID = re.compile(r"^/api/graph-governance/([^/]+)/")
+
+
+def _emit_dashboard_changed(path: str, method: str) -> None:
+    """Fan out a 'dashboard.changed' event for any successful POST/DELETE
+    under /api/graph-governance/<project_id>/... so SSE clients can refetch.
+
+    Intentionally lightweight: parses project_id from the path, slices off
+    the query string, and publishes via the global EventBus. Failures are
+    swallowed by the caller; this is best-effort live-sync, not a contract.
+    """
+    try:
+        parsed = urlparse(path)
+        clean_path = parsed.path
+        match = _GRAPH_GOV_PATH_PID.match(clean_path)
+        if not match:
+            return
+        project_id = match.group(1)
+        from . import event_bus
+        event_bus._bus.publish("dashboard.changed", {
+            "project_id": project_id,
+            "path": clean_path,
+            "method": method,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        # Live-sync is best-effort — never let it surface to callers.
+        pass
+
+
 class GovernanceHandler(BaseHTTPRequestHandler):
     """HTTP request handler with routing and middleware."""
 
@@ -356,6 +398,11 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 idem_key=self.headers.get("Idempotency-Key", ""),
             )
             result = handler(ctx)
+            # Streaming handlers (SSE) write headers + body directly via
+            # self.wfile and return the STREAMED_RESPONSE sentinel; skip the
+            # normal JSON response path so we don't double-write.
+            if isinstance(result, _StreamedResponse):
+                return
             if isinstance(result, tuple) and len(result) == 3:
                 code, body, extra_headers = result
             elif isinstance(result, tuple):
@@ -370,6 +417,19 @@ class GovernanceHandler(BaseHTTPRequestHandler):
                 extra_headers = None
             body["request_id"] = request_id
             self._respond(code, body, extra_headers)
+            # Dashboard live-sync: any successful mutating call against the
+            # graph-governance namespace fans out a 'dashboard.changed' event
+            # so connected SSE clients can debounce-refetch. Cheap, in-process,
+            # best-effort — failures are swallowed.
+            try:
+                if (
+                    method in ("POST", "DELETE")
+                    and 200 <= code < 300
+                    and "/api/graph-governance/" in self.path
+                ):
+                    _emit_dashboard_changed(self.path, method)
+            except Exception:
+                pass
         except GovernanceError as e:
             body = e.to_dict()
             body["request_id"] = request_id
@@ -1996,6 +2056,101 @@ def _summarize_graph_drift_rows(rows: list[dict]) -> dict:
         "by_type": dict(sorted(by_type.items())),
         "open_sample": open_sample,
     }
+
+
+@route("GET", "/api/graph-governance/{project_id}/events/stream")
+def handle_graph_governance_events_stream(ctx: RequestContext):
+    """Server-Sent Events stream of governance events for the dashboard.
+
+    Emits:
+      - `ready` once on connect (project_id + server_version) so the client
+        can flip into "live" state.
+      - One event per EventBus publish whose payload's project_id matches
+        (or whose payload has no project_id — those are treated as global).
+      - `: ping\\n\\n` heartbeat comment every 15s so reverse proxies and
+        EventSource don't kill the idle connection.
+
+    The handler subscribes a queue-pushing callback via subscribe_all and
+    unsubscribes in the finally block when the client disconnects or the
+    server shuts down. Each connection runs on its own thread courtesy of
+    ThreadingHTTPServer, so multiple dashboards can stream concurrently.
+    """
+    import queue
+    from . import event_bus
+
+    handler = ctx.handler
+    project_id = ctx.get_project_id()
+
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache, no-transform")
+        handler.send_header("Connection", "keep-alive")
+        handler.send_header("X-Accel-Buffering", "no")  # disable nginx buffering
+        for k, v in handler.CORS_HEADERS.items():
+            handler.send_header(k, v)
+        handler.end_headers()
+    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+        return STREAMED_RESPONSE
+
+    q: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=500)
+
+    def on_event(event_name: str, payload: dict) -> None:
+        # Bound the queue: drop on overflow rather than block the publisher.
+        # Filter by project_id when payload carries one; global events
+        # (no project_id) are forwarded to every connection.
+        pid = payload.get("project_id") if isinstance(payload, dict) else None
+        if pid and project_id and pid != project_id:
+            return
+        try:
+            q.put_nowait((event_name, payload))
+        except queue.Full:
+            pass
+
+    bus = event_bus.get_event_bus()
+    bus.subscribe_all(on_event)
+
+    def _write_sse(event_name: str, data: dict) -> None:
+        try:
+            line = (
+                f"event: {event_name}\n"
+                f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            )
+            handler.wfile.write(line.encode("utf-8"))
+            handler.wfile.flush()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            raise
+
+    try:
+        _write_sse("ready", {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "project_id": project_id,
+            "server_version": get_server_version(),
+        })
+
+        while True:
+            try:
+                event_name, payload = q.get(timeout=15.0)
+            except queue.Empty:
+                try:
+                    handler.wfile.write(b": ping\n\n")
+                    handler.wfile.flush()
+                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+                    break
+                continue
+
+            try:
+                _write_sse(event_name, {
+                    "event": event_name,
+                    "payload": payload,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+                break
+    finally:
+        bus.unsubscribe_all(on_event)
+
+    return STREAMED_RESPONSE
 
 
 @route("GET", "/api/graph-governance/{project_id}/status")
