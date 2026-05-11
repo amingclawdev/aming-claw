@@ -553,20 +553,29 @@ def on_governance_startup(payload: Any = None) -> None:
                         )
                         _get_executor().submit(_drain_node, project_id, sid)
                     # MF-2026-05-10-017: also drain unenriched edge requests.
+                    # observer-hotfix 2026-05-11: mirror the dedup-by-event_seq
+                    # fix from _drain_edge — startup catchup must use the SAME
+                    # logic, otherwise a re-request submitted before restart
+                    # silently never gets queued (operator clicked Enrich, AI
+                    # ran on prior payload returning garbage, operator
+                    # re-submitted; old query excluded that request entirely).
                     edge_pending = conn.execute(
                         """
-                        SELECT COUNT(*) AS n FROM graph_events
-                        WHERE project_id = ? AND snapshot_id = ?
-                          AND event_type = 'edge_semantic_requested'
-                          AND status = 'observed'
-                          AND target_id NOT IN (
-                            SELECT target_id FROM graph_events
-                            WHERE project_id = ? AND snapshot_id = ?
-                              AND event_type = 'edge_semantic_enriched'
-                              AND status IN ('observed', 'proposed', 'accepted', 'materialized')
+                        SELECT COUNT(*) AS n FROM graph_events r
+                        WHERE r.project_id = ? AND r.snapshot_id = ?
+                          AND r.event_type = 'edge_semantic_requested'
+                          AND r.status = 'observed'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM graph_events e
+                            WHERE e.project_id = r.project_id
+                              AND e.snapshot_id = r.snapshot_id
+                              AND e.event_type = 'edge_semantic_enriched'
+                              AND e.target_id = r.target_id
+                              AND e.status IN ('observed', 'proposed', 'accepted', 'materialized')
+                              AND e.event_seq > r.event_seq
                           )
                         """,
-                        (project_id, sid, project_id, sid),
+                        (project_id, sid),
                     ).fetchone()
                     en = int(edge_pending["n"] if edge_pending else 0)
                     if en > 0:
