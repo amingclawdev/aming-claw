@@ -1092,19 +1092,10 @@ function drawContainer(g: GroupSel, d: PlacedNode) {
     .attr("letter-spacing", "0.1em")
     .attr("fill", "var(--ink-500)")
     .text("NODES");
-  // Container health rollup score under the layer pill (prototype line 2150
-  // pattern). Hidden for containers with no L7 descendants.
-  if (healthValue != null) {
-    g.append("text")
-      .attr("class", "gscore")
-      .attr("text-anchor", "middle")
-      .attr("x", w / 2 - 14)
-      .attr("y", -h / 2 + 14)
-      .attr("font-size", isFocus ? 11 : 10)
-      .attr("font-weight", 700)
-      .attr("fill", healthColor)
-      .text(healthValue);
-  }
+  // Container rollup health is conveyed by the box outline color + the small
+  // health dot top-right — no numeric score, which was hard to read at this
+  // size and competed visually with the bigger "NODES" count at the center.
+  // (Per-L7-leaf scores remain visible in drawLeaf.)
 }
 
 function drawLeaf(g: GroupSel, d: PlacedNode) {
@@ -1151,17 +1142,33 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
     .attr("fill", "var(--ink-500)")
     .attr("font-family", "JetBrains Mono, ui-monospace, monospace")
     .text(d.node.node_id);
-  // Per-node health score text under the circle (mirrors prototype line 2150).
-  // Only render when _health is non-null so L4 assets don't show a phantom 0.
+  // Per-node health score text under the circle. White rounded rect behind
+  // the number so the score stays readable when the graph is dense and a leaf
+  // sits over an edge line. Bigger font + 700 weight for skimming legibility.
   if (healthValue != null) {
+    const scoreFontSize = isFocus ? 13 : 12;
+    const scoreText = String(healthValue);
+    const pillW = scoreText.length * (isFocus ? 8 : 7) + 10;
+    const pillH = isFocus ? 16 : 14;
+    g.append("rect")
+      .attr("class", "gscore-pill")
+      .attr("x", -pillW / 2)
+      .attr("y", r + 4)
+      .attr("width", pillW)
+      .attr("height", pillH)
+      .attr("rx", pillH / 2)
+      .attr("ry", pillH / 2)
+      .attr("fill", "#ffffff")
+      .attr("stroke", ringColor)
+      .attr("stroke-width", 1);
     g.append("text")
       .attr("class", "gscore")
       .attr("text-anchor", "middle")
-      .attr("y", r + 14)
-      .attr("font-size", isFocus ? 12 : 10.5)
+      .attr("y", r + 4 + pillH / 2 + scoreFontSize / 3)
+      .attr("font-size", scoreFontSize)
       .attr("font-weight", 700)
       .attr("fill", ringColor)
-      .text(healthValue);
+      .text(scoreText);
   }
 }
 
