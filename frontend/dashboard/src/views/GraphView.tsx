@@ -587,6 +587,8 @@ function renderHierarchy(args: RenderArgs) {
     onEdgeHover: args.onEdgeHover,
     onEdgeClick: args.onEdgeClick,
     idx,
+    multiSelectMode: args.multiSelectMode,
+    multiSelectIds: args.multiSelectIds,
   });
 }
 
@@ -805,6 +807,8 @@ function renderRelations(args: RenderArgs): void {
     onEdgeHover: args.onEdgeHover,
     onEdgeClick: args.onEdgeClick,
     idx,
+    multiSelectMode: args.multiSelectMode,
+    multiSelectIds: args.multiSelectIds,
   });
 }
 
@@ -819,6 +823,8 @@ interface DrawArgs {
   onEdgeHover(info: EdgeInfo | null): void;
   onEdgeClick(info: EdgeInfo): void;
   idx: Index;
+  multiSelectMode: boolean;
+  multiSelectIds: Set<string>;
 }
 
 function drawSvg(args: DrawArgs) {
@@ -885,6 +891,73 @@ function drawSvg(args: DrawArgs) {
       onEdgeClick(buildEdgeInfo(d, event));
     });
 
+  const multiOn = args.multiSelectMode;
+  const multiSet = args.multiSelectIds;
+
+  // Multi-select edge highlight layer. Keyed by edge id (in worker
+  // `<src>-><dst>:<type>` form so it matches the App.tsx bucket). Joined on
+  // a filtered subset so unselected edges leave zero DOM nodes here.
+  // vector-effect=non-scaling-stroke keeps the overlay at 4px regardless of
+  // the parent zoom transform — otherwise it visually disappears once the
+  // graph is scaled down ~0.35x.
+  const selectedEdges = multiOn
+    ? edges.filter((d) => multiSet.has(`edge:${d.src}->${d.dst}:${d.type}`))
+    : [];
+  linkLayer
+    .selectAll<SVGPathElement, PlacedEdge>("path.gselect-edge")
+    .data(selectedEdges, (d) => edgeKey(d))
+    .join("path")
+    .attr("class", "gselect-edge")
+    .attr("fill", "none")
+    .attr("stroke", "#4f46e5")
+    .attr("stroke-width", 4)
+    .attr("stroke-opacity", 0.7)
+    .attr("stroke-linecap", "round")
+    .attr("vector-effect", "non-scaling-stroke")
+    .attr("pointer-events", "none")
+    .attr("d", (d) => bezierPath(d));
+
+  // Midpoint ✓ badge for each selected edge — uses getPointAtLength so the
+  // marker tracks the actual rendered bezier rather than a naive lerp. We
+  // also fight the parent zoom by sizing the badge in graph-space and
+  // counter-scaling so it stays roughly readable.
+  const badgeSel = linkLayer
+    .selectAll<SVGGElement, PlacedEdge>("g.gselect-edge-badge")
+    .data(selectedEdges, (d) => edgeKey(d))
+    .join((enter) => enter.append("g").attr("class", "gselect-edge-badge").attr("pointer-events", "none"));
+  badgeSel.selectAll("*").remove();
+  badgeSel.each(function (d) {
+    const g = select<SVGGElement, PlacedEdge>(this);
+    // Resolve the bezier midpoint via the matching glink path. Falls back to
+    // the straight-line midpoint if the path isn't in the DOM yet (first paint).
+    let mx = (d.s.x + d.t.x) / 2;
+    let my = (d.s.y + d.t.y) / 2;
+    const pathNode = linkLayer
+      .selectAll<SVGPathElement, PlacedEdge>("path.glink")
+      .filter((pd) => pd === d)
+      .node();
+    if (pathNode) {
+      const total = pathNode.getTotalLength();
+      const pt = pathNode.getPointAtLength(total / 2);
+      mx = pt.x;
+      my = pt.y;
+    }
+    g.attr("transform", `translate(${mx},${my})`);
+    g.append("circle")
+      .attr("r", 14)
+      .attr("fill", "#4f46e5")
+      .attr("stroke", "#fff")
+      .attr("stroke-width", 2.5)
+      .attr("vector-effect", "non-scaling-stroke");
+    g.append("text")
+      .attr("text-anchor", "middle")
+      .attr("y", 5)
+      .attr("font-size", 16)
+      .attr("font-weight", 700)
+      .attr("fill", "#fff")
+      .text("✓");
+  });
+
   const nodeSel = nodeLayer
     .selectAll<SVGGElement, PlacedNode>("g.gnode")
     .data(placedArr, (d) => d.node.node_id)
@@ -895,9 +968,6 @@ function drawSvg(args: DrawArgs) {
 
   // Wipe + redraw shapes (deterministic, fewer than 100 nodes typically in hierarchy mode).
   nodeSel.selectAll("*").remove();
-
-  const multiOn = args.multiSelectMode;
-  const multiSet = args.multiSelectIds;
 
   nodeSel.each(function (d) {
     const g = select<SVGGElement, PlacedNode>(this);
@@ -924,23 +994,26 @@ function drawSvg(args: DrawArgs) {
         .attr("fill", "var(--ink-500)")
         .text(d.edgeMeta);
     }
-    // Multi-select highlight: ✓ badge bottom-right when in bucket. Painted
-    // last so it sits on top of the layer pill / health ring.
+    // Multi-select highlight: ✓ badge top-right when in bucket. Painted
+    // last so it sits on top of the layer pill / health ring. Sizes are in
+    // graph-space; non-scaling-stroke keeps the white outline crisp at any
+    // zoom level (otherwise the 2.5px stroke vanishes under scale 0.35x).
     if (multiOn && multiSet.has(`node:${d.node.node_id}`)) {
       g.append("circle")
         .attr("class", "gselect-badge")
-        .attr("cx", 18)
-        .attr("cy", -18)
-        .attr("r", 9)
+        .attr("cx", 22)
+        .attr("cy", -22)
+        .attr("r", 14)
         .attr("fill", "#4f46e5")
         .attr("stroke", "#fff")
-        .attr("stroke-width", 2);
+        .attr("stroke-width", 2.5)
+        .attr("vector-effect", "non-scaling-stroke");
       g.append("text")
         .attr("class", "gselect-tick")
-        .attr("x", 18)
-        .attr("y", -15)
+        .attr("x", 22)
+        .attr("y", -17)
         .attr("text-anchor", "middle")
-        .attr("font-size", 11)
+        .attr("font-size", 16)
         .attr("font-weight", 700)
         .attr("fill", "#fff")
         .text("✓");
