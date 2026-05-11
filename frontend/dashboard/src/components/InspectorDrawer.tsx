@@ -21,6 +21,7 @@ import { editorConfigured, editorScheme, editorUrl } from "../lib/editor";
 import type { PinnedEdge } from "./FocusCard";
 import type { ActionKind, ActionTarget } from "./ActionControlPanel";
 import RetryFeedbackModal from "./RetryFeedbackModal";
+import CandidateSemanticBlock from "./CandidateSemanticBlock";
 
 interface Props {
   node: NodeRecord | null;
@@ -28,6 +29,7 @@ interface Props {
   edges: EdgeRecord[];
   pinnedEdge?: PinnedEdge | null;
   feedback?: FeedbackQueueResponse | null;
+  snapshotId?: string | null;
   onSelectNode(id: string): void;
   onClose(): void;
   onClearEdge?(): void;
@@ -44,10 +46,13 @@ interface EdgeProps {
   byId: Map<string, NodeRecord>;
   edges: EdgeRecord[];
   feedback: FeedbackQueueResponse | null;
+  snapshotId?: string | null;
   onSelectNode(id: string): void;
   onClose(): void;
   onOpenAction?(kind: ActionKind, target: ActionTarget): void;
   onOpenBacklog?(target: ActionTarget): void;
+  onDecide?(feedbackIds: string[], action: string, summaryHint?: string): void;
+  onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
   tab: Tab;
   onTabChange(tab: Tab): void;
 }
@@ -83,6 +88,7 @@ export default function InspectorDrawer({
   edges,
   pinnedEdge,
   feedback,
+  snapshotId,
   onSelectNode,
   onClose,
   onClearEdge,
@@ -134,10 +140,13 @@ export default function InspectorDrawer({
         byId={byId}
         edges={edges}
         feedback={feedback ?? null}
+        snapshotId={snapshotId ?? null}
         onSelectNode={onSelectNode}
         onClose={onClearEdge ?? onClose}
         onOpenAction={onOpenAction}
         onOpenBacklog={onOpenBacklog}
+        onDecide={onDecide}
+        onRetry={onRetry}
         tab={tab}
         onTabChange={setTab}
       />
@@ -218,6 +227,7 @@ export default function InspectorDrawer({
             pendingReview={findPendingReviewGroup(feedback, node.node_id)}
             onDecide={onDecide}
             onRetry={onRetry}
+            snapshotId={snapshotId ?? null}
           />
         ) : null}
         {tab === "files" ? <FilesTab node={node} /> : null}
@@ -256,6 +266,7 @@ function OverviewTab({
   pendingReview,
   onDecide,
   onRetry,
+  snapshotId,
 }: {
   node: NodeRecord;
   isContainer: boolean;
@@ -266,6 +277,7 @@ function OverviewTab({
   pendingReview?: FeedbackQueueGroup | null;
   onDecide?(feedbackIds: string[], action: string, summaryHint?: string): void;
   onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
+  snapshotId?: string | null;
 }) {
   const sem = node.semantic ?? {};
   const v = sem.validity ?? {};
@@ -301,6 +313,11 @@ function OverviewTab({
             </span>
           </div>
           <div className="drawer-review-banner-body">{pendingReview.representative_issue}</div>
+          <CandidateSemanticBlock
+            snapshotId={snapshotId ?? null}
+            targetType="node"
+            targetId={pendingReview.target_id}
+          />
           <div className="drawer-review-banner-actions">
             <button
               className="action-btn"
@@ -500,16 +517,48 @@ function EdgeInspector({
   byId,
   edges,
   feedback,
+  snapshotId,
   onSelectNode,
   onClose,
   onOpenAction,
   onOpenBacklog,
+  onDecide,
+  onRetry,
   tab,
   onTabChange,
 }: EdgeProps) {
   const src = byId.get(edge.src) ?? null;
   const dst = byId.get(edge.dst) ?? null;
   const desc = EDGE_TYPE_DESC[edge.type] ?? "structure-derived typed relation";
+  // Find the pending review feedback group for THIS edge — match either of
+  // the two target_id formats (`a|b|type` from ActionControlPanel, `a->b:type`
+  // from the worker).
+  const edgePending = useMemo<FeedbackQueueGroup | null>(() => {
+    const groups = feedback?.groups ?? [];
+    const pipe = `${edge.src}|${edge.dst}|${edge.type}`;
+    const arrow = `${edge.src}->${edge.dst}:${edge.type}`;
+    return (
+      groups.find(
+        (g) =>
+          g.target_type === "edge" && (g.target_id === pipe || g.target_id === arrow),
+      ) ?? null
+    );
+  }, [edge.src, edge.dst, edge.type, feedback]);
+  const [edgeReviewBusy, setEdgeReviewBusy] = useState(false);
+  const [edgeShowRetry, setEdgeShowRetry] = useState(false);
+  const dispatchEdgeDecide = async (action: string) => {
+    if (!onDecide || !edgePending) return;
+    setEdgeReviewBusy(true);
+    try {
+      await onDecide(
+        edgePending.feedback_ids,
+        action,
+        `edge ${edgePending.target_id}`,
+      );
+    } finally {
+      setEdgeReviewBusy(false);
+    }
+  };
 
   return (
     <aside className="inspector-drawer">
@@ -560,6 +609,73 @@ function EdgeInspector({
       </nav>
 
       <div className="inspector-body scrollbar-thin">
+        {tab === "overview" && edgePending ? (
+          <section className="drawer-review-banner">
+            <div className="drawer-review-banner-head">
+              <span className="drawer-review-banner-title">
+                ⚖ Pending semantic review · {edgePending.target_id}
+              </span>
+              <span className="mono" style={{ fontSize: 10.5, color: "var(--ink-400)" }}>
+                {edgePending.representative_feedback_id}
+                {edgePending.feedback_ids.length > 1
+                  ? ` +${edgePending.feedback_ids.length - 1}`
+                  : ""}
+              </span>
+            </div>
+            <div className="drawer-review-banner-body">{edgePending.representative_issue}</div>
+            <CandidateSemanticBlock
+              snapshotId={snapshotId ?? null}
+              targetType="edge"
+              targetId={edgePending.target_id}
+            />
+            <div className="drawer-review-banner-actions">
+              <button
+                className="action-btn"
+                disabled={edgeReviewBusy || !onDecide}
+                title="POST /feedback/decision action=accept_semantic_enrichment"
+                onClick={() => dispatchEdgeDecide("accept_semantic_enrichment")}
+              >
+                {edgeReviewBusy ? "…" : "Accept"}
+              </button>
+              <button
+                className="action-btn"
+                disabled={edgeReviewBusy || !onRetry}
+                title="Reject + re-enqueue with rationale"
+                onClick={() => setEdgeShowRetry(true)}
+              >
+                Retry
+              </button>
+              <button
+                className="action-btn action-btn-danger"
+                disabled={edgeReviewBusy || !onDecide}
+                title="POST /feedback/decision action=reject_false_positive"
+                onClick={() => dispatchEdgeDecide("reject_false_positive")}
+              >
+                {edgeReviewBusy ? "…" : "Reject"}
+              </button>
+            </div>
+          </section>
+        ) : null}
+
+        {edgeShowRetry && edgePending && onRetry ? (
+          <RetryFeedbackModal
+            targetType={edgePending.target_type}
+            targetId={edgePending.target_id}
+            feedbackIds={edgePending.feedback_ids}
+            priorIssue={edgePending.representative_issue}
+            onCancel={() => setEdgeShowRetry(false)}
+            onSubmit={async (rationale) => {
+              setEdgeReviewBusy(true);
+              try {
+                await onRetry(edgePending.feedback_ids, edgePending.target_id, rationale);
+                setEdgeShowRetry(false);
+              } finally {
+                setEdgeReviewBusy(false);
+              }
+            }}
+          />
+        ) : null}
+
         {tab === "overview" ? (
           <EdgeOverviewTab edge={edge} src={src} dst={dst} onSelectNode={onSelectNode} />
         ) : null}

@@ -3094,6 +3094,66 @@ svg.graph-svg path.ghit:hover {
   padding: 6px 14px;
 }
 
+/* MF-016/017: candidate semantic block — surfaces the AI's proposed
+   semantic_payload inside the drawer when a target has a pending review. */
+.candidate-block {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.candidate-loading, .candidate-empty, .candidate-error {
+  font-size: 11.5px;
+  color: var(--ink-700);
+}
+.candidate-error { color: #b91c1c; background: #fef2f2; border-color: #fecaca; }
+.candidate-block-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.candidate-block-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #5b21b6;
+}
+.candidate-block-meta {
+  font-size: 10.5px;
+  color: var(--ink-400);
+}
+.candidate-block-row {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.candidate-block-key {
+  font-weight: 600;
+  color: var(--ink-700);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  align-self: start;
+  padding-top: 2px;
+}
+.candidate-block-val { color: var(--ink-800); }
+.candidate-block-issues {
+  margin: 0;
+  padding-left: 18px;
+  list-style: disc;
+  font-size: 11px;
+}
+.candidate-block-issues li { margin-bottom: 2px; }
+
 /* Drawer pending-review banner */
 .drawer-review-banner {
   margin: 0 0 10px;

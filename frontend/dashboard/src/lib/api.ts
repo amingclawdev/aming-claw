@@ -295,6 +295,43 @@ export const api = {
       signal,
     );
   },
+  // MF-016/017 review surface: fetch graph_events rows so the dashboard can
+  // render the AI's candidate semantic_payload alongside the feedback row.
+  // Filter to status=proposed + matching target to find pending review payloads.
+  listProposedEvents(
+    snapshotId: string,
+    opts: { target_type: "node" | "edge"; target_id: string },
+    signal?: AbortSignal,
+  ) {
+    const q = new URLSearchParams({
+      target_type: opts.target_type,
+      target_id: opts.target_id,
+      status: "proposed",
+      limit: "10",
+    });
+    return getJSON<{
+      ok: boolean;
+      count: number;
+      events: Array<{
+        event_id: string;
+        event_type: string;
+        target_type: string;
+        target_id: string;
+        status: string;
+        confidence?: number;
+        created_at?: string;
+        payload?: {
+          semantic_payload?: Record<string, unknown>;
+          edge?: Record<string, unknown>;
+          edge_context?: Record<string, unknown>;
+          [key: string]: unknown;
+        };
+      }>;
+    }>(
+      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/events?${q.toString()}`,
+      signal,
+    );
+  },
   // POST /semantic-feedback — appends to the JSONL artifact that
   // run_semantic_enrichment reads (and pipes per-node into the AI payload's
   // `review_feedback` array). Separate from graph_feedback_items table.

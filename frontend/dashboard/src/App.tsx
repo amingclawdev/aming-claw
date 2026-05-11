@@ -582,6 +582,7 @@ export default function App() {
                   allNodes={data.nodes}
                   edges={data.edges}
                   feedback={data.feedback}
+                  snapshotId={data.status?.active_snapshot_id ?? data.summary?.snapshot_id ?? null}
                   onSelectNode={handleSelectNode}
                   onClose={() => {
                     setSelectedNodeId(null);
