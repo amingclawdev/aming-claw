@@ -134,6 +134,14 @@ export interface NodeMetadata {
   exclude_as_feature?: boolean;
   feature_metadata?: { exclude_as_feature?: boolean };
   quality_flags?: string[];
+  // L4 asset metadata. asset_key encodes "<kind>:<path|name>" — for
+  // file-backed kinds (config, artifact) it's the surrogate path the
+  // backend uses to look up the asset. The dashboard reads it as a
+  // fallback when primary_files is empty (which is the case for every
+  // L4 node today — backend doesn't populate primary_files for L4).
+  asset_key?: string;
+  kind?: string;
+  aggregate_asset?: boolean;
 }
 
 export interface NodeSemantic {

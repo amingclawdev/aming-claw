@@ -1341,7 +1341,12 @@ function FilesTab({ node }: { node: NodeRecord }) {
     { key: "config", label: "Config", files: node.config_files },
   ];
   const total = sections.reduce((acc, s) => acc + (s.files?.length ?? 0), 0);
-  if (total === 0) {
+  // Backend currently returns empty primary_files for every L4 node, even
+  // file-backed ones (kind=config/artifact). The path lives in
+  // metadata.asset_key as "<kind>:<rel_path>". Surface it here so the
+  // operator can still jump to the file. Filed as backend follow-up.
+  const fallback = deriveL4AssetFile(node);
+  if (total === 0 && !fallback) {
     return <div className="empty">No files bound to this node.</div>;
   }
   return (
@@ -1351,6 +1356,21 @@ function FilesTab({ node }: { node: NodeRecord }) {
           <strong>Editor jump disabled.</strong> Set <span className="mono">VITE_WORKSPACE_ROOT</span>{" "}
           in <span className="mono">.env.local</span> to enable click-to-open.
         </div>
+      ) : null}
+      {fallback ? (
+        <section className="inspector-section">
+          <div className="inspector-section-title">
+            Asset reference <span className="head-hint">1</span>
+            <span className="head-hint" style={{ marginLeft: "auto" }}>
+              from metadata.asset_key
+            </span>
+          </div>
+          <ul className="file-list">
+            <li>
+              <FileLink path={fallback} />
+            </li>
+          </ul>
+        </section>
       ) : null}
       {sections.map((s) =>
         s.files && s.files.length > 0 ? (
@@ -1375,6 +1395,27 @@ function FilesTab({ node }: { node: NodeRecord }) {
       )}
     </>
   );
+}
+
+// L4 asset_key fallback for FilesTab. Only file-backed kinds (config /
+// artifact) surface a path; db_table / task / etc. are abstract assets
+// with no on-disk file. Returns null when no usable path is available.
+function deriveL4AssetFile(node: NodeRecord): string | null {
+  if (node.layer !== "L4") return null;
+  const ak = node.metadata?.asset_key;
+  if (!ak || typeof ak !== "string") return null;
+  const colon = ak.indexOf(":");
+  if (colon <= 0) return null;
+  const kind = ak.slice(0, colon);
+  const rest = ak.slice(colon + 1).trim();
+  if (!rest) return null;
+  // Only kinds we know are real on-disk paths. Other kinds (db_table,
+  // task, role) are governance abstractions, not files.
+  if (kind !== "config" && kind !== "artifact") return null;
+  // Skip aggregate placeholders (e.g. config:__shared_volume) — no concrete
+  // file to jump to.
+  if (rest.startsWith("__")) return null;
+  return rest;
 }
 
 function RelationsTab({

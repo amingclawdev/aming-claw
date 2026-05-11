@@ -1225,7 +1225,6 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
   // the tree + drawer + FocusCard. Falls back to semantic-status color when
   // the node has no _health (L4 assets, package markers, empty placeholders).
   const healthValue = d.node._health ?? null;
-  const assetBinding = d.node._asset_binding ?? null;
   const ringColor = healthValue != null ? healthHex(healthValue) : statusDotFill(d.status);
   // Health ring
   g.append("circle")
@@ -1240,26 +1239,18 @@ function drawLeaf(g: GroupSel, d: PlacedNode) {
     .attr("fill", isFocus ? "#eef2ff" : "#ffffff")
     .attr("stroke", isFocus ? "#4f46e5" : "var(--ink-200)")
     .attr("stroke-width", isFocus ? 2.5 : 1.5);
-  // Center label: prefer the actual health score number (red/amber/green by
-  // ring color). The layer letter (L7 / L4) was visually meaningless — the
-  // shape + position + ring already convey layer. Fall back to the layer
-  // letter only when no scoreable signal is available (package markers).
+  // Center label:
+  //   - L7 leaf with health score: show the number (red/amber/green by ring).
+  //   - L4 / package marker / anything without feature-health: show the layer
+  //     letter in muted ink. Previously we fell back to asset_binding here,
+  //     but a big bold "70" in the same slot as the L7 health number reads
+  //     visually as health and confuses the operator. asset_binding lives in
+  //     the FocusCard / drawer where it's labelled explicitly.
   const centerText =
-    healthValue != null
-      ? String(healthValue)
-      : assetBinding != null
-        ? String(assetBinding)
-        : d.node.layer;
-  const centerColor =
-    healthValue != null || assetBinding != null ? ringColor : layerFg(d.node.layer);
+    healthValue != null ? String(healthValue) : d.node.layer;
+  const centerColor = healthValue != null ? ringColor : layerFg(d.node.layer);
   const centerFontSize =
-    healthValue != null || assetBinding != null
-      ? isFocus
-        ? 14
-        : 12
-      : isFocus
-        ? 13
-        : 11;
+    healthValue != null ? (isFocus ? 14 : 12) : isFocus ? 13 : 11;
   g.append("text")
     .attr("text-anchor", "middle")
     .attr("dy", "0.35em")
