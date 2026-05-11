@@ -361,16 +361,34 @@ export default function App() {
   // jumps the same way node clicks do.
   const handleSelectEdgeFromReview = useCallback(
     (edgeId: string) => {
-      const arrowIdx = edgeId.indexOf("->");
-      if (arrowIdx < 0) {
-        setToast({ kind: "error", msg: `Cannot parse edge id ${edgeId}` });
-        return;
+      // Edge target_id ships in two formats depending on who created the
+      // feedback row:
+      //   1. `<src>-><dst>:<type>` — worker writes this when it enriches an
+      //      edge_semantic_requested event (semantic_worker, server.py edge
+      //      POST handler).
+      //   2. `<src>|<dst>|<type>` — ActionControlPanel writes this when the
+      //      operator files feedback from the graph view.
+      // Try both, normalize to {src, dst, type}.
+      let src = "", dst = "", type = "";
+      if (edgeId.includes("|")) {
+        const parts = edgeId.split("|");
+        if (parts.length < 2) {
+          setToast({ kind: "error", msg: `Cannot parse edge id ${edgeId}` });
+          return;
+        }
+        [src, dst, type = ""] = parts;
+      } else {
+        const arrowIdx = edgeId.indexOf("->");
+        if (arrowIdx < 0) {
+          setToast({ kind: "error", msg: `Cannot parse edge id ${edgeId}` });
+          return;
+        }
+        src = edgeId.slice(0, arrowIdx);
+        const rest = edgeId.slice(arrowIdx + 2);
+        const colonIdx = rest.indexOf(":");
+        dst = colonIdx >= 0 ? rest.slice(0, colonIdx) : rest;
+        type = colonIdx >= 0 ? rest.slice(colonIdx + 1) : "";
       }
-      const src = edgeId.slice(0, arrowIdx);
-      const rest = edgeId.slice(arrowIdx + 2);
-      const colonIdx = rest.indexOf(":");
-      const dst = colonIdx >= 0 ? rest.slice(0, colonIdx) : rest;
-      const type = colonIdx >= 0 ? rest.slice(colonIdx + 1) : "";
       // Look up the real edge record so confidence/evidence/direction come
       // from the live graph instead of being blanked out on the pin.
       const real = data?.edges.find(

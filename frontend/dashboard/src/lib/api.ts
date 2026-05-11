@@ -115,6 +115,13 @@ export const api = {
     },
     signal?: AbortSignal,
   ) {
+    // When the operator clicks any of the accept_* actions, that click IS the
+    // human signoff — pass accept=true so the backend doesn't fall back to
+    // requires_human_signoff (which would leave the row in an intermediate
+    // needs_human_signoff state and the UI looks like nothing happened).
+    // Reject and Defer don't set the flag — let the backend interpret those
+    // as the operator declining to sign off.
+    const isAccept = payload.action.startsWith("accept_");
     return postJSON<{
       ok?: boolean;
       decided_count?: number;
@@ -132,6 +139,7 @@ export const api = {
         action: payload.action,
         actor: payload.actor ?? "dashboard_user",
         rationale: payload.rationale ?? "",
+        ...(isAccept ? { accept: true } : {}),
       },
       signal,
     );
