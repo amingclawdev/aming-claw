@@ -1127,7 +1127,6 @@ function EdgeEndpointSection({
   }
   const status = classifyNode(node);
   const tone = statusTone(status);
-  const fnCount = node.metadata?.functions?.length ?? 0;
   return (
     <section className="inspector-section">
       <div className="inspector-section-title">{label}</div>
@@ -1154,7 +1153,6 @@ function EdgeEndpointSection({
           </button>
         </div>
       </div>
-      {fnCount > 0 ? <FunctionsSection node={node} /> : null}
     </section>
   );
 }
@@ -1182,7 +1180,15 @@ const EDGE_TYPE_DESC: Record<string, string> = {
   writes_artifact: "writes a build / generated artifact",
 };
 
-function FunctionsSection({ node }: { node: NodeRecord }) {
+function FunctionsSection({
+  node,
+  title = "Functions",
+  idHint,
+}: {
+  node: NodeRecord;
+  title?: string;
+  idHint?: string;
+}) {
   // Function lines come from the graph itself — backend persists
   // `metadata.function_lines: { "ShortName": [start, end] }` (graph adapter
   // since commit 59c9fbc). The dashboard reads them directly; no source fetch.
@@ -1202,7 +1208,11 @@ function FunctionsSection({ node }: { node: NodeRecord }) {
   return (
     <section className="inspector-section">
       <div className="inspector-section-title">
-        Functions <span className="head-hint">{node.metadata?.functions?.length}</span>
+        {title}{" "}
+        <span className="head-hint">
+          {idHint ? `${idHint} · ` : ""}
+          {node.metadata?.functions?.length}
+        </span>
         {editorConfigured ? (
           <span className="head-hint" style={{ marginLeft: "auto" }}>
             {resolvedCount > 0
@@ -1670,48 +1680,26 @@ function EdgeFunctionsTab({
   const dstFns = dst?.metadata?.functions ?? [];
   return (
     <>
-      <section className="inspector-section">
-        <div className="inspector-section-title">
-          Source functions{" "}
-          <span className="head-hint">
-            {src?.node_id ?? edge.src} · {srcFns.length}
-          </span>
-        </div>
-        {srcFns.length === 0 ? (
+      {src && srcFns.length > 0 ? (
+        <FunctionsSection node={src} title="Source functions" idHint={src.node_id ?? edge.src} />
+      ) : (
+        <section className="inspector-section">
+          <div className="inspector-section-title">
+            Source functions <span className="head-hint">{src?.node_id ?? edge.src} · 0</span>
+          </div>
           <div className="empty">Source has no captured functions.</div>
-        ) : (
-          <ul className="link-list">
-            {srcFns.slice(0, 30).map((fn) => (
-              <li key={fn}>
-                <div className="link-row" style={{ padding: "4px 6px" }}>
-                  <span className="mono" style={{ fontSize: 12 }}>{fn}</span>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-      <section className="inspector-section">
-        <div className="inspector-section-title">
-          Target functions{" "}
-          <span className="head-hint">
-            {dst?.node_id ?? edge.dst} · {dstFns.length}
-          </span>
-        </div>
-        {dstFns.length === 0 ? (
+        </section>
+      )}
+      {dst && dstFns.length > 0 ? (
+        <FunctionsSection node={dst} title="Target functions" idHint={dst.node_id ?? edge.dst} />
+      ) : (
+        <section className="inspector-section">
+          <div className="inspector-section-title">
+            Target functions <span className="head-hint">{dst?.node_id ?? edge.dst} · 0</span>
+          </div>
           <div className="empty">Target has no captured functions.</div>
-        ) : (
-          <ul className="link-list">
-            {dstFns.slice(0, 30).map((fn) => (
-              <li key={fn}>
-                <div className="link-row" style={{ padding: "4px 6px" }}>
-                  <span className="mono" style={{ fontSize: 12 }}>{fn}</span>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        </section>
+      )}
     </>
   );
 }
