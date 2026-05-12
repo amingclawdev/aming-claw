@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 const dashboardDir = path.dirname(fileURLToPath(import.meta.url));
 const defaultWorkspaceRoot = path.resolve(dashboardDir, "../..").replace(/\\/g, "/");
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const backend = env.VITE_BACKEND_URL || "http://localhost:40000";
+  const base = env.VITE_DASHBOARD_BASE || (command === "build" ? "/dashboard/" : "/");
   const workspaceRoot = (env.VITE_WORKSPACE_ROOT || defaultWorkspaceRoot).replace(/\\/g, "/");
   const defaultWorkspaceRootPlugin = {
     name: "dashboard-default-workspace-root",
@@ -23,6 +24,7 @@ export default defineConfig(({ mode }) => {
     },
   };
   return {
+    base,
     plugins: [defaultWorkspaceRootPlugin, react()],
     define: {
       __DEFAULT_WORKSPACE_ROOT__: JSON.stringify(workspaceRoot),

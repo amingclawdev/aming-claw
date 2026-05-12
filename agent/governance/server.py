@@ -6,6 +6,7 @@ Provides routing, middleware (auth, idempotency, request_id, audit), and JSON ha
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 import sys
 import uuid
@@ -13,7 +14,7 @@ import hashlib
 import traceback
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,7 @@ import os
 import signal
 import subprocess
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
+DASHBOARD_ROUTE_PREFIX = "/dashboard"
 
 # --- Server Version (dynamic with 30s cache) ---
 _version_cache = {"value": "unknown", "ts": 0}
@@ -76,6 +78,125 @@ SERVER_PID = os.getpid()
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dashboard_dist_dir() -> Path:
+    """Return the built dashboard directory served by the governance process."""
+    override = str(os.environ.get("GOVERNANCE_DASHBOARD_DIST") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path(__file__).resolve().parents[2] / "frontend" / "dashboard" / "dist").resolve()
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _dashboard_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".js":
+        return "application/javascript; charset=utf-8"
+    if suffix == ".css":
+        return "text/css; charset=utf-8"
+    if suffix in {".html", ".htm"}:
+        return "text/html; charset=utf-8"
+    if suffix == ".svg":
+        return "image/svg+xml"
+    if suffix == ".json":
+        return "application/json; charset=utf-8"
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or "application/octet-stream"
+
+
+def _resolve_dashboard_static_request(url_path: str, dist_dir: Path | None = None) -> dict[str, Any]:
+    """Resolve a /dashboard request to a built SPA asset.
+
+    Returns a small dict so unit tests can verify routing without standing up an
+    HTTP server. Non-dashboard paths return {"handled": False}.
+    """
+    parsed_path = urlparse(url_path).path or "/"
+    if parsed_path != DASHBOARD_ROUTE_PREFIX and not parsed_path.startswith(f"{DASHBOARD_ROUTE_PREFIX}/"):
+        return {"handled": False}
+
+    dist = (dist_dir or _dashboard_dist_dir()).resolve()
+    index = dist / "index.html"
+    if not index.is_file():
+        return {
+            "handled": True,
+            "status": 503,
+            "path": None,
+            "content_type": "text/plain; charset=utf-8",
+            "cache_control": "no-store",
+            "body": (
+                "Dashboard build not found. Run `npm --prefix frontend/dashboard run build` "
+                "or set GOVERNANCE_DASHBOARD_DIST."
+            ).encode("utf-8"),
+        }
+
+    suffix = parsed_path[len(DASHBOARD_ROUTE_PREFIX):].lstrip("/")
+    if not suffix:
+        target = index
+        spa_fallback = True
+    else:
+        clean_suffix = unquote(suffix).replace("\\", "/")
+        parts = [part for part in clean_suffix.split("/") if part]
+        if any(part in {".", ".."} for part in parts):
+            return {
+                "handled": True,
+                "status": 404,
+                "path": None,
+                "content_type": "text/plain; charset=utf-8",
+                "cache_control": "no-store",
+                "body": b"Not found",
+            }
+        requested = dist.joinpath(*parts).resolve()
+        if not _path_is_relative_to(requested, dist):
+            return {
+                "handled": True,
+                "status": 404,
+                "path": None,
+                "content_type": "text/plain; charset=utf-8",
+                "cache_control": "no-store",
+                "body": b"Not found",
+            }
+        if requested.is_file():
+            target = requested
+            spa_fallback = False
+        elif parts and parts[0] == "assets":
+            return {
+                "handled": True,
+                "status": 404,
+                "path": None,
+                "content_type": "text/plain; charset=utf-8",
+                "cache_control": "no-store",
+                "body": b"Not found",
+            }
+        elif parts and "." in parts[-1]:
+            return {
+                "handled": True,
+                "status": 404,
+                "path": None,
+                "content_type": "text/plain; charset=utf-8",
+                "cache_control": "no-store",
+                "body": b"Not found",
+            }
+        else:
+            target = index
+            spa_fallback = True
+
+    cache_control = "no-cache" if spa_fallback or target.name == "index.html" else "public, max-age=31536000, immutable"
+    return {
+        "handled": True,
+        "status": 200,
+        "path": target,
+        "content_type": _dashboard_content_type(target),
+        "cache_control": cache_control,
+        "body": None,
+    }
 
 
 def _row_get(row, key: str, default=""):
@@ -381,10 +502,61 @@ class GovernanceHandler(BaseHTTPRequestHandler):
             # crash the gov server. Just log and move on.
             log.debug("client connection dropped during _respond: %s", e)
 
+    def _respond_bytes(
+        self,
+        code: int,
+        payload: bytes,
+        content_type: str,
+        extra_headers: dict | None = None,
+    ):
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            headers = dict(self.CORS_HEADERS)
+            if extra_headers:
+                headers.update(extra_headers)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(payload)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
+            log.debug("client connection dropped during _respond_bytes: %s", e)
+
+    def _serve_dashboard_static(self) -> bool:
+        resolved = _resolve_dashboard_static_request(self.path)
+        if not resolved.get("handled"):
+            return False
+        payload = resolved.get("body")
+        if payload is None:
+            static_path = resolved.get("path")
+            if not isinstance(static_path, Path):
+                payload = b"Not found"
+            else:
+                try:
+                    payload = static_path.read_bytes()
+                except OSError:
+                    resolved = {
+                        **resolved,
+                        "status": 404,
+                        "content_type": "text/plain; charset=utf-8",
+                        "cache_control": "no-store",
+                    }
+                    payload = b"Not found"
+        self._respond_bytes(
+            int(resolved.get("status") or 200),
+            payload,
+            str(resolved.get("content_type") or "application/octet-stream"),
+            {"Cache-Control": str(resolved.get("cache_control") or "no-store")},
+        )
+        return True
+
     def _handle(self, method: str):
         request_id = f"req-{uuid.uuid4().hex[:12]}"
         handler, path_params, _ = self._find_handler(method)
         if not handler:
+            if method == "GET" and self._serve_dashboard_static():
+                return
             self._respond(404, {"error": "not_found", "message": "Endpoint not found"})
             return
         try:

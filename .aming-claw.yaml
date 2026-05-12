@@ -73,6 +73,23 @@ testing:
           tags:
             - "semantic-review"
             - "accept"
+      dashboard.static.production:
+        label: "Dashboard production static route"
+        command: "node frontend/dashboard/scripts/e2e-trunk.mjs --probe --static-route --build-dashboard --dashboard http://localhost:40000/dashboard"
+        auto_run: false
+        live_ai: false
+        mutates_db: false
+        requires_human_approval: false
+        isolation_project: "aming-claw"
+        timeout_sec: 300
+        trigger:
+          paths:
+            - "agent/governance/server.py"
+            - "frontend/dashboard/**"
+          tags:
+            - "dashboard"
+            - "static-route"
+            - "production"
 
 build:
   command: ""

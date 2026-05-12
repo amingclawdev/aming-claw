@@ -1,0 +1,48 @@
+version: 2
+project_id: external-governance-demo
+name: "External Governance Demo"
+language: mixed
+
+testing:
+  unit_command: "python -m pytest tests -q"
+  e2e_command: "node tests/smoke.test.mjs"
+  allowed_commands:
+    - executable: "python"
+      args_prefixes: ["-m pytest"]
+    - executable: "node"
+      args_prefixes: ["tests/smoke.test.mjs"]
+
+governance:
+  enabled: true
+  test_tool_label: "pytest+node"
+
+graph:
+  exclude_paths:
+    - "node_modules"
+    - "dist"
+    - "coverage"
+  ignore_globs:
+    - "**/node_modules/**"
+    - "**/dist/**"
+    - "**/coverage/**"
+  nested_projects:
+    mode: "exclude"
+    roots: []
+
+ai:
+  routing:
+    pm:
+      provider: "openai"
+      model: "gpt-5.5"
+    dev:
+      provider: "openai"
+      model: "gpt-5.4"
+    tester:
+      provider: "openai"
+      model: "gpt-5.4"
+    qa:
+      provider: "openai"
+      model: "gpt-5.5"
+    semantic:
+      provider: "anthropic"
+      model: "claude-opus-4-7"

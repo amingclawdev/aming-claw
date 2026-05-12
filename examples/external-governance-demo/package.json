@@ -1,6 +1,9 @@
 {
   "name": "external-governance-demo-web",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "smoke": "node tests/smoke.test.mjs",
+    "test": "node tests/smoke.test.mjs"
+  }
 }
-

@@ -11,6 +11,7 @@
 //   node scripts/e2e-trunk.mjs --semantic-live   # real AI call + review accept
 //   node scripts/e2e-trunk.mjs --semantic-live --semantic-decision reject
 //   node scripts/e2e-trunk.mjs --skip-dashboard
+//   node scripts/e2e-trunk.mjs --probe --static-route --build-dashboard
 //
 // The default run mutates only the isolated fixture workspace under the OS temp
 // directory and the governance DB rows for that fixture project. It queues one
@@ -37,7 +38,10 @@ const DEFAULT_WORKSPACE = path.join(os.tmpdir(), "aming-claw-dashboard-e2e", DEF
 
 const FLAGS = parseFlags(process.argv.slice(2));
 const BACKEND = FLAGS.backend || process.env.VITE_BACKEND_URL || "http://localhost:40000";
-const DASHBOARD = FLAGS.dashboard || process.env.DASHBOARD_URL || process.env.VITE_DASHBOARD_URL || "http://localhost:5173";
+const STATIC_ROUTE = FLAGS["static-route"] === true;
+const BUILD_DASHBOARD = FLAGS["build-dashboard"] === true;
+const DEFAULT_DASHBOARD = STATIC_ROUTE ? `${BACKEND.replace(/\/+$/, "")}/dashboard` : "http://localhost:5173";
+const DASHBOARD = FLAGS.dashboard || process.env.DASHBOARD_URL || process.env.VITE_DASHBOARD_URL || DEFAULT_DASHBOARD;
 const PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || DEFAULT_PROJECT;
 const WORKSPACE = path.resolve(FLAGS.workspace || DEFAULT_WORKSPACE);
 const ARTIFACTS = path.resolve(FLAGS.artifacts || path.join(WORKSPACE, ".aming-claw", "e2e-artifacts"));
@@ -92,7 +96,16 @@ const context = {
 };
 
 function parseFlags(args) {
-  const bool = new Set(["reset", "probe", "skip-dashboard", "skip-semantic", "semantic-live", "keep"]);
+  const bool = new Set([
+    "reset",
+    "probe",
+    "skip-dashboard",
+    "skip-semantic",
+    "semantic-live",
+    "keep",
+    "static-route",
+    "build-dashboard",
+  ]);
   const out = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -185,6 +198,74 @@ function command(cmd, args, cwd, options = {}) {
 
 function git(args, cwd = WORKSPACE, options = {}) {
   return command("git", args, cwd, options);
+}
+
+function trimTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+function sameOriginApiPath(baseUrl, route) {
+  return new URL(route, `${trimTrailingSlash(baseUrl)}/`).toString();
+}
+
+async function fetchText(url) {
+  const response = await fetch(url).catch((error) => ({
+    ok: false,
+    status: 0,
+    headers: new Headers(),
+    text: async () => String(error),
+  }));
+  const text = await response.text().catch(() => "");
+  return { response, text };
+}
+
+async function validateDashboardStaticRoute() {
+  const base = trimTrailingSlash(DASHBOARD);
+  const index = await fetchText(base);
+  assert(index.response.ok, `dashboard static route ${base} is not reachable (status ${index.response.status})`);
+  assert(index.text.includes("<div id=\"root\"></div>"), "dashboard static index missing React root");
+  assert(index.text.includes("/dashboard/assets/"), "dashboard static index does not reference /dashboard/assets/");
+
+  const assetRefs = [...index.text.matchAll(/(?:src|href)="([^"]+)"/g)]
+    .map((match) => match[1])
+    .filter((value) => value.includes("/dashboard/assets/"));
+  assert(assetRefs.some((value) => value.endsWith(".js")), "dashboard static index missing JS asset");
+  assert(assetRefs.some((value) => value.endsWith(".css")), "dashboard static index missing CSS asset");
+
+  const assets = [];
+  for (const ref of assetRefs) {
+    const assetUrl = new URL(ref, base).toString();
+    const asset = await fetchText(assetUrl);
+    assert(asset.response.ok, `dashboard asset ${assetUrl} failed with status ${asset.response.status}`);
+    const contentType = asset.response.headers.get("content-type") || "";
+    if (ref.endsWith(".js")) {
+      assert(contentType.includes("javascript"), `dashboard JS asset content-type was ${contentType}`);
+      assert(asset.text.includes("React") || asset.text.includes("createElement") || asset.text.length > 1000, "dashboard JS asset looked empty");
+    }
+    if (ref.endsWith(".css")) {
+      assert(contentType.includes("text/css"), `dashboard CSS asset content-type was ${contentType}`);
+      assert(asset.text.length > 100, "dashboard CSS asset looked empty");
+    }
+    assets.push({ ref, status: asset.response.status, content_type: contentType });
+  }
+
+  const fallback = await fetchText(`${base}/projects/static-route-smoke`);
+  assert(fallback.response.ok, `dashboard SPA fallback failed with status ${fallback.response.status}`);
+  assert(fallback.text.includes("<div id=\"root\"></div>"), "dashboard SPA fallback did not return index.html");
+
+  const health = await fetch(sameOriginApiPath(base, "/api/health"));
+  assert(health.ok, `same-origin /api/health failed with status ${health.status}`);
+  const healthJson = await health.json();
+  assert(healthJson.ok !== false, "same-origin /api/health returned ok=false");
+
+  return {
+    mode: "static-route",
+    url: base,
+    status: index.response.status,
+    assets,
+    spa_fallback_status: fallback.response.status,
+    same_origin_api: "/api/health",
+  };
 }
 
 async function http(method, route, body) {
@@ -777,18 +858,25 @@ async function loadRuntimeBundle(projectId) {
 }
 
 async function stepEnvGate() {
+  if (BUILD_DASHBOARD) {
+    const dashboardDir = path.join(REPO_ROOT, "frontend", "dashboard");
+    command("npm", ["run", "build"], dashboardDir);
+  }
   const health = await http("GET", "/api/health");
   const projects = await http("GET", "/api/projects");
   assert(Array.isArray(projects.projects), "/api/projects did not return projects[]");
   let dashboard = { skipped: true };
   if (!SKIP_DASHBOARD) {
-    const response = await fetch(DASHBOARD).catch((error) => ({ ok: false, status: 0, text: async () => String(error) }));
-    const text = await response.text().catch(() => "");
-    assert(response.ok, `dashboard ${DASHBOARD} is not reachable (status ${response.status})`);
-    assert(text.includes("<div id=\"root\"></div>") || text.includes("aming-claw"), "dashboard root did not look like the Vite app");
-    dashboard = { skipped: false, url: DASHBOARD, status: response.status };
+    if (STATIC_ROUTE) {
+      dashboard = { skipped: false, ...(await validateDashboardStaticRoute()) };
+    } else {
+      const { response, text } = await fetchText(DASHBOARD);
+      assert(response.ok, `dashboard ${DASHBOARD} is not reachable (status ${response.status})`);
+      assert(text.includes("<div id=\"root\"></div>") || text.includes("aming-claw"), "dashboard root did not look like the Vite app");
+      dashboard = { skipped: false, mode: "dev-or-custom", url: DASHBOARD, status: response.status };
+    }
   }
-  return { health, project_count: projects.projects.length, dashboard };
+  return { health, project_count: projects.projects.length, dashboard, built_dashboard: BUILD_DASHBOARD };
 }
 
 async function stepFixtureProject() {

@@ -45,6 +45,20 @@ testing:
             - "agent/governance/**"
             - "frontend/dashboard/**"
           tags: ["dashboard", "semantic"]
+      dashboard.static.production:
+        label: "Dashboard production static route"
+        command: "node frontend/dashboard/scripts/e2e-trunk.mjs --probe --static-route --build-dashboard --dashboard http://localhost:40000/dashboard"
+        auto_run: false
+        live_ai: false
+        mutates_db: false
+        requires_human_approval: false
+        isolation_project: "aming-claw"
+        timeout_sec: 300
+        trigger:
+          paths:
+            - "agent/governance/server.py"
+            - "frontend/dashboard/**"
+          tags: ["dashboard", "static-route", "production"]
 ```
 
 `allowed_commands` is the command safety allowlist used by bootstrap and
@@ -56,6 +70,9 @@ whether it may auto-run, whether it uses live AI or mutates governance DB state,
 and the path/node/tag triggers that make previous evidence stale or relevant.
 Live AI suites should keep `auto_run: false` and
 `requires_human_approval: true`.
+Production static-route suites can build `frontend/dashboard/dist` and probe
+`/dashboard` on the governance origin; they should remain non-mutating and safe
+to run before a manual smoke test.
 
 E2E evidence and impact use:
 
