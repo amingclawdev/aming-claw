@@ -1163,6 +1163,95 @@ def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware
     assert changed_projected["health"]["semantic_stale_count"] == 1
 
 
+def test_semantic_projection_rejects_target_id_fallback_when_lid_is_reused(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    old_graph = _graph("L7.1")
+    old_node = old_graph["deps_graph"]["nodes"][0]
+    old_node["title"] = "gateway.executors.plan_task"
+    old_node["primary"] = ["gateway/executors/plan_task.py"]
+    old_node["metadata"] = {"module": "gateway.executors.plan_task"}
+    old_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-old-lid-owner",
+        commit_sha="commit-old",
+        snapshot_kind="scope",
+        graph_json=old_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        old_snapshot["snapshot_id"],
+        nodes=old_graph["deps_graph"]["nodes"],
+        edges=old_graph["deps_graph"]["edges"],
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        old_snapshot["snapshot_id"],
+        event_id="old-lid-semantic",
+        event_type="semantic_node_enriched",
+        event_kind="semantic",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        baseline_commit="commit-old",
+        target_commit="commit-old",
+        stable_node_key=graph_events.stable_node_key_for_node(old_node),
+        feature_hash=graph_events.feature_hash_for_node(old_node),
+        payload={
+            "semantic_payload": {
+                "feature_name": "plan_task executor",
+                "primary": ["gateway/executors/plan_task.py"],
+                "source_title": "gateway.executors.plan_task",
+            }
+        },
+        created_by="test",
+    )
+
+    new_graph = _graph("L7.1")
+    new_node = new_graph["deps_graph"]["nodes"][0]
+    new_node["title"] = "frontend.dashboard.scripts.verify-acceptance"
+    new_node["primary"] = ["frontend/dashboard/scripts/verify-acceptance.mjs"]
+    new_node["metadata"] = {"module": "frontend.dashboard.scripts.verify-acceptance"}
+    assert graph_events.stable_node_key_for_node(old_node) != graph_events.stable_node_key_for_node(new_node)
+
+    new_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-new-lid-owner",
+        commit_sha="commit-new",
+        snapshot_kind="scope",
+        parent_snapshot_id=old_snapshot["snapshot_id"],
+        graph_json=new_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        new_snapshot["snapshot_id"],
+        nodes=new_graph["deps_graph"]["nodes"],
+        edges=new_graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        new_snapshot["snapshot_id"],
+        actor="test",
+        backfill_existing=False,
+    )
+
+    node_semantic = projection["projection"]["node_semantics"]["L7.1"]
+    assert node_semantic["validity"]["status"] == "semantic_missing"
+    assert node_semantic["semantic"] == {}
+    assert node_semantic["source_event"]["event_id"] == ""
+
+
 def test_graph_governance_current_state_contract_reports_graph_and_semantic_drift(conn, monkeypatch):
     monkeypatch.setattr(
         server,

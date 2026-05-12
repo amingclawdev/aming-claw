@@ -1874,6 +1874,9 @@ def _latest_semantic_event_for_node(
     node_id: str,
     stable_key: str,
     branch_ref: str = "",
+    *,
+    current_feature_hash: str = "",
+    current_file_hashes: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     ensure_schema(conn)
     params: list[Any] = [project_id, "semantic_node_enriched", branch_ref]
@@ -1915,8 +1918,46 @@ def _latest_semantic_event_for_node(
             """,
             (project_id, node_id, branch_ref, branch_ref),
         ).fetchone()
-        return _row_to_event(row) if row else None
+        if not row:
+            return None
+        event = _row_to_event(row)
+        if not _target_id_fallback_matches_current_node(
+            event,
+            stable_key=stable_key,
+            current_feature_hash=current_feature_hash,
+            current_file_hashes=current_file_hashes or {},
+        ):
+            return None
+        return event
     return None
+
+
+def _target_id_fallback_matches_current_node(
+    event: dict[str, Any],
+    *,
+    stable_key: str,
+    current_feature_hash: str,
+    current_file_hashes: dict[str, Any],
+) -> bool:
+    """Guard the legacy target_id fallback against L-id reuse.
+
+    New semantic events carry stable_node_key and should be found by that
+    key. The target_id fallback only exists for older rows; once L7 ids are
+    renumbered, target_id alone can point at a completely different feature.
+    """
+    event_stable_key = str(event.get("stable_node_key") or "").strip()
+    if stable_key and event_stable_key:
+        return event_stable_key == stable_key
+
+    stored_feature_hash = str(event.get("feature_hash") or "").strip()
+    if current_feature_hash and stored_feature_hash:
+        return _hash_values_equal(stored_feature_hash, current_feature_hash)
+
+    stored_file_hashes = event.get("file_hashes") if isinstance(event.get("file_hashes"), dict) else {}
+    if current_file_hashes and stored_file_hashes:
+        return current_file_hashes == stored_file_hashes
+
+    return False
 
 
 def _eligible_semantic_edges(edges: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -2339,8 +2380,20 @@ def build_semantic_projection(
         if not node_id:
             continue
         stable_key = stable_node_key_for_node(node)
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        current_file_hashes = (
+            metadata.get("file_hashes")
+            if isinstance(metadata.get("file_hashes"), dict)
+            else {}
+        )
         event = _latest_semantic_event_for_node(
-            conn, project_id, node_id, stable_key, branch_ref=branch_ref,
+            conn,
+            project_id,
+            node_id,
+            stable_key,
+            branch_ref=branch_ref,
+            current_feature_hash=feature_hash_for_node(node),
+            current_file_hashes=current_file_hashes,
         )
         validity = _semantic_validity(node, event, snapshot_id=snapshot_id, commit_sha=commit_sha)
         node_semantics[node_id] = {
