@@ -1,5 +1,6 @@
 import type {
   ActiveSummaryResponse,
+  BacklogResponse,
   EdgesResponse,
   FeedbackQueueResponse,
   HealthResponse,
@@ -117,6 +118,9 @@ export const api = {
       `/api/graph-governance/${pid()}/operations/queue`,
       signal,
     );
+  },
+  backlog(signal?: AbortSignal) {
+    return getJSON<BacklogResponse>(`/api/backlog/${pid()}`, signal);
   },
   feedbackQueue(snapshotId: string, signal?: AbortSignal) {
     // MF-2026-05-10-016 P1: drop require_current_semantic filter so the

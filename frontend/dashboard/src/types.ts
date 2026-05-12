@@ -347,3 +347,33 @@ export interface FeedbackQueueSummary {
   by_lane_all_items: Record<string, number>;
   by_lane_visible_groups: Record<string, number>;
 }
+
+export interface BacklogResponse {
+  bugs: BacklogBug[];
+  count: number;
+  request_id?: string;
+}
+
+export interface BacklogBug {
+  bug_id: string;
+  title: string;
+  status: string;
+  priority: "P0" | "P1" | "P2" | "P3" | string;
+  target_files?: string[] | string;
+  test_files?: string[] | string;
+  acceptance_criteria?: string[] | string;
+  details_md?: string;
+  commit?: string;
+  created_at?: string;
+  updated_at?: string;
+  fixed_at?: string;
+  required_docs?: string[];
+  provenance_paths?: string[];
+  chain_stage?: string;
+  runtime_state?: string;
+  current_task_id?: string;
+  root_task_id?: string;
+  worktree_branch?: string;
+  worktree_path?: string;
+  mf_type?: string;
+}

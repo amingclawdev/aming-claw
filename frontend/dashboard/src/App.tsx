@@ -10,6 +10,7 @@ import { computeNodeHealth } from "./lib/health";
 import { useEventStream } from "./lib/sse";
 import type {
   ActiveSummaryResponse,
+  BacklogResponse,
   EdgeRecord,
   FeedbackQueueResponse,
   HealthResponse,
@@ -31,8 +32,9 @@ import OverviewView from "./views/OverviewView";
 import OperationsQueueView from "./views/OperationsQueueView";
 import ReviewQueueView from "./views/ReviewQueueView";
 import GraphView from "./views/GraphView";
+import BacklogView from "./views/BacklogView";
 
-export type ViewName = "overview" | "graph" | "operations" | "review";
+export type ViewName = "overview" | "graph" | "operations" | "review" | "backlog";
 
 interface DataBundle {
   health: HealthResponse;
@@ -43,6 +45,7 @@ interface DataBundle {
   edges: EdgeRecord[];
   ops: OperationsQueueResponse;
   feedback: FeedbackQueueResponse;
+  backlog: BacklogResponse;
   loadedAt: string;
 }
 
@@ -50,6 +53,8 @@ interface Toast {
   kind: "info" | "error" | "success";
   msg: string;
 }
+
+const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
 
 export default function App() {
   const [data, setData] = useState<DataBundle | null>(null);
@@ -92,12 +97,13 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const [health, status, summary, projection, ops, projectList, aiCfg] = await Promise.all([
+      const [health, status, summary, projection, ops, backlog, projectList, aiCfg] = await Promise.all([
         api.health(signal),
         api.status(signal),
         api.activeSummary(signal),
         api.activeProjection(signal),
         api.operationsQueue(signal),
+        api.backlog(signal),
         api.projects(signal),
         api.aiConfig(signal),
       ]);
@@ -129,6 +135,7 @@ export default function App() {
         edges: edgesRes.edges,
         ops,
         feedback,
+        backlog,
         loadedAt: new Date().toISOString(),
       });
     } catch (e) {
@@ -771,6 +778,7 @@ export default function App() {
           activeView={view}
           opsCount={data?.ops?.count ?? 0}
           reviewCount={data?.feedback?.summary?.visible_group_count ?? 0}
+          backlogCount={countOpenBacklog(data?.backlog)}
           onSelectNode={handleSelectNode}
           onSelectView={(v) => setView(v)}
           loading={loading}
@@ -850,6 +858,9 @@ export default function App() {
               onOpenEdgeInGraph={handleSelectEdgeFromReview}
             />
           ) : null}
+          {view === "backlog" && data ? (
+            <BacklogView backlog={data.backlog} projectId={currentProjectId} />
+          ) : null}
           {!data && !error ? (
             <div className="view">
               <div className="empty">
@@ -902,6 +913,15 @@ export default function App() {
         }}
       />
     </div>
+  );
+}
+
+function countOpenBacklog(backlog?: BacklogResponse): number {
+  return (
+    backlog?.bugs?.filter((bug) => {
+      const status = String(bug.status || "OPEN").toUpperCase();
+      return !CLOSED_BACKLOG_STATUSES.has(status);
+    }).length ?? 0
   );
 }
 

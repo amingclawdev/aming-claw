@@ -18,6 +18,7 @@ interface Props {
   activeView: ViewName;
   opsCount: number;
   reviewCount: number;
+  backlogCount: number;
   loading: boolean;
   onSelectNode(id: string): void;
   onSelectView(v: ViewName): void;
@@ -33,7 +34,7 @@ interface Index {
 }
 
 export default function TreePanel(props: Props) {
-  const { nodes, selectedNodeId, activeView, opsCount, reviewCount, loading } = props;
+  const { nodes, selectedNodeId, activeView, opsCount, reviewCount, backlogCount, loading } = props;
 
   const idx = useMemo<Index>(() => buildIndex(nodes), [nodes]);
 
@@ -137,6 +138,13 @@ export default function TreePanel(props: Props) {
           meta={loading ? "…" : String(reviewCount)}
           active={activeView === "review"}
           onClick={() => props.onSelectView("review")}
+        />
+        <NavRow
+          icon="▤"
+          label="Backlog"
+          meta={loading ? "…" : String(backlogCount)}
+          active={activeView === "backlog"}
+          onClick={() => props.onSelectView("backlog")}
         />
       </div>
 
