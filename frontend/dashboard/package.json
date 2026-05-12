@@ -10,7 +10,8 @@
     "preview": "vite preview --port 5173",
     "typecheck": "tsc -b --noEmit",
     "e2e:projects": "node scripts/e2e-projects.mjs",
-    "e2e:semantic": "node scripts/e2e-semantic.mjs"
+    "e2e:semantic": "node scripts/e2e-semantic.mjs",
+    "e2e:trunk": "node scripts/e2e-trunk.mjs"
   },
   "dependencies": {
     "d3-drag": "^3.0.0",

@@ -1,0 +1,735 @@
+#!/usr/bin/env node
+// dashboard-trunk-e2e
+//
+// Layered dashboard E2E trunk for the local plugin MVP. It builds an isolated
+// fixture project, bootstraps its graph, commits a trunk change, materializes
+// scope reconcile, and checks that the dashboard/API contracts stay aligned.
+//
+//   node scripts/e2e-trunk.mjs
+//   node scripts/e2e-trunk.mjs --reset
+//   node scripts/e2e-trunk.mjs --probe
+//   node scripts/e2e-trunk.mjs --skip-dashboard
+//
+// The default run mutates only the isolated fixture workspace under the OS temp
+// directory and the governance DB rows for that fixture project. It must not
+// queue AI semantic jobs.
+
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { exit } from "node:process";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(SCRIPT_DIR, "../../..");
+const DEFAULT_PROJECT = "dashboard-e2e-fixture";
+const DEFAULT_WORKSPACE = path.join(os.tmpdir(), "aming-claw-dashboard-e2e", DEFAULT_PROJECT);
+
+const FLAGS = parseFlags(process.argv.slice(2));
+const BACKEND = FLAGS.backend || process.env.VITE_BACKEND_URL || "http://localhost:40000";
+const DASHBOARD = FLAGS.dashboard || process.env.DASHBOARD_URL || process.env.VITE_DASHBOARD_URL || "http://localhost:5173";
+const PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || DEFAULT_PROJECT;
+const WORKSPACE = path.resolve(FLAGS.workspace || DEFAULT_WORKSPACE);
+const ARTIFACTS = path.resolve(FLAGS.artifacts || path.join(WORKSPACE, ".aming-claw", "e2e-artifacts"));
+const RESET = FLAGS.reset === true;
+const PROBE_ONLY = FLAGS.probe === true;
+const SKIP_DASHBOARD = FLAGS["skip-dashboard"] === true;
+const KEEP_WORKSPACE = FLAGS.keep === true;
+const RUN_ID = FLAGS["run-id"] || `dashboard-trunk-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+
+const C = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  bold: "\x1b[1m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  cyan: "\x1b[36m",
+};
+
+const c = (color, text) => `${C[color]}${text}${C.reset}`;
+const say = (color, tag, text) => console.log(`${c(color, tag)} ${text}`);
+const info = (text) => say("dim", "  -", text);
+const ok = (text) => say("green", "  ok", text);
+const warn = (text) => say("yellow", "  warn", text);
+const fail = (text) => say("red", "  fail", text);
+
+const results = [];
+const context = {
+  backend: BACKEND,
+  dashboard: DASHBOARD,
+  project: PROJECT,
+  workspace: WORKSPACE,
+  artifacts: ARTIFACTS,
+  runId: RUN_ID,
+  baselineCommit: "",
+  targetCommit: "",
+  bootstrap: null,
+  baselineStatus: null,
+  baselineSummary: null,
+  baselineNode: null,
+  reconciledStatus: null,
+  reconciledNode: null,
+};
+
+function parseFlags(args) {
+  const bool = new Set(["reset", "probe", "skip-dashboard", "keep"]);
+  const out = {};
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith("--")) continue;
+    const key = arg.slice(2);
+    if (bool.has(key)) {
+      out[key] = true;
+    } else {
+      out[key] = args[i + 1];
+      i++;
+    }
+  }
+  return out;
+}
+
+class HttpError extends Error {
+  constructor(method, route, status, body, request) {
+    super(`${method} ${route} -> ${status}`);
+    this.method = method;
+    this.route = route;
+    this.status = status;
+    this.body = body;
+    this.request = request;
+  }
+}
+
+function pid(projectId) {
+  return encodeURIComponent(projectId);
+}
+
+function activePath(projectId, suffix) {
+  return `/api/graph-governance/${pid(projectId)}/snapshots/active${suffix}`;
+}
+
+function snapshotPath(projectId, snapshotId, suffix) {
+  return `/api/graph-governance/${pid(projectId)}/snapshots/${encodeURIComponent(snapshotId)}${suffix}`;
+}
+
+function shortCommit(commit) {
+  return commit ? String(commit).slice(0, 7) : "-";
+}
+
+function normalizePath(value) {
+  return String(value || "").replaceAll("\\", "/");
+}
+
+function allNodePaths(node) {
+  return [
+    ...(node.primary_files || []),
+    ...(node.secondary_files || []),
+    ...(node.test_files || []),
+    ...(node.metadata?.config_files || []),
+  ].map(normalizePath);
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function writeText(file, text) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, text.replace(/\n/g, os.EOL), "utf8");
+}
+
+function readText(file) {
+  return readFileSync(file, "utf8");
+}
+
+function command(cmd, args, cwd, options = {}) {
+  try {
+    return execFileSync(cmd, args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      ...options,
+    }).trim();
+  } catch (error) {
+    if (options.allowFail) {
+      return {
+        ok: false,
+        status: error.status,
+        stdout: String(error.stdout || "").trim(),
+        stderr: String(error.stderr || "").trim(),
+      };
+    }
+    const stderr = String(error.stderr || "").trim();
+    throw new Error(`${cmd} ${args.join(" ")} failed${stderr ? `: ${stderr}` : ""}`);
+  }
+}
+
+function git(args, cwd = WORKSPACE, options = {}) {
+  return command("git", args, cwd, options);
+}
+
+async function http(method, route, body) {
+  const init = { method, headers: { Accept: "application/json" } };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  let response;
+  try {
+    response = await fetch(`${BACKEND}${route}`, init);
+  } catch (error) {
+    throw new HttpError(method, route, 0, String(error), body);
+  }
+  const text = await response.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  if (!response.ok) throw new HttpError(method, route, response.status, text, body);
+  return json;
+}
+
+async function httpMaybe(method, route, body) {
+  try {
+    return { ok: true, value: await http(method, route, body) };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+async function waitFor(label, fn, { timeoutMs = 60000, intervalMs = 1000 } = {}) {
+  const started = Date.now();
+  let lastError = null;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const value = await fn();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`${label} timed out${lastError ? `: ${lastError.message}` : ""}`);
+}
+
+async function runStep(id, title, fn) {
+  console.log("");
+  console.log(`${c("cyan", id)} ${c("bold", title)}`);
+  const startedAt = new Date().toISOString();
+  try {
+    const detail = await fn();
+    if (id === "L7") {
+      detail.report_path = artifactPath("report.json");
+    }
+    results.push({ id, title, status: "passed", started_at: startedAt, ended_at: new Date().toISOString(), detail });
+    if (id === "L7") {
+      detail.report_path = writeReport();
+    }
+    ok(title);
+    return detail;
+  } catch (error) {
+    const detail = {
+      message: error.message,
+      http: error instanceof HttpError
+        ? {
+            method: error.method,
+            route: error.route,
+            status: error.status,
+            body: String(error.body || "").slice(0, 1000),
+            request: error.request,
+          }
+        : undefined,
+    };
+    results.push({ id, title, status: "failed", started_at: startedAt, ended_at: new Date().toISOString(), detail });
+    fail(error.message);
+    throw error;
+  }
+}
+
+function artifactPath(name) {
+  return path.join(ARTIFACTS, RUN_ID, name);
+}
+
+function writeArtifact(name, data) {
+  const target = artifactPath(name);
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, JSON.stringify(data, null, 2) + "\n", "utf8");
+  return target;
+}
+
+function buildReport() {
+  return {
+    ok: results.every((row) => row.status === "passed"),
+    run_id: RUN_ID,
+    project_id: PROJECT,
+    workspace: WORKSPACE,
+    backend: BACKEND,
+    dashboard: SKIP_DASHBOARD ? "" : DASHBOARD,
+    baseline_commit: context.baselineCommit,
+    target_commit: context.targetCommit,
+    active_snapshot_id: context.reconciledStatus?.active_snapshot_id || context.baselineStatus?.active_snapshot_id || "",
+    results,
+  };
+}
+
+function writeReport() {
+  return writeArtifact("report.json", buildReport());
+}
+
+function writeFixtureFiles() {
+  const config = `version: 2
+project_id: ${PROJECT}
+name: "Dashboard E2E Fixture"
+language: typescript
+
+testing:
+  unit_command: "node tests/smoke.test.mjs"
+  e2e_command: "node ${normalizePath(path.relative(WORKSPACE, path.join(SCRIPT_DIR, "e2e-trunk.mjs")))} --project ${PROJECT} --workspace ."
+  allowed_commands:
+    - executable: "node"
+      args_prefixes: ["tests/smoke.test.mjs"]
+
+governance:
+  enabled: true
+  test_tool_label: "node"
+
+graph:
+  exclude_paths:
+    - "node_modules"
+    - "dist"
+    - "coverage"
+    - ".aming-claw/e2e-artifacts"
+  ignore_globs:
+    - "**/node_modules/**"
+    - "**/dist/**"
+    - "**/coverage/**"
+    - "**/.aming-claw/e2e-artifacts/**"
+  nested_projects:
+    mode: "exclude"
+    roots: []
+
+ai:
+  routing:
+    pm:
+      provider: "openai"
+      model: "gpt-5.5"
+    dev:
+      provider: "openai"
+      model: "gpt-5.4"
+    tester:
+      provider: "openai"
+      model: "gpt-5.4"
+    qa:
+      provider: "openai"
+      model: "gpt-5.5"
+    semantic:
+      provider: "anthropic"
+      model: "claude-opus-4-7"
+`;
+
+  writeText(path.join(WORKSPACE, ".aming-claw.yaml"), config);
+  writeText(
+    path.join(WORKSPACE, ".gitignore"),
+    `node_modules/
+dist/
+coverage/
+.aming-claw/e2e-artifacts/
+`,
+  );
+  writeText(
+    path.join(WORKSPACE, "package.json"),
+    `{"name":"${PROJECT}","private":true,"type":"module","scripts":{"test":"node tests/smoke.test.mjs"}}\n`,
+  );
+  writeText(
+    path.join(WORKSPACE, "README.md"),
+    `# Dashboard E2E Fixture
+
+This project is generated by the dashboard trunk E2E harness.
+
+It intentionally includes TypeScript source, a test, docs, and ignored output
+folders so the graph builder can prove project bootstrap and reconcile behavior
+without mutating the main aming-claw workspace.
+`,
+  );
+  writeText(
+    path.join(WORKSPACE, "src", "api.ts"),
+    `export interface Task {
+  id: string;
+  title: string;
+  status: "queued" | "running" | "done";
+}
+
+export async function fetchTasks(): Promise<Task[]> {
+  return [
+    { id: "fixture-1", title: "Check graph snapshot", status: "queued" },
+    { id: "fixture-2", title: "Review pending reconcile", status: "running" },
+  ];
+}
+
+export function summarizeTasks(tasks: Task[]): string {
+  const open = tasks.filter((task) => task.status !== "done").length;
+  return \`\${open}/\${tasks.length} open\`;
+}
+
+export function queueDepth(tasks: Task[]): number {
+  return tasks.filter((task) => task.status === "queued").length;
+}
+`,
+  );
+  writeText(
+    path.join(WORKSPACE, "src", "App.tsx"),
+    `import { fetchTasks, queueDepth, summarizeTasks, type Task } from "./api";
+
+export async function loadDashboardSummary(): Promise<string> {
+  const tasks: Task[] = await fetchTasks();
+  return summarizeTasks(tasks);
+}
+
+export async function loadQueueDepth(): Promise<number> {
+  const tasks: Task[] = await fetchTasks();
+  return queueDepth(tasks);
+}
+
+export function renderDashboardTitle(projectName: string): string {
+  return \`\${projectName} dashboard\`;
+}
+`,
+  );
+  writeText(
+    path.join(WORKSPACE, "tests", "smoke.test.mjs"),
+    `import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const src = readFileSync(join(process.cwd(), "src", "api.ts"), "utf8");
+if (!src.includes("summarizeTasks")) {
+  throw new Error("fixture api is missing summarizeTasks");
+}
+console.log("fixture smoke ok");
+`,
+  );
+  writeText(path.join(WORKSPACE, "node_modules", "ignored.js"), "export const ignored = true;\n");
+  writeText(path.join(WORKSPACE, "dist", "bundle.js"), "export const bundled = true;\n");
+  writeText(path.join(WORKSPACE, "coverage", "coverage.json"), "{\"ignored\":true}\n");
+}
+
+function ensureGitRepository() {
+  if (!existsSync(path.join(WORKSPACE, ".git"))) {
+    git(["init", "-b", "main"], WORKSPACE, { allowFail: true });
+    if (!existsSync(path.join(WORKSPACE, ".git"))) {
+      git(["init"], WORKSPACE);
+      git(["checkout", "-B", "main"], WORKSPACE);
+    }
+  }
+  git(["config", "user.email", "dashboard-e2e@example.local"], WORKSPACE);
+  git(["config", "user.name", "Dashboard E2E"], WORKSPACE);
+  git(["add", "."], WORKSPACE);
+  const hasHead = git(["rev-parse", "--verify", "HEAD"], WORKSPACE, { allowFail: true });
+  const dirty = git(["status", "--porcelain"], WORKSPACE);
+  if (!hasHead.ok && dirty) {
+    git(["commit", "-m", "baseline dashboard e2e fixture"], WORKSPACE);
+  } else if (dirty) {
+    git(["commit", "-m", "refresh dashboard e2e fixture"], WORKSPACE);
+  }
+  context.baselineCommit = git(["rev-parse", "HEAD"], WORKSPACE);
+  return context.baselineCommit;
+}
+
+function mutateFixtureForScopeReconcile() {
+  const file = path.join(WORKSPACE, "src", "api.ts");
+  const runToken = RUN_ID.replace(/[^a-zA-Z0-9]/g, "").slice(-10);
+  const marker = `// E2E_TRUNK_MARKER_START
+export function formatTrunkRunLabel(count: number): string {
+  return \`trunk-${runToken}:\${count}\`;
+}
+// E2E_TRUNK_MARKER_END
+`;
+  const before = readText(file);
+  const updated = before.includes("// E2E_TRUNK_MARKER_START")
+    ? before.replace(/\/\/ E2E_TRUNK_MARKER_START[\s\S]*?\/\/ E2E_TRUNK_MARKER_END\s*/m, marker)
+    : `${before.trimEnd()}\n\n${marker}`;
+  writeText(file, updated);
+  git(["add", "src/api.ts"], WORKSPACE);
+  const dirty = git(["status", "--porcelain"], WORKSPACE);
+  assert(dirty, "fixture mutation did not change git state");
+  git(["commit", "-m", `dashboard trunk change ${RUN_ID}`], WORKSPACE);
+  context.targetCommit = git(["rev-parse", "HEAD"], WORKSPACE);
+  return context.targetCommit;
+}
+
+function functionNames(node) {
+  const functions = node?.metadata?.functions || [];
+  return functions.map((item) => String(item).split("::").pop() || String(item));
+}
+
+function findNodeForPath(nodes, relPath) {
+  const needle = normalizePath(relPath);
+  return (nodes || []).find((node) => allNodePaths(node).some((item) => item === needle || item.endsWith(`/${needle}`)));
+}
+
+function assertNoIgnoredPaths(nodes, files) {
+  const values = [];
+  for (const node of nodes || []) values.push(...allNodePaths(node));
+  for (const row of files || []) values.push(normalizePath(row.path || ""));
+  const ignored = values.filter((item) =>
+    item.includes("node_modules/")
+    || item.includes("dist/")
+    || item.includes("coverage/")
+    || item.includes(".aming-claw/e2e-artifacts/"),
+  );
+  assert(ignored.length === 0, `ignored paths leaked into graph: ${ignored.slice(0, 5).join(", ")}`);
+}
+
+function queuedAiJobCount(ops) {
+  const statuses = new Set(["queued", "running", "ai_pending", "ai_running"]);
+  return (ops.operations || []).filter((op) =>
+    (op.operation_type === "node_semantic" || op.operation_type === "edge_semantic")
+    && statuses.has(String(op.status || "")),
+  ).length;
+}
+
+async function loadRuntimeBundle(projectId) {
+  const status = await http("GET", `/api/graph-governance/${pid(projectId)}/status`);
+  const snapshotId = status.active_snapshot_id;
+  assert(snapshotId, `${projectId} active snapshot missing`);
+  const [summary, ops, nodes, edges, files, projection] = await Promise.all([
+    http("GET", activePath(projectId, "/summary")),
+    http("GET", `/api/graph-governance/${pid(projectId)}/operations/queue`),
+    http("GET", snapshotPath(projectId, snapshotId, "/nodes?include_semantic=true&limit=2000")),
+    http("GET", snapshotPath(projectId, snapshotId, "/edges?limit=6000")),
+    http("GET", snapshotPath(projectId, snapshotId, "/files?limit=2000")),
+    httpMaybe("GET", activePath(projectId, "/semantic/projection")),
+  ]);
+  return {
+    status,
+    snapshotId,
+    summary,
+    ops,
+    nodes: nodes.nodes || [],
+    edges: edges.edges || [],
+    files: files.files || [],
+    projection: projection.ok ? projection.value : null,
+  };
+}
+
+async function stepEnvGate() {
+  const health = await http("GET", "/api/health");
+  const projects = await http("GET", "/api/projects");
+  assert(Array.isArray(projects.projects), "/api/projects did not return projects[]");
+  let dashboard = { skipped: true };
+  if (!SKIP_DASHBOARD) {
+    const response = await fetch(DASHBOARD).catch((error) => ({ ok: false, status: 0, text: async () => String(error) }));
+    const text = await response.text().catch(() => "");
+    assert(response.ok, `dashboard ${DASHBOARD} is not reachable (status ${response.status})`);
+    assert(text.includes("<div id=\"root\"></div>") || text.includes("aming-claw"), "dashboard root did not look like the Vite app");
+    dashboard = { skipped: false, url: DASHBOARD, status: response.status };
+  }
+  return { health, project_count: projects.projects.length, dashboard };
+}
+
+async function stepFixtureProject() {
+  if (RESET && existsSync(WORKSPACE)) {
+    rmSync(WORKSPACE, { recursive: true, force: true });
+  }
+  mkdirSync(WORKSPACE, { recursive: true });
+  const shouldWrite = RESET || !existsSync(path.join(WORKSPACE, ".aming-claw.yaml"));
+  if (shouldWrite) writeFixtureFiles();
+  const commit = ensureGitRepository();
+  const smoke = command("node", ["tests/smoke.test.mjs"], WORKSPACE);
+  assert(smoke.includes("fixture smoke ok"), "fixture smoke test failed");
+  return { workspace: WORKSPACE, project: PROJECT, baseline_commit: commit, reset: RESET, wrote_fixture: shouldWrite };
+}
+
+async function stepBootstrapProject() {
+  const registered = await httpMaybe("POST", "/api/projects/register", { workspace_path: WORKSPACE });
+  if (!registered.ok && registered.error.status !== 409) throw registered.error;
+  const bootstrap = await http("POST", "/api/project/bootstrap", {
+    workspace_path: WORKSPACE,
+    project_name: PROJECT,
+    scan_depth: 3,
+    exclude_patterns: ["node_modules", "dist", "coverage", ".aming-claw/e2e-artifacts"],
+  });
+  assert(bootstrap.project_id === PROJECT, `bootstrap returned project ${bootstrap.project_id}, expected ${PROJECT}`);
+  assert(bootstrap.snapshot_id, "bootstrap did not return snapshot_id");
+  context.bootstrap = bootstrap;
+  return {
+    project_id: bootstrap.project_id,
+    snapshot_id: bootstrap.snapshot_id,
+    node_count: bootstrap.graph_stats?.node_count,
+    edge_count: bootstrap.graph_stats?.edge_count,
+    register_status: registered.ok ? "registered" : "already_registered",
+  };
+}
+
+async function stepGraphBaseline() {
+  const bundle = await loadRuntimeBundle(PROJECT);
+  assert(bundle.status.graph_snapshot_commit === context.baselineCommit, "baseline graph commit does not match fixture HEAD");
+  assert(bundle.status.current_state?.graph_stale?.is_stale === false, "baseline graph should not be stale");
+  assert((bundle.summary.counts?.features || 0) > 0, "summary features count is zero");
+  assert((bundle.nodes || []).length > 0, "nodes list is empty");
+  assertNoIgnoredPaths(bundle.nodes, bundle.files);
+  const apiNode = findNodeForPath(bundle.nodes, "src/api.ts");
+  assert(apiNode, "src/api.ts node not found");
+  const funcs = functionNames(apiNode);
+  assert(funcs.some((name) => name.includes("summarizeTasks")), "src/api.ts functions did not include summarizeTasks");
+  assert(apiNode.metadata?.function_lines, "src/api.ts node missing metadata.function_lines");
+  assert(queuedAiJobCount(bundle.ops) === 0, "baseline queued AI semantic jobs unexpectedly present");
+  context.baselineStatus = bundle.status;
+  context.baselineSummary = bundle.summary;
+  context.baselineNode = apiNode;
+  return {
+    snapshot_id: bundle.snapshotId,
+    commit: bundle.status.graph_snapshot_commit,
+    nodes: bundle.nodes.length,
+    edges: bundle.edges.length,
+    functions: funcs,
+  };
+}
+
+async function stepTrunkCommitAndReconcile() {
+  const targetCommit = mutateFixtureForScopeReconcile();
+  const stale = await waitFor("graph stale status", async () => {
+    const status = await http("GET", `/api/graph-governance/${pid(PROJECT)}/status`);
+    return status.current_state?.graph_stale?.is_stale ? status : null;
+  }, { timeoutMs: 30000, intervalMs: 1000 });
+  assert(stale.current_state.graph_stale.head_commit === targetCommit, "stale status head_commit does not match target commit");
+
+  await http("POST", `/api/graph-governance/${pid(PROJECT)}/pending-scope`, {
+    commit_sha: targetCommit,
+    parent_commit_sha: stale.current_state.graph_stale.active_graph_commit || stale.graph_snapshot_commit || "",
+    actor: "dashboard_e2e",
+    evidence: { source: "dashboard_trunk_e2e", run_id: RUN_ID, layer: "L4" },
+  });
+
+  const result = await http("POST", `/api/graph-governance/${pid(PROJECT)}/reconcile/pending-scope`, {
+    target_commit_sha: targetCommit,
+    run_id: `dashboard-trunk-scope-${shortCommit(targetCommit)}-${Date.now()}`,
+    actor: "dashboard_e2e",
+    activate: true,
+    semantic_enrich: true,
+    semantic_use_ai: false,
+    enqueue_stale: false,
+    semantic_skip_completed: true,
+    notes_extra: { source: "dashboard_trunk_e2e", run_id: RUN_ID, action: "scope_reconcile" },
+  });
+
+  const current = await waitFor("graph current status", async () => {
+    const status = await http("GET", `/api/graph-governance/${pid(PROJECT)}/status`);
+    const graphStale = status.current_state?.graph_stale;
+    return graphStale?.is_stale === false && status.graph_snapshot_commit === targetCommit ? status : null;
+  }, { timeoutMs: 90000, intervalMs: 1500 });
+  assert((current.pending_scope_reconcile_count || 0) === 0, "pending scope reconcile should be empty after materialize");
+  context.reconciledStatus = current;
+  return {
+    target_commit: targetCommit,
+    stale_snapshot: stale.active_snapshot_id,
+    reconciled_snapshot: current.active_snapshot_id,
+    result_snapshot: result.snapshot_id,
+  };
+}
+
+async function stepDashboardApiConsistency() {
+  const bundle = await loadRuntimeBundle(PROJECT);
+  assert(bundle.status.graph_snapshot_commit === context.targetCommit, "reconciled graph commit mismatch");
+  assert(bundle.status.active_snapshot_id === bundle.summary.snapshot_id, "status/summary snapshot mismatch");
+  assert(bundle.ops.active_snapshot_id === bundle.status.active_snapshot_id, "operations queue snapshot mismatch");
+  assert(queuedAiJobCount(bundle.ops) === 0, "scope reconcile queued AI semantic jobs unexpectedly");
+  const apiNode = findNodeForPath(bundle.nodes, "src/api.ts");
+  assert(apiNode, "src/api.ts node missing after reconcile");
+  const funcs = functionNames(apiNode);
+  assert(funcs.some((name) => name.includes("formatTrunkRunLabel")), "reconciled node missing new trunk function");
+  const lineKeys = Object.keys(apiNode.metadata?.function_lines || {});
+  assert(lineKeys.some((key) => key.endsWith("formatTrunkRunLabel")), "new trunk function line metadata missing");
+  context.reconciledNode = apiNode;
+  return {
+    snapshot_id: bundle.snapshotId,
+    project_id: bundle.status.project_id,
+    node_id: apiNode.node_id,
+    semantic_projection_status: bundle.projection?.status || bundle.projection?.projection?.status || "unknown",
+    functions: funcs,
+  };
+}
+
+async function stepScenarioBranches() {
+  const scenarios = [
+    {
+      id: "L6.python-function-lines",
+      depends_on: "L5",
+      status: "ready",
+      note: "Add a Python fixture and assert function_lines parity.",
+    },
+    {
+      id: "L6.docs-orphans",
+      depends_on: "L5",
+      status: "ready",
+      note: "Generate docs with node binding markers and assert orphan handling.",
+    },
+    {
+      id: "L6.semantic-cancel",
+      depends_on: "L5",
+      status: "delegated",
+      note: "Covered by scripts/e2e-semantic.mjs cancel-first matrix.",
+    },
+    {
+      id: "L6.ui-inspector",
+      depends_on: "L5",
+      status: SKIP_DASHBOARD ? "blocked" : "ready",
+      note: "Add Playwright once dashboard runtime is available in CI.",
+    },
+  ];
+  return { scenarios };
+}
+
+async function stepCleanupAndArtifacts() {
+  const reportPath = artifactPath("report.json");
+  info(`${KEEP_WORKSPACE ? "fixture workspace kept" : "fixture workspace kept for rerun/debug"}: ${WORKSPACE}`);
+  return { report_path: reportPath, kept_workspace: true };
+}
+
+async function main() {
+  console.log(c("bold", "dashboard-trunk-e2e"));
+  console.log(c("dim", `backend=${BACKEND} dashboard=${SKIP_DASHBOARD ? "skipped" : DASHBOARD}`));
+  console.log(c("dim", `project=${PROJECT} workspace=${WORKSPACE} run_id=${RUN_ID}`));
+
+  try {
+    await runStep("L0", "Environment gate", stepEnvGate);
+    if (PROBE_ONLY) {
+      await runStep("L7", "Artifacts", stepCleanupAndArtifacts);
+      console.log("");
+      console.log(c("green", "TRUNK E2E PROBE OK"));
+      return;
+    }
+    await runStep("L1", "Fixture project factory", stepFixtureProject);
+    await runStep("L2", "Project registration and bootstrap", stepBootstrapProject);
+    await runStep("L3", "Graph baseline assertions", stepGraphBaseline);
+    await runStep("L4", "Trunk commit and scope reconcile", stepTrunkCommitAndReconcile);
+    await runStep("L5", "Dashboard/API consistency", stepDashboardApiConsistency);
+    await runStep("L6", "Scenario branch registry", stepScenarioBranches);
+    await runStep("L7", "Cleanup and artifacts", stepCleanupAndArtifacts);
+    console.log("");
+    console.log(c("green", "TRUNK E2E OK"));
+  } catch (error) {
+    try {
+      await stepCleanupAndArtifacts();
+      writeReport();
+    } catch {
+      // Best effort only.
+    }
+    if (error instanceof HttpError) {
+      console.log(c("dim", `body=${String(error.body || "").slice(0, 1000)}`));
+    }
+    console.log("");
+    console.log(c("red", "TRUNK E2E FAIL"));
+    exit(error instanceof HttpError ? 1 : 2);
+  }
+}
+
+main();
