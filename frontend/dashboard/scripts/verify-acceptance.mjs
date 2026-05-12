@@ -121,7 +121,11 @@ function classify(n) {
   }
 
   const sh = summary.health.semantic_health;
-  const banner = !commitsMatch(health.version, status.graph_snapshot_commit);
+  const graphStale = status?.current_state?.graph_stale;
+  const banner =
+    typeof graphStale?.is_stale === "boolean"
+      ? graphStale.is_stale
+      : !commitsMatch(health.version, status.graph_snapshot_commit);
   const lines = [
     `service.version              = ${health.version}`,
     `status.graph_snapshot_commit = ${status.graph_snapshot_commit.slice(0, 7)}…`,

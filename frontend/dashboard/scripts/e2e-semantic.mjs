@@ -379,11 +379,19 @@ async function phasePreflight() {
       throw e;
     }
   }
-  // Banner check
+  // Banner check: backend owns project-scoped stale detection. Comparing
+  // service version with snapshot commit is a false positive for nested demo
+  // projects whose workspace did not change under the newer repo HEAD.
   const runtime = (await http("GET", "/api/health")).version;
   const snap = lastStatus.graph_snapshot_commit;
-  if (snap && runtime && !snap.startsWith(runtime) && !runtime.startsWith(snap.slice(0, runtime.length))) {
-    warn(`graph snapshot behind runtime — service ${runtime} vs snapshot ${snap.slice(0, 7)} (dashboard banner active)`);
+  const graphStale = lastStatus?.current_state?.graph_stale;
+  const bannerActive =
+    typeof graphStale?.is_stale === "boolean"
+      ? graphStale.is_stale
+      : snap && runtime && !snap.startsWith(runtime) && !runtime.startsWith(snap.slice(0, runtime.length));
+  if (bannerActive) {
+    const head = graphStale?.head_commit || runtime;
+    warn(`graph snapshot behind HEAD — head ${head.slice(0, 7)} vs snapshot ${snap.slice(0, 7)} (dashboard banner active)`);
   }
   return {
     snapshotId: sid,

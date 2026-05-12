@@ -22,19 +22,17 @@ interface Props {
   onQueueReconcile(): void;
 }
 
-// active snapshot is commit-anchored. If the running governance service is on
-// a newer commit than the active snapshot, the graph is behind runtime — show
-// a banner and offer manual reconcile. Working-tree dirtiness is NOT inferred
-// here; without an explicit `dirty` flag from the API we don't pretend the
-// scope is stale.
+// The backend owns stale detection because it knows the governed project
+// workspace. Nested/demo projects can share the same Git repo and service HEAD
+// while having no changed files under their own root; comparing service commit
+// to snapshot commit in the browser would produce false stale banners.
 //
 // MF-016 banner P3: banner has two display modes —
 // 1. **stale**: HEAD ≠ snapshot. Default state; shows the queue button.
 // 2. **in-progress / just done**: while handleQueueReconcile runs, replace the
 //    button with phase chips + progress bar so the operator can read off what
 //    is happening (queue → materialize → projection rebuild → done).
-//    Banner auto-hides once the stale condition clears (governed by the
-//    snapshot/service commit comparison below).
+//    Banner auto-hides once status.current_state.graph_stale.is_stale clears.
 export default function StaleGraphBanner({
   health,
   status,
@@ -45,10 +43,19 @@ export default function StaleGraphBanner({
 }: Props) {
   if (!health || !status) return null;
   const serviceVersion = (health.version || "").trim();
-  const snapshotCommit = (status.graph_snapshot_commit || "").trim();
-  if (!serviceVersion || !snapshotCommit) return null;
+  const graphStale = status.current_state?.graph_stale;
+  const snapshotCommit = (
+    graphStale?.active_graph_commit ||
+    status.graph_snapshot_commit ||
+    ""
+  ).trim();
+  const headCommit = (graphStale?.head_commit || serviceVersion || "").trim();
+  if (!snapshotCommit || !headCommit) return null;
 
-  const stale = !commitsMatch(serviceVersion, snapshotCommit);
+  const stale =
+    typeof graphStale?.is_stale === "boolean"
+      ? graphStale.is_stale
+      : !commitsMatch(serviceVersion, snapshotCommit);
   const inProgress = phase !== "idle";
   // Keep banner visible briefly after success so the operator can see "done"
   // before it disappears on the next refresh tick.
@@ -67,8 +74,8 @@ export default function StaleGraphBanner({
           <ReconcileProgress phase={phase} detail={phaseDetail} />
         ) : (
           <>
-            <span className="banner-title">graph snapshot behind runtime</span>{" "}
-            — service is on <span className="mono">{serviceVersion.slice(0, 7)}</span>,
+            <span className="banner-title">graph snapshot behind HEAD</span>{" "}
+            — HEAD is <span className="mono">{headCommit.slice(0, 7)}</span>,
             active snapshot was built from{" "}
             <span className="mono">{snapshotCommit.slice(0, 7)}</span>. Tree counts
             and semantic scores reflect the snapshot, not the running code.
