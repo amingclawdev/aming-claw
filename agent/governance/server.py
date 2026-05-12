@@ -4319,6 +4319,10 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
+                # Dashboard graph-build actions are structural by default:
+                # rebuild the snapshot and projection without silently filling
+                # graph_semantic_jobs. Operators enqueue AI explicitly later.
+                semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)

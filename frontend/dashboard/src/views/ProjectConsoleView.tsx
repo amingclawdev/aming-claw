@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
   ActiveSummaryResponse,
   BacklogResponse,
   OperationsQueueResponse,
   StatusResponse,
 } from "../types";
-import { api, ApiError, type AiConfigResponse, type ProjectListItem } from "../lib/api";
+import { api, ApiError, type AiConfigResponse, type ProjectConfigResponse, type ProjectListItem } from "../lib/api";
 
 interface Props {
   projects: ProjectListItem[];
@@ -13,6 +13,7 @@ interface Props {
   loading: boolean;
   onOpenProject(projectId: string): void;
   onOpenAiConfig(): void;
+  onRefresh(): Promise<void> | void;
 }
 
 interface ProjectRuntime {
@@ -22,7 +23,40 @@ interface ProjectRuntime {
   ops?: OperationsQueueResponse;
   backlog?: BacklogResponse;
   aiConfig?: AiConfigResponse;
+  config?: ProjectConfigResponse;
   error?: string;
+  errors: {
+    status?: RuntimeFailure;
+    summary?: RuntimeFailure;
+    config?: RuntimeFailure;
+  };
+}
+
+interface RuntimeFailure {
+  message: string;
+  status?: number;
+}
+
+type LifecycleKind =
+  | "loading"
+  | "ready"
+  | "graph_stale"
+  | "graph_missing"
+  | "config_missing"
+  | "reconcile_pending"
+  | "service_error";
+
+interface Lifecycle {
+  kind: LifecycleKind;
+  label: string;
+  detail: string;
+  className: string;
+  action?: "build" | "update";
+}
+
+interface Notice {
+  kind: "success" | "error" | "info";
+  message: string;
 }
 
 const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
@@ -33,9 +67,15 @@ export default function ProjectConsoleView({
   loading,
   onOpenProject,
   onOpenAiConfig,
+  onRefresh,
 }: Props) {
   const [runtime, setRuntime] = useState<Record<string, ProjectRuntime>>({});
   const [runtimeLoading, setRuntimeLoading] = useState(false);
+  const [refreshToken, setRefreshToken] = useState(0);
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [projectName, setProjectName] = useState("");
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [actionState, setActionState] = useState<{ key: string; label: string } | null>(null);
   const projectKey = useMemo(() => projects.map((p) => p.project_id).join("\u0000"), [projects]);
 
   useEffect(() => {
@@ -54,7 +94,7 @@ export default function ProjectConsoleView({
         if (!ac.signal.aborted) setRuntimeLoading(false);
       });
     return () => ac.abort();
-  }, [projectKey, projects]);
+  }, [projectKey, projects, refreshToken]);
 
   const rows = useMemo(
     () =>
@@ -74,9 +114,113 @@ export default function ProjectConsoleView({
       total: projects.length,
       current: runtimes.filter((r) => r.status?.current_state?.graph_stale?.is_stale === false).length,
       stale: runtimes.filter((r) => r.status?.current_state?.graph_stale?.is_stale === true).length,
+      missing: projects.filter((p) => lifecycleFor(p, runtime[p.project_id]).kind === "graph_missing").length,
       backlogOpen: runtimes.reduce((sum, r) => sum + countOpenBacklog(r.backlog), 0),
     };
   }, [projects.length, runtime]);
+
+  const refreshRuntime = async () => {
+    setRefreshToken((value) => value + 1);
+    await onRefresh();
+  };
+
+  const handleBootstrap = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const path = workspacePath.trim();
+    if (!path) {
+      setNotice({ kind: "error", message: "Workspace path is required." });
+      return;
+    }
+    setActionState({ key: "bootstrap", label: "Bootstrapping" });
+    setNotice({ kind: "info", message: "Bootstrapping project..." });
+    try {
+      const result = await api.bootstrapProject({
+        workspace_path: path,
+        project_name: projectName.trim() || undefined,
+        scan_depth: 3,
+      });
+      setWorkspacePath("");
+      setProjectName("");
+      setNotice({
+        kind: "success",
+        message: `Bootstrapped ${result.project_id}${result.snapshot_id ? ` · ${result.snapshot_id}` : ""}`,
+      });
+      await refreshRuntime();
+    } catch (error) {
+      setNotice({ kind: "error", message: `Bootstrap failed: ${errorMessage(error)}` });
+    } finally {
+      setActionState(null);
+    }
+  };
+
+  const handleBuildGraph = async (project: ProjectListItem) => {
+    const key = actionKey(project.project_id, "build");
+    setActionState({ key, label: "Building graph" });
+    setNotice({ kind: "info", message: `Building graph for ${project.project_id}...` });
+    try {
+      const result = await api.fullReconcileFor(project.project_id, {
+        run_id: `dashboard-full-${project.project_id}-${Date.now()}`,
+        actor: "dashboard",
+        activate: true,
+        semantic_enrich: true,
+        semantic_use_ai: false,
+        enqueue_stale: false,
+        semantic_skip_completed: true,
+        notes_extra: { source: "dashboard_project_console", action: "build_graph" },
+      });
+      setNotice({
+        kind: "success",
+        message: `Graph built for ${project.project_id}${result.snapshot_id ? ` · ${result.snapshot_id}` : ""}`,
+      });
+      await refreshRuntime();
+    } catch (error) {
+      setNotice({ kind: "error", message: `Build graph failed: ${errorMessage(error)}` });
+    } finally {
+      setActionState(null);
+    }
+  };
+
+  const handleUpdateGraph = async (project: ProjectListItem, row?: ProjectRuntime) => {
+    const key = actionKey(project.project_id, "update");
+    const targetCommit = targetCommitFor(row);
+    if (!targetCommit) {
+      setNotice({ kind: "error", message: `No target commit available for ${project.project_id}.` });
+      return;
+    }
+    setActionState({ key, label: "Updating graph" });
+    setNotice({ kind: "info", message: `Updating graph for ${project.project_id}...` });
+    try {
+      const graphStale = row?.status?.current_state?.graph_stale;
+      if (graphStale?.is_stale) {
+        await api.queuePendingScopeFor(project.project_id, {
+          commit_sha: targetCommit,
+          parent_commit_sha: graphStale.active_graph_commit || row?.status?.graph_snapshot_commit || "",
+          actor: "dashboard",
+          evidence: { source: "dashboard_project_console", action: "update_graph" },
+        });
+      }
+      const result = await api.materializePendingScopeFor(project.project_id, {
+        target_commit_sha: targetCommit,
+        run_id: `dashboard-scope-${project.project_id}-${shortCommit(targetCommit)}-${Date.now()}`,
+        actor: "dashboard",
+        activate: true,
+        semantic_enrich: true,
+        semantic_use_ai: false,
+        enqueue_stale: false,
+        semantic_skip_completed: true,
+        notes_extra: { source: "dashboard_project_console", action: "update_graph" },
+      });
+      setNotice({
+        kind: "success",
+        message: `Graph updated for ${project.project_id}${result.snapshot_id ? ` · ${result.snapshot_id}` : ""}`,
+      });
+      await refreshRuntime();
+    } catch (error) {
+      setNotice({ kind: "error", message: `Update graph failed: ${errorMessage(error)}` });
+    } finally {
+      setActionState(null);
+    }
+  };
 
   return (
     <div className="view project-console">
@@ -92,8 +236,38 @@ export default function ProjectConsoleView({
         <Kpi label="Registered" value={stats.total} tone="blue" />
         <Kpi label="Graph current" value={stats.current} tone="green" />
         <Kpi label="Graph stale" value={stats.stale} tone={stats.stale > 0 ? "amber" : "neutral"} />
+        <Kpi label="Graph missing" value={stats.missing} tone={stats.missing > 0 ? "red" : "neutral"} />
         <Kpi label="Open backlog" value={stats.backlogOpen} tone={stats.backlogOpen > 0 ? "amber" : "neutral"} />
       </div>
+
+      <form className="project-bootstrap card" onSubmit={handleBootstrap}>
+        <div className="project-bootstrap-fields">
+          <label>
+            <span>Workspace path</span>
+            <input
+              value={workspacePath}
+              onChange={(event) => setWorkspacePath(event.target.value)}
+              placeholder="C:\\path\\to\\project"
+            />
+          </label>
+          <label>
+            <span>Project name</span>
+            <input
+              value={projectName}
+              onChange={(event) => setProjectName(event.target.value)}
+              placeholder="optional"
+            />
+          </label>
+          <button className="action-btn action-btn-primary" disabled={Boolean(actionState)}>
+            {actionState?.key === "bootstrap" ? "Bootstrapping..." : "Bootstrap"}
+          </button>
+        </div>
+        {notice ? (
+          <div className={`project-console-notice ${notice.kind}`}>
+            {notice.message}
+          </div>
+        ) : null}
+      </form>
 
       <div className="section">
         <div className="section-head">
@@ -126,8 +300,12 @@ export default function ProjectConsoleView({
                     project={project}
                     runtime={row}
                     selected={selected}
+                    lifecycle={lifecycleFor(project, row)}
+                    busyLabel={busyLabelFor(project.project_id, actionState)}
                     onOpenProject={onOpenProject}
                     onOpenAiConfig={onOpenAiConfig}
+                    onBuildGraph={() => handleBuildGraph(project)}
+                    onUpdateGraph={() => handleUpdateGraph(project, row)}
                   />
                 );
               })}
@@ -150,35 +328,29 @@ function ProjectRow({
   project,
   runtime,
   selected,
+  lifecycle,
+  busyLabel,
   onOpenProject,
   onOpenAiConfig,
+  onBuildGraph,
+  onUpdateGraph,
 }: {
   project: ProjectListItem;
   runtime?: ProjectRuntime;
   selected: boolean;
+  lifecycle: Lifecycle;
+  busyLabel?: string;
   onOpenProject(projectId: string): void;
   onOpenAiConfig(): void;
+  onBuildGraph(): void;
+  onUpdateGraph(): void;
 }) {
-  const graphStale = runtime?.status?.current_state?.graph_stale;
   const summary = runtime?.summary;
   const ops = runtime?.ops;
   const backlogOpen = countOpenBacklog(runtime?.backlog);
   const aiRoute = runtime?.aiConfig?.semantic;
-  const hasGraph = Boolean(runtime?.status || runtime?.summary);
-  const graphClass = runtime?.error
-    ? "status-failed"
-    : graphStale?.is_stale
-      ? "status-pending"
-      : hasGraph
-        ? "status-complete"
-        : "status-unknown";
-  const graphLabel = runtime?.error
-    ? "unavailable"
-    : graphStale?.is_stale
-      ? "stale"
-      : hasGraph
-        ? "current"
-        : "unknown";
+  const actionBusy = Boolean(busyLabel);
+  const actionDisabled = actionBusy || lifecycle.kind === "config_missing" || lifecycle.kind === "service_error";
 
   return (
     <tr className={selected ? "project-console-selected" : ""}>
@@ -193,7 +365,8 @@ function ProjectRow({
         </div>
       </td>
       <td>
-        <span className={`status-badge ${graphClass}`}>{graphLabel}</span>
+        <span className={`status-badge ${lifecycle.className}`}>{lifecycle.label}</span>
+        <div className="project-console-sub">{lifecycle.detail}</div>
         {runtime?.status?.pending_scope_reconcile_count ? (
           <div className="project-console-sub mono">
             pending scope {runtime.status.pending_scope_reconcile_count}
@@ -229,21 +402,45 @@ function ProjectRow({
         </span>
       </td>
       <td>
-        <button
-          className="action-btn"
-          onClick={() => onOpenProject(project.project_id)}
-          title="Open this project in the dashboard"
-        >
-          Open
-        </button>
-        <button
-          className="action-btn"
-          disabled={!selected}
-          onClick={onOpenAiConfig}
-          title={selected ? "Open AI configuration" : "Open the project first"}
-        >
-          AI config
-        </button>
+        <div className="project-console-actions">
+          <button
+            className="action-btn"
+            disabled={actionBusy}
+            onClick={() => onOpenProject(project.project_id)}
+            title="Open this project in the dashboard"
+          >
+            Open
+          </button>
+          {lifecycle.action === "build" ? (
+            <button
+              className="action-btn"
+              disabled={actionDisabled}
+              onClick={onBuildGraph}
+              title="Run full graph reconcile without AI enrichment"
+            >
+              Build graph
+            </button>
+          ) : null}
+          {lifecycle.action === "update" ? (
+            <button
+              className="action-btn"
+              disabled={actionDisabled}
+              onClick={onUpdateGraph}
+              title="Run scope reconcile without AI enrichment"
+            >
+              Update graph
+            </button>
+          ) : null}
+          <button
+            className="action-btn"
+            disabled={!selected || actionBusy}
+            onClick={onOpenAiConfig}
+            title={selected ? "Open AI configuration" : "Open the project first"}
+          >
+            AI config
+          </button>
+          {busyLabel ? <span className="project-console-busy">{busyLabel}</span> : null}
+        </div>
       </td>
     </tr>
   );
@@ -282,13 +479,17 @@ async function loadProjectRuntime(projects: ProjectListItem[], signal: AbortSign
 
 async function loadOneProjectRuntime(project: ProjectListItem, signal: AbortSignal): Promise<ProjectRuntime> {
   const projectId = project.project_id;
-  const [status, summary, ops, backlog, aiConfig] = await Promise.allSettled([
+  const [status, summary, ops, backlog, aiConfig, config] = await Promise.allSettled([
     api.statusFor(projectId, signal),
     api.activeSummaryFor(projectId, signal),
     api.operationsQueueFor(projectId, signal),
     api.backlogFor(projectId, signal),
     api.aiConfigFor(projectId, signal),
+    api.projectConfigFor(projectId, signal),
   ]);
+  const statusError = failure(status);
+  const summaryError = failure(summary);
+  const configError = failure(config);
   return {
     projectId,
     status: settledValue(status),
@@ -296,7 +497,13 @@ async function loadOneProjectRuntime(project: ProjectListItem, signal: AbortSign
     ops: settledValue(ops),
     backlog: settledValue(backlog),
     aiConfig: settledValue(aiConfig),
-    error: firstError(status, summary),
+    config: settledValue(config),
+    error: firstError(statusError, summaryError),
+    errors: {
+      status: statusError,
+      summary: summaryError,
+      config: configError,
+    },
   };
 }
 
@@ -304,12 +511,15 @@ function settledValue<T>(result: PromiseSettledResult<T>): T | undefined {
   return result.status === "fulfilled" ? result.value : undefined;
 }
 
-function firstError(...results: PromiseSettledResult<unknown>[]): string | undefined {
-  const failed = results.find((result) => result.status === "rejected");
-  if (!failed || failed.status !== "rejected") return undefined;
-  const reason = failed.reason;
-  if (reason instanceof ApiError) return `HTTP ${reason.status}`;
-  return reason instanceof Error ? reason.message : "error";
+function failure(result: PromiseSettledResult<unknown>): RuntimeFailure | undefined {
+  if (result.status === "fulfilled") return undefined;
+  const reason = result.reason;
+  if (reason instanceof ApiError) return { message: `HTTP ${reason.status}`, status: reason.status };
+  return { message: reason instanceof Error ? reason.message : "error" };
+}
+
+function firstError(...failures: Array<RuntimeFailure | undefined>): string | undefined {
+  return failures.find(Boolean)?.message;
 }
 
 function countOpenBacklog(backlog?: BacklogResponse): number {
@@ -331,4 +541,100 @@ function formatRoute(route?: { provider?: string; model?: string } | null): stri
   const provider = route.provider || "default";
   const model = route.model || "default";
   return `${provider} / ${model}`;
+}
+
+function lifecycleFor(project: ProjectListItem, runtime?: ProjectRuntime): Lifecycle {
+  if (!runtime) {
+    return {
+      kind: "loading",
+      label: "loading",
+      detail: "checking",
+      className: "status-unknown",
+    };
+  }
+  const pending = runtime.status?.pending_scope_reconcile_count ?? 0;
+  if (pending > 0) {
+    return {
+      kind: "reconcile_pending",
+      label: "pending",
+      detail: `${pending} scope row${pending === 1 ? "" : "s"}`,
+      className: "status-running",
+      action: "update",
+    };
+  }
+  const graphStale = runtime.status?.current_state?.graph_stale;
+  if (graphStale?.is_stale) {
+    return {
+      kind: "graph_stale",
+      label: "stale",
+      detail: shortCommit(graphStale.active_graph_commit || "") + " -> " + shortCommit(graphStale.head_commit || ""),
+      className: "status-pending",
+      action: "update",
+    };
+  }
+  const hasGraph = Boolean(runtime.status?.active_snapshot_id || runtime.summary || project.active_snapshot_id);
+  if (hasGraph && !runtime.errors.status && !runtime.errors.summary) {
+    return {
+      kind: "ready",
+      label: "ready",
+      detail: runtime.summary?.snapshot_kind || "active graph",
+      className: "status-complete",
+    };
+  }
+  const configMissing = Boolean(runtime.errors.config || runtime.aiConfig?.project_config_error);
+  if (configMissing) {
+    return {
+      kind: "config_missing",
+      label: "config missing",
+      detail: runtime.errors.config?.message || runtime.aiConfig?.project_config_error || "no project config",
+      className: "status-failed",
+    };
+  }
+  if (runtime.errors.status?.status === 404 || runtime.errors.summary?.status === 404) {
+    return {
+      kind: "graph_missing",
+      label: "graph missing",
+      detail: "needs full reconcile",
+      className: "status-failed",
+      action: "build",
+    };
+  }
+  if (runtime.errors.status || runtime.errors.summary) {
+    return {
+      kind: "service_error",
+      label: "service error",
+      detail: runtime.error || "request failed",
+      className: "status-failed",
+    };
+  }
+  return {
+    kind: "graph_missing",
+    label: "graph missing",
+    detail: "needs full reconcile",
+    className: "status-failed",
+    action: "build",
+  };
+}
+
+function targetCommitFor(runtime?: ProjectRuntime): string {
+  const stale = runtime?.status?.current_state?.graph_stale;
+  if (stale?.head_commit) return stale.head_commit;
+  const pending = runtime?.status?.pending_scope_reconcile?.[0] as
+    | { commit_sha?: string; target_commit_sha?: string }
+    | undefined;
+  return pending?.commit_sha || pending?.target_commit_sha || runtime?.status?.graph_snapshot_commit || "";
+}
+
+function actionKey(projectId: string, action: "build" | "update"): string {
+  return `${action}:${projectId}`;
+}
+
+function busyLabelFor(projectId: string, state: { key: string; label: string } | null): string | undefined {
+  if (!state) return undefined;
+  return state.key.endsWith(`:${projectId}`) || state.key === "bootstrap" ? state.label : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof ApiError) return `${error.message}${error.body ? ` ${error.body}` : ""}`;
+  return error instanceof Error ? error.message : String(error);
 }

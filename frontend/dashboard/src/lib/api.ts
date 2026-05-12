@@ -87,6 +87,15 @@ export const api = {
   projectConfig(signal?: AbortSignal) {
     return getJSON<ProjectConfigResponse>(`/api/projects/${pid()}/config`, signal);
   },
+  projectConfigFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<ProjectConfigResponse>(`/api/projects/${pidFor(projectId)}/config`, signal);
+  },
+  bootstrapProject(
+    payload: { workspace_path: string; project_name?: string; scan_depth?: number },
+    signal?: AbortSignal,
+  ) {
+    return postJSON<BootstrapProjectResponse>("/api/project/bootstrap", payload, signal);
+  },
   aiConfig(signal?: AbortSignal) {
     return getJSON<AiConfigResponse>(`/api/projects/${pid()}/ai-config`, signal);
   },
@@ -146,6 +155,27 @@ export const api = {
   },
   backlogFor(projectId: string, signal?: AbortSignal) {
     return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}`, signal);
+  },
+  fullReconcileFor(projectId: string, payload: GraphReconcilePayload, signal?: AbortSignal) {
+    return postJSON<GraphReconcileResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/reconcile/full`,
+      payload,
+      signal,
+    );
+  },
+  queuePendingScopeFor(projectId: string, payload: PendingScopePayload, signal?: AbortSignal) {
+    return postJSON<{ ok?: boolean; pending_scope_reconcile?: unknown }>(
+      `/api/graph-governance/${pidFor(projectId)}/pending-scope`,
+      payload,
+      signal,
+    );
+  },
+  materializePendingScopeFor(projectId: string, payload: GraphReconcilePayload, signal?: AbortSignal) {
+    return postJSON<GraphReconcileResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/reconcile/pending-scope`,
+      payload,
+      signal,
+    );
   },
   feedbackQueue(snapshotId: string, signal?: AbortSignal) {
     // MF-2026-05-10-016 P1: drop require_current_semantic filter so the
@@ -487,6 +517,45 @@ export interface ProjectConfigResponse {
     nested_projects?: { mode?: string; roots?: string[] };
   };
   ai?: { routing?: Record<string, { provider?: string; model?: string }> };
+}
+
+export interface BootstrapProjectResponse {
+  project_id: string;
+  snapshot_id?: string;
+  graph_stats?: { node_count?: number; edge_count?: number };
+  preflight?: { status?: string };
+  activation?: { snapshot_id?: string; projection_status?: string };
+}
+
+export interface GraphReconcilePayload {
+  run_id?: string;
+  target_commit_sha?: string;
+  commit_sha?: string;
+  actor?: string;
+  activate?: boolean;
+  semantic_enrich?: boolean;
+  semantic_use_ai?: boolean;
+  enqueue_stale?: boolean;
+  semantic_skip_completed?: boolean;
+  notes_extra?: Record<string, unknown>;
+}
+
+export interface GraphReconcileResponse {
+  ok?: boolean;
+  project_id?: string;
+  run_id?: string;
+  commit_sha?: string;
+  snapshot_id?: string;
+  snapshot_status?: string;
+  activation?: { snapshot_id?: string; projection_status?: string };
+  graph_stats?: { nodes?: number; edges?: number; node_count?: number; edge_count?: number };
+}
+
+export interface PendingScopePayload {
+  commit_sha: string;
+  parent_commit_sha?: string;
+  actor?: string;
+  evidence?: Record<string, unknown>;
 }
 
 export interface AiConfigResponse {

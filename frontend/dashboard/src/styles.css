@@ -921,6 +921,73 @@ a:hover { text-decoration: underline; }
   margin-bottom: 16px;
 }
 
+.project-bootstrap {
+  padding: 12px;
+  margin-bottom: 18px;
+}
+
+.project-bootstrap-fields {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.5fr) minmax(180px, 0.8fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.project-bootstrap label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.project-bootstrap label span {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-500);
+}
+
+.project-bootstrap input {
+  height: 30px;
+  border: 1px solid var(--ink-200);
+  border-radius: 6px;
+  padding: 0 10px;
+  font: inherit;
+  color: var(--ink-800);
+  background: #fff;
+}
+
+.project-bootstrap input:focus {
+  outline: 2px solid rgba(79, 70, 229, 0.16);
+  border-color: var(--indigo);
+}
+
+.project-console-notice {
+  margin-top: 10px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+}
+
+.project-console-notice.info {
+  background: var(--blue-bg);
+  color: var(--blue-fg);
+  border: 1px solid #bfdbfe;
+}
+
+.project-console-notice.success {
+  background: var(--green-bg);
+  color: var(--green-fg);
+  border: 1px solid #bbf7d0;
+}
+
+.project-console-notice.error {
+  background: var(--red-bg);
+  color: var(--red-fg);
+  border: 1px solid #fecaca;
+}
+
 .project-console-table td {
   vertical-align: top;
 }
@@ -985,6 +1052,22 @@ a:hover { text-decoration: underline; }
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--ink-700);
+}
+
+.project-console-actions {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.project-console-actions .action-btn {
+  margin-right: 0;
+}
+
+.project-console-busy {
+  color: var(--ink-500);
+  font-size: 10.5px;
 }
 
 /* ---------- Operations queue KPI strip ---------- */

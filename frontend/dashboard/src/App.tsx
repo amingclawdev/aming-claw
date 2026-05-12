@@ -620,9 +620,7 @@ export default function App() {
     [data, fetchAll],
   );
 
-  const handleRefresh = useCallback(() => {
-    fetchAll();
-  }, [fetchAll]);
+  const handleRefresh = useCallback(() => fetchAll(), [fetchAll]);
 
   const handleProjectChange = useCallback((nextProjectId: string) => {
     const next = nextProjectId.trim() || DEFAULT_PROJECT_ID;
@@ -810,6 +808,7 @@ export default function App() {
               loading={loading}
               onOpenProject={handleOpenProject}
               onOpenAiConfig={() => setAiConfigOpen(true)}
+              onRefresh={handleRefresh}
             />
           ) : null}
           {view === "overview" && data ? (
