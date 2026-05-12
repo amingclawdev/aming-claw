@@ -16,7 +16,12 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from governance.graph_generator import detect_language, generate_graph
-from project_config import generate_default_config, load_project_config, ProjectConfig
+from project_config import (
+    ProjectConfig,
+    effective_graph_exclude_roots,
+    generate_default_config,
+    load_project_config,
+)
 from governance.preflight import check_bootstrap, _pass, _fail
 
 
@@ -243,6 +248,51 @@ class TestBackwardCompatibility:
         config = load_project_config(python_workspace)
         assert config.governance.exclude_roots == ["examples", "sandbox/demo"]
 
+    def test_load_project_config_parses_graph_and_ai_routing(self, python_workspace):
+        (python_workspace / ".aming-claw.yaml").write_text(
+            "\n".join([
+                "version: 2",
+                "project_id: test-proj",
+                "language: python",
+                "governance:",
+                "  exclude_roots:",
+                "    - legacy-demo",
+                "graph:",
+                "  exclude_paths:",
+                "    - examples",
+                "    - docs/dev",
+                "  ignore_globs:",
+                "    - '**/dist/**'",
+                "  nested_projects:",
+                "    mode: exclude",
+                "    roots:",
+                "      - sandbox/project-a",
+                "ai:",
+                "  routing:",
+                "    pm:",
+                "      provider: openai",
+                "      model: gpt-5.5",
+                "    semantic:",
+                "      provider: anthropic",
+                "      model: claude-opus-4-7",
+                "",
+            ])
+        )
+
+        config = load_project_config(python_workspace)
+
+        assert config.graph.exclude_paths == ["examples", "docs/dev"]
+        assert config.graph.ignore_globs == ["**/dist/**"]
+        assert config.graph.nested_projects.roots == ["sandbox/project-a"]
+        assert config.ai.routing["pm"] == {"provider": "openai", "model": "gpt-5.5"}
+        assert config.ai.routing["semantic"]["model"] == "claude-opus-4-7"
+        assert effective_graph_exclude_roots(config) == [
+            "legacy-demo",
+            "examples",
+            "docs/dev",
+            "sandbox/project-a",
+        ]
+
 
 class TestGraphGeneratorAC10:
     """AC10: as_posix or replace verifiable in graph_generator.py."""
@@ -279,3 +329,58 @@ class TestIdempotentBootstrap:
             node_files.extend(node.get("test", []) or [])
 
         assert all(not str(path).startswith("examples/") for path in node_files)
+
+
+def test_bootstrap_project_uses_snapshot_full_reconcile(tmp_path, monkeypatch):
+    from agent.governance import db as gov_db
+    from agent.governance import project_service
+    from agent.governance import state_reconcile
+
+    state_root = tmp_path / "state"
+    monkeypatch.setattr(gov_db, "_governance_root", lambda: state_root)
+    monkeypatch.setattr(project_service, "_governance_root", lambda: state_root)
+
+    workspace = tmp_path / "workspace"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+    (workspace / ".aming-claw.yaml").write_text(
+        "\n".join([
+            "version: 2",
+            "project_id: bootstrap-demo",
+            "language: python",
+            "graph:",
+            "  exclude_paths:",
+            "    - examples",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    observed = {}
+
+    def fake_reconcile(conn, project_id, project_root, **kwargs):
+        observed.update({
+            "project_id": project_id,
+            "project_root": str(project_root),
+            **kwargs,
+        })
+        return {
+            "ok": True,
+            "snapshot_id": "full-bootstrap-demo",
+            "activation": {"snapshot_id": "full-bootstrap-demo", "projection_status": "rebuilt"},
+            "graph_stats": {"node_count": 0, "edge_count": 0, "layers": {"L7": 1}},
+            "index_counts": {"nodes": 3, "edges": 2},
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_state_only_full_reconcile", fake_reconcile)
+
+    result = project_service.bootstrap_project(str(workspace))
+
+    assert result["bootstrap_mode"] == "snapshot_full_reconcile"
+    assert result["snapshot_id"] == "full-bootstrap-demo"
+    assert result["graph_stats"]["node_count"] == 3
+    assert observed["project_id"] == "bootstrap-demo"
+    assert observed["activate"] is True
+    assert observed["semantic_use_ai"] is False
+    assert observed["semantic_enqueue_stale"] is False
+    assert observed["notes_extra"]["effective_exclude_roots"] == ["examples"]

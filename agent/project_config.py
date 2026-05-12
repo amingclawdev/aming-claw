@@ -16,7 +16,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # sys.path bootstrap (mirrors other agent modules)
@@ -80,6 +80,28 @@ class GovernanceConfig:
 
 
 @dataclass
+class NestedProjectsConfig:
+    mode: str = "exclude"
+    """How nested projects are treated by the parent graph. MVP: exclude."""
+    roots: List[str] = field(default_factory=list)
+
+
+@dataclass
+class GraphConfig:
+    exclude_paths: List[str] = field(default_factory=list)
+    """Workspace-relative directories/path prefixes excluded from graph scans."""
+    ignore_globs: List[str] = field(default_factory=list)
+    """Glob patterns excluded from graph scans."""
+    nested_projects: NestedProjectsConfig = field(default_factory=NestedProjectsConfig)
+
+
+@dataclass
+class AiConfig:
+    routing: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    """Role -> {provider, model}; roles include pm/dev/tester/qa/semantic."""
+
+
+@dataclass
 class ProjectConfig:
     project_id: str = ""
     language: str = "python"
@@ -87,6 +109,8 @@ class ProjectConfig:
     build: BuildConfig = field(default_factory=BuildConfig)
     deploy: DeployConfig = field(default_factory=DeployConfig)
     governance: GovernanceConfig = field(default_factory=GovernanceConfig)
+    graph: GraphConfig = field(default_factory=GraphConfig)
+    ai: AiConfig = field(default_factory=AiConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +168,11 @@ DEFAULT_CONFIG = ProjectConfig(
     governance=GovernanceConfig(
         enabled=True,
         test_tool_label="pytest",
+        exclude_roots=[],
+    ),
+    graph=GraphConfig(
+        exclude_paths=["examples", "docs/dev", ".worktrees", ".claude/worktrees"],
+        nested_projects=NestedProjectsConfig(mode="exclude", roots=[]),
     ),
 )
 """Hardcoded fallback for the aming-claw project itself.
@@ -189,12 +218,17 @@ def validate_commands(config: ProjectConfig) -> List[str]:
 
 _REQUIRED_FIELDS = ("project_id", "language")
 _KNOWN_TOP_LEVEL = {
+    "version",
     "project_id",
+    "name",
+    "workspace_path",
     "language",
     "testing",
     "build",
     "deploy",
     "governance",
+    "graph",
+    "ai",
 }
 _VALID_STRATEGIES = {"docker", "electron", "systemd", "process", "none"}
 _KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -329,6 +363,24 @@ def _parse_raw(raw: dict) -> ProjectConfig:
         exclude_roots=_string_list(g_raw.get("exclude_roots", [])),
     )
 
+    # ---- graph ----
+    graph_raw = raw.get("graph", {})
+    nested_raw = graph_raw.get("nested_projects", {}) if isinstance(graph_raw, dict) else {}
+    graph = GraphConfig(
+        exclude_paths=_string_list(graph_raw.get("exclude_paths", []) if isinstance(graph_raw, dict) else []),
+        ignore_globs=_string_list(graph_raw.get("ignore_globs", []) if isinstance(graph_raw, dict) else []),
+        nested_projects=NestedProjectsConfig(
+            mode=str(nested_raw.get("mode", "exclude") or "exclude"),
+            roots=_string_list(nested_raw.get("roots", [])),
+        ),
+    )
+
+    # ---- ai ----
+    ai_raw = raw.get("ai", {})
+    ai = AiConfig(
+        routing=_routing_map(ai_raw.get("routing", {}) if isinstance(ai_raw, dict) else {}),
+    )
+
     return ProjectConfig(
         project_id=raw.get("project_id", ""),
         language=raw.get("language", "python"),
@@ -336,6 +388,8 @@ def _parse_raw(raw: dict) -> ProjectConfig:
         build=build,
         deploy=deploy,
         governance=governance,
+        graph=graph,
+        ai=ai,
     )
 
 
@@ -448,6 +502,55 @@ def _string_list(raw: Any) -> List[str]:
             continue
         seen.add(norm)
         out.append(norm)
+    return out
+
+
+def _routing_map(raw: Any) -> Dict[str, Dict[str, str]]:
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for role, value in raw.items():
+        role_key = str(role or "").strip().lower()
+        if not role_key:
+            continue
+        if isinstance(value, str):
+            entry = {"provider": "", "model": value.strip()}
+        elif isinstance(value, dict):
+            entry = {
+                "provider": str(value.get("provider", "") or "").strip(),
+                "model": str(value.get("model", "") or "").strip(),
+            }
+        else:
+            continue
+        if entry["provider"] or entry["model"]:
+            out[role_key] = entry
+    return out
+
+
+def effective_graph_exclude_roots(config: ProjectConfig) -> List[str]:
+    """Return all project-level path prefixes excluded from graph governance."""
+    graph = getattr(config, "graph", None)
+    governance = getattr(config, "governance", None)
+    nested = getattr(graph, "nested_projects", None)
+    groups: List[Iterable[str]] = [
+        getattr(governance, "exclude_roots", []) or [],
+        getattr(graph, "exclude_paths", []) or [],
+    ]
+    if getattr(nested, "mode", "exclude") == "exclude":
+        groups.append(getattr(nested, "roots", []) or [])
+    return _merge_string_lists(*groups)
+
+
+def _merge_string_lists(*groups: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group or []:
+            norm = str(value or "").replace("\\", "/").strip().strip("/")
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(norm)
     return out
 
 

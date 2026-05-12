@@ -131,13 +131,12 @@ def _discover_existing_excludes(root: Path) -> List[str]:
 
 def _configured_exclude_roots(root: Path) -> List[str]:
     try:
-        from project_config import load_project_config  # type: ignore
+        from project_config import effective_graph_exclude_roots, load_project_config  # type: ignore
 
         config = load_project_config(root)
     except Exception:
         return []
-    governance = getattr(config, "governance", None)
-    return _merge_roots(getattr(governance, "exclude_roots", []) or [])
+    return _merge_roots(effective_graph_exclude_roots(config))
 
 
 def _merge_roots(*groups: Iterable[str]) -> List[str]:
@@ -173,7 +172,7 @@ def _discover_source_roots(
             continue
         if DEFAULT_LANGUAGE_POLICY.is_excluded_path(child.name) or _is_under_any(rel, exclude_roots):
             continue
-        if _contains_source_file(child, root):
+        if _contains_source_file(child, root, exclude_roots):
             roots.add(rel)
     return sorted(roots)
 
@@ -189,9 +188,11 @@ def _contains_root_source_file(root: Path) -> bool:
     return False
 
 
-def _contains_source_file(path: Path, root: Path) -> bool:
+def _contains_source_file(path: Path, root: Path, exclude_roots: List[str] | None = None) -> bool:
     for file_path in _iter_files(path):
         rel = _rel(root, file_path)
+        if _is_under_any(rel, exclude_roots or []):
+            continue
         parts = [p.lower() for p in rel.split("/") if p]
         if any(part in TEST_DIR_NAMES or part in DOC_DIR_NAMES for part in parts):
             continue

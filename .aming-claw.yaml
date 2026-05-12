@@ -58,3 +58,37 @@ governance:
   test_tool_label: "pytest"
   exclude_roots:
     - "examples"
+
+graph:
+  exclude_paths:
+    - "examples"
+    - "docs/dev"
+    - ".worktrees"
+    - ".claude/worktrees"
+  ignore_globs:
+    - "**/node_modules/**"
+    - "**/.next/**"
+    - "**/dist/**"
+    - "**/build/**"
+  nested_projects:
+    mode: "exclude"
+    roots:
+      - "examples"
+
+ai:
+  routing:
+    pm:
+      provider: "openai"
+      model: "gpt-5.5"
+    dev:
+      provider: "openai"
+      model: "gpt-5.5"
+    tester:
+      provider: "openai"
+      model: "gpt-5.4"
+    qa:
+      provider: "openai"
+      model: "gpt-5.5"
+    semantic:
+      provider: "anthropic"
+      model: "claude-opus-4-7"

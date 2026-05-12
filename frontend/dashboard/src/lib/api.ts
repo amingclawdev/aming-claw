@@ -9,11 +9,25 @@ import type {
   StatusResponse,
 } from "../types";
 
-const PROJECT_ID = (import.meta.env.VITE_PROJECT_ID as string | undefined) || "aming-claw";
+const DEFAULT_PROJECT_ID = (import.meta.env.VITE_PROJECT_ID as string | undefined) || "aming-claw";
 const DIRECT = (import.meta.env.VITE_DIRECT_API as string | undefined) === "true";
 const BACKEND = (import.meta.env.VITE_BACKEND_URL as string | undefined) || "http://localhost:40000";
 
-export const projectId = PROJECT_ID;
+let activeProjectId = DEFAULT_PROJECT_ID;
+
+export const projectId = DEFAULT_PROJECT_ID;
+
+export function getProjectId(): string {
+  return activeProjectId;
+}
+
+export function setProjectId(projectId: string): void {
+  activeProjectId = projectId.trim() || DEFAULT_PROJECT_ID;
+}
+
+function pid(): string {
+  return encodeURIComponent(activeProjectId);
+}
 
 function base(): string {
   return DIRECT ? BACKEND : "";
@@ -62,36 +76,45 @@ export const api = {
   health(signal?: AbortSignal) {
     return getJSON<HealthResponse>("/api/health", signal);
   },
+  projects(signal?: AbortSignal) {
+    return getJSON<ProjectsResponse>("/api/projects", signal);
+  },
+  projectConfig(signal?: AbortSignal) {
+    return getJSON<ProjectConfigResponse>(`/api/projects/${pid()}/config`, signal);
+  },
+  aiConfig(signal?: AbortSignal) {
+    return getJSON<AiConfigResponse>(`/api/projects/${pid()}/ai-config`, signal);
+  },
   status(signal?: AbortSignal) {
-    return getJSON<StatusResponse>(`/api/graph-governance/${PROJECT_ID}/status`, signal);
+    return getJSON<StatusResponse>(`/api/graph-governance/${pid()}/status`, signal);
   },
   activeSummary(signal?: AbortSignal) {
     return getJSON<ActiveSummaryResponse>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/active/summary`,
+      `/api/graph-governance/${pid()}/snapshots/active/summary`,
       signal,
     );
   },
   activeProjection(signal?: AbortSignal) {
     return getJSON<ProjectionResponse>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/active/semantic/projection`,
+      `/api/graph-governance/${pid()}/snapshots/active/semantic/projection`,
       signal,
     );
   },
   nodes(snapshotId: string, limit = 1000, signal?: AbortSignal) {
     const path =
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}` +
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}` +
       `/nodes?include_semantic=true&limit=${limit}`;
     return getJSON<NodesResponse>(path, signal);
   },
   edges(snapshotId: string, limit = 4000, signal?: AbortSignal) {
     const path =
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}` +
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}` +
       `/edges?limit=${limit}`;
     return getJSON<EdgesResponse>(path, signal);
   },
   operationsQueue(signal?: AbortSignal) {
     return getJSON<OperationsQueueResponse>(
-      `/api/graph-governance/${PROJECT_ID}/operations/queue`,
+      `/api/graph-governance/${pid()}/operations/queue`,
       signal,
     );
   },
@@ -101,7 +124,7 @@ export const api = {
     // act on. The semantic_review_gate.reason on each group still tells the UI
     // whether the underlying semantic is current.
     const path =
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}` +
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}` +
       `/feedback/queue?require_current_semantic=false`;
     return getJSON<FeedbackQueueResponse>(path, signal);
   },
@@ -133,7 +156,7 @@ export const api = {
       projection_rebuilt?: boolean;
       projection_rebuild_error?: string;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/feedback/decision`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/feedback/decision`,
       {
         feedback_ids: payload.feedback_ids,
         action: payload.action,
@@ -159,7 +182,7 @@ export const api = {
         queued_at?: string;
       };
     }>(
-      `/api/graph-governance/${PROJECT_ID}/pending-scope`,
+      `/api/graph-governance/${pid()}/pending-scope`,
       {
         commit_sha: opts.commit_sha,
         parent_commit_sha: opts.parent_commit_sha,
@@ -183,7 +206,7 @@ export const api = {
       snapshot_id: string;
       activation?: { snapshot_id?: string; previous_snapshot_id?: string; projection_status?: string };
     }>(
-      `/api/graph-governance/${PROJECT_ID}/reconcile/pending-scope`,
+      `/api/graph-governance/${pid()}/reconcile/pending-scope`,
       {
         target_commit_sha: opts.target_commit_sha,
         actor: opts.actor ?? "dashboard_user",
@@ -204,7 +227,7 @@ export const api = {
       waived_count?: number;
       operation_id?: string;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/reconcile/scope/cancel`,
+      `/api/graph-governance/${pid()}/reconcile/scope/cancel`,
       {
         commit_sha: opts.commit_sha,
         operation_id: opts.operation_id,
@@ -220,7 +243,7 @@ export const api = {
       cancelled_count?: number;
       job?: { job_id?: string; status?: string };
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs/${encodeURIComponent(jobId)}/cancel`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs/${encodeURIComponent(jobId)}/cancel`,
       { actor: "dashboard_user" },
       signal,
     );
@@ -242,7 +265,7 @@ export const api = {
       matched_count?: number;
       cancelled_ops?: Array<{ operation_id: string; target_id: string }>;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs/cancel-all`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs/cancel-all`,
       { ...filters, actor: "dashboard_user" },
       signal,
     );
@@ -264,7 +287,7 @@ export const api = {
       edge_audit_matched: number;
       requested_statuses: string[];
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs/clear-terminal`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs/clear-terminal`,
       { ...opts, actor: "dashboard_user" },
       signal,
     );
@@ -276,21 +299,21 @@ export const api = {
       cancelled_count: number;
       feedback_cancel_contract?: "keep_status_observation";
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/feedback/cancel`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/feedback/cancel`,
       { ...opts, actor: "dashboard_user" },
       signal,
     );
   },
   submitSemanticJob(snapshotId: string, payload: SemanticJobPayload, signal?: AbortSignal) {
     return postJSON<SemanticJobResponse>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/semantic/jobs`,
       payload,
       signal,
     );
   },
   submitFeedback(snapshotId: string, payload: FeedbackSubmitPayload, signal?: AbortSignal) {
     return postJSON<FeedbackSubmitResponse>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/feedback`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/feedback`,
       payload,
       signal,
     );
@@ -328,7 +351,7 @@ export const api = {
         };
       }>;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/events?${q.toString()}`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/events?${q.toString()}`,
       signal,
     );
   },
@@ -354,7 +377,7 @@ export const api = {
       added_count?: number;
       feedback_path?: string;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/semantic-feedback`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/semantic-feedback`,
       { feedback_items: items, actor: actor ?? "dashboard_user" },
       signal,
     );
@@ -368,7 +391,7 @@ export const api = {
       event_id?: string;
       status?: string;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/events`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/events`,
       payload,
       signal,
     );
@@ -389,7 +412,7 @@ export const api = {
       backlog_task_id?: string;
       task_id?: string;
     }>(
-      `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}/events/${encodeURIComponent(eventId)}/file-backlog`,
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/events/${encodeURIComponent(eventId)}/file-backlog`,
       payload,
       signal,
     );
@@ -406,6 +429,52 @@ export interface BacklogDraft {
   branch_mode: "main" | "batch_branch" | "reconcile_branch";
   acceptance_criteria: string[];
   prompt: string;
+}
+
+export interface ProjectListItem {
+  project_id: string;
+  name?: string;
+  workspace_path?: string;
+  status?: string;
+  node_count?: number;
+  created_at?: string;
+}
+
+export interface ProjectsResponse {
+  ok?: boolean;
+  projects: ProjectListItem[];
+}
+
+export interface ProjectConfigResponse {
+  project_id: string;
+  language: string;
+  testing?: { unit_command?: string; e2e_command?: string };
+  graph?: {
+    exclude_paths?: string[];
+    ignore_globs?: string[];
+    effective_exclude_roots?: string[];
+    nested_projects?: { mode?: string; roots?: string[] };
+  };
+  ai?: { routing?: Record<string, { provider?: string; model?: string }> };
+}
+
+export interface AiConfigResponse {
+  project_id: string;
+  workspace_path?: string;
+  read_only?: boolean;
+  project_config?: ProjectConfigResponse;
+  role_routing?: Record<string, { provider?: string; model?: string; source?: string }>;
+  semantic?: {
+    provider?: string;
+    model?: string;
+    analyzer_role?: string;
+    chain_role?: string;
+    use_ai_default?: boolean;
+    job_profiles?: Record<string, { provider?: string; model?: string; analyzer_role?: string }>;
+  };
+  pipeline_error?: string;
+  semantic_error?: string;
+  project_config_error?: string;
 }
 
 export interface SemanticJobPayload {

@@ -6,6 +6,7 @@ import type {
   StatusResponse,
 } from "../types";
 import type { LiveStatus } from "../lib/sse";
+import type { AiConfigResponse, ProjectListItem } from "../lib/api";
 
 interface Props {
   loading: boolean;
@@ -14,11 +15,16 @@ interface Props {
   health?: HealthResponse;
   ops?: OperationsQueueResponse;
   loadedAt?: string;
+  projectId: string;
+  projects: ProjectListItem[];
+  aiConfig?: AiConfigResponse | null;
   reviewBadge?: number;
   // SSE liveness: green dot when streaming, amber while reconnecting, gray
   // when offline. Drives the "live" pill next to the snapshot status.
   liveStatus?: LiveStatus;
   onRefresh(): void;
+  onProjectChange(projectId: string): void;
+  onOpenAiConfig(): void;
   onOpenReview?(): void;
   // Multi-select mode (batch AI enrich many nodes/edges at once). When ON,
   // graph clicks add/remove from a bucket and the header shows the count +
@@ -39,9 +45,14 @@ export default function Header({
   health,
   ops,
   loadedAt,
+  projectId,
+  projects,
+  aiConfig,
   reviewBadge,
   liveStatus = "offline",
   onRefresh,
+  onProjectChange,
+  onOpenAiConfig,
   onOpenReview,
   multiSelectMode = false,
   multiSelectCount = 0,
@@ -90,6 +101,23 @@ export default function Header({
             </span>
           </div>
           <div className="header-meta">
+            <select
+              className="project-select"
+              value={projectId}
+              onChange={(event) => onProjectChange(event.target.value)}
+              title="Switch registered project"
+            >
+              {projects.length ? (
+                projects.map((project) => (
+                  <option key={project.project_id} value={project.project_id}>
+                    {project.project_id}
+                  </option>
+                ))
+              ) : (
+                <option value={projectId}>{projectId}</option>
+              )}
+            </select>
+            <span>·</span>
             <span className="mono" title={status?.graph_snapshot_commit ?? ""}>
               {commit || "—"}
             </span>
@@ -125,6 +153,16 @@ export default function Header({
           ) : null}
         </button>
       ) : null}
+
+      <button
+        className="btn-action"
+        onClick={onOpenAiConfig}
+        title="View AI routing and semantic worker configuration"
+      >
+        <span className="btn-action-icon">⚙</span>
+        <span>AI config</span>
+        {aiConfig?.read_only ? <span className="btn-action-badge">read</span> : null}
+      </button>
 
       {onToggleMultiSelect ? (
         <div className="multi-select-bar">

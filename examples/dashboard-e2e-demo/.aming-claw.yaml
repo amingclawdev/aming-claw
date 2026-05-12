@@ -1,0 +1,48 @@
+version: 2
+project_id: dashboard-e2e-demo
+name: "Dashboard E2E Demo"
+language: typescript
+
+testing:
+  unit_command: "npm test"
+  e2e_command: "node ../../frontend/dashboard/scripts/e2e-semantic.mjs --project dashboard-e2e-demo"
+  allowed_commands:
+    - executable: "npm"
+      args_prefixes: ["test", "run"]
+    - executable: "node"
+      args_prefixes: ["../../frontend/dashboard/scripts/e2e-semantic.mjs"]
+
+governance:
+  enabled: true
+  test_tool_label: "vitest"
+
+graph:
+  exclude_paths:
+    - "node_modules"
+    - "dist"
+    - "coverage"
+  ignore_globs:
+    - "**/node_modules/**"
+    - "**/dist/**"
+    - "**/coverage/**"
+  nested_projects:
+    mode: "exclude"
+    roots: []
+
+ai:
+  routing:
+    pm:
+      provider: "openai"
+      model: "gpt-5.5"
+    dev:
+      provider: "openai"
+      model: "gpt-5.4"
+    tester:
+      provider: "openai"
+      model: "gpt-5.4"
+    qa:
+      provider: "openai"
+      model: "gpt-5.5"
+    semantic:
+      provider: "anthropic"
+      model: "claude-opus-4-7"

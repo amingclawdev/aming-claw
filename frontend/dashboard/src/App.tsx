@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, projectId as PROJECT_ID } from "./lib/api";
+import {
+  api,
+  ApiError,
+  projectId as DEFAULT_PROJECT_ID,
+  setProjectId as setApiProjectId,
+} from "./lib/api";
 import { mergeProjection } from "./lib/semantic";
 import { computeNodeHealth } from "./lib/health";
 import { useEventStream } from "./lib/sse";
@@ -21,6 +26,7 @@ import type { PinnedEdge } from "./components/FocusCard";
 import ActionControlPanel, { type ActionKind, type ActionTarget, type EnrichPreset } from "./components/ActionControlPanel";
 import ActionPanel from "./components/ActionPanel";
 import type { BacklogDraft } from "./lib/api";
+import type { AiConfigResponse, ProjectListItem } from "./lib/api";
 import OverviewView from "./views/OverviewView";
 import OperationsQueueView from "./views/OperationsQueueView";
 import ReviewQueueView from "./views/ReviewQueueView";
@@ -72,22 +78,31 @@ export default function App() {
   const [multiSelectIds, setMultiSelectIds] = useState<Set<string>>(() => new Set());
   const multiSelectIdsRef = useRef<Set<string>>(new Set());
   const [batchEnrichBusy, setBatchEnrichBusy] = useState(false);
+  const [currentProjectId, setCurrentProjectId] = useState(DEFAULT_PROJECT_ID);
+  const [projects, setProjects] = useState<ProjectListItem[]>([]);
+  const [aiConfig, setAiConfig] = useState<AiConfigResponse | null>(null);
+  const [aiConfigOpen, setAiConfigOpen] = useState(false);
 
   useEffect(() => {
     multiSelectIdsRef.current = multiSelectIds;
   }, [multiSelectIds]);
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
+    setApiProjectId(currentProjectId);
     setLoading(true);
     setError(null);
     try {
-      const [health, status, summary, projection, ops] = await Promise.all([
+      const [health, status, summary, projection, ops, projectList, aiCfg] = await Promise.all([
         api.health(signal),
         api.status(signal),
         api.activeSummary(signal),
         api.activeProjection(signal),
         api.operationsQueue(signal),
+        api.projects(signal),
+        api.aiConfig(signal),
       ]);
+      setProjects(projectList.projects ?? []);
+      setAiConfig(aiCfg);
       const snapshotId = status.active_snapshot_id || summary.snapshot_id;
       const [nodesRes, edgesRes, feedback] = await Promise.all([
         api.nodes(snapshotId, 1000, signal),
@@ -124,7 +139,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [currentProjectId]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -154,7 +169,7 @@ export default function App() {
     [],
   );
 
-  const liveStatus = useEventStream(PROJECT_ID, {
+  const liveStatus = useEventStream(currentProjectId, {
     enabled: true,
     onEvent: scheduleLiveRefetch,
   });
@@ -601,6 +616,18 @@ export default function App() {
     fetchAll();
   }, [fetchAll]);
 
+  const handleProjectChange = useCallback((nextProjectId: string) => {
+    const next = nextProjectId.trim() || DEFAULT_PROJECT_ID;
+    setApiProjectId(next);
+    setCurrentProjectId(next);
+    setData(null);
+    setError(null);
+    setSelectedNodeId(null);
+    setPinnedEdge(null);
+    setMultiSelectIds(new Set());
+    multiSelectIdsRef.current = new Set();
+  }, []);
+
   // Auto-dismiss toasts.
   useEffect(() => {
     if (!toast) return;
@@ -706,8 +733,13 @@ export default function App() {
         health={data?.health}
         ops={data?.ops}
         loadedAt={data?.loadedAt}
+        projectId={currentProjectId}
+        projects={projects}
+        aiConfig={aiConfig}
         reviewBadge={data?.feedback?.summary?.visible_group_count ?? 0}
         onRefresh={handleRefresh}
+        onProjectChange={handleProjectChange}
+        onOpenAiConfig={() => setAiConfigOpen(true)}
         onOpenReview={() => setActionPanelOpen(true)}
         liveStatus={liveStatus}
         multiSelectMode={multiSelectMode}
@@ -832,6 +864,13 @@ export default function App() {
           {toast.msg}
         </div>
       ) : null}
+      {aiConfigOpen ? (
+        <AiConfigDialog
+          config={aiConfig}
+          projectId={currentProjectId}
+          onClose={() => setAiConfigOpen(false)}
+        />
+      ) : null}
       <ActionControlPanel
         open={actionPanel != null}
         kind={actionPanel?.kind ?? "enrich"}
@@ -864,4 +903,90 @@ export default function App() {
       />
     </div>
   );
+}
+
+function AiConfigDialog({
+  config,
+  projectId,
+  onClose,
+}: {
+  config: AiConfigResponse | null;
+  projectId: string;
+  onClose(): void;
+}) {
+  const projectRouting = config?.project_config?.ai?.routing ?? {};
+  const roleRouting = config?.role_routing ?? {};
+  const roles = Array.from(
+    new Set([
+      ...Object.keys(projectRouting),
+      ...Object.keys(roleRouting),
+      "pm",
+      "dev",
+      "tester",
+      "qa",
+      "semantic",
+    ]),
+  );
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="AI configuration">
+      <div className="config-dialog">
+        <div className="config-dialog-head">
+          <div>
+            <div className="config-dialog-title">AI configuration</div>
+            <div className="config-dialog-sub mono">{projectId}</div>
+          </div>
+          <button className="icon-btn" onClick={onClose} title="Close AI configuration">
+            ×
+          </button>
+        </div>
+        <div className="config-section">
+          <div className="config-section-title">Project routing</div>
+          <div className="config-table">
+            <div className="config-row config-row-head">
+              <span>Role</span>
+              <span>Configured</span>
+              <span>Effective</span>
+            </div>
+            {roles.map((role) => {
+              const configured = projectRouting[role];
+              const effective = role === "semantic" ? config?.semantic : roleRouting[role];
+              return (
+                <div className="config-row" key={role}>
+                  <span className="mono">{role}</span>
+                  <span>{fmtRoute(configured)}</span>
+                  <span>{fmtRoute(effective)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="config-section">
+          <div className="config-section-title">Semantic worker</div>
+          <div className="config-kv">
+            <span>Analyzer role</span>
+            <span className="mono">{config?.semantic?.analyzer_role ?? "—"}</span>
+            <span>Chain role</span>
+            <span className="mono">{config?.semantic?.chain_role ?? "—"}</span>
+            <span>Default AI</span>
+            <span>{config?.semantic?.use_ai_default ? "enabled" : "manual"}</span>
+          </div>
+        </div>
+        {config?.pipeline_error || config?.semantic_error || config?.project_config_error ? (
+          <div className="config-warning">
+            {[config.pipeline_error, config.semantic_error, config.project_config_error]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function fmtRoute(route?: { provider?: string; model?: string } | null): string {
+  if (!route) return "—";
+  const provider = route.provider || "default";
+  const model = route.model || "default";
+  return `${provider}/${model}`;
 }

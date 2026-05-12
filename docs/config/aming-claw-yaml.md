@@ -1,67 +1,119 @@
 # .aming-claw.yaml Schema Reference
 
-The `.aming-claw.yaml` file is the project-level configuration file that registers a workspace with the Aming Claw governance platform.
+`.aming-claw.yaml` is the project-level contract used by bootstrap, graph
+reconcile, dashboard project management, and AI role routing. Keep it at the
+workspace root.
 
-## Location
-
-Place this file at the root of your project workspace.
-
-## Schema
-
-### `project_id` (required)
-
-- **Type:** `string`
-- **Description:** Unique identifier for the project within the governance platform.
-- **Example:** `"my-project"`
-
-### `workspace_path` (optional)
-
-- **Type:** `string`
-- **Description:** Absolute path to the project workspace. Defaults to the directory containing this file.
-- **Example:** `"/home/user/projects/my-project"`
-
-### `governance` (optional)
-
-- **Type:** `object`
-- **Description:** Governance-specific settings.
-
-#### `governance.auto_chain` (optional)
-
-- **Type:** `boolean`
-- **Default:** `true`
-- **Description:** Whether to enable automatic task chain progression (PM → Dev → Test → QA → Merge).
-
-#### `governance.gate_policy` (optional)
-
-- **Type:** `string`
-- **Allowed values:** `"strict"`, `"permissive"`
-- **Default:** `"strict"`
-- **Description:** Controls how strictly gates enforce validation between pipeline stages.
-
-### `memory` (optional)
-
-- **Type:** `object`
-- **Description:** Memory backend configuration.
-
-#### `memory.backend` (optional)
-
-- **Type:** `string`
-- **Allowed values:** `"local"`, `"docker"`, `"cloud"`
-- **Default:** `"local"`
-- **Description:** Which memory backend to use for development memory storage.
-
-### `roles` (optional)
-
-- **Type:** `object`
-- **Description:** Role-specific overrides. See [role-permissions.md](role-permissions.md) for the full role permission schema.
-
-## Example
+## Required Fields
 
 ```yaml
 project_id: my-project
+language: python
+```
+
+- `project_id`: kebab-case governance project id.
+- `language`: primary language hint. Mixed-language projects are still scanned
+  by the language adapters.
+
+## Testing
+
+```yaml
+testing:
+  unit_command: "python -m pytest"
+  e2e_command: "npm run e2e"
+  allowed_commands:
+    - executable: "python"
+      args_prefixes: ["-m pytest", "-m unittest"]
+```
+
+`allowed_commands` is the command safety allowlist used by bootstrap and
+project registration checks.
+
+## Graph Governance
+
+```yaml
 governance:
-  auto_chain: true
-  gate_policy: strict
-memory:
-  backend: local
+  enabled: true
+  test_tool_label: "pytest"
+  exclude_roots:
+    - "examples"
+
+graph:
+  exclude_paths:
+    - "docs/dev"
+    - ".worktrees"
+  ignore_globs:
+    - "**/node_modules/**"
+    - "**/dist/**"
+  nested_projects:
+    mode: "exclude"
+    roots:
+      - "examples/dashboard-e2e-demo"
+```
+
+`governance.exclude_roots` is the legacy path-prefix list. `graph.exclude_paths`
+is the v2 graph-scanner path-prefix list. They are merged into
+`effective_exclude_roots` along with `graph.nested_projects.roots` when
+`nested_projects.mode` is `exclude`.
+
+Use `graph.exclude_paths` for generated artifacts, local worktrees, nested demo
+projects, and docs/dev handoff scratch space that should not become governed L4
+or L7 nodes in the parent project.
+
+## AI Routing
+
+```yaml
+ai:
+  routing:
+    pm:
+      provider: "openai"
+      model: "gpt-5.5"
+    dev:
+      provider: "openai"
+      model: "gpt-5.5"
+    tester:
+      provider: "openai"
+      model: "gpt-5.4"
+    qa:
+      provider: "openai"
+      model: "gpt-5.5"
+    semantic:
+      provider: "anthropic"
+      model: "claude-opus-4-7"
+```
+
+Dashboard reads this block through `GET /api/projects/{project_id}/config` and
+`GET /api/projects/{project_id}/ai-config`. Execution still applies the
+existing runtime routing stack until the write/update API is promoted from
+read-only.
+
+## Complete Example
+
+```yaml
+version: 2
+project_id: dashboard-demo
+name: "Dashboard Demo"
+language: typescript
+
+testing:
+  unit_command: "npm test"
+  e2e_command: "npm run e2e"
+
+governance:
+  enabled: true
+  test_tool_label: "vitest"
+
+graph:
+  exclude_paths:
+    - "node_modules"
+    - "dist"
+  nested_projects:
+    mode: "exclude"
+    roots: []
+
+ai:
+  routing:
+    pm: { provider: "openai", model: "gpt-5.5" }
+    dev: { provider: "openai", model: "gpt-5.5" }
+    semantic: { provider: "anthropic", model: "claude-opus-4-7" }
 ```

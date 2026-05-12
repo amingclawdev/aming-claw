@@ -389,9 +389,11 @@ def bootstrap_project(
     if _agent_root not in _sys.path:
         _sys.path.insert(0, _agent_root)
 
-    from project_config import load_project_config, generate_default_config
-    from .graph_generator import generate_graph, save_graph_atomic
-    from .preflight import check_bootstrap
+    from project_config import (
+        effective_graph_exclude_roots,
+        generate_default_config,
+        load_project_config,
+    )
 
     ws = Path(workspace_path).resolve()
     if not ws.is_dir():
@@ -411,6 +413,23 @@ def bootstrap_project(
             config.language = config_override["language"]
         if "testing" in config_override and "unit_command" in config_override["testing"]:
             config.testing.unit_command = config_override["testing"]["unit_command"]
+        if "graph" in config_override and isinstance(config_override["graph"], dict):
+            graph_override = config_override["graph"]
+            if "exclude_paths" in graph_override:
+                config.graph.exclude_paths = [
+                    str(value).replace("\\", "/").strip().strip("/")
+                    for value in graph_override.get("exclude_paths") or []
+                    if str(value or "").strip()
+                ]
+        if "ai" in config_override and isinstance(config_override["ai"], dict):
+            ai_override = config_override["ai"]
+            if isinstance(ai_override.get("routing"), dict):
+                for role, route in ai_override["routing"].items():
+                    if isinstance(route, dict):
+                        config.ai.routing[str(role).lower()] = {
+                            "provider": str(route.get("provider", "") or "").strip(),
+                            "model": str(route.get("model", "") or "").strip(),
+                        }
 
     pid = config.project_id or project_name or ws.name.lower().replace("_", "-")
     pid = _normalize_project_id(pid)
@@ -427,47 +446,18 @@ def bootstrap_project(
         raise ValidationError(f"Project initialization failed: {e}")
 
     try:
-        # Step 3: scan_codebase + generate_graph
-        configured_excludes = list(getattr(config.governance, "exclude_roots", []) or [])
+        # Step 3: snapshot-native full reconcile + activation. The old
+        # generate_graph path wrote a legacy graph.json only; dashboard and
+        # graph-governance now consume active graph snapshots.
+        configured_excludes = effective_graph_exclude_roots(config)
         effective_excludes = sorted({
             str(value).replace("\\", "/").strip().strip("/")
             for value in ((exclude_patterns or []) + configured_excludes)
             if str(value or "").strip()
         })
-        gen_result = generate_graph(
-            str(ws),
-            scan_depth=scan_depth,
-            exclude_patterns=effective_excludes,
-        )
-        graph = gen_result["graph"]
-
-        # Step 4: Save graph atomically (R7)
-        graph_path = _governance_root() / pid / "graph.json"
-        save_graph_atomic(graph, str(graph_path))
-
-        # Step 5: Save code_doc_map.json (R6)
-        code_doc_map = gen_result.get("code_doc_map", {})
-        if code_doc_map:
-            cdm_path = _governance_root() / pid / "code_doc_map.json"
-            import tempfile as _tf
-            fd, tmp = _tf.mkstemp(dir=str(cdm_path.parent), suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(code_doc_map, f, ensure_ascii=False, indent=2)
-                os.replace(tmp, str(cdm_path))
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-
-        # Step 6: node_state init
         conn = get_connection(pid)
         try:
-            count = state_service.init_node_states(conn, pid, graph)
-            conn.commit()
-
-            # Step 7: version seed
+            # Step 4: version seed remains for legacy gates and health checks.
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
                 "INSERT OR REPLACE INTO project_version "
@@ -477,16 +467,53 @@ def bootstrap_project(
             )
             conn.commit()
 
-            # Step 8: preflight check
-            preflight_result = check_bootstrap(conn, pid)
+            from .state_reconcile import run_state_only_full_reconcile
+
+            reconcile_result = run_state_only_full_reconcile(
+                conn,
+                pid,
+                ws,
+                run_id=f"bootstrap-full-{pid}",
+                snapshot_kind="full",
+                created_by="bootstrap",
+                activate=True,
+                notes_extra={
+                    "source": "bootstrap_project_v2",
+                    "effective_exclude_roots": effective_excludes,
+                    "scan_depth": scan_depth,
+                },
+                semantic_enrich=True,
+                semantic_use_ai=False,
+                semantic_enqueue_stale=False,
+            )
+            conn.commit()
+
+            graph_stats = reconcile_result.get("graph_stats") or {}
+            index_counts = reconcile_result.get("index_counts") or {}
+            node_count = int(graph_stats.get("node_count") or index_counts.get("nodes") or 0)
+            edge_count = int(graph_stats.get("edge_count") or index_counts.get("edges") or 0)
+            preflight_result = {
+                "status": "pass" if reconcile_result.get("ok") else "fail",
+                "details": {
+                    "bootstrap_mode": "snapshot_full_reconcile",
+                    "snapshot_id": reconcile_result.get("snapshot_id", ""),
+                    "activation": reconcile_result.get("activation") or {},
+                    "projection_status": (
+                        reconcile_result.get("activation") or {}
+                    ).get("projection_status", ""),
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                },
+            }
 
             # Update project metadata
             projects = _load_projects()
             if pid in projects["projects"]:
-                projects["projects"][pid]["node_count"] = gen_result["node_count"]
+                projects["projects"][pid]["node_count"] = node_count
+                projects["projects"][pid]["active_snapshot_id"] = reconcile_result.get("snapshot_id", "")
                 _save_projects(projects)
 
-            # R4: Backfill chain history for this project at bootstrap
+            # Step 5: Backfill chain history for this project at bootstrap.
             try:
                 from .chain_trailer import backfill_legacy_chain_history
                 backfill_legacy_chain_history(project_id=pid, incremental=False)
@@ -509,20 +536,31 @@ def bootstrap_project(
         "language": config.language,
         "testing": {"unit_command": config.testing.unit_command},
         "deploy": {"strategy": config.deploy.strategy},
+        "graph": {
+            "exclude_paths": list(getattr(config.graph, "exclude_paths", []) or []),
+            "ignore_globs": list(getattr(config.graph, "ignore_globs", []) or []),
+            "nested_projects": {
+                "mode": getattr(config.graph.nested_projects, "mode", "exclude"),
+                "roots": list(getattr(config.graph.nested_projects, "roots", []) or []),
+            },
+            "effective_exclude_roots": effective_graph_exclude_roots(config),
+        },
+        "ai": {"routing": dict(getattr(config.ai, "routing", {}) or {})},
     }
 
     result = {
         "project_id": pid,
         "graph_stats": {
-            "node_count": gen_result["node_count"],
-            "edge_count": gen_result["edge_count"],
-            "layers": gen_result["layers"],
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "layers": (graph_stats or {}).get("layers") or {},
         },
         "config": config_dict,
         "preflight": preflight_result,
+        "snapshot_id": reconcile_result.get("snapshot_id", ""),
+        "activation": reconcile_result.get("activation") or {},
+        "bootstrap_mode": "snapshot_full_reconcile",
     }
-    if gen_result.get("warning"):
-        result["warning"] = gen_result["warning"]
 
     return result
 

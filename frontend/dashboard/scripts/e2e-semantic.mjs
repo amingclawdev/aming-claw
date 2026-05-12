@@ -6,12 +6,14 @@
 // walks the operator through review decisions, then verifies state changes.
 //
 //   node scripts/e2e-semantic.mjs                # interactive, dry-run by default
+//   node scripts/e2e-semantic.mjs --project dashboard-e2e-demo
 //   node scripts/e2e-semantic.mjs --probe        # preflight only
 //   node scripts/e2e-semantic.mjs --probe-cancel # read-only cancel coverage check
 //   node scripts/e2e-semantic.mjs --node L7.37   # use specific node
 //   node scripts/e2e-semantic.mjs --edge L7.37,L4.13,owns_state
 //   node scripts/e2e-semantic.mjs --apply        # real AI calls (dry_run=false)
 //   node scripts/e2e-semantic.mjs --ignore-cancel  # bypass cancel-first gate
+//   node scripts/e2e-semantic.mjs --project aming-claw --unsafe-aming-claw
 //
 // CANCEL-FIRST CONTRACT: before any POST that queues operator-visible work,
 // the runner verifies each planned step has a working cancel path. If any
@@ -31,11 +33,13 @@ import { stdin as input, stdout as output, exit } from "node:process";
 const argv = process.argv.slice(2);
 const FLAGS = parseFlags(argv);
 const BACKEND = FLAGS.backend || process.env.VITE_BACKEND_URL || "http://localhost:40000";
-const PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || "aming-claw";
+const DEFAULT_E2E_PROJECT = "dashboard-e2e-demo";
+const PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || DEFAULT_E2E_PROJECT;
 const APPLY = FLAGS.apply === true;
 const PROBE_ONLY = FLAGS.probe === true;
 const PROBE_CANCEL = FLAGS["probe-cancel"] === true;
 const IGNORE_CANCEL = FLAGS["ignore-cancel"] === true;
+const UNSAFE_AMING_CLAW = FLAGS["unsafe-aming-claw"] === true;
 const SCOPE_RECONCILE_ONLY = FLAGS["scope-reconcile-only"] === true;
 const ACTIONS_ONLY = FLAGS["actions-only"] === true;
 const FORCED_NODE = FLAGS.node || null;
@@ -47,6 +51,7 @@ function parseFlags(args) {
     "apply",
     "probe-cancel",
     "ignore-cancel",
+    "unsafe-aming-claw",
     "scope-reconcile-only",
     "actions-only",
   ]);
@@ -63,6 +68,17 @@ function parseFlags(args) {
     }
   }
   return out;
+}
+
+if (PROJECT === "aming-claw" && !UNSAFE_AMING_CLAW && !PROBE_ONLY && !PROBE_CANCEL) {
+  console.error(
+    [
+      "Refusing to mutate project_id=aming-claw from dashboard e2e.",
+      "Use --project dashboard-e2e-demo after bootstrapping examples/dashboard-e2e-demo,",
+      "or pass --unsafe-aming-claw for an explicit main-project debug run.",
+    ].join("\n"),
+  );
+  exit(2);
 }
 
 // ---------- Tiny ANSI helpers ----------

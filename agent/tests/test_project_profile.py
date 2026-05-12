@@ -83,3 +83,41 @@ def test_project_profile_respects_configured_governance_excludes(tmp_path):
     assert "examples" not in profile.source_roots
     assert profile.is_production_source_path("src/app.py")
     assert not profile.is_production_source_path("examples/demo/app.py")
+
+
+def test_project_profile_respects_graph_exclude_paths_and_nested_projects(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        str(project / ".aming-claw.yaml"),
+        "\n".join([
+            "version: 2",
+            "project_id: demo-project",
+            "language: typescript",
+            "graph:",
+            "  exclude_paths:",
+            "    - docs/dev",
+            "  nested_projects:",
+            "    mode: exclude",
+            "    roots:",
+            "      - examples/dashboard-e2e-demo",
+            "",
+        ]),
+    )
+    _write(str(project / "src" / "app.ts"), "export function app() { return 1 }\n")
+    _write(str(project / "docs" / "dev" / "handoff.md"), "# generated\n")
+    _write(
+        str(project / "examples" / "dashboard-e2e-demo" / "src" / "app.ts"),
+        "export function demo() { return 1 }\n",
+    )
+
+    profile = discover_project_profile(str(project))
+
+    assert "docs/dev" in profile.exclude_roots
+    assert "examples/dashboard-e2e-demo" in profile.exclude_roots
+    assert "src" in profile.source_roots
+    assert "examples" not in profile.source_roots
+    assert profile.is_production_source_path("src/app.ts")
+    assert not profile.is_production_source_path("docs/dev/handoff.md")
+    assert not profile.is_production_source_path(
+        "examples/dashboard-e2e-demo/src/app.ts"
+    )

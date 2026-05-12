@@ -569,6 +569,12 @@ def handle_project_list(ctx: RequestContext):
     return {"projects": project_service.list_projects()}
 
 
+@route("GET", "/api/projects")
+def handle_projects_list(ctx: RequestContext):
+    """List registered projects for dashboard project switching."""
+    return {"ok": True, "projects": project_service.list_projects()}
+
+
 @route("POST", "/api/projects/register")
 def handle_project_register(ctx: RequestContext):
     """Register a project workspace with config validation.
@@ -591,7 +597,7 @@ def handle_project_register(ctx: RequestContext):
     # In Docker, host paths are not accessible — skip path validation
     # but still validate config if accessible
     try:
-        from project_config import load_project_config, validate_commands
+        from project_config import effective_graph_exclude_roots, load_project_config, validate_commands
         config = load_project_config(ws)
     except (ValueError, FileNotFoundError) as e:
         # Path not accessible (Docker) or no config — try /workspace mount
@@ -638,6 +644,8 @@ def handle_project_register(ctx: RequestContext):
         "language": config.language,
         "test_command": config.testing.unit_command,
         "deploy_strategy": config.deploy.strategy,
+        "graph": {"effective_exclude_roots": effective_graph_exclude_roots(config)},
+        "ai": {"routing": dict(getattr(config.ai, "routing", {}) or {})},
     }
 
 
@@ -651,7 +659,7 @@ def handle_project_config(ctx: RequestContext):
 
     project_id = ctx.get_project_id()
     try:
-        from project_config import load_project_config
+        from project_config import effective_graph_exclude_roots, load_project_config
         from pathlib import Path
         # Try governance project workspace_path, then /workspace fallback
         proj_data = project_service.list_projects()
@@ -679,6 +687,16 @@ def handle_project_config(ctx: RequestContext):
                 "test_tool_label": config.governance.test_tool_label,
                 "exclude_roots": list(getattr(config.governance, "exclude_roots", []) or []),
             },
+            "graph": {
+                "exclude_paths": list(getattr(config.graph, "exclude_paths", []) or []),
+                "ignore_globs": list(getattr(config.graph, "ignore_globs", []) or []),
+                "nested_projects": {
+                    "mode": getattr(config.graph.nested_projects, "mode", "exclude"),
+                    "roots": list(getattr(config.graph.nested_projects, "roots", []) or []),
+                },
+                "effective_exclude_roots": effective_graph_exclude_roots(config),
+            },
+            "ai": {"routing": dict(getattr(config.ai, "routing", {}) or {})},
         }
     except Exception as e:
         return 404, {"error": f"config not found: {e}"}
@@ -757,9 +775,27 @@ def handle_project_ai_config(ctx: RequestContext):
     except Exception as exc:
         semantic_error = str(exc)
 
+    project_config = {}
+    project_config_error = ""
+    try:
+        from project_config import load_project_config
+
+        cfg = load_project_config(root)
+        project_config = {
+            "ai": {"routing": dict(getattr(cfg.ai, "routing", {}) or {})},
+            "graph": {
+                "exclude_paths": list(getattr(cfg.graph, "exclude_paths", []) or []),
+                "ignore_globs": list(getattr(cfg.graph, "ignore_globs", []) or []),
+            },
+        }
+    except Exception as exc:
+        project_config_error = str(exc)
+
     return {
         "project_id": project_id,
         "workspace_path": str(root),
+        "project_config": project_config,
+        "project_config_error": project_config_error,
         "pipeline": pipeline,
         "pipeline_error": pipeline_error,
         "role_routing": role_routing,
