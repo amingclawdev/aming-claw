@@ -3310,6 +3310,7 @@ def run_semantic_enrichment(
             semantic_state,
             round_number=round_number,
             feature_index=feature_index,
+            submit_for_review=submit_for_review,
         )
         semantic_graph_state_report.update({
             "state_path": str(latest_state_path),

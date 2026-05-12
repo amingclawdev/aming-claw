@@ -333,6 +333,7 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def _semantic_hash_state(status: str, feature_hash: str, payload: dict[str, Any]) -> str:
+    status_norm = str(status or "").strip().lower()
     validation = payload.get("semantic_state_validation")
     if isinstance(validation, dict):
         validation_status = str(validation.get("status") or "").lower()
@@ -349,11 +350,13 @@ def _semantic_hash_state(status: str, feature_hash: str, payload: dict[str, Any]
         if flag_set.intersection({"semantic_hash_mismatch", "source_hash_changed", "semantic_stale"}):
             return "stale"
 
-    if status in {"ai_complete", "semantic_graph_state", "review_pending", "reviewed"} and feature_hash:
-        return "current"
-    if status in {"pending_ai", "ai_pending", "running", "ai_running"}:
+    if status_norm in {"pending_review", "review_pending"}:
         return "pending"
-    if status in {"ai_failed", "failed"}:
+    if status_norm in {"ai_complete", "semantic_graph_state", "reviewed"} and feature_hash:
+        return "current"
+    if status_norm in {"pending_ai", "ai_pending", "running", "ai_running"}:
+        return "pending"
+    if status_norm in {"ai_failed", "failed"}:
         return "failed"
     return "unknown"
 
@@ -369,6 +372,7 @@ def _semantic_overlay_from_node_row(row: sqlite3.Row) -> dict[str, Any]:
     node_status = str(_row_value(row, "semantic_status", "") or "")
     job_status = str(_row_value(row, "semantic_job_status", "") or "")
     status = node_status or job_status or str(payload.get("status") or "structure_only")
+    api_status = "review_pending" if status == "pending_review" else status
     feature_hash = str(
         _row_value(row, "semantic_feature_hash", "")
         or payload.get("feature_hash")
@@ -384,7 +388,7 @@ def _semantic_overlay_from_node_row(row: sqlite3.Row) -> dict[str, Any]:
 
     overlay = dict(payload)
     overlay.update({
-        "status": status,
+        "status": api_status,
         "node_status": node_status,
         "job_status": job_status,
         "feature_hash": feature_hash,

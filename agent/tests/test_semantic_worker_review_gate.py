@@ -122,6 +122,64 @@ def test_a_persist_submit_for_review_writes_pending_review_status(conn):
     )
 
 
+def test_a1_run_semantic_enrichment_review_gate_survives_final_write(conn, tmp_path):
+    """Full run regression: the final artifact write must not undo review gating."""
+    snap = _create_snapshot_with_node(conn, "run-review", node_id="L7.7")
+    sid = snap["snapshot_id"]
+    source = tmp_path / "agent" / "governance" / "L7_7.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("def target():\n    return 'ok'\n", encoding="utf-8")
+
+    def _ai_call(stage, payload):
+        assert stage == "reconcile_semantic_feature"
+        assert payload["feature"]["node_id"] == "L7.7"
+        return {
+            "feature_name": "Reviewed Feature",
+            "semantic_summary": "Generated semantic proposal.",
+            "intent": "Exercise the review gate.",
+            "confidence": 0.8,
+        }
+
+    result = semantic.run_semantic_enrichment(
+        conn,
+        PID,
+        sid,
+        str(tmp_path),
+        use_ai=True,
+        ai_call=_ai_call,
+        semantic_node_ids=["L7.7"],
+        semantic_skip_completed=False,
+        submit_for_review=True,
+        created_by="test",
+        max_excerpt_chars=200,
+    )
+
+    assert result["summary"]["ai_complete_count"] == 1
+    row = conn.execute(
+        """
+        SELECT status
+        FROM graph_semantic_nodes
+        WHERE project_id = ? AND snapshot_id = ? AND node_id = 'L7.7'
+        """,
+        (PID, sid),
+    ).fetchone()
+    assert row["status"] == "pending_review"
+
+    graph_events.backfill_existing_semantic_events(conn, PID, sid, actor="test")
+    event = conn.execute(
+        """
+        SELECT status
+        FROM graph_events
+        WHERE project_id = ? AND snapshot_id = ?
+          AND event_type = 'semantic_node_enriched'
+          AND target_id = 'L7.7'
+        ORDER BY event_seq DESC LIMIT 1
+        """,
+        (PID, sid),
+    ).fetchone()
+    assert event["status"] == graph_events.EVENT_STATUS_PROPOSED
+
+
 def test_a2_submit_for_review_skips_carried_forward_rows(conn):
     """A2 (regression for the 2026-05-10 first-run scoping spillover):
     `submit_for_review=True` must NOT flip rows that came from
