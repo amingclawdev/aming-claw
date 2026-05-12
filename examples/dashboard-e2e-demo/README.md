@@ -10,5 +10,6 @@ curl -s -X POST http://localhost:40000/api/project/bootstrap \
   -d '{"workspace_path":"examples/dashboard-e2e-demo","project_name":"dashboard-e2e-demo"}'
 
 cd frontend/dashboard
+node scripts/e2e-projects.mjs
 node scripts/e2e-semantic.mjs --project dashboard-e2e-demo --probe
 ```
