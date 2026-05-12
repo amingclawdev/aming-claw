@@ -27,7 +27,11 @@ export function setProjectId(projectId: string): void {
 }
 
 function pid(): string {
-  return encodeURIComponent(activeProjectId);
+  return pidFor(activeProjectId);
+}
+
+function pidFor(projectId: string): string {
+  return encodeURIComponent(projectId.trim() || DEFAULT_PROJECT_ID);
 }
 
 function base(): string {
@@ -86,12 +90,24 @@ export const api = {
   aiConfig(signal?: AbortSignal) {
     return getJSON<AiConfigResponse>(`/api/projects/${pid()}/ai-config`, signal);
   },
+  aiConfigFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<AiConfigResponse>(`/api/projects/${pidFor(projectId)}/ai-config`, signal);
+  },
   status(signal?: AbortSignal) {
     return getJSON<StatusResponse>(`/api/graph-governance/${pid()}/status`, signal);
+  },
+  statusFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<StatusResponse>(`/api/graph-governance/${pidFor(projectId)}/status`, signal);
   },
   activeSummary(signal?: AbortSignal) {
     return getJSON<ActiveSummaryResponse>(
       `/api/graph-governance/${pid()}/snapshots/active/summary`,
+      signal,
+    );
+  },
+  activeSummaryFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<ActiveSummaryResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/active/summary`,
       signal,
     );
   },
@@ -119,8 +135,17 @@ export const api = {
       signal,
     );
   },
+  operationsQueueFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<OperationsQueueResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/operations/queue`,
+      signal,
+    );
+  },
   backlog(signal?: AbortSignal) {
     return getJSON<BacklogResponse>(`/api/backlog/${pid()}`, signal);
+  },
+  backlogFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}`, signal);
   },
   feedbackQueue(snapshotId: string, signal?: AbortSignal) {
     // MF-2026-05-10-016 P1: drop require_current_semantic filter so the
@@ -440,7 +465,9 @@ export interface ProjectListItem {
   name?: string;
   workspace_path?: string;
   status?: string;
+  initialized?: boolean;
   node_count?: number;
+  active_snapshot_id?: string;
   created_at?: string;
 }
 

@@ -915,6 +915,78 @@ a:hover { text-decoration: underline; }
   color: var(--ink-400);
 }
 
+/* ---------- Project console ---------- */
+
+.project-console-score-grid {
+  margin-bottom: 16px;
+}
+
+.project-console-table td {
+  vertical-align: top;
+}
+
+.project-console-selected {
+  background: #eef2ff;
+}
+
+.project-console-selected:hover {
+  background: #e0e7ff !important;
+}
+
+.project-console-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-console-current {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--indigo-bg);
+  color: var(--indigo-fg);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.project-console-sub {
+  margin-top: 2px;
+  color: var(--ink-500);
+  font-size: 10.5px;
+}
+
+.project-console-error {
+  margin-top: 4px;
+  color: var(--red-fg);
+  font-size: 10.5px;
+}
+
+.project-console-metric {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 8px;
+  color: var(--ink-500);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.project-console-metric .mono {
+  color: var(--ink-800);
+}
+
+.project-console-workspace {
+  display: block;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-700);
+}
+
 /* ---------- Operations queue KPI strip ---------- */
 /* Compact replacement for the old "By type" + "Status" stacked .score-card
    grids. Four (or so) cells in a single row, neutral by default, accent

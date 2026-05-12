@@ -33,8 +33,9 @@ import OperationsQueueView from "./views/OperationsQueueView";
 import ReviewQueueView from "./views/ReviewQueueView";
 import GraphView from "./views/GraphView";
 import BacklogView from "./views/BacklogView";
+import ProjectConsoleView from "./views/ProjectConsoleView";
 
-export type ViewName = "overview" | "graph" | "operations" | "review" | "backlog";
+export type ViewName = "projects" | "overview" | "graph" | "operations" | "review" | "backlog";
 
 interface DataBundle {
   health: HealthResponse;
@@ -60,7 +61,7 @@ export default function App() {
   const [data, setData] = useState<DataBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<ViewName>("overview");
+  const [view, setView] = useState<ViewName>("projects");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [pinnedEdge, setPinnedEdge] = useState<PinnedEdge | null>(null);
   const [drawerTab, setDrawerTab] = useState<InspectorTabName>("overview");
@@ -635,6 +636,14 @@ export default function App() {
     multiSelectIdsRef.current = new Set();
   }, []);
 
+  const handleOpenProject = useCallback(
+    (nextProjectId: string) => {
+      handleProjectChange(nextProjectId);
+      setView("overview");
+    },
+    [handleProjectChange],
+  );
+
   // Auto-dismiss toasts.
   useEffect(() => {
     if (!toast) return;
@@ -779,12 +788,13 @@ export default function App() {
           opsCount={data?.ops?.count ?? 0}
           reviewCount={data?.feedback?.summary?.visible_group_count ?? 0}
           backlogCount={countOpenBacklog(data?.backlog)}
+          projectCount={projects.length}
           onSelectNode={handleSelectNode}
           onSelectView={(v) => setView(v)}
           loading={loading}
         />
         <main className="main scrollbar-thin">
-          {error && !data ? (
+          {error && !data && view !== "projects" ? (
             <div className="view">
               <div className="empty">
                 Load failed. Check the governance service is reachable at{" "}
@@ -792,6 +802,15 @@ export default function App() {
                 <span className="mono" style={{ color: "var(--ink-700)" }}>{error}</span>
               </div>
             </div>
+          ) : null}
+          {view === "projects" ? (
+            <ProjectConsoleView
+              projects={projects}
+              currentProjectId={currentProjectId}
+              loading={loading}
+              onOpenProject={handleOpenProject}
+              onOpenAiConfig={() => setAiConfigOpen(true)}
+            />
           ) : null}
           {view === "overview" && data ? (
             <OverviewView data={data} onSelectNode={handleSelectNode} />
@@ -861,7 +880,7 @@ export default function App() {
           {view === "backlog" && data ? (
             <BacklogView backlog={data.backlog} projectId={currentProjectId} />
           ) : null}
-          {!data && !error ? (
+          {!data && !error && view !== "projects" ? (
             <div className="view">
               <div className="empty">
                 <span className="spinner" /> Loading governance snapshot…

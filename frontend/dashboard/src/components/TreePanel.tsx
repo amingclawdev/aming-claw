@@ -19,6 +19,7 @@ interface Props {
   opsCount: number;
   reviewCount: number;
   backlogCount: number;
+  projectCount: number;
   loading: boolean;
   onSelectNode(id: string): void;
   onSelectView(v: ViewName): void;
@@ -34,7 +35,7 @@ interface Index {
 }
 
 export default function TreePanel(props: Props) {
-  const { nodes, selectedNodeId, activeView, opsCount, reviewCount, backlogCount, loading } = props;
+  const { nodes, selectedNodeId, activeView, opsCount, reviewCount, backlogCount, projectCount, loading } = props;
 
   const idx = useMemo<Index>(() => buildIndex(nodes), [nodes]);
 
@@ -111,6 +112,13 @@ export default function TreePanel(props: Props) {
     <aside className="sidebar scrollbar-thin">
       <div className="sidebar-section">
         <div className="sidebar-section-title">Views</div>
+        <NavRow
+          icon="▣"
+          label="Projects"
+          meta={loading ? "…" : String(projectCount)}
+          active={activeView === "projects"}
+          onClick={() => props.onSelectView("projects")}
+        />
         <NavRow
           icon="▦"
           label="Project overview"
