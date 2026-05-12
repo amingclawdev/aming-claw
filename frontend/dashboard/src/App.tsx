@@ -37,6 +37,62 @@ import ProjectConsoleView from "./views/ProjectConsoleView";
 
 export type ViewName = "projects" | "overview" | "graph" | "operations" | "review" | "backlog";
 
+const DASHBOARD_PROJECT_STORAGE_KEY = "aming-claw.dashboard.projectId";
+const DASHBOARD_PROJECT_PARAM = "project";
+const DASHBOARD_VIEW_PARAM = "view";
+const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "overview", "graph", "operations", "review", "backlog"];
+
+function normalizeProjectId(value: string | null | undefined): string {
+  return (value ?? "").trim() || DEFAULT_PROJECT_ID;
+}
+
+function normalizeViewName(value: string | null | undefined): ViewName {
+  return DASHBOARD_VIEWS.includes(value as ViewName) ? (value as ViewName) : "projects";
+}
+
+function readStoredProjectId(): string {
+  if (typeof window === "undefined") return DEFAULT_PROJECT_ID;
+  try {
+    return normalizeProjectId(window.localStorage.getItem(DASHBOARD_PROJECT_STORAGE_KEY));
+  } catch {
+    return DEFAULT_PROJECT_ID;
+  }
+}
+
+function readDashboardLocation(): { projectId: string; view: ViewName } {
+  if (typeof window === "undefined") {
+    return { projectId: DEFAULT_PROJECT_ID, view: "projects" };
+  }
+  const params = new URLSearchParams(window.location.search);
+  return {
+    projectId: normalizeProjectId(params.get(DASHBOARD_PROJECT_PARAM) || readStoredProjectId()),
+    view: normalizeViewName(params.get(DASHBOARD_VIEW_PARAM)),
+  };
+}
+
+function writeStoredProjectId(projectId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(DASHBOARD_PROJECT_STORAGE_KEY, normalizeProjectId(projectId));
+  } catch {
+    // localStorage may be disabled; URL state still preserves navigation.
+  }
+}
+
+function writeDashboardLocation(projectId: string, view: ViewName, mode: "push" | "replace"): void {
+  if (typeof window === "undefined") return;
+  const nextProjectId = normalizeProjectId(projectId);
+  const url = new URL(window.location.href);
+  url.searchParams.set(DASHBOARD_PROJECT_PARAM, nextProjectId);
+  url.searchParams.set(DASHBOARD_VIEW_PARAM, view);
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextUrl === currentUrl) return;
+  const state = { projectId: nextProjectId, view };
+  if (mode === "push") window.history.pushState(state, "", nextUrl);
+  else window.history.replaceState(state, "", nextUrl);
+}
+
 interface DataBundle {
   health: HealthResponse;
   status: StatusResponse;
@@ -61,7 +117,8 @@ export default function App() {
   const [data, setData] = useState<DataBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<ViewName>("projects");
+  const initialLocation = useMemo(() => readDashboardLocation(), []);
+  const [view, setView] = useState<ViewName>(initialLocation.view);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [pinnedEdge, setPinnedEdge] = useState<PinnedEdge | null>(null);
   const [drawerTab, setDrawerTab] = useState<InspectorTabName>("overview");
@@ -84,7 +141,8 @@ export default function App() {
   const [multiSelectIds, setMultiSelectIds] = useState<Set<string>>(() => new Set());
   const multiSelectIdsRef = useRef<Set<string>>(new Set());
   const [batchEnrichBusy, setBatchEnrichBusy] = useState(false);
-  const [currentProjectId, setCurrentProjectId] = useState(DEFAULT_PROJECT_ID);
+  const [currentProjectId, setCurrentProjectId] = useState(initialLocation.projectId);
+  const currentProjectIdRef = useRef(currentProjectId);
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
   const [aiConfig, setAiConfig] = useState<AiConfigResponse | null>(null);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
@@ -92,6 +150,36 @@ export default function App() {
   useEffect(() => {
     multiSelectIdsRef.current = multiSelectIds;
   }, [multiSelectIds]);
+
+  useEffect(() => {
+    setApiProjectId(currentProjectId);
+    currentProjectIdRef.current = currentProjectId;
+    writeStoredProjectId(currentProjectId);
+    writeDashboardLocation(currentProjectId, view, "replace");
+  }, [currentProjectId, view]);
+
+  const resetProjectScopedUi = useCallback(() => {
+    setData(null);
+    setError(null);
+    setSelectedNodeId(null);
+    setPinnedEdge(null);
+    setActionPanel(null);
+    setActionPanelOpen(false);
+    setMultiSelectIds(new Set());
+    multiSelectIdsRef.current = new Set();
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const next = readDashboardLocation();
+      setApiProjectId(next.projectId);
+      if (currentProjectIdRef.current !== next.projectId) resetProjectScopedUi();
+      setCurrentProjectId(next.projectId);
+      setView(next.view);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [resetProjectScopedUi]);
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
     setApiProjectId(currentProjectId);
@@ -625,21 +713,23 @@ export default function App() {
   const handleProjectChange = useCallback((nextProjectId: string) => {
     const next = nextProjectId.trim() || DEFAULT_PROJECT_ID;
     setApiProjectId(next);
+    writeStoredProjectId(next);
+    writeDashboardLocation(next, view, "push");
     setCurrentProjectId(next);
-    setData(null);
-    setError(null);
-    setSelectedNodeId(null);
-    setPinnedEdge(null);
-    setMultiSelectIds(new Set());
-    multiSelectIdsRef.current = new Set();
-  }, []);
+    resetProjectScopedUi();
+  }, [resetProjectScopedUi, view]);
 
   const handleOpenProject = useCallback(
     (nextProjectId: string) => {
-      handleProjectChange(nextProjectId);
+      const next = nextProjectId.trim() || DEFAULT_PROJECT_ID;
+      setApiProjectId(next);
+      writeStoredProjectId(next);
+      writeDashboardLocation(next, "overview", "push");
+      setCurrentProjectId(next);
       setView("overview");
+      resetProjectScopedUi();
     },
-    [handleProjectChange],
+    [resetProjectScopedUi],
   );
 
   // Auto-dismiss toasts.

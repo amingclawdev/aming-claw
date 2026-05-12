@@ -80,6 +80,8 @@ export default function Header({
   const edgeEligible = sem?.edge_semantic_eligible_count ?? 0;
   const edgeCurrent = sem?.edge_semantic_current_count ?? 0;
   const edgeMissing = sem?.edge_semantic_missing_count ?? 0;
+  const activeProject = projects.find((project) => project.project_id === projectId);
+  const activeProjectLabel = activeProject?.name?.trim() || projectId;
 
   return (
     <header className="header">
@@ -87,7 +89,7 @@ export default function Header({
         <div className="header-logo">a</div>
         <div>
           <div className="header-title-row">
-            <div className="header-title">aming-claw</div>
+            <div className="header-title" title={projectId}>{activeProjectLabel}</div>
             <span className="pill pill-active">
               <span className="pill-dot" />
               {summary?.snapshot_status ?? "—"}
@@ -110,7 +112,7 @@ export default function Header({
               {projects.length ? (
                 projects.map((project) => (
                   <option key={project.project_id} value={project.project_id}>
-                    {project.project_id}
+                    {project.name?.trim() || project.project_id}
                   </option>
                 ))
               ) : (
