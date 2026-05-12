@@ -70,7 +70,12 @@ export default function App() {
   // prefixed `node:<id>` / `edge:<id>` so the single Set can hold both.
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [multiSelectIds, setMultiSelectIds] = useState<Set<string>>(() => new Set());
+  const multiSelectIdsRef = useRef<Set<string>>(new Set());
   const [batchEnrichBusy, setBatchEnrichBusy] = useState(false);
+
+  useEffect(() => {
+    multiSelectIdsRef.current = multiSelectIds;
+  }, [multiSelectIds]);
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -392,17 +397,18 @@ export default function App() {
 
   // Multi-select handlers
   const toggleMultiSelect = useCallback((kind: "node" | "edge", id: string) => {
-    setMultiSelectIds((prev) => {
-      const next = new Set(prev);
-      const key = `${kind}:${id}`;
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+    const next = new Set(multiSelectIdsRef.current);
+    const key = `${kind}:${id}`;
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    multiSelectIdsRef.current = next;
+    setMultiSelectIds(next);
   }, []);
 
   const clearMultiSelect = useCallback(() => {
-    setMultiSelectIds(new Set());
+    const next = new Set<string>();
+    multiSelectIdsRef.current = next;
+    setMultiSelectIds(next);
   }, []);
 
   const handleBatchEnrich = useCallback(async () => {
@@ -411,13 +417,14 @@ export default function App() {
       setToast({ kind: "error", msg: "No active snapshot." });
       return;
     }
-    if (multiSelectIds.size === 0) {
+    const selectedKeys = Array.from(multiSelectIdsRef.current);
+    if (selectedKeys.length === 0) {
       setToast({ kind: "error", msg: "Pick at least one node or edge first." });
       return;
     }
     const nodeIds: string[] = [];
     const edgeIds: string[] = [];
-    multiSelectIds.forEach((k) => {
+    selectedKeys.forEach((k) => {
       const idx = k.indexOf(":");
       const kind = k.slice(0, idx);
       const id = k.slice(idx + 1);
@@ -431,6 +438,7 @@ export default function App() {
     setBatchEnrichBusy(true);
     try {
       const summary: string[] = [];
+      const partial: string[] = [];
       if (nodeIds.length > 0) {
         const res = await api.submitSemanticJob(snapshotId, {
           job_type: "semantic_enrichment",
@@ -438,13 +446,20 @@ export default function App() {
           target_ids: nodeIds,
           options: {
             target: "nodes",
-            mode: "semanticize",
+            scope: "selected_nodes",
+            mode: "retry",
             dry_run: false,
             include_nodes: true,
+            include_edges: false,
+            skip_current: false,
+            retry_stale_failed: true,
+            include_package_markers: false,
           },
           created_by: "dashboard_user",
         });
-        summary.push(`nodes ${res.queued_count ?? nodeIds.length}`);
+        const queued = res.queued_count ?? nodeIds.length;
+        summary.push(`nodes ${queued}/${nodeIds.length}`);
+        if (queued < nodeIds.length) partial.push(`nodes queued ${queued}/${nodeIds.length}`);
       }
       if (edgeIds.length > 0) {
         const res = await api.submitSemanticJob(snapshotId, {
@@ -453,19 +468,25 @@ export default function App() {
           target_ids: edgeIds,
           options: {
             target: "edges",
+            scope: "selected_edges",
             mode: "semanticize",
             dry_run: false,
+            include_nodes: false,
             include_edges: true,
           },
           created_by: "dashboard_user",
         });
-        summary.push(`edges ${res.queued_count ?? edgeIds.length}`);
+        const queued = res.queued_count ?? edgeIds.length;
+        summary.push(`edges ${queued}/${edgeIds.length}`);
+        if (queued < edgeIds.length) partial.push(`edges queued ${queued}/${edgeIds.length}`);
       }
       setToast({
-        kind: "success",
-        msg: `Batch AI enrich queued · ${summary.join(" · ")}`,
+        kind: partial.length > 0 ? "info" : "success",
+        msg: `Batch AI enrich queued · ${summary.join(" · ")}${partial.length > 0 ? " · check queue for skipped/current targets" : ""}`,
       });
-      setMultiSelectIds(new Set());
+      const next = new Set<string>();
+      multiSelectIdsRef.current = next;
+      setMultiSelectIds(next);
       // Auto-exit multi-select mode so subsequent clicks behave normally.
       setMultiSelectMode(false);
       fetchAll();
@@ -475,7 +496,7 @@ export default function App() {
     } finally {
       setBatchEnrichBusy(false);
     }
-  }, [data, multiSelectIds, fetchAll]);
+  }, [data, fetchAll]);
 
   const handleSelectNodeFromReview = useCallback(
     (id: string) => {
@@ -694,7 +715,11 @@ export default function App() {
         batchEnrichBusy={batchEnrichBusy}
         onToggleMultiSelect={() => {
           setMultiSelectMode((prev) => !prev);
-          if (multiSelectMode) setMultiSelectIds(new Set());
+          if (multiSelectMode) {
+            const next = new Set<string>();
+            multiSelectIdsRef.current = next;
+            setMultiSelectIds(next);
+          }
         }}
         onBatchEnrich={handleBatchEnrich}
         onClearMultiSelect={clearMultiSelect}
