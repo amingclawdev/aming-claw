@@ -2553,7 +2553,7 @@ def _git_changed_paths_between(project_root: Path, base_commit: str, target_comm
         return []
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", f"{base_commit}..{target_commit}"],
+            ["git", "diff", "--name-only", f"{base_commit}..{target_commit}", "--", "."],
             capture_output=True,
             text=True,
             timeout=10,
@@ -2592,6 +2592,8 @@ def _graph_stale_scope_operation(
     if not head_commit or not graph_commit or head_commit == graph_commit:
         return None, stale_summary
     all_changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=None)
+    if not all_changed_files:
+        return None, stale_summary
     changed_files = all_changed_files[:25]
     stale_summary.update({
         "is_stale": True,

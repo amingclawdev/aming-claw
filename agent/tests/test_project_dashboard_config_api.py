@@ -134,3 +134,29 @@ def test_projects_list_endpoint_returns_registered_projects(monkeypatch):
 
     assert payload["ok"] is True
     assert payload["projects"][0]["project_id"] == "dashboard-demo"
+
+
+def test_graph_stale_scope_operation_ignores_outside_workspace_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: "head-commit")
+    monkeypatch.setattr(
+        server,
+        "_git_changed_paths_between",
+        lambda _root, _base, _target, limit=None: [],
+    )
+
+    operation, summary = server._graph_stale_scope_operation(
+        "dashboard-demo",
+        status={"graph_snapshot_commit": "old-commit"},
+        pending_rows=[],
+    )
+
+    assert operation is None
+    assert summary["is_stale"] is False
+    assert summary["head_commit"] == "head-commit"
+    assert summary["changed_files"] == []
+    assert summary["changed_file_count"] == 0
