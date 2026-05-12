@@ -980,6 +980,7 @@ def aggregate_functions_into_nodes(
 def find_test_coverage(
     project_root: str,
     primary_file: str,
+    profile: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Find test files and coverage for a given primary source file.
 
@@ -998,10 +999,12 @@ def find_test_coverage(
     module_token = rel_without_ext.replace("/", ".")
     basename = os.path.basename(primary_file)
     compact_stem = re.sub(r"[^a-z0-9]+", "", stem)
-    skip_dirs = {name.lower() for name in DEFAULT_LANGUAGE_POLICY.exclude_roots} | {".hg", ".svn"}
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
 
     def _is_test_like(rel: str, fname: str) -> bool:
-        return DEFAULT_LANGUAGE_POLICY.is_test_path(rel)
+        return profile.is_test_path(rel)
 
     def _matches_primary(fname: str) -> bool:
         lower = fname.lower()
@@ -1052,12 +1055,20 @@ def find_test_coverage(
         return any(token and token in lowered for token in tokens)
 
     for dirpath, dirnames, filenames in os.walk(project_root):
-        dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
+        kept_dirs = []
+        for dirname in dirnames:
+            rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
+            if profile.is_excluded_path(rel_dir) or profile.is_doc_path(rel_dir):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
         for fname in filenames:
             if not DEFAULT_LANGUAGE_POLICY.is_source_path(fname):
                 continue
             fpath = os.path.join(dirpath, fname)
             rel = _repo_relpath(project_root, fpath)
+            if profile.is_excluded_path(rel) or profile.is_doc_path(rel):
+                continue
             if not _is_test_like(rel, fname):
                 continue
             name_match = _matches_primary(fname)
@@ -1080,6 +1091,7 @@ def find_test_coverage(
 def find_doc_coverage(
     project_root: str,
     primary_file: str,
+    profile: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Find doc files referencing a given primary source file.
 
@@ -1093,35 +1105,30 @@ def find_doc_coverage(
     rel_normalized = rel.replace(os.sep, "/").strip("/")
     module_token = os.path.splitext(rel_normalized)[0].replace("/", ".")
     basename = os.path.basename(primary_file)
-    skip_dirs = {
-        ".git",
-        ".claude",
-        ".hg",
-        ".svn",
-        ".worktrees",
-        ".observer-cache",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "runtime",
-        "search-workspace",
-        "shared-volume",
-        "venv",
-        ".venv",
-    }
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
     skip_rel_prefixes = {
         "docs/dev/scratch/",
         "docs/dev/observer/logs/",
     }
 
     for dirpath, dirnames, filenames in os.walk(project_root):
-        dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirs]
+        kept_dirs = []
+        for dirname in dirnames:
+            rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
+            if profile.is_excluded_path(rel_dir) or profile.is_test_path(rel_dir):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
         for fname in filenames:
             if not fname.lower().endswith((".md", ".rst", ".txt", ".adoc")):
                 continue
             fpath = os.path.join(dirpath, fname)
             doc_rel = _repo_relpath(project_root, fpath)
+            if profile.is_excluded_path(doc_rel) or profile.is_test_path(doc_rel):
+                ignored_doc_files.append(fpath)
+                continue
             if any(doc_rel.startswith(prefix) for prefix in skip_rel_prefixes):
                 ignored_doc_files.append(fpath)
                 continue
@@ -1825,6 +1832,7 @@ def enrich_nodes_with_architecture_signals(
 def append_filetree_fallback_source_nodes(
     project_root: str,
     nodes: List[Dict[str, Any]],
+    profile: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Add source files not covered by the symbol parser as file-tree nodes."""
     try:
@@ -1862,8 +1870,8 @@ def append_filetree_fallback_source_nodes(
             "functions": [],
             "function_lines": {},
             "function_count": 0,
-            "test_coverage": find_test_coverage(project_root, rel),
-            "doc_coverage": find_doc_coverage(project_root, rel),
+            "test_coverage": find_test_coverage(project_root, rel, profile=profile),
+            "doc_coverage": find_doc_coverage(project_root, rel, profile=profile),
             "source_kind": "filetree_fallback",
             "language": row.get("language") or "",
         }
@@ -3731,7 +3739,10 @@ def build_graph_v2_from_symbols(
     If >30 cycles detected, returns status='aborted'.
     """
     # Step 1: PR1 — parse + call graph + SCC
-    modules = parse_production_modules(project_root)
+    from agent.governance.project_profile import discover_project_profile
+
+    profile = discover_project_profile(project_root)
+    modules = parse_production_modules(project_root, profile=profile)
     call_graph = build_call_graph(modules)
     sccs = tarjan_scc(call_graph.edges)
 
@@ -3773,8 +3784,8 @@ def build_graph_v2_from_symbols(
     # Step 3: PR3 — coverage lookup
     for node in nodes:
         pf = node.get("primary_file", "")
-        test_cov = find_test_coverage(project_root, pf)
-        doc_cov = find_doc_coverage(project_root, pf)
+        test_cov = find_test_coverage(project_root, pf, profile=profile)
+        doc_cov = find_doc_coverage(project_root, pf, profile=profile)
         node["test_coverage"] = test_cov
         node["doc_coverage"] = doc_cov
 
@@ -3789,7 +3800,7 @@ def build_graph_v2_from_symbols(
         node for node in nodes
         if node.get("source_kind") == "filetree_fallback"
     ]
-    fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes)
+    fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes, profile=profile)
     all_fallback_nodes = adapter_fallback_nodes + fallback_nodes
     if all_fallback_nodes:
         feature_clusters.extend(_fallback_feature_clusters(all_fallback_nodes))

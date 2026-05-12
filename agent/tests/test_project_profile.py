@@ -121,3 +121,31 @@ def test_project_profile_respects_graph_exclude_paths_and_nested_projects(tmp_pa
     assert not profile.is_production_source_path(
         "examples/dashboard-e2e-demo/src/app.ts"
     )
+
+
+def test_project_profile_respects_graph_ignore_globs(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        str(project / ".aming-claw.yaml"),
+        "\n".join([
+            "version: 2",
+            "project_id: demo-project",
+            "language: typescript",
+            "graph:",
+            "  ignore_globs:",
+            "    - '**/*.generated.ts'",
+            "",
+        ]),
+    )
+    _write(str(project / "src" / "app.ts"), "export function app() { return 1 }\n")
+    _write(
+        str(project / "src" / "client.generated.ts"),
+        "export function generated() { return 1 }\n",
+    )
+
+    profile = discover_project_profile(str(project))
+
+    assert "src" in profile.source_roots
+    assert profile.is_production_source_path("src/app.ts")
+    assert profile.is_excluded_path("src/client.generated.ts")
+    assert not profile.is_production_source_path("src/client.generated.ts")

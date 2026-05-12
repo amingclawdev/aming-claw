@@ -111,6 +111,74 @@ def test_l7_metadata_persists_function_line_index(tmp_path):
     assert metadata["function_count"] == len(metadata["function_lines"])
 
 
+def test_graph_excluded_nested_project_does_not_bind_docs_or_tests(tmp_path):
+    project = tmp_path / "project"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    _write(
+        str(project / ".aming-claw.yaml"),
+        "\n".join([
+            "version: 2",
+            "project_id: parent-project",
+            "language: python",
+            "graph:",
+            "  nested_projects:",
+            "    mode: exclude",
+            "    roots:",
+            "      - examples/dashboard-e2e-demo",
+            "",
+        ]),
+    )
+    _write(
+        str(project / "src" / "app.py"),
+        "def app():\n"
+        "    return 'parent'\n",
+    )
+    _write(
+        str(project / "examples" / "dashboard-e2e-demo" / "README.md"),
+        "# Demo\n\nThis mentions src/app.py and src.app.\n",
+    )
+    _write(
+        str(project / "examples" / "dashboard-e2e-demo" / "tests" / "test_app.py"),
+        "from src.app import app\n\n"
+        "def test_app():\n"
+        "    assert app() == 'parent'\n",
+    )
+
+    result = build_graph_v2_from_symbols(
+        str(project),
+        dry_run=True,
+        scratch_dir=str(scratch),
+    )
+
+    app_node = next(node for node in result["nodes"] if node["module"] == "src.app")
+    assert app_node["test_coverage"]["test_files"] == []
+    assert app_node["doc_coverage"]["doc_files"] == []
+    assert all(
+        "examples/dashboard-e2e-demo" not in str(value).replace("\\", "/")
+        for node in result["nodes"]
+        for value in (
+            [node.get("primary_file")]
+            + (node.get("test_coverage") or {}).get("test_files", [])
+            + (node.get("doc_coverage") or {}).get("doc_files", [])
+        )
+    )
+
+    candidate = build_rebase_candidate_graph(
+        str(project),
+        result,
+        session_id="session-exclude-demo",
+        run_id=result["run_id"],
+    )
+    l7_node = next(
+        graph_node for graph_node in candidate["deps_graph"]["nodes"]
+        if graph_node["layer"] == "L7" and graph_node["title"] == "src.app"
+    )
+    assert l7_node["primary"] == ["src/app.py"]
+    assert l7_node["secondary"] == []
+    assert l7_node["test"] == []
+
+
 def test_architecture_graph_promotes_state_and_workflow_parents(tmp_path):
     project = tmp_path / "project"
     scratch = tmp_path / "scratch"

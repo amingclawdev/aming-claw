@@ -7,6 +7,7 @@ code graph while keeping tests/docs as downstream consumers.
 from __future__ import annotations
 
 import os
+import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List
@@ -31,6 +32,7 @@ class ProjectProfile:
     test_roots: List[str] = field(default_factory=list)
     doc_roots: List[str] = field(default_factory=list)
     exclude_roots: List[str] = field(default_factory=list)
+    ignore_globs: List[str] = field(default_factory=list)
     manifest_files: List[str] = field(default_factory=list)
     language_policy: LanguagePolicy = field(
         default=DEFAULT_LANGUAGE_POLICY,
@@ -43,7 +45,10 @@ class ProjectProfile:
 
     def is_excluded_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
-        return self.language_policy.is_excluded_path(rel, self.exclude_roots)
+        return (
+            self.language_policy.is_excluded_path(rel, self.exclude_roots)
+            or _matches_any_glob(rel, self.ignore_globs)
+        )
 
     def is_doc_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
@@ -55,11 +60,13 @@ class ProjectProfile:
 
     def is_production_source_path(self, path: str) -> bool:
         rel = self.normalize_relpath(path)
-        return self.language_policy.is_production_source_path(
-            rel,
-            test_roots=self.test_roots,
-            doc_roots=self.doc_roots,
-            exclude_roots=self.exclude_roots,
+        return (
+            self.language_policy.is_source_path(rel)
+            and not self.language_policy.is_config_path(rel)
+            and not self.language_policy.is_generated_path(rel)
+            and not self.is_excluded_path(rel)
+            and not self.is_test_path(rel)
+            and not self.is_doc_path(rel)
         )
 
 
@@ -74,6 +81,7 @@ def discover_project_profile(project_root: str) -> ProjectProfile:
         _discover_existing_excludes(root),
         _configured_exclude_roots(root),
     )
+    ignore_globs = _configured_ignore_globs(root)
     source_roots = _discover_source_roots(root, test_roots, doc_roots, exclude_roots)
 
     if not source_roots:
@@ -86,6 +94,7 @@ def discover_project_profile(project_root: str) -> ProjectProfile:
         test_roots=test_roots,
         doc_roots=doc_roots,
         exclude_roots=exclude_roots,
+        ignore_globs=ignore_globs,
         manifest_files=manifests,
     )
 
@@ -137,6 +146,25 @@ def _configured_exclude_roots(root: Path) -> List[str]:
     except Exception:
         return []
     return _merge_roots(effective_graph_exclude_roots(config))
+
+
+def _configured_ignore_globs(root: Path) -> List[str]:
+    try:
+        from project_config import load_project_config  # type: ignore
+
+        config = load_project_config(root)
+    except Exception:
+        return []
+    values = getattr(getattr(config, "graph", None), "ignore_globs", []) or []
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        glob = str(value or "").replace("\\", "/").strip().strip("/")
+        if not glob or glob in seen:
+            continue
+        seen.add(glob)
+        out.append(glob)
+    return sorted(out)
 
 
 def _merge_roots(*groups: Iterable[str]) -> List[str]:
@@ -219,6 +247,15 @@ def _is_under_any(rel: str, roots: Iterable[str]) -> bool:
         if not base:
             continue
         if norm == base or norm.startswith(base + "/"):
+            return True
+    return False
+
+
+def _matches_any_glob(rel: str, globs: Iterable[str]) -> bool:
+    norm = str(rel or "").replace("\\", "/").strip("/")
+    for pattern in globs or []:
+        glob = str(pattern or "").replace("\\", "/").strip("/")
+        if glob and fnmatch.fnmatch(norm, glob):
             return True
     return False
 
