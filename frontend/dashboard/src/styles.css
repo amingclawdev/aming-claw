@@ -3620,7 +3620,8 @@ svg.graph-svg path.ghit:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.config-row input {
+.config-row input,
+.config-row select {
   min-width: 0;
   height: 28px;
   border: 1px solid var(--ink-200);
@@ -3628,8 +3629,10 @@ svg.graph-svg path.ghit:hover {
   padding: 0 8px;
   font: inherit;
   color: var(--ink-800);
+  background: white;
 }
-.config-row input:focus {
+.config-row input:focus,
+.config-row select:focus {
   outline: 2px solid rgba(79, 70, 229, 0.16);
   border-color: var(--indigo);
 }
@@ -3668,6 +3671,34 @@ svg.graph-svg path.ghit:hover {
   border-color: #fecaca;
   background: #fef2f2;
   color: #991b1b;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--ink-200);
+  background: var(--ink-50);
+  color: var(--ink-600);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.status-pill.ok {
+  border-color: #bbf7d0;
+  background: #ecfdf5;
+  color: #047857;
+}
+.status-pill.warn {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #b45309;
+}
+.status-pill.err {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #dc2626;
 }
 .config-dialog-actions {
   display: flex;

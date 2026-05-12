@@ -22,6 +22,7 @@ import type { PinnedEdge } from "./FocusCard";
 import type { ActionKind, ActionTarget } from "./ActionControlPanel";
 import RetryFeedbackModal from "./RetryFeedbackModal";
 import CandidateSemanticBlock from "./CandidateSemanticBlock";
+import { formatSemanticValue } from "../lib/semanticFormat";
 import { healthHex, healthTone } from "../lib/health";
 
 interface Props {
@@ -834,14 +835,10 @@ function EdgeOverviewTab({
 // CandidateSemanticBlock renders, just labelled as the current accepted
 // state instead of a pending proposal.
 function EdgeSemanticSection({ sem }: { sem: Record<string, unknown> }) {
-  const str = (k: string): string => {
-    const v = sem[k];
-    return typeof v === "string" ? v : v == null ? "" : String(v);
-  };
-  const relationPurpose = str("relation_purpose");
-  const semanticLabel = str("semantic_label");
-  const directionality = str("directionality");
-  const risk = str("risk");
+  const relationPurpose = formatSemanticValue(sem.relation_purpose);
+  const semanticLabel = formatSemanticValue(sem.semantic_label, 180);
+  const directionality = formatSemanticValue(sem.directionality);
+  const risk = formatSemanticValue(sem.risk);
   const confidence = typeof sem.confidence === "number" ? (sem.confidence as number) : null;
   const evidence = sem.evidence as Record<string, unknown> | undefined;
   const openIssues = Array.isArray(sem.open_issues) ? (sem.open_issues as unknown[]) : [];
@@ -886,9 +883,7 @@ function EdgeSemanticSection({ sem }: { sem: Record<string, unknown> }) {
           <div className="candidate-block-row">
             <span className="candidate-block-key">evidence</span>
             <span className="candidate-block-val">
-              {typeof (evidence as { basis?: unknown }).basis === "string"
-                ? ((evidence as { basis: string }).basis)
-                : JSON.stringify(evidence).slice(0, 240)}
+              {formatSemanticValue((evidence as { basis?: unknown }).basis || evidence, 240)}
             </span>
           </div>
         ) : null}
@@ -898,7 +893,7 @@ function EdgeSemanticSection({ sem }: { sem: Record<string, unknown> }) {
             <div>
               <ul className="candidate-block-issues">
                 {openIssues.slice(0, 3).map((it, i) => (
-                  <li key={i}>{typeof it === "string" ? it : JSON.stringify(it).slice(0, 240)}</li>
+                  <li key={i}>{formatSemanticValue(it, 240)}</li>
                 ))}
               </ul>
               {openIssues.length > 3 ? (

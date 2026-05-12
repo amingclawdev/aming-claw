@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -113,9 +113,15 @@ interface Toast {
 
 const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
 
+const DEFAULT_AI_MODELS: Record<string, string[]> = {
+  anthropic: ["claude-opus-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5"],
+  openai: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
+};
+
 export default function App() {
   const [data, setData] = useState<DataBundle | null>(null);
   const [loading, setLoading] = useState(true);
+  const loadingRef = useRef(loading);
   const [error, setError] = useState<string | null>(null);
   const initialLocation = useMemo(() => readDashboardLocation(), []);
   const [view, setView] = useState<ViewName>(initialLocation.view);
@@ -248,15 +254,29 @@ export default function App() {
   // plus pass-through for node.status_changed etc. We debounce a refetch so
   // bursts (e.g. worker draining 20 nodes in 1s) collapse into one call.
   const refetchTimerRef = useRef<number | null>(null);
+  const liveRefetchPendingRef = useRef(false);
   const scheduleLiveRefetch = useCallback(() => {
     if (refetchTimerRef.current != null) window.clearTimeout(refetchTimerRef.current);
     refetchTimerRef.current = window.setTimeout(() => {
       refetchTimerRef.current = null;
-      // Only re-fetch when not already loading — avoids fetchAll re-entrancy
-      // (the in-flight load will pick up the latest server state anyway).
-      if (!loading) void fetchAll();
+      // If a completion event lands during a load, keep a pending refresh
+      // marker. The in-flight load often started before the worker committed
+      // its final state, so dropping the event can leave rows stuck as running.
+      if (loadingRef.current) {
+        liveRefetchPendingRef.current = true;
+        return;
+      }
+      liveRefetchPendingRef.current = false;
+      void fetchAll();
     }, 600);
-  }, [fetchAll, loading]);
+  }, [fetchAll]);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+    if (!loading && liveRefetchPendingRef.current) {
+      scheduleLiveRefetch();
+    }
+  }, [loading, scheduleLiveRefetch]);
 
   useEffect(
     () => () => {
@@ -1047,6 +1067,8 @@ function AiConfigDialog({
 }) {
   const projectRouting = config?.project_config?.ai?.routing ?? {};
   const roleRouting = config?.role_routing ?? {};
+  const modelCatalog = config?.model_catalog?.models ?? DEFAULT_AI_MODELS;
+  const providerIds = Array.from(new Set([...Object.keys(DEFAULT_AI_MODELS), ...Object.keys(modelCatalog)]));
   const roles = Array.from(
     new Set([
       ...Object.keys(projectRouting),
@@ -1087,18 +1109,24 @@ function AiConfigDialog({
     }));
   };
 
+  const modelOptionsFor = (provider: string) => {
+    const key = provider.trim();
+    return key ? (modelCatalog[key] ?? DEFAULT_AI_MODELS[key] ?? []) : [];
+  };
+
   const saveRouting = async () => {
     setSaving(true);
     setMessage(null);
     try {
+      const routingEntries: Array<[string, { provider: string; model: string }]> = roles.map((role) => [
+        role,
+        {
+          provider: (draft[role]?.provider ?? "").trim(),
+          model: (draft[role]?.model ?? "").trim(),
+        },
+      ]);
       const routing = Object.fromEntries(
-        roles.map((role) => [
-          role,
-          {
-            provider: (draft[role]?.provider ?? "").trim(),
-            model: (draft[role]?.model ?? "").trim(),
-          },
-        ]),
+        routingEntries.filter(([, route]) => route.provider || route.model),
       );
       const next = await api.updateAiConfigFor(projectId, { routing, actor: "dashboard" });
       onSaved(next);
@@ -1125,6 +1153,11 @@ function AiConfigDialog({
         </div>
         <div className="config-section">
           <div className="config-section-title">Project routing</div>
+          <div className="config-dialog-sub" style={{ marginBottom: 10 }}>
+            Anthropic routes through Claude Code (<span className="mono">claude</span> CLI). OpenAI routes through
+            Codex CLI (<span className="mono">codex</span>). Version checks below are local tool probes only and do not
+            call a model.
+          </div>
           <div className="config-table">
             <div className="config-row config-row-head config-row-editable">
               <span>Role</span>
@@ -1134,19 +1167,40 @@ function AiConfigDialog({
             </div>
             {roles.map((role) => {
               const effective = role === "semantic" ? config?.semantic : roleRouting[role];
+              const provider = draft[role]?.provider ?? "";
+              const modelOptions = modelOptionsFor(provider);
+              const currentModel = draft[role]?.model ?? "";
               return (
                 <div className="config-row config-row-editable" key={role}>
                   <span className="mono">{role}</span>
-                  <input
-                    value={draft[role]?.provider ?? ""}
+                  <select
+                    value={provider}
                     onChange={(event) => updateDraft(role, "provider", event.target.value)}
-                    placeholder="provider"
-                  />
-                  <input
-                    value={draft[role]?.model ?? ""}
-                    onChange={(event) => updateDraft(role, "model", event.target.value)}
-                    placeholder="model"
-                  />
+                  >
+                    <option value="">provider</option>
+                    {providerIds.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={modelOptions.includes(currentModel) ? currentModel : currentModel ? "__custom__" : ""}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      updateDraft(role, "model", value === "__custom__" ? currentModel : value);
+                    }}
+                  >
+                    <option value="">model</option>
+                    {modelOptions.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                    {currentModel && !modelOptions.includes(currentModel) ? (
+                      <option value="__custom__">custom: {currentModel}</option>
+                    ) : null}
+                  </select>
                   <span>{fmtRoute(effective)}</span>
                 </div>
               );
@@ -1161,6 +1215,31 @@ function AiConfigDialog({
             </span>
           </div>
           {message ? <div className={`config-warning ${message.kind}`}>{message.text}</div> : null}
+        </div>
+        <div className="config-section">
+          <div className="config-section-title">Local AI tools</div>
+          <div className="config-kv">
+            {providerIds.map((provider) => {
+              const tool = config?.tool_health?.[provider];
+              const providerMeta = config?.model_catalog?.providers?.[provider];
+              const status = tool?.status ?? "unknown";
+              return (
+                <Fragment key={provider}>
+                  <span>{provider}</span>
+                  <span>
+                    <span className={`status-pill ${status === "detected" ? "ok" : status === "missing" ? "err" : "warn"}`}>
+                      {status}
+                    </span>{" "}
+                    <span className="mono">
+                      {tool?.runtime ?? providerMeta?.runtime ?? providerMeta?.command ?? "local CLI"}
+                      {tool?.version ? ` · ${tool.version}` : ""}
+                    </span>
+                    {tool?.path ? <span className="config-dialog-sub"> · {tool.path}</span> : null}
+                  </span>
+                </Fragment>
+              );
+            })}
+          </div>
         </div>
         <div className="config-section">
           <div className="config-section-title">Semantic worker</div>

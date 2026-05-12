@@ -147,6 +147,9 @@ def test_project_ai_config_endpoint_returns_writable_dashboard_contract(tmp_path
     assert payload["write_supported"] is True
     assert "role_routing" in payload
     assert "semantic" in payload
+    assert payload["model_catalog"]["models"]["anthropic"]
+    assert payload["model_catalog"]["providers"]["openai"]["runtime"] == "Codex CLI"
+    assert payload["tool_health"]["anthropic"]["runtime"] == "Claude Code CLI"
     assert payload["semantic"]["analyzer_role"]
     assert payload["project_config"]["ai"]["routing"]["semantic"]["model"] == "claude-opus-4-7"
     assert "dashboard.semantic.safe" in payload["project_config"]["testing"]["e2e"]["suites"]

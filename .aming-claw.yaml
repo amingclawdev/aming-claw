@@ -12,7 +12,9 @@ testing:
     - executable: "bash"
       args_prefixes: ["scripts/e2e-"]
     - executable: "node"
-      args_prefixes: ["frontend/dashboard/scripts/e2e-trunk.mjs"]
+      args_prefixes: ["frontend/dashboard/scripts/e2e-trunk.mjs", "scripts/materialize-fixture.mjs"]
+    - executable: "npm"
+      args_prefixes: ["--prefix examples/external-governance-demo test"]
   e2e:
     auto_run: false
     default_timeout_sec: 900
@@ -90,6 +92,24 @@ testing:
             - "dashboard"
             - "static-route"
             - "production"
+      dashboard.smoke.fixture:
+        label: "Dashboard external mixed-language smoke fixture"
+        command: "npm --prefix examples/external-governance-demo test"
+        auto_run: false
+        live_ai: false
+        mutates_db: false
+        requires_human_approval: false
+        isolation_project: "external-governance-demo"
+        timeout_sec: 300
+        trigger:
+          paths:
+            - "scripts/materialize-fixture.mjs"
+            - "docs/fixtures/external-governance-demo/**"
+            - "examples/external-governance-demo/**"
+          tags:
+            - "dashboard"
+            - "fixture"
+            - "smoke"
 
 build:
   command: ""

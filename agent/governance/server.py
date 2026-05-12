@@ -45,10 +45,40 @@ from .impact_analyzer import ImpactAnalyzer
 from .models import ImpactAnalysisRequest, FileHitPolicy
 
 import os
+import shutil
 import signal
 import subprocess
 PORT = int(os.environ.get("GOVERNANCE_PORT", "40000"))
 DASHBOARD_ROUTE_PREFIX = "/dashboard"
+
+AI_MODEL_CATALOG = {
+    "anthropic": [
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+    ],
+    "openai": [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex",
+    ],
+}
+
+AI_PROVIDER_REQUIREMENTS = {
+    "anthropic": {
+        "label": "Anthropic",
+        "runtime": "Claude Code CLI",
+        "command": "claude",
+        "env_var": "CLAUDE_BIN",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "runtime": "Codex CLI",
+        "command": "codex",
+        "env_var": "CODEX_BIN",
+    },
+}
 
 # --- Server Version (dynamic with 30s cache) ---
 _version_cache = {"value": "unknown", "ts": 0}
@@ -956,6 +986,60 @@ def handle_project_e2e_config(ctx: RequestContext):
         return 404, {"error": f"e2e config not found: {exc}"}
 
 
+def _ai_tool_health() -> dict[str, Any]:
+    """Detect local CLI tools used by dashboard-configured AI providers."""
+    health: dict[str, Any] = {}
+    for provider, requirement in AI_PROVIDER_REQUIREMENTS.items():
+        env_var = str(requirement["env_var"])
+        configured = os.environ.get(env_var, "").strip()
+        candidates = [configured] if configured else []
+        candidates.append(str(requirement["command"]))
+        resolved = ""
+        source = ""
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = candidate if os.path.isabs(candidate) else shutil.which(candidate)
+            if path:
+                resolved = path
+                source = env_var if configured and candidate == configured else "PATH"
+                break
+        status = "missing"
+        version = ""
+        error = ""
+        if resolved:
+            status = "detected"
+            try:
+                proc = subprocess.run(
+                    [resolved, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                first_line = (proc.stdout or proc.stderr or "").strip().splitlines()[0:1]
+                version = first_line[0] if first_line else ""
+                if proc.returncode != 0:
+                    status = "version_error"
+                    error = (proc.stderr or proc.stdout or "").strip()[:400]
+            except Exception as exc:
+                status = "version_error"
+                error = str(exc)
+        health[provider] = {
+            "provider": provider,
+            "label": requirement["label"],
+            "runtime": requirement["runtime"],
+            "command": requirement["command"],
+            "env_var": env_var,
+            "path": resolved,
+            "source": source,
+            "status": status,
+            "version": version,
+            "auth_status": "unknown",
+            "error": error,
+        }
+    return health
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/e2e/evidence")
 def handle_graph_governance_snapshot_e2e_evidence(ctx: RequestContext):
     """Record E2E evidence bound to a graph snapshot."""
@@ -1115,6 +1199,11 @@ def handle_project_ai_config(ctx: RequestContext):
         "role_config_error": role_config_error,
         "semantic": semantic,
         "semantic_error": semantic_error,
+        "tool_health": _ai_tool_health(),
+        "model_catalog": {
+            "providers": AI_PROVIDER_REQUIREMENTS,
+            "models": AI_MODEL_CATALOG,
+        },
         "read_only": False,
         "write_supported": True,
     }

@@ -22,9 +22,10 @@ python -m pytest tests -q
 npm test
 ```
 
-The fixture is materialized from `artifacts/l4-smoke-fixture.md`. Add future
-E2E scenarios by extending the `governance-hint` block and the fenced file
-blocks in that L4 artifact, then run `npm run generate`.
+The fixture is materialized from the aming-claw repo-level artifact
+`docs/fixtures/external-governance-demo/l4-smoke-fixture.md`. Add future E2E
+scenarios by extending the `governance-hint` block and the fenced file blocks in
+that L4 artifact, then run `npm run generate`.
 
 Graph smoke coverage:
 

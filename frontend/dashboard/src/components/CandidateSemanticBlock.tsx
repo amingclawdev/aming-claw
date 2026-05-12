@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { formatSemanticValue } from "../lib/semanticFormat";
 
 interface Props {
   snapshotId: string | null | undefined;
@@ -89,14 +90,14 @@ export default function CandidateSemanticBlock({ snapshotId, targetType, targetI
   }
 
   const p = state.payload;
-  const relationPurpose = stringField(p, "relation_purpose");
-  const semanticLabel = stringField(p, "semantic_label");
-  const directionality = stringField(p, "directionality");
-  const risk = stringField(p, "risk");
-  const semanticSummary = stringField(p, "semantic_summary");
-  const intent = stringField(p, "intent");
-  const featureName = stringField(p, "feature_name");
-  const domainLabel = stringField(p, "domain_label");
+  const relationPurpose = formatSemanticValue(p.relation_purpose);
+  const semanticLabel = formatSemanticValue(p.semantic_label, 180);
+  const directionality = formatSemanticValue(p.directionality);
+  const risk = formatSemanticValue(p.risk);
+  const semanticSummary = formatSemanticValue(p.semantic_summary);
+  const intent = formatSemanticValue(p.intent);
+  const featureName = formatSemanticValue(p.feature_name, 180);
+  const domainLabel = formatSemanticValue(p.domain_label, 180);
   const evidence = p.evidence as Record<string, unknown> | undefined;
   const openIssues = Array.isArray(p.open_issues) ? (p.open_issues as unknown[]) : [];
   const confidence =
@@ -173,7 +174,7 @@ export default function CandidateSemanticBlock({ snapshotId, targetType, targetI
         <div className="candidate-block-row">
           <span className="candidate-block-key">evidence</span>
           <span className="candidate-block-val">
-            {stringField(evidence, "basis") || JSON.stringify(evidence).slice(0, 240)}
+            {formatSemanticValue(evidence.basis || evidence, 240)}
           </span>
         </div>
       ) : null}
@@ -183,7 +184,7 @@ export default function CandidateSemanticBlock({ snapshotId, targetType, targetI
           <div>
             <ul className="candidate-block-issues">
               {openIssues.slice(0, 3).map((it, i) => (
-                <li key={i}>{typeof it === "string" ? it : JSON.stringify(it).slice(0, 240)}</li>
+                <li key={i}>{formatSemanticValue(it, 240)}</li>
               ))}
             </ul>
             {openIssues.length > 3 ? (
@@ -196,11 +197,4 @@ export default function CandidateSemanticBlock({ snapshotId, targetType, targetI
       ) : null}
     </div>
   );
-}
-
-function stringField(obj: Record<string, unknown>, key: string): string {
-  const v = obj[key];
-  if (typeof v === "string") return v;
-  if (v == null) return "";
-  return String(v);
 }

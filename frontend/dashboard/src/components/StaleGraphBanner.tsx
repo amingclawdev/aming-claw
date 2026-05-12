@@ -96,7 +96,7 @@ export default function StaleGraphBanner({
             disabled={busy}
             title="Materialize new snapshot + rebuild projection — runs inline"
           >
-            {busy ? "Reconcile…" : "Scope reconcile"}
+            {busy ? "Updating…" : "Update graph"}
           </button>
         </>
       ) : null}

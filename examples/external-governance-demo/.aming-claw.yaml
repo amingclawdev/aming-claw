@@ -37,20 +37,6 @@ graph:
     mode: "exclude"
     roots: []
 
-ai:
-  routing:
-    pm:
-      provider: "openai"
-      model: "gpt-5.5"
-    dev:
-      provider: "openai"
-      model: "gpt-5.4"
-    tester:
-      provider: "openai"
-      model: "gpt-5.4"
-    qa:
-      provider: "openai"
-      model: "gpt-5.5"
-    semantic:
-      provider: "anthropic"
-      model: "claude-opus-4-7"
+# Intentionally no ai.routing block: smoke fixtures should not silently enable
+# live model calls. Configure AI from the dashboard when a live semantic smoke
+# pass is desired.

@@ -8,7 +8,9 @@ const checkout = readFileSync(join(process.cwd(), "web", "checkout.ts"), "utf8")
 const contract = readFileSync(join(process.cwd(), "contracts", "quote.schema.json"), "utf8");
 const pricing = readFileSync(join(process.cwd(), "state", "pricing-rules.json"), "utf8");
 const l4Doc = readFileSync(join(process.cwd(), "docs", "l4", "quote-contract.md"), "utf8");
-const fixtureArtifact = readFileSync(join(process.cwd(), "artifacts", "l4-smoke-fixture.md"), "utf8");
+const manifest = JSON.parse(
+  readFileSync(join(process.cwd(), ".aming-claw", "e2e-artifacts", "materialize-manifest.json"), "utf8"),
+);
 
 if (!service.includes("calculate_total")) {
   throw new Error("Python service fixture is missing calculate_total");
@@ -42,8 +44,8 @@ if (!l4Doc.includes("quote.v1") || !l4Doc.includes("src/demo_app/service.py")) {
   throw new Error("L4 quote contract doc is missing code binding markers");
 }
 
-if (!fixtureArtifact.includes("governance-hint") || !fixtureArtifact.includes('path="src/demo_app/service.py"')) {
-  throw new Error("L4 fixture artifact is missing governance hints or service materialization block");
+if (!manifest.hint_count || !manifest.files.includes("src/demo_app/service.py")) {
+  throw new Error("L4 fixture materializer did not load governance hints or service materialization block");
 }
 
 console.log("external governance mixed smoke ok");

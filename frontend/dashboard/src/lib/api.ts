@@ -636,6 +636,23 @@ export interface AiConfigResponse {
   write_supported?: boolean;
   project_config?: ProjectConfigResponse;
   role_routing?: Record<string, { provider?: string; model?: string; source?: string }>;
+  tool_health?: Record<string, {
+    provider?: string;
+    label?: string;
+    runtime?: string;
+    command?: string;
+    env_var?: string;
+    path?: string;
+    source?: string;
+    status?: string;
+    version?: string;
+    auth_status?: string;
+    error?: string;
+  }>;
+  model_catalog?: {
+    providers?: Record<string, { label?: string; runtime?: string; command?: string; env_var?: string }>;
+    models?: Record<string, string[]>;
+  };
   semantic?: {
     provider?: string;
     model?: string;

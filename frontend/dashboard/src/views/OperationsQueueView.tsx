@@ -86,7 +86,7 @@ export default function OperationsQueueView({
         <div className={`ops-kpi${runningCount > 0 ? " ops-kpi-blue" : ""}`}>
           <div className="ops-kpi-label">Running</div>
           <div className="ops-kpi-value">{runningCount}</div>
-          <div className="ops-kpi-sub">in flight</div>
+          <div className="ops-kpi-sub">parallel workers</div>
         </div>
       </div>
 
@@ -95,7 +95,7 @@ export default function OperationsQueueView({
           stuck. Empty banner is tiny (one line). */}
       <QueueSection
         title="Running"
-        hint="in flight — cancel disabled, will complete or fail on its own"
+        hint="in flight across semantic worker lanes — cancel disabled, will complete or fail on its own"
         rows={runningRows}
         emptyMsg="No tasks running."
         onCancelOperation={onCancelOperation}
@@ -103,7 +103,7 @@ export default function OperationsQueueView({
 
       <QueueSection
         title="Queued"
-        hint="waiting in queue order"
+        hint="waiting for an available semantic worker lane"
         rows={queuedRows}
         emptyMsg="No tasks queued."
         onCancelOperation={onCancelOperation}

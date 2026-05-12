@@ -1,7 +1,7 @@
 # L4 Smoke Fixture Artifact
 
 This artifact is the source of truth for the external-governance-demo smoke project.
-Add future dashboard E2E coverage by extending the governance hint and file blocks, then run `npm run generate`.
+Add future dashboard E2E coverage by extending the governance hint and file blocks, then run `node scripts/materialize-fixture.mjs`.
 
 <!-- governance-hint
 {
@@ -11,8 +11,9 @@ Add future dashboard E2E coverage by extending the governance hint and file bloc
   "kind": "fixture_artifact",
   "purpose": "Materialize a mixed Python/TypeScript/JavaScript project for dashboard graph/bootstrap/scope-reconcile smoke tests.",
   "generation": {
-    "command": "npm run generate",
+    "command": "node scripts/materialize-fixture.mjs --root examples/external-governance-demo --artifact docs/fixtures/external-governance-demo/l4-smoke-fixture.md",
     "script": "scripts/materialize-fixture.mjs",
+    "target_root": "examples/external-governance-demo",
     "deterministic": true,
     "uses_ai": false,
     "mutates_governance_db": false
@@ -163,23 +164,9 @@ graph:
     mode: "exclude"
     roots: []
 
-ai:
-  routing:
-    pm:
-      provider: "openai"
-      model: "gpt-5.5"
-    dev:
-      provider: "openai"
-      model: "gpt-5.4"
-    tester:
-      provider: "openai"
-      model: "gpt-5.4"
-    qa:
-      provider: "openai"
-      model: "gpt-5.5"
-    semantic:
-      provider: "anthropic"
-      model: "claude-opus-4-7"
+# Intentionally no ai.routing block: smoke fixtures should not silently enable
+# live model calls. Configure AI from the dashboard when a live semantic smoke
+# pass is desired.
 ````
 
 #### .gitignore
@@ -191,6 +178,7 @@ __pycache__/
 node_modules/
 dist/
 coverage/
+.aming-claw/e2e-artifacts/
 ````
 
 #### package.json
@@ -260,9 +248,10 @@ python -m pytest tests -q
 npm test
 ```
 
-The fixture is materialized from `artifacts/l4-smoke-fixture.md`. Add future
-E2E scenarios by extending the `governance-hint` block and the fenced file
-blocks in that L4 artifact, then run `npm run generate`.
+The fixture is materialized from the aming-claw repo-level artifact
+`docs/fixtures/external-governance-demo/l4-smoke-fixture.md`. Add future E2E
+scenarios by extending the `governance-hint` block and the fenced file blocks in
+that L4 artifact, then run `npm run generate`.
 
 Graph smoke coverage:
 
@@ -307,8 +296,8 @@ Available routes:
 
 Related L4 assets:
 
-- `artifacts/l4-smoke-fixture.md` is the deployable fixture artifact with
-  governance hints and file blocks.
+- `docs/fixtures/external-governance-demo/l4-smoke-fixture.md` is the
+  deployable fixture artifact with governance hints and file blocks.
 - `docs/l4/quote-contract.md` explains the request and response contract.
 - `docs/l4/pricing-state.md` describes pricing state and compliance flags.
 - `docs/l4/test-coverage.md` maps smoke tests to the code paths.
@@ -694,7 +683,9 @@ const checkout = readFileSync(join(process.cwd(), "web", "checkout.ts"), "utf8")
 const contract = readFileSync(join(process.cwd(), "contracts", "quote.schema.json"), "utf8");
 const pricing = readFileSync(join(process.cwd(), "state", "pricing-rules.json"), "utf8");
 const l4Doc = readFileSync(join(process.cwd(), "docs", "l4", "quote-contract.md"), "utf8");
-const fixtureArtifact = readFileSync(join(process.cwd(), "artifacts", "l4-smoke-fixture.md"), "utf8");
+const manifest = JSON.parse(
+  readFileSync(join(process.cwd(), ".aming-claw", "e2e-artifacts", "materialize-manifest.json"), "utf8"),
+);
 
 if (!service.includes("calculate_total")) {
   throw new Error("Python service fixture is missing calculate_total");
@@ -728,8 +719,8 @@ if (!l4Doc.includes("quote.v1") || !l4Doc.includes("src/demo_app/service.py")) {
   throw new Error("L4 quote contract doc is missing code binding markers");
 }
 
-if (!fixtureArtifact.includes("governance-hint") || !fixtureArtifact.includes('path="src/demo_app/service.py"')) {
-  throw new Error("L4 fixture artifact is missing governance hints or service materialization block");
+if (!manifest.hint_count || !manifest.files.includes("src/demo_app/service.py")) {
+  throw new Error("L4 fixture materializer did not load governance hints or service materialization block");
 }
 
 console.log("external governance mixed smoke ok");
