@@ -3479,6 +3479,8 @@ def build_candidate_coverage_ledger(
             else:
                 coverage_status = "config_pending_semantic_classification"
                 audit_reasons.append("config_requires_ai_semantic_classification")
+        elif file_kind == "type_contract":
+            coverage_status = "type_contract_support"
         elif scan_status == "ignored" or str(row.get("decision") or "") == "ignore":
             coverage_status = "ignored_or_generated"
         elif str(row.get("decision") or "") == "pending" or scan_status in {"pending_decision", "orphan"}:

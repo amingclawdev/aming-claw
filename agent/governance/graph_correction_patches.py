@@ -15,6 +15,7 @@ import uuid
 from pathlib import PurePosixPath
 from typing import Any, Iterable
 
+from .language_policy import DEFAULT_LANGUAGE_POLICY
 from .graph_snapshot_store import graph_payload_edges, utc_now
 
 
@@ -240,6 +241,19 @@ def classify_node_file_role(node: dict[str, Any]) -> dict[str, Any]:
         role = "package_marker"
         confidence = 0.94 if function_count == 0 and not typed_relations else 0.78
         reasons.append(f"{first} is a package or module marker")
+    elif (
+        function_count == 0
+        and all(DEFAULT_LANGUAGE_POLICY.is_typescript_contract_path(path) for path in primary)
+    ):
+        role = "type_contract"
+        confidence = 0.86
+        reasons.append("primary file is a TypeScript declaration or type-contract module")
+        flags.append("coverage_noise_candidate")
+    elif first in {"main.ts", "main.tsx", "main.js", "main.jsx", "main.mjs", "main.cjs"} and function_count == 0:
+        role = "entrypoint_support"
+        confidence = 0.82
+        reasons.append(f"{first} is a runtime entrypoint with no captured feature symbols")
+        flags.append("coverage_noise_candidate")
     elif first in {"index.js", "index.ts", "index.jsx", "index.tsx", "mod.rs"}:
         role = "barrel_or_index"
         confidence = 0.72
@@ -303,7 +317,7 @@ def annotate_graph_node_roles(graph_json: dict[str, Any]) -> dict[str, Any]:
         metadata["file_role_confidence"] = role["confidence"]
         metadata["file_role_reasons"] = role["reasons"]
         metadata["quality_flags"] = sorted(set(_path_list(metadata.get("quality_flags")) + role["flags"]))
-        if role["role"] == "package_marker":
+        if role["role"] in {"package_marker", "type_contract", "entrypoint_support"}:
             metadata["exclude_as_feature"] = True
         role_counts[role["role"]] = role_counts.get(role["role"], 0) + 1
         for flag in role["flags"]:

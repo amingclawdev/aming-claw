@@ -318,6 +318,7 @@ def test_semantic_enrichment_skips_package_markers_by_default_but_allows_explici
     project = tmp_path / "project"
     _write(project / "agent" / "__init__.py", "def bootstrap_project():\n    return None\n")
     _write(project / "agent" / "service.py", "def service_entry():\n    return 'ok'\n")
+    _write(project / "agent" / "types.ts", "export interface ServiceContract { operation_type: string }\n")
     graph = {
         "deps_graph": {
             "nodes": [
@@ -336,6 +337,16 @@ def test_semantic_enrichment_skips_package_markers_by_default_but_allows_explici
                     "metadata": {
                         "exclude_as_feature": True,
                         "file_role": "package_marker",
+                    },
+                },
+                {
+                    "id": "L7.types",
+                    "layer": "L7",
+                    "title": "agent.types",
+                    "primary": ["agent/types.ts"],
+                    "metadata": {
+                        "exclude_as_feature": True,
+                        "file_role": "type_contract",
                     },
                 },
             ],

@@ -311,7 +311,7 @@ def _is_governed_feature_node(node: dict[str, Any]) -> bool:
     if metadata.get("exclude_as_feature") is True:
         return False
     file_role = str(metadata.get("file_role") or node.get("kind") or "").strip().lower()
-    if file_role == "package_marker":
+    if file_role in {"package_marker", "type_contract", "entrypoint_support"}:
         return False
     return True
 

@@ -221,6 +221,8 @@ def classify_file_kind(profile: ProjectProfile, rel_path: str) -> str:
 
     if DEFAULT_LANGUAGE_POLICY.is_generated_path(rel):
         return "generated"
+    if DEFAULT_LANGUAGE_POLICY.is_declaration_path(rel):
+        return "type_contract"
     if DEFAULT_LANGUAGE_POLICY.is_config_path(rel):
         return "config"
     if profile.is_test_path(rel):
@@ -445,6 +447,11 @@ def build_file_inventory(
             decision = "keep"
             graph_status = "support"
             reason = "test support file; audited as non-feature-specific support"
+        elif kind == "type_contract":
+            scan_status = "support"
+            decision = "keep"
+            graph_status = "support"
+            reason = "TypeScript declaration contract; audited as non-runtime support"
         elif kind in {"doc", "index_doc"} and is_archive_doc_path(rel):
             scan_status = "archive"
             decision = "keep"

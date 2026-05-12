@@ -77,6 +77,46 @@ def test_file_role_annotation_marks_package_marker_and_coverage_noise():
     assert result["report"]["role_counts"]["package_marker"] == 1
 
 
+def test_file_role_annotation_excludes_ts_contracts_and_entrypoint_support():
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.types",
+                    "layer": "L7",
+                    "title": "frontend.dashboard.src.types",
+                    "primary": ["frontend/dashboard/src/types.ts"],
+                    "metadata": {
+                        "function_count": 0,
+                        "typed_relations": [{"relation_type": "uses_task_metadata"}],
+                    },
+                },
+                {
+                    "id": "L7.main",
+                    "layer": "L7",
+                    "title": "frontend.dashboard.src.main",
+                    "primary": ["frontend/dashboard/src/main.tsx"],
+                    "metadata": {"function_count": 0, "typed_relations": []},
+                },
+            ],
+            "edges": [],
+        }
+    }
+
+    result = annotate_graph_node_roles(graph)
+    nodes = {node["id"]: node for node in result["graph"]["deps_graph"]["nodes"]}
+
+    type_meta = nodes["L7.types"]["metadata"]
+    assert type_meta["file_role"] == "type_contract"
+    assert type_meta["exclude_as_feature"] is True
+    assert "coverage_noise_candidate" in type_meta["quality_flags"]
+
+    main_meta = nodes["L7.main"]["metadata"]
+    assert main_meta["file_role"] == "entrypoint_support"
+    assert main_meta["exclude_as_feature"] is True
+    assert "coverage_noise_candidate" in main_meta["quality_flags"]
+
+
 def test_relationship_metrics_exclude_hierarchy_edges_from_fan_in_out():
     graph = _graph()
     graph["deps_graph"]["edges"].append(

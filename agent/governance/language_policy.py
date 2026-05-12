@@ -165,6 +165,16 @@ class LanguagePolicy:
         rel = str(rel_path or "").replace("\\", "/").strip("/").lower()
         return rel.endswith(self.declaration_suffixes)
 
+    def is_typescript_contract_path(self, rel_path: str) -> bool:
+        """Return true for TS declaration or conventional type-contract modules."""
+        rel = str(rel_path or "").replace("\\", "/").strip("/").lower()
+        name = Path(rel).name
+        if self.is_declaration_path(rel):
+            return True
+        if Path(rel).suffix.lower() not in {".ts", ".tsx"}:
+            return False
+        return name in {"types.ts", "types.tsx"} or name.endswith((".types.ts", ".types.tsx"))
+
     def is_production_source_path(
         self,
         rel_path: str,
@@ -187,6 +197,8 @@ class LanguagePolicy:
         return self.manifest_language_hints.get(Path(str(rel_path or "")).name, "")
 
     def language_for_path(self, rel_path: str, kind: str = "") -> str:
+        if self.is_declaration_path(rel_path):
+            return "typescript"
         suffix = Path(str(rel_path or "")).suffix.lower()
         language = self.extension_languages.get(suffix, "")
         if language:

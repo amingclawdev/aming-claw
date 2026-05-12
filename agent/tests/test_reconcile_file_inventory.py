@@ -74,6 +74,9 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     _write(str(project / "tests" / "test_orphan.py"), "def test_orphan():\n    assert True\n")
     _write(str(project / "tests" / "conftest.py"), "import pytest\n")
     _write(str(project / "tests" / "fixtures" / "replay_data.py"), "DATA = {}\n")
+    _write(str(project / "web" / "src" / "vite-env.d.ts"), "/// <reference types=\"vite/client\" />\n")
+    _write(str(project / "web" / "src" / "worker.d.mts"), "export interface WorkerContract {}\n")
+    _write(str(project / "web" / "src" / "legacy.d.cts"), "export interface LegacyContract {}\n")
     _write(str(project / "docs" / "service.md"), "See agent/service.py\n")
     _write(str(project / "docs" / "orphan.md"), "Unattached note\n")
     _write(str(project / "docs" / "dev" / "handoff-2026-04-24-post-audit.md"), "Session handoff\n")
@@ -126,6 +129,14 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert rows_by_path["tests/test_orphan.py"]["scan_status"] == "orphan"
     assert rows_by_path["tests/conftest.py"]["scan_status"] == "support"
     assert rows_by_path["tests/fixtures/replay_data.py"]["scan_status"] == "support"
+    assert rows_by_path["web/src/vite-env.d.ts"]["file_kind"] == "type_contract"
+    assert rows_by_path["web/src/vite-env.d.ts"]["scan_status"] == "support"
+    assert rows_by_path["web/src/vite-env.d.ts"]["graph_status"] == "support"
+    assert rows_by_path["web/src/vite-env.d.ts"]["language"] == "typescript"
+    assert rows_by_path["web/src/worker.d.mts"]["file_kind"] == "type_contract"
+    assert rows_by_path["web/src/worker.d.mts"]["scan_status"] == "support"
+    assert rows_by_path["web/src/legacy.d.cts"]["file_kind"] == "type_contract"
+    assert rows_by_path["web/src/legacy.d.cts"]["scan_status"] == "support"
     assert rows_by_path["docs/orphan.md"]["scan_status"] == "orphan"
     assert rows_by_path["docs/dev/handoff-2026-04-24-post-audit.md"]["scan_status"] == "archive"
     assert rows_by_path["MEMORY.md"]["scan_status"] == "archive"
@@ -149,7 +160,7 @@ def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     assert summary["by_status"]["clustered"] == 1
     assert summary["by_status"]["secondary_attached"] == 2
     assert summary["by_status"]["orphan"] == 3
-    assert summary["by_status"]["support"] == 2
+    assert summary["by_status"]["support"] == 5
     assert summary["by_status"]["archive"] == 2
     assert summary["by_status"]["pending_decision"] == 3
     assert summary["by_status"]["ignored"] == 3
@@ -185,6 +196,7 @@ def test_inventory_uses_shared_language_policy_for_mixed_js_ts_fixture(tmp_path)
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
     _write(str(project / "web" / "src" / "index.js"), "export function main() {}\n")
     _write(str(project / "web" / "src" / "App.tsx"), "export function App() { return null }\n")
+    _write(str(project / "web" / "src" / "vite-env.d.ts"), "/// <reference types=\"vite/client\" />\n")
     _write(str(project / "web" / "src" / "App.test.tsx"), "test('app', () => {})\n")
     _write(str(project / "web" / "src" / "config.json"), "{}\n")
     _write(str(project / "web" / "vite.config.ts"), "export default {}\n")
@@ -207,6 +219,9 @@ def test_inventory_uses_shared_language_policy_for_mixed_js_ts_fixture(tmp_path)
     assert rows_by_path["web/src/index.js"]["language"] == "javascript"
     assert rows_by_path["web/src/App.tsx"]["file_kind"] == "source"
     assert rows_by_path["web/src/App.tsx"]["language"] == "typescript"
+    assert rows_by_path["web/src/vite-env.d.ts"]["file_kind"] == "type_contract"
+    assert rows_by_path["web/src/vite-env.d.ts"]["scan_status"] == "support"
+    assert rows_by_path["web/src/vite-env.d.ts"]["language"] == "typescript"
     assert rows_by_path["web/src/App.test.tsx"]["file_kind"] == "test"
     assert rows_by_path["web/src/App.test.tsx"]["language"] == "typescript"
     assert rows_by_path["web/src/config.json"]["file_kind"] == "config"

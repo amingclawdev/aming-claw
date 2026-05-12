@@ -475,7 +475,14 @@ def _node_excluded_from_default_semantics(node: dict[str, Any]) -> bool:
     if metadata.get("exclude_as_feature") is True:
         return True
     file_role = str(metadata.get("file_role") or "").strip().lower()
-    if file_role in {"package_marker", "namespace_marker", "init_marker", "module_marker"}:
+    if file_role in {
+        "package_marker",
+        "namespace_marker",
+        "init_marker",
+        "module_marker",
+        "type_contract",
+        "entrypoint_support",
+    }:
         return True
     quality_flags = {
         str(item or "").strip().lower()
