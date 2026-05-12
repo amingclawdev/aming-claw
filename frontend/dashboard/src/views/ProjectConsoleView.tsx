@@ -5,7 +5,14 @@ import type {
   OperationsQueueResponse,
   StatusResponse,
 } from "../types";
-import { api, ApiError, type AiConfigResponse, type ProjectConfigResponse, type ProjectListItem } from "../lib/api";
+import {
+  api,
+  ApiError,
+  type AiConfigResponse,
+  type ProjectConfigResponse,
+  type ProjectGitRefsResponse,
+  type ProjectListItem,
+} from "../lib/api";
 
 interface Props {
   projects: ProjectListItem[];
@@ -24,11 +31,13 @@ interface ProjectRuntime {
   backlog?: BacklogResponse;
   aiConfig?: AiConfigResponse;
   config?: ProjectConfigResponse;
+  gitRefs?: ProjectGitRefsResponse;
   error?: string;
   errors: {
     status?: RuntimeFailure;
     summary?: RuntimeFailure;
     config?: RuntimeFailure;
+    gitRefs?: RuntimeFailure;
   };
 }
 
@@ -222,6 +231,29 @@ export default function ProjectConsoleView({
     }
   };
 
+  const handleSelectRef = async (project: ProjectListItem, selectedRef: string) => {
+    const ref = selectedRef.trim();
+    if (!ref) return;
+    const key = actionKey(project.project_id, "ref");
+    setActionState({ key, label: "Saving ref" });
+    setNotice({ kind: "info", message: `Saving ref for ${project.project_id}...` });
+    try {
+      const result = await api.selectGitRefFor(project.project_id, {
+        selected_ref: ref,
+        actor: "dashboard",
+      });
+      setNotice({
+        kind: "success",
+        message: `Selected ${result.selected_ref || ref} for ${project.project_id}`,
+      });
+      await refreshRuntime();
+    } catch (error) {
+      setNotice({ kind: "error", message: `Select ref failed: ${errorMessage(error)}` });
+    } finally {
+      setActionState(null);
+    }
+  };
+
   return (
     <div className="view project-console">
       <div className="view-head">
@@ -281,6 +313,7 @@ export default function ProjectConsoleView({
             <thead>
               <tr>
                 <th>Project</th>
+                <th style={{ width: 170 }}>Ref</th>
                 <th style={{ width: 150 }}>Graph</th>
                 <th style={{ width: 170 }}>Snapshot</th>
                 <th style={{ width: 150 }}>Scale</th>
@@ -306,12 +339,13 @@ export default function ProjectConsoleView({
                     onOpenAiConfig={onOpenAiConfig}
                     onBuildGraph={() => handleBuildGraph(project)}
                     onUpdateGraph={() => handleUpdateGraph(project, row)}
+                    onSelectRef={(selectedRef) => handleSelectRef(project, selectedRef)}
                   />
                 );
               })}
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="empty" style={{ padding: 16 }}>
+                  <td colSpan={9} className="empty" style={{ padding: 16 }}>
                     No registered projects.
                   </td>
                 </tr>
@@ -334,6 +368,7 @@ function ProjectRow({
   onOpenAiConfig,
   onBuildGraph,
   onUpdateGraph,
+  onSelectRef,
 }: {
   project: ProjectListItem;
   runtime?: ProjectRuntime;
@@ -344,6 +379,7 @@ function ProjectRow({
   onOpenAiConfig(): void;
   onBuildGraph(): void;
   onUpdateGraph(): void;
+  onSelectRef(selectedRef: string): void;
 }) {
   const summary = runtime?.summary;
   const ops = runtime?.ops;
@@ -363,6 +399,14 @@ function ProjectRow({
         <div className="project-console-sub">
           {project.status || (project.initialized ? "initialized" : "registered")}
         </div>
+      </td>
+      <td>
+        <ProjectRefControl
+          project={project}
+          refs={runtime?.gitRefs}
+          disabled={actionBusy}
+          onSelect={onSelectRef}
+        />
       </td>
       <td>
         <span className={`status-badge ${lifecycle.className}`}>{lifecycle.label}</span>
@@ -455,6 +499,52 @@ function MetricLine({ label, value }: { label: string; value?: number }) {
   );
 }
 
+function ProjectRefControl({
+  project,
+  refs,
+  disabled,
+  onSelect,
+}: {
+  project: ProjectListItem;
+  refs?: ProjectGitRefsResponse;
+  disabled: boolean;
+  onSelect(selectedRef: string): void;
+}) {
+  const selected = refs?.selected_ref || project.selected_ref || refs?.current_branch || "";
+  const branches = refs?.branches ?? [];
+  const options = Array.from(new Set([selected, refs?.current_branch, ...branches].filter(Boolean) as string[]));
+  const head = shortCommit(refs?.head_commit || "");
+
+  if (!refs?.is_git_repo) {
+    return (
+      <div>
+        <div className="project-console-sub">no git refs</div>
+        <div className="project-console-sub mono">{project.selected_ref || "—"}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="project-ref-control">
+      <select
+        value={selected}
+        disabled={disabled || options.length === 0}
+        onChange={(event) => onSelect(event.target.value)}
+        title="Select project ref for dashboard graph actions"
+      >
+        {options.map((ref) => (
+          <option key={ref} value={ref}>
+            {ref}
+          </option>
+        ))}
+      </select>
+      <div className="project-console-sub mono">
+        {refs.current_branch ? `worktree ${refs.current_branch}` : head}
+      </div>
+    </div>
+  );
+}
+
 function Kpi({
   label,
   value,
@@ -479,17 +569,19 @@ async function loadProjectRuntime(projects: ProjectListItem[], signal: AbortSign
 
 async function loadOneProjectRuntime(project: ProjectListItem, signal: AbortSignal): Promise<ProjectRuntime> {
   const projectId = project.project_id;
-  const [status, summary, ops, backlog, aiConfig, config] = await Promise.allSettled([
+  const [status, summary, ops, backlog, aiConfig, config, gitRefs] = await Promise.allSettled([
     api.statusFor(projectId, signal),
     api.activeSummaryFor(projectId, signal),
     api.operationsQueueFor(projectId, signal),
     api.backlogFor(projectId, signal),
     api.aiConfigFor(projectId, signal),
     api.projectConfigFor(projectId, signal),
+    api.gitRefsFor(projectId, signal),
   ]);
   const statusError = failure(status);
   const summaryError = failure(summary);
   const configError = failure(config);
+  const gitRefsError = failure(gitRefs);
   return {
     projectId,
     status: settledValue(status),
@@ -498,11 +590,13 @@ async function loadOneProjectRuntime(project: ProjectListItem, signal: AbortSign
     backlog: settledValue(backlog),
     aiConfig: settledValue(aiConfig),
     config: settledValue(config),
+    gitRefs: settledValue(gitRefs),
     error: firstError(statusError, summaryError),
     errors: {
       status: statusError,
       summary: summaryError,
       config: configError,
+      gitRefs: gitRefsError,
     },
   };
 }
@@ -625,7 +719,7 @@ function targetCommitFor(runtime?: ProjectRuntime): string {
   return pending?.commit_sha || pending?.target_commit_sha || runtime?.status?.graph_snapshot_commit || "";
 }
 
-function actionKey(projectId: string, action: "build" | "update"): string {
+function actionKey(projectId: string, action: "build" | "update" | "ref"): string {
   return `${action}:${projectId}`;
 }
 

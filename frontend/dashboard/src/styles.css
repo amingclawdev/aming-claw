@@ -1070,6 +1070,31 @@ a:hover { text-decoration: underline; }
   font-size: 10.5px;
 }
 
+.project-ref-control {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.project-ref-control select {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--ink-200);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: #fff;
+  color: var(--ink-800);
+  font: inherit;
+  font-size: 11px;
+}
+
+.project-ref-control select:focus {
+  outline: 2px solid rgba(79, 70, 229, 0.16);
+  border-color: var(--indigo);
+}
+
 /* ---------- Operations queue KPI strip ---------- */
 /* Compact replacement for the old "By type" + "Status" stacked .score-card
    grids. Four (or so) cells in a single row, neutral by default, accent
@@ -3585,11 +3610,28 @@ svg.graph-svg path.ghit:hover {
   border-top: 1px solid var(--ink-100);
   min-width: 0;
 }
+.config-row-editable {
+  grid-template-columns: 92px minmax(100px, 0.8fr) minmax(150px, 1.2fr) minmax(0, 1fr);
+  align-items: center;
+}
 .config-row:first-child { border-top: 0; }
 .config-row span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.config-row input {
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--ink-200);
+  border-radius: 6px;
+  padding: 0 8px;
+  font: inherit;
+  color: var(--ink-800);
+}
+.config-row input:focus {
+  outline: 2px solid rgba(79, 70, 229, 0.16);
+  border-color: var(--indigo);
 }
 .config-row-head {
   background: var(--ink-50);
@@ -3616,6 +3658,22 @@ svg.graph-svg path.ghit:hover {
   background: #fffbeb;
   color: #92400e;
   font-size: 11px;
+}
+.config-warning.success {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+}
+.config-warning.error {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+.config-dialog-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 /* Multi-select header bar: toggle + count badge + batch enrich button. */

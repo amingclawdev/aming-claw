@@ -102,6 +102,15 @@ export const api = {
   aiConfigFor(projectId: string, signal?: AbortSignal) {
     return getJSON<AiConfigResponse>(`/api/projects/${pidFor(projectId)}/ai-config`, signal);
   },
+  updateAiConfigFor(projectId: string, payload: AiConfigUpdatePayload, signal?: AbortSignal) {
+    return postJSON<AiConfigResponse>(`/api/projects/${pidFor(projectId)}/ai-config`, payload, signal);
+  },
+  gitRefsFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<ProjectGitRefsResponse>(`/api/projects/${pidFor(projectId)}/git-refs`, signal);
+  },
+  selectGitRefFor(projectId: string, payload: ProjectGitRefSelectPayload, signal?: AbortSignal) {
+    return postJSON<ProjectGitRefsResponse>(`/api/projects/${pidFor(projectId)}/git-ref`, payload, signal);
+  },
   status(signal?: AbortSignal) {
     return getJSON<StatusResponse>(`/api/graph-governance/${pid()}/status`, signal);
   },
@@ -498,6 +507,8 @@ export interface ProjectListItem {
   initialized?: boolean;
   node_count?: number;
   active_snapshot_id?: string;
+  selected_ref?: string;
+  selected_ref_updated_at?: string;
   created_at?: string;
 }
 
@@ -562,6 +573,7 @@ export interface AiConfigResponse {
   project_id: string;
   workspace_path?: string;
   read_only?: boolean;
+  write_supported?: boolean;
   project_config?: ProjectConfigResponse;
   role_routing?: Record<string, { provider?: string; model?: string; source?: string }>;
   semantic?: {
@@ -575,6 +587,28 @@ export interface AiConfigResponse {
   pipeline_error?: string;
   semantic_error?: string;
   project_config_error?: string;
+}
+
+export interface AiConfigUpdatePayload {
+  routing: Record<string, { provider?: string; model?: string }>;
+  actor?: string;
+}
+
+export interface ProjectGitRefsResponse {
+  ok?: boolean;
+  project_id: string;
+  workspace_path?: string;
+  is_git_repo?: boolean;
+  selected_ref?: string;
+  current_branch?: string;
+  head_commit?: string;
+  branches?: string[];
+  tags?: string[];
+}
+
+export interface ProjectGitRefSelectPayload {
+  selected_ref: string;
+  actor?: string;
 }
 
 export interface SemanticJobPayload {

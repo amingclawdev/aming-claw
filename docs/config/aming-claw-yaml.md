@@ -83,9 +83,25 @@ ai:
 ```
 
 Dashboard reads this block through `GET /api/projects/{project_id}/config` and
-`GET /api/projects/{project_id}/ai-config`. Execution still applies the
-existing runtime routing stack until the write/update API is promoted from
-read-only.
+`GET /api/projects/{project_id}/ai-config`. Operators can update only this
+block through `POST /api/projects/{project_id}/ai-config` with a `routing`
+object; the backend writes it back to `.aming-claw.yaml` / `.aming-claw.json`
+and leaves other config sections intact. Execution still applies the existing
+runtime routing stack until role launchers consume the project-level routing
+directly.
+
+## Dashboard Branch / Ref Selection
+
+```http
+GET  /api/projects/{project_id}/git-refs
+POST /api/projects/{project_id}/git-ref
+```
+
+The ref selector is dashboard metadata for graph operations. `POST /git-ref`
+validates that the requested branch/ref resolves to a commit and persists it in
+the project registry as `selected_ref`; it does not run `git checkout`.
+Branch-aware graph history and semantic projection rules are separate schema
+work.
 
 ## Complete Example
 

@@ -897,6 +897,7 @@ export default function App() {
         <AiConfigDialog
           config={aiConfig}
           projectId={currentProjectId}
+          onSaved={(next) => setAiConfig(next)}
           onClose={() => setAiConfigOpen(false)}
         />
       ) : null}
@@ -946,10 +947,12 @@ function countOpenBacklog(backlog?: BacklogResponse): number {
 function AiConfigDialog({
   config,
   projectId,
+  onSaved,
   onClose,
 }: {
   config: AiConfigResponse | null;
   projectId: string;
+  onSaved(config: AiConfigResponse): void;
   onClose(): void;
 }) {
   const projectRouting = config?.project_config?.ai?.routing ?? {};
@@ -965,6 +968,58 @@ function AiConfigDialog({
       "semantic",
     ]),
   );
+  const [draft, setDraft] = useState<Record<string, { provider: string; model: string }>>({});
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+
+  useEffect(() => {
+    setDraft(
+      Object.fromEntries(
+        roles.map((role) => [
+          role,
+          {
+            provider: projectRouting[role]?.provider ?? "",
+            model: projectRouting[role]?.model ?? "",
+          },
+        ]),
+      ),
+    );
+  }, [config?.project_id, roles.join("\u0000")]);
+
+  const updateDraft = (role: string, field: "provider" | "model", value: string) => {
+    setDraft((current) => ({
+      ...current,
+      [role]: {
+        provider: current[role]?.provider ?? "",
+        model: current[role]?.model ?? "",
+        [field]: value,
+      },
+    }));
+  };
+
+  const saveRouting = async () => {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const routing = Object.fromEntries(
+        roles.map((role) => [
+          role,
+          {
+            provider: (draft[role]?.provider ?? "").trim(),
+            model: (draft[role]?.model ?? "").trim(),
+          },
+        ]),
+      );
+      const next = await api.updateAiConfigFor(projectId, { routing, actor: "dashboard" });
+      onSaved(next);
+      setMessage({ kind: "success", text: "Saved AI routing." });
+    } catch (error) {
+      const msg = error instanceof ApiError ? `${error.message}${error.body ? ` ${error.body}` : ""}` : String(error);
+      setMessage({ kind: "error", text: `Save failed: ${msg}` });
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="AI configuration">
@@ -981,23 +1036,41 @@ function AiConfigDialog({
         <div className="config-section">
           <div className="config-section-title">Project routing</div>
           <div className="config-table">
-            <div className="config-row config-row-head">
+            <div className="config-row config-row-head config-row-editable">
               <span>Role</span>
-              <span>Configured</span>
+              <span>Provider</span>
+              <span>Model</span>
               <span>Effective</span>
             </div>
             {roles.map((role) => {
-              const configured = projectRouting[role];
               const effective = role === "semantic" ? config?.semantic : roleRouting[role];
               return (
-                <div className="config-row" key={role}>
+                <div className="config-row config-row-editable" key={role}>
                   <span className="mono">{role}</span>
-                  <span>{fmtRoute(configured)}</span>
+                  <input
+                    value={draft[role]?.provider ?? ""}
+                    onChange={(event) => updateDraft(role, "provider", event.target.value)}
+                    placeholder="provider"
+                  />
+                  <input
+                    value={draft[role]?.model ?? ""}
+                    onChange={(event) => updateDraft(role, "model", event.target.value)}
+                    placeholder="model"
+                  />
                   <span>{fmtRoute(effective)}</span>
                 </div>
               );
             })}
           </div>
+          <div className="config-dialog-actions">
+            <button className="action-btn action-btn-primary" disabled={saving || !config} onClick={saveRouting}>
+              {saving ? "Saving..." : "Save routing"}
+            </button>
+            <span className="config-dialog-sub">
+              {config?.write_supported === false ? "write disabled" : "writes .aming-claw.yaml"}
+            </span>
+          </div>
+          {message ? <div className={`config-warning ${message.kind}`}>{message.text}</div> : null}
         </div>
         <div className="config-section">
           <div className="config-section-title">Semantic worker</div>

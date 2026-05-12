@@ -575,6 +575,65 @@ def handle_projects_list(ctx: RequestContext):
     return {"ok": True, "projects": project_service.list_projects()}
 
 
+@route("GET", "/api/projects/{project_id}/git-refs")
+def handle_project_git_refs(ctx: RequestContext):
+    """Return current git branch/ref information for a registered project."""
+    project_id = ctx.get_project_id()
+    try:
+        root = _graph_governance_project_root(project_id, {})
+    except Exception as exc:
+        return 404, {"error": f"project root not found: {exc}"}
+    refs = _git_refs_for_root(root)
+    project = project_service.get_project(project_id) or {}
+    selected_ref = str(project.get("selected_ref") or "").strip()
+    if not selected_ref:
+        selected_ref = refs.get("current_branch") or refs.get("head_commit") or ""
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "workspace_path": str(root),
+        "selected_ref": selected_ref,
+        **refs,
+    }
+
+
+@route("POST", "/api/projects/{project_id}/git-ref")
+def handle_project_git_ref_select(ctx: RequestContext):
+    """Persist the dashboard-selected branch/ref without checking it out."""
+    project_id = ctx.get_project_id()
+    selected_ref = str(
+        ctx.body.get("selected_ref")
+        or ctx.body.get("ref")
+        or ctx.body.get("branch")
+        or ""
+    ).strip()
+    if not selected_ref:
+        return 400, {"error": "selected_ref is required"}
+    try:
+        root = _graph_governance_project_root(project_id, {})
+    except Exception as exc:
+        return 404, {"error": f"project root not found: {exc}"}
+    if not _git_ref_exists(root, selected_ref):
+        return 400, {"error": f"unknown git ref: {selected_ref}"}
+    project = project_service.update_project_metadata(
+        project_id,
+        {
+            "selected_ref": selected_ref,
+            "selected_ref_updated_at": _utc_now(),
+            "selected_ref_updated_by": str(ctx.body.get("actor") or "dashboard"),
+        },
+    )
+    refs = _git_refs_for_root(root)
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "workspace_path": str(root),
+        "selected_ref": project.get("selected_ref", selected_ref),
+        "project": project,
+        **refs,
+    }
+
+
 @route("POST", "/api/projects/register")
 def handle_project_register(ctx: RequestContext):
     """Register a project workspace with config validation.
@@ -704,7 +763,7 @@ def handle_project_config(ctx: RequestContext):
 
 @route("GET", "/api/projects/{project_id}/ai-config")
 def handle_project_ai_config(ctx: RequestContext):
-    """Return read-only AI/model routing config for dashboard operators."""
+    """Return AI/model routing config for dashboard operators."""
     import sys as _sys
     _agent_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)))
     if _agent_dir not in _sys.path:
@@ -803,8 +862,40 @@ def handle_project_ai_config(ctx: RequestContext):
         "role_config_error": role_config_error,
         "semantic": semantic,
         "semantic_error": semantic_error,
-        "read_only": True,
+        "read_only": False,
+        "write_supported": True,
     }
+
+
+@route("POST", "/api/projects/{project_id}/ai-config")
+def handle_project_ai_config_update(ctx: RequestContext):
+    """Update project-level ai.routing in .aming-claw.yaml/.json."""
+    project_id = ctx.get_project_id()
+    routing = ctx.body.get("routing")
+    if not isinstance(routing, dict):
+        return 400, {"error": "routing object is required"}
+    try:
+        root = _graph_governance_project_root(project_id, {})
+    except Exception as exc:
+        return 404, {"error": f"project root not found: {exc}"}
+    try:
+        from project_config import update_project_ai_routing
+
+        cfg = update_project_ai_routing(root, routing)
+    except Exception as exc:
+        return 400, {"error": f"ai config update failed: {exc}"}
+    if cfg.project_id != project_id:
+        return 409, {
+            "error": f"config project_id {cfg.project_id!r} does not match route project_id {project_id!r}"
+        }
+    payload = handle_project_ai_config(ctx)
+    if isinstance(payload, tuple):
+        return payload
+    payload["ok"] = True
+    payload["updated"] = True
+    payload["read_only"] = False
+    payload["write_supported"] = True
+    return payload
 
 
 @route("POST", "/api/projects/{project_id}/explain")
@@ -2544,6 +2635,51 @@ def _git_head_commit(project_root: Path) -> str:
     except Exception:
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_output(project_root: Path, args: list[str], *, timeout: int = 5) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=project_root,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_refs_for_root(project_root: Path) -> dict[str, Any]:
+    """Return a small read-only git ref summary for dashboard project rows."""
+    head_commit = _git_output(project_root, ["rev-parse", "HEAD"])
+    current_branch = _git_output(project_root, ["branch", "--show-current"])
+    branch_raw = _git_output(
+        project_root,
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    branches = sorted({line.strip() for line in branch_raw.splitlines() if line.strip()})
+    tag_raw = _git_output(
+        project_root,
+        ["for-each-ref", "--format=%(refname:short)", "refs/tags"],
+    )
+    tags = sorted({line.strip() for line in tag_raw.splitlines() if line.strip()})
+    return {
+        "head_commit": head_commit,
+        "current_branch": current_branch,
+        "branches": branches,
+        "tags": tags,
+        "is_git_repo": bool(head_commit),
+    }
+
+
+def _git_ref_exists(project_root: Path, ref_name: str) -> bool:
+    ref_name = str(ref_name or "").strip()
+    if not ref_name:
+        return False
+    resolved = _git_output(project_root, ["rev-parse", "--verify", f"{ref_name}^{{commit}}"])
+    return bool(resolved)
 
 
 def _git_changed_paths_between(project_root: Path, base_commit: str, target_commit: str, *, limit: int | None = 25) -> list[str]:

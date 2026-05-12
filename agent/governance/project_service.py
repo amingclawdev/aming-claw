@@ -301,6 +301,25 @@ def list_projects() -> list[dict]:
     return result
 
 
+def update_project_metadata(project_id: str, updates: dict) -> dict:
+    """Persist small dashboard/project metadata fields in projects.json."""
+    project_id = _normalize_project_id(project_id)
+    projects = _load_projects()
+    entry = projects["projects"].get(project_id)
+    if not entry:
+        raise ValidationError(f"Project {project_id!r} not registered")
+    allowed = {
+        "selected_ref",
+        "selected_ref_updated_at",
+        "selected_ref_updated_by",
+    }
+    for key, value in (updates or {}).items():
+        if key in allowed:
+            entry[key] = value
+    _save_projects(projects)
+    return {k: v for k, v in entry.items() if k != "password_hash"}
+
+
 def project_exists(project_id: str) -> bool:
     return get_project(project_id) is not None
 

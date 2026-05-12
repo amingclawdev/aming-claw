@@ -305,6 +305,27 @@ def _try_load_json(path: Path) -> dict:
         return json.load(fh)
 
 
+def _write_yaml(path: Path, raw: dict) -> None:
+    """Persist YAML using PyYAML when available.
+
+    The dashboard only edits structured config blocks. Full comment-preserving
+    round-tripping would need ruamel.yaml, which is intentionally not a runtime
+    dependency here.
+    """
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError as exc:
+        raise RuntimeError("pyyaml is required to update .aming-claw.yaml") from exc
+    with path.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True)
+
+
+def _write_json(path: Path, raw: dict) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(raw, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+
+
 # ---------------------------------------------------------------------------
 # Raw dict → dataclass conversion
 # ---------------------------------------------------------------------------
@@ -525,6 +546,49 @@ def _routing_map(raw: Any) -> Dict[str, Dict[str, str]]:
         if entry["provider"] or entry["model"]:
             out[role_key] = entry
     return out
+
+
+def update_project_ai_routing(
+    workspace_path: Path,
+    routing: Dict[str, Dict[str, str]],
+) -> ProjectConfig:
+    """Update ``ai.routing`` in a project's local config file and reload it.
+
+    Empty provider/model pairs remove the role override. Other top-level config
+    blocks are preserved as raw YAML/JSON data.
+    """
+    workspace_path = Path(workspace_path)
+    config_file = _find_config_file(workspace_path)
+    if not config_file:
+        raise FileNotFoundError(
+            f"No .aming-claw.yaml or .aming-claw.json found at {workspace_path}"
+        )
+    if config_file.suffix == ".json":
+        raw = _try_load_json(config_file)
+    else:
+        raw = _try_load_yaml(config_file)
+    if not isinstance(raw, dict):
+        raw = {}
+
+    next_routing = _routing_map(routing)
+    ai_raw = raw.get("ai")
+    if not isinstance(ai_raw, dict):
+        ai_raw = {}
+    ai_raw["routing"] = next_routing
+    raw["ai"] = ai_raw
+
+    is_valid, messages = validate_project_config(raw)
+    if not is_valid:
+        raise ValueError(
+            "Invalid project config after ai.routing update: "
+            + "; ".join(m for m in messages if not m.startswith("Unknown"))
+        )
+
+    if config_file.suffix == ".json":
+        _write_json(config_file, raw)
+    else:
+        _write_yaml(config_file, raw)
+    return load_project_config(workspace_path)
 
 
 def effective_graph_exclude_roots(config: ProjectConfig) -> List[str]:
