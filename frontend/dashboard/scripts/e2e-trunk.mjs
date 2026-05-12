@@ -28,7 +28,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { exit } from "node:process";
+import { exit, platform } from "node:process";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -198,6 +198,13 @@ function command(cmd, args, cwd, options = {}) {
 
 function git(args, cwd = WORKSPACE, options = {}) {
   return command("git", args, cwd, options);
+}
+
+function npmCommand(args, cwd, options = {}) {
+  if (platform === "win32") {
+    return command("cmd.exe", ["/d", "/s", "/c", ["npm", ...args].join(" ")], cwd, options);
+  }
+  return command("npm", args, cwd, options);
 }
 
 function trimTrailingSlash(value) {
@@ -860,7 +867,7 @@ async function loadRuntimeBundle(projectId) {
 async function stepEnvGate() {
   if (BUILD_DASHBOARD) {
     const dashboardDir = path.join(REPO_ROOT, "frontend", "dashboard");
-    command("npm", ["run", "build"], dashboardDir);
+    npmCommand(["run", "build"], dashboardDir);
   }
   const health = await http("GET", "/api/health");
   const projects = await http("GET", "/api/projects");
