@@ -427,6 +427,41 @@ def test_js_ts_adapter_edges_api_relations_tests_config_and_ignores(tmp_path):
         "interface",
     ) in api_relations
 
+    candidate = build_rebase_candidate_graph(
+        str(project),
+        result,
+        session_id="session-js-ts-api-test",
+        run_id=result["run_id"],
+    )
+    graph = candidate["deps_graph"]
+    by_title = {node["title"]: node for node in graph["nodes"]}
+    assert by_title["Interface Contracts"]["layer"] == "L3"
+    endpoint_assets = {
+        node["title"]: node
+        for node in graph["nodes"]
+        if node.get("layer") == "L4"
+        and (node.get("metadata") or {}).get("kind") == "interface"
+    }
+    assert "/api/graph-governance/aming-claw/status" in endpoint_assets
+    assert "/api/graph-governance/aming-claw/query" in endpoint_assets
+
+    api_client_id = by_title["web.src.api.client"]["id"]
+    app_id = by_title["web.src.App"]["id"]
+    status_id = endpoint_assets["/api/graph-governance/aming-claw/status"]["id"]
+    query_id = endpoint_assets["/api/graph-governance/aming-claw/query"]["id"]
+    assert any(
+        link["source"] == api_client_id
+        and link["target"] == status_id
+        and link["type"] == "calls_api"
+        for link in graph["links"]
+    )
+    assert any(
+        link["source"] == app_id
+        and link["target"] == query_id
+        and link["type"] == "calls_api"
+        for link in graph["links"]
+    )
+
     rows = {row["path"]: row for row in result["file_inventory"]}
     assert rows["web/src/App.test.tsx"]["file_kind"] == "test"
     assert rows["web/package.json"]["file_kind"] == "config"

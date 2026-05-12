@@ -2051,7 +2051,7 @@ def build_architecture_graph(
             "artifact": ("artifact_assets", "Artifact Assets"),
             "config": ("config_assets", "Config Assets"),
             "event": ("contract_assets", "Contract Assets"),
-            "interface": ("contract_assets", "Contract Assets"),
+            "interface": ("interface_contracts", "Interface Contracts"),
             "task": ("contract_assets", "Contract Assets"),
             "task_metadata": ("contract_assets", "Contract Assets"),
         }
@@ -2091,6 +2091,8 @@ def build_architecture_graph(
         if target_kind == "event":
             return "event:__event_contracts", "Event Contracts", True
         if target_kind == "interface":
+            if "/api/" in lower:
+                return f"interface:{target}", target, False
             return "interface:__interface_contracts", "Interface Contracts", True
         if target_kind == "task":
             return "task:__task_contracts", "Task Contracts", True
