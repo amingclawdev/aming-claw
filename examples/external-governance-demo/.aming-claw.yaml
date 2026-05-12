@@ -5,12 +5,14 @@ language: mixed
 
 testing:
   unit_command: "python -m pytest tests -q"
-  e2e_command: "node tests/smoke.test.mjs"
+  e2e_command: "npm test"
   allowed_commands:
     - executable: "python"
       args_prefixes: ["-m pytest"]
     - executable: "node"
-      args_prefixes: ["tests/smoke.test.mjs"]
+      args_prefixes: ["tests/smoke.test.mjs", "tests/widget.test.mjs"]
+    - executable: "npm"
+      args_prefixes: ["test", "run smoke"]
 
 governance:
   enabled: true
@@ -21,10 +23,14 @@ graph:
     - "node_modules"
     - "dist"
     - "coverage"
+    - ".pytest_cache"
+    - "__pycache__"
   ignore_globs:
     - "**/node_modules/**"
     - "**/dist/**"
     - "**/coverage/**"
+    - "**/.pytest_cache/**"
+    - "**/__pycache__/**"
   nested_projects:
     mode: "exclude"
     roots: []

@@ -1,0 +1,18 @@
+{
+  "contract": "quote.v1",
+  "tax_rates": {
+    "CA-ON": 0.13,
+    "US-NY": 0.08875,
+    "DEFAULT": 0.1
+  },
+  "discount_rates": {
+    "standard": 0,
+    "member": 0.05,
+    "enterprise": 0.15
+  },
+  "shipping": {
+    "free_quantity_threshold": 5,
+    "base_fee": 7.5
+  },
+  "review_flags": ["requires_hazmat_review", "invalid_price"]
+}

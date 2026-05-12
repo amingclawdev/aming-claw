@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quote.v1",
+  "title": "Quote Request",
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "customer_tier": {
+      "type": "string",
+      "enum": ["standard", "member", "enterprise"],
+      "default": "standard"
+    },
+    "region": {
+      "type": "string",
+      "default": "CA-ON"
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["sku", "price"],
+        "properties": {
+          "sku": { "type": "string" },
+          "price": { "type": "number", "minimum": 0 },
+          "quantity": { "type": "integer", "minimum": 1, "default": 1 },
+          "hazmat": { "type": "boolean", "default": false }
+        }
+      }
+    }
+  }
+}

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "smoke": "node tests/smoke.test.mjs",
-    "test": "node tests/smoke.test.mjs"
+    "smoke": "node tests/smoke.test.mjs && node tests/widget.test.mjs",
+    "test": "node tests/smoke.test.mjs && node tests/widget.test.mjs"
   }
 }
