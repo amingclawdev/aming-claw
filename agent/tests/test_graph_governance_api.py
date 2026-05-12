@@ -469,6 +469,50 @@ def test_graph_governance_snapshot_nodes_normalize_pending_review_overlay(conn):
     assert semantic["has_semantic_payload"] is True
 
 
+def test_graph_governance_snapshot_nodes_do_not_treat_completed_job_as_semantic(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-job-only-overlay",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           feedback_round, batch_index, attempt_count, updated_at, created_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', 'sha256:job-only',
+                '{"agent/governance/server.py":"sha256:file"}', 2, 7, 1,
+                '2026-05-09T20:31:24Z', '2026-05-09T20:00:00Z')
+        """,
+        (PID, snapshot["snapshot_id"]),
+    )
+    conn.commit()
+
+    nodes = server.handle_graph_governance_snapshot_nodes(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+
+    semantic = nodes["nodes"][0]["semantic"]
+    assert semantic["status"] == "structure_only"
+    assert semantic["node_status"] == ""
+    assert semantic["job_status"] == "ai_complete"
+    assert semantic["feature_hash"] == ""
+    assert semantic["hash_state"] == "unknown"
+    assert semantic["has_semantic_payload"] is False
+    assert semantic["job"]["feature_hash"] == "sha256:job-only"
+
+
 def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         server,

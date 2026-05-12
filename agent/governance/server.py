@@ -5020,6 +5020,147 @@ def _accept_semantic_enrichment_for_feedback_items(
     }
 
 
+def _reject_semantic_enrichment_for_feedback_items(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    feedback_ids: list[str],
+    *,
+    actor: str = "observer",
+) -> dict[str, Any]:
+    """Reject worker-produced semantic proposals linked to feedback items.
+
+    Feedback review state alone is not enough: pending semantic rows are
+    serialized by the node API, and proposed graph events can be backfilled
+    into future projections. Rejecting the review must therefore also reject
+    linked semantic events and clear the pending persistent cache row.
+    """
+    from . import graph_events
+    from . import reconcile_feedback
+
+    items = reconcile_feedback.list_feedback_items(project_id, snapshot_id)
+    by_id = {str(item.get("feedback_id") or ""): item for item in items}
+    node_ids_cleared: list[str] = []
+    edge_ids_cleared: list[str] = []
+    event_ids_rejected: list[str] = []
+    job_ids_marked_rejected: list[str] = []
+    errors: list[dict[str, Any]] = []
+    semantic_event_types = {"semantic_node_enriched", "edge_semantic_enriched"}
+    for fid in feedback_ids:
+        item = by_id.get(fid)
+        if not item:
+            errors.append({"feedback_id": fid, "error": "feedback_not_found"})
+            continue
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        raw_issue = evidence.get("raw_issue") if isinstance(evidence.get("raw_issue"), dict) else {}
+        worker_evidence = (
+            raw_issue.get("evidence") if isinstance(raw_issue.get("evidence"), dict) else {}
+        )
+        target_type_hint = str(
+            item.get("target_type")
+            or raw_issue.get("target_type")
+            or ""
+        ).strip().lower()
+        target_id = (
+            str(item.get("target_id") or "").strip()
+            or str(worker_evidence.get("node_id") or "").strip()
+            or str(worker_evidence.get("edge_id") or "").strip()
+            or str(evidence.get("node_id") or "").strip()
+        )
+        event_ids = (
+            worker_evidence.get("linked_event_ids")
+            or evidence.get("linked_event_ids")
+            or []
+        )
+        if not isinstance(event_ids, list):
+            event_ids = [event_ids]
+        linked_events: list[dict[str, Any]] = []
+        for eid in event_ids:
+            eid_s = str(eid or "").strip()
+            if not eid_s:
+                continue
+            try:
+                event = graph_events.get_event(conn, project_id, snapshot_id, eid_s)
+                if not event:
+                    errors.append({"feedback_id": fid, "event_id": eid_s, "error": "event_not_found"})
+                    continue
+                if str(event.get("event_type") or "") not in semantic_event_types:
+                    continue
+                updated = graph_events.update_event_status(
+                    conn, project_id, snapshot_id, eid_s,
+                    status=graph_events.EVENT_STATUS_REJECTED,
+                    actor=actor,
+                    evidence={
+                        "source": "reject_semantic_enrichment",
+                        "feedback_id": fid,
+                        "target_type": target_type_hint or str(event.get("target_type") or ""),
+                    },
+                )
+                linked_events.append(updated)
+                event_ids_rejected.append(eid_s)
+            except Exception as exc:  # noqa: BLE001 - advisory
+                errors.append({"feedback_id": fid, "event_id": eid_s, "error": str(exc)})
+
+        node_event = next(
+            (ev for ev in linked_events if str(ev.get("event_type") or "") == "semantic_node_enriched"),
+            None,
+        )
+        edge_event = next(
+            (ev for ev in linked_events if str(ev.get("event_type") or "") == "edge_semantic_enriched"),
+            None,
+        )
+        if node_event:
+            node_id = target_id or str(node_event.get("target_id") or "")
+            feature_hash = str(node_event.get("feature_hash") or "")
+            if node_id:
+                cur = conn.execute(
+                    """
+                    DELETE FROM graph_semantic_nodes
+                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                      AND status = 'pending_review'
+                      AND (? = '' OR feature_hash = ?)
+                    """,
+                    (project_id, snapshot_id, node_id, feature_hash, feature_hash),
+                )
+                if cur.rowcount > 0:
+                    node_ids_cleared.append(node_id)
+                job_cur = conn.execute(
+                    """
+                    UPDATE graph_semantic_jobs
+                    SET status = 'rejected', worker_id = '', claim_id = '',
+                        claimed_at = '', lease_expires_at = '', updated_at = ?
+                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                      AND status IN ('pending_ai', 'ai_pending', 'running', 'ai_running', 'ai_complete')
+                    """,
+                    (_utc_now(), project_id, snapshot_id, node_id),
+                )
+                if job_cur.rowcount > 0:
+                    job_ids_marked_rejected.append(node_id)
+        elif edge_event:
+            edge_id = target_id or str(edge_event.get("target_id") or "")
+            edge_hash = str(edge_event.get("feature_hash") or "")
+            if edge_id:
+                cur = conn.execute(
+                    """
+                    DELETE FROM graph_semantic_edges
+                    WHERE project_id = ? AND snapshot_id = ? AND edge_id = ?
+                      AND status = 'pending_review'
+                      AND (? = '' OR edge_signature_hash = ?)
+                    """,
+                    (project_id, snapshot_id, edge_id, edge_hash, edge_hash),
+                )
+                if cur.rowcount > 0:
+                    edge_ids_cleared.append(edge_id)
+    conn.commit()
+    return {
+        "node_ids_cleared": node_ids_cleared,
+        "edge_ids_cleared": edge_ids_cleared,
+        "event_ids_rejected": event_ids_rejected,
+        "job_ids_marked_rejected": job_ids_marked_rejected,
+        "errors": errors,
+    }
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/decision")
 def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
     """Apply explicit user/observer decisions to feedback items."""
@@ -5099,6 +5240,30 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
                 )
                 result["semantic_enrichment_accepted"] = accepted
                 if accepted.get("event_ids_flipped"):
+                    try:
+                        graph_events.build_semantic_projection(
+                            conn, project_id, snapshot_id,
+                            actor=str(body.get("actor") or "observer"),
+                        )
+                        result["projection_rebuilt"] = True
+                    except Exception as exc:  # noqa: BLE001 - advisory
+                        result["projection_rebuilt"] = False
+                        result["projection_rebuild_error"] = str(exc)
+            elif action == "reject_false_positive":
+                from . import graph_events
+                rejected = _reject_semantic_enrichment_for_feedback_items(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    feedback_ids,
+                    actor=str(body.get("actor") or "observer"),
+                )
+                result["semantic_enrichment_rejected"] = rejected
+                if (
+                    rejected.get("event_ids_rejected")
+                    or rejected.get("node_ids_cleared")
+                    or rejected.get("edge_ids_cleared")
+                ):
                     try:
                         graph_events.build_semantic_projection(
                             conn, project_id, snapshot_id,

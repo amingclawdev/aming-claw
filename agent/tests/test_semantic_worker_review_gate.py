@@ -355,6 +355,113 @@ def test_c_accept_helper_flips_node_status_and_event(conn):
     assert ev_row["status"] == graph_events.EVENT_STATUS_ACCEPTED
 
 
+def test_c3_reject_decision_clears_node_pending_review_payload(conn, monkeypatch):
+    """Rejecting a semantic review must retract the proposed event and cache row."""
+    snap = _create_snapshot_with_node(conn, "reject-helper")
+    sid = snap["snapshot_id"]
+    semantic._persist_semantic_state_to_db(
+        conn, PID, sid,
+        {
+            "node_semantics": {
+                "L7.1": {
+                    "status": "pending_review",
+                    "feature_hash": "sha256:reject-me",
+                    "semantic_summary": "unapproved",
+                    "feature_name": "Unapproved Feature",
+                },
+            }
+        },
+        submit_for_review=False,
+    )
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs
+          (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+           feedback_round, batch_index, attempt_count, updated_at, created_at)
+        VALUES (?, ?, 'L7.1', 'ai_complete', 'sha256:reject-me', '{}',
+                0, 0, 1, '2026-05-12T00:00:00Z', '2026-05-12T00:00:00Z')
+        """,
+        (PID, sid),
+    )
+    graph_events.backfill_existing_semantic_events(conn, PID, sid, actor="test")
+    conn.commit()
+    ev_id = conn.execute(
+        """
+        SELECT event_id FROM graph_events
+        WHERE project_id=? AND snapshot_id=? AND target_id='L7.1'
+          AND event_type='semantic_node_enriched'
+        LIMIT 1
+        """,
+        (PID, sid),
+    ).fetchone()["event_id"]
+    submitted = reconcile_feedback.submit_feedback_item(
+        PID, sid,
+        feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+        issue={
+            "issue": "AI semantic enrichment generated for L7.1 -- awaiting review",
+            "source_node_ids": ["L7.1"],
+            "target_id": "L7.1",
+            "target_type": "node",
+            "priority": "P3",
+            "evidence": {
+                "node_id": "L7.1",
+                "linked_event_ids": [ev_id],
+            },
+        },
+        actor="test",
+    )
+    feedback_id = submitted["items"][0]["feedback_id"]
+
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    ctx = server.RequestContext(
+        None,
+        "POST",
+        {"project_id": PID, "snapshot_id": sid},
+        {},
+        {
+            "feedback_id": feedback_id,
+            "action": "reject_false_positive",
+            "actor": "test",
+        },
+        "req-test",
+        "",
+        "",
+    )
+    result = server.handle_graph_governance_snapshot_feedback_decision(ctx)
+
+    assert result["ok"] is True
+    assert result["semantic_enrichment_rejected"]["node_ids_cleared"] == ["L7.1"]
+    assert result["semantic_enrichment_rejected"]["event_ids_rejected"] == [ev_id]
+    assert result["semantic_enrichment_rejected"]["job_ids_marked_rejected"] == ["L7.1"]
+    assert result["projection_rebuilt"] is True
+    row = conn.execute(
+        """
+        SELECT status FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'
+        """,
+        (PID, sid),
+    ).fetchone()
+    assert row is None
+    event = conn.execute(
+        "SELECT status FROM graph_events WHERE project_id=? AND snapshot_id=? AND event_id=?",
+        (PID, sid, ev_id),
+    ).fetchone()
+    assert event["status"] == graph_events.EVENT_STATUS_REJECTED
+    job = conn.execute(
+        "SELECT status FROM graph_semantic_jobs WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'",
+        (PID, sid),
+    ).fetchone()
+    assert job["status"] == "rejected"
+    node = store.list_graph_snapshot_nodes(conn, PID, sid, include_semantic=True, limit=10)[0]
+    assert node["semantic"]["has_semantic_payload"] is False
+    assert "feature_name" not in node["semantic"]
+
+
 def test_d_worker_register_is_idempotent_and_subscribes(monkeypatch):
     """D: register() is safe to call twice; subscribes both topics."""
     # Reset module-level state so the test is independent of import order.

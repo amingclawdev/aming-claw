@@ -371,12 +371,25 @@ def _semantic_overlay_from_node_row(row: sqlite3.Row) -> dict[str, Any]:
 
     node_status = str(_row_value(row, "semantic_status", "") or "")
     job_status = str(_row_value(row, "semantic_job_status", "") or "")
-    status = node_status or job_status or str(payload.get("status") or "structure_only")
+    job_status_norm = job_status.lower()
+    payload_status = str(payload.get("status") or "")
+    status = node_status or payload_status or "structure_only"
+    if not node_status and not payload_status and job_status_norm in {
+        "pending_ai",
+        "ai_pending",
+        "running",
+        "ai_running",
+        "ai_failed",
+        "failed",
+        "cancelled",
+        "canceled",
+        "rejected",
+    }:
+        status = job_status
     api_status = "review_pending" if status == "pending_review" else status
     feature_hash = str(
         _row_value(row, "semantic_feature_hash", "")
         or payload.get("feature_hash")
-        or _row_value(row, "semantic_job_feature_hash", "")
         or ""
     )
     updated_at = str(
