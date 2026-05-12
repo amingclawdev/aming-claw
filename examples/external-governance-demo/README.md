@@ -9,6 +9,7 @@ It intentionally includes:
 - Python package code under `src/demo_app/`
 - Python tests under `tests/`
 - TypeScript dashboard/client code under `web/`
+- JavaScript compatibility shim under `web/widget.js`
 - Contract and state assets under `contracts/` and `state/`
 - L4-style docs under `docs/l4/`
 - A local `.aming-claw.yaml` project config
@@ -16,9 +17,14 @@ It intentionally includes:
 Smoke commands:
 
 ```bash
+npm run generate
 python -m pytest tests -q
 npm test
 ```
+
+The fixture is materialized from `artifacts/l4-smoke-fixture.md`. Add future
+E2E scenarios by extending the `governance-hint` block and the fenced file
+blocks in that L4 artifact, then run `npm run generate`.
 
 Graph smoke coverage:
 
@@ -29,5 +35,7 @@ Graph smoke coverage:
 - TypeScript fan-out: `buildQuoteView` fans out to subtotal, discount, tax, and
   badge helpers.
 - TypeScript fan-in: checkout helpers and renderers reuse the quote view.
+- JavaScript support: `web/widget.js` gives the graph builder a plain JS file
+  beside the TypeScript sources.
 - L4 assets: quote schema, pricing state, and coverage docs are present so the
   dashboard can display code, docs, tests, config, and contract files together.

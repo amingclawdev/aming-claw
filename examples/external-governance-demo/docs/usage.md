@@ -23,6 +23,8 @@ Available routes:
 
 Related L4 assets:
 
+- `artifacts/l4-smoke-fixture.md` is the deployable fixture artifact with
+  governance hints and file blocks.
 - `docs/l4/quote-contract.md` explains the request and response contract.
 - `docs/l4/pricing-state.md` describes pricing state and compliance flags.
 - `docs/l4/test-coverage.md` maps smoke tests to the code paths.

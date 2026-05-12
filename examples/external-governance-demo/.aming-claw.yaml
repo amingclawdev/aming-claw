@@ -10,9 +10,9 @@ testing:
     - executable: "python"
       args_prefixes: ["-m pytest"]
     - executable: "node"
-      args_prefixes: ["tests/smoke.test.mjs", "tests/widget.test.mjs"]
+      args_prefixes: ["scripts/materialize-fixture.mjs", "tests/smoke.test.mjs", "tests/widget.test.mjs"]
     - executable: "npm"
-      args_prefixes: ["test", "run smoke"]
+      args_prefixes: ["test", "run smoke", "run generate"]
 
 governance:
   enabled: true
@@ -25,12 +25,14 @@ graph:
     - "coverage"
     - ".pytest_cache"
     - "__pycache__"
+    - ".aming-claw/e2e-artifacts"
   ignore_globs:
     - "**/node_modules/**"
     - "**/dist/**"
     - "**/coverage/**"
     - "**/.pytest_cache/**"
     - "**/__pycache__/**"
+    - "**/.aming-claw/e2e-artifacts/**"
   nested_projects:
     mode: "exclude"
     roots: []

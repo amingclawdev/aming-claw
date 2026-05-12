@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "smoke": "node tests/smoke.test.mjs && node tests/widget.test.mjs",
-    "test": "node tests/smoke.test.mjs && node tests/widget.test.mjs"
+    "generate": "node scripts/materialize-fixture.mjs",
+    "smoke": "npm run generate && node tests/smoke.test.mjs && node tests/widget.test.mjs",
+    "test": "npm run smoke"
   }
 }
