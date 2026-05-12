@@ -428,10 +428,16 @@ def bootstrap_project(
 
     try:
         # Step 3: scan_codebase + generate_graph
+        configured_excludes = list(getattr(config.governance, "exclude_roots", []) or [])
+        effective_excludes = sorted({
+            str(value).replace("\\", "/").strip().strip("/")
+            for value in ((exclude_patterns or []) + configured_excludes)
+            if str(value or "").strip()
+        })
         gen_result = generate_graph(
             str(ws),
             scan_depth=scan_depth,
-            exclude_patterns=exclude_patterns,
+            exclude_patterns=effective_excludes,
         )
         graph = gen_result["graph"]
 

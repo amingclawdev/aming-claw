@@ -227,6 +227,22 @@ class TestBackwardCompatibility:
         config = load_project_config(python_workspace)
         assert config.project_id == "test-proj"
 
+    def test_load_project_config_parses_governance_exclude_roots(self, python_workspace):
+        (python_workspace / ".aming-claw.yaml").write_text(
+            "\n".join([
+                "project_id: test-proj",
+                "language: python",
+                "governance:",
+                "  enabled: true",
+                "  exclude_roots:",
+                "    - examples",
+                "    - sandbox/demo",
+                "",
+            ])
+        )
+        config = load_project_config(python_workspace)
+        assert config.governance.exclude_roots == ["examples", "sandbox/demo"]
+
 
 class TestGraphGeneratorAC10:
     """AC10: as_posix or replace verifiable in graph_generator.py."""
@@ -249,3 +265,17 @@ class TestIdempotentBootstrap:
         assert result1["node_count"] == result2["node_count"]
         assert result1["edge_count"] == result2["edge_count"]
         assert result1["layers"] == result2["layers"]
+
+    def test_generate_graph_respects_configured_exclude_patterns(self, python_workspace):
+        examples = python_workspace / "examples" / "demo"
+        examples.mkdir(parents=True)
+        (examples / "app.py").write_text("def demo(): return 1\n")
+
+        result = generate_graph(str(python_workspace), exclude_patterns=["examples"])
+        node_files = []
+        for _node_id, node in result["graph"].G.nodes(data=True):
+            node_files.extend(node.get("primary", []) or [])
+            node_files.extend(node.get("secondary", []) or [])
+            node_files.extend(node.get("test", []) or [])
+
+        assert all(not str(path).startswith("examples/") for path in node_files)

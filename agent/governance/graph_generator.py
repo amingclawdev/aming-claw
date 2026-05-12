@@ -12,6 +12,7 @@ Layer assignment:
 """
 
 import ast
+import fnmatch
 import json
 import logging
 import os
@@ -56,6 +57,24 @@ _DEFAULT_EXCLUDE = {
 def _normalize_path(p: str) -> str:
     """Normalize path to forward slashes (posix) — AC10."""
     return p.replace("\\", "/")
+
+
+def _is_excluded(rel_path: str, name: str, excludes: Set[str]) -> bool:
+    rel = _normalize_path(rel_path).strip("/")
+    lowered_rel = rel.lower()
+    lowered_name = name.lower()
+    for raw in excludes:
+        pattern = _normalize_path(str(raw or "")).strip("/")
+        if not pattern:
+            continue
+        lowered_pattern = pattern.lower()
+        if lowered_name == lowered_pattern:
+            return True
+        if lowered_rel == lowered_pattern or lowered_rel.startswith(lowered_pattern + "/"):
+            return True
+        if fnmatch.fnmatch(lowered_name, lowered_pattern) or fnmatch.fnmatch(lowered_rel, lowered_pattern):
+            return True
+    return False
 
 
 def _is_test_file(filename: str) -> bool:
@@ -157,8 +176,10 @@ def scan_codebase(
             rel = _normalize_path(str(entry.relative_to(ws)))
             name = entry.name
 
-            # Skip excluded
-            if name in excludes:
+            # Skip excluded directories/files.  Configured entries may be
+            # simple names ("node_modules"), path prefixes ("examples/demo"),
+            # or glob patterns ("*.egg-info").
+            if _is_excluded(rel, name, excludes):
                 continue
 
             if entry.is_dir():

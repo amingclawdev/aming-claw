@@ -242,7 +242,7 @@ def build_symbol_index(
             symbol = {
                 "id": func.qualified_name,
                 "kind": "function",
-                "language": "python",
+                "language": module.language or "",
                 "module": module_name,
                 "path": rel,
                 "line_start": func.lineno,
@@ -271,12 +271,13 @@ def build_symbol_index(
         if row.get("file_kind") != "source":
             continue
         path = str(row.get("path") or "")
-        if not path or path in covered_files:
+        language = str(row.get("language") or "")
+        if not path or (path in covered_files and language == "python"):
             continue
         file_symbols.append({
             "id": f"file::{path}",
             "kind": "file",
-            "language": row.get("language") or "",
+            "language": language,
             "path": path,
             "line_start": 1,
             "line_end": _count_lines(root / path),

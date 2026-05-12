@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS graph_events (
   confidence REAL NOT NULL DEFAULT 0.0,
   baseline_commit TEXT NOT NULL DEFAULT '',
   target_commit TEXT NOT NULL DEFAULT '',
+  branch_ref TEXT NOT NULL DEFAULT '',
+  operation_type TEXT NOT NULL DEFAULT '',
+  source_branch_ref TEXT NOT NULL DEFAULT '',
+  source_snapshot_id TEXT NOT NULL DEFAULT '',
+  source_event_id TEXT NOT NULL DEFAULT '',
+  payload_hash TEXT NOT NULL DEFAULT '',
   stable_node_key TEXT NOT NULL DEFAULT '',
   feature_hash TEXT NOT NULL DEFAULT '',
   file_hashes_json TEXT NOT NULL DEFAULT '{}',
@@ -64,6 +70,8 @@ CREATE TABLE IF NOT EXISTS graph_semantic_projections (
   snapshot_id TEXT NOT NULL,
   projection_id TEXT NOT NULL,
   base_commit TEXT NOT NULL DEFAULT '',
+  branch_ref TEXT NOT NULL DEFAULT '',
+  projection_rule_version TEXT NOT NULL DEFAULT '',
   event_watermark INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'current',
   projection_json TEXT NOT NULL DEFAULT '{}',
@@ -158,22 +166,52 @@ GRAPH_MUTATION_EVENT_TYPES = {
     "semantic_stale",
 }
 
+SEMANTIC_PROJECTION_RULE_VERSION = "semantic_projection_v3_branch_timeline"
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(GRAPH_EVENTS_SCHEMA_SQL)
     _ensure_graph_event_columns(conn)
+    _ensure_semantic_projection_columns(conn)
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {
+        str(row["name"] if hasattr(row, "keys") else row[1])
+        for row in rows
+    }
+
+
+def _ensure_columns(conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
+    existing = _table_columns(conn, table_name)
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {ddl}")
 
 
 def _ensure_graph_event_columns(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("PRAGMA table_info(graph_events)").fetchall()
-    existing = {str(row["name"]) for row in rows}
-    for name, ddl in {
+    _ensure_columns(conn, "graph_events", {
+        "branch_ref": "TEXT NOT NULL DEFAULT ''",
+        "operation_type": "TEXT NOT NULL DEFAULT ''",
+        "source_branch_ref": "TEXT NOT NULL DEFAULT ''",
+        "source_snapshot_id": "TEXT NOT NULL DEFAULT ''",
+        "source_event_id": "TEXT NOT NULL DEFAULT ''",
+        "payload_hash": "TEXT NOT NULL DEFAULT ''",
         "stable_node_key": "TEXT NOT NULL DEFAULT ''",
         "feature_hash": "TEXT NOT NULL DEFAULT ''",
         "file_hashes_json": "TEXT NOT NULL DEFAULT '{}'",
-    }.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE graph_events ADD COLUMN {name} {ddl}")
+    })
+
+
+def _ensure_semantic_projection_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(conn, "graph_semantic_projections", {
+        "branch_ref": "TEXT NOT NULL DEFAULT ''",
+        "projection_rule_version": "TEXT NOT NULL DEFAULT ''",
+    })
 
 
 def _json(data: Any) -> str:
@@ -315,6 +353,82 @@ def _hash_scheme(value: str) -> str:
     if len(text) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in text):
         return "fallback_sha256"
     return "opaque"
+
+
+def _row_get(row: sqlite3.Row | dict[str, Any], key: str, default: Any = "") -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key] if key in row.keys() else default
+    except Exception:
+        return default
+
+
+def _snapshot_branch_ref(conn: sqlite3.Connection, project_id: str, snapshot_id: str) -> str:
+    """Return the best known branch/ref for a snapshot.
+
+    Structural snapshots remain commit evidence.  The semantic timeline needs
+    a branch/ref so future branch projections do not import another branch's
+    proposed semantics by accident.  Existing installations only have the
+    generic `active` ref, so this function is intentionally conservative.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT ref_name FROM graph_snapshot_refs
+            WHERE project_id = ? AND snapshot_id = ?
+            ORDER BY CASE WHEN ref_name = 'active' THEN 1 ELSE 0 END, ref_name
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    for row in rows:
+        ref = str(_row_get(row, "ref_name") or "").strip()
+        if ref and ref != "active":
+            return ref
+    return ""
+
+
+def _semantic_operation_type(
+    event_type: str,
+    status: str,
+    payload: dict[str, Any] | None,
+    evidence: dict[str, Any] | None,
+    explicit: str = "",
+) -> str:
+    explicit = str(explicit or "").strip()
+    if explicit:
+        return explicit
+    payload = payload if isinstance(payload, dict) else {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+    semantic_payload = _event_payload_semantic({"payload": payload})
+    if not isinstance(semantic_payload, dict):
+        semantic_payload = {}
+    if semantic_payload.get("operation_type"):
+        return str(semantic_payload.get("operation_type") or "")
+    if semantic_payload.get("carried_forward_from_snapshot_id") or payload.get("source_snapshot_id"):
+        return "carry_forward"
+    if status == EVENT_STATUS_REJECTED:
+        return "reject"
+    if status == EVENT_STATUS_ACCEPTED:
+        return "accept"
+    if event_type in {"semantic_node_enriched", "semantic_enriched", "edge_semantic_enriched"}:
+        return "ai_enrich"
+    if event_type in {"semantic_job_requested", "semantic_retry_requested", "edge_semantic_requested"}:
+        return "retry" if "retry" in event_type else "ai_enrich"
+    if event_type == "semantic_projection_generated":
+        return "projection_build"
+    return event_type
+
+
+def _payload_hash(payload: dict[str, Any] | None, explicit: str = "") -> str:
+    explicit = str(explicit or "").strip()
+    if explicit:
+        return explicit
+    return _hash_payload(payload or {})
 
 
 def stable_node_key_for_node(node: dict[str, Any]) -> str:
@@ -535,6 +649,12 @@ def create_event(
     confidence: float = 0.0,
     baseline_commit: str = "",
     target_commit: str = "",
+    branch_ref: str = "",
+    operation_type: str = "",
+    source_branch_ref: str = "",
+    source_snapshot_id: str = "",
+    source_event_id: str = "",
+    payload_hash: str = "",
     stable_node_key: str = "",
     feature_hash: str = "",
     file_hashes: dict[str, Any] | None = None,
@@ -553,15 +673,27 @@ def create_event(
     commit = str(snapshot.get("commit_sha") or "")
     eid = event_id or f"ge-{uuid.uuid4().hex[:12]}"
     now = store.utc_now()
+    payload_value = payload or {}
+    evidence_value = evidence or {}
+    branch_value = str(branch_ref or "").strip() or _snapshot_branch_ref(conn, project_id, snapshot_id)
+    operation_value = _semantic_operation_type(
+        event_type,
+        status,
+        payload_value,
+        evidence_value,
+        operation_type,
+    )
     conn.execute(
         """
         INSERT INTO graph_events
           (project_id, snapshot_id, event_id, event_seq, event_kind, event_type,
            target_type, target_id, status, risk_level, confidence, baseline_commit,
-           target_commit, stable_node_key, feature_hash, file_hashes_json,
+           target_commit, branch_ref, operation_type, source_branch_ref,
+           source_snapshot_id, source_event_id, payload_hash,
+           stable_node_key, feature_hash, file_hashes_json,
            payload_json, precondition_json, evidence_json,
            created_by, created_at, updated_by, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project_id, snapshot_id, event_id) DO UPDATE SET
           event_kind = excluded.event_kind,
           event_type = excluded.event_type,
@@ -572,6 +704,12 @@ def create_event(
           confidence = excluded.confidence,
           baseline_commit = excluded.baseline_commit,
           target_commit = excluded.target_commit,
+          branch_ref = excluded.branch_ref,
+          operation_type = excluded.operation_type,
+          source_branch_ref = excluded.source_branch_ref,
+          source_snapshot_id = excluded.source_snapshot_id,
+          source_event_id = excluded.source_event_id,
+          payload_hash = excluded.payload_hash,
           stable_node_key = excluded.stable_node_key,
           feature_hash = excluded.feature_hash,
           file_hashes_json = excluded.file_hashes_json,
@@ -595,12 +733,18 @@ def create_event(
             float(confidence or 0.0),
             baseline_commit or commit,
             target_commit or commit,
+            branch_value,
+            operation_value,
+            str(source_branch_ref or ""),
+            str(source_snapshot_id or ""),
+            str(source_event_id or ""),
+            _payload_hash(payload_value, payload_hash),
             stable_node_key,
             feature_hash,
             _json(file_hashes or {}),
-            _json(payload or {}),
+            _json(payload_value),
             _json(precondition or {}),
-            _json(evidence or {}),
+            _json(evidence_value),
             created_by,
             now,
             created_by,
@@ -685,6 +829,7 @@ def update_event_status(
     status: str,
     actor: str = "",
     evidence: dict[str, Any] | None = None,
+    operation_type: str = "",
 ) -> dict[str, Any]:
     ensure_schema(conn)
     if status not in ALLOWED_EVENT_STATUSES:
@@ -704,13 +849,26 @@ def update_event_status(
             })
         merged_evidence.update({k: v for k, v in evidence.items() if k != "status_events"})
     now = store.utc_now()
+    op_value = str(operation_type or "").strip()
     conn.execute(
         """
         UPDATE graph_events
-        SET status = ?, evidence_json = ?, updated_by = ?, updated_at = ?
+        SET status = ?,
+            operation_type = CASE WHEN ? = '' THEN operation_type ELSE ? END,
+            evidence_json = ?, updated_by = ?, updated_at = ?
         WHERE project_id = ? AND snapshot_id = ? AND event_id = ?
         """,
-        (status, _json(merged_evidence), actor, now, project_id, snapshot_id, event_id),
+        (
+            status,
+            op_value,
+            op_value,
+            _json(merged_evidence),
+            actor,
+            now,
+            project_id,
+            snapshot_id,
+            event_id,
+        ),
     )
     return get_event(conn, project_id, snapshot_id, event_id) or {}
 
@@ -1449,10 +1607,23 @@ def backfill_existing_semantic_events(
     updated = 0
     skipped = 0
     if _table_exists(conn, "graph_semantic_nodes"):
+        node_columns = _table_columns(conn, "graph_semantic_nodes")
+        node_optional = [
+            name for name in (
+                "branch_ref",
+                "operation_type",
+                "source_branch_ref",
+                "source_snapshot_id",
+                "source_event_id",
+                "payload_hash",
+            )
+            if name in node_columns
+        ]
+        node_optional_sql = (", " + ", ".join(node_optional)) if node_optional else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT node_id, status, feature_hash, file_hashes_json, semantic_json,
-                   feedback_round, batch_index, updated_at
+                   feedback_round, batch_index, updated_at{node_optional_sql}
             FROM graph_semantic_nodes
             WHERE project_id = ? AND snapshot_id = ?
             """,
@@ -1485,6 +1656,9 @@ def backfill_existing_semantic_events(
                 str(row["feature_hash"] or "")[:12],
             )
             existed = get_event(conn, project_id, snapshot_id, event_id)
+            source_snapshot_id = str(_row_get(row, "source_snapshot_id") or "")
+            if not source_snapshot_id and isinstance(semantic_payload, dict):
+                source_snapshot_id = str(semantic_payload.get("carried_forward_from_snapshot_id") or "")
             create_event(
                 conn,
                 project_id,
@@ -1495,6 +1669,12 @@ def backfill_existing_semantic_events(
                 target_type="node",
                 target_id=node_id,
                 status=event_status,
+                branch_ref=str(_row_get(row, "branch_ref") or ""),
+                operation_type=str(_row_get(row, "operation_type") or ""),
+                source_branch_ref=str(_row_get(row, "source_branch_ref") or ""),
+                source_snapshot_id=source_snapshot_id,
+                source_event_id=str(_row_get(row, "source_event_id") or ""),
+                payload_hash=str(_row_get(row, "payload_hash") or ""),
                 stable_node_key=stable_node_key_for_node(node),
                 feature_hash=str(row["feature_hash"] or ""),
                 file_hashes=_json_load(row["file_hashes_json"], {}),
@@ -1573,10 +1753,23 @@ def backfill_existing_semantic_events(
         if eid:
             edges_by_id[eid] = edge
     if _table_exists(conn, "graph_semantic_edges"):
+        edge_columns = _table_columns(conn, "graph_semantic_edges")
+        edge_optional = [
+            name for name in (
+                "branch_ref",
+                "operation_type",
+                "source_branch_ref",
+                "source_snapshot_id",
+                "source_event_id",
+                "payload_hash",
+            )
+            if name in edge_columns
+        ]
+        edge_optional_sql = (", " + ", ".join(edge_optional)) if edge_optional else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT edge_id, status, edge_signature_hash, semantic_json,
-                   feedback_round, batch_index, updated_at
+                   feedback_round, batch_index, updated_at{edge_optional_sql}
             FROM graph_semantic_edges
             WHERE project_id = ? AND snapshot_id = ?
             """,
@@ -1611,6 +1804,9 @@ def backfill_existing_semantic_events(
             )
             existed = get_event(conn, project_id, snapshot_id, event_id)
             edge_struct = edges_by_id.get(edge_id, {})
+            source_snapshot_id = str(_row_get(row, "source_snapshot_id") or "")
+            if not source_snapshot_id and isinstance(semantic_entry, dict):
+                source_snapshot_id = str(semantic_entry.get("carried_forward_from_snapshot_id") or "")
             create_event(
                 conn,
                 project_id,
@@ -1621,6 +1817,12 @@ def backfill_existing_semantic_events(
                 target_type="edge",
                 target_id=edge_id,
                 status=event_status,
+                branch_ref=str(_row_get(row, "branch_ref") or ""),
+                operation_type=str(_row_get(row, "operation_type") or ""),
+                source_branch_ref=str(_row_get(row, "source_branch_ref") or ""),
+                source_snapshot_id=source_snapshot_id,
+                source_event_id=str(_row_get(row, "source_event_id") or ""),
+                payload_hash=str(_row_get(row, "payload_hash") or ""),
                 # MF 2026-05-11: stash stable_edge_key into the existing
                 # stable_node_key column so _latest_edge_semantic_events
                 # can find this event cross-snapshot. Column name is
@@ -1671,14 +1873,16 @@ def _latest_semantic_event_for_node(
     project_id: str,
     node_id: str,
     stable_key: str,
+    branch_ref: str = "",
 ) -> dict[str, Any] | None:
     ensure_schema(conn)
-    params: list[Any] = [project_id, "semantic_node_enriched"]
+    params: list[Any] = [project_id, "semantic_node_enriched", branch_ref]
     sql = """
         SELECT * FROM graph_events
         WHERE project_id = ?
           AND event_type = ?
           AND status IN ('observed', 'materialized', 'accepted')
+          AND (branch_ref = ? OR branch_ref = '')
     """
     if stable_key:
         sql += " AND stable_node_key = ?"
@@ -1686,7 +1890,12 @@ def _latest_semantic_event_for_node(
     else:
         sql += " AND target_type = 'node' AND target_id = ?"
         params.append(node_id)
-    sql += " ORDER BY updated_at DESC, created_at DESC, event_seq DESC LIMIT 1"
+    params.append(branch_ref)
+    sql += """
+        ORDER BY CASE WHEN branch_ref = ? THEN 0 ELSE 1 END,
+                 updated_at DESC, created_at DESC, event_seq DESC
+        LIMIT 1
+    """
     row = conn.execute(sql, params).fetchone()
     if row:
         return _row_to_event(row)
@@ -1699,9 +1908,12 @@ def _latest_semantic_event_for_node(
               AND target_type = 'node'
               AND target_id = ?
               AND status IN ('observed', 'materialized', 'accepted')
-            ORDER BY updated_at DESC, created_at DESC, event_seq DESC LIMIT 1
+              AND (branch_ref = ? OR branch_ref = '')
+            ORDER BY CASE WHEN branch_ref = ? THEN 0 ELSE 1 END,
+                     updated_at DESC, created_at DESC, event_seq DESC
+            LIMIT 1
             """,
-            (project_id, node_id),
+            (project_id, node_id, branch_ref, branch_ref),
         ).fetchone()
         return _row_to_event(row) if row else None
     return None
@@ -1727,6 +1939,7 @@ def _latest_edge_semantic_events(
     snapshot_id: str,
     *,
     edge_index: dict[str, dict[str, Any]] | None = None,
+    branch_ref: str = "",
 ) -> dict[str, dict[str, Any]]:
     """Latest edge_semantic_* event per edge_id.
 
@@ -1747,9 +1960,11 @@ def _latest_edge_semantic_events(
           AND target_type = 'edge'
           AND event_type IN ('edge_semantic_requested', 'edge_semantic_enriched')
           AND status IN ('observed', 'materialized', 'accepted')
-        ORDER BY event_seq ASC, updated_at ASC, created_at ASC
+          AND (branch_ref = ? OR branch_ref = '')
+        ORDER BY CASE WHEN branch_ref = ? THEN 1 ELSE 0 END,
+                 event_seq ASC, updated_at ASC, created_at ASC
         """,
-        (project_id,),
+        (project_id, branch_ref, branch_ref),
     ).fetchall()
     # Build lookup by target_id and (if available) by stable_edge_key.
     by_target_id: dict[str, dict[str, Any]] = {}
@@ -1833,6 +2048,12 @@ def _build_edge_semantics(
                 "snapshot_id": (event or {}).get("snapshot_id", ""),
                 "event_seq": (event or {}).get("event_seq", 0),
                 "event_type": (event or {}).get("event_type", ""),
+                "branch_ref": (event or {}).get("branch_ref", ""),
+                "operation_type": (event or {}).get("operation_type", ""),
+                "source_branch_ref": (event or {}).get("source_branch_ref", ""),
+                "source_snapshot_id": (event or {}).get("source_snapshot_id", ""),
+                "source_event_id": (event or {}).get("source_event_id", ""),
+                "payload_hash": (event or {}).get("payload_hash", ""),
                 "updated_at": (event or {}).get("updated_at", ""),
             },
         }
@@ -2098,6 +2319,7 @@ def build_semantic_projection(
     if backfill_existing:
         backfill_existing_semantic_events(conn, project_id, snapshot_id, actor=actor)
     commit_sha = str(snapshot.get("commit_sha") or "")
+    branch_ref = _snapshot_branch_ref(conn, project_id, snapshot_id)
     nodes = store.list_graph_snapshot_nodes(
         conn,
         project_id,
@@ -2117,7 +2339,9 @@ def build_semantic_projection(
         if not node_id:
             continue
         stable_key = stable_node_key_for_node(node)
-        event = _latest_semantic_event_for_node(conn, project_id, node_id, stable_key)
+        event = _latest_semantic_event_for_node(
+            conn, project_id, node_id, stable_key, branch_ref=branch_ref,
+        )
         validity = _semantic_validity(node, event, snapshot_id=snapshot_id, commit_sha=commit_sha)
         node_semantics[node_id] = {
             "node_id": node_id,
@@ -2128,6 +2352,12 @@ def build_semantic_projection(
                 "event_id": (event or {}).get("event_id", ""),
                 "snapshot_id": (event or {}).get("snapshot_id", ""),
                 "event_seq": (event or {}).get("event_seq", 0),
+                "branch_ref": (event or {}).get("branch_ref", ""),
+                "operation_type": (event or {}).get("operation_type", ""),
+                "source_branch_ref": (event or {}).get("source_branch_ref", ""),
+                "source_snapshot_id": (event or {}).get("source_snapshot_id", ""),
+                "source_event_id": (event or {}).get("source_event_id", ""),
+                "payload_hash": (event or {}).get("payload_hash", ""),
                 "updated_at": (event or {}).get("updated_at", ""),
             },
         }
@@ -2160,7 +2390,7 @@ def build_semantic_projection(
     edge_semantics = _build_edge_semantics(
         edges,
         _latest_edge_semantic_events(
-            conn, project_id, snapshot_id, edge_index=edge_carry_index,
+            conn, project_id, snapshot_id, edge_index=edge_carry_index, branch_ref=branch_ref,
         ),
     )
     watermark_row = conn.execute(
@@ -2172,8 +2402,10 @@ def build_semantic_projection(
     health.update(_edge_projection_health(edges, edge_semantics))
     projection = {
         "schema_version": 1,
+        "projection_rule_version": SEMANTIC_PROJECTION_RULE_VERSION,
         "project_id": project_id,
         "snapshot_id": snapshot_id,
+        "branch_ref": branch_ref,
         "commit_sha": commit_sha,
         "event_watermark": event_watermark,
         "node_semantics": node_semantics,
@@ -2185,11 +2417,14 @@ def build_semantic_projection(
     conn.execute(
         """
         INSERT INTO graph_semantic_projections
-          (project_id, snapshot_id, projection_id, base_commit, event_watermark,
+          (project_id, snapshot_id, projection_id, base_commit, branch_ref,
+           projection_rule_version, event_watermark,
            status, projection_json, health_json, created_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project_id, snapshot_id, projection_id) DO UPDATE SET
           base_commit = excluded.base_commit,
+          branch_ref = excluded.branch_ref,
+          projection_rule_version = excluded.projection_rule_version,
           event_watermark = excluded.event_watermark,
           status = excluded.status,
           projection_json = excluded.projection_json,
@@ -2201,6 +2436,8 @@ def build_semantic_projection(
             snapshot_id,
             pid,
             commit_sha,
+            branch_ref,
+            SEMANTIC_PROJECTION_RULE_VERSION,
             event_watermark,
             "current",
             _json(projection),
@@ -2224,6 +2461,8 @@ def build_semantic_projection(
         target_commit=commit_sha,
         payload={
             "projection_id": pid,
+            "branch_ref": branch_ref,
+            "projection_rule_version": SEMANTIC_PROJECTION_RULE_VERSION,
             "event_watermark": event_watermark,
             "health": health,
         },
@@ -2235,6 +2474,8 @@ def build_semantic_projection(
         "snapshot_id": snapshot_id,
         "projection_id": pid,
         "base_commit": commit_sha,
+        "branch_ref": branch_ref,
+        "projection_rule_version": SEMANTIC_PROJECTION_RULE_VERSION,
         "event_watermark": event_watermark,
         "projection": projection,
         "health": health,

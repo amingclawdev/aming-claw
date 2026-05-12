@@ -70,7 +70,10 @@ def discover_project_profile(project_root: str) -> ProjectProfile:
     languages = _discover_languages(root, manifests)
     test_roots = _discover_named_dirs(root, TEST_DIR_NAMES)
     doc_roots = _discover_named_dirs(root, DOC_DIR_NAMES)
-    exclude_roots = _discover_existing_excludes(root)
+    exclude_roots = _merge_roots(
+        _discover_existing_excludes(root),
+        _configured_exclude_roots(root),
+    )
     source_roots = _discover_source_roots(root, test_roots, doc_roots, exclude_roots)
 
     if not source_roots:
@@ -124,6 +127,30 @@ def _discover_existing_excludes(root: Path) -> List[str]:
         if (root / name).exists():
             found.add(name)
     return sorted(found)
+
+
+def _configured_exclude_roots(root: Path) -> List[str]:
+    try:
+        from project_config import load_project_config  # type: ignore
+
+        config = load_project_config(root)
+    except Exception:
+        return []
+    governance = getattr(config, "governance", None)
+    return _merge_roots(getattr(governance, "exclude_roots", []) or [])
+
+
+def _merge_roots(*groups: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group or []:
+            rel = str(value or "").replace("\\", "/").strip().strip("/")
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            out.append(rel)
+    return sorted(out)
 
 
 def _discover_source_roots(

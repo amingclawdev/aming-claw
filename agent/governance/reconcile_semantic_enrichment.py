@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS graph_semantic_nodes (
   feature_hash TEXT NOT NULL DEFAULT '',
   file_hashes_json TEXT NOT NULL DEFAULT '{}',
   semantic_json TEXT NOT NULL DEFAULT '{}',
+  branch_ref TEXT NOT NULL DEFAULT '',
+  operation_type TEXT NOT NULL DEFAULT '',
+  source_branch_ref TEXT NOT NULL DEFAULT '',
+  source_snapshot_id TEXT NOT NULL DEFAULT '',
+  source_event_id TEXT NOT NULL DEFAULT '',
+  payload_hash TEXT NOT NULL DEFAULT '',
   feedback_round INTEGER NOT NULL DEFAULT 0,
   batch_index INTEGER,
   updated_at TEXT NOT NULL DEFAULT '',
@@ -68,6 +74,12 @@ CREATE TABLE IF NOT EXISTS graph_semantic_edges (
   status TEXT NOT NULL DEFAULT '',
   edge_signature_hash TEXT NOT NULL DEFAULT '',
   semantic_json TEXT NOT NULL DEFAULT '{}',
+  branch_ref TEXT NOT NULL DEFAULT '',
+  operation_type TEXT NOT NULL DEFAULT '',
+  source_branch_ref TEXT NOT NULL DEFAULT '',
+  source_snapshot_id TEXT NOT NULL DEFAULT '',
+  source_event_id TEXT NOT NULL DEFAULT '',
+  payload_hash TEXT NOT NULL DEFAULT '',
   feedback_round INTEGER NOT NULL DEFAULT 0,
   batch_index INTEGER,
   updated_at TEXT NOT NULL DEFAULT '',
@@ -84,6 +96,8 @@ CREATE TABLE IF NOT EXISTS graph_semantic_jobs (
   status TEXT NOT NULL DEFAULT 'pending_ai',
   feature_hash TEXT NOT NULL DEFAULT '',
   file_hashes_json TEXT NOT NULL DEFAULT '{}',
+  branch_ref TEXT NOT NULL DEFAULT '',
+  operation_type TEXT NOT NULL DEFAULT '',
   feedback_round INTEGER NOT NULL DEFAULT 0,
   batch_index INTEGER,
   attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -105,6 +119,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_semantic_jobs_status
 
 def _ensure_semantic_state_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SEMANTIC_STATE_SCHEMA_SQL)
+    _ensure_semantic_timeline_columns(conn)
     _ensure_semantic_jobs_claim_columns(conn)
 
 
@@ -142,6 +157,43 @@ def _ensure_semantic_jobs_claim_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE graph_semantic_jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
             )
+
+
+def _ensure_semantic_timeline_columns(conn: sqlite3.Connection) -> None:
+    column_groups = {
+        "graph_semantic_nodes": {
+            "branch_ref": "TEXT NOT NULL DEFAULT ''",
+            "operation_type": "TEXT NOT NULL DEFAULT ''",
+            "source_branch_ref": "TEXT NOT NULL DEFAULT ''",
+            "source_snapshot_id": "TEXT NOT NULL DEFAULT ''",
+            "source_event_id": "TEXT NOT NULL DEFAULT ''",
+            "payload_hash": "TEXT NOT NULL DEFAULT ''",
+        },
+        "graph_semantic_edges": {
+            "branch_ref": "TEXT NOT NULL DEFAULT ''",
+            "operation_type": "TEXT NOT NULL DEFAULT ''",
+            "source_branch_ref": "TEXT NOT NULL DEFAULT ''",
+            "source_snapshot_id": "TEXT NOT NULL DEFAULT ''",
+            "source_event_id": "TEXT NOT NULL DEFAULT ''",
+            "payload_hash": "TEXT NOT NULL DEFAULT ''",
+        },
+        "graph_semantic_jobs": {
+            "branch_ref": "TEXT NOT NULL DEFAULT ''",
+            "operation_type": "TEXT NOT NULL DEFAULT ''",
+        },
+    }
+    for table, columns in column_groups.items():
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        existing = {
+            (row["name"] if hasattr(row, "keys") else row[1])
+            for row in rows
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def _string_list(raw: Any) -> list[str]:
@@ -1148,7 +1200,9 @@ def _load_semantic_graph_state_from_db(
     state = _empty_semantic_graph_state(project_id, snapshot_id, snapshot)
     node_rows = conn.execute(
         """
-        SELECT node_id, status, feature_hash, file_hashes_json, semantic_json
+        SELECT node_id, status, feature_hash, file_hashes_json, semantic_json,
+               branch_ref, operation_type, source_branch_ref, source_snapshot_id,
+               source_event_id, payload_hash
         FROM graph_semantic_nodes
         WHERE project_id = ? AND snapshot_id = ?
         ORDER BY node_id
@@ -1169,10 +1223,46 @@ def _load_semantic_graph_state_from_db(
                 file_hashes = {}
             payload["file_hashes"] = file_hashes if isinstance(file_hashes, dict) else {}
             payload["status"] = str(row["status"] or payload.get("status") or "")
+            payload["branch_ref"] = str(row["branch_ref"] or payload.get("branch_ref") or "")
+            payload["operation_type"] = str(row["operation_type"] or payload.get("operation_type") or "")
+            payload["source_branch_ref"] = str(row["source_branch_ref"] or payload.get("source_branch_ref") or "")
+            payload["source_snapshot_id"] = str(row["source_snapshot_id"] or payload.get("source_snapshot_id") or "")
+            payload["source_event_id"] = str(row["source_event_id"] or payload.get("source_event_id") or "")
+            payload["payload_hash"] = str(row["payload_hash"] or payload.get("payload_hash") or "")
             node_semantics[str(row["node_id"])] = payload
+    edge_rows = conn.execute(
+        """
+        SELECT edge_id, status, edge_signature_hash, semantic_json,
+               branch_ref, operation_type, source_branch_ref, source_snapshot_id,
+               source_event_id, payload_hash
+        FROM graph_semantic_edges
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY edge_id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    edge_semantics: dict[str, dict[str, Any]] = {}
+    for row in edge_rows:
+        try:
+            payload = json.loads(row["semantic_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            payload["edge_signature_hash"] = str(
+                row["edge_signature_hash"] or payload.get("edge_signature_hash") or ""
+            )
+            payload["status"] = str(row["status"] or payload.get("status") or "")
+            payload["branch_ref"] = str(row["branch_ref"] or payload.get("branch_ref") or "")
+            payload["operation_type"] = str(row["operation_type"] or payload.get("operation_type") or "")
+            payload["source_branch_ref"] = str(row["source_branch_ref"] or payload.get("source_branch_ref") or "")
+            payload["source_snapshot_id"] = str(row["source_snapshot_id"] or payload.get("source_snapshot_id") or "")
+            payload["source_event_id"] = str(row["source_event_id"] or payload.get("source_event_id") or "")
+            payload["payload_hash"] = str(row["payload_hash"] or payload.get("payload_hash") or "")
+            edge_semantics[str(row["edge_id"])] = payload
     job_rows = conn.execute(
         """
-        SELECT node_id, status, feature_hash, file_hashes_json, feedback_round,
+        SELECT node_id, status, feature_hash, file_hashes_json, branch_ref,
+               operation_type, feedback_round,
                batch_index, attempt_count, worker_id, claim_id, claimed_at,
                lease_expires_at, claimed_by, last_error, updated_at, created_at
         FROM graph_semantic_jobs
@@ -1192,6 +1282,8 @@ def _load_semantic_graph_state_from_db(
             "status": str(row["status"] or ""),
             "feature_hash": str(row["feature_hash"] or ""),
             "file_hashes": file_hashes if isinstance(file_hashes, dict) else {},
+            "branch_ref": str(row["branch_ref"] or ""),
+            "operation_type": str(row["operation_type"] or ""),
             "feedback_round": int(row["feedback_round"] or 0),
             "batch_index": row["batch_index"],
             "attempt_count": int(row["attempt_count"] or 0),
@@ -1205,6 +1297,7 @@ def _load_semantic_graph_state_from_db(
             "created_at": str(row["created_at"] or ""),
         }
     state["node_semantics"] = node_semantics
+    state["edge_semantics"] = edge_semantics
     state["semantic_jobs"] = semantic_jobs
     _rebuild_semantic_graph_state_indexes(state)
     return state
@@ -1243,17 +1336,29 @@ def _persist_semantic_state_to_db(
             row_status = "pending_review"
         else:
             row_status = str(raw_entry.get("status") or "")
+        row_operation = str(raw_entry.get("operation_type") or "").strip()
+        if not row_operation:
+            row_operation = "carry_forward" if is_carried_forward else "ai_enrich"
+        row_payload_hash = str(raw_entry.get("payload_hash") or "").strip() or _hash_payload(raw_entry)
         conn.execute(
             """
             INSERT INTO graph_semantic_nodes
               (project_id, snapshot_id, node_id, status, feature_hash,
-               file_hashes_json, semantic_json, feedback_round, batch_index, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               file_hashes_json, semantic_json, branch_ref, operation_type,
+               source_branch_ref, source_snapshot_id, source_event_id, payload_hash,
+               feedback_round, batch_index, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, snapshot_id, node_id) DO UPDATE SET
               status = excluded.status,
               feature_hash = excluded.feature_hash,
               file_hashes_json = excluded.file_hashes_json,
               semantic_json = excluded.semantic_json,
+              branch_ref = excluded.branch_ref,
+              operation_type = excluded.operation_type,
+              source_branch_ref = excluded.source_branch_ref,
+              source_snapshot_id = excluded.source_snapshot_id,
+              source_event_id = excluded.source_event_id,
+              payload_hash = excluded.payload_hash,
               feedback_round = excluded.feedback_round,
               batch_index = excluded.batch_index,
               updated_at = excluded.updated_at
@@ -1266,6 +1371,12 @@ def _persist_semantic_state_to_db(
                 str(raw_entry.get("feature_hash") or ""),
                 _json(raw_entry.get("file_hashes") or {}),
                 _json(raw_entry),
+                str(raw_entry.get("branch_ref") or state.get("branch_ref") or ""),
+                row_operation,
+                str(raw_entry.get("source_branch_ref") or raw_entry.get("source_branch") or ""),
+                str(raw_entry.get("source_snapshot_id") or raw_entry.get("carried_forward_from_snapshot_id") or ""),
+                str(raw_entry.get("source_event_id") or ""),
+                row_payload_hash,
                 int(raw_entry.get("feedback_round") or 0),
                 raw_entry.get("batch_index"),
                 str(raw_entry.get("updated_at") or state.get("updated_at") or ""),
@@ -1283,16 +1394,28 @@ def _persist_semantic_state_to_db(
             edge_row_status = "pending_review"
         else:
             edge_row_status = str(raw_entry.get("status") or "")
+        edge_row_operation = str(raw_entry.get("operation_type") or "").strip()
+        if not edge_row_operation:
+            edge_row_operation = "carry_forward" if is_carried_forward else "ai_enrich"
+        edge_payload_hash = str(raw_entry.get("payload_hash") or "").strip() or _hash_payload(raw_entry)
         conn.execute(
             """
             INSERT INTO graph_semantic_edges
               (project_id, snapshot_id, edge_id, status, edge_signature_hash,
-               semantic_json, feedback_round, batch_index, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               semantic_json, branch_ref, operation_type, source_branch_ref,
+               source_snapshot_id, source_event_id, payload_hash,
+               feedback_round, batch_index, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, snapshot_id, edge_id) DO UPDATE SET
               status = excluded.status,
               edge_signature_hash = excluded.edge_signature_hash,
               semantic_json = excluded.semantic_json,
+              branch_ref = excluded.branch_ref,
+              operation_type = excluded.operation_type,
+              source_branch_ref = excluded.source_branch_ref,
+              source_snapshot_id = excluded.source_snapshot_id,
+              source_event_id = excluded.source_event_id,
+              payload_hash = excluded.payload_hash,
               feedback_round = excluded.feedback_round,
               batch_index = excluded.batch_index,
               updated_at = excluded.updated_at
@@ -1304,6 +1427,12 @@ def _persist_semantic_state_to_db(
                 edge_row_status,
                 str(raw_entry.get("edge_signature_hash") or ""),
                 _json(raw_entry),
+                str(raw_entry.get("branch_ref") or state.get("branch_ref") or ""),
+                edge_row_operation,
+                str(raw_entry.get("source_branch_ref") or raw_entry.get("source_branch") or ""),
+                str(raw_entry.get("source_snapshot_id") or raw_entry.get("carried_forward_from_snapshot_id") or ""),
+                str(raw_entry.get("source_event_id") or ""),
+                edge_payload_hash,
                 int(raw_entry.get("feedback_round") or 0),
                 raw_entry.get("batch_index"),
                 str(raw_entry.get("updated_at") or state.get("updated_at") or ""),
@@ -1317,14 +1446,17 @@ def _persist_semantic_state_to_db(
             """
             INSERT INTO graph_semantic_jobs
               (project_id, snapshot_id, node_id, status, feature_hash,
-               file_hashes_json, feedback_round, batch_index, attempt_count,
+               file_hashes_json, branch_ref, operation_type,
+               feedback_round, batch_index, attempt_count,
                worker_id, claim_id, claimed_at, lease_expires_at, claimed_by,
                last_error, updated_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, snapshot_id, node_id) DO UPDATE SET
               status = excluded.status,
               feature_hash = excluded.feature_hash,
               file_hashes_json = excluded.file_hashes_json,
+              branch_ref = excluded.branch_ref,
+              operation_type = excluded.operation_type,
               feedback_round = excluded.feedback_round,
               batch_index = excluded.batch_index,
               attempt_count = excluded.attempt_count,
@@ -1343,6 +1475,8 @@ def _persist_semantic_state_to_db(
                 str(raw_job.get("status") or "pending_ai"),
                 str(raw_job.get("feature_hash") or ""),
                 _json(raw_job.get("file_hashes") or {}),
+                str(raw_job.get("branch_ref") or state.get("branch_ref") or ""),
+                str(raw_job.get("operation_type") or "ai_enrich"),
                 int(raw_job.get("feedback_round") or 0),
                 raw_job.get("batch_index"),
                 int(raw_job.get("attempt_count") or 0),
@@ -1365,13 +1499,13 @@ def _load_semantic_graph_state_source(
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     state = _load_semantic_graph_state_from_db(conn, project_id, snapshot_id, snapshot)
-    if state.get("node_semantics") or state.get("semantic_jobs"):
+    if state.get("node_semantics") or state.get("edge_semantics") or state.get("semantic_jobs"):
         state["source"] = "db"
         return state
     # One-time compatibility import for snapshots created before DB-backed
     # semantic state. After this point DB rows are the source of truth.
     companion_state = _load_semantic_graph_state(project_id, snapshot_id, snapshot)
-    if companion_state.get("node_semantics") or companion_state.get("semantic_jobs"):
+    if companion_state.get("node_semantics") or companion_state.get("edge_semantics") or companion_state.get("semantic_jobs"):
         with _semantic_write_lock():
             _persist_semantic_state_to_db(conn, project_id, snapshot_id, companion_state)
             _commit_semantic_write(conn)

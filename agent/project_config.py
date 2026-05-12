@@ -75,6 +75,8 @@ class DeployConfig:
 class GovernanceConfig:
     enabled: bool = False
     test_tool_label: str = "pytest"
+    exclude_roots: List[str] = field(default_factory=list)
+    """Workspace-relative directories/path prefixes excluded from governance scans."""
 
 
 @dataclass
@@ -324,6 +326,7 @@ def _parse_raw(raw: dict) -> ProjectConfig:
     governance = GovernanceConfig(
         enabled=g_raw.get("enabled", False),
         test_tool_label=g_raw.get("test_tool_label", "pytest"),
+        exclude_roots=_string_list(g_raw.get("exclude_roots", [])),
     )
 
     return ProjectConfig(
@@ -426,6 +429,26 @@ def _find_config_file(workspace_path: Path) -> Optional[Path]:
         if p.is_file():
             return p
     return None
+
+
+def _string_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        norm = str(value or "").replace("\\", "/").strip().strip("/")
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
 
 
 # ---------------------------------------------------------------------------

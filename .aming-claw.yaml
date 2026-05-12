@@ -56,3 +56,5 @@ deploy:
 governance:
   enabled: true
   test_tool_label: "pytest"
+  exclude_roots:
+    - "examples"

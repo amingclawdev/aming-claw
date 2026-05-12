@@ -662,6 +662,8 @@ def handle_project_config(ctx: RequestContext):
                 break
         if ws_path:
             config = load_project_config(Path(ws_path))
+        elif project_id == "aming-claw":
+            config = load_project_config(Path(__file__).resolve().parents[2])
         elif Path('/workspace').exists():
             config = load_project_config(Path('/workspace'))
         else:
@@ -672,10 +674,101 @@ def handle_project_config(ctx: RequestContext):
             "testing": {"unit_command": config.testing.unit_command, "e2e_command": config.testing.e2e_command},
             "build": {"command": config.build.command, "release_checks": config.build.release_checks},
             "deploy": {"strategy": config.deploy.strategy, "service_rules_count": len(config.deploy.service_rules)},
-            "governance": {"enabled": config.governance.enabled, "test_tool_label": config.governance.test_tool_label},
+            "governance": {
+                "enabled": config.governance.enabled,
+                "test_tool_label": config.governance.test_tool_label,
+                "exclude_roots": list(getattr(config.governance, "exclude_roots", []) or []),
+            },
         }
     except Exception as e:
         return 404, {"error": f"config not found: {e}"}
+
+
+@route("GET", "/api/projects/{project_id}/ai-config")
+def handle_project_ai_config(ctx: RequestContext):
+    """Return read-only AI/model routing config for dashboard operators."""
+    import sys as _sys
+    _agent_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)))
+    if _agent_dir not in _sys.path:
+        _sys.path.insert(0, _agent_dir)
+
+    project_id = ctx.get_project_id()
+    try:
+        root = _graph_governance_project_root(project_id, {})
+    except Exception as exc:
+        return 404, {"error": f"project root not found: {exc}"}
+
+    pipeline = {}
+    pipeline_error = ""
+    role_routing = {}
+    try:
+        from pipeline_config import get_effective_pipeline_config, resolve_role_config
+
+        pipeline = get_effective_pipeline_config()
+        for role in ("pm", "dev", "tester", "qa", "coordinator", "gatekeeper", "observer"):
+            role_routing[role] = resolve_role_config(role, pipeline)
+    except Exception as exc:
+        pipeline_error = str(exc)
+
+    role_configs = {}
+    role_config_error = ""
+    try:
+        from .role_config import load_all_role_configs
+
+        loaded = load_all_role_configs(project_id=project_id)
+        for role, config in loaded.items():
+            role_configs[role] = {
+                "max_turns": config.max_turns,
+                "tools": list(config.tools or []),
+                "task_type_alias": config.task_type_alias or "",
+            }
+    except Exception as exc:
+        role_config_error = str(exc)
+
+    semantic = {}
+    semantic_error = ""
+    try:
+        from .reconcile_semantic_config import load_semantic_enrichment_config
+
+        semantic_config = load_semantic_enrichment_config(project_root=root)
+        semantic = {
+            "provider": semantic_config.provider,
+            "model": semantic_config.model,
+            "analyzer_role": semantic_config.analyzer_role,
+            "chain_role": semantic_config.chain_role,
+            "use_ai_default": semantic_config.use_ai_default,
+            "automation_policy": {
+                "semantic_mode": semantic_config.automation_policy.semantic_mode,
+                "feedback_review_mode": semantic_config.automation_policy.feedback_review_mode,
+                "graph_apply_mode": semantic_config.automation_policy.graph_apply_mode,
+                "review_workers": semantic_config.automation_policy.review_workers,
+            },
+            "job_profiles": {
+                name: {
+                    "analyzer_role": profile.analyzer_role,
+                    "provider": profile.provider,
+                    "model": profile.model,
+                }
+                for name, profile in semantic_config.job_profiles.items()
+            },
+            "source_path": semantic_config.source_path,
+            "override_path": semantic_config.override_path,
+        }
+    except Exception as exc:
+        semantic_error = str(exc)
+
+    return {
+        "project_id": project_id,
+        "workspace_path": str(root),
+        "pipeline": pipeline,
+        "pipeline_error": pipeline_error,
+        "role_routing": role_routing,
+        "role_configs": role_configs,
+        "role_config_error": role_config_error,
+        "semantic": semantic,
+        "semantic_error": semantic_error,
+        "read_only": True,
+    }
 
 
 @route("POST", "/api/projects/{project_id}/explain")
@@ -5002,6 +5095,7 @@ def _accept_semantic_enrichment_for_feedback_items(
                     conn, project_id, snapshot_id, eid_s,
                     status=graph_events.EVENT_STATUS_ACCEPTED,
                     actor=actor,
+                    operation_type="accept",
                     evidence={
                         "source": "accept_semantic_enrichment",
                         "feedback_id": fid,
@@ -5090,6 +5184,7 @@ def _reject_semantic_enrichment_for_feedback_items(
                     conn, project_id, snapshot_id, eid_s,
                     status=graph_events.EVENT_STATUS_REJECTED,
                     actor=actor,
+                    operation_type="reject",
                     evidence={
                         "source": "reject_semantic_enrichment",
                         "feedback_id": fid,

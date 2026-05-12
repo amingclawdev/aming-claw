@@ -57,3 +57,29 @@ def test_project_profile_discovers_python_boundaries(tmp_path):
     assert not profile.is_production_source_path("web/.next/server.js")
     assert not profile.is_production_source_path("docs/service.md")
     assert not profile.is_production_source_path("runtime/generated.py")
+
+
+def test_project_profile_respects_configured_governance_excludes(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        str(project / ".aming-claw.yaml"),
+        "\n".join([
+            "project_id: demo-project",
+            "language: python",
+            "governance:",
+            "  enabled: true",
+            "  exclude_roots:",
+            "    - examples",
+            "",
+        ]),
+    )
+    _write(str(project / "src" / "app.py"), "def app():\n    pass\n")
+    _write(str(project / "examples" / "demo" / "app.py"), "def demo():\n    pass\n")
+
+    profile = discover_project_profile(str(project))
+
+    assert "examples" in profile.exclude_roots
+    assert "src" in profile.source_roots
+    assert "examples" not in profile.source_roots
+    assert profile.is_production_source_path("src/app.py")
+    assert not profile.is_production_source_path("examples/demo/app.py")
