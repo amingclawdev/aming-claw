@@ -25,6 +25,19 @@ def _write_project_config(root: Path) -> None:
             "language: typescript",
             "testing:",
             "  unit_command: npm test",
+            "  e2e:",
+            "    auto_run: false",
+            "    suites:",
+            "      dashboard.semantic.safe:",
+            "        label: Dashboard semantic safe path",
+            "        command: node scripts/e2e-trunk.mjs --skip-dashboard",
+            "        live_ai: false",
+            "        mutates_db: true",
+            "        trigger:",
+            "          paths:",
+            "            - src/**",
+            "          tags:",
+            "            - dashboard",
             "governance:",
             "  enabled: true",
             "  test_tool_label: vitest",
@@ -68,6 +81,7 @@ def test_project_config_endpoint_exposes_governance_exclude_roots(tmp_path, monk
     assert payload["project_id"] == "dashboard-demo"
     assert payload["language"] == "typescript"
     assert payload["governance"]["exclude_roots"] == ["examples"]
+    assert payload["testing"]["e2e"]["suites"]["dashboard.semantic.safe"]["command"].startswith("node scripts/")
     assert payload["graph"]["exclude_paths"] == ["docs/dev"]
     assert payload["graph"]["effective_exclude_roots"] == [
         "examples",
@@ -97,6 +111,23 @@ def test_project_config_endpoint_falls_back_to_repo_root_for_aming_claw(monkeypa
     assert "examples" in payload["governance"]["exclude_roots"]
 
 
+def test_project_e2e_config_endpoint_exposes_suite_registry(tmp_path, monkeypatch):
+    _write_project_config(tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_graph_governance_project_root",
+        lambda _project_id, _body: tmp_path,
+    )
+
+    payload = server.handle_project_e2e_config(_ctx("dashboard-demo"))
+
+    assert payload["ok"] is True
+    assert payload["project_id"] == "dashboard-demo"
+    suites = payload["e2e"]["suites"]
+    assert suites["dashboard.semantic.safe"]["trigger"]["paths"] == ["src/**"]
+    assert suites["dashboard.semantic.safe"]["live_ai"] is False
+
+
 def test_project_ai_config_endpoint_returns_writable_dashboard_contract(tmp_path, monkeypatch):
     _write_project_config(tmp_path)
     monkeypatch.setattr(
@@ -118,6 +149,7 @@ def test_project_ai_config_endpoint_returns_writable_dashboard_contract(tmp_path
     assert "semantic" in payload
     assert payload["semantic"]["analyzer_role"]
     assert payload["project_config"]["ai"]["routing"]["semantic"]["model"] == "claude-opus-4-7"
+    assert "dashboard.semantic.safe" in payload["project_config"]["testing"]["e2e"]["suites"]
 
 
 def test_project_ai_config_endpoint_updates_project_routing(tmp_path, monkeypatch):

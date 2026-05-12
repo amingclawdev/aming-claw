@@ -90,6 +90,24 @@ export const api = {
   projectConfigFor(projectId: string, signal?: AbortSignal) {
     return getJSON<ProjectConfigResponse>(`/api/projects/${pidFor(projectId)}/config`, signal);
   },
+  projectE2EConfigFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<{ ok?: boolean; project_id: string; workspace_path?: string; e2e?: E2EConfig }>(
+      `/api/projects/${pidFor(projectId)}/e2e/config`,
+      signal,
+    );
+  },
+  e2eImpact(snapshotId: string, signal?: AbortSignal) {
+    return getJSON<E2EImpactResponse>(
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/e2e/impact`,
+      signal,
+    );
+  },
+  e2eImpactFor(projectId: string, snapshotId: string, signal?: AbortSignal) {
+    return getJSON<E2EImpactResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}/e2e/impact`,
+      signal,
+    );
+  },
   bootstrapProject(
     payload: { workspace_path: string; project_name?: string; scan_depth?: number },
     signal?: AbortSignal,
@@ -517,10 +535,52 @@ export interface ProjectsResponse {
   projects: ProjectListItem[];
 }
 
+export interface E2ESuiteConfig {
+  suite_id?: string;
+  label?: string;
+  command?: string;
+  trigger?: { paths?: string[]; nodes?: string[]; tags?: string[] };
+  auto_run?: boolean;
+  live_ai?: boolean;
+  mutates_db?: boolean;
+  requires_human_approval?: boolean;
+  isolation_project?: string;
+  timeout_sec?: number;
+  max_parallel?: number;
+}
+
+export interface E2EConfig {
+  auto_run?: boolean;
+  default_timeout_sec?: number;
+  max_parallel?: number;
+  require_clean_worktree?: boolean;
+  evidence_retention_days?: number;
+  suites?: Record<string, E2ESuiteConfig>;
+}
+
+export interface E2EImpactResponse {
+  ok?: boolean;
+  project_id: string;
+  snapshot_id: string;
+  summary?: Record<string, number>;
+  suites?: Array<{
+    suite_id: string;
+    label?: string;
+    status: "current" | "stale" | "missing" | "failed" | "blocked" | string;
+    required?: boolean;
+    trigger_matched?: boolean;
+    can_autorun?: boolean;
+    blocked_reason?: string;
+    command?: string;
+    latest_evidence?: Record<string, unknown>;
+    stale_reasons?: Array<Record<string, unknown>>;
+  }>;
+}
+
 export interface ProjectConfigResponse {
   project_id: string;
   language: string;
-  testing?: { unit_command?: string; e2e_command?: string };
+  testing?: { unit_command?: string; e2e_command?: string; e2e?: E2EConfig };
   graph?: {
     exclude_paths?: string[];
     ignore_globs?: string[];

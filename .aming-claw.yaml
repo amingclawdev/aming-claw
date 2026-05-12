@@ -11,6 +11,68 @@ testing:
       args_prefixes: ["-m pytest", "-m unittest"]
     - executable: "bash"
       args_prefixes: ["scripts/e2e-"]
+    - executable: "node"
+      args_prefixes: ["frontend/dashboard/scripts/e2e-trunk.mjs"]
+  e2e:
+    auto_run: false
+    default_timeout_sec: 900
+    max_parallel: 1
+    require_clean_worktree: true
+    evidence_retention_days: 14
+    suites:
+      dashboard.semantic.safe:
+        label: "Dashboard semantic trunk safe path"
+        command: "node frontend/dashboard/scripts/e2e-trunk.mjs --reset --skip-dashboard"
+        auto_run: false
+        live_ai: false
+        mutates_db: true
+        requires_human_approval: false
+        isolation_project: "dashboard-e2e-fixture"
+        timeout_sec: 900
+        trigger:
+          paths:
+            - "agent/governance/**"
+            - "agent/project_config.py"
+            - "frontend/dashboard/**"
+          tags:
+            - "dashboard"
+            - "semantic"
+            - "graph"
+      dashboard.semantic.live.reject:
+        label: "Dashboard live semantic reject path"
+        command: "node frontend/dashboard/scripts/e2e-trunk.mjs --reset --semantic-live --semantic-decision reject --skip-dashboard"
+        auto_run: false
+        live_ai: true
+        mutates_db: true
+        requires_human_approval: true
+        isolation_project: "dashboard-e2e-fixture"
+        timeout_sec: 1800
+        trigger:
+          paths:
+            - "agent/governance/semantic_worker.py"
+            - "agent/governance/reconcile_feedback.py"
+            - "agent/governance/graph_events.py"
+            - "frontend/dashboard/src/views/ReviewQueueView.tsx"
+          tags:
+            - "semantic-review"
+            - "reject"
+      dashboard.semantic.live.accept:
+        label: "Dashboard live semantic accept path"
+        command: "node frontend/dashboard/scripts/e2e-trunk.mjs --reset --semantic-live --semantic-decision accept --skip-dashboard"
+        auto_run: false
+        live_ai: true
+        mutates_db: true
+        requires_human_approval: true
+        isolation_project: "dashboard-e2e-fixture"
+        timeout_sec: 1800
+        trigger:
+          paths:
+            - "agent/governance/semantic_worker.py"
+            - "agent/governance/reconcile_semantic_enrichment.py"
+            - "frontend/dashboard/src/components/InspectorDrawer.tsx"
+          tags:
+            - "semantic-review"
+            - "accept"
 
 build:
   command: ""

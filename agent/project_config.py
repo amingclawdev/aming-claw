@@ -33,11 +33,47 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class E2ETriggerConfig:
+    paths: List[str] = field(default_factory=list)
+    """Path globs or prefixes that make a suite relevant."""
+    nodes: List[str] = field(default_factory=list)
+    """Graph node ids or stable node titles that make a suite relevant."""
+    tags: List[str] = field(default_factory=list)
+    """Free-form feature tags for dashboard grouping."""
+
+
+@dataclass
+class E2ESuiteConfig:
+    suite_id: str = ""
+    label: str = ""
+    command: str = ""
+    trigger: E2ETriggerConfig = field(default_factory=E2ETriggerConfig)
+    auto_run: bool = False
+    live_ai: bool = False
+    mutates_db: bool = True
+    requires_human_approval: bool = False
+    isolation_project: str = ""
+    timeout_sec: int = 900
+    max_parallel: int = 1
+
+
+@dataclass
+class E2EConfig:
+    auto_run: bool = False
+    default_timeout_sec: int = 900
+    max_parallel: int = 1
+    require_clean_worktree: bool = True
+    evidence_retention_days: int = 14
+    suites: Dict[str, E2ESuiteConfig] = field(default_factory=dict)
+
+
+@dataclass
 class TestingConfig:
     unit_command: str = "python -m pytest"
     e2e_command: str = ""
     allowed_commands: List[Dict[str, Any]] = field(default_factory=list)
     """Each entry: {"executable": str, "args_prefixes": list[str]}"""
+    e2e: E2EConfig = field(default_factory=E2EConfig)
 
 
 @dataclass
@@ -205,6 +241,8 @@ def validate_commands(config: ProjectConfig) -> List[str]:
 
     _check("testing.unit_command", config.testing.unit_command)
     _check("testing.e2e_command", config.testing.e2e_command)
+    for suite_id, suite in config.testing.e2e.suites.items():
+        _check(f"testing.e2e.suites.{suite_id}.command", suite.command)
     _check("build.command", config.build.command)
     for key, cmd in config.deploy.commands.items():
         _check(f"deploy.commands.{key}", cmd)
@@ -340,6 +378,7 @@ def _parse_raw(raw: dict) -> ProjectConfig:
         unit_command=t_raw.get("unit_command", DEFAULT_CONFIG.testing.unit_command),
         e2e_command=t_raw.get("e2e_command", DEFAULT_CONFIG.testing.e2e_command),
         allowed_commands=t_raw.get("allowed_commands", []),
+        e2e=_parse_e2e_config(t_raw.get("e2e", {}) if isinstance(t_raw, dict) else {}),
     )
 
     # ---- build ----
@@ -524,6 +563,113 @@ def _string_list(raw: Any) -> List[str]:
         seen.add(norm)
         out.append(norm)
     return out
+
+
+def _bool_value(raw: Any, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _int_value(raw: Any, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _parse_e2e_trigger(raw: Any) -> E2ETriggerConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    return E2ETriggerConfig(
+        paths=_string_list(raw.get("paths", [])),
+        nodes=_string_list(raw.get("nodes", [])),
+        tags=_string_list(raw.get("tags", [])),
+    )
+
+
+def _parse_e2e_suite(suite_id: str, raw: Any, parent: E2EConfig) -> E2ESuiteConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    sid = str(raw.get("suite_id") or suite_id or "").strip()
+    return E2ESuiteConfig(
+        suite_id=sid,
+        label=str(raw.get("label") or sid).strip(),
+        command=str(raw.get("command") or "").strip(),
+        trigger=_parse_e2e_trigger(raw.get("trigger", {})),
+        auto_run=_bool_value(raw.get("auto_run"), parent.auto_run),
+        live_ai=_bool_value(raw.get("live_ai"), False),
+        mutates_db=_bool_value(raw.get("mutates_db"), True),
+        requires_human_approval=_bool_value(raw.get("requires_human_approval"), False),
+        isolation_project=str(raw.get("isolation_project") or "").strip(),
+        timeout_sec=_int_value(raw.get("timeout_sec"), parent.default_timeout_sec, minimum=1),
+        max_parallel=_int_value(raw.get("max_parallel"), parent.max_parallel, minimum=1),
+    )
+
+
+def _parse_e2e_config(raw: Any) -> E2EConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    config = E2EConfig(
+        auto_run=_bool_value(raw.get("auto_run"), False),
+        default_timeout_sec=_int_value(raw.get("default_timeout_sec"), 900, minimum=1),
+        max_parallel=_int_value(raw.get("max_parallel"), 1, minimum=1),
+        require_clean_worktree=_bool_value(raw.get("require_clean_worktree"), True),
+        evidence_retention_days=_int_value(raw.get("evidence_retention_days"), 14, minimum=0),
+        suites={},
+    )
+    suites_raw = raw.get("suites", {})
+    if isinstance(suites_raw, list):
+        iterable = ((str(item.get("suite_id") or item.get("id") or ""), item) for item in suites_raw if isinstance(item, dict))
+    elif isinstance(suites_raw, dict):
+        iterable = suites_raw.items()
+    else:
+        iterable = []
+    for key, value in iterable:
+        suite = _parse_e2e_suite(str(key), value, config)
+        if suite.suite_id:
+            config.suites[suite.suite_id] = suite
+    return config
+
+
+def e2e_config_to_dict(config: E2EConfig) -> Dict[str, Any]:
+    return {
+        "auto_run": config.auto_run,
+        "default_timeout_sec": config.default_timeout_sec,
+        "max_parallel": config.max_parallel,
+        "require_clean_worktree": config.require_clean_worktree,
+        "evidence_retention_days": config.evidence_retention_days,
+        "suites": {
+            suite_id: {
+                "suite_id": suite.suite_id,
+                "label": suite.label,
+                "command": suite.command,
+                "trigger": {
+                    "paths": list(suite.trigger.paths),
+                    "nodes": list(suite.trigger.nodes),
+                    "tags": list(suite.trigger.tags),
+                },
+                "auto_run": suite.auto_run,
+                "live_ai": suite.live_ai,
+                "mutates_db": suite.mutates_db,
+                "requires_human_approval": suite.requires_human_approval,
+                "isolation_project": suite.isolation_project,
+                "timeout_sec": suite.timeout_sec,
+                "max_parallel": suite.max_parallel,
+            }
+            for suite_id, suite in sorted(config.suites.items())
+        },
+    }
 
 
 def _routing_map(raw: Any) -> Dict[str, Dict[str, str]]:
@@ -788,6 +934,7 @@ def explain_config(
             "unit_command": config.testing.unit_command,
             "e2e_command": config.testing.e2e_command,
             "allowed_commands": config.testing.allowed_commands,
+            "e2e": e2e_config_to_dict(config.testing.e2e),
         },
         "build": {
             "command": config.build.command,

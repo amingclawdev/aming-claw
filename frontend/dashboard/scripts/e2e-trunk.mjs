@@ -9,6 +9,7 @@
 //   node scripts/e2e-trunk.mjs --reset
 //   node scripts/e2e-trunk.mjs --probe
 //   node scripts/e2e-trunk.mjs --semantic-live   # real AI call + review accept
+//   node scripts/e2e-trunk.mjs --semantic-live --semantic-decision reject
 //   node scripts/e2e-trunk.mjs --skip-dashboard
 //
 // The default run mutates only the isolated fixture workspace under the OS temp
@@ -45,9 +46,13 @@ const PROBE_ONLY = FLAGS.probe === true;
 const SKIP_DASHBOARD = FLAGS["skip-dashboard"] === true;
 const SKIP_SEMANTIC = FLAGS["skip-semantic"] === true;
 const SEMANTIC_LIVE = FLAGS["semantic-live"] === true;
+const SEMANTIC_DECISION = String(FLAGS["semantic-decision"] || "accept").trim().toLowerCase();
 const SEMANTIC_TIMEOUT_MS = Number(FLAGS["semantic-timeout-ms"] || 180000);
 const KEEP_WORKSPACE = FLAGS.keep === true;
 const RUN_ID = FLAGS["run-id"] || `dashboard-trunk-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+if (!["accept", "reject", "both"].includes(SEMANTIC_DECISION)) {
+  throw new Error("--semantic-decision must be accept, reject, or both");
+}
 
 const C = {
   reset: "\x1b[0m",
@@ -83,6 +88,7 @@ const context = {
   reconciledStatus: null,
   reconciledNode: null,
   semantic: null,
+  e2eEvidence: null,
 };
 
 function parseFlags(args) {
@@ -281,11 +287,13 @@ function buildReport() {
     backend: BACKEND,
     dashboard: SKIP_DASHBOARD ? "" : DASHBOARD,
     semantic_live: SEMANTIC_LIVE,
+    semantic_decision: SEMANTIC_DECISION,
     semantic_skipped: SKIP_SEMANTIC,
     baseline_commit: context.baselineCommit,
     target_commit: context.targetCommit,
     active_snapshot_id: context.reconciledStatus?.active_snapshot_id || context.baselineStatus?.active_snapshot_id || "",
     semantic: context.semantic,
+    e2e_evidence: context.e2eEvidence,
     results,
   };
 }
@@ -306,6 +314,37 @@ testing:
   allowed_commands:
     - executable: "node"
       args_prefixes: ["tests/smoke.test.mjs"]
+  e2e:
+    auto_run: false
+    default_timeout_sec: 900
+    max_parallel: 1
+    require_clean_worktree: true
+    evidence_retention_days: 14
+    suites:
+      dashboard.semantic.safe:
+        label: "Dashboard semantic trunk safe path"
+        command: "node ${normalizePath(path.relative(WORKSPACE, path.join(SCRIPT_DIR, "e2e-trunk.mjs")))} --project ${PROJECT} --workspace . --skip-dashboard"
+        live_ai: false
+        mutates_db: true
+        requires_human_approval: false
+        isolation_project: "${PROJECT}"
+        trigger:
+          paths:
+            - "src/**"
+            - "tests/**"
+            - ".aming-claw.yaml"
+          tags: ["dashboard", "semantic"]
+      dashboard.semantic.live.reject:
+        label: "Dashboard live semantic reject path"
+        command: "node ${normalizePath(path.relative(WORKSPACE, path.join(SCRIPT_DIR, "e2e-trunk.mjs")))} --project ${PROJECT} --workspace . --semantic-live --semantic-decision reject --skip-dashboard"
+        live_ai: true
+        mutates_db: true
+        requires_human_approval: true
+        isolation_project: "${PROJECT}"
+        trigger:
+          paths:
+            - "src/**"
+          tags: ["semantic-review", "reject"]
 
 governance:
   enabled: true
@@ -591,6 +630,128 @@ async function eventById(snapshotId, eventId) {
   return http("GET", snapshotPath(PROJECT, snapshotId, `/events/${encodeURIComponent(eventId)}`));
 }
 
+function e2eSuiteId() {
+  if (SKIP_SEMANTIC) return "dashboard.trunk.safe";
+  if (!SEMANTIC_LIVE) return "dashboard.semantic.safe";
+  return `dashboard.semantic.live.${SEMANTIC_DECISION}`;
+}
+
+async function queueSelectedNodeSemanticJob(snapshotId, node) {
+  const queued = await http(
+    "POST",
+    snapshotPath(PROJECT, snapshotId, "/semantic/jobs"),
+    semanticJobPayload(node, { dryRun: false }),
+  );
+  assert(queued.status === "queued", `semantic queue returned ${queued.status}`);
+  assert(queued.queued_count === 1, `selected-node queue should enqueue 1 row, got ${queued.queued_count}`);
+  const queuedTargets = (queued.queued_ops || []).map((op) => String(op.target_id || op.job_id || ""));
+  assert(queuedTargets.length === 1 && queuedTargets[0] === node.node_id, `queued_ops mismatch: ${queuedTargets.join(",")}`);
+  return queued;
+}
+
+async function waitForSemanticProposal(snapshotId, nodeId, seenEventIds = new Set()) {
+  return waitFor(
+    "semantic worker feedback",
+    async () => {
+      const feedbackItem = await semanticFeedbackForNode(snapshotId, nodeId);
+      if (!feedbackItem) return null;
+      const ids = feedbackLinkedEventIds(feedbackItem);
+      return ids.some((eventId) => !seenEventIds.has(eventId)) ? feedbackItem : null;
+    },
+    { timeoutMs: SEMANTIC_TIMEOUT_MS, intervalMs: 3000 },
+  );
+}
+
+async function assertSemanticEventNotProjected(snapshotId, nodeId, eventId) {
+  const projection = await http("GET", activePath(PROJECT, "/semantic/projection"));
+  const projected = semanticProjectionEntry(projection, nodeId);
+  if (projected) {
+    const sourceEvent = projected.source_event || projected.source || {};
+    assert(
+      String(sourceEvent.event_id || sourceEvent.id || "") !== eventId,
+      "rejected semantic event remained projected on the target node",
+    );
+  }
+  const allNodeSemantics = projection.projection?.node_semantics || {};
+  const mountedElsewhere = Object.entries(allNodeSemantics).filter(([otherNodeId, entry]) => {
+    if (otherNodeId === nodeId) return false;
+    const otherSource = entry?.source_event || entry?.source || {};
+    return String(otherSource.event_id || otherSource.id || "") === eventId;
+  });
+  assert(mountedElsewhere.length === 0, `semantic event also mounted on another node: ${mountedElsewhere.map(([id]) => id).join(",")}`);
+  return { projected };
+}
+
+async function applySemanticLiveDecision(snapshotId, node, decisionName, seenEventIds = new Set()) {
+  const feedbackItem = await waitForSemanticProposal(snapshotId, node.node_id, seenEventIds);
+  assert(String(feedbackItem.target_id || "") === node.node_id, "semantic feedback target_id mismatch");
+  const linkedEventIds = feedbackLinkedEventIds(feedbackItem);
+  assert(linkedEventIds.length > 0, "semantic feedback missing linked event ids");
+  const eventId = linkedEventIds.find((id) => !seenEventIds.has(id)) || linkedEventIds[0];
+  const eventResp = await eventById(snapshotId, eventId);
+  const event = eventResp.event || {};
+  assert(String(event.target_type || "") === "node", "semantic event target_type mismatch");
+  assert(String(event.target_id || "") === node.node_id, "semantic event mounted to wrong node");
+  const eventPayload = event.payload?.semantic_payload || event.payload?.semantic || {};
+  assert(Object.keys(eventPayload).length > 0, "semantic event payload is empty");
+
+  const action = decisionName === "reject" ? "reject_false_positive" : "accept_semantic_enrichment";
+  const decisionVerb = decisionName === "reject" ? "rejected" : "accepted";
+  const decision = await http("POST", snapshotPath(PROJECT, snapshotId, "/feedback/decision"), {
+    feedback_ids: [feedbackItem.feedback_id],
+    action,
+    actor: "dashboard_trunk_e2e",
+    rationale: `Dashboard trunk E2E ${decisionVerb} AI semantic enrichment for mount validation.`,
+  });
+  assert(decision.projection_rebuilt === true, `${decisionName} decision did not rebuild projection`);
+
+  if (decisionName === "reject") {
+    const rejected = decision.semantic_enrichment_rejected || {};
+    assert((rejected.event_ids_rejected || []).includes(eventId), "reject decision did not reject linked semantic event");
+    const eventAfter = await eventById(snapshotId, eventId);
+    assert(String(eventAfter.event?.status || "") === "rejected", "semantic event status was not rejected");
+    const jobAfter = await httpMaybe("GET", snapshotPath(PROJECT, snapshotId, `/semantic/jobs/${encodeURIComponent(node.node_id)}`));
+    if (jobAfter.ok && jobAfter.value?.job?.status) {
+      assert(String(jobAfter.value.job.status) === "rejected", `semantic job status after reject was ${jobAfter.value.job.status}`);
+    }
+    await assertSemanticEventNotProjected(snapshotId, node.node_id, eventId);
+    return {
+      decision: "reject",
+      feedback_id: feedbackItem.feedback_id,
+      event_id: eventId,
+      event_status: "rejected",
+      payload_keys: Object.keys(eventPayload).sort(),
+    };
+  }
+
+  assert(decision.semantic_enrichment_accepted?.event_ids_flipped?.includes(eventId), "accept decision did not flip linked semantic event");
+  const projection = await http("GET", activePath(PROJECT, "/semantic/projection"));
+  const projected = semanticProjectionEntry(projection, node.node_id);
+  assert(projected, "accepted semantic payload missing from projection for target node");
+  const sourceEvent = projected.source_event || projected.source || {};
+  assert(
+    String(sourceEvent.event_id || sourceEvent.id || "") === eventId,
+    "projection source_event does not match accepted semantic event",
+  );
+  const projectedPayload = semanticProjectionPayload(projected);
+  assert(Object.keys(projectedPayload).length > 0, "projected semantic payload is empty");
+  const allNodeSemantics = projection.projection?.node_semantics || {};
+  const mountedElsewhere = Object.entries(allNodeSemantics).filter(([otherNodeId, entry]) => {
+    if (otherNodeId === node.node_id) return false;
+    const otherSource = entry?.source_event || entry?.source || {};
+    return String(otherSource.event_id || otherSource.id || "") === eventId;
+  });
+  assert(mountedElsewhere.length === 0, `semantic event also mounted on another node: ${mountedElsewhere.map(([id]) => id).join(",")}`);
+  return {
+    decision: "accept",
+    feedback_id: feedbackItem.feedback_id,
+    event_id: eventId,
+    event_status: event.status,
+    projected_status: projected.validity?.status || projected.status || "",
+    payload_keys: Object.keys(projectedPayload).sort(),
+  };
+}
+
 async function loadRuntimeBundle(projectId) {
   const status = await http("GET", `/api/graph-governance/${pid(projectId)}/status`);
   const snapshotId = status.active_snapshot_id;
@@ -774,15 +935,23 @@ async function stepSemanticJobsPath() {
   assert(dry.planned_count === 1, `selected-node dry-run should plan 1 node, got ${dry.planned_count}`);
   assert((dry.batch_plan?.target_ids || []).includes(node.node_id), "dry-run batch_plan lost selected node id");
 
-  const queued = await http(
-    "POST",
-    snapshotPath(PROJECT, snapshotId, "/semantic/jobs"),
-    semanticJobPayload(node, { dryRun: false }),
-  );
-  assert(queued.status === "queued", `semantic queue returned ${queued.status}`);
-  assert(queued.queued_count === 1, `selected-node queue should enqueue 1 row, got ${queued.queued_count}`);
-  const queuedTargets = (queued.queued_ops || []).map((op) => String(op.target_id || op.job_id || ""));
-  assert(queuedTargets.length === 1 && queuedTargets[0] === node.node_id, `queued_ops mismatch: ${queuedTargets.join(",")}`);
+  if (!SEMANTIC_LIVE) {
+    const cancelSweep = await cancelAllQueuedSemantic(snapshotId);
+    await clearTerminalSemanticJobs(snapshotId);
+    const opsAfter = await http("GET", `/api/graph-governance/${pid(PROJECT)}/operations/queue`);
+    assert(nodeSemanticOps(opsAfter, node.node_id).length === 0, "safe semantic path left node job rows visible in operations queue");
+    context.semantic = {
+      snapshot_id: snapshotId,
+      node_id: node.node_id,
+      dry_run: { planned_count: dry.planned_count, queued_count: dry.queued_count },
+      queue: { skipped: true, reason: "safe path uses dry_run only" },
+      cancel_sweep: { cancelled_count: cancelSweep.cancelled_count ?? 0, status: cancelSweep.status || "" },
+      live: { skipped: true },
+    };
+    return context.semantic;
+  }
+
+  const queued = await queueSelectedNodeSemanticJob(snapshotId, node);
 
   const jobBeforeCancel = await http(
     "GET",
@@ -790,87 +959,26 @@ async function stepSemanticJobsPath() {
   );
   assert(jobBeforeCancel.job?.node_id === node.node_id, "queued job lookup returned wrong node");
 
-  let cancelResult = null;
-  if (!SEMANTIC_LIVE) {
-    cancelResult = await http(
-      "POST",
-      snapshotPath(PROJECT, snapshotId, `/semantic/jobs/${encodeURIComponent(queued.job_id)}/cancel`),
-      { actor: "dashboard_trunk_e2e" },
-    );
-    const cancelledCount = Number(cancelResult.cancelled_count ?? (cancelResult.job ? 1 : 0));
-    const status = String(cancelResult.status || cancelResult.job?.status || "");
-    assert(
-      cancelledCount >= 1 || status === "noop_terminal",
-      `semantic session cancel did not cancel selected job: ${JSON.stringify(cancelResult).slice(0, 500)}`,
-    );
-    await clearTerminalSemanticJobs(snapshotId);
-    const opsAfter = await http("GET", `/api/graph-governance/${pid(PROJECT)}/operations/queue`);
-    assert(nodeSemanticOps(opsAfter, node.node_id).length === 0, "cancelled semantic job still visible in operations queue");
-    context.semantic = {
-      snapshot_id: snapshotId,
-      node_id: node.node_id,
-      dry_run: { planned_count: dry.planned_count, queued_count: dry.queued_count },
-      queue: { job_id: queued.job_id, queued_count: queued.queued_count, queued_ops: queued.queued_ops || [] },
-      cancel: { cancelled_count: cancelResult.cancelled_count ?? null, status: cancelResult.status || "" },
-      live: { skipped: true },
-    };
-    return context.semantic;
+  const liveDecisions = [];
+  const seenEventIds = new Set();
+  const firstDecision = SEMANTIC_DECISION === "both" ? "reject" : SEMANTIC_DECISION;
+  const first = await applySemanticLiveDecision(snapshotId, node, firstDecision, seenEventIds);
+  liveDecisions.push(first);
+  seenEventIds.add(first.event_id);
+  let secondQueue = null;
+  if (SEMANTIC_DECISION === "both") {
+    secondQueue = await queueSelectedNodeSemanticJob(snapshotId, node);
+    const second = await applySemanticLiveDecision(snapshotId, node, "accept", seenEventIds);
+    liveDecisions.push(second);
+    seenEventIds.add(second.event_id);
   }
-
-  const feedbackItem = await waitFor(
-    "semantic worker feedback",
-    async () => semanticFeedbackForNode(snapshotId, node.node_id),
-    { timeoutMs: SEMANTIC_TIMEOUT_MS, intervalMs: 3000 },
-  );
-  assert(String(feedbackItem.target_id || "") === node.node_id, "semantic feedback target_id mismatch");
-  const linkedEventIds = feedbackLinkedEventIds(feedbackItem);
-  assert(linkedEventIds.length > 0, "semantic feedback missing linked event ids");
-  const eventResp = await eventById(snapshotId, linkedEventIds[0]);
-  const event = eventResp.event || {};
-  assert(String(event.target_type || "") === "node", "semantic event target_type mismatch");
-  assert(String(event.target_id || "") === node.node_id, "semantic event mounted to wrong node");
-  const eventPayload = event.payload?.semantic_payload || event.payload?.semantic || {};
-  assert(Object.keys(eventPayload).length > 0, "semantic event payload is empty");
-
-  const decision = await http("POST", snapshotPath(PROJECT, snapshotId, "/feedback/decision"), {
-    feedback_ids: [feedbackItem.feedback_id],
-    action: "accept_semantic_enrichment",
-    actor: "dashboard_trunk_e2e",
-    rationale: "Dashboard trunk E2E accepted AI semantic enrichment for mount validation.",
-  });
-  assert(decision.semantic_enrichment_accepted?.event_ids_flipped?.includes(linkedEventIds[0]), "accept decision did not flip linked semantic event");
-  assert(decision.projection_rebuilt === true, "accept decision did not rebuild projection");
-
-  const projection = await http("GET", activePath(PROJECT, "/semantic/projection"));
-  const projected = semanticProjectionEntry(projection, node.node_id);
-  assert(projected, "accepted semantic payload missing from projection for target node");
-  const sourceEvent = projected.source_event || projected.source || {};
-  assert(
-    String(sourceEvent.event_id || sourceEvent.id || "") === linkedEventIds[0],
-    "projection source_event does not match accepted semantic event",
-  );
-  const projectedPayload = semanticProjectionPayload(projected);
-  assert(Object.keys(projectedPayload).length > 0, "projected semantic payload is empty");
-  const allNodeSemantics = projection.projection?.node_semantics || {};
-  const mountedElsewhere = Object.entries(allNodeSemantics).filter(([otherNodeId, entry]) => {
-    if (otherNodeId === node.node_id) return false;
-    const otherSource = entry?.source_event || entry?.source || {};
-    return String(otherSource.event_id || otherSource.id || "") === linkedEventIds[0];
-  });
-  assert(mountedElsewhere.length === 0, `semantic event also mounted on another node: ${mountedElsewhere.map(([id]) => id).join(",")}`);
-
   context.semantic = {
     snapshot_id: snapshotId,
     node_id: node.node_id,
     dry_run: { planned_count: dry.planned_count, queued_count: dry.queued_count },
     queue: { job_id: queued.job_id, queued_count: queued.queued_count, queued_ops: queued.queued_ops || [] },
-    live: {
-      feedback_id: feedbackItem.feedback_id,
-      event_id: linkedEventIds[0],
-      event_status: event.status,
-      projected_status: projected.validity?.status || projected.status || "",
-      payload_keys: Object.keys(projectedPayload).sort(),
-    },
+    second_queue: secondQueue ? { job_id: secondQueue.job_id, queued_count: secondQueue.queued_count } : null,
+    live: liveDecisions,
   };
   return context.semantic;
 }
@@ -896,6 +1004,18 @@ async function stepScenarioBranches() {
       note: "Covered by this trunk semantic path and the broader scripts/e2e-semantic.mjs cancel matrix.",
     },
     {
+      id: "L7.semantic-review-reject",
+      depends_on: "L6",
+      status: SEMANTIC_LIVE && ["reject", "both"].includes(SEMANTIC_DECISION) ? "covered" : "ready",
+      note: "Run --semantic-live --semantic-decision reject to verify rejected AI semantic events never mount into projection.",
+    },
+    {
+      id: "L7.e2e-evidence-ledger",
+      depends_on: "L8",
+      status: "covered",
+      note: "Successful trunk runs post covered files and L7 node feature hashes to the E2E evidence ledger.",
+    },
+    {
       id: "L7.ui-inspector",
       depends_on: "L5",
       status: SKIP_DASHBOARD ? "blocked" : "ready",
@@ -909,6 +1029,36 @@ async function stepCleanupAndArtifacts() {
   const reportPath = artifactPath("report.json");
   info(`${KEEP_WORKSPACE ? "fixture workspace kept" : "fixture workspace kept for rerun/debug"}: ${WORKSPACE}`);
   return { report_path: reportPath, kept_workspace: true };
+}
+
+async function recordRunEvidence(status = "passed") {
+  const snapshotId = context.reconciledStatus?.active_snapshot_id || context.baselineStatus?.active_snapshot_id;
+  if (!snapshotId || PROBE_ONLY) return null;
+  const coveredNodeIds = [context.reconciledNode?.node_id || context.baselineNode?.node_id].filter(Boolean);
+  const payload = {
+    suite_id: e2eSuiteId(),
+    status,
+    command: ["node", normalizePath(path.relative(WORKSPACE, fileURLToPath(import.meta.url))), ...process.argv.slice(2)].join(" "),
+    run_id: RUN_ID,
+    artifact_path: artifactPath("report.json"),
+    actor: "dashboard_trunk_e2e",
+    covered_node_ids: coveredNodeIds,
+    covered_files: [
+      ".aming-claw.yaml",
+      "src/api.ts",
+      "src/App.tsx",
+      "tests/smoke.test.mjs",
+    ],
+    metadata: {
+      semantic_live: SEMANTIC_LIVE,
+      semantic_decision: SEMANTIC_DECISION,
+      target_commit: context.targetCommit,
+    },
+  };
+  const evidence = await http("POST", snapshotPath(PROJECT, snapshotId, "/e2e/evidence"), payload);
+  context.e2eEvidence = evidence;
+  info(`e2e evidence recorded: ${evidence.evidence_id}`);
+  return evidence;
 }
 
 async function main() {
@@ -932,6 +1082,8 @@ async function main() {
     await runStep("L6", "Semantic jobs path", stepSemanticJobsPath);
     await runStep("L7", "Scenario branch registry", stepScenarioBranches);
     await runStep("L8", "Cleanup and artifacts", stepCleanupAndArtifacts);
+    await recordRunEvidence("passed");
+    writeReport();
     console.log("");
     console.log(c("green", "TRUNK E2E OK"));
   } catch (error) {

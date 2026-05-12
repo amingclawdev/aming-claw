@@ -718,7 +718,7 @@ def handle_project_config(ctx: RequestContext):
 
     project_id = ctx.get_project_id()
     try:
-        from project_config import effective_graph_exclude_roots, load_project_config
+        from project_config import e2e_config_to_dict, effective_graph_exclude_roots, load_project_config
         from pathlib import Path
         # Try governance project workspace_path, then /workspace fallback
         proj_data = project_service.list_projects()
@@ -738,7 +738,11 @@ def handle_project_config(ctx: RequestContext):
         return {
             "project_id": config.project_id,
             "language": config.language,
-            "testing": {"unit_command": config.testing.unit_command, "e2e_command": config.testing.e2e_command},
+            "testing": {
+                "unit_command": config.testing.unit_command,
+                "e2e_command": config.testing.e2e_command,
+                "e2e": e2e_config_to_dict(config.testing.e2e),
+            },
             "build": {"command": config.build.command, "release_checks": config.build.release_checks},
             "deploy": {"strategy": config.deploy.strategy, "service_rules_count": len(config.deploy.service_rules)},
             "governance": {
@@ -759,6 +763,82 @@ def handle_project_config(ctx: RequestContext):
         }
     except Exception as e:
         return 404, {"error": f"config not found: {e}"}
+
+
+@route("GET", "/api/projects/{project_id}/e2e/config")
+def handle_project_e2e_config(ctx: RequestContext):
+    """Return the resolved E2E suite registry for a project."""
+    project_id = ctx.get_project_id()
+    try:
+        root = _graph_governance_project_root(project_id, {})
+        from project_config import e2e_config_to_dict, load_project_config
+
+        config = load_project_config(root)
+        return {
+            "ok": True,
+            "project_id": config.project_id,
+            "workspace_path": str(root),
+            "e2e": e2e_config_to_dict(config.testing.e2e),
+        }
+    except Exception as exc:
+        return 404, {"error": f"e2e config not found: {exc}"}
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/e2e/evidence")
+def handle_graph_governance_snapshot_e2e_evidence(ctx: RequestContext):
+    """Record E2E evidence bound to a graph snapshot."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.e2e.evidence")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        from .e2e_evidence import record_e2e_evidence
+
+        return record_e2e_evidence(conn, project_id, snapshot_id, ctx.body)
+    except KeyError as exc:
+        return 404, {"error": str(exc)}
+    except Exception as exc:
+        return 400, {"error": f"e2e evidence record failed: {exc}"}
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/e2e/impact")
+def handle_graph_governance_snapshot_e2e_impact(ctx: RequestContext):
+    """Plan which E2E suites are current, stale, missing, or blocked."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    conn = get_connection(project_id)
+    try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        root = _graph_governance_project_root(project_id, {})
+        from project_config import e2e_config_to_dict, load_project_config
+        from .e2e_evidence import plan_e2e_impact
+
+        config = load_project_config(root)
+        changed_raw = ctx.query.get("changed_files") or ctx.query.get("changed_file") or ""
+        node_raw = ctx.query.get("changed_node_ids") or ctx.query.get("changed_node_id") or ""
+
+        def _split(value):
+            if isinstance(value, list):
+                return value
+            return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+        return plan_e2e_impact(
+            conn,
+            project_id,
+            snapshot_id,
+            e2e_config_to_dict(config.testing.e2e),
+            changed_files=_split(changed_raw),
+            changed_node_ids=_split(node_raw),
+        )
+    except KeyError as exc:
+        return 404, {"error": str(exc)}
+    except Exception as exc:
+        return 400, {"error": f"e2e impact planning failed: {exc}"}
+    finally:
+        conn.close()
 
 
 @route("GET", "/api/projects/{project_id}/ai-config")
@@ -837,11 +917,12 @@ def handle_project_ai_config(ctx: RequestContext):
     project_config = {}
     project_config_error = ""
     try:
-        from project_config import load_project_config
+        from project_config import e2e_config_to_dict, load_project_config
 
         cfg = load_project_config(root)
         project_config = {
             "ai": {"routing": dict(getattr(cfg.ai, "routing", {}) or {})},
+            "testing": {"e2e": e2e_config_to_dict(cfg.testing.e2e)},
             "graph": {
                 "exclude_paths": list(getattr(cfg.graph, "exclude_paths", []) or []),
                 "ignore_globs": list(getattr(cfg.graph, "ignore_globs", []) or []),

@@ -24,10 +24,51 @@ testing:
   allowed_commands:
     - executable: "python"
       args_prefixes: ["-m pytest", "-m unittest"]
+  e2e:
+    auto_run: false
+    default_timeout_sec: 900
+    max_parallel: 1
+    require_clean_worktree: true
+    evidence_retention_days: 14
+    suites:
+      dashboard.semantic.safe:
+        label: "Dashboard semantic trunk safe path"
+        command: "node frontend/dashboard/scripts/e2e-trunk.mjs --reset --skip-dashboard"
+        auto_run: false
+        live_ai: false
+        mutates_db: true
+        requires_human_approval: false
+        isolation_project: "dashboard-e2e-fixture"
+        timeout_sec: 900
+        trigger:
+          paths:
+            - "agent/governance/**"
+            - "frontend/dashboard/**"
+          tags: ["dashboard", "semantic"]
 ```
 
 `allowed_commands` is the command safety allowlist used by bootstrap and
 project registration checks.
+
+`testing.e2e` is the dashboard-visible suite registry. It is deliberately
+separate from the legacy single `e2e_command`: each suite declares its command,
+whether it may auto-run, whether it uses live AI or mutates governance DB state,
+and the path/node/tag triggers that make previous evidence stale or relevant.
+Live AI suites should keep `auto_run: false` and
+`requires_human_approval: true`.
+
+E2E evidence and impact use:
+
+```http
+GET  /api/projects/{project_id}/e2e/config
+POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/e2e/evidence
+GET  /api/graph-governance/{project_id}/snapshots/{snapshot_id}/e2e/impact
+```
+
+The evidence endpoint records the suite result with covered file hashes and L7
+feature hashes. The impact endpoint compares that ledger to a later graph
+snapshot so the dashboard can show `current`, `stale`, `missing`, or `failed`
+without guessing from filenames alone.
 
 ## Graph Governance
 
@@ -114,6 +155,17 @@ language: typescript
 testing:
   unit_command: "npm test"
   e2e_command: "npm run e2e"
+  e2e:
+    auto_run: false
+    suites:
+      dashboard.semantic.safe:
+        command: "npm run e2e -- --suite dashboard.semantic.safe"
+        live_ai: false
+        mutates_db: true
+        trigger:
+          paths:
+            - "src/**"
+            - "tests/e2e/**"
 
 governance:
   enabled: true

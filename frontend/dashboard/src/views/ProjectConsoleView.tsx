@@ -9,6 +9,7 @@ import {
   api,
   ApiError,
   type AiConfigResponse,
+  type E2EImpactResponse,
   type ProjectConfigResponse,
   type ProjectGitRefsResponse,
   type ProjectListItem,
@@ -30,12 +31,14 @@ interface ProjectRuntime {
   ops?: OperationsQueueResponse;
   backlog?: BacklogResponse;
   aiConfig?: AiConfigResponse;
+  e2eImpact?: E2EImpactResponse;
   config?: ProjectConfigResponse;
   gitRefs?: ProjectGitRefsResponse;
   error?: string;
   errors: {
     status?: RuntimeFailure;
     summary?: RuntimeFailure;
+    e2eImpact?: RuntimeFailure;
     config?: RuntimeFailure;
     gitRefs?: RuntimeFailure;
   };
@@ -384,6 +387,7 @@ function ProjectRow({
   const summary = runtime?.summary;
   const ops = runtime?.ops;
   const backlogOpen = countOpenBacklog(runtime?.backlog);
+  const e2eRequired = runtime?.e2eImpact?.summary?.required;
   const aiRoute = runtime?.aiConfig?.semantic;
   const actionBusy = Boolean(busyLabel);
   const actionDisabled = actionBusy || lifecycle.kind === "config_missing" || lifecycle.kind === "service_error";
@@ -433,6 +437,7 @@ function ProjectRow({
         <MetricLine label="ops" value={ops?.count} />
         <MetricLine label="backlog" value={backlogOpen} />
         <MetricLine label="review" value={ops?.summary?.feedback_queue?.visible_group_count} />
+        <MetricLine label="e2e req" value={e2eRequired} />
       </td>
       <td>
         <div>{formatRoute(aiRoute)}</div>
@@ -569,17 +574,19 @@ async function loadProjectRuntime(projects: ProjectListItem[], signal: AbortSign
 
 async function loadOneProjectRuntime(project: ProjectListItem, signal: AbortSignal): Promise<ProjectRuntime> {
   const projectId = project.project_id;
-  const [status, summary, ops, backlog, aiConfig, config, gitRefs] = await Promise.allSettled([
+  const [status, summary, ops, backlog, aiConfig, e2eImpact, config, gitRefs] = await Promise.allSettled([
     api.statusFor(projectId, signal),
     api.activeSummaryFor(projectId, signal),
     api.operationsQueueFor(projectId, signal),
     api.backlogFor(projectId, signal),
     api.aiConfigFor(projectId, signal),
+    api.e2eImpactFor(projectId, "active", signal),
     api.projectConfigFor(projectId, signal),
     api.gitRefsFor(projectId, signal),
   ]);
   const statusError = failure(status);
   const summaryError = failure(summary);
+  const e2eImpactError = failure(e2eImpact);
   const configError = failure(config);
   const gitRefsError = failure(gitRefs);
   return {
@@ -589,12 +596,14 @@ async function loadOneProjectRuntime(project: ProjectListItem, signal: AbortSign
     ops: settledValue(ops),
     backlog: settledValue(backlog),
     aiConfig: settledValue(aiConfig),
+    e2eImpact: settledValue(e2eImpact),
     config: settledValue(config),
     gitRefs: settledValue(gitRefs),
     error: firstError(statusError, summaryError),
     errors: {
       status: statusError,
       summary: summaryError,
+      e2eImpact: e2eImpactError,
       config: configError,
       gitRefs: gitRefsError,
     },
