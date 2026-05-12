@@ -1,6 +1,6 @@
 # Manual Fix SOP (Standard Operating Procedure)
 
-> Status: DRAFT v6 — trailer-priority chain anchor (DB version-update deprecated)
+> Status: DRAFT v7 - trailer-priority chain anchor + graph-first/E2E impact gate
 > Author: Observer
 > Date: 2026-04-05
 > Scope: Enforceable operating procedure for AI agents performing manual fixes
@@ -82,6 +82,7 @@ Manual fixes are **only** permitted in chicken-and-egg deadlock scenarios where 
 │  │      - create execution record (R7)             │              │
 │  │      - verify doc locations (R10)               │              │
 │  │      - check coverage for committed files (R9)  │              │
+│  │      - check E2E impact for new features (R14)  │              │
 │  └──────────────────────┬─────────────────────────┘              │
 │                         v                                        │
 │  Phase 3: COMMIT                                                 │
@@ -196,6 +197,7 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R11 | chain anchor via trailer (trailer-priority) | Every manual fix commit | MUST author the MF commit with a `Chain-Source-Stage:` git trailer (e.g. `Chain-Source-Stage: observer-hotfix`) so it is recognized as the latest chain anchor. `handle_version_check` in `agent/governance/server.py` now uses `chain_trailer.get_chain_state()` as the primary source of `chain_version` — the legacy `POST /api/version-update/{project_id}` write path is **deprecated** and the API returns `{"deprecated_write_ignored": true, "source": "git_trailer"}` (the DB `project_version.chain_version` row is no longer authoritative). Without a trailer on HEAD, `chain_trailer` walks first-parent back to the previous trailered commit and `HEAD != CHAIN_VERSION` blocks all dispatch through the version gate. Verify with `GET /api/version-check/{project_id}` returns `ok: true`, `dirty: false`, and `chain_version == HEAD`. Working reference: MF commit `0d4329d` (a trailered observer-hotfix that became the chain anchor). The deprecated `POST /api/version-sync` + `POST /api/version-update` flow MUST NOT be used as the primary mechanism — calling it is a no-op against chain state. |
 | R12 | Per-project chain history cache | Every manual fix commit | After commit, the per-project chain history cache at `agent/governance/chain_history/{project_id}.json` will be updated on next governance startup or bootstrap. Manual fixes that add commits without trailers will be detected as `legacy_inferred` entries in the cache. No manual action needed — the cache updates incrementally. |
 | R13 | Graph-first reuse check | Every AI-authored manual fix or implementation task | MUST inspect the active graph or graph snapshot for target files, nearby modules, existing nodes, and reusable subsystems before creating new modules or abstractions. The execution record must list reused graph nodes/modules or state that the graph was unavailable and why. |
+| R14 | E2E impact gate | New feature, user-visible behavior change, dashboard operator path, graph/reconcile/bootstrap/project-config behavior, semantic job/review/cancel/backlog behavior, or any change to a feature already covered by an E2E suite | MUST record an E2E impact decision before close: run or add/update the relevant E2E and record evidence, or file a follow-up backlog row when the E2E is deferred. Live-AI, DB-mutating, or human-approval E2E may be deferred, but only with an explicit backlog row and reason. |
 
 ---
 
@@ -210,6 +212,41 @@ Before editing code, the agent must use the graph as the first map of the system
 5. Only create a new module after recording why no existing node/module is a good owner.
 
 This rule exists because the graph can reveal reusable work that text search alone may miss. If the graph says a subsystem already exists, the default action is to inspect and reuse it, not rebuild it.
+
+---
+
+### R14 E2E Impact Checklist
+
+Every new feature or externally visible behavior change must answer these questions
+before the backlog row is closed:
+
+1. Does the change affect a dashboard user path or API contract?
+2. Does it affect graph build, scope/full reconcile, bootstrap, project config, or
+   code-search/query behavior?
+3. Does it affect semantic jobs, queueing, cancellation, review accept/reject,
+   backlog filing, or evidence projection?
+4. Is there an existing E2E suite in `.aming-claw.yaml` whose trigger paths,
+   nodes, or tags cover this change?
+5. If yes, did the suite run and write current evidence, or is there a recorded
+   stale/missing reason?
+6. If no, should a new E2E suite or scenario be added now?
+
+The allowed outcomes are:
+
+- `e2e_current`: relevant E2E passed and evidence was recorded for the current
+  commit/snapshot.
+- `e2e_added`: a new or updated E2E scenario was committed and evidence was
+  recorded.
+- `e2e_deferred`: a backlog row was filed with scope, reason, and acceptance
+  criteria. This is acceptable for live-AI, DB-mutating, slow, or human-approval
+  suites, but it must be explicit.
+- `e2e_not_applicable`: the change is docs-only or otherwise outside runtime and
+  operator behavior; record the reason in the MF notes or final summary.
+
+When the E2E impact planner exists for the project, use it as the source of truth
+for `current`, `stale`, `missing`, and `blocked` suite status. Chain integration
+is tracked separately in backlog rows and is not required for manual execution of
+this rule.
 
 ---
 
@@ -347,6 +384,14 @@ pre_commit_checks:
   - pytest test_reconcile.py: PASS (27 tests)
   - pytest agent/tests/ -x: PASS (275 tests)
   - preflight baseline: 0 blockers, 2 warnings
+e2e_impact:
+  decision:              e2e_current | e2e_added | e2e_deferred | e2e_not_applicable
+  suites:
+    - dashboard.semantic.safe: current
+  evidence:
+    - e2e-20260512-abcdef
+  deferred_backlog:
+    - OPT-CHAIN-E2E-AUTORUN-POLICY
 
 post_commit_checks:
   - governance restart: OK

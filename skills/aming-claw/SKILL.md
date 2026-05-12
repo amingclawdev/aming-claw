@@ -8,6 +8,7 @@ description: Use when working in the Aming Claw repo or any governance, dashboar
 ## Operating Contract
 
 Treat the active graph as the project map and the backlog as the work ledger. Before editing code, docs, config, dashboard assets, or runtime state, establish current graph/runtime status, identify the owning nodes/modules, and record the work item.
+For new features or user-visible behavior changes, treat E2E impact as part of the work ledger: run/update the relevant suite and evidence, or file an explicit follow-up backlog row when the E2E is deferred.
 
 ## Start Sequence
 
@@ -42,7 +43,8 @@ Before closing a row:
 4. Restart/redeploy governance or ServiceManager when runtime code changed.
 5. Re-run `version_check` and confirm runtime matches HEAD.
 6. Check graph status and operations queue; if graph is stale, queue/perform scope reconcile before claiming dashboard state is current.
-7. Close the backlog row with commit evidence.
+7. Confirm E2E impact is current, deferred with a backlog row, or explicitly not applicable.
+8. Close the backlog row with commit evidence.
 
 ## References
 
