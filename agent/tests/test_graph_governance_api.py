@@ -3933,10 +3933,11 @@ def test_operations_queue_synthesizes_stale_scope_reconcile(conn, monkeypatch, t
     )
     monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr(server, "_git_head_commit", lambda _root: "head-commit")
+    changed_paths = [f"docs/governance/manual-fix-{i}.md" for i in range(30)]
     monkeypatch.setattr(
         server,
         "_git_changed_paths_between",
-        lambda _root, _base, _head, limit=25: ["docs/governance/manual-fix-sop.md"],
+        lambda _root, _base, _head, limit=25: changed_paths if limit is None else changed_paths[:limit],
     )
     snapshot = store.create_graph_snapshot(
         conn,
@@ -3963,6 +3964,7 @@ def test_operations_queue_synthesizes_stale_scope_reconcile(conn, monkeypatch, t
     assert row["status"] == "not_queued"
     assert row["target_id"] == "head-commit"
     assert row["active_graph_commit"] == "old-commit"
-    assert row["changed_files"] == ["docs/governance/manual-fix-sop.md"]
+    assert row["changed_files"] == changed_paths[:25]
+    assert "30 changed files" in row["last_result"]
     assert queue["summary"]["graph_stale"]["is_stale"] is True
-    assert queue["summary"]["graph_stale"]["changed_file_count"] == 1
+    assert queue["summary"]["graph_stale"]["changed_file_count"] == 30

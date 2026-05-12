@@ -270,12 +270,13 @@ def test_js_ts_adapter_edges_api_relations_tests_config_and_ignores(tmp_path):
         str(project / "web" / "src" / "App.tsx"),
         "import { useNodes } from './hooks/useNodes'\n"
         "import axios from 'axios'\n"
-        "export function App() {\n"
+        "export default function App() {\n"
         "  axios.post('/api/graph-governance/aming-claw/query', {})\n"
         "  return useNodes()\n"
         "}\n",
     )
     _write(str(project / "web" / "src" / "App.test.tsx"), "import { App } from './App'\n")
+    _write(str(project / "web" / "src" / "vite-env.d.ts"), "/// <reference types=\"vite/client\" />\n")
     _write(str(project / "web" / "package.json"), "{\"name\":\"dashboard\"}\n")
     _write(str(project / "web" / "tsconfig.json"), "{\"compilerOptions\":{}}\n")
     _write(str(project / "web" / "vite.config.ts"), "export default {}\n")
@@ -293,6 +294,7 @@ def test_js_ts_adapter_edges_api_relations_tests_config_and_ignores(tmp_path):
     assert nodes_by_module["web.src.api.client"]["language"] == "typescript"
     assert nodes_by_module["web.src.App"]["function_count"] == 1
     assert "web.src.App.test" not in nodes_by_module
+    assert "web.src.vite-env.d" not in nodes_by_module
     assert "web.vite.config" not in nodes_by_module
     assert not any("node_modules" in node["primary_file"].replace("\\", "/") for node in result["nodes"])
 

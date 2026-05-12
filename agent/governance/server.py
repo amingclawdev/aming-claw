@@ -2417,7 +2417,7 @@ def _git_head_commit(project_root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _git_changed_paths_between(project_root: Path, base_commit: str, target_commit: str, *, limit: int = 25) -> list[str]:
+def _git_changed_paths_between(project_root: Path, base_commit: str, target_commit: str, *, limit: int | None = 25) -> list[str]:
     base_commit = str(base_commit or "").strip()
     target_commit = str(target_commit or "").strip()
     if not base_commit or not target_commit:
@@ -2435,7 +2435,9 @@ def _git_changed_paths_between(project_root: Path, base_commit: str, target_comm
     if result.returncode != 0:
         return []
     paths = [line.strip().replace("\\", "/") for line in result.stdout.splitlines() if line.strip()]
-    return paths[: max(0, int(limit or 25))]
+    if limit is None:
+        return paths
+    return paths[: max(0, int(limit))]
 
 
 def _graph_stale_scope_operation(
@@ -2460,11 +2462,12 @@ def _graph_stale_scope_operation(
     stale_summary["head_commit"] = head_commit
     if not head_commit or not graph_commit or head_commit == graph_commit:
         return None, stale_summary
-    changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=25)
+    all_changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=None)
+    changed_files = all_changed_files[:25]
     stale_summary.update({
         "is_stale": True,
         "changed_files": changed_files,
-        "changed_file_count": len(changed_files),
+        "changed_file_count": len(all_changed_files),
     })
     pending_for_head = any(
         str(row.get("commit_sha") or row.get("target_commit") or "") == head_commit
@@ -2473,7 +2476,7 @@ def _graph_stale_scope_operation(
     )
     if pending_for_head:
         return None, stale_summary
-    changed_hint = f"; {len(changed_files)} changed files since snapshot" if changed_files else ""
+    changed_hint = f"; {len(all_changed_files)} changed files since snapshot" if all_changed_files else ""
     operation = {
         "operation_id": f"scope-reconcile:stale:{head_commit[:12]}",
         "operation_type": "scope_reconcile",

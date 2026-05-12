@@ -114,6 +114,31 @@ def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str)
     })
 
 
+def _git_dirty_files(project_root: str | Path) -> list[str]:
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    dirty: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[1].strip()
+        path = path.replace("\\", "/").strip("/")
+        if path:
+            dirty.append(path)
+    return sorted(set(dirty))
+
+
 def _deps_graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:
     deps = graph_json.get("deps_graph") if isinstance(graph_json, dict) else {}
     nodes = deps.get("nodes") if isinstance(deps, dict) else []
@@ -1307,6 +1332,14 @@ def run_pending_scope_reconcile_candidate(
             "target_commit_sha": target,
             "pending_count": len(pending),
         }
+    dirty_files = _git_dirty_files(root)
+    if dirty_files:
+        preview = ", ".join(dirty_files[:8])
+        suffix = f", ... +{len(dirty_files) - 8} more" if len(dirty_files) > 8 else ""
+        raise ValueError(
+            "pending scope materializer requires a clean git worktree; "
+            f"uncommitted files: {preview}{suffix}"
+        )
 
     active = get_active_graph_snapshot(conn, project_id) or {}
     active_inventory = _snapshot_inventory_rows(conn, project_id, active.get("snapshot_id", ""))

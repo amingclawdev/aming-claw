@@ -27,6 +27,7 @@ class LanguagePolicy:
         ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
     })
     python_extensions: frozenset[str] = frozenset({".py", ".pyi"})
+    declaration_suffixes: tuple[str, ...] = (".d.ts", ".d.mts", ".d.cts")
     test_dir_names: frozenset[str] = frozenset({"test", "tests", "__tests__"})
     doc_dir_names: frozenset[str] = frozenset({"doc", "docs", "documentation"})
     exclude_roots: frozenset[str] = frozenset({
@@ -155,7 +156,14 @@ class LanguagePolicy:
         return self.is_under_any(rel, test_roots)
 
     def is_source_path(self, rel_path: str) -> bool:
-        return Path(str(rel_path or "")).suffix.lower() in self.source_extensions
+        return (
+            Path(str(rel_path or "")).suffix.lower() in self.source_extensions
+            and not self.is_declaration_path(rel_path)
+        )
+
+    def is_declaration_path(self, rel_path: str) -> bool:
+        rel = str(rel_path or "").replace("\\", "/").strip("/").lower()
+        return rel.endswith(self.declaration_suffixes)
 
     def is_production_source_path(
         self,

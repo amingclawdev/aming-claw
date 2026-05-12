@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
@@ -22,21 +22,48 @@ _REQUIRE_RE = re.compile(
     r"""(?m)(?:const|let|var)\s+(?P<body>[\w${}\s,]+?)\s*=\s*require\(\s*["'](?P<specifier>[^"']+)["']\s*\)"""
 )
 _FUNCTION_RE = re.compile(
-    r"""(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+(?P<name>[A-Za-z_$][\w$]*)\s*\("""
+    r"""(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(?P<name>[A-Za-z_$][\w$]*)\s*\("""
 )
 _ARROW_RE = re.compile(
     r"""(?m)^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"""
 )
 _CLASS_RE = re.compile(
-    r"""(?m)^\s*(?:export\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)\b"""
+    r"""(?m)^\s*(?:export\s+)?(?:default\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)\b"""
 )
 _FETCH_RE = re.compile(
-    r"""\bfetch\(\s*["'](?P<endpoint>[^"']+)["']""",
+    r"""\bfetch\(\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
+    re.DOTALL | re.MULTILINE,
+)
+_JSON_HELPER_CALL_RE = re.compile(
+    r"""\b(?P<helper>getJSON|postJSON)\s*(?:<[^>]+>)?\s*\(\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
+    re.DOTALL | re.MULTILINE,
+)
+_HTTP_HELPER_CALL_RE = re.compile(
+    r"""\bhttp\s*\(\s*(?P<method_quote>["'`])(?P<method>[A-Z]+)(?P=method_quote)\s*,\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
+    re.DOTALL | re.MULTILINE,
+)
+_HELPER_VAR_CALL_RE = re.compile(
+    r"""\b(?P<helper>getJSON|postJSON)\s*(?:<[^>]+>)?\s*\(\s*(?P<var>[A-Za-z_$][\w$]*)\b""",
+    re.MULTILINE,
+)
+_CONST_ASSIGN_RE = re.compile(
+    r"""\bconst\s+(?P<name>[A-Za-z_$][\w$]*)\s*=""",
+    re.MULTILINE,
+)
+_STRING_LITERAL_RE = re.compile(
+    r"""(?P<quote>["'`])(?P<value>.*?)(?P=quote)""",
+    re.DOTALL,
+)
+_OBJECT_EXPORT_RE = re.compile(
+    r"""(?m)^\s*export\s+const\s+(?P<object>[A-Za-z_$][\w$]*)\s*=\s*\{"""
+)
+_OBJECT_METHOD_LINE_RE = re.compile(
+    r"""^\s*(?:async\s+)?(?P<name>[A-Za-z_$][\w$]*)\s*(?:<[^>{}]+>)?\s*\(""",
     re.MULTILINE,
 )
 _HTTP_METHOD_RE = re.compile(
-    r"""\b(?P<client>axios|api|client|http)\.(?P<method>get|post|put|delete|patch)\(\s*["'](?P<endpoint>[^"']+)["']""",
-    re.IGNORECASE | re.MULTILINE,
+    r"""\b(?P<client>axios|api|client|http)\.(?P<method>get|post|put|delete|patch)\s*(?:<[^>]+>)?\(\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
 
@@ -45,6 +72,9 @@ class JavaScriptTypescriptAdapter:
 
     def supports(self, file_path: str) -> bool:
         if not file_path:
+            return False
+        normalized = file_path.replace("\\", "/").lower()
+        if DEFAULT_LANGUAGE_POLICY.is_declaration_path(normalized):
             return False
         return Path(file_path).suffix.lower() in _JS_TS_EXTENSIONS
 
@@ -89,6 +119,7 @@ class JavaScriptTypescriptAdapter:
             for match in regex.finditer(source or ""):
                 name = match.group("name")
                 lineno = _line_number(source, match.start())
+                end_lineno = _block_end_lineno(source, match.start(), lineno)
                 key = (kind, name, lineno)
                 if key in seen:
                     continue
@@ -97,9 +128,15 @@ class JavaScriptTypescriptAdapter:
                     "name": name,
                     "kind": kind,
                     "lineno": lineno,
-                    "end_lineno": lineno,
+                    "end_lineno": end_lineno,
                     "decorators": [],
                 })
+        for symbol in _exported_object_method_symbols(source or ""):
+            key = (str(symbol.get("kind") or ""), str(symbol.get("name") or ""), int(symbol.get("lineno") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            symbols.append(symbol)
         symbols.sort(key=lambda item: (int(item.get("lineno") or 0), str(item.get("name") or "")))
         return symbols
 
@@ -128,10 +165,27 @@ class JavaScriptTypescriptAdapter:
         imports: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         relations: List[Dict[str, Any]] = []
+        endpoint_vars = _endpoint_variables(source or "")
         for match in _FETCH_RE.finditer(source or ""):
             endpoint = _normalize_endpoint(match.group("endpoint"))
             if endpoint:
                 relations.append(_api_relation("fetch", "GET", endpoint, source, match.start()))
+        for match in _JSON_HELPER_CALL_RE.finditer(source or ""):
+            endpoint = _normalize_endpoint(match.group("endpoint"))
+            if endpoint:
+                helper = match.group("helper")
+                method = "POST" if helper == "postJSON" else "GET"
+                relations.append(_api_relation(helper, method, endpoint, source, match.start()))
+        for match in _HTTP_HELPER_CALL_RE.finditer(source or ""):
+            endpoint = _normalize_endpoint(match.group("endpoint"))
+            if endpoint:
+                relations.append(_api_relation("http", match.group("method").upper(), endpoint, source, match.start()))
+        for match in _HELPER_VAR_CALL_RE.finditer(source or ""):
+            endpoint = _endpoint_var_before(endpoint_vars, match.group("var"), match.start())
+            if endpoint:
+                helper = match.group("helper")
+                method = "POST" if helper == "postJSON" else "GET"
+                relations.append(_api_relation(f"{helper}:var", method, endpoint, source, match.start()))
         for match in _HTTP_METHOD_RE.finditer(source or ""):
             endpoint = _normalize_endpoint(match.group("endpoint"))
             if endpoint:
@@ -149,10 +203,126 @@ def _line_number(source: str, offset: int) -> int:
     return (source or "")[:offset].count("\n") + 1
 
 
+def _find_matching_brace(source: str, open_offset: int) -> int:
+    if open_offset < 0 or open_offset >= len(source) or source[open_offset] != "{":
+        return -1
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(open_offset, len(source)):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _block_end_lineno(source: str, start_offset: int, fallback_lineno: int) -> int:
+    line_end = source.find("\n", start_offset)
+    if line_end == -1:
+        line_end = len(source)
+    brace = source.find("{", start_offset, line_end + 1)
+    if brace == -1:
+        return fallback_lineno
+    close = _find_matching_brace(source, brace)
+    if close == -1:
+        return fallback_lineno
+    return _line_number(source, close)
+
+
+def _exported_object_method_symbols(source: str) -> List[Dict[str, Any]]:
+    symbols: List[Dict[str, Any]] = []
+    for match in _OBJECT_EXPORT_RE.finditer(source or ""):
+        object_name = match.group("object")
+        open_offset = source.find("{", match.start())
+        close_offset = _find_matching_brace(source, open_offset)
+        if open_offset == -1 or close_offset == -1:
+            continue
+        offset = open_offset + 1
+        while offset < close_offset:
+            line_end = source.find("\n", offset, close_offset)
+            if line_end == -1:
+                line_end = close_offset
+            line = source[offset:line_end]
+            method_match = _OBJECT_METHOD_LINE_RE.match(line)
+            if method_match:
+                name = method_match.group("name")
+                absolute_start = offset + method_match.start("name")
+                signature_end = line_end
+                brace = source.find("{", absolute_start, signature_end + 1)
+                end_lineno = _line_number(source, absolute_start)
+                if brace != -1:
+                    method_close = _find_matching_brace(source, brace)
+                    if method_close != -1:
+                        end_lineno = _line_number(source, method_close)
+                        offset = method_close + 1
+                    else:
+                        offset = line_end + 1
+                else:
+                    offset = line_end + 1
+                symbols.append({
+                    "name": f"{object_name}.{name}",
+                    "kind": "function",
+                    "lineno": _line_number(source, absolute_start),
+                    "end_lineno": end_lineno,
+                    "decorators": [],
+                })
+                continue
+            offset = line_end + 1
+    return symbols
+
+
+def _endpoint_variables(source: str) -> Dict[str, List[Tuple[int, str]]]:
+    out: Dict[str, List[Tuple[int, str]]] = {}
+    for match in _CONST_ASSIGN_RE.finditer(source or ""):
+        name = match.group("name")
+        semi = source.find(";", match.end())
+        if semi == -1:
+            continue
+        expr = source[match.end():semi]
+        if len(expr) > 1200:
+            continue
+        parts = [part.group("value") for part in _STRING_LITERAL_RE.finditer(expr)]
+        if not parts or not any("/api/" in part for part in parts):
+            continue
+        endpoint = _normalize_endpoint("".join(parts))
+        if endpoint:
+            out.setdefault(name, []).append((match.start(), endpoint))
+    return out
+
+
+def _endpoint_var_before(endpoint_vars: Dict[str, List[Tuple[int, str]]], name: str, offset: int) -> str:
+    candidates = [
+        (position, endpoint)
+        for position, endpoint in endpoint_vars.get(name, [])
+        if position < offset
+    ]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
 def _locals_from_import_body(body: str) -> List[str]:
     text = " ".join(str(body or "").replace("\n", " ").split())
     if not text:
         return []
+    if text.startswith("type "):
+        text = text[5:].strip()
     if text.startswith("{") and text.endswith("}"):
         names = text.strip("{} ")
     elif text.startswith("* as "):
@@ -174,6 +344,8 @@ def _split_named_imports(names: str) -> List[str]:
         item = part.strip()
         if not item:
             continue
+        if item.startswith("type "):
+            item = item[5:].strip()
         if " as " in item:
             item = item.rsplit(" as ", 1)[1].strip()
         out.append(item)
@@ -203,6 +375,8 @@ def _normalize_endpoint(endpoint: str) -> str:
     raw = str(endpoint or "").strip()
     if not raw:
         return ""
+    raw = re.sub(r"""\$\{[^}]*\}""", "{expr}", raw)
+    raw = "".join(raw.split())
     if raw.startswith("/api/"):
         return raw
     marker = "/api/"

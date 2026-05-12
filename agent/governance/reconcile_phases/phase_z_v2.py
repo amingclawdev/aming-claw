@@ -39,7 +39,7 @@ _GRAPH_LANGUAGE_ADAPTERS: Tuple[LanguageAdapter, ...] = (
     JavaScriptTypescriptAdapter(),
 )
 _FILETREE_ADAPTER = FileTreeAdapter()
-_IMPORT_RESOLUTION_SUFFIXES: Tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx")
+_IMPORT_RESOLUTION_SUFFIXES: Tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
 # ---------------------------------------------------------------------------
@@ -538,11 +538,13 @@ def build_call_graph(modules: Dict[str, ModuleInfo]) -> CallGraph:
     name_to_qualified: Dict[str, List[str]] = {}
     # module_name -> {func_short_name -> qualified_name}
     module_local_funcs: Dict[str, Dict[str, str]] = {}
+    function_languages: Dict[str, str] = {}
 
     for mod_name, mod_info in modules.items():
         module_local_funcs[mod_name] = {}
         for func in mod_info.functions:
             all_funcs[func.qualified_name] = func
+            function_languages[func.qualified_name] = str(mod_info.language or "")
             module_local_funcs[mod_name][func.name] = func.qualified_name
 
             short = func.name
@@ -569,6 +571,8 @@ def build_call_graph(modules: Dict[str, ModuleInfo]) -> CallGraph:
                     all_funcs=all_funcs,
                     name_to_qualified=name_to_qualified,
                     module_local_funcs=module_local_funcs,
+                    caller_language=str(mod_info.language or ""),
+                    function_languages=function_languages,
                 )
 
                 if resolved is None:
@@ -597,6 +601,8 @@ def _resolve_call(
     all_funcs: Dict[str, FunctionMeta],
     name_to_qualified: Dict[str, List[str]],
     module_local_funcs: Dict[str, Dict[str, str]],
+    caller_language: str = "",
+    function_languages: Optional[Dict[str, str]] = None,
 ) -> Optional[str | List[str]]:
     """Resolve a call target to a qualified function name.
 
@@ -631,13 +637,23 @@ def _resolve_call(
         if resolved is not None:
             return resolved
 
-    # 3. If simple name and NOT in imports, check if it exists in name_to_qualified
-    # But we do NOT do naive last-segment matching — only if there's exactly one match
-    # AND the name is not in imports (i.e., it's truly unknown)
+    # 3. Conservative fallback for simple names: only consider same top-level
+    # namespace and same language. This avoids cross-package/cross-language false
+    # edges such as Python logger.info resolving to a frontend helper named info.
     if "." not in call_target and call_target not in import_map:
         candidates = name_to_qualified.get(call_target, [])
         # Filter out self (don't count calls within the same function)
         candidates = [c for c in candidates if not c.startswith(f"{caller_module}::")]
+        caller_root = _top_level_namespace(caller_module)
+        candidates = [
+            c for c in candidates
+            if _top_level_namespace(c.split("::", 1)[0]) == caller_root
+        ]
+        if caller_language and function_languages:
+            candidates = [
+                c for c in candidates
+                if not function_languages.get(c) or function_languages.get(c) == caller_language
+            ]
         if len(candidates) == 1:
             return candidates[0]
         elif len(candidates) > 1:
@@ -645,6 +661,10 @@ def _resolve_call(
 
     # Not resolved — external or builtin
     return None
+
+
+def _top_level_namespace(module_name: str) -> str:
+    return str(module_name or "").split(".", 1)[0]
 
 
 def _find_function_by_fqn(

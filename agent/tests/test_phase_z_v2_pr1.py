@@ -77,6 +77,7 @@ def _make_modules(module_specs: Dict[str, Dict]) -> Dict[str, ModuleInfo]:
             module_name=mod_name,
             import_map=spec.get("import_map", {}),
             functions=funcs,
+            language=spec.get("language", ""),
         )
     return modules
 
@@ -179,25 +180,25 @@ class TestBuildCallGraph:
         """AC2+AC6: Ambiguous call produces weak_edge with candidates."""
         # Three modules each define a function called "get"
         modules = _make_modules({
-            "mod_a": {
+            "pkg.mod_a": {
                 "import_map": {},
                 "functions": [
                     {"name": "get", "calls": []},
                 ],
             },
-            "mod_b": {
+            "pkg.mod_b": {
                 "import_map": {},
                 "functions": [
                     {"name": "get", "calls": []},
                 ],
             },
-            "mod_c": {
+            "pkg.mod_c": {
                 "import_map": {},
                 "functions": [
                     {"name": "get", "calls": []},
                 ],
             },
-            "mod_caller": {
+            "pkg.mod_caller": {
                 "import_map": {},  # No import — ambiguous!
                 "functions": [
                     {"name": "do_stuff", "calls": ["get"]},
@@ -217,10 +218,34 @@ class TestBuildCallGraph:
         assert hasattr(we, "candidates")
         assert hasattr(we, "reason")
 
-        assert we.caller == "mod_caller::do_stuff"
+        assert we.caller == "pkg.mod_caller::do_stuff"
         assert we.target == "get"
         assert len(we.candidates) == 3
         assert "ambiguous" in we.reason
+
+    def test_build_call_graph_does_not_cross_namespace_on_short_name(self):
+        """Unqualified fallback must not connect frontend helpers to backend calls."""
+        modules = _make_modules({
+            "agent.governance.server": {
+                "language": "python",
+                "import_map": {},
+                "functions": [
+                    {"name": "handle", "calls": ["info"]},
+                ],
+            },
+            "frontend.dashboard.scripts.e2e_semantic": {
+                "language": "javascript",
+                "import_map": {},
+                "functions": [
+                    {"name": "info", "calls": []},
+                ],
+            },
+        })
+
+        graph = build_call_graph(modules)
+
+        assert graph.edges.get("agent.governance.server::handle") == []
+        assert graph.weak_edges == []
 
     def test_build_call_graph_import_resolved(self):
         """Import map resolves call to correct target — not naive match."""

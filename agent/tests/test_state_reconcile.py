@@ -305,6 +305,32 @@ def test_pending_scope_materializer_requires_current_head(conn, tmp_path, monkey
         )
 
 
+def test_pending_scope_materializer_rejects_dirty_worktree(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha="old",
+        evidence={"source": "test"},
+    )
+    (project / "README.md").write_text("# Dirty\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="clean git worktree"):
+        run_pending_scope_reconcile_candidate(
+            conn,
+            PID,
+            project,
+            target_commit_sha=head_commit,
+            run_id="scope-dirty-worktree-test",
+        )
+
+
 def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
     project = tmp_path / "project"
     _write_project(project)
