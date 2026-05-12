@@ -1,11 +1,32 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const dashboardDir = path.dirname(fileURLToPath(import.meta.url));
+const defaultWorkspaceRoot = path.resolve(dashboardDir, "../..").replace(/\\/g, "/");
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const backend = env.VITE_BACKEND_URL || "http://localhost:40000";
+  const workspaceRoot = (env.VITE_WORKSPACE_ROOT || defaultWorkspaceRoot).replace(/\\/g, "/");
+  const defaultWorkspaceRootPlugin = {
+    name: "dashboard-default-workspace-root",
+    enforce: "pre" as const,
+    transform(code: string, id: string) {
+      if (!id.replace(/\\/g, "/").endsWith("/src/lib/editor.ts")) return null;
+      const nextCode = code.replace(
+        'typeof __DEFAULT_WORKSPACE_ROOT__ === "string" ? __DEFAULT_WORKSPACE_ROOT__ : ""',
+        JSON.stringify(workspaceRoot),
+      );
+      return nextCode === code ? null : { code: nextCode, map: null };
+    },
+  };
   return {
-    plugins: [react()],
+    plugins: [defaultWorkspaceRootPlugin, react()],
+    define: {
+      __DEFAULT_WORKSPACE_ROOT__: JSON.stringify(workspaceRoot),
+    },
     server: {
       port: 5173,
       strictPort: false,

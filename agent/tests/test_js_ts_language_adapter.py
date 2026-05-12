@@ -32,6 +32,7 @@ export const api = {
 };
 await http("GET", `/api/graph-governance/${PROJECT_ID}/operations/queue`);
 await http("GET", p.path);
+fetch(`${BACKEND}${path}`);
 const path =
   `/api/graph-governance/${PROJECT_ID}/snapshots/${encodeURIComponent(snapshotId)}` +
   `/edges?limit=${limit}`;
@@ -98,3 +99,47 @@ function scopedPaths() {
     assert ("calls_api", "/api/first", "interface") in triples
     assert ("calls_api", "/api/second", "interface") in triples
     assert all("p.path" not in row["target"] for row in relations)
+    assert all("getJSON" not in row["target"] for row in relations)
+    assert not any(row["target"] == "/api/health" and row["evidence"].endswith("via fetch") for row in relations)
+
+
+def test_js_ts_adapter_tracks_multiline_tsx_function_end_lines():
+    adapter = JavaScriptTypescriptAdapter()
+    source = """import { useState } from "react";
+
+interface Props {
+  targetType: string;
+  targetId: string;
+  onCancel: () => void;
+}
+
+export default function RetryFeedbackModal({
+  targetType,
+  targetId,
+  onCancel,
+}: Props) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="modal-backdrop" onClick={onCancel}>
+      <div>Operator's queue</div>
+      <div>{targetType} {targetId}</div>
+      <button
+        disabled={busy}
+        onClick={() => {
+          setBusy(true);
+          onCancel();
+        }}
+      >
+        Close
+      </button>
+    </div>
+  );
+}
+"""
+
+    symbols = adapter.parse_symbols("frontend/dashboard/src/components/RetryFeedbackModal.tsx", source)
+    modal = next(row for row in symbols if row["name"] == "RetryFeedbackModal")
+    lines = source.splitlines()
+    assert lines[modal["lineno"] - 1].startswith("export default function RetryFeedbackModal")
+    assert lines[modal["end_lineno"] - 1] == "}"
+    assert modal["end_lineno"] == len(lines)

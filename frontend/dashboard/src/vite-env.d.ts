@@ -8,6 +8,8 @@ interface ImportMetaEnv {
   readonly VITE_EDITOR_SCHEME?: string;
 }
 
+declare const __DEFAULT_WORKSPACE_ROOT__: string;
+
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }

@@ -30,17 +30,19 @@ _ARROW_RE = re.compile(
 _CLASS_RE = re.compile(
     r"""(?m)^\s*(?:export\s+)?(?:default\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)\b"""
 )
+_API_LITERAL_RE_FRAGMENT = r"""(?P<quote>["'`])(?P<endpoint>[^"'`\r\n]*?/api/[^"'`\r\n]*)(?P=quote)"""
 _FETCH_RE = re.compile(
-    r"""\bfetch\(\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
-    re.DOTALL | re.MULTILINE,
+    r"""\bfetch\(\s*""" + _API_LITERAL_RE_FRAGMENT,
+    re.MULTILINE,
 )
 _JSON_HELPER_CALL_RE = re.compile(
-    r"""\b(?P<helper>getJSON|postJSON)\s*(?:<[^>]+>)?\s*\(\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
-    re.DOTALL | re.MULTILINE,
+    r"""\b(?P<helper>getJSON|postJSON)\s*(?:<[^>]+>)?\s*\(\s*""" + _API_LITERAL_RE_FRAGMENT,
+    re.MULTILINE,
 )
 _HTTP_HELPER_CALL_RE = re.compile(
-    r"""\bhttp\s*\(\s*(?P<method_quote>["'`])(?P<method>[A-Z]+)(?P=method_quote)\s*,\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
-    re.DOTALL | re.MULTILINE,
+    r"""\bhttp\s*\(\s*(?P<method_quote>["'`])(?P<method>[A-Z]+)(?P=method_quote)\s*,\s*"""
+    + _API_LITERAL_RE_FRAGMENT,
+    re.MULTILINE,
 )
 _HELPER_VAR_CALL_RE = re.compile(
     r"""\b(?P<helper>getJSON|postJSON)\s*(?:<[^>]+>)?\s*\(\s*(?P<var>[A-Za-z_$][\w$]*)\b""",
@@ -62,8 +64,9 @@ _OBJECT_METHOD_LINE_RE = re.compile(
     re.MULTILINE,
 )
 _HTTP_METHOD_RE = re.compile(
-    r"""\b(?P<client>axios|api|client|http)\.(?P<method>get|post|put|delete|patch)\s*(?:<[^>]+>)?\(\s*(?P<quote>["'`])(?P<endpoint>.*?/api/.*?)(?P=quote)""",
-    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    r"""\b(?P<client>axios|api|client|http)\.(?P<method>get|post|put|delete|patch)\s*(?:<[^>]+>)?\(\s*"""
+    + _API_LITERAL_RE_FRAGMENT,
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -118,8 +121,8 @@ class JavaScriptTypescriptAdapter:
         for kind, regex in (("function", _FUNCTION_RE), ("function", _ARROW_RE), ("class", _CLASS_RE)):
             for match in regex.finditer(source or ""):
                 name = match.group("name")
-                lineno = _line_number(source, match.start())
-                end_lineno = _block_end_lineno(source, match.start(), lineno)
+                lineno = _line_number(source, match.start("name"))
+                end_lineno = _block_end_lineno(source, match.end(), lineno)
                 key = (kind, name, lineno)
                 if key in seen:
                     continue
@@ -209,8 +212,19 @@ def _find_matching_brace(source: str, open_offset: int) -> int:
     depth = 0
     quote = ""
     escaped = False
+    line_comment = False
+    block_comment = False
     for index in range(open_offset, len(source)):
         char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+            continue
         if quote:
             if escaped:
                 escaped = False
@@ -218,6 +232,12 @@ def _find_matching_brace(source: str, open_offset: int) -> int:
                 escaped = True
             elif char == quote:
                 quote = ""
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
             continue
         if char in {"'", '"', "`"}:
             quote = char
@@ -232,16 +252,108 @@ def _find_matching_brace(source: str, open_offset: int) -> int:
 
 
 def _block_end_lineno(source: str, start_offset: int, fallback_lineno: int) -> int:
-    line_end = source.find("\n", start_offset)
-    if line_end == -1:
-        line_end = len(source)
-    brace = source.find("{", start_offset, line_end + 1)
+    brace = _body_open_brace(source, start_offset)
     if brace == -1:
         return fallback_lineno
     close = _find_matching_brace(source, brace)
     if close == -1:
+        close = _find_matching_brace_raw(source, brace)
+    if close == -1:
         return fallback_lineno
     return _line_number(source, close)
+
+
+def _find_matching_brace_raw(source: str, open_offset: int) -> int:
+    if open_offset < 0 or open_offset >= len(source) or source[open_offset] != "{":
+        return -1
+    depth = 0
+    for index in range(open_offset, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _body_open_brace(source: str, start_offset: int) -> int:
+    paren_depth = 1 if start_offset > 0 and source[start_offset - 1] == "(" else 0
+    bracket_depth = 0
+    angle_depth = 0
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = max(0, start_offset)
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if char == "(":
+            paren_depth += 1
+        elif char == ")" and paren_depth > 0:
+            paren_depth -= 1
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]" and bracket_depth > 0:
+            bracket_depth -= 1
+        elif char == "<" and paren_depth == 0 and bracket_depth == 0:
+            angle_depth += 1
+        elif char == ">" and angle_depth > 0:
+            angle_depth -= 1
+        elif char == "{" and paren_depth == 0 and bracket_depth == 0 and angle_depth == 0:
+            if _previous_nonspace(source, index) in {":", "<", ","}:
+                close = _find_matching_brace(source, index)
+                if close > index:
+                    index = close + 1
+                    continue
+            return index
+        index += 1
+    return -1
+
+
+def _previous_nonspace(source: str, offset: int) -> str:
+    index = offset - 1
+    while index >= 0:
+        char = source[index]
+        if not char.isspace():
+            return char
+        index -= 1
+    return ""
 
 
 def _exported_object_method_symbols(source: str) -> List[Dict[str, Any]]:

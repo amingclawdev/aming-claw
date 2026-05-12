@@ -8,7 +8,10 @@
 // When VITE_WORKSPACE_ROOT is unset the helpers return null and the UI
 // falls back to plain monospace text + a "copy path" button.
 
-const RAW_ROOT = (import.meta.env.VITE_WORKSPACE_ROOT as string | undefined) || "";
+declare const __DEFAULT_WORKSPACE_ROOT__: string | undefined;
+
+const DEFAULT_ROOT = typeof __DEFAULT_WORKSPACE_ROOT__ === "string" ? __DEFAULT_WORKSPACE_ROOT__ : "";
+const RAW_ROOT = (import.meta.env.VITE_WORKSPACE_ROOT as string | undefined) || DEFAULT_ROOT;
 const EDITOR_SCHEME = ((import.meta.env.VITE_EDITOR_SCHEME as string | undefined) || "vscode").toLowerCase();
 
 export const editorConfigured: boolean = RAW_ROOT.trim().length > 0;
