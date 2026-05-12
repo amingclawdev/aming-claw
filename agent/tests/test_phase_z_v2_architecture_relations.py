@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from agent.governance.reconcile_phases.phase_z_v2 import (
     apply_dependency_patches,
@@ -23,6 +24,18 @@ def _write(path, content):
 def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):
     project = tmp_path / "project"
     _write(
+        str(project / ".aming-claw.yaml"),
+        "\n".join([
+            "version: 2",
+            "project_id: artifact-test",
+            "language: python",
+            "graph:",
+            "  exclude_paths:",
+            "    - docs/dev",
+            "",
+        ]),
+    )
+    _write(
         str(project / "agent" / "governance" / "server.py"),
         "from agent.governance.db import create_user\n\n"
         "@route('POST', '/api/users')\n"
@@ -42,7 +55,9 @@ def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):
         "def apply(ctx):\n"
         "    ctx.store._persist_event(event_type='graph.delta.applied')\n"
         "    path = 'graph.rebase.overlay.json'\n"
-        "    Path(path).write_text('{}')\n",
+        "    Path(path).write_text('{}')\n"
+        "    Path('docs/dev/graph-rebuild-mapping.json').write_text('{}')\n"
+        "    Path('shared-volume/codex-tasks/state/governance/aming-claw/scratch/graph-rebuild-mapping.json').write_text('{}')\n",
     )
 
     modules = parse_production_modules(str(project))
@@ -59,6 +74,28 @@ def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):
     assert ("agent.governance.server", "creates_task", "governance_task") in triples
     assert ("agent.governance.auto_chain", "emits_event", "graph.delta.applied") in triples
     assert ("agent.governance.auto_chain", "writes_artifact", "graph.rebase.overlay.json") in triples
+    assert ("agent.governance.auto_chain", "writes_artifact", "docs/dev/graph-rebuild-mapping.json") not in triples
+    assert not any(
+        target.endswith("graph-rebuild-mapping.json")
+        for _source, relation_type, target in triples
+        if relation_type == "writes_artifact"
+    )
+
+
+def test_legacy_graph_rebuild_scripts_keep_mapping_out_of_docs_dev():
+    repo_root = Path(__file__).resolve().parents[2]
+    shared_mapping = (
+        "shared-volume/codex-tasks/state/governance/aming-claw/"
+        "scratch/graph-rebuild-mapping.json"
+    )
+
+    rebuild_source = (repo_root / "scripts" / "rebuild_graph.py").read_text(encoding="utf-8")
+    apply_source = (repo_root / "scripts" / "apply_graph.py").read_text(encoding="utf-8")
+
+    assert shared_mapping in rebuild_source
+    assert shared_mapping in apply_source
+    assert "docs/dev/graph-rebuild-mapping.json" not in rebuild_source
+    assert "docs/dev/graph-rebuild-mapping.json" not in apply_source
 
 
 def test_l7_metadata_persists_function_line_index(tmp_path):

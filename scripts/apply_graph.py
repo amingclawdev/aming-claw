@@ -13,7 +13,7 @@ from pathlib import Path
 def main():
     os.chdir(Path(__file__).resolve().parent.parent)
 
-    mapping_path = "docs/dev/graph-rebuild-mapping.json"
+    mapping_path = "shared-volume/codex-tasks/state/governance/aming-claw/scratch/graph-rebuild-mapping.json"
     graph_path = "shared-volume/codex-tasks/state/governance/aming-claw/graph.json"
     db_path = "shared-volume/codex-tasks/state/governance/aming-claw/governance.db"
 

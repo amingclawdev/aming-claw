@@ -1,7 +1,8 @@
 """Phase 1: Graph Rebuild — generate complete node mapping.
 
 Run: python scripts/rebuild_graph.py
-Output: docs/dev/graph-rebuild-mapping.json (for review before applying)
+Output: shared-volume/codex-tasks/state/governance/aming-claw/scratch/graph-rebuild-mapping.json
+        (for review before applying)
 """
 import glob
 import json
@@ -278,7 +279,7 @@ def main():
             "docs_total": len(doc_files),
         }
     }
-    out_path = "docs/dev/graph-rebuild-mapping.json"
+    out_path = "shared-volume/codex-tasks/state/governance/aming-claw/scratch/graph-rebuild-mapping.json"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)

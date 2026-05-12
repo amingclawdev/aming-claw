@@ -1460,6 +1460,19 @@ def _looks_like_artifact(value: str) -> bool:
     return False
 
 
+def _governed_artifact_literal(project_root: str, value: str, profile: Optional[Any] = None) -> bool:
+    rel = DEFAULT_LANGUAGE_POLICY.normalize_relpath(project_root, value)
+    if not rel:
+        return False
+    if profile is not None and profile.is_excluded_path(rel):
+        return False
+    if DEFAULT_LANGUAGE_POLICY.is_excluded_path(rel):
+        return False
+    if _is_git_ignored_path(project_root, rel):
+        return False
+    return True
+
+
 def _artifact_relation_type(source: str) -> str:
     lowered = (source or "").lower()
     write_tokens = ("write_text", "write_bytes", "json.dump", "open(", "'w'", '"w"', "os.replace", "shutil.copy")
@@ -1484,6 +1497,11 @@ def extract_typed_relations(project_root: str, modules: Dict[str, ModuleInfo]) -
     """
     sql_by_module: Dict[str, str] = {}
     created_tables: Set[str] = set()
+    try:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    except Exception:
+        profile = None
     for module in modules.values():
         blob = "\n".join(_sql_string_constants(module.source or ""))
         sql_by_module[module.module_name] = blob
@@ -1512,7 +1530,7 @@ def extract_typed_relations(project_root: str, modules: Dict[str, ModuleInfo]) -
                                            "SQL read", rel_file))
 
         for value in sorted(set(constants)):
-            if _looks_like_artifact(value):
+            if _looks_like_artifact(value) and _governed_artifact_literal(project_root, value, profile):
                 relations.append(TypedRelation(
                     module.module_name,
                     _artifact_relation_type(source),
