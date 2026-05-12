@@ -26,7 +26,12 @@ python -m agent.mcp.server --project aming-claw --workers 0 --governance-url htt
 ```
 
 Keep `--workers 0` for normal editor/plugin sessions. ServiceManager owns executor lifecycle.
+Redis event forwarding is off by default for local plugin sessions; use
+`MCP_ENABLE_EVENTS=1` or `--enable-events` only when push notifications are
+needed.
 
 ## Publish Caution
 
-Before publishing or sharing the plugin outside the local machine, sanitize `.mcp.json` and environment variables. Local credentials and host paths are acceptable for a private dev checkout but not for a distributed plugin.
+Before publishing or sharing the plugin outside the local machine, sanitize
+`.mcp.json` and environment variables. Never commit local credentials into MCP
+env blocks; provide them through the host environment instead.

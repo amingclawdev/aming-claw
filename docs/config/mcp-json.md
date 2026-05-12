@@ -58,6 +58,8 @@ Each server entry contains:
       ],
       "env": {
         "GOVERNANCE_URL": "http://localhost:40000",
+        "MANAGER_URL": "http://127.0.0.1:40101",
+        "PYTHONUNBUFFERED": "1",
         "PYTHONDONTWRITEBYTECODE": "1"
       }
     }
@@ -70,6 +72,7 @@ Each server entry contains:
 - The active MCP server entrypoint is `agent.mcp.server`. The older `agent.governance.mcp_server` is retained only for compatibility.
 - The MCP server provides governance tools as MCP tool calls: task management, workflow impact, backlog filing, graph governance queries, operations queue checks, version checks, manager-sidecar host operations, and optional MCP-local executor control.
 - Use `--workers 0` for normal editor/plugin sessions so opening MCP does not spawn duplicate queue consumers. Start workers only from an explicit executor-owned session.
+- Redis event notifications are disabled by default for editor/plugin sessions to keep stdio startup quiet and resilient. Set `MCP_ENABLE_EVENTS=1` or pass `--enable-events` only for sessions that need push notifications.
 - Host-ops tools such as `manager_health`, `manager_start`, `governance_redeploy`, `executor_respawn`, and `runtime_status` are a facade over ServiceManager/manager_http_server. They do not make MCP the owner of long-lived services.
 - `manager_start` currently bootstraps the Windows PowerShell host script. Linux/macOS bootstrap scripts are tracked separately in `OPT-BACKLOG-HOST-OPS-CROSS-PLATFORM-SCRIPTS`.
 - See [.aming-claw.yaml](aming-claw-yaml.md) for project-level configuration.

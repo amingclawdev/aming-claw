@@ -112,12 +112,14 @@ class AmingClawMCP:
 
     def __init__(self, project_id: str, governance_url: str, workspace: str,
                  redis_url: str, manager_url: str = "http://127.0.0.1:40101",
-                 max_workers: int = 0, autostart_executor: bool = False):
+                 max_workers: int = 0, autostart_executor: bool = False,
+                 enable_events: bool = False):
         self.project_id = project_id
         self.gov_url = governance_url.rstrip("/")
         self.manager_url = manager_url.rstrip("/")
         self._workspace = workspace
         self._autostart_executor = autostart_executor
+        self._enable_events = enable_events
 
         # Worker pool — only if explicitly requested (default: 0 = no workers)
         # Executor should run as independent process to avoid blocking MCP stdio
@@ -132,10 +134,12 @@ class AmingClawMCP:
             )
 
         # Event bridge (Redis → MCP notifications)
-        self.event_bridge = EventBridge(
-            redis_url=redis_url,
-            notify_fn=self._on_redis_event,
-        )
+        self.event_bridge = None
+        if self._enable_events:
+            self.event_bridge = EventBridge(
+                redis_url=redis_url,
+                notify_fn=self._on_redis_event,
+            )
 
         # Service manager is only constructed when this MCP session explicitly
         # owns executor lifecycle. Ad-hoc MCP sessions should stay read/control
@@ -171,7 +175,12 @@ class AmingClawMCP:
         # Start subsystems
         if self.worker_pool:
             self.worker_pool.start()
-        self.event_bridge.start()
+        if self.event_bridge:
+            try:
+                self.event_bridge.start()
+            except Exception:
+                log.exception("EventBridge failed to start; continuing without event notifications")
+                self.event_bridge = None
         # Note: :40020 HTTP removed — executor syncs git status via governance API
 
         # Optional host-side executor ownership. Default off so ad-hoc MCP
@@ -230,7 +239,8 @@ class AmingClawMCP:
         log.info("Shutting down MCP server...")
         if self.service_mgr:
             self.service_mgr.stop()
-        self.event_bridge.stop()
+        if self.event_bridge:
+            self.event_bridge.stop()
         if self.worker_pool:
             self.worker_pool.stop(timeout=30)
         log.info("MCP server stopped")
@@ -355,6 +365,12 @@ def main():
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:40079/0"))
     parser.add_argument("--workers", type=int, default=int(os.getenv("MCP_WORKERS", "1")))
     parser.add_argument(
+        "--enable-events",
+        action="store_true",
+        default=os.getenv("MCP_ENABLE_EVENTS", "0") == "1",
+        help="Enable optional Redis event notifications over MCP stdio",
+    )
+    parser.add_argument(
         "--autostart-executor",
         action="store_true",
         default=os.getenv("MCP_AUTOSTART_EXECUTOR", "0") == "1",
@@ -362,8 +378,9 @@ def main():
     )
     args = parser.parse_args()
 
+    log_level_name = os.getenv("MCP_LOG_LEVEL", "WARNING").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level_name, logging.WARNING),
         format="%(levelname)s %(name)s %(message)s",
         stream=sys.stderr,  # MCP protocol uses stdout, logs go to stderr
     )
@@ -376,6 +393,7 @@ def main():
         manager_url=args.manager_url,
         max_workers=args.workers,
         autostart_executor=args.autostart_executor,
+        enable_events=args.enable_events,
     )
     server.run()
 

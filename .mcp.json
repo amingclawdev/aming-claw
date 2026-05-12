@@ -6,8 +6,9 @@
       "cwd": "C:\\Users\\z5866\\Documents\\amingclaw\\aming_claw",
       "env": {
         "PYTHONDONTWRITEBYTECODE": "1",
-        "TELEGRAM_BOT_TOKEN": "8654388599:AAHhCYb0E1CBpi_k3j7dbnl3u8hEW3WJDSw",
+        "PYTHONUNBUFFERED": "1",
         "GOVERNANCE_URL": "http://localhost:40000",
+        "MANAGER_URL": "http://127.0.0.1:40101",
         "MEMORY_BACKEND": "docker"
       }
     }
