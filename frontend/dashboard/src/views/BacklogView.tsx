@@ -1,23 +1,43 @@
-import { useMemo, useState } from "react";
-import type { BacklogBug, BacklogResponse } from "../types";
+import { useEffect, useMemo, useState } from "react";
+import { api, ApiError } from "../lib/api";
+import type { BacklogBug, BacklogResponse, FileInventoryRow, NodeRecord } from "../types";
 
 interface Props {
   backlog: BacklogResponse;
   projectId: string;
+  snapshotId: string;
+  nodes: NodeRecord[];
 }
 
 type StatusFilter = "OPEN" | "FIXED" | "ALL";
 type PriorityFilter = "ALL" | "P0" | "P1" | "P2" | "P3";
+type AttachRole = "doc" | "test" | "config";
+type AttachState = "idle" | "writing" | "written_uncommitted" | "error";
 
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
 
-export default function BacklogView({ backlog, projectId }: Props) {
+interface AttachDraft {
+  targetNodeId: string;
+  role: AttachRole;
+}
+
+interface AttachResult {
+  state: AttachState;
+  message: string;
+}
+
+export default function BacklogView({ backlog, projectId, snapshotId, nodes }: Props) {
   const bugs = backlog.bugs ?? [];
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("OPEN");
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>("ALL");
   const [query, setQuery] = useState("");
+  const [files, setFiles] = useState<FileInventoryRow[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState("");
+  const [drafts, setDrafts] = useState<Record<string, AttachDraft>>({});
+  const [attachResults, setAttachResults] = useState<Record<string, AttachResult>>({});
 
   const stats = useMemo(() => {
     const open = bugs.filter(isOpenBug);
@@ -55,6 +75,98 @@ export default function BacklogView({ backlog, projectId }: Props) {
       .sort(compareBugs);
   }, [bugs, priorityFilter, query, statusFilter]);
 
+  const nodeOptions = useMemo(
+    () =>
+      nodes
+        .filter((node) => (node.layer || "").toUpperCase() === "L7")
+        .slice()
+        .sort((a, b) => (a.title || a.node_id).localeCompare(b.title || b.node_id)),
+    [nodes],
+  );
+
+  const attachableFiles = useMemo(
+    () =>
+      files.filter((file) => {
+        const kind = normalizeFileKind(file.file_kind);
+        const status = normalizeStatus(file.scan_status);
+        return (
+          ["doc", "test", "config"].includes(kind) &&
+          status === "ORPHAN" &&
+          !hasAttachedNode(file)
+        );
+      }),
+    [files],
+  );
+
+  useEffect(() => {
+    if (!snapshotId) return;
+    const ac = new AbortController();
+    setFilesLoading(true);
+    setFilesError("");
+    api.snapshotFiles(snapshotId, { limit: 1000, sort: "path" }, ac.signal)
+      .then((res) => {
+        if (!ac.signal.aborted) setFiles(res.files ?? []);
+      })
+      .catch((error) => {
+        if (ac.signal.aborted) return;
+        const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
+        setFilesError(msg);
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setFilesLoading(false);
+      });
+    return () => ac.abort();
+  }, [snapshotId, projectId]);
+
+  const updateDraft = (path: string, patch: Partial<AttachDraft>) => {
+    setDrafts((current) => {
+      const existing = current[path] ?? {
+        targetNodeId: nodeOptions[0]?.node_id ?? "",
+        role: roleForFile(files.find((file) => file.path === path)),
+      };
+      return { ...current, [path]: { ...existing, ...patch } };
+    });
+  };
+
+  const writeHint = async (file: FileInventoryRow) => {
+    const draft = drafts[file.path] ?? {
+      targetNodeId: nodeOptions[0]?.node_id ?? "",
+      role: roleForFile(file),
+    };
+    if (!draft.targetNodeId) {
+      setAttachResults((current) => ({
+        ...current,
+        [file.path]: { state: "error", message: "Select a target node first." },
+      }));
+      return;
+    }
+    setAttachResults((current) => ({
+      ...current,
+      [file.path]: { state: "writing", message: "Writing governance hint..." },
+    }));
+    try {
+      const result = await api.attachFileGovernanceHint(snapshotId, {
+        path: file.path,
+        target_node_id: draft.targetNodeId,
+        role: draft.role,
+        actor: "dashboard_user",
+      });
+      setAttachResults((current) => ({
+        ...current,
+        [file.path]: {
+          state: "written_uncommitted",
+          message: result.message || "Hint written. Commit this file, then run Update graph.",
+        },
+      }));
+    } catch (error) {
+      const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
+      setAttachResults((current) => ({
+        ...current,
+        [file.path]: { state: "error", message: msg },
+      }));
+    }
+  };
+
   return (
     <div className="view">
       <div className="view-head">
@@ -67,8 +179,8 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
       <div className="backlog-guidance">
         <div>
-          <strong>Read-only project memory.</strong> Add richer backlog context from the graph
-          inspector or action panel so AI can include node, edge, file, and acceptance context.
+          <strong>Project memory.</strong> Backlog rows stay read-only here; orphan file binding
+          writes source-controlled hints that reconcile can materialize.
         </div>
         <span className="mono">manual filing hidden in v1</span>
       </div>
@@ -78,6 +190,107 @@ export default function BacklogView({ backlog, projectId }: Props) {
         <Kpi label="P0/P1 open" value={stats.urgent} tone={stats.urgent > 0 ? "red" : "neutral"} />
         <Kpi label="Fixed" value={stats.fixed} tone="green" />
         <Kpi label="Total" value={stats.total} tone="blue" />
+      </div>
+
+      <div className="section">
+        <div className="section-head">
+          Orphan file binding{" "}
+          <span className="head-hint">
+            {filesLoading ? "loading" : `${attachableFiles.length} orphan files · write hint, commit, then Update graph`}
+          </span>
+        </div>
+        <div className="backlog-guidance backlog-guidance-amber">
+          <div>
+            <strong>Direct write flow.</strong> This writes a governance hint into the selected file only.
+            Commit that file before clicking <span className="mono">Update graph</span>, because reconcile reads committed source.
+          </div>
+          <span className="mono">state: source write → commit → graph update</span>
+        </div>
+        {filesError ? <div className="config-warning error">File inventory load failed: {filesError}</div> : null}
+        {attachableFiles.length === 0 ? (
+          <div className="empty empty-compact">
+            No orphan doc/test/config files are attachable in this snapshot.
+          </div>
+        ) : (
+          <div className="card">
+            <table className="table backlog-orphan-table">
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th style={{ width: 92 }}>Role</th>
+                  <th style={{ width: 280 }}>Target node</th>
+                  <th style={{ width: 168 }}>Action</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {attachableFiles.slice(0, 20).map((file) => {
+                  const draft = drafts[file.path] ?? {
+                    targetNodeId: nodeOptions[0]?.node_id ?? "",
+                    role: roleForFile(file),
+                  };
+                  const result = attachResults[file.path] ?? { state: "idle", message: "Not written." };
+                  const supported = canDirectWriteHint(file.path);
+                  const disabled =
+                    !supported ||
+                    nodeOptions.length === 0 ||
+                    result.state === "writing" ||
+                    result.state === "written_uncommitted";
+                  return (
+                    <tr key={file.path}>
+                      <td>
+                        <div className="cell-strong mono">{file.path}</div>
+                        <div className="cell-mono-id">
+                          {file.file_kind || "unknown"} · {file.scan_status || "pending"}
+                        </div>
+                      </td>
+                      <td>
+                        <select
+                          value={draft.role}
+                          onChange={(event) => updateDraft(file.path, { role: event.target.value as AttachRole })}
+                          disabled={result.state === "writing" || result.state === "written_uncommitted"}
+                        >
+                          <option value="doc">doc</option>
+                          <option value="test">test</option>
+                          <option value="config">config</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          className="backlog-node-select"
+                          value={draft.targetNodeId}
+                          onChange={(event) => updateDraft(file.path, { targetNodeId: event.target.value })}
+                          disabled={result.state === "writing" || result.state === "written_uncommitted"}
+                        >
+                          {nodeOptions.map((node) => (
+                            <option key={node.node_id} value={node.node_id}>
+                              {node.title || node.node_id} · {node.node_id}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <button
+                          className="action-btn action-btn-primary"
+                          disabled={disabled}
+                          onClick={() => writeHint(file)}
+                          title={supported ? "Write governance hint into the file" : "This file type cannot be safely commented"}
+                        >
+                          {result.state === "writing" ? "Writing..." : "Write hint"}
+                        </button>
+                      </td>
+                      <td>
+                        <div className={`attach-state attach-state-${result.state}`}>
+                          {supported ? result.message : "Direct write unsupported for this file type."}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <div className="backlog-toolbar card">
@@ -258,6 +471,52 @@ function statusClass(status?: string): string {
   if (s === "RUNNING" || s === "CLAIMED" || s === "IN_CHAIN") return "status-running";
   if (s === "OPEN" || s === "QUEUED") return "status-pending";
   return "status-unknown";
+}
+
+function normalizeFileKind(kind?: string): string {
+  return (kind || "").trim().toLowerCase();
+}
+
+function roleForFile(file?: FileInventoryRow): AttachRole {
+  const kind = normalizeFileKind(file?.file_kind);
+  if (kind === "test") return "test";
+  if (kind === "config") return "config";
+  return "doc";
+}
+
+function hasAttachedNode(file: FileInventoryRow): boolean {
+  return Array.isArray(file.attached_node_ids) && file.attached_node_ids.length > 0;
+}
+
+function canDirectWriteHint(path: string): boolean {
+  const lower = path.toLowerCase();
+  const name = lower.split(/[\\/]/).pop() || "";
+  if (name === "dockerfile" || name === "makefile") return true;
+  return [
+    ".md",
+    ".mdx",
+    ".html",
+    ".htm",
+    ".py",
+    ".pyw",
+    ".sh",
+    ".bash",
+    ".ps1",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+  ].some((suffix) => lower.endsWith(suffix));
 }
 
 function listFrom(value?: string[] | string): string[] {

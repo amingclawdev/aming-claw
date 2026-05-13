@@ -776,6 +776,16 @@ a:hover { text-decoration: underline; }
   white-space: nowrap;
 }
 
+.backlog-guidance.backlog-guidance-amber {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: var(--amber-strong);
+}
+
+.backlog-guidance.backlog-guidance-amber .mono {
+  color: var(--amber-strong);
+}
+
 .backlog-score-grid { margin-bottom: 12px; }
 
 .backlog-toolbar {
@@ -815,6 +825,41 @@ a:hover { text-decoration: underline; }
 
 .backlog-table td {
   vertical-align: top;
+}
+
+.backlog-orphan-table td {
+  vertical-align: top;
+}
+
+.backlog-orphan-table select,
+.backlog-node-select {
+  width: 100%;
+  min-height: 28px;
+  border: 1px solid var(--ink-200);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink-800);
+  font: inherit;
+  padding: 0 8px;
+}
+
+.attach-state {
+  font-size: 11px;
+  color: var(--ink-500);
+  max-width: 460px;
+}
+
+.attach-state-writing {
+  color: var(--blue-strong);
+}
+
+.attach-state-written_uncommitted {
+  color: var(--amber-strong);
+  font-weight: 600;
+}
+
+.attach-state-error {
+  color: var(--red-strong);
 }
 
 .backlog-title-cell {

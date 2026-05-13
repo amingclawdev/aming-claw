@@ -16,6 +16,10 @@ from .language_policy import DEFAULT_LANGUAGE_POLICY
 
 
 _HINT_RE = re.compile(r"<!--\s*governance-hint\s*([\s\S]*?)\s*-->", re.IGNORECASE)
+_LINE_HINT_RE = re.compile(
+    r"(?m)^\s*(?:#|//)\s*governance-hint\s+({.*})\s*$",
+    re.IGNORECASE,
+)
 
 _ROLE_TO_FIELD = {
     "doc": "secondary",
@@ -70,7 +74,45 @@ def parse_governance_hint_bindings(markdown: str, *, source_path: str = "") -> l
         except json.JSONDecodeError:
             continue
         hints.extend(_bindings_from_payload(payload, source_path=source_path))
+    for match in _LINE_HINT_RE.finditer(markdown or ""):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        hints.extend(_bindings_from_payload(payload, source_path=source_path))
     return hints
+
+
+def render_governance_hint_comment(path: str, payload: dict[str, Any]) -> str:
+    """Render a governance hint using a comment style safe for the file type."""
+    rel = normalize_relpath("", path)
+    suffix = Path(rel).suffix.lower()
+    name = Path(rel).name.lower()
+    body = f"governance-hint {json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+    if suffix in {".md", ".mdx", ".html", ".htm"}:
+        return f"<!-- {body} -->"
+    if suffix in {
+        ".py",
+        ".pyw",
+        ".sh",
+        ".bash",
+        ".ps1",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".txt",
+        ".rst",
+        ".adoc",
+    } or name in {"dockerfile", "makefile"}:
+        return f"# {body}"
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        return f"// {body}"
+    return ""
 
 
 def load_governance_hint_bindings(project_root: str | Path) -> list[BindingHint]:

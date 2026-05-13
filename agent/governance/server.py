@@ -4277,6 +4277,155 @@ def _create_file_hygiene_event(
         _raise_graph_api_validation(exc)
 
 
+def _resolve_project_child(root: Path, rel_path: str) -> Path:
+    from .errors import ValidationError
+
+    rel = str(rel_path or "").strip().replace("\\", "/").strip("/")
+    if not rel:
+        raise ValidationError("path is required")
+    candidate = (root / rel).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        raise ValidationError("path must stay within project root")
+    return candidate
+
+
+def _hint_role_for_file_kind(file_kind: str, requested_role: str = "") -> str:
+    role = str(requested_role or "").strip().lower()
+    if role in {"doc", "test", "config"}:
+        return role
+    kind = str(file_kind or "").strip().lower()
+    if kind == "doc":
+        return "doc"
+    if kind == "test":
+        return "test"
+    if kind == "config":
+        return "config"
+    return ""
+
+
+def _snapshot_node_by_id(store, conn, project_id: str, snapshot_id: str, node_id: str) -> dict:
+    for node in store.list_graph_snapshot_nodes(
+        conn,
+        project_id,
+        snapshot_id,
+        limit=1000,
+        include_semantic=False,
+    ):
+        if str(node.get("node_id") or "") == node_id:
+            return dict(node)
+    return {}
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/hints/attach")
+def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContext):
+    """Write a source-controlled governance hint into an orphan file.
+
+    The write changes the working tree only. Operators must commit the file and
+    then run Update graph; reconcile is the only path that materializes the
+    binding into graph metadata.
+    """
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .errors import ValidationError
+    from .governance_hints import parse_governance_hint_bindings, render_governance_hint_comment
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.file-hygiene.hint.attach")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        root = _graph_governance_project_root(project_id, body)
+        path = str(body.get("path") or body.get("file_path") or "").strip().replace("\\", "/").strip("/")
+        node_id = str(body.get("node_id") or body.get("target_node_id") or "").strip()
+        if not node_id:
+            raise ValidationError("target_node_id is required")
+
+        files_result = store.list_graph_snapshot_files(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=1000,
+            path_contains=path,
+        )
+        row = _find_file_inventory_row(files_result, path)
+        if not row:
+            raise ValidationError(f"file inventory row not found: {path}")
+        if row.get("attached_node_ids"):
+            raise ValidationError("file is already attached to a node")
+        scan_status = str(row.get("scan_status") or "")
+        if scan_status != "orphan":
+            raise ValidationError(f"file is not attachable from scan_status={scan_status}; orphan required")
+        role = _hint_role_for_file_kind(str(row.get("file_kind") or ""), str(body.get("role") or ""))
+        if not role:
+            raise ValidationError(f"file kind is not supported for hint attach: {row.get('file_kind') or 'unknown'}")
+        target_node = _snapshot_node_by_id(store, conn, project_id, snapshot_id, node_id)
+        if not target_node:
+            raise ValidationError(f"target node not found: {node_id}")
+
+        abs_path = _resolve_project_child(root, path)
+        if not abs_path.exists() or not abs_path.is_file():
+            raise ValidationError(f"file does not exist: {path}")
+        payload = {
+            "attach_to_node": {
+                "path": path,
+                "role": role,
+                "target_node_id": node_id,
+            }
+        }
+        comment = render_governance_hint_comment(path, payload)
+        if not comment:
+            raise ValidationError(f"file type does not support direct governance-hint comments: {path}")
+        text = abs_path.read_text(encoding="utf-8")
+        existing = parse_governance_hint_bindings(text, source_path=path)
+        for hint in existing:
+            if (
+                hint.path == path
+                and hint.field in {"secondary", "test", "config"}
+                and hint.target_node_id == node_id
+            ):
+                return {
+                    "ok": True,
+                    "project_id": project_id,
+                    "snapshot_id": snapshot_id,
+                    "path": path,
+                    "target_node_id": node_id,
+                    "role": role,
+                    "state": "written_uncommitted",
+                    "hint_written": False,
+                    "already_present": True,
+                    "requires_commit": True,
+                    "update_graph_after_commit": True,
+                    "message": "Governance hint already exists. Commit the file, then run Update graph.",
+                    "file": row,
+                    "target_node": target_node,
+                }
+
+        prefix = comment.rstrip() + "\n\n"
+        abs_path.write_text(prefix + text, encoding="utf-8")
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "path": path,
+            "target_node_id": node_id,
+            "role": role,
+            "state": "written_uncommitted",
+            "hint_written": True,
+            "already_present": False,
+            "requires_commit": True,
+            "update_graph_after_commit": True,
+            "message": "Governance hint written. Commit the file, then run Update graph.",
+            "hint": comment,
+            "file": row,
+            "target_node": target_node,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/actions")
 def handle_graph_governance_snapshot_file_hygiene_action(ctx: RequestContext):
     """Turn dashboard file-hygiene actions into auditable graph events.

@@ -1,8 +1,10 @@
 import type {
   ActiveSummaryResponse,
+  AttachFileHintResponse,
   BacklogResponse,
   EdgesResponse,
   FeedbackQueueResponse,
+  SnapshotFilesResponse,
   HealthResponse,
   NodesResponse,
   OperationsQueueResponse,
@@ -188,6 +190,32 @@ export const api = {
   },
   backlogFor(projectId: string, signal?: AbortSignal) {
     return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}`, signal);
+  },
+  snapshotFiles(
+    snapshotId: string,
+    opts: { limit?: number; scan_status?: string; file_kind?: string; sort?: string } = {},
+    signal?: AbortSignal,
+  ) {
+    const q = new URLSearchParams();
+    q.set("limit", String(opts.limit ?? 1000));
+    if (opts.scan_status) q.set("scan_status", opts.scan_status);
+    if (opts.file_kind) q.set("file_kind", opts.file_kind);
+    if (opts.sort) q.set("sort", opts.sort);
+    return getJSON<SnapshotFilesResponse>(
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/files?${q.toString()}`,
+      signal,
+    );
+  },
+  attachFileGovernanceHint(
+    snapshotId: string,
+    payload: { path: string; target_node_id: string; role?: "doc" | "test" | "config"; actor?: string },
+    signal?: AbortSignal,
+  ) {
+    return postJSON<AttachFileHintResponse>(
+      `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}/file-hygiene/hints/attach`,
+      { ...payload, actor: payload.actor ?? "dashboard_user" },
+      signal,
+    );
   },
   fullReconcileFor(projectId: string, payload: GraphReconcilePayload, signal?: AbortSignal) {
     return postJSON<GraphReconcileResponse>(

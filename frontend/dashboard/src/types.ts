@@ -377,3 +377,48 @@ export interface BacklogBug {
   worktree_path?: string;
   mf_type?: string;
 }
+
+export interface FileInventoryRow {
+  path: string;
+  file_kind?: string;
+  language?: string;
+  scan_status?: string;
+  graph_status?: string;
+  decision?: string;
+  candidate_node_id?: string;
+  attached_node_ids?: string[];
+  mapped_node_ids?: string[];
+  attachment_role?: string;
+  attachment_source?: string;
+  size_bytes?: number;
+  reason?: string;
+}
+
+export interface SnapshotFilesResponse {
+  ok: boolean;
+  project_id: string;
+  snapshot_id: string;
+  summary?: Record<string, unknown>;
+  total_count: number;
+  filtered_count: number;
+  sort?: string;
+  files: FileInventoryRow[];
+}
+
+export interface AttachFileHintResponse {
+  ok: boolean;
+  project_id: string;
+  snapshot_id: string;
+  path: string;
+  target_node_id: string;
+  role: "doc" | "test" | "config" | string;
+  state: "written_uncommitted" | string;
+  hint_written: boolean;
+  already_present?: boolean;
+  requires_commit: boolean;
+  update_graph_after_commit: boolean;
+  message?: string;
+  hint?: string;
+  file?: FileInventoryRow;
+  target_node?: NodeRecord;
+}

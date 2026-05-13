@@ -2271,6 +2271,87 @@ def test_graph_governance_file_hygiene_actions_create_auditable_events(conn, mon
     assert delete_candidate["event"]["payload"]["destructive_mutation_performed"] is False
 
 
+def test_graph_governance_file_hygiene_hint_attach_writes_source_hint(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    project = tmp_path / "project"
+    doc = project / "docs" / "orphan.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("# Orphan\n\nNeeds binding.\n", encoding="utf-8")
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-hygiene-hint-attach",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.write_companion_files(
+        PID,
+        snapshot["snapshot_id"],
+        graph_json=_graph(),
+        file_inventory=[
+            {
+                "path": "docs/orphan.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "decision": "pending",
+                "attached_node_ids": [],
+                "size_bytes": 123,
+            },
+        ],
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_snapshot_file_hygiene_hint_attach(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "docs/orphan.md",
+                "target_node_id": "L7.1",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "written_uncommitted"
+    assert result["requires_commit"] is True
+    assert result["update_graph_after_commit"] is True
+    text = doc.read_text(encoding="utf-8")
+    assert text.startswith("<!-- governance-hint ")
+    assert '"target_node_id": "L7.1"' in text
+    assert '"path": "docs/orphan.md"' in text
+
+    second = server.handle_graph_governance_snapshot_file_hygiene_hint_attach(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "docs/orphan.md",
+                "target_node_id": "L7.1",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+            },
+        )
+    )
+    assert second["already_present"] is True
+    assert doc.read_text(encoding="utf-8").count("governance-hint") == 1
+
+
 def test_graph_governance_file_hygiene_batch_actions_create_auditable_events(conn, monkeypatch):
     monkeypatch.setattr(
         server,

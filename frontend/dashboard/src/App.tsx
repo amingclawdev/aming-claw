@@ -990,7 +990,12 @@ export default function App() {
             />
           ) : null}
           {view === "backlog" && data ? (
-            <BacklogView backlog={data.backlog} projectId={currentProjectId} />
+            <BacklogView
+              backlog={data.backlog}
+              projectId={currentProjectId}
+              snapshotId={data.status?.active_snapshot_id ?? data.summary?.snapshot_id ?? ""}
+              nodes={data.nodes}
+            />
           ) : null}
           {!data && !error && view !== "projects" ? (
             <div className="view">

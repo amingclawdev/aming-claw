@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent.governance.governance_hints import apply_binding_hints_to_graph_nodes
+from agent.governance.governance_hints import (
+    apply_binding_hints_to_graph_nodes,
+    parse_governance_hint_bindings,
+    render_governance_hint_comment,
+)
 
 
 def _write(path: Path, content: str) -> None:
@@ -77,3 +81,19 @@ def test_governance_hint_defers_index_doc_container_binding(tmp_path):
     assert summary["applied_count"] == 0
     assert nodes[0]["secondary"] == []
     assert summary["skipped"][0]["reason"] == "index_doc_deferred"
+
+
+def test_governance_hint_parses_rendered_line_comment():
+    payload = {"attach_to_node": {"path": "tests/test_service.py", "role": "test", "target_node_id": "L7.1"}}
+    comment = render_governance_hint_comment("tests/test_service.py", payload)
+
+    hints = parse_governance_hint_bindings(comment, source_path="tests/test_service.py")
+
+    assert comment.startswith("# governance-hint ")
+    assert hints[0].path == "tests/test_service.py"
+    assert hints[0].field == "test"
+    assert hints[0].target_node_id == "L7.1"
+
+
+def test_governance_hint_render_rejects_json_comment_write():
+    assert render_governance_hint_comment("config/settings.json", {"attach_to_node": {}}) == ""
