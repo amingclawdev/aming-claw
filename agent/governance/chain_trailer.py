@@ -21,6 +21,12 @@ import re
 import subprocess
 from typing import Any
 
+from .dirty_worktree import (
+    DIRTY_IGNORE_PREFIXES as _DIRTY_IGNORE,
+    filter_dirty_files,
+    parse_git_porcelain_paths,
+)
+
 log = logging.getLogger(__name__)
 
 # 4-field trailer regexes per §4.1
@@ -31,17 +37,6 @@ _RE_BUG_ID = re.compile(r"^Chain-Bug-Id:\s*(\S+)", re.MULTILINE)
 
 # Legacy single-field regex (for backfill detection)
 _LEGACY_TRAILER_RE = re.compile(r"^Chain-Version:\s*(\S+)", re.MULTILINE)
-
-# Prefixes filtered from dirty_files (mirrors auto_chain._DIRTY_IGNORE)
-_DIRTY_IGNORE = (
-    ".claude/", ".claude\\",
-    ".worktrees/", ".worktrees\\",
-    "docs/dev/", "docs/dev\\",
-    ".recent-tasks.json",
-    ".governance-cache/", ".governance-cache\\",
-    ".observer-cache/", ".observer-cache\\",
-)
-
 
 def _repo_root() -> str:
     """Return the repository root directory."""
@@ -144,18 +139,8 @@ def get_chain_state(cwd: str | None = None) -> dict[str, Any]:
 
     # Check dirty status
     status_proc = _git(["status", "--porcelain"], cwd=root)
-    raw_dirty = []
-    if status_proc.returncode == 0:
-        for line in status_proc.stdout.splitlines():
-            if len(line) >= 4:
-                filepath = line[3:].rstrip()
-                if filepath:
-                    raw_dirty.append(filepath)
-
-    dirty_files = [
-        f for f in raw_dirty
-        if not any(f.startswith(p) for p in _DIRTY_IGNORE)
-    ]
+    raw_dirty = parse_git_porcelain_paths(status_proc.stdout if status_proc.returncode == 0 else "")
+    dirty_files = filter_dirty_files(raw_dirty)
 
     return {
         "chain_sha": chain_sha,

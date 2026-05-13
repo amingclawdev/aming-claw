@@ -24,6 +24,7 @@ from .doc_policy import (
     is_governance_internal_repair as _is_governance_internal_repair,
     _GOVERNANCE_INTERNAL_PREFIXES,
 )
+from .dirty_worktree import DIRTY_IGNORE_PREFIXES as _DIRTY_IGNORE
 from . import backlog_runtime
 
 log = logging.getLogger(__name__)
@@ -31,20 +32,6 @@ log = logging.getLogger(__name__)
 # Set to True to skip SERVER_VERSION vs git-HEAD check during development.
 # Restore to False before production use.
 _DISABLE_VERSION_GATE = False
-
-# B15/B23/B31: Prefixes filtered from dirty_files before version gate evaluation.
-# Paths matching any prefix are tool-local or non-governed and must not block chain.
-# To add new entry here when an observer script writes a runtime-state file to repo
-# root: append the path prefix (with both "/" and "\\" variants for cross-platform)
-# to this tuple so that the version gate does not treat it as a governed dirty file.
-_DIRTY_IGNORE = (
-    ".claude/", ".claude\\",
-    ".worktrees/", ".worktrees\\",
-    "docs/dev/", "docs/dev\\",
-    ".recent-tasks.json",
-    ".governance-cache/", ".governance-cache\\",
-    ".observer-cache/", ".observer-cache\\",
-)
 
 # Graph-driven doc governance: observation mode flag (Step 5, P1 principle)
 # When True, graph doc checks log warnings instead of blocking.

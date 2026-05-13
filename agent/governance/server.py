@@ -23,7 +23,7 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 from .errors import GovernanceError
-from .auto_chain import _DIRTY_IGNORE
+from .dirty_worktree import filter_dirty_files
 import logging
 import sqlite3
 import time
@@ -11101,8 +11101,8 @@ def handle_version_check(ctx: RequestContext):
         chain_ver = row["chain_version"]
     git_head = row["git_head"] or ""
     dirty_files_raw = json.loads(row["dirty_files"] or "[]")
-    # B31: apply _DIRTY_IGNORE filter (same as auto_chain._gate_version_check)
-    dirty_files = [f for f in dirty_files_raw if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
+    # B31: apply shared dirty-worktree filter (same policy as auto_chain/scope reconcile)
+    dirty_files = filter_dirty_files(dirty_files_raw)
     git_synced = row["git_synced_at"] or ""
 
     # Determine source: prefer trailer if available
@@ -11111,8 +11111,7 @@ def handle_version_check(ctx: RequestContext):
         source = trailer_state["source"]  # 'trailer' or 'head'
         # Merge trailer dirty_files with DB dirty_files (union, filtered)
         if trailer_state.get("dirty_files"):
-            trailer_dirty = [f for f in trailer_state["dirty_files"]
-                             if not any(f.startswith(p) for p in _DIRTY_IGNORE)]
+            trailer_dirty = filter_dirty_files(trailer_state["dirty_files"])
             for f in trailer_dirty:
                 if f not in dirty_files:
                     dirty_files.append(f)

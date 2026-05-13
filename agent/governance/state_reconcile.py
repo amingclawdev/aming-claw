@@ -48,6 +48,7 @@ from agent.governance.graph_correction_patches import (
     record_patch_apply_report,
 )
 from agent.governance.db import sqlite_write_lock
+from agent.governance.dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 from agent.governance.governance_index import (
     build_governance_index,
     merge_feature_hashes_into_graph_nodes,
@@ -126,17 +127,7 @@ def _git_dirty_files(project_root: str | Path) -> list[str]:
         )
     except Exception:
         return []
-    dirty: list[str] = []
-    for line in (result.stdout or "").splitlines():
-        if not line.strip():
-            continue
-        path = line[3:].strip() if len(line) > 3 else line.strip()
-        if " -> " in path:
-            path = path.rsplit(" -> ", 1)[1].strip()
-        path = path.replace("\\", "/").strip("/")
-        if path:
-            dirty.append(path)
-    return sorted(set(dirty))
+    return filter_dirty_files(parse_git_porcelain_paths(result.stdout or ""))
 
 
 def _deps_graph_nodes(graph_json: dict[str, Any]) -> list[dict[str, Any]]:

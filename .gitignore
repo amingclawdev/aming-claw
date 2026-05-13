@@ -142,11 +142,17 @@ vite.config.ts.timestamp-*
 __pycache__/
 *.pyc
 *.egg-info/
+.venv/
+
+# Local Codex/test tooling state
+.codex/
+.hypothesis/
 
 # OpenClaw local outputs
 .openclaw/
 shared-volume/
 .worktrees/
+build/
 governance.db
 agent/governance/governance.db
 
