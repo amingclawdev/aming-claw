@@ -750,6 +750,7 @@ def _install_signal_handlers(stop_fn: Callable[[], None]) -> None:
     def _handler(signum, frame):  # pragma: no cover - exercised by manual host runs
         log.info("ServiceManager host process received signal %s, stopping", signum)
         stop_fn()
+        raise SystemExit(0)
 
     for signame in ("SIGINT", "SIGTERM"):
         sig = getattr(signal, signame, None)

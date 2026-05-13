@@ -40,5 +40,6 @@ def test_start_manager_posix_script_bootstraps_service_manager_without_takeover(
     assert "subprocess.Popen" in script
     assert "start_new_session=True" in script
     assert "stdin=subprocess.DEVNULL" in script
+    assert "Manager sidecar is healthy but executor worker did not appear" in script
     assert "agent/executor_worker.py.*--project" in script
     assert "MANAGER_URL" in script

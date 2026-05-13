@@ -91,10 +91,23 @@ find_worker_pid() {
 }
 
 if check_manager_health; then
-  echo "Manager already healthy."
-  echo "  manager: $(find_manager_pid)"
-  echo "  worker:  $(find_worker_pid)"
-  exit 0
+  DEADLINE=$((SECONDS + HEALTH_WAIT_SECONDS))
+  while (( SECONDS < DEADLINE )); do
+    MANAGER_PID="$(find_manager_pid)"
+    WORKER_PID="$(find_worker_pid)"
+    if [[ -n "$MANAGER_PID" && -n "$WORKER_PID" ]]; then
+      echo "Manager already healthy."
+      echo "  manager: $MANAGER_PID"
+      echo "  worker:  $WORKER_PID"
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "Manager sidecar is healthy but executor worker did not appear within $HEALTH_WAIT_SECONDS seconds." >&2
+  echo "  manager: $(find_manager_pid)" >&2
+  echo "  worker:  $(find_worker_pid)" >&2
+  echo "Stop the stale manager host process and run this script again." >&2
+  exit 1
 fi
 
 if ! "$PYTHON" -c "import requests" >/dev/null 2>&1; then

@@ -2,6 +2,7 @@
 
 import sys
 import os
+import signal
 import time
 import threading
 import subprocess
@@ -14,7 +15,7 @@ _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from service_manager import ServiceManager, get_manager  # noqa: E402
+from service_manager import ServiceManager, get_manager, _install_signal_handlers  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,23 @@ class TestStartStop(unittest.TestCase):
         self.mgr.stop()
 
         fake_proc.kill.assert_called_once()
+
+
+class TestHostSignalHandlers(unittest.TestCase):
+    """Tests for host process signal handling."""
+
+    @patch("service_manager.signal.signal")
+    def test_signal_handler_stops_and_exits_host_loop(self, mock_signal):
+        stop_fn = MagicMock()
+
+        _install_signal_handlers(stop_fn)
+
+        handlers = {call.args[0]: call.args[1] for call in mock_signal.call_args_list}
+        with self.assertRaises(SystemExit) as raised:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        stop_fn.assert_called_once()
+        self.assertEqual(raised.exception.code, 0)
 
 
 # ---------------------------------------------------------------------------
