@@ -12,6 +12,7 @@
 //   node scripts/e2e-semantic.mjs --node L7.37   # use specific node
 //   node scripts/e2e-semantic.mjs --edge L7.37,L4.13,owns_state
 //   node scripts/e2e-semantic.mjs --apply        # real AI calls (dry_run=false)
+//   node scripts/e2e-semantic.mjs --auto-decision keep  # noninteractive dry-run
 //   node scripts/e2e-semantic.mjs --ignore-cancel  # bypass cancel-first gate
 //   node scripts/e2e-semantic.mjs --project aming-claw --unsafe-aming-claw
 //
@@ -44,6 +45,8 @@ const SCOPE_RECONCILE_ONLY = FLAGS["scope-reconcile-only"] === true;
 const ACTIONS_ONLY = FLAGS["actions-only"] === true;
 const FORCED_NODE = FLAGS.node || null;
 const FORCED_EDGE = FLAGS.edge || null;
+const AUTO_DECISION = normalizeDecisionFlag(FLAGS["auto-decision"] || "");
+const AUTO_CONTINUE = FLAGS["auto-continue"] === true || Boolean(AUTO_DECISION);
 const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 
 function parseFlags(args) {
@@ -55,6 +58,7 @@ function parseFlags(args) {
     "unsafe-aming-claw",
     "scope-reconcile-only",
     "actions-only",
+    "auto-continue",
   ]);
   const out = {};
   for (let i = 0; i < args.length; i++) {
@@ -69,6 +73,34 @@ function parseFlags(args) {
     }
   }
   return out;
+}
+
+function normalizeDecisionFlag(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  const aliases = {
+    accept: "a",
+    a: "a",
+    reject: "r",
+    r: "r",
+    "file-backlog": "f",
+    file_backlog: "f",
+    backlog: "f",
+    f: "f",
+    keep: "k",
+    k: "k",
+    "needs-signoff": "n",
+    needs_signoff: "n",
+    signoff: "n",
+    n: "n",
+    skip: "s",
+    s: "s",
+  };
+  const normalized = aliases[raw];
+  if (!normalized) {
+    throw new Error("--auto-decision must be one of accept, reject, file-backlog, keep, needs-signoff, or skip");
+  }
+  return normalized;
 }
 
 if (PROJECT === "aming-claw" && !UNSAFE_AMING_CLAW && !PROBE_ONLY && !PROBE_CANCEL) {
@@ -522,14 +554,16 @@ async function phaseScopeReconcileClick(status) {
 //   1. single node enrich            → POST /semantic/jobs (target_scope=node)
 //   2. single edge enrich            → POST /semantic/jobs (target_scope=edge)
 //   3. bulk node enrich (preset)     → POST /semantic/jobs (target=nodes, scope=missing)
-//   3.5 cancel-all node_semantic     → POST /semantic/jobs/cancel-all
+//   3.5 cancel-all node_semantic     → POST /semantic/jobs/cancel-all when rows were queued
 //   4. bulk edge enrich (preset)     → POST /semantic/jobs (target=edges, scope=missing)
-//   4.5 cancel-all edge_semantic     → POST /semantic/jobs/cancel-all
+//   4.5 cancel-all edge_semantic     → POST /semantic/jobs/cancel-all when rows were queued
 //   5. per-node feedback             → POST /feedback
 //   6. file backlog 2-step           → POST /events + POST /events/{id}/file-backlog
 //
 // Each writer step pairs with a verification + a cancel/withdraw so the test
-// leaves the queue clean. Uses dry_run=true unless --apply.
+// leaves the queue clean. Uses dry_run=true unless --apply. This matters for
+// edge semantic rows because a local worker can claim them immediately, and
+// running rows are deliberately not cancellable.
 async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
   phase("actions-only · exercise every dashboard action with cancel paired");
 
@@ -542,8 +576,9 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
   if (!chosenNode) throw new Error("no node available — projection or /nodes empty");
   if (!chosenEdge) warn("no typed edge available — edge phases will be skipped");
 
-  // Per-target phases (1, 2) honor --apply / dry_run; bulk phases always queue
-  // real rows then cancel-all so the queue stays clean.
+  // All enrich phases honor --apply / dry_run. Real queue writes are useful for
+  // targeted debug, but the default Mac E2E lane must not require live AI or
+  // leave uncancellable running rows behind.
   const dry = !APPLY;
   const results = [];
   const log = (step, ok, detail) => results.push({ step, ok, detail });
@@ -633,13 +668,9 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
     info("[2] skipped (no edge)");
   }
 
-  // 3. bulk node enrich (preset: retry_stale → use scope=stale to actually queue)
-  //
-  // NOTE: dry_run=true short-circuits the queue (queued_count=0), so cancel-all
-  // has nothing to cancel. Bulk phases always queue real rows then immediately
-  // cancel-all so the queue stays clean. This intentionally diverges from the
-  // dashboard's "Dry run" radio button — we want to exercise the cancel path.
+  // 3. bulk node enrich (preset: retry_stale → use scope=stale when applying)
   let bulkNodeJobId = null;
+  let bulkNodeQueued = 0;
   {
     const payload = {
       job_type: "semantic_enrichment",
@@ -651,7 +682,7 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
         include_edges: false,
         scope: "stale",
         mode: "retry",
-        dry_run: false,
+        dry_run: dry,
         skip_current: true,
         retry_stale_failed: true,
         include_package_markers: false,
@@ -665,8 +696,9 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
         payload,
       );
       bulkNodeJobId = r.job_id;
+      bulkNodeQueued = Number(r.queued_count || 0);
       ok(`[3] bulk-node enrich (preset=retry_stale) · job_id=${r.job_id} · queued=${r.queued_count}`);
-      log("bulk_node_enrich", true, `queued=${r.queued_count}`);
+      log("bulk_node_enrich", true, `queued=${r.queued_count}${dry ? " dry_run" : ""}`);
     } catch (e) {
       fail(`[3] bulk-node enrich failed: ${e.message}`);
       log("bulk_node_enrich", false, e.message);
@@ -674,7 +706,7 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
   }
 
   // 3.5 cancel-all node_semantic
-  if (bulkNodeJobId) {
+  if (bulkNodeJobId && bulkNodeQueued > 0) {
     try {
       const c = await http(
         "POST",
@@ -687,6 +719,9 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
       fail(`[3.5] cancel-all node_semantic failed: ${e.message}`);
       log("cancel_all_node", false, e.message);
     }
+  } else {
+    ok("[3.5] cancel-all node_semantic skipped · no queued rows");
+    log("cancel_all_node", true, "skipped");
   }
 
   // 4. bulk edge enrich (preset: missing_edges)
@@ -694,6 +729,7 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
   // not target_scope=snapshot. The snapshot path is the node-semantic queue
   // and silently routes target=edges as node work.
   let bulkEdgeJobId = null;
+  let bulkEdgeQueued = 0;
   {
     const payload = {
       job_type: "semantic_enrichment",
@@ -705,7 +741,7 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
         include_edges: true,
         scope: "missing",
         mode: "semanticize",
-        dry_run: false,
+        dry_run: dry,
         skip_current: true,
         all_eligible: true,
         include_contains: false,
@@ -721,8 +757,9 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
         payload,
       );
       bulkEdgeJobId = r.job_id;
+      bulkEdgeQueued = Number(r.queued_count || 0);
       ok(`[4] bulk-edge enrich (preset=missing_edges) · job_id=${r.job_id} · queued=${r.queued_count}`);
-      log("bulk_edge_enrich", true, `queued=${r.queued_count}`);
+      log("bulk_edge_enrich", true, `queued=${r.queued_count}${dry ? " dry_run" : ""}`);
     } catch (e) {
       fail(`[4] bulk-edge enrich failed: ${e.message}`);
       log("bulk_edge_enrich", false, e.message);
@@ -730,7 +767,7 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
   }
 
   // 4.5 cancel-all edge_semantic
-  if (bulkEdgeJobId) {
+  if (bulkEdgeJobId && bulkEdgeQueued > 0) {
     try {
       const c = await http(
         "POST",
@@ -743,6 +780,9 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
       fail(`[4.5] cancel-all edge_semantic failed: ${e.message}`);
       log("cancel_all_edge", false, e.message);
     }
+  } else {
+    ok("[4.5] cancel-all edge_semantic skipped · no queued rows");
+    log("cancel_all_edge", true, "skipped");
   }
 
   // 5. per-node feedback (soft-withdraw via /feedback/cancel)
@@ -821,6 +861,23 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
     log("clear_terminal", false, e.message);
   }
 
+  // 5.7 queue cleanliness. The operations queue may legitimately include
+  // not_queued suggestions, but actions-only must not leave live semantic jobs.
+  try {
+    const openOps = await openSemanticOperations();
+    if (openOps.length > 0) {
+      const detail = openOps.map((op) => `${op.operation_type}:${op.target_id}:${op.status}`).join(", ");
+      fail(`[5.7] open semantic operations remain: ${detail}`);
+      log("semantic_queue_clean", false, detail);
+    } else {
+      ok("[5.7] semantic operations queue clean");
+      log("semantic_queue_clean", true, "no open semantic ops");
+    }
+  } catch (e) {
+    fail(`[5.7] semantic queue cleanliness check failed: ${e.message}`);
+    log("semantic_queue_clean", false, e.message);
+  }
+
   // 6. file backlog 2-step
   {
     try {
@@ -879,6 +936,17 @@ async function phaseActionsOnly(snapshotId, projection, nodesRes, edgesRes) {
   }
   const allOk = results.every((r) => r.ok);
   return { ok: allOk, results };
+}
+
+async function openSemanticOperations() {
+  const ops = await http("GET", `/api/graph-governance/${PROJECT}/operations/queue`);
+  const openStatuses = new Set(["queued", "ai_pending", "pending_ai", "running", "claimed", "ai_reviewing"]);
+  return (ops.operations || []).filter((op) => {
+    const type = String(op.operation_type || "");
+    if (type !== "node_semantic" && type !== "edge_semantic") return false;
+    const status = String(op.status || "").toLowerCase().replace(/-/g, "_");
+    return openStatuses.has(status);
+  });
 }
 
 function phaseCancelGate(plan) {
@@ -1088,6 +1156,10 @@ async function phasePauseForOperator(rl, snapshotId, transcript) {
   Open the dashboard, switch to ${c("bold", "Graph")} or ${c("bold", "Operations Queue")} tab, and verify the rows above are visible.
   Then click into the ${c("bold", "Action Panel")} (Header → ⚖ Action) → ${c("bold", "Review & approve")} to see the new feedback rows.
 `);
+  if (AUTO_CONTINUE) {
+    ok(`auto-continue enabled${AUTO_DECISION ? ` (decision=${AUTO_DECISION})` : ""}`);
+    return;
+  }
   while (true) {
     const ans = (await rl.question(c("yellow", "  Type 'g' to continue, 'q' to abort: "))).trim().toLowerCase();
     if (ans === "g") return;
@@ -1121,9 +1193,10 @@ async function phaseDecisions(rl, snapshotId, transcript) {
     kind:    ${fb.kind}
     target:  ${fb.target}
 `);
-    const choice = (
+    const choice = AUTO_DECISION || (
       await rl.question(c("yellow", "    [a]ccept / [r]eject / [f]ile-backlog / [k]eep / [n]eeds-signoff / [s]kip / [q]abort: "))
     ).trim().toLowerCase();
+    if (AUTO_DECISION) info(`auto-decision=${AUTO_DECISION}`);
 
     if (choice === "q") throw new Error("operator aborted");
     if (choice === "s") {
