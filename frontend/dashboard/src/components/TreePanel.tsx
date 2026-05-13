@@ -26,6 +26,15 @@ interface Props {
 }
 
 const FILTER_LAYERS: Layer[] = ["L1", "L2", "L3", "L4", "L7"];
+type LayerFilter = Layer | "ALL";
+
+const LAYER_LABELS: Record<Layer, { label: string; title: string }> = {
+  L1: { label: "Runtime", title: "L1 Runtime — project root / runtime boundary" },
+  L2: { label: "Area", title: "L2 Area — product or source domain grouping" },
+  L3: { label: "Subsystem", title: "L3 Subsystem — implementation subsystem" },
+  L4: { label: "Asset", title: "L4 Asset — config / state / contract / artifact" },
+  L7: { label: "Feature", title: "L7 Feature — inspectable implementation feature" },
+};
 
 interface Index {
   byId: Map<string, NodeRecord>;
@@ -40,22 +49,24 @@ export default function TreePanel(props: Props) {
   const idx = useMemo<Index>(() => buildIndex(nodes), [nodes]);
 
   const [search, setSearch] = useState("");
-  const [layerOn, setLayerOn] = useState<Set<Layer>>(() => new Set(FILTER_LAYERS));
+  const [layerFilter, setLayerFilter] = useState<LayerFilter>("ALL");
 
   // Compute the set of node_ids that should be visible given the search +
-  // layer filters. We include any ancestor of a matching node so the path is
-  // walkable even when intermediate layers are filtered out.
+  // layer filters. Search-only mode includes ancestors so paths stay
+  // walkable; layer mode intentionally returns only that semantic layer.
   const visible = useMemo<Set<string> | null>(() => {
     const q = search.trim().toLowerCase();
-    if (!q && layerOn.size === FILTER_LAYERS.length) return null; // unfiltered
+    const activeLayer = layerFilter === "ALL" ? null : layerFilter;
+    if (!q && !activeLayer) return null; // unfiltered
     const matches = new Set<string>();
     nodes.forEach((n) => {
-      if (!layerOn.has(n.layer as Layer)) return;
+      if (activeLayer && n.layer !== activeLayer) return;
       if (q) {
         const hay = `${n.node_id} ${n.title || ""} ${(n.primary_files || []).join(" ")} ${(n.metadata?.module || "")}`.toLowerCase();
         if (!hay.includes(q)) return;
       }
       matches.add(n.node_id);
+      if (activeLayer) return;
       // Include ancestors so path is reachable.
       let cur: NodeRecord | undefined = n;
       let safety = 8;
@@ -67,7 +78,14 @@ export default function TreePanel(props: Props) {
       }
     });
     return matches;
-  }, [nodes, idx.byId, search, layerOn]);
+  }, [nodes, idx.byId, search, layerFilter]);
+
+  const treeRoots = useMemo(() => {
+    if (visible && layerFilter !== "ALL") {
+      return sortChildren(nodes.filter((n) => visible.has(n.node_id)));
+    }
+    return idx.roots.filter((r) => !visible || visible.has(r.node_id));
+  }, [idx.roots, layerFilter, nodes, visible]);
 
   // Default: expand L1 roots only.
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -176,41 +194,38 @@ export default function TreePanel(props: Props) {
         </div>
         <div className="tree-chip-row">
           <button
-            className={`chip layer-chip${layerOn.size === FILTER_LAYERS.length ? " on" : " off"}`}
-            onClick={() => setLayerOn(new Set(FILTER_LAYERS))}
+            className={`chip layer-chip${layerFilter === "ALL" ? " on" : " off"}`}
+            onClick={() => setLayerFilter("ALL")}
             title="Show all layers"
           >
             All
           </button>
-          {FILTER_LAYERS.map((l) => (
-            <button
-              key={l}
-              className={`chip layer-chip layer-${l}${layerOn.has(l) ? " on" : " off"}`}
-              onClick={() =>
-                setLayerOn((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(l)) next.delete(l);
-                  else next.add(l);
-                  return next;
-                })
-              }
-            >
-              {l}
-            </button>
-          ))}
+          {FILTER_LAYERS.map((l) => {
+            const meta = LAYER_LABELS[l];
+            return (
+              <button
+                key={l}
+                className={`chip layer-chip layer-${l}${layerFilter === l ? " on" : " off"}`}
+                onClick={() => setLayerFilter(l)}
+                title={`${meta.title}. Click to show only ${l} nodes.`}
+              >
+                <span className="layer-chip-code">{l}</span>
+                <span className="layer-chip-label">{meta.label}</span>
+              </button>
+            );
+          })}
         </div>
         <div className="tree-counter">
           {visible == null ? `${nodes.length} nodes` : `${visible.size} of ${nodes.length} nodes`}
         </div>
       </div>
       <div className="sidebar-tree">
-        {idx.roots.length === 0 ? (
+        {idx.roots.length === 0 || treeRoots.length === 0 ? (
           <div style={{ fontSize: 11, color: "var(--ink-500)", padding: "10px 12px" }}>
-            {loading ? "Loading…" : "No nodes"}
+            {loading ? "Loading…" : layerFilter === "ALL" ? "No nodes" : `No ${layerFilter} nodes`}
           </div>
         ) : (
-          idx.roots
-            .filter((r) => !visible || visible.has(r.node_id))
+          treeRoots
             .map((root) => (
               <TreeNode
                 key={root.node_id}

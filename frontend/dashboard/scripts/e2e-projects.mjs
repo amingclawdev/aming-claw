@@ -319,6 +319,17 @@ function verifyHeaderV1Contract() {
   ok("global Action launcher is hidden for v1");
 }
 
+function verifyTreeLayerFilterContract() {
+  phase("tree layer filter contract");
+  const treeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TreePanel.tsx"), "utf8");
+  assert(treeSource.includes('type LayerFilter = Layer | "ALL"'), "Tree layer filter should be single-select, not a toggle set");
+  assert(treeSource.includes("setLayerFilter(l)"), "Layer chip click should select only the clicked layer");
+  assert(treeSource.includes("layerFilter === l"), "Layer chip active state should match the selected layer");
+  assert(treeSource.includes("LAYER_LABELS"), "Layer chips should carry semantic labels/tooltips");
+  assert(treeSource.includes("layer mode intentionally returns only that semantic layer"), "Layer filtering should not mix ancestor layers into the result");
+  ok("tree layer chips are semantic single-select filters");
+}
+
 function verifyEditorJumpWorkspaceContract() {
   phase("editor jump workspace contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
@@ -341,6 +352,7 @@ async function main() {
     await http("GET", "/api/health");
     verifyProjectImportUiContract();
     verifyHeaderV1Contract();
+    verifyTreeLayerFilterContract();
     verifyEditorJumpWorkspaceContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();

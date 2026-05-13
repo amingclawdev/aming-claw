@@ -2611,6 +2611,14 @@ a:hover { text-decoration: underline; }
   letter-spacing: 0.02em;
   padding: 2px 8px;
 }
+.chip.layer-chip .layer-chip-code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+.chip.layer-chip .layer-chip-label {
+  font-family: "Inter", system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: 0;
+}
 .chip.layer-chip.layer-L1.on { background: var(--ink-100); color: var(--ink-900); border-color: var(--ink-300); }
 .chip.layer-chip.layer-L2.on { background: #e0e7ff; color: #3730a3; border-color: #c7d2fe; }
 .chip.layer-chip.layer-L3.on { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
