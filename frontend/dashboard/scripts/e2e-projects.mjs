@@ -402,6 +402,26 @@ function verifyTreeLayerFilterContract() {
   ok("tree layer chips are semantic single-select filters");
 }
 
+function verifyVisualCollaborationPanelsContract() {
+  phase("visual collaboration panels contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const treeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TreePanel.tsx"), "utf8");
+  const graphSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/GraphView.tsx"), "utf8");
+  const focusSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/FocusCard.tsx"), "utf8");
+  const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
+  assert(appSource.includes("DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY"), "App should persist the left sidebar collapsed preference");
+  assert(appSource.includes("collapsed={sidebarCollapsed}"), "App should pass collapse state to TreePanel");
+  assert(treeSource.includes("aria-label={collapsed ? \"Expand navigation\" : \"Collapse navigation\"}"), "TreePanel collapse button needs an accessible label");
+  assert(treeSource.includes("sidebar${collapsed ? \" collapsed\" : \"\"}"), "TreePanel should apply collapsed sidebar class");
+  assert(graphSource.includes("FOCUS_CARD_MINIMIZED_STORAGE_KEY"), "GraphView should persist FocusCard minimized preference");
+  assert(graphSource.includes("minimized={focusCardMinimized}"), "GraphView should pass minimized state to FocusCard");
+  assert(focusSource.includes("MinimizedFocusCard"), "FocusCard should expose a compact minimized rendering");
+  assert(focusSource.includes("aria-label=\"Restore focus card\""), "Minimized FocusCard should have an accessible restore affordance");
+  assert(cssSource.includes(".sidebar.collapsed"), "CSS should reserve a compact collapsed sidebar rail");
+  assert(cssSource.includes(".focus-card.focus-card-minimized"), "CSS should style the minimized FocusCard");
+  ok("graph workspace panels can collapse/minimize for shared-screen collaboration");
+}
+
 function verifyEditorJumpWorkspaceContract() {
   phase("editor jump workspace contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
@@ -430,6 +450,7 @@ async function main() {
     verifyAiConfigProjectScopeContract();
     verifyQueueLaneCopyContract();
     verifyTreeLayerFilterContract();
+    verifyVisualCollaborationPanelsContract();
     verifyEditorJumpWorkspaceContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();

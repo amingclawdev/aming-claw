@@ -14,7 +14,7 @@
   "interface": {
     "displayName": "Aming Claw",
     "shortDescription": "Graph-first governance workflow guard",
-    "longDescription": "Provides the Aming Claw session skill and MCP configuration so agents start with graph-first discovery, backlog/MF discipline, ServiceManager-aware runtime checks, and dashboard governance context.",
+    "longDescription": "Provides the Aming Claw session skill, MCP resources, and MCP configuration so agents start with graph-first discovery, backlog/MF discipline, ServiceManager-aware runtime checks, and dashboard governance context.",
     "developerName": "Aming Claw",
     "category": "Productivity",
     "capabilities": [
@@ -23,9 +23,9 @@
       "MCP"
     ],
     "defaultPrompt": [
-      "Use $aming-claw before changing dashboard or governance code.",
-      "Use $aming-claw to run graph-first MF work in aming-claw.",
-      "Use $aming-claw to inspect MCP, graph, and backlog state."
+      "Read the Aming Claw MCP resource aming-claw://skill or use $aming-claw before changing dashboard or governance code.",
+      "Call graph_query with tool=query_schema, then inspect graph/status/backlog before implementation.",
+      "If services are offline, ask the user to run aming-claw start instead of silently starting workers."
     ],
     "brandColor": "#0F766E"
   }

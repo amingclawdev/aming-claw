@@ -107,6 +107,8 @@ class TestLocalPluginPackaging:
         assert (ROOT / manifest["skills"]).is_dir()
         assert (ROOT / manifest["mcpServers"]).is_file()
         assert "MCP" in manifest["interface"]["capabilities"]
+        assert "MCP resources" in manifest["interface"]["longDescription"]
+        assert any("aming-claw://skill" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         assert (ROOT / "CLAUDE.md").is_file()
 
     def test_mcp_config_is_relocatable_and_uses_stdio_module_entrypoint(self):

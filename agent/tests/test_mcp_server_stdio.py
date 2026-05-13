@@ -54,6 +54,7 @@ def test_mcp_stdio_initialize_and_health_survive_missing_governance():
     assert returncode == 0
     assert stderr == ""
     assert responses[0]["result"]["serverInfo"]["name"] == "aming-claw"
+    assert "resources" in responses[0]["result"]["capabilities"]
     text = responses[1]["result"]["content"][0]["text"]
     payload = json.loads(text)
     assert "error" in payload
@@ -68,3 +69,43 @@ def test_mcp_stdio_tools_list_does_not_require_redis_or_governance():
     assert stderr == ""
     names = {tool["name"] for tool in responses[0]["result"]["tools"]}
     assert {"health", "manager_health", "graph_query", "backlog_upsert"}.issubset(names)
+
+
+def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
+    responses, stderr, returncode = _run_mcp_probe([
+        {"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "resources/templates/list",
+            "params": {},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": {"uri": "aming-claw://skill"},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "resources/read",
+            "params": {"uri": "aming-claw://current-context"},
+        },
+    ])
+
+    assert returncode == 0
+    assert stderr == ""
+    resources = {r["uri"]: r for r in responses[0]["result"]["resources"]}
+    assert "aming-claw://skill" in resources
+    assert "aming-claw://current-context" in resources
+    templates = responses[1]["result"]["resourceTemplates"]
+    assert templates[0]["uriTemplate"] == "aming-claw://project/{project_id}/context"
+    skill_text = responses[2]["result"]["contents"][0]["text"]
+    assert "## Capabilities" in skill_text
+    assert "graph_query" in skill_text
+    context_text = responses[3]["result"]["contents"][0]["text"]
+    assert "project_id: `aming-claw`" in context_text
+    assert "dashboard_url:" in context_text
+    assert "health: `unavailable`" in context_text
+    assert "Call `graph_query` with `tool=query_schema`" in context_text

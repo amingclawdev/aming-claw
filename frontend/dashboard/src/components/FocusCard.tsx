@@ -23,9 +23,14 @@ interface Props {
   onOpenAction(kind: ActionKind, target: ActionTarget): void;
   onJumpToNode(id: string): void;
   onClearEdge(): void;
+  minimized: boolean;
+  onToggleMinimized(): void;
 }
 
 export default function FocusCard(props: Props) {
+  if (props.minimized && (props.edge || props.node)) {
+    return <MinimizedFocusCard {...props} />;
+  }
   if (props.edge) {
     return <EdgeFocusCard {...props} edge={props.edge} />;
   }
@@ -53,6 +58,7 @@ function NodeFocusCard({
   edgesByDst,
   onOpenDrawerTab,
   onOpenAction,
+  onToggleMinimized,
 }: Props & { node: NodeRecord }) {
   const status = classifyNode(node);
   const tone = statusToTone(status);
@@ -67,6 +73,9 @@ function NodeFocusCard({
         <span className={`layer-badge layer-${node.layer}`} style={{ marginLeft: "auto" }}>
           {node.layer}
         </span>
+        <button className="btn-close btn-minimize" onClick={onToggleMinimized} aria-label="Minimize focus card" title="Minimize focus card">
+          −
+        </button>
       </div>
       <div className="focus-title-block">
         <div className="focus-title" title={node.title}>
@@ -163,6 +172,7 @@ function EdgeFocusCard({
   onJumpToNode,
   onClearEdge,
   onOpenAction,
+  onToggleMinimized,
 }: Props & { edge: PinnedEdge }) {
   const src = byId.get(edge.src);
   const dst = byId.get(edge.dst);
@@ -181,6 +191,9 @@ function EdgeFocusCard({
     <div className="focus-card focus-edge">
       <div className="focus-head">
         <span className="focus-kind" style={{ color: "var(--purple-fg)" }}>Relation</span>
+        <button className="btn-close btn-minimize" onClick={onToggleMinimized} aria-label="Minimize focus card" title="Minimize focus card">
+          −
+        </button>
         <button className="btn-close" onClick={onClearEdge} aria-label="Clear edge selection">
           ×
         </button>
@@ -230,6 +243,46 @@ function EdgeFocusCard({
           Go to target
         </button>
       </div>
+    </div>
+  );
+}
+
+function MinimizedFocusCard({
+  node,
+  edge,
+  byId,
+  onToggleMinimized,
+  onClearEdge,
+}: Props) {
+  const src = edge ? byId.get(edge.src) : null;
+  const dst = edge ? byId.get(edge.dst) : null;
+  const title = edge
+    ? `${shortTitle(src?.title || edge.src)} → ${shortTitle(dst?.title || edge.dst)}`
+    : shortTitle(node?.title || node?.node_id || "Focus");
+  const subtitle = edge ? edge.type : node?.node_id ?? "";
+  const layer = edge ? "EDGE" : node?.layer ?? "NODE";
+  const status = node ? classifyNode(node) : null;
+  return (
+    <div className={`focus-card focus-card-minimized${edge ? " focus-edge" : ""}`}>
+      <button
+        type="button"
+        className="focus-minimized-main"
+        onClick={onToggleMinimized}
+        aria-label="Restore focus card"
+        title="Restore focus card"
+      >
+        <span className={`layer-badge ${edge ? "layer-edge" : `layer-${node?.layer ?? ""}`}`}>{layer}</span>
+        {status ? <span className={`sem-dot ${semStatusDotClass(status)}`} /> : <span className="sem-dot unverified" />}
+        <span className="focus-minimized-text">
+          <span className="focus-minimized-title">{title}</span>
+          <span className="focus-minimized-subtitle mono">{subtitle}</span>
+        </span>
+      </button>
+      {edge ? (
+        <button className="btn-close" onClick={onClearEdge} aria-label="Clear edge selection" title="Clear edge selection">
+          ×
+        </button>
+      ) : null}
     </div>
   );
 }

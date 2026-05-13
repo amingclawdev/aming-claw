@@ -43,6 +43,34 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "aming-claw"
 SERVER_VERSION = "1.1.0"
 
+RESOURCE_FILES: dict[str, tuple[str, str, str]] = {
+    "aming-claw://skill": (
+        "Aming Claw Skill",
+        "skills/aming-claw/SKILL.md",
+        "text/markdown",
+    ),
+    "aming-claw://graph-first": (
+        "Graph-first Playbook",
+        "skills/aming-claw/references/graph-first.md",
+        "text/markdown",
+    ),
+    "aming-claw://mcp-tools": (
+        "MCP Tools Guide",
+        "skills/aming-claw/references/mcp-tools.md",
+        "text/markdown",
+    ),
+    "aming-claw://mf-sop": (
+        "Manual Fix SOP",
+        "skills/aming-claw/references/mf-sop.md",
+        "text/markdown",
+    ),
+    "aming-claw://plugin-packaging": (
+        "Plugin Packaging Guide",
+        "skills/aming-claw/references/plugin-packaging.md",
+        "text/markdown",
+    ),
+}
+
 # JSON-RPC error codes
 PARSE_ERROR = -32700
 METHOD_NOT_FOUND = -32601
@@ -166,6 +194,132 @@ class AmingClawMCP:
             manager_api_fn=self._manager_http,
             workspace=workspace,
         )
+
+    # -----------------------------------------------------------------------
+    # MCP resources
+    # -----------------------------------------------------------------------
+
+    def _resources_list(self) -> dict:
+        resources = []
+        for uri, (name, rel_path, mime_type) in RESOURCE_FILES.items():
+            resources.append({
+                "uri": uri,
+                "name": name,
+                "description": f"Aming Claw operating guidance from {rel_path}.",
+                "mimeType": mime_type,
+            })
+        resources.append({
+            "uri": "aming-claw://current-context",
+            "name": "Current Aming Claw Context",
+            "description": "Project id, governance URL, manager URL, dashboard URL, workspace, and safe first actions.",
+            "mimeType": "text/markdown",
+        })
+        return {"resources": resources}
+
+    def _resource_templates_list(self) -> dict:
+        return {
+            "resourceTemplates": [
+                {
+                    "uriTemplate": "aming-claw://project/{project_id}/context",
+                    "name": "Project Context",
+                    "description": "Runtime-safe startup context for an Aming Claw project id.",
+                    "mimeType": "text/markdown",
+                },
+            ],
+        }
+
+    def _read_resource_text(self, uri: str) -> str:
+        if uri == "aming-claw://current-context":
+            return self._current_context_text(self.project_id)
+        prefix = "aming-claw://project/"
+        suffix = "/context"
+        if uri.startswith(prefix) and uri.endswith(suffix):
+            project_id = uri[len(prefix):-len(suffix)]
+            return self._current_context_text(project_id or self.project_id)
+        spec = RESOURCE_FILES.get(uri)
+        if not spec:
+            raise ValueError(f"Unknown resource URI: {uri}")
+        _, rel_path, _ = spec
+        root = Path(self._workspace).resolve()
+        path = (root / rel_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Resource escapes workspace: {uri}") from exc
+        return path.read_text(encoding="utf-8")
+
+    def _resource_mime_type(self, uri: str) -> str:
+        if uri == "aming-claw://current-context" or (uri.startswith("aming-claw://project/") and uri.endswith("/context")):
+            return "text/markdown"
+        spec = RESOURCE_FILES.get(uri)
+        return spec[2] if spec else "text/plain"
+
+    def _current_context_text(self, project_id: str) -> str:
+        dashboard_url = f"{self.gov_url}/dashboard?project={project_id}&view=projects"
+        health = self._request_json("GET", f"{self.gov_url}/api/health", timeout=2)
+        version = self._request_json("GET", f"{self.gov_url}/api/version-check/{project_id}", timeout=2)
+        graph = self._request_json("GET", f"{self.gov_url}/api/graph-governance/{project_id}/status", timeout=2)
+        ops = self._request_json("GET", f"{self.gov_url}/api/graph-governance/{project_id}/operations/queue", timeout=2)
+        health_line = self._format_context_health(health)
+        version_line = self._format_context_version(version)
+        graph_line = self._format_context_graph(graph)
+        ops_line = self._format_context_ops(ops)
+        return "\n".join([
+            "# Aming Claw Current Context",
+            "",
+            f"- project_id: `{project_id}`",
+            f"- governance_url: `{self.gov_url}`",
+            f"- manager_url: `{self.manager_url}`",
+            f"- dashboard_url: `{dashboard_url}`",
+            f"- workspace: `{self._workspace}`",
+            f"- health: {health_line}",
+            f"- version: {version_line}",
+            f"- graph: {graph_line}",
+            f"- operations_queue: {ops_line}",
+            "",
+            "## Startup Checklist",
+            "",
+            "1. Read `aming-claw://skill`.",
+            "2. Check `health`, `version_check`, `graph_status`, `graph_operations_queue`, and open backlog.",
+            "3. Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
+            "4. File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
+            "5. Use the dashboard as a visual control plane when browser-use is available.",
+            "6. If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
+            "",
+        ])
+
+    @staticmethod
+    def _format_context_health(payload: dict) -> str:
+        if payload.get("error"):
+            return f"`unavailable` ({payload['error']})"
+        status = payload.get("status") or payload.get("ok") or "unknown"
+        version = payload.get("version") or payload.get("runtime_version") or "-"
+        return f"`{status}` version `{version}`"
+
+    @staticmethod
+    def _format_context_version(payload: dict) -> str:
+        if payload.get("error"):
+            return f"`unavailable` ({payload['error']})"
+        head = str(payload.get("head") or "-")[:7]
+        dirty = payload.get("dirty")
+        runtime_match = payload.get("runtime_match")
+        return f"HEAD `{head}` dirty `{dirty}` runtime_match `{runtime_match}`"
+
+    @staticmethod
+    def _format_context_graph(payload: dict) -> str:
+        if payload.get("error"):
+            return f"`unavailable` ({payload['error']})"
+        snapshot_id = payload.get("active_snapshot_id") or "-"
+        state = payload.get("current_state") or {}
+        stale = (state.get("graph_stale") or {}).get("is_stale")
+        pending = payload.get("pending_scope_reconcile_count")
+        return f"snapshot `{snapshot_id}` stale `{stale}` pending_scope `{pending}`"
+
+    @staticmethod
+    def _format_context_ops(payload: dict) -> str:
+        if payload.get("error"):
+            return f"`unavailable` ({payload['error']})"
+        return f"count `{payload.get('count', '-')}`"
 
     def run(self) -> None:
         """Start services, enter stdin read loop, shutdown on EOF."""
@@ -307,7 +461,7 @@ class AmingClawMCP:
         if method == "initialize":
             _response(req_id, {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION,
@@ -322,6 +476,36 @@ class AmingClawMCP:
         # --- tools/list ---
         if method == "tools/list":
             _response(req_id, {"tools": TOOLS})
+            return
+
+        # --- resources/list ---
+        if method == "resources/list":
+            _response(req_id, self._resources_list())
+            return
+
+        # --- resources/templates/list ---
+        if method == "resources/templates/list":
+            _response(req_id, self._resource_templates_list())
+            return
+
+        # --- resources/read ---
+        if method == "resources/read":
+            uri = str(params.get("uri") or "")
+            try:
+                _response(req_id, {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": self._resource_mime_type(uri),
+                            "text": self._read_resource_text(uri),
+                        },
+                    ],
+                })
+            except ValueError as exc:
+                _error_response(req_id, METHOD_NOT_FOUND, str(exc))
+            except Exception as exc:
+                log.exception("Resource read error: %s", uri)
+                _error_response(req_id, INTERNAL_ERROR, str(exc))
             return
 
         # --- tools/call ---

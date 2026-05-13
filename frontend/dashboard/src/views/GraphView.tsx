@@ -32,6 +32,26 @@ interface Props {
 
 type GraphMode = "hierarchy" | "relations";
 
+const FOCUS_CARD_MINIMIZED_STORAGE_KEY = "aming-claw.dashboard.focusCardMinimized";
+
+function readStoredFocusMinimized(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(FOCUS_CARD_MINIMIZED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredFocusMinimized(value: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(FOCUS_CARD_MINIMIZED_STORAGE_KEY, value ? "1" : "0");
+  } catch {
+    // Non-critical UI preference.
+  }
+}
+
 interface EdgeInfo {
   key: string;
   type: string;
@@ -234,6 +254,7 @@ export default function GraphView({
   const wrapRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<GraphMode>("hierarchy");
   const [edgeFilter, setEdgeFilter] = useState<Set<string>>(() => new Set(["contains", ...RELATIONS_DEFAULT_TYPES]));
+  const [focusCardMinimized, setFocusCardMinimized] = useState(() => readStoredFocusMinimized());
   const pinnedRef = useRef<PinnedEdge | null>(null);
   pinnedRef.current = pinnedEdge;
 
@@ -357,6 +378,10 @@ export default function GraphView({
 
   const breadcrumb = useMemo(() => (focusNode ? chainOf(focusNode, idx.byId) : []), [focusNode, idx.byId]);
 
+  useEffect(() => {
+    writeStoredFocusMinimized(focusCardMinimized);
+  }, [focusCardMinimized]);
+
   return (
     <div className="graph-view">
       <div className="graph-toolbar">
@@ -435,6 +460,8 @@ export default function GraphView({
           edgesByDst={idx.edgesByDst}
           onOpenDrawerTab={onOpenDrawerTab}
           onOpenAction={onOpenAction}
+          minimized={focusCardMinimized}
+          onToggleMinimized={() => setFocusCardMinimized((prev) => !prev)}
           onJumpToNode={(id) => {
             onPinEdge(null);
             onSelectNode(id);
@@ -1351,4 +1378,3 @@ function layerFg(layer: Layer | string): string {
       return "#0f172a";
   }
 }
-

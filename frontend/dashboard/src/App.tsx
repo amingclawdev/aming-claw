@@ -38,6 +38,7 @@ import ProjectConsoleView from "./views/ProjectConsoleView";
 export type ViewName = "projects" | "overview" | "graph" | "operations" | "review" | "backlog";
 
 const DASHBOARD_PROJECT_STORAGE_KEY = "aming-claw.dashboard.projectId";
+const DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY = "aming-claw.dashboard.sidebarCollapsed";
 const DASHBOARD_PROJECT_PARAM = "project";
 const DASHBOARD_VIEW_PARAM = "view";
 const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "overview", "graph", "operations", "review", "backlog"];
@@ -76,6 +77,24 @@ function writeStoredProjectId(projectId: string): void {
     window.localStorage.setItem(DASHBOARD_PROJECT_STORAGE_KEY, normalizeProjectId(projectId));
   } catch {
     // localStorage may be disabled; URL state still preserves navigation.
+  }
+}
+
+function readStoredFlag(key: string): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredFlag(key: string, value: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // Non-critical UI preference.
   }
 }
 
@@ -152,6 +171,9 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
   const [aiConfig, setAiConfig] = useState<AiConfigResponse | null>(null);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
+    readStoredFlag(DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY),
+  );
 
   useEffect(() => {
     multiSelectIdsRef.current = multiSelectIds;
@@ -163,6 +185,10 @@ export default function App() {
     writeStoredProjectId(currentProjectId);
     writeDashboardLocation(currentProjectId, view, "replace");
   }, [currentProjectId, view]);
+
+  useEffect(() => {
+    writeStoredFlag(DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed);
+  }, [sidebarCollapsed]);
 
   const resetProjectScopedUi = useCallback(() => {
     setData(null);
@@ -909,6 +935,8 @@ export default function App() {
           onSelectNode={handleSelectNode}
           onSelectView={(v) => setView(v)}
           loading={loading}
+          collapsed={sidebarCollapsed}
+          onToggleCollapsed={() => setSidebarCollapsed((prev) => !prev)}
         />
         <main className="main scrollbar-thin">
           {error && !data && view !== "projects" ? (

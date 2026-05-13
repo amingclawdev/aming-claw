@@ -21,8 +21,10 @@ interface Props {
   backlogCount: number;
   projectCount: number;
   loading: boolean;
+  collapsed: boolean;
   onSelectNode(id: string): void;
   onSelectView(v: ViewName): void;
+  onToggleCollapsed(): void;
 }
 
 const FILTER_LAYERS: Layer[] = ["L1", "L2", "L3", "L4", "L7"];
@@ -44,7 +46,17 @@ interface Index {
 }
 
 export default function TreePanel(props: Props) {
-  const { nodes, selectedNodeId, activeView, opsCount, reviewCount, backlogCount, projectCount, loading } = props;
+  const {
+    nodes,
+    selectedNodeId,
+    activeView,
+    opsCount,
+    reviewCount,
+    backlogCount,
+    projectCount,
+    loading,
+    collapsed,
+  } = props;
 
   const idx = useMemo<Index>(() => buildIndex(nodes), [nodes]);
 
@@ -127,14 +139,26 @@ export default function TreePanel(props: Props) {
   };
 
   return (
-    <aside className="sidebar scrollbar-thin">
+    <aside className={`sidebar${collapsed ? " collapsed" : ""} scrollbar-thin`}>
+      <div className="sidebar-collapse-head">
+        {collapsed ? null : <span className="sidebar-section-title inline">Views</span>}
+        <button
+          type="button"
+          className="icon-btn sidebar-collapse-btn"
+          onClick={props.onToggleCollapsed}
+          aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+          title={collapsed ? "Expand navigation" : "Collapse navigation"}
+        >
+          {collapsed ? "›" : "‹"}
+        </button>
+      </div>
       <div className="sidebar-section">
-        <div className="sidebar-section-title">Views</div>
         <NavRow
           icon="▣"
           label="Projects"
           meta={loading ? "…" : String(projectCount)}
           active={activeView === "projects"}
+          collapsed={collapsed}
           onClick={() => props.onSelectView("projects")}
         />
         <NavRow
@@ -142,6 +166,7 @@ export default function TreePanel(props: Props) {
           label="Project overview"
           meta={`${nodes.length}`}
           active={activeView === "overview"}
+          collapsed={collapsed}
           onClick={() => props.onSelectView("overview")}
         />
         <NavRow
@@ -149,6 +174,7 @@ export default function TreePanel(props: Props) {
           label="Graph"
           meta={loading ? "…" : `${nodes.length}`}
           active={activeView === "graph"}
+          collapsed={collapsed}
           onClick={() => props.onSelectView("graph")}
         />
         <NavRow
@@ -156,6 +182,7 @@ export default function TreePanel(props: Props) {
           label="Operations Queue"
           meta={loading ? "…" : String(opsCount)}
           active={activeView === "operations"}
+          collapsed={collapsed}
           onClick={() => props.onSelectView("operations")}
         />
         <NavRow
@@ -163,6 +190,7 @@ export default function TreePanel(props: Props) {
           label="Review Queue"
           meta={loading ? "…" : String(reviewCount)}
           active={activeView === "review"}
+          collapsed={collapsed}
           onClick={() => props.onSelectView("review")}
         />
         <NavRow
@@ -170,77 +198,82 @@ export default function TreePanel(props: Props) {
           label="Backlog"
           meta={loading ? "…" : String(backlogCount)}
           active={activeView === "backlog"}
+          collapsed={collapsed}
           onClick={() => props.onSelectView("backlog")}
         />
       </div>
 
-      <div className="sidebar-section-title" style={{ marginTop: 4 }}>
-        Graph tree
-      </div>
-      <div className="tree-controls">
-        <div className="tree-search-row">
-          <input
-            type="text"
-            className="tree-search"
-            placeholder="Search nodes / files…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-          {search ? (
-            <button className="tree-search-clear" onClick={() => setSearch("")} title="Clear search">
-              ×
-            </button>
-          ) : null}
-        </div>
-        <div className="tree-chip-row">
-          <button
-            className={`chip layer-chip${layerFilter === "ALL" ? " on" : " off"}`}
-            onClick={() => setLayerFilter("ALL")}
-            title="Show all layers"
-          >
-            All
-          </button>
-          {FILTER_LAYERS.map((l) => {
-            const meta = LAYER_LABELS[l];
-            return (
-              <button
-                key={l}
-                className={`chip layer-chip layer-${l}${layerFilter === l ? " on" : " off"}`}
-                onClick={() => setLayerFilter(l)}
-                title={`${meta.title}. Click to show only ${l} nodes.`}
-              >
-                <span className="layer-chip-code">{l}</span>
-                <span className="layer-chip-label">{meta.label}</span>
-              </button>
-            );
-          })}
-        </div>
-        <div className="tree-counter">
-          {visible == null ? `${nodes.length} nodes` : `${visible.size} of ${nodes.length} nodes`}
-        </div>
-      </div>
-      <div className="sidebar-tree">
-        {idx.roots.length === 0 || treeRoots.length === 0 ? (
-          <div style={{ fontSize: 11, color: "var(--ink-500)", padding: "10px 12px" }}>
-            {loading ? "Loading…" : layerFilter === "ALL" ? "No nodes" : `No ${layerFilter} nodes`}
+      {collapsed ? null : (
+        <>
+          <div className="sidebar-section-title" style={{ marginTop: 4 }}>
+            Graph tree
           </div>
-        ) : (
-          treeRoots
-            .map((root) => (
-              <TreeNode
-                key={root.node_id}
-                node={root}
-                depth={0}
-                idx={idx}
-                visible={visible}
-                expanded={expanded}
-                selectedNodeId={selectedNodeId}
-                onToggle={toggle}
-                onSelectNode={props.onSelectNode}
+          <div className="tree-controls">
+            <div className="tree-search-row">
+              <input
+                type="text"
+                className="tree-search"
+                placeholder="Search nodes / files…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
               />
-            ))
-        )}
-      </div>
+              {search ? (
+                <button className="tree-search-clear" onClick={() => setSearch("")} title="Clear search">
+                  ×
+                </button>
+              ) : null}
+            </div>
+            <div className="tree-chip-row">
+              <button
+                className={`chip layer-chip${layerFilter === "ALL" ? " on" : " off"}`}
+                onClick={() => setLayerFilter("ALL")}
+                title="Show all layers"
+              >
+                All
+              </button>
+              {FILTER_LAYERS.map((l) => {
+                const meta = LAYER_LABELS[l];
+                return (
+                  <button
+                    key={l}
+                    className={`chip layer-chip layer-${l}${layerFilter === l ? " on" : " off"}`}
+                    onClick={() => setLayerFilter(l)}
+                    title={`${meta.title}. Click to show only ${l} nodes.`}
+                  >
+                    <span className="layer-chip-code">{l}</span>
+                    <span className="layer-chip-label">{meta.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="tree-counter">
+              {visible == null ? `${nodes.length} nodes` : `${visible.size} of ${nodes.length} nodes`}
+            </div>
+          </div>
+          <div className="sidebar-tree">
+            {idx.roots.length === 0 || treeRoots.length === 0 ? (
+              <div style={{ fontSize: 11, color: "var(--ink-500)", padding: "10px 12px" }}>
+                {loading ? "Loading…" : layerFilter === "ALL" ? "No nodes" : `No ${layerFilter} nodes`}
+              </div>
+            ) : (
+              treeRoots
+                .map((root) => (
+                  <TreeNode
+                    key={root.node_id}
+                    node={root}
+                    depth={0}
+                    idx={idx}
+                    visible={visible}
+                    expanded={expanded}
+                    selectedNodeId={selectedNodeId}
+                    onToggle={toggle}
+                    onSelectNode={props.onSelectNode}
+                  />
+                ))
+            )}
+          </div>
+        </>
+      )}
     </aside>
   );
 }
@@ -250,19 +283,25 @@ function NavRow(props: {
   label: string;
   meta: string;
   active: boolean;
+  collapsed: boolean;
   onClick(): void;
 }) {
   return (
     <div
-      className={`tree-row${props.active ? " active" : ""}`}
+      className={`tree-row nav-row${props.active ? " active" : ""}${props.collapsed ? " collapsed" : ""}`}
       onClick={props.onClick}
+      title={props.collapsed ? `${props.label} ${props.meta}` : undefined}
       style={{ padding: "5px 8px" }}
     >
       <span className="tree-icon">{props.icon}</span>
-      <span className="tree-name" style={{ fontWeight: 600 }}>
-        {props.label}
-      </span>
-      <span className="tree-meta">{props.meta}</span>
+      {props.collapsed ? null : (
+        <>
+          <span className="tree-name" style={{ fontWeight: 600 }}>
+            {props.label}
+          </span>
+          <span className="tree-meta">{props.meta}</span>
+        </>
+      )}
     </div>
   );
 }
