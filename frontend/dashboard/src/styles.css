@@ -928,7 +928,7 @@ a:hover { text-decoration: underline; }
 
 .project-bootstrap-fields {
   display: grid;
-  grid-template-columns: minmax(260px, 1.5fr) minmax(180px, 0.8fr) auto;
+  grid-template-columns: minmax(260px, 1.5fr) auto minmax(180px, 0.8fr) auto;
   gap: 10px;
   align-items: end;
 }
@@ -961,6 +961,12 @@ a:hover { text-decoration: underline; }
 .project-bootstrap input:focus {
   outline: 2px solid rgba(79, 70, 229, 0.16);
   border-color: var(--indigo);
+}
+
+.project-import-directory-btn {
+  height: 30px;
+  margin-right: 0;
+  white-space: nowrap;
 }
 
 .project-console-notice {
@@ -1068,6 +1074,12 @@ a:hover { text-decoration: underline; }
 .project-console-busy {
   color: var(--ink-500);
   font-size: 10.5px;
+}
+
+@media (max-width: 980px) {
+  .project-bootstrap-fields {
+    grid-template-columns: minmax(220px, 1fr) auto;
+  }
 }
 
 .project-ref-control {

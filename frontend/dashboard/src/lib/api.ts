@@ -114,6 +114,9 @@ export const api = {
   ) {
     return postJSON<BootstrapProjectResponse>("/api/project/bootstrap", payload, signal);
   },
+  chooseLocalDirectory(payload: { initial_path?: string; title?: string } = {}, signal?: AbortSignal) {
+    return postJSON<LocalDirectoryPickerResponse>("/api/local/choose-directory", payload, signal);
+  },
   aiConfig(signal?: AbortSignal) {
     return getJSON<AiConfigResponse>(`/api/projects/${pid()}/ai-config`, signal);
   },
@@ -596,6 +599,14 @@ export interface BootstrapProjectResponse {
   graph_stats?: { node_count?: number; edge_count?: number };
   preflight?: { status?: string };
   activation?: { snapshot_id?: string; projection_status?: string };
+}
+
+export interface LocalDirectoryPickerResponse {
+  ok?: boolean;
+  selected: boolean;
+  path?: string;
+  manual_entry?: boolean;
+  error?: string;
 }
 
 export interface GraphReconcilePayload {

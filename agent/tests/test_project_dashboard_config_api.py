@@ -229,6 +229,44 @@ def test_project_git_ref_endpoints_return_and_persist_selected_ref(tmp_path, mon
     assert projects["dashboard-demo"]["selected_ref_updated_by"] == "dashboard-test"
 
 
+def test_local_choose_directory_endpoint_returns_selected_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_open_local_directory_picker",
+        lambda initial_path="", title="": str(tmp_path),
+    )
+
+    payload = server.handle_local_choose_directory(_ctx(
+        "dashboard-demo",
+        method="POST",
+        body={"initial_path": str(tmp_path.parent), "title": "Pick one"},
+    ))
+
+    assert payload["ok"] is True
+    assert payload["selected"] is True
+    assert payload["path"] == str(tmp_path)
+    assert payload["manual_entry"] is False
+
+
+def test_local_choose_directory_endpoint_handles_unavailable_picker(monkeypatch):
+    def _raise_unavailable(initial_path="", title=""):
+        raise RuntimeError("picker unavailable")
+
+    monkeypatch.setattr(server, "_open_local_directory_picker", _raise_unavailable)
+
+    status, payload = server.handle_local_choose_directory(_ctx(
+        "dashboard-demo",
+        method="POST",
+        body={"initial_path": "C:/missing"},
+    ))
+
+    assert status == 503
+    assert payload["ok"] is False
+    assert payload["selected"] is False
+    assert payload["manual_entry"] is True
+    assert "picker unavailable" in payload["error"]
+
+
 def test_projects_list_endpoint_returns_registered_projects(monkeypatch):
     monkeypatch.setattr(
         server.project_service,

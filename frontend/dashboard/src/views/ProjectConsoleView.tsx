@@ -165,6 +165,30 @@ export default function ProjectConsoleView({
     }
   };
 
+  const handleChooseDirectory = async () => {
+    setActionState({ key: "choose-directory", label: "Choosing directory" });
+    setNotice({ kind: "info", message: "Choose a project directory..." });
+    try {
+      const result = await api.chooseLocalDirectory({
+        initial_path: workspacePath.trim() || undefined,
+        title: "Import project directory",
+      });
+      if (result.selected && result.path) {
+        setWorkspacePath(result.path);
+        setNotice({ kind: "success", message: "Directory selected." });
+      } else {
+        setNotice({ kind: "info", message: "No directory selected. Paste a path or choose again." });
+      }
+    } catch (error) {
+      setNotice({
+        kind: "error",
+        message: `Directory picker unavailable: ${errorMessage(error)} Paste the path manually.`,
+      });
+    } finally {
+      setActionState(null);
+    }
+  };
+
   const handleBuildGraph = async (project: ProjectListItem) => {
     const key = actionKey(project.project_id, "build");
     setActionState({ key, label: "Building graph" });
@@ -275,16 +299,26 @@ export default function ProjectConsoleView({
         <Kpi label="Open backlog" value={stats.backlogOpen} tone={stats.backlogOpen > 0 ? "amber" : "neutral"} />
       </div>
 
-      <form className="project-bootstrap card" onSubmit={handleBootstrap}>
+      <form className="project-bootstrap card" data-testid="project-import-form" onSubmit={handleBootstrap}>
         <div className="project-bootstrap-fields">
           <label>
             <span>Workspace path</span>
             <input
+              data-testid="project-import-workspace-path"
               value={workspacePath}
               onChange={(event) => setWorkspacePath(event.target.value)}
               placeholder="C:\\path\\to\\project"
             />
           </label>
+          <button
+            type="button"
+            className="action-btn project-import-directory-btn"
+            data-testid="project-import-directory"
+            disabled={Boolean(actionState)}
+            onClick={handleChooseDirectory}
+          >
+            {actionState?.key === "choose-directory" ? "Choosing..." : "Choose directory"}
+          </button>
           <label>
             <span>Project name</span>
             <input
@@ -293,7 +327,11 @@ export default function ProjectConsoleView({
               placeholder="optional"
             />
           </label>
-          <button className="action-btn action-btn-primary" disabled={Boolean(actionState)}>
+          <button
+            className="action-btn action-btn-primary"
+            data-testid="project-import-bootstrap"
+            disabled={Boolean(actionState)}
+          >
             {actionState?.key === "bootstrap" ? "Bootstrapping..." : "Bootstrap"}
           </button>
         </div>

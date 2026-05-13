@@ -110,6 +110,42 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _open_local_directory_picker(initial_path: str = "", title: str = "Choose project directory") -> str:
+    """Open a local directory picker and return the selected absolute path."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # pragma: no cover - depends on host Python build
+        raise RuntimeError(f"local directory picker unavailable: {exc}") from exc
+
+    initial_dir = ""
+    if initial_path:
+        candidate = Path(initial_path).expanduser()
+        if candidate.exists():
+            initial_dir = str(candidate if candidate.is_dir() else candidate.parent)
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+            root.update()
+        except Exception:
+            pass
+        options = {"parent": root, "title": title, "mustexist": True}
+        if initial_dir:
+            options["initialdir"] = initial_dir
+        selected = filedialog.askdirectory(**options)
+        return str(Path(selected).resolve()) if selected else ""
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
 def _dashboard_dist_dir() -> Path:
     """Return the built dashboard directory served by the governance process."""
     override = str(os.environ.get("GOVERNANCE_DASHBOARD_DIST") or "").strip()
@@ -764,6 +800,41 @@ def handle_project_bootstrap(ctx: RequestContext):
         return 200, result
     except Exception as e:
         return 400, {"error": str(e)}
+
+
+@route("POST", "/api/local/choose-directory")
+def handle_local_choose_directory(ctx: RequestContext):
+    """Open a local directory picker for the dashboard import form.
+
+    Plain browser directory APIs intentionally do not expose absolute paths.
+    Since this dashboard is a local plugin surface, the governance process owns
+    the native picker and returns a path that the bootstrap API can consume.
+    """
+    initial_path = str(ctx.body.get("initial_path") or ctx.body.get("workspace_path") or "").strip()
+    title = str(ctx.body.get("title") or "Choose project directory").strip() or "Choose project directory"
+    try:
+        selected = _open_local_directory_picker(initial_path=initial_path, title=title)
+    except Exception as exc:
+        return 503, {
+            "ok": False,
+            "selected": False,
+            "path": "",
+            "manual_entry": True,
+            "error": str(exc),
+        }
+    if not selected:
+        return {
+            "ok": True,
+            "selected": False,
+            "path": "",
+            "manual_entry": True,
+        }
+    return {
+        "ok": True,
+        "selected": True,
+        "path": selected,
+        "manual_entry": False,
+    }
 
 
 @route("GET", "/api/project/list")

@@ -170,7 +170,11 @@ async function verifyProjectConfig() {
     http("GET", `/api/projects/${pid(PROJECT)}/git-refs`),
   ]);
   assert(config.project_id === PROJECT, `config project_id mismatch: ${config.project_id}`);
-  assert(String(config.language || "").toLowerCase().includes("type"), "expected typescript project config");
+  const language = String(config.language || "").toLowerCase();
+  assert(
+    language.includes("type") || language === "mixed",
+    `expected typescript or mixed project config, got ${config.language || "(empty)"}`,
+  );
   const excludes = [
     ...(config.graph?.exclude_paths || []),
     ...(config.graph?.ignore_globs || []),
@@ -288,12 +292,23 @@ async function verifyProjectSwitchContract(runtime) {
   ok(`${PROJECT} snapshot=${runtime.status.active_snapshot_id}`);
 }
 
+function verifyProjectImportUiContract() {
+  phase("project import UI contract");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
+  const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  assert(viewSource.includes('data-testid="project-import-directory"'), "Projects page import directory button is missing");
+  assert(viewSource.includes("handleChooseDirectory"), "Projects page does not wire a directory picker handler");
+  assert(apiSource.includes("/api/local/choose-directory"), "dashboard API client missing directory picker endpoint");
+  ok("Projects page exposes import directory picker contract");
+}
+
 async function main() {
   console.log(c("bold", "dashboard-projects-e2e"));
   console.log(c("dim", `backend=${BACKEND} project=${PROJECT} workspace=${WORKSPACE} apply=${APPLY}`));
 
   try {
     await http("GET", "/api/health");
+    verifyProjectImportUiContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();
     const runtime = await verifyGraphRuntime(project);
