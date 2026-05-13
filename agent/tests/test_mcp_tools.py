@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from agent.mcp import tools as mcp_tools
 from agent.mcp.tools import TOOLS, ToolDispatcher
 
 
@@ -206,3 +209,46 @@ def test_mcp_manager_start_refuses_takeover_from_mcp():
 
     assert result["ok"] is False
     assert result["error"] == "takeover_not_supported_from_mcp"
+
+
+def test_mcp_manager_start_uses_posix_script_on_macos(monkeypatch):
+    governance = _Recorder()
+    manager = _Recorder()
+
+    def manager_api(method: str, path: str, data: dict | None = None) -> dict:
+        manager.calls.append((method, path, data))
+        return {"ok": len(manager.calls) > 1}
+
+    dispatcher = ToolDispatcher(
+        api_fn=governance.api,
+        worker_pool=None,
+        service_mgr=None,
+        manager_api_fn=manager_api,
+        workspace="/repo",
+    )
+    calls = []
+
+    monkeypatch.setattr(mcp_tools.sys, "platform", "darwin")
+    monkeypatch.setattr(mcp_tools.os.path, "exists", lambda path: path == "/repo/scripts/start-manager.sh")
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=0, stdout="Manager healthy.", stderr="")
+
+    monkeypatch.setattr(mcp_tools.subprocess, "run", fake_run)
+
+    result = dispatcher.dispatch("manager_start", {"health_wait_seconds": 7})
+
+    assert result["ok"] is True
+    assert result["script"] == "start-manager.sh"
+    assert result["platform"] == "darwin"
+    assert calls[0][0] == [
+        "bash",
+        "/repo/scripts/start-manager.sh",
+        "--health-wait-seconds",
+        "7",
+    ]
+    assert manager.calls == [
+        ("GET", "/api/manager/health", None),
+        ("GET", "/api/manager/health", None),
+    ]

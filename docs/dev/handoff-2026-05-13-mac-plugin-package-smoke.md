@@ -174,6 +174,7 @@ Run these focused tests before and after any package/plugin changes:
 
 ```bash
 python -m pytest \
+  -p no:capture \
   agent/tests/test_package_install.py \
   agent/tests/test_dashboard_static_route.py \
   agent/tests/test_project_dashboard_config_api.py \
@@ -184,6 +185,13 @@ python -m pytest \
 ```
 
 Windows result before handoff: `42 passed`.
+
+macOS note:
+
+- `-p no:capture` is intentional for this focused package/plugin suite. This
+  Mac Python 3.11 environment has been observed to segfault before collection
+  while pytest's capture plugin imports macOS `readline`.
+- Do not make `-p no:capture` global; some wider tests use `capsys`.
 
 Known caveat:
 

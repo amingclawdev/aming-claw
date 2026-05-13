@@ -342,7 +342,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "health_wait_seconds": {
                     "type": "integer",
-                    "description": "Maximum seconds for scripts/start-manager.ps1 to wait for the managed worker.",
+                    "description": "Maximum seconds for scripts/start-manager.{ps1,sh} to wait for the managed worker.",
                     "default": 90,
                     "minimum": 5,
                     "maximum": 300,
@@ -794,26 +794,32 @@ class ToolDispatcher:
         return [line for line in dirty.splitlines() if line.strip()]
 
     def _start_manager(self, health_wait_seconds: int) -> dict:
-        if sys.platform != "win32":
-            return {
-                "ok": False,
-                "error": "platform_bootstrap_not_supported",
-                "platform": sys.platform,
-                "message": "Non-Windows manager bootstrap needs POSIX scripts; tracked by OPT-BACKLOG-HOST-OPS-CROSS-PLATFORM-SCRIPTS.",
-            }
-        script = os.path.join(self._workspace, "scripts", "start-manager.ps1")
+        if sys.platform == "win32":
+            script_name = "start-manager.ps1"
+            script = os.path.join(self._workspace, "scripts", script_name)
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script,
+                "-HealthWaitSeconds",
+                str(health_wait_seconds),
+            ]
+            missing_error = "start_manager_script_missing"
+        else:
+            script_name = "start-manager.sh"
+            script = os.path.join(self._workspace, "scripts", script_name)
+            cmd = [
+                "bash",
+                script,
+                "--health-wait-seconds",
+                str(health_wait_seconds),
+            ]
+            missing_error = "start_manager_posix_script_missing"
         if not os.path.exists(script):
-            return {"ok": False, "error": "start_manager_script_missing", "script": script}
-        cmd = [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            script,
-            "-HealthWaitSeconds",
-            str(health_wait_seconds),
-        ]
+            return {"ok": False, "error": missing_error, "script": script, "platform": sys.platform}
         try:
             proc = subprocess.run(
                 cmd,
@@ -823,7 +829,13 @@ class ToolDispatcher:
                 timeout=health_wait_seconds + 30,
             )
         except FileNotFoundError as exc:
-            return {"ok": False, "error": "powershell_not_found", "detail": str(exc), "command": cmd[:1]}
+            return {
+                "ok": False,
+                "error": "manager_start_launcher_not_found",
+                "detail": str(exc),
+                "command": cmd[:1],
+                "platform": sys.platform,
+            }
         except subprocess.TimeoutExpired as exc:
             return {
                 "ok": False,
@@ -836,6 +848,8 @@ class ToolDispatcher:
         return {
             "ok": bool(proc.returncode == 0 and health.get("ok")),
             "action": "manager_start",
+            "script": script_name,
+            "platform": sys.platform,
             "returncode": proc.returncode,
             "stdout": (proc.stdout or "")[-4000:],
             "stderr": (proc.stderr or "")[-4000:],
