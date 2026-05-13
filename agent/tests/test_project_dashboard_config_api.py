@@ -375,6 +375,38 @@ def test_linux_directory_picker_requires_gui_fallback(monkeypatch):
         raise AssertionError("expected RuntimeError when no Linux picker is available")
 
 
+def test_project_registry_exposes_bootstrap_progress(monkeypatch):
+    data = {
+        "version": 1,
+        "projects": {
+            "dashboard-demo": {
+                "project_id": "dashboard-demo",
+                "workspace_path": "C:/demo",
+                "status": "active",
+            },
+        },
+    }
+
+    monkeypatch.setattr(server.project_service, "_load_projects", lambda: data)
+
+    monkeypatch.setattr(server.project_service, "_save_projects", lambda _updated: None)
+
+    progress = server.project_service.update_project_operation_progress(
+        "dashboard-demo",
+        operation="bootstrap",
+        status="running",
+        phase="full_reconcile",
+        message="Running full graph reconcile.",
+    )
+
+    assert progress["phase"] == "full_reconcile"
+    projects = server.project_service.list_projects()
+    exposed = projects[0]["bootstrap_progress"]
+    assert exposed["operation"] == "bootstrap"
+    assert exposed["status"] == "running"
+    assert exposed["elapsed_seconds"] >= 0
+
+
 def test_projects_list_endpoint_returns_registered_projects(monkeypatch):
     monkeypatch.setattr(
         server.project_service,

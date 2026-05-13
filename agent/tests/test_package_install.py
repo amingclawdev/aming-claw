@@ -70,6 +70,7 @@ class TestPackagedDashboardAssets:
         find_config = data["tool"]["setuptools"]["packages"]["find"]
 
         assert package_data["agent.governance.dashboard_dist"] == ["**/*"]
+        assert package_data["agent.mcp"] == ["resources/*"]
         assert find_config["namespaces"] is True
         assert "agent.tests*" in find_config["exclude"]
         assert "agent.governance.chain_history*" in find_config["exclude"]
@@ -79,6 +80,7 @@ class TestPackagedDashboardAssets:
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
 
         assert "recursive-include agent/governance/dashboard_dist *" in manifest
+        assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
         assert "include .codex-plugin/plugin.json" in manifest
         assert "include CLAUDE.md" in manifest
@@ -109,7 +111,15 @@ class TestLocalPluginPackaging:
         assert "MCP" in manifest["interface"]["capabilities"]
         assert "MCP resources" in manifest["interface"]["longDescription"]
         assert any("aming-claw://skill" in prompt for prompt in manifest["interface"]["defaultPrompt"])
+        assert any("aming-claw://seed-graph-summary" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         assert (ROOT / "CLAUDE.md").is_file()
+
+    def test_mcp_seed_graph_resource_is_packaged(self):
+        seed = ROOT / "agent" / "mcp" / "resources" / "seed-graph-summary.json"
+        data = json.loads(seed.read_text(encoding="utf-8"))
+
+        assert data["project_id"] == "aming-claw"
+        assert data["mvp_boundaries"]["primary"]
 
     def test_mcp_config_is_relocatable_and_uses_stdio_module_entrypoint(self):
         config_text = (ROOT / ".mcp.json").read_text(encoding="utf-8")

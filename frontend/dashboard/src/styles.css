@@ -1085,6 +1085,38 @@ a:hover { text-decoration: underline; }
   border: 1px solid #fecaca;
 }
 
+.project-console-progress {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  background: #eff6ff;
+  color: var(--blue-fg);
+  font-size: 11px;
+}
+
+.project-console-progress-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--blue-fg);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.project-console-progress-row {
+  margin-top: 5px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--blue-fg);
+  font-size: 10.5px;
+}
+
 .project-console-guide {
   display: flex;
   flex-wrap: wrap;

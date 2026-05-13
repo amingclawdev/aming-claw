@@ -30,10 +30,11 @@ For dashboard/graph E2E work, update repo-owned fixture artifacts first and mate
 1. Confirm the workspace root and project id, normally `aming-claw`.
 2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status` when available.
 3. Check graph state: `graph_status` and `graph_operations_queue`.
-4. Call `graph_query` with `tool=query_schema` to discover the live query contract.
-5. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
-6. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
-7. Inspect files only after graph discovery identifies likely owners and reusable modules.
+4. If governance is offline or this is a fresh install, read `aming-claw://seed-graph-summary` for packaged MVP structure before asking the user to start services.
+5. Call `graph_query` with `tool=query_schema` to discover the live query contract.
+6. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
+7. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
+8. Inspect files only after graph discovery identifies likely owners and reusable modules.
 
 ## Visual AI Collaboration
 

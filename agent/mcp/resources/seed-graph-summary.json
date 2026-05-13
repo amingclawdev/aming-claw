@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "project_id": "aming-claw",
+  "purpose": "Packaged fallback context for fresh plugin sessions before a local graph database is available.",
+  "last_curated_commit": "899d676",
+  "recommended_first_actions": [
+    "Read aming-claw://skill and aming-claw://current-context.",
+    "Call graph_query with tool=query_schema before inspecting files; use graph-native discovery before full scans.",
+    "Use find_node_by_path, get_node, get_neighbors, degree_summary, high_degree_nodes, function_index, search_structure, and search_semantic before falling back to full repo scans.",
+    "If governance is offline, ask the user to run aming-claw start or open the dashboard."
+  ],
+  "core_surfaces": [
+    {
+      "name": "dashboard",
+      "paths": [
+        "frontend/dashboard/src/App.tsx",
+        "frontend/dashboard/src/views/ProjectConsoleView.tsx",
+        "frontend/dashboard/src/views/GraphView.tsx",
+        "frontend/dashboard/src/components/InspectorDrawer.tsx",
+        "frontend/dashboard/src/lib/api.ts"
+      ],
+      "notes": "Local UI for project import, graph inspection, operations queue, review queue, backlog, and AI config."
+    },
+    {
+      "name": "governance-api",
+      "paths": [
+        "agent/governance/server.py",
+        "agent/governance/project_service.py",
+        "agent/governance/state_reconcile.py",
+        "agent/governance/graph_query.py"
+      ],
+      "notes": "REST API and graph-native query surface used by the dashboard, MCP tools, and plugin sessions."
+    },
+    {
+      "name": "mcp-plugin",
+      "paths": [
+        "agent/mcp/server.py",
+        ".codex-plugin/plugin.json",
+        "skills/aming-claw/SKILL.md",
+        "skills/aming-claw/references/mcp-tools.md"
+      ],
+      "notes": "Stdio MCP bridge exposing tools and resources for Codex/Claude local plugin sessions."
+    },
+    {
+      "name": "packaging",
+      "paths": [
+        "pyproject.toml",
+        "MANIFEST.in",
+        "scripts/build_package.py",
+        "agent/governance/dashboard_dist"
+      ],
+      "notes": "Pip package and local plugin assets, including the static dashboard build."
+    }
+  ],
+  "mvp_boundaries": {
+    "primary": [
+      "Build/update local code graphs",
+      "Query graph structure and function indexes",
+      "Inspect code through dashboard and MCP graph APIs",
+      "File graph-backed backlog items"
+    ],
+    "experimental": [
+      "Live AI semantic enrichment",
+      "Semantic proposal review",
+      "Auto-chain implementation workflow",
+      "Branch/time-series merge and rollback semantics"
+    ]
+  }
+}

@@ -585,7 +585,20 @@ export interface ProjectListItem {
   active_snapshot_id?: string;
   selected_ref?: string;
   selected_ref_updated_at?: string;
+  bootstrap_progress?: ProjectOperationProgress;
   created_at?: string;
+}
+
+export interface ProjectOperationProgress {
+  operation?: "bootstrap" | "build_graph" | "update_graph" | string;
+  status?: "running" | "succeeded" | "failed" | "cancelled" | string;
+  phase?: string;
+  message?: string;
+  started_at?: string;
+  updated_at?: string;
+  completed_at?: string;
+  elapsed_seconds?: number;
+  heartbeat?: number;
 }
 
 export interface ProjectsResponse {

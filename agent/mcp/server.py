@@ -69,6 +69,11 @@ RESOURCE_FILES: dict[str, tuple[str, str, str]] = {
         "skills/aming-claw/references/plugin-packaging.md",
         "text/markdown",
     ),
+    "aming-claw://seed-graph-summary": (
+        "Seed Graph Summary",
+        "agent/mcp/resources/seed-graph-summary.json",
+        "application/json",
+    ),
 }
 
 # JSON-RPC error codes
@@ -240,13 +245,19 @@ class AmingClawMCP:
         if not spec:
             raise ValueError(f"Unknown resource URI: {uri}")
         _, rel_path, _ = spec
-        root = Path(self._workspace).resolve()
-        path = (root / rel_path).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(f"Resource escapes workspace: {uri}") from exc
-        return path.read_text(encoding="utf-8")
+        candidates = [
+            Path(self._workspace).resolve(),
+            Path(__file__).resolve().parents[2],
+        ]
+        for root in candidates:
+            path = (root / rel_path).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"Resource escapes workspace: {uri}") from exc
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+        raise FileNotFoundError(f"Resource file not found for {uri}: {rel_path}")
 
     def _resource_mime_type(self, uri: str) -> str:
         if uri == "aming-claw://current-context" or (uri.startswith("aming-claw://project/") and uri.endswith("/context")):
@@ -280,11 +291,12 @@ class AmingClawMCP:
             "## Startup Checklist",
             "",
             "1. Read `aming-claw://skill`.",
-            "2. Check `health`, `version_check`, `graph_status`, `graph_operations_queue`, and open backlog.",
-            "3. Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
-            "4. File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
-            "5. Use the dashboard as a visual control plane when browser-use is available.",
-            "6. If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
+            "2. Read `aming-claw://seed-graph-summary` if governance is offline or this is a fresh package install.",
+            "3. Check `health`, `version_check`, `graph_status`, `graph_operations_queue`, and open backlog.",
+            "4. Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
+            "5. File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
+            "6. Use the dashboard as a visual control plane when browser-use is available.",
+            "7. If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
             "",
         ])
 

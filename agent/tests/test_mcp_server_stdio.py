@@ -92,6 +92,12 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
             "method": "resources/read",
             "params": {"uri": "aming-claw://current-context"},
         },
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "resources/read",
+            "params": {"uri": "aming-claw://seed-graph-summary"},
+        },
     ])
 
     assert returncode == 0
@@ -99,6 +105,7 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     resources = {r["uri"]: r for r in responses[0]["result"]["resources"]}
     assert "aming-claw://skill" in resources
     assert "aming-claw://current-context" in resources
+    assert "aming-claw://seed-graph-summary" in resources
     templates = responses[1]["result"]["resourceTemplates"]
     assert templates[0]["uriTemplate"] == "aming-claw://project/{project_id}/context"
     skill_text = responses[2]["result"]["contents"][0]["text"]
@@ -109,3 +116,6 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     assert "dashboard_url:" in context_text
     assert "health: `unavailable`" in context_text
     assert "Call `graph_query` with `tool=query_schema`" in context_text
+    seed = json.loads(responses[4]["result"]["contents"][0]["text"])
+    assert seed["project_id"] == "aming-claw"
+    assert "graph-native" in " ".join(seed["recommended_first_actions"]).lower()

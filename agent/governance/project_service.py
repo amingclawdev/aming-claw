@@ -57,6 +57,20 @@ def _save_projects(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _progress_with_elapsed(progress: object) -> object:
+    if not isinstance(progress, dict):
+        return progress
+    out = dict(progress)
+    started_at = str(out.get("started_at") or "").strip()
+    if started_at:
+        try:
+            started = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            out["elapsed_seconds"] = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+        except ValueError:
+            pass
+    return out
+
+
 # ============================================================
 # Project ID normalization
 # ============================================================
@@ -297,6 +311,8 @@ def list_projects() -> list[dict]:
     for p in projects["projects"].values():
         # Never expose password_hash
         safe = {k: v for k, v in p.items() if k != "password_hash"}
+        if "bootstrap_progress" in safe:
+            safe["bootstrap_progress"] = _progress_with_elapsed(safe["bootstrap_progress"])
         result.append(safe)
     return result
 
@@ -319,6 +335,42 @@ def update_project_metadata(project_id: str, updates: dict) -> dict:
             entry[key] = value
     _save_projects(projects)
     return {k: v for k, v in entry.items() if k != "password_hash"}
+
+
+def update_project_operation_progress(
+    project_id: str,
+    *,
+    operation: str,
+    status: str,
+    phase: str,
+    message: str = "",
+) -> dict | None:
+    """Persist lightweight project operation progress for dashboard polling."""
+    project_id = _normalize_project_id(project_id)
+    projects = _load_projects()
+    entry = projects["projects"].get(project_id)
+    if not entry:
+        return None
+
+    now = _utc_iso()
+    previous = entry.get("bootstrap_progress") if isinstance(entry.get("bootstrap_progress"), dict) else {}
+    same_operation = previous.get("operation") == operation and previous.get("status") == "running"
+    started_at = previous.get("started_at") if same_operation else now
+    heartbeat = int(previous.get("heartbeat") or 0) + 1 if same_operation else 1
+    progress = {
+        "operation": operation,
+        "status": status,
+        "phase": phase,
+        "message": message or phase,
+        "started_at": started_at,
+        "updated_at": now,
+        "heartbeat": heartbeat,
+    }
+    if status in {"succeeded", "failed", "cancelled"}:
+        progress["completed_at"] = now
+    entry["bootstrap_progress"] = progress
+    _save_projects(projects)
+    return progress
 
 
 def project_exists(project_id: str) -> bool:
@@ -453,10 +505,24 @@ def bootstrap_project(
 
     pid = config.project_id or project_name or ws.name.lower().replace("_", "-")
     pid = _normalize_project_id(pid)
+    update_project_operation_progress(
+        pid,
+        operation="bootstrap",
+        status="running",
+        phase="config",
+        message="Project config resolved.",
+    )
 
     # Step 2: init_project (idempotent — AC6)
     is_new = not project_exists(pid)
     try:
+        update_project_operation_progress(
+            pid,
+            operation="bootstrap",
+            status="running",
+            phase="register",
+            message="Registering project workspace.",
+        )
         init_result = init_project(
             project_id=pid,
             project_name=project_name or pid,
@@ -474,6 +540,13 @@ def bootstrap_project(
         # Step 3: snapshot-native full reconcile + activation. The old
         # generate_graph path wrote a legacy graph.json only; dashboard and
         # graph-governance now consume active graph snapshots.
+        update_project_operation_progress(
+            pid,
+            operation="bootstrap",
+            status="running",
+            phase="scan",
+            message="Scanning files and building graph snapshot.",
+        )
         configured_excludes = effective_graph_exclude_roots(config)
         effective_excludes = sorted({
             str(value).replace("\\", "/").strip().strip("/")
@@ -494,6 +567,13 @@ def bootstrap_project(
 
             from .state_reconcile import run_state_only_full_reconcile
 
+            update_project_operation_progress(
+                pid,
+                operation="bootstrap",
+                status="running",
+                phase="full_reconcile",
+                message="Running full graph reconcile.",
+            )
             reconcile_result = run_state_only_full_reconcile(
                 conn,
                 pid,
@@ -540,6 +620,13 @@ def bootstrap_project(
 
             # Step 5: Backfill chain history for this project at bootstrap.
             try:
+                update_project_operation_progress(
+                    pid,
+                    operation="bootstrap",
+                    status="running",
+                    phase="chain_history",
+                    message="Backfilling chain history.",
+                )
                 from .chain_trailer import backfill_legacy_chain_history
                 backfill_legacy_chain_history(project_id=pid, incremental=False)
             except Exception:
@@ -548,6 +635,13 @@ def bootstrap_project(
             conn.close()
 
     except Exception as e:
+        update_project_operation_progress(
+            pid,
+            operation="bootstrap",
+            status="failed",
+            phase="failed",
+            message=str(e),
+        )
         # Rollback: remove project if newly created
         if is_new:
             projects = _load_projects()
@@ -586,6 +680,13 @@ def bootstrap_project(
         "activation": reconcile_result.get("activation") or {},
         "bootstrap_mode": "snapshot_full_reconcile",
     }
+    update_project_operation_progress(
+        pid,
+        operation="bootstrap",
+        status="succeeded",
+        phase="complete",
+        message=f"Graph ready: {node_count} nodes, {edge_count} edges.",
+    )
 
     return result
 

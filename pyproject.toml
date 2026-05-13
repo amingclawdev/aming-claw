@@ -45,4 +45,5 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml", "*.json"]
+"agent.mcp" = ["resources/*"]
 "agent.governance.dashboard_dist" = ["**/*"]

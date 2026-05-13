@@ -316,6 +316,20 @@ function verifyProjectImportUiContract() {
   ok("Projects page exposes import directory picker contract");
 }
 
+function verifyProjectProgressContract() {
+  phase("project bootstrap progress contract");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
+  const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  const serviceSource = readFileSync(path.join(REPO_ROOT, "agent/governance/project_service.py"), "utf8");
+  assert(apiSource.includes("bootstrap_progress?: ProjectOperationProgress"), "project registry type should expose bootstrap_progress");
+  assert(serviceSource.includes("update_project_operation_progress"), "backend should persist project operation progress");
+  assert(serviceSource.includes('"full_reconcile"'), "bootstrap progress should expose the full_reconcile phase");
+  assert(viewSource.includes("project-console-progress"), "Projects page should display a visible long-operation progress strip");
+  assert(viewSource.includes("polling registry status"), "Projects page should poll registry status while long graph operations run");
+  assert(viewSource.includes("elapsedLabel"), "Projects page should display elapsed time for long operations");
+  ok("Projects page exposes pollable bootstrap/build graph progress");
+}
+
 function verifyHeaderV1Contract() {
   phase("header v1 contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
@@ -443,6 +457,7 @@ async function main() {
   try {
     await http("GET", "/api/health");
     verifyProjectImportUiContract();
+    verifyProjectProgressContract();
     verifyHeaderV1Contract();
     verifyProjectDisplayNameContract();
     verifyProjectScopedFetchContract();

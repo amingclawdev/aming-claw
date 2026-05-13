@@ -24,6 +24,7 @@
     ],
     "defaultPrompt": [
       "Read the Aming Claw MCP resource aming-claw://skill or use $aming-claw before changing dashboard or governance code.",
+      "If governance is unavailable, read aming-claw://seed-graph-summary for packaged MVP structure, then ask the user to run aming-claw start.",
       "Call graph_query with tool=query_schema, then inspect graph/status/backlog before implementation.",
       "If services are offline, ask the user to run aming-claw start instead of silently starting workers."
     ],

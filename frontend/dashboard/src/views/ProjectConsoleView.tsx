@@ -13,6 +13,7 @@ import {
   type ProjectConfigResponse,
   type ProjectGitRefsResponse,
   type ProjectListItem,
+  type ProjectOperationProgress,
 } from "../lib/api";
 
 interface Props {
@@ -88,6 +89,8 @@ export default function ProjectConsoleView({
   const [projectName, setProjectName] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [actionState, setActionState] = useState<{ key: string; label: string } | null>(null);
+  const [actionStartedAt, setActionStartedAt] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const workspacePathInputRef = useRef<HTMLInputElement | null>(null);
   const projectKey = useMemo(() => projects.map((p) => p.project_id).join("\u0000"), [projects]);
 
@@ -108,6 +111,23 @@ export default function ProjectConsoleView({
       });
     return () => ac.abort();
   }, [projectKey, projects, refreshToken]);
+
+  useEffect(() => {
+    if (!actionState) {
+      setActionStartedAt(null);
+      return;
+    }
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    const poller = window.setInterval(() => {
+      setRefreshToken((value) => value + 1);
+      void onRefresh();
+    }, 2000);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(poller);
+    };
+  }, [actionState, onRefresh]);
 
   const rows = useMemo(
     () =>
@@ -146,6 +166,7 @@ export default function ProjectConsoleView({
       return;
     }
     setActionState({ key: "bootstrap", label: "Bootstrapping" });
+    setActionStartedAt(Date.now());
     setNotice({ kind: "info", message: "Bootstrapping project..." });
     try {
       const result = await api.bootstrapProject({
@@ -211,6 +232,7 @@ export default function ProjectConsoleView({
   const handleBuildGraph = async (project: ProjectListItem) => {
     const key = actionKey(project.project_id, "build");
     setActionState({ key, label: "Building graph" });
+    setActionStartedAt(Date.now());
     setNotice({ kind: "info", message: `Building graph for ${project.project_id}...` });
     try {
       const result = await api.fullReconcileFor(project.project_id, {
@@ -243,6 +265,7 @@ export default function ProjectConsoleView({
       return;
     }
     setActionState({ key, label: "Updating graph" });
+    setActionStartedAt(Date.now());
     setNotice({ kind: "info", message: `Updating graph for ${project.project_id}...` });
     try {
       const graphStale = row?.status?.current_state?.graph_stale;
@@ -282,6 +305,7 @@ export default function ProjectConsoleView({
     if (!ref) return;
     const key = actionKey(project.project_id, "ref");
     setActionState({ key, label: "Saving ref" });
+    setActionStartedAt(Date.now());
     setNotice({ kind: "info", message: `Saving ref for ${project.project_id}...` });
     try {
       const result = await api.selectGitRefFor(project.project_id, {
@@ -366,6 +390,14 @@ export default function ProjectConsoleView({
             {notice.message}
           </div>
         ) : null}
+        {actionState ? (
+          <div className="project-console-progress" role="status">
+            <span className="project-console-progress-dot" />
+            <strong>{actionState.label}</strong>
+            <span>{elapsedLabel(actionStartedAt, nowMs)}</span>
+            <span>polling registry status</span>
+          </div>
+        ) : null}
       </form>
 
       <div className="section">
@@ -406,6 +438,7 @@ export default function ProjectConsoleView({
                     selected={selected}
                     lifecycle={lifecycleFor(project, row)}
                     busyLabel={busyLabelFor(project.project_id, actionState)}
+                    localElapsed={busyLabelFor(project.project_id, actionState) ? elapsedLabel(actionStartedAt, nowMs) : undefined}
                     onOpenProject={onOpenProject}
                     onOpenAiConfig={onOpenAiConfig}
                     onBuildGraph={() => handleBuildGraph(project)}
@@ -435,6 +468,7 @@ function ProjectRow({
   selected,
   lifecycle,
   busyLabel,
+  localElapsed,
   onOpenProject,
   onOpenAiConfig,
   onBuildGraph,
@@ -446,6 +480,7 @@ function ProjectRow({
   selected: boolean;
   lifecycle: Lifecycle;
   busyLabel?: string;
+  localElapsed?: string;
   onOpenProject(projectId: string): void;
   onOpenAiConfig(): void;
   onBuildGraph(): void;
@@ -459,6 +494,8 @@ function ProjectRow({
   const aiRoute = runtime?.aiConfig?.semantic;
   const actionBusy = Boolean(busyLabel);
   const actionDisabled = actionBusy || lifecycle.kind === "config_missing" || lifecycle.kind === "service_error";
+  const progress = project.bootstrap_progress;
+  const progressLabel = progressLabelFor(progress, busyLabel, localElapsed);
 
   return (
     <tr className={selected ? "project-console-selected" : ""}>
@@ -471,6 +508,7 @@ function ProjectRow({
         <div className="project-console-sub">
           {project.status || (project.initialized ? "initialized" : "registered")}
         </div>
+        {progressLabel ? <div className="project-console-progress-row">{progressLabel}</div> : null}
       </td>
       <td>
         <ProjectRefControl
@@ -556,7 +594,12 @@ function ProjectRow({
           >
             AI config
           </button>
-          {busyLabel ? <span className="project-console-busy">{busyLabel}</span> : null}
+          {busyLabel ? (
+            <span className="project-console-busy">
+              {busyLabel}
+              {localElapsed ? ` · ${localElapsed}` : ""}
+            </span>
+          ) : null}
         </div>
       </td>
     </tr>
@@ -808,6 +851,53 @@ function actionKey(projectId: string, action: "build" | "update" | "ref"): strin
 function busyLabelFor(projectId: string, state: { key: string; label: string } | null): string | undefined {
   if (!state) return undefined;
   return state.key.endsWith(`:${projectId}`) || state.key === "bootstrap" ? state.label : undefined;
+}
+
+function elapsedLabel(startedAt: number | null, nowMs: number): string {
+  if (!startedAt) return "elapsed 0s";
+  const seconds = Math.max(0, Math.floor((nowMs - startedAt) / 1000));
+  if (seconds < 60) return `elapsed ${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `elapsed ${minutes}m ${rest}s`;
+}
+
+function progressLabelFor(
+  progress: ProjectOperationProgress | undefined,
+  localLabel?: string,
+  localElapsed?: string,
+): string | undefined {
+  if (localLabel) {
+    return `${localLabel}${localElapsed ? ` · ${localElapsed}` : ""}`;
+  }
+  if (!progress?.status) return undefined;
+  const phase = progress.phase ? ` · ${progress.phase}` : "";
+  const message = progress.message ? ` · ${progress.message}` : "";
+  const elapsed = typeof progress.elapsed_seconds === "number" ? ` · elapsed ${formatSeconds(progress.elapsed_seconds)}` : "";
+  if (progress.status === "running") {
+    return `${operationLabel(progress.operation)} running${phase}${elapsed}${message}`;
+  }
+  if (progress.status === "failed") {
+    return `${operationLabel(progress.operation)} failed${phase}${message}`;
+  }
+  if (progress.status === "succeeded") {
+    return `${operationLabel(progress.operation)} complete${phase}${message}`;
+  }
+  return `${operationLabel(progress.operation)} ${progress.status}${phase}${message}`;
+}
+
+function operationLabel(operation?: string): string {
+  if (operation === "bootstrap") return "Bootstrap";
+  if (operation === "build_graph") return "Build graph";
+  if (operation === "update_graph") return "Update graph";
+  return "Project operation";
+}
+
+function formatSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${minutes}m ${rest}s`;
 }
 
 function errorMessage(error: unknown): string {
