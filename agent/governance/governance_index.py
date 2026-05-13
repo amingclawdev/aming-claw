@@ -21,6 +21,7 @@ from agent.governance.external_project_governance import (
     build_doc_index,
     build_symbol_index,
 )
+from agent.governance.checkout_provenance import describe_checkout
 from agent.governance.graph_snapshot_store import (
     ensure_schema as ensure_graph_snapshot_schema,
     get_active_graph_snapshot,
@@ -464,6 +465,11 @@ def build_governance_index(
     commit = commit_sha or _git_commit(root) or "unknown"
     rid = run_id or _make_run_id(commit)
     profile = profile or discover_project_profile(str(root))
+    checkout_provenance = describe_checkout(
+        root,
+        project_id=project_id,
+        commit_sha=commit,
+    )
 
     source_snapshot: dict[str, Any] | None = None
     source_nodes: list[dict[str, Any]] = []
@@ -542,10 +548,16 @@ def build_governance_index(
         "commit_sha": commit,
         "generated_at": _utc_now(),
         "project_root": str(root),
+        "project_root_role": "execution_root",
+        "checkout_provenance": checkout_provenance,
         "active_snapshot": dict(source_snapshot) if source_snapshot else {},
         "active_node_count": len(source_nodes),
         "index_scope": index_scope,
-        "profile": _json_safe(asdict(profile)),
+        "profile": {
+            **_json_safe(asdict(profile)),
+            "project_root_role": "execution_root",
+            "checkout_provenance": checkout_provenance,
+        },
         "file_inventory": file_inventory,
         "file_inventory_summary": summarize_file_inventory(file_inventory),
         "governance_hint_bindings": governance_hint_bindings,

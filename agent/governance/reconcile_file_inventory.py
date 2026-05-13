@@ -137,7 +137,14 @@ def _gitignored_paths(project_root: str | Path, paths: Iterable[str]) -> set[str
     }
 
 
-def _git_inventory_paths(project_root: str, profile: ProjectProfile) -> set[str] | None:
+def git_tracked_paths(project_root: str | Path, ref: str = "HEAD") -> set[str] | None:
+    """Return repository paths tracked by *ref*.
+
+    Git-backed reconcile inventory is commit-bound: untracked operator files may
+    exist in one checkout but not another, so they must not participate in graph
+    deltas. Prefer the committed tree for ``ref`` and fall back to the index for
+    newborn repositories that do not have ``HEAD`` yet.
+    """
     root = Path(project_root)
     try:
         inside = subprocess.run(
@@ -149,20 +156,37 @@ def _git_inventory_paths(project_root: str, profile: ProjectProfile) -> set[str]
         )
         if inside.returncode != 0 or (inside.stdout or "").strip().lower() != "true":
             return None
-        result = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
     except Exception:
         return None
-    raw_paths = {
-        normalize_relpath(project_root, path)
-        for path in (result.stdout or "").split("\0")
-        if path.strip()
-    }
+
+    commands = [
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z", str(ref or "HEAD")],
+        ["git", "-C", str(root), "ls-files", "--cached", "-z"],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+        except Exception:
+            continue
+        return {
+            normalize_relpath(str(root), path)
+            for path in (result.stdout or "").split("\0")
+            if path.strip()
+        }
+    return None
+
+
+def _git_inventory_paths(project_root: str, profile: ProjectProfile) -> set[str] | None:
+    root = Path(project_root)
+    raw_paths = git_tracked_paths(project_root)
+    if raw_paths is None:
+        return None
     ignored = _gitignored_paths(project_root, raw_paths)
     out: set[str] = set()
     for rel in raw_paths - ignored:
@@ -731,6 +755,7 @@ __all__ = [
     "FileInventoryRow",
     "build_file_inventory",
     "classify_file_kind",
+    "git_tracked_paths",
     "summarize_file_inventory",
     "query_file_inventory",
     "upsert_file_inventory",

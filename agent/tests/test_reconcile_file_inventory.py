@@ -66,6 +66,35 @@ def test_inventory_respects_gitignore_even_for_force_tracked_drafts(tmp_path):
     assert "docs/dev/tracked.md" not in rows_by_path
 
 
+def test_git_inventory_is_tracked_only_across_worktrees(tmp_path):
+    project = tmp_path / "project"
+    _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")
+    _write(str(project / "README.md"), "# demo\n")
+    _git(project, "init")
+    _git(project, "config", "user.email", "test@example.com")
+    _git(project, "config", "user.name", "Test User")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "initial")
+
+    linked = tmp_path / "linked"
+    _git(project, "worktree", "add", "--detach", str(linked), "HEAD")
+    _write(str(project / "agent" / "local_only.py"), "VALUE = 1\n")
+    _write(str(project / ".codex" / "config.toml"), "local = true\n")
+    _write(str(linked / "agent" / "other_local_only.py"), "VALUE = 2\n")
+
+    rows_main = build_file_inventory(project_root=str(project), run_id="main")
+    rows_linked = build_file_inventory(project_root=str(linked), run_id="linked")
+
+    paths_main = {row["path"] for row in rows_main}
+    paths_linked = {row["path"] for row in rows_linked}
+    assert paths_main == paths_linked
+    assert "agent/service.py" in paths_main
+    assert "README.md" in paths_main
+    assert "agent/local_only.py" not in paths_main
+    assert ".codex/config.toml" not in paths_main
+    assert "agent/other_local_only.py" not in paths_linked
+
+
 def test_inventory_classifies_clustered_attached_and_orphan_files(tmp_path):
     project = tmp_path / "project"
     _write(str(project / "agent" / "service.py"), "def run():\n    return 1\n")

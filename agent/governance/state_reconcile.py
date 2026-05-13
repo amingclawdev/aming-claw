@@ -54,11 +54,13 @@ from agent.governance.governance_index import (
     merge_feature_hashes_into_graph_nodes,
     persist_governance_index,
 )
+from agent.governance.checkout_provenance import describe_checkout
 from agent.governance.reconcile_semantic_enrichment import run_semantic_enrichment
 from agent.governance.reconcile_trace import ReconcileTrace, artifact_ref
 from agent.governance.reconcile_file_inventory import (
     filter_governed_inventory_rows,
     filter_governed_paths,
+    git_tracked_paths,
 )
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
@@ -213,6 +215,25 @@ def _build_scope_file_delta(
         old_rows = filter_governed_inventory_rows(project_root, old_rows)
         new_rows = filter_governed_inventory_rows(project_root, new_rows)
         changed_files = filter_governed_paths(project_root, changed_files)
+        tracked_paths = git_tracked_paths(project_root)
+        if tracked_paths is not None:
+            def row_path(row: dict[str, Any]) -> str:
+                return str(row.get("path") or "").replace("\\", "/").strip("/")
+
+            changed_path_set = {
+                str(path or "").replace("\\", "/").strip("/")
+                for path in changed_files
+                if str(path or "").strip()
+            }
+            old_rows = [
+                row for row in old_rows
+                if row_path(row) in tracked_paths
+                or row_path(row) in changed_path_set
+            ]
+            new_rows = [
+                row for row in new_rows
+                if row_path(row) in tracked_paths
+            ]
     old_by_path = _rows_by_path(old_rows)
     new_by_path = _rows_by_path(new_rows)
     old_paths = set(old_by_path)
@@ -745,6 +766,11 @@ def run_state_only_full_reconcile(
     commit = commit_sha or _git_commit(root) or "unknown"
     sid = snapshot_id or snapshot_id_for(snapshot_kind, commit)
     rid = run_id or sid
+    checkout_provenance = describe_checkout(
+        root,
+        project_id=project_id,
+        commit_sha=commit,
+    )
     state_dir = _governance_state_dir(project_id, rid)
     scratch_dir = state_dir / "scratch"
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -759,6 +785,8 @@ def run_state_only_full_reconcile(
         input_payload={
             "project_id": project_id,
             "project_root": str(root),
+            "project_root_role": "execution_root",
+            "checkout_provenance": checkout_provenance,
             "run_id": rid,
             "snapshot_id": sid,
             "snapshot_kind": snapshot_kind,
@@ -904,6 +932,7 @@ def run_state_only_full_reconcile(
         "file_role_annotation": role_annotation["report"],
         "relationship_metrics": relationship_metrics["report"],
         "graph_correction_patch_report": patch_application["report"],
+        "checkout_provenance": checkout_provenance,
         **(notes_extra or {}),
     }
     notes["trace"] = {

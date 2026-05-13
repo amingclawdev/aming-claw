@@ -171,6 +171,11 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
         == ["L7.service"]
     )
     assert "confidence" not in json.dumps(index, ensure_ascii=False)
+    assert index["project_root_role"] == "execution_root"
+    assert index["checkout_provenance"]["execution_root_role"] == "execution_root"
+    assert index["checkout_provenance"]["canonical_project_identity"]["project_id"] == PID
+    assert index["profile"]["project_root_role"] == "execution_root"
+    assert index["profile"]["checkout_provenance"]["execution_root"] == index["project_root"]
 
     summary = persist_governance_index(
         conn,
@@ -183,6 +188,9 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     assert summary["feature_count"] == 1
     for path in summary["artifacts"].values():
         assert Path(path).exists()
+    profile_payload = json.loads(Path(summary["artifacts"]["profile_path"]).read_text(encoding="utf-8"))
+    assert profile_payload["project_root_role"] == "execution_root"
+    assert profile_payload["checkout_provenance"]["canonical_project_identity"]["project_id"] == PID
 
     persisted = conn.execute(
         """

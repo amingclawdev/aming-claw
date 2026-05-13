@@ -153,6 +153,35 @@ def test_mcp_graph_tools_route_to_governance_api():
     )
 
 
+def test_mcp_pending_scope_queue_can_force_requeue_suspect_materialization():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch(
+        "graph_pending_scope_queue",
+        {
+            "project_id": "aming-claw",
+            "commit_sha": "head",
+            "status": "queued",
+            "force_requeue": True,
+            "evidence": {"source": "suspect_snapshot"},
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/graph-governance/aming-claw/pending-scope",
+            {
+                "commit_sha": "head",
+                "status": "queued",
+                "force_requeue": True,
+                "evidence": {"source": "suspect_snapshot"},
+            },
+        )
+    ]
+
+
 def test_mcp_host_ops_tools_route_to_manager_sidecar():
     governance = _Recorder()
     manager = _Recorder()

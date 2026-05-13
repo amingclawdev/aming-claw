@@ -589,3 +589,80 @@ def test_strict_graph_ready_ignores_scan_baseline_when_active_graph_is_stale(con
     ready = store.strict_graph_ready(conn, PID, target_commit="old-graph")
     assert ready["ok"] is True
     assert ready["reason"] == ""
+
+
+def test_graph_status_surfaces_snapshot_materialization_warnings(conn):
+    _ensure_schema(conn)
+    notes = {
+        "checkout_provenance": {
+            "execution_root": "/private/tmp/aming-claw-scope/repo",
+            "execution_root_role": "execution_root",
+            "execution_root_is_ephemeral": True,
+            "canonical_project_identity": {
+                "type": "git",
+                "project_id": PID,
+                "identity_hash": "abc123",
+            },
+            "warnings": [
+                {
+                    "code": "ephemeral_execution_root",
+                    "message": "graph snapshot was materialized from a temporary execution root",
+                }
+            ],
+        }
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-suspect-root",
+        commit_sha="head",
+        snapshot_kind="scope",
+        notes=json.dumps(notes, sort_keys=True),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+
+    status = store.graph_governance_status(conn, PID)
+
+    assert status["active_snapshot_materialization"]["execution_root_role"] == "execution_root"
+    assert status["active_snapshot_materialization"]["warning_count"] == 1
+    assert status["active_snapshot_warnings"][0]["code"] == "ephemeral_execution_root"
+
+
+def test_pending_scope_force_requeue_reopens_materialized_rows(conn):
+    _ensure_schema(conn)
+    first = store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+        status=store.PENDING_STATUS_MATERIALIZED,
+        snapshot_id="scope-old",
+        evidence={"source": "test"},
+    )
+    assert first["status"] == store.PENDING_STATUS_MATERIALIZED
+
+    preserved = store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        status=store.PENDING_STATUS_QUEUED,
+        evidence={"source": "normal_requeue"},
+    )
+    assert preserved["status"] == store.PENDING_STATUS_MATERIALIZED
+    assert preserved["snapshot_id"] == "scope-old"
+
+    reopened = store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        status=store.PENDING_STATUS_QUEUED,
+        evidence={"source": "suspect_snapshot_requeue"},
+        force_requeue=True,
+    )
+
+    assert reopened["status"] == store.PENDING_STATUS_QUEUED
+    assert reopened["snapshot_id"] == ""
+    assert reopened["retry_count"] == 1
+    evidence = json.loads(reopened["evidence_json"])
+    assert evidence["source"] == "suspect_snapshot_requeue"
+    assert evidence["force_requeue"] is True

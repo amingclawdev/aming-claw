@@ -3318,12 +3318,17 @@ def _graph_stale_scope_operation(
     status: dict[str, Any],
     pending_rows: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    active_warnings = [
+        dict(item) for item in status.get("active_snapshot_warnings") or []
+        if isinstance(item, dict)
+    ]
     stale_summary: dict[str, Any] = {
         "is_stale": False,
         "active_graph_commit": str(status.get("graph_snapshot_commit") or ""),
         "head_commit": "",
         "changed_files": [],
         "changed_file_count": 0,
+        "active_snapshot_warnings": active_warnings,
     }
     try:
         root = _graph_governance_project_root(project_id, {})
@@ -3332,8 +3337,33 @@ def _graph_stale_scope_operation(
     head_commit = _git_head_commit(root)
     graph_commit = str(status.get("graph_snapshot_commit") or "")
     stale_summary["head_commit"] = head_commit
-    if not head_commit or not graph_commit or head_commit == graph_commit:
+    if not head_commit or not graph_commit:
         return None, stale_summary
+    if head_commit == graph_commit:
+        if not active_warnings:
+            return None, stale_summary
+        operation = {
+            "operation_id": f"scope-reconcile:suspect-root:{graph_commit[:12]}",
+            "operation_type": "scope_reconcile",
+            "target_scope": "snapshot",
+            "target_id": graph_commit,
+            "target_label": graph_commit[:12],
+            "status": "not_queued",
+            "progress": {"done": 0, "total": 1},
+            "created_at": "",
+            "updated_at": "",
+            "claimed_by": "",
+            "worker_id": "",
+            "lease_expires_at": "",
+            "last_error": "",
+            "last_result": "active graph snapshot has materialization provenance warnings",
+            "supported_actions": ["queue_scope_reconcile", "view_trace", "file_backlog"],
+            "active_graph_commit": graph_commit,
+            "head_commit": head_commit,
+            "changed_files": [],
+            "warnings": active_warnings,
+        }
+        return operation, stale_summary
     all_changed_files = _git_changed_paths_between(root, graph_commit, head_commit, limit=None)
     if not all_changed_files:
         return None, stale_summary
@@ -3370,6 +3400,7 @@ def _graph_stale_scope_operation(
         "active_graph_commit": graph_commit,
         "head_commit": head_commit,
         "changed_files": changed_files,
+        "warnings": active_warnings,
     }
     return operation, stale_summary
 
@@ -5087,6 +5118,7 @@ def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
                         "source": "graph_governance_api",
                         "actor": body.get("actor", "api"),
                     },
+                    force_requeue=_query_bool(body, "force_requeue", False),
                 )
             except ValueError as exc:
                 _raise_graph_api_validation(exc)

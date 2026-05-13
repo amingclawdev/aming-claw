@@ -86,6 +86,37 @@ def test_scope_file_delta_respects_current_gitignore(tmp_path):
     assert delta["impacted_files"] == ["agent/service.py"]
 
 
+def test_scope_file_delta_keeps_real_deletions_but_ignores_old_untracked_artifacts(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git(project)
+    _write(project / "agent" / "service.py", "def run():\n    return 1\n")
+    _write(project / "agent" / "removed.py", "VALUE = 1\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "initial")
+    (project / "agent" / "removed.py").unlink()
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "remove tracked file")
+
+    delta = _build_scope_file_delta(
+        project_root=project,
+        old_rows=[
+            {"path": "agent/service.py", "file_hash": "sha256:same", "scan_status": "clustered"},
+            {"path": "agent/removed.py", "file_hash": "sha256:removed", "scan_status": "orphan"},
+            {"path": ".codex/config.toml", "file_hash": "sha256:local", "scan_status": "orphan"},
+        ],
+        new_rows=[
+            {"path": "agent/service.py", "file_hash": "sha256:same", "scan_status": "clustered"},
+        ],
+        changed_files=["agent/removed.py"],
+    )
+
+    assert delta["changed_files"] == ["agent/removed.py"]
+    assert delta["removed_files"] == ["agent/removed.py"]
+    assert ".codex/config.toml" not in delta["removed_files"]
+    assert ".codex/config.toml" not in delta["impacted_files"]
+
+
 def _write_project(root: Path) -> list[Path]:
     files = [
         root / "agent" / "service.py",
@@ -140,6 +171,9 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert (trace_dir / "summary.json").exists()
     assert (trace_dir / "steps" / "001-run-input" / "input.json").exists()
     assert (trace_dir / "steps" / "002-build-graph-v2" / "output.json").exists()
+    run_input = json.loads((trace_dir / "steps" / "001-run-input" / "input.json").read_text(encoding="utf-8"))
+    assert run_input["project_root_role"] == "execution_root"
+    assert run_input["checkout_provenance"]["canonical_project_identity"]["project_id"] == PID
     assert result["semantic_enrichment"]["feature_payload_input_count"] > 0
     assert Path(result["semantic_enrichment"]["feature_payload_input_dir"]).exists()
     assert Path(result["semantic_enrichment"]["semantic_index_path"]).exists()
@@ -164,6 +198,8 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     notes = json.loads(snapshot_row["notes"])
     assert notes["state_only"] is True
     assert notes["feature_cluster_count"] >= 1
+    assert notes["checkout_provenance"]["execution_root_role"] == "execution_root"
+    assert notes["checkout_provenance"]["canonical_project_identity"]["project_id"] == PID
     assert Path(notes["trace"]["summary_path"]).exists()
     assert notes["governance_index"]["feature_count"] == result["governance_index"]["feature_count"]
     assert notes["semantic_enrichment"]["feature_count"] == result["semantic_enrichment"]["feature_count"]

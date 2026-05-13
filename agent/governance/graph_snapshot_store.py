@@ -1247,6 +1247,25 @@ def _snapshot_notes(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     return notes if isinstance(notes, dict) else {}
 
 
+def snapshot_materialization_provenance(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    """Return checkout provenance and warnings recorded for a snapshot."""
+    notes = _snapshot_notes(snapshot)
+    provenance = notes.get("checkout_provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    raw_warnings = provenance.get("warnings") if isinstance(provenance, dict) else []
+    warnings = [dict(item) for item in raw_warnings or [] if isinstance(item, dict)]
+    return {
+        "execution_root": provenance.get("execution_root", ""),
+        "execution_root_role": provenance.get("execution_root_role", ""),
+        "execution_root_is_ephemeral": bool(provenance.get("execution_root_is_ephemeral")),
+        "canonical_project_identity": provenance.get("canonical_project_identity") or {},
+        "git": provenance.get("git") or {},
+        "warnings": warnings,
+        "warning_count": len(warnings),
+    }
+
+
 def _latest_global_review_from_notes(notes: dict[str, Any]) -> dict[str, Any]:
     review_meta = notes.get("global_semantic_review")
     if not isinstance(review_meta, dict):
@@ -2063,6 +2082,7 @@ def list_pending_scope_reconcile(
 
 def graph_governance_status(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
     active = get_active_graph_snapshot(conn, project_id)
+    materialization = snapshot_materialization_provenance(active)
     scan = get_latest_scan_baseline(conn, project_id)
     pending = list_pending_scope_reconcile(
         conn,
@@ -2078,6 +2098,8 @@ def graph_governance_status(conn: sqlite3.Connection, project_id: str) -> dict[s
         "active_snapshot_id": active.get("snapshot_id") if active else "",
         "graph_snapshot_commit": active.get("commit_sha") if active else "",
         "materialized_graph_baseline_commit": active.get("commit_sha") if active else "",
+        "active_snapshot_materialization": materialization,
+        "active_snapshot_warnings": materialization.get("warnings") or [],
         "scan_baseline_commit": scan.get("chain_version") if scan else "",
         "scan_baseline_id": scan.get("baseline_id") if scan else None,
         "pending_scope_reconcile_count": len(pending),
@@ -2360,11 +2382,13 @@ def queue_pending_scope_reconcile(
     status: str = PENDING_STATUS_QUEUED,
     snapshot_id: str = "",
     evidence: dict[str, Any] | None = None,
+    force_requeue: bool = False,
 ) -> dict[str, Any]:
     ensure_schema(conn)
     if status not in ALLOWED_PENDING_STATUSES:
         raise ValueError(f"invalid pending scope reconcile status: {status}")
     now = utc_now()
+    force_flag = 1 if force_requeue else 0
     conn.execute(
         """
         INSERT INTO pending_scope_reconcile
@@ -2372,16 +2396,26 @@ def queue_pending_scope_reconcile(
            retry_count, snapshot_id, evidence_json)
         VALUES (?, ?, ?, ?, ?, 0, ?, ?)
         ON CONFLICT(project_id, commit_sha) DO UPDATE SET
+          queued_at = CASE
+            WHEN ? = 1 THEN excluded.queued_at
+            ELSE pending_scope_reconcile.queued_at
+          END,
           parent_commit_sha = CASE
             WHEN pending_scope_reconcile.parent_commit_sha = '' THEN excluded.parent_commit_sha
             ELSE pending_scope_reconcile.parent_commit_sha
           END,
           status = CASE
+            WHEN ? = 1 THEN excluded.status
             WHEN pending_scope_reconcile.status IN ('materialized', 'waived')
             THEN pending_scope_reconcile.status
             ELSE excluded.status
           END,
+          retry_count = CASE
+            WHEN ? = 1 THEN pending_scope_reconcile.retry_count + 1
+            ELSE pending_scope_reconcile.retry_count
+          END,
           snapshot_id = CASE
+            WHEN ? = 1 THEN excluded.snapshot_id
             WHEN excluded.snapshot_id != '' THEN excluded.snapshot_id
             ELSE pending_scope_reconcile.snapshot_id
           END,
@@ -2394,7 +2428,14 @@ def queue_pending_scope_reconcile(
             now,
             status,
             snapshot_id,
-            _json(evidence or {}),
+            _json({
+                **(evidence or {}),
+                **({"force_requeue": True, "forced_at": now} if force_requeue else {}),
+            }),
+            force_flag,
+            force_flag,
+            force_flag,
+            force_flag,
         ),
     )
     row = conn.execute(
@@ -2511,6 +2552,7 @@ __all__ = [
     "queue_pending_scope_reconcile",
     "record_drift",
     "select_existing_graph_source",
+    "snapshot_materialization_provenance",
     "snapshot_companion_dir",
     "snapshot_graph_path",
     "snapshot_id_for",

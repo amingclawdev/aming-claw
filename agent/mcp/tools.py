@@ -295,6 +295,11 @@ TOOLS: list[dict] = [
                 "snapshot_id": {"type": "string"},
                 "evidence": {"type": "object"},
                 "actor": {"type": "string"},
+                "force_requeue": {
+                    "type": "boolean",
+                    "description": "Reopen an existing materialized/waived pending-scope row when its snapshot input is suspect.",
+                    "default": False,
+                },
             },
             "required": ["project_id"],
         },

@@ -4226,3 +4226,55 @@ def test_operations_queue_synthesizes_stale_scope_reconcile(conn, monkeypatch, t
     assert "30 changed files" in row["last_result"]
     assert queue["summary"]["graph_stale"]["is_stale"] is True
     assert queue["summary"]["graph_stale"]["changed_file_count"] == 30
+
+
+def test_operations_queue_surfaces_suspect_snapshot_root_warning(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: "head-commit")
+    notes = {
+        "checkout_provenance": {
+            "execution_root": "/private/tmp/aming-claw-scope/repo",
+            "execution_root_role": "execution_root",
+            "execution_root_is_ephemeral": True,
+            "canonical_project_identity": {"type": "git", "project_id": PID},
+            "warnings": [
+                {
+                    "code": "ephemeral_execution_root",
+                    "message": "graph snapshot was materialized from a temporary execution root",
+                }
+            ],
+        }
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-suspect-root-active",
+        commit_sha="head-commit",
+        snapshot_kind="scope",
+        graph_json=_graph(),
+        notes=json.dumps(notes, sort_keys=True),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    queue = server.handle_graph_governance_operations_queue(_ctx({"project_id": PID}))
+
+    row = next(
+        item for item in queue["operations"]
+        if item["operation_id"] == "scope-reconcile:suspect-root:head-commit"
+    )
+    assert row["status"] == "not_queued"
+    assert row["warnings"][0]["code"] == "ephemeral_execution_root"
+    assert queue["summary"]["graph_stale"]["active_snapshot_warnings"][0]["code"] == "ephemeral_execution_root"
