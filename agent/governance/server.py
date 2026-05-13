@@ -125,6 +125,17 @@ def _open_local_directory_picker(
 ) -> str:
     """Open a local directory picker and return the selected absolute path."""
     errors: list[str] = []
+    if sys.platform == "darwin":
+        try:
+            return _open_local_directory_picker_macos(
+                initial_path=initial_path,
+                title=title,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:  # pragma: no cover - depends on host desktop
+            errors.append(f"macos picker unavailable: {exc}")
+            raise RuntimeError("local directory picker unavailable: " + "; ".join(errors))
+
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -143,15 +154,6 @@ def _open_local_directory_picker(
                 )
             except Exception as exc:  # pragma: no cover - depends on host desktop
                 errors.append(f"windows picker unavailable: {exc}")
-        elif sys.platform == "darwin":
-            try:
-                return _open_local_directory_picker_macos(
-                    initial_path=initial_path,
-                    title=title,
-                    timeout_seconds=timeout_seconds,
-                )
-            except Exception as exc:  # pragma: no cover - depends on host desktop
-                errors.append(f"macos picker unavailable: {exc}")
         elif os.name == "posix":
             try:
                 return _open_local_directory_picker_linux(

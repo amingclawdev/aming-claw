@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -284,6 +285,47 @@ def test_local_choose_directory_endpoint_passes_clamped_timeout(tmp_path, monkey
 
     assert payload["ok"] is True
     assert seen["timeout_seconds"] == 60.0
+
+
+def test_local_directory_picker_on_macos_prefers_osascript(tmp_path, monkeypatch):
+    calls = {}
+
+    def _fake_macos(initial_path="", title="", timeout_seconds=12.0):
+        calls["initial_path"] = initial_path
+        calls["title"] = title
+        calls["timeout_seconds"] = timeout_seconds
+        return str(tmp_path)
+
+    def _fail_tk():
+        raise AssertionError("macOS picker should not use in-process tkinter")
+
+    fake_tk = SimpleNamespace(
+        Tk=_fail_tk,
+        filedialog=SimpleNamespace(askdirectory=lambda **kwargs: _fail_tk()),
+    )
+    real_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tkinter":
+            return fake_tk
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+    monkeypatch.setattr(server, "_open_local_directory_picker_macos", _fake_macos)
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    selected = server._open_local_directory_picker(
+        initial_path=str(tmp_path.parent),
+        title="Pick project",
+        timeout_seconds=4,
+    )
+
+    assert selected == str(tmp_path)
+    assert calls == {
+        "initial_path": str(tmp_path.parent),
+        "title": "Pick project",
+        "timeout_seconds": 4,
+    }
 
 
 def test_macos_directory_picker_uses_osascript(tmp_path, monkeypatch):
