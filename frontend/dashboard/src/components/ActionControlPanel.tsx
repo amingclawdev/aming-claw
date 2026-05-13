@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeRecord } from "../types";
 import type { PinnedEdge } from "./FocusCard";
 import { classifyNode, semStatusLabel, type SemanticStatus } from "../lib/semantic";
-import { api, ApiError, type FeedbackSubmitPayload, type SemanticJobPayload } from "../lib/api";
+import { api, ApiError, type AiConfigResponse, type FeedbackSubmitPayload, type SemanticJobPayload } from "../lib/api";
 
 export type ActionKind = "enrich" | "feedback";
 
@@ -37,6 +37,7 @@ interface Props {
   kind: ActionKind;
   target: ActionTarget | null;
   snapshotId: string | null;
+  aiConfig?: AiConfigResponse | null;
   onClose(): void;
   onSubmitted(message: string, tone: "success" | "error" | "info"): void;
 }
@@ -119,6 +120,7 @@ export default function ActionControlPanel({
   kind,
   target,
   snapshotId,
+  aiConfig,
   onClose,
   onSubmitted,
 }: Props) {
@@ -306,10 +308,16 @@ export default function ActionControlPanel({
     : tNode?.node_id ?? "";
   const status: SemanticStatus | null = tNode ? classifyNode(tNode) : null;
   const previewPayload = kind === "enrich" ? semanticJobPayload : feedbackPayload;
+  const aiReadiness = semanticAiReadiness(aiConfig);
+  const isLiveAiApply = kind === "enrich" && enrichExec === "apply";
 
   async function dispatch() {
     if (!snapshotId) {
       onSubmitted("No active snapshot — refresh and try again.", "error");
+      return;
+    }
+    if (isLiveAiApply && !aiReadiness.ready) {
+      onSubmitted(aiReadiness.blockMessage, "error");
       return;
     }
     setBusy(true);
@@ -427,6 +435,11 @@ export default function ActionControlPanel({
                   />
                 </>
               ) : null}
+              <div className={`action-ai-readiness ${aiReadiness.ready ? "ok" : "blocked"}`}>
+                {aiReadiness.ready
+                  ? `Live AI route: ${aiReadiness.routeLabel}`
+                  : `${aiReadiness.blockMessage} Use AI config before applying live jobs.`}
+              </div>
               <fieldset className="action-fieldset">
                 <legend>
                   Note <span className="action-optional">optional</span>
@@ -509,7 +522,7 @@ export default function ActionControlPanel({
           <button
             className={`action-btn-primary kind-${kind}`}
             onClick={dispatch}
-            disabled={busy || (kind === "feedback" && note.trim().length === 0)}
+            disabled={busy || (kind === "feedback" && note.trim().length === 0) || (isLiveAiApply && !aiReadiness.ready)}
           >
             {busy
               ? "Submitting…"
@@ -565,4 +578,39 @@ function RadioGroup<T extends string>({
 function shortTitle(t: string): string {
   const parts = t.split(".");
   return parts.length > 2 ? parts.slice(-2).join(".") : t;
+}
+
+function semanticAiReadiness(config?: AiConfigResponse | null): {
+  ready: boolean;
+  routeLabel: string;
+  blockMessage: string;
+} {
+  const route = config?.project_config?.ai?.routing?.semantic;
+  const provider = (route?.provider || "").trim();
+  const model = (route?.model || "").trim();
+  if (!provider || !model) {
+    return {
+      ready: false,
+      routeLabel: "unset",
+      blockMessage: "AI enrich blocked: configure this project's semantic provider/model in AI config first.",
+    };
+  }
+  const tool = config?.tool_health?.[provider];
+  if (!tool) {
+    return {
+      ready: false,
+      routeLabel: `${provider}/${model}`,
+      blockMessage: `AI enrich blocked: no local CLI requirement is registered for provider ${provider}.`,
+    };
+  }
+  if (tool.status !== "detected") {
+    return {
+      ready: false,
+      routeLabel: `${provider}/${model}`,
+      blockMessage:
+        `AI enrich blocked: ${tool.runtime || provider} is ${tool.status || "not detected"}. ` +
+        `Install/configure ${tool.command || provider} or choose another provider.`,
+    };
+  }
+  return { ready: true, routeLabel: `${provider}/${model}`, blockMessage: "" };
 }

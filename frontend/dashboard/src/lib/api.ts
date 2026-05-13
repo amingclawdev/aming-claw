@@ -161,15 +161,33 @@ export const api = {
       signal,
     );
   },
+  activeProjectionFor(projectId: string, signal?: AbortSignal) {
+    return getJSON<ProjectionResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/active/semantic/projection`,
+      signal,
+    );
+  },
   nodes(snapshotId: string, limit = 1000, signal?: AbortSignal) {
     const path =
       `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}` +
       `/nodes?include_semantic=true&limit=${limit}`;
     return getJSON<NodesResponse>(path, signal);
   },
+  nodesFor(projectId: string, snapshotId: string, limit = 1000, signal?: AbortSignal) {
+    const path =
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}` +
+      `/nodes?include_semantic=true&limit=${limit}`;
+    return getJSON<NodesResponse>(path, signal);
+  },
   edges(snapshotId: string, limit = 4000, signal?: AbortSignal) {
     const path =
       `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}` +
+      `/edges?limit=${limit}`;
+    return getJSON<EdgesResponse>(path, signal);
+  },
+  edgesFor(projectId: string, snapshotId: string, limit = 4000, signal?: AbortSignal) {
+    const path =
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}` +
       `/edges?limit=${limit}`;
     return getJSON<EdgesResponse>(path, signal);
   },
@@ -245,6 +263,12 @@ export const api = {
     // whether the underlying semantic is current.
     const path =
       `/api/graph-governance/${pid()}/snapshots/${encodeURIComponent(snapshotId)}` +
+      `/feedback/queue?require_current_semantic=false`;
+    return getJSON<FeedbackQueueResponse>(path, signal);
+  },
+  feedbackQueueFor(projectId: string, snapshotId: string, signal?: AbortSignal) {
+    const path =
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}` +
       `/feedback/queue?require_current_semantic=false`;
     return getJSON<FeedbackQueueResponse>(path, signal);
   },
@@ -701,6 +725,8 @@ export interface AiConfigResponse {
     analyzer_role?: string;
     chain_role?: string;
     use_ai_default?: boolean;
+    source_path?: string;
+    override_path?: string;
     job_profiles?: Record<string, { provider?: string; model?: string; analyzer_role?: string }>;
   };
   pipeline_error?: string;

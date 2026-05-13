@@ -319,6 +319,71 @@ function verifyHeaderV1Contract() {
   ok("global Action launcher is hidden for v1");
 }
 
+function verifyProjectDisplayNameContract() {
+  phase("project display-name contract");
+  const headerSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/Header.tsx"), "utf8");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
+  const projectServiceSource = readFileSync(path.join(REPO_ROOT, "agent/governance/project_service.py"), "utf8");
+  assert(headerSource.includes("activeProjectLabel"), "Header should derive active project display name");
+  assert(headerSource.includes("`${project.name.trim()} · ${project.project_id}`"), "Project selector should show display name plus project_id when they differ");
+  assert(viewSource.includes("currentProjectLabel"), "Projects view subtitle should prefer display name for current project");
+  assert(viewSource.includes("projectLabelFor(projects, currentProjectId)"), "Projects view should derive current label from registry");
+  assert(projectServiceSource.includes('"name",'), "Project metadata update allow-list should include name");
+  assert(projectServiceSource.includes('projects["projects"][pid]["name"] = project_name.strip()'), "Bootstrap should update display name for existing project imports");
+  ok("display names are primary, project_id stays visible as technical id");
+}
+
+function verifyProjectScopedFetchContract() {
+  phase("project-scoped fetch contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  assert(appSource.includes("const requestProjectId = currentProjectId"), "fetchAll should capture the active project_id for one request cycle");
+  assert(appSource.includes("setAiConfig(null)"), "Project switch should clear stale AI config before the next project load");
+  for (const token of ["statusFor(requestProjectId", "activeSummaryFor(requestProjectId", "activeProjectionFor(requestProjectId", "operationsQueueFor(requestProjectId", "backlogFor(requestProjectId", "nodesFor(requestProjectId", "edgesFor(requestProjectId", "feedbackQueueFor(requestProjectId"]) {
+    assert(appSource.includes(token), `App fetchAll should use explicit project API: ${token}`);
+  }
+  for (const fn of ["activeProjectionFor(projectId", "nodesFor(projectId", "edgesFor(projectId", "feedbackQueueFor(projectId"]) {
+    assert(apiSource.includes(fn), `API client missing explicit project method ${fn}`);
+  }
+  ok("dashboard data fetches are explicit per active project");
+}
+
+function verifyProjectGraphActionsGuideContract() {
+  phase("project graph actions guide contract");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
+  assert(viewSource.includes("project-console-guide"), "Projects page should show concise graph action guidance");
+  assert(viewSource.includes("<strong>Build graph</strong>"), "Projects guide should explain Build graph");
+  assert(viewSource.includes("<strong>Update graph</strong>"), "Projects guide should explain Update graph");
+  assert(viewSource.includes("semantic_use_ai: false"), "Project graph actions must not make live AI calls by default");
+  assert(viewSource.includes("title=\"Run full graph reconcile without AI enrichment\""), "Build graph action should have explicit tooltip");
+  assert(viewSource.includes("title=\"Run scope reconcile without AI enrichment\""), "Update graph action should have explicit tooltip");
+  ok("Projects page exposes clear build/update graph actions");
+}
+
+function verifyAiConfigProjectScopeContract() {
+  phase("AI config project-scope contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const actionSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/ActionControlPanel.tsx"), "utf8");
+  const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
+  assert(appSource.includes("Project scope"), "AI config modal should show project scope");
+  assert(appSource.includes("semanticAiReadiness"), "App should compute semantic AI readiness before batch enrich");
+  assert(appSource.includes("project_config?.ai?.routing?.semantic"), "AI readiness should require explicit project semantic routing");
+  assert(appSource.includes("aiConfig={aiConfig}"), "Action modal should receive active project AI config");
+  assert(actionSource.includes("AI enrich blocked: configure this project's semantic provider/model"), "Action modal should block unconfigured live AI");
+  assert(actionSource.includes("tool.status !== \"detected\""), "Action modal should block missing local CLI tools");
+  assert(serverSource.includes("tool_health"), "Backend ai-config response should expose tool health");
+  assert(serverSource.includes("AI_MODEL_CATALOG"), "Backend ai-config response should expose model catalog");
+  ok("AI config shows local CLI requirements and blocks unconfigured live enrich");
+}
+
+function verifyQueueLaneCopyContract() {
+  phase("semantic queue lane copy contract");
+  const opsSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/OperationsQueueView.tsx"), "utf8");
+  assert(opsSource.includes("parallel workers"), "Operations Queue KPI should not imply strict serial execution");
+  assert(opsSource.includes("semantic worker lanes"), "Running section should explain parallel semantic lanes");
+  ok("queue wording matches parallel semantic worker behavior");
+}
+
 function verifyTreeLayerFilterContract() {
   phase("tree layer filter contract");
   const treeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/TreePanel.tsx"), "utf8");
@@ -352,6 +417,11 @@ async function main() {
     await http("GET", "/api/health");
     verifyProjectImportUiContract();
     verifyHeaderV1Contract();
+    verifyProjectDisplayNameContract();
+    verifyProjectScopedFetchContract();
+    verifyProjectGraphActionsGuideContract();
+    verifyAiConfigProjectScopeContract();
+    verifyQueueLaneCopyContract();
     verifyTreeLayerFilterContract();
     verifyEditorJumpWorkspaceContract();
     const project = await ensureProjectRegistered();

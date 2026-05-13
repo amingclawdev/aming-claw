@@ -120,6 +120,7 @@ export default function ProjectConsoleView({
         }),
     [currentProjectId, projects],
   );
+  const currentProjectLabel = projectLabelFor(projects, currentProjectId);
 
   const stats = useMemo(() => {
     const runtimes = Object.values(runtime);
@@ -305,7 +306,13 @@ export default function ProjectConsoleView({
         <h2 className="view-title">Projects</h2>
         <span className="view-subtitle">
           local plugin console · {rows.length} registered · current{" "}
-          <span className="mono">{currentProjectId}</span>
+          <span>{currentProjectLabel}</span>
+          {currentProjectLabel !== currentProjectId ? (
+            <>
+              {" "}
+              <span className="mono">({currentProjectId})</span>
+            </>
+          ) : null}
         </span>
       </div>
 
@@ -367,6 +374,10 @@ export default function ProjectConsoleView({
           <span className="head-hint">
             {runtimeLoading || loading ? "refreshing" : "live"}
           </span>
+        </div>
+        <div className="project-console-guide">
+          <span><strong>Build graph</strong> runs a full local scan for a new or broken graph.</span>
+          <span><strong>Update graph</strong> catches an existing graph up to the selected ref/HEAD without live AI calls.</span>
         </div>
         <div className="card">
           <table className="table project-console-table">
@@ -689,6 +700,11 @@ function countOpenBacklog(backlog?: BacklogResponse): number {
       return !CLOSED_BACKLOG_STATUSES.has(status);
     }).length ?? 0
   );
+}
+
+function projectLabelFor(projects: ProjectListItem[], projectId: string): string {
+  const project = projects.find((p) => p.project_id === projectId);
+  return project?.name?.trim() || projectId;
 }
 
 function shortCommit(commit: string): string {

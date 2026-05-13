@@ -108,7 +108,9 @@ export default function Header({
               {projects.length ? (
                 projects.map((project) => (
                   <option key={project.project_id} value={project.project_id}>
-                    {project.name?.trim() || project.project_id}
+                    {project.name?.trim() && project.name.trim() !== project.project_id
+                      ? `${project.name.trim()} · ${project.project_id}`
+                      : project.project_id}
                   </option>
                 ))
               ) : (

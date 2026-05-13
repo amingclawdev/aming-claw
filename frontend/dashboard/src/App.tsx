@@ -171,6 +171,7 @@ export default function App() {
     setPinnedEdge(null);
     setActionPanel(null);
     setActionPanelOpen(false);
+    setAiConfig(null);
     setMultiSelectIds(new Set());
     multiSelectIdsRef.current = new Set();
   }, []);
@@ -188,27 +189,28 @@ export default function App() {
   }, [resetProjectScopedUi]);
 
   const fetchAll = useCallback(async (signal?: AbortSignal) => {
-    setApiProjectId(currentProjectId);
+    const requestProjectId = currentProjectId;
+    setApiProjectId(requestProjectId);
     setLoading(true);
     setError(null);
     try {
       const [health, status, summary, projection, ops, backlog, projectList, aiCfg] = await Promise.all([
         api.health(signal),
-        api.status(signal),
-        api.activeSummary(signal),
-        api.activeProjection(signal),
-        api.operationsQueue(signal),
-        api.backlog(signal),
+        api.statusFor(requestProjectId, signal),
+        api.activeSummaryFor(requestProjectId, signal),
+        api.activeProjectionFor(requestProjectId, signal),
+        api.operationsQueueFor(requestProjectId, signal),
+        api.backlogFor(requestProjectId, signal),
         api.projects(signal),
-        api.aiConfig(signal),
+        api.aiConfigFor(requestProjectId, signal),
       ]);
       setProjects(projectList.projects ?? []);
       setAiConfig(aiCfg);
       const snapshotId = status.active_snapshot_id || summary.snapshot_id;
       const [nodesRes, edgesRes, feedback] = await Promise.all([
-        api.nodes(snapshotId, 1000, signal),
-        api.edges(snapshotId, 4000, signal),
-        api.feedbackQueue(snapshotId, signal),
+        api.nodesFor(requestProjectId, snapshotId, 1000, signal),
+        api.edgesFor(requestProjectId, snapshotId, 4000, signal),
+        api.feedbackQueueFor(requestProjectId, snapshotId, signal),
       ]);
       // projection.projection is null when the snapshot was just rebuilt and
       // the semantic projection hasn't been computed yet. mergeProjection
@@ -548,6 +550,11 @@ export default function App() {
       setToast({ kind: "error", msg: "No active snapshot." });
       return;
     }
+    const readiness = semanticAiReadiness(aiConfig);
+    if (!readiness.ready) {
+      setToast({ kind: "error", msg: readiness.blockMessage });
+      return;
+    }
     const selectedKeys = Array.from(multiSelectIdsRef.current);
     if (selectedKeys.length === 0) {
       setToast({ kind: "error", msg: "Pick at least one node or edge first." });
@@ -627,7 +634,7 @@ export default function App() {
     } finally {
       setBatchEnrichBusy(false);
     }
-  }, [data, fetchAll]);
+  }, [aiConfig, data, fetchAll]);
 
   const handleSelectNodeFromReview = useCallback(
     (id: string) => {
@@ -1015,6 +1022,7 @@ export default function App() {
         <AiConfigDialog
           config={aiConfig}
           projectId={currentProjectId}
+          projectLabel={projectDisplayName(projects, currentProjectId)}
           onSaved={(next) => setAiConfig(next)}
           onClose={() => setAiConfigOpen(false)}
         />
@@ -1024,6 +1032,7 @@ export default function App() {
         kind={actionPanel?.kind ?? "enrich"}
         target={actionPanel?.target ?? null}
         snapshotId={data?.status.active_snapshot_id ?? data?.summary.snapshot_id ?? null}
+        aiConfig={aiConfig}
         onClose={() => setActionPanel(null)}
         onSubmitted={(msg, kind) => setToast({ kind, msg })}
       />
@@ -1062,14 +1071,49 @@ function countOpenBacklog(backlog?: BacklogResponse): number {
   );
 }
 
+function projectDisplayName(projects: ProjectListItem[], projectId: string): string {
+  const project = projects.find((p) => p.project_id === projectId);
+  return project?.name?.trim() || projectId;
+}
+
+function semanticAiReadiness(config?: AiConfigResponse | null): { ready: boolean; blockMessage: string } {
+  const projectRoute = config?.project_config?.ai?.routing?.semantic;
+  const provider = (projectRoute?.provider || "").trim();
+  const model = (projectRoute?.model || "").trim();
+  if (!provider || !model) {
+    return {
+      ready: false,
+      blockMessage: "AI enrich blocked: configure this project's semantic provider/model in AI config first.",
+    };
+  }
+  const tool = config?.tool_health?.[provider];
+  if (!tool) {
+    return {
+      ready: false,
+      blockMessage: `AI enrich blocked: no local tool requirement is registered for provider ${provider}.`,
+    };
+  }
+  if (tool.status !== "detected") {
+    return {
+      ready: false,
+      blockMessage:
+        `AI enrich blocked: ${tool.runtime || provider} is ${tool.status || "not detected"}. ` +
+        `Install/configure ${tool.command || provider} or choose another provider.`,
+    };
+  }
+  return { ready: true, blockMessage: "" };
+}
+
 function AiConfigDialog({
   config,
   projectId,
+  projectLabel,
   onSaved,
   onClose,
 }: {
   config: AiConfigResponse | null;
   projectId: string;
+  projectLabel: string;
   onSaved(config: AiConfigResponse): void;
   onClose(): void;
 }) {
@@ -1091,6 +1135,25 @@ function AiConfigDialog({
   const [draft, setDraft] = useState<Record<string, { provider: string; model: string }>>({});
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const semanticReadiness = semanticAiReadiness(config);
+  const configPath = config?.workspace_path ? `${config.workspace_path.replace(/[/\\]$/, "")}/.aming-claw.yaml` : "";
+  const semanticSource =
+    config?.semantic?.override_path ||
+    (projectRouting.semantic ? configPath : config?.semantic?.source_path) ||
+    "";
+
+  const effectiveRouteFor = (role: string) => {
+    const draftRoute = draft[role];
+    if (draftRoute?.provider || draftRoute?.model) {
+      return { provider: draftRoute.provider, model: draftRoute.model, source: "project draft" };
+    }
+    const projectRoute = projectRouting[role];
+    if (projectRoute?.provider || projectRoute?.model) {
+      return { ...projectRoute, source: ".aming-claw.yaml" };
+    }
+    const fallback = role === "semantic" ? config?.semantic : roleRouting[role];
+    return fallback ? { ...fallback, source: role === "semantic" ? "semantic default" : "global default" } : null;
+  };
 
   useEffect(() => {
     setDraft(
@@ -1153,11 +1216,29 @@ function AiConfigDialog({
         <div className="config-dialog-head">
           <div>
             <div className="config-dialog-title">AI configuration</div>
-            <div className="config-dialog-sub mono">{projectId}</div>
+            <div className="config-dialog-sub">
+              {projectLabel} <span className="mono">· {projectId}</span>
+            </div>
           </div>
           <button className="icon-btn" onClick={onClose} title="Close AI configuration">
             ×
           </button>
+        </div>
+        <div className="config-section">
+          <div className="config-section-title">Project scope</div>
+          <div className="config-kv">
+            <span>Workspace</span>
+            <span className="mono">{config?.workspace_path || "—"}</span>
+            <span>Writes</span>
+            <span className="mono">{configPath || "—"}</span>
+            <span>Semantic source</span>
+            <span className="mono">{semanticSource || "unset"}</span>
+          </div>
+          <div className={`config-warning ${semanticReadiness.ready ? "success" : "error"}`}>
+            {semanticReadiness.ready
+              ? "Live AI semantic jobs are enabled for this project route."
+              : semanticReadiness.blockMessage}
+          </div>
         </div>
         <div className="config-section">
           <div className="config-section-title">Project routing</div>
@@ -1174,7 +1255,7 @@ function AiConfigDialog({
               <span>Effective</span>
             </div>
             {roles.map((role) => {
-              const effective = role === "semantic" ? config?.semantic : roleRouting[role];
+              const effective = effectiveRouteFor(role);
               const provider = draft[role]?.provider ?? "";
               const modelOptions = modelOptionsFor(provider);
               const currentModel = draft[role]?.model ?? "";
@@ -1209,7 +1290,10 @@ function AiConfigDialog({
                       <option value="__custom__">custom: {currentModel}</option>
                     ) : null}
                   </select>
-                  <span>{fmtRoute(effective)}</span>
+                  <span title={effective?.source || ""}>
+                    {fmtRoute(effective)}{" "}
+                    {effective?.source ? <span className="config-source-chip">{effective.source}</span> : null}
+                  </span>
                 </div>
               );
             })}

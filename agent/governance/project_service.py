@@ -309,6 +309,7 @@ def update_project_metadata(project_id: str, updates: dict) -> dict:
     if not entry:
         raise ValidationError(f"Project {project_id!r} not registered")
     allowed = {
+        "name",
         "selected_ref",
         "selected_ref_updated_at",
         "selected_ref_updated_by",
@@ -461,6 +462,11 @@ def bootstrap_project(
             project_name=project_name or pid,
             workspace_path=str(ws),
         )
+        if project_name.strip():
+            projects = _load_projects()
+            if pid in projects["projects"]:
+                projects["projects"][pid]["name"] = project_name.strip()
+                _save_projects(projects)
     except Exception as e:
         raise ValidationError(f"Project initialization failed: {e}")
 

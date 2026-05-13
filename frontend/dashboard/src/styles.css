@@ -1039,6 +1039,22 @@ a:hover { text-decoration: underline; }
   border: 1px solid #fecaca;
 }
 
+.project-console-guide {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+  color: var(--ink-600);
+  font-size: 11px;
+}
+
+.project-console-guide span {
+  border: 1px solid var(--ink-200);
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px 8px;
+}
+
 .project-console-table td {
   vertical-align: top;
 }
@@ -2094,6 +2110,25 @@ a:hover { text-decoration: underline; }
   color: var(--ink-500);
   line-height: 1.45;
   margin-top: 2px;
+}
+
+.action-ai-readiness {
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.action-ai-readiness.ok {
+  border: 1px solid #bbf7d0;
+  background: var(--green-bg);
+  color: var(--green-fg);
+}
+
+.action-ai-readiness.blocked {
+  border: 1px solid #fecaca;
+  background: var(--red-bg);
+  color: var(--red-fg);
 }
 
 .action-textarea {
@@ -3736,6 +3771,22 @@ svg.graph-svg path.ghit:hover {
   border-color: #fecaca;
   background: #fef2f2;
   color: #991b1b;
+}
+.config-section > .config-warning {
+  margin: 10px 0 0;
+}
+.config-source-chip {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  border: 1px solid var(--ink-200);
+  background: var(--ink-50);
+  color: var(--ink-500);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 .status-pill {
   display: inline-flex;
