@@ -83,6 +83,15 @@ def test_dashboard_unbuilt_dist_returns_503(tmp_path):
     assert b"Dashboard build not found" in result["body"]
 
 
+def test_dashboard_dist_dir_falls_back_to_packaged_assets(tmp_path, monkeypatch):
+    packaged = _dist(tmp_path / "packaged")
+    monkeypatch.delenv("GOVERNANCE_DASHBOARD_DIST", raising=False)
+    monkeypatch.setattr(server, "_repo_dashboard_dist_dir", lambda: tmp_path / "missing-repo-dist")
+    monkeypatch.setattr(server, "_packaged_dashboard_dist_dir", lambda: packaged)
+
+    assert server._dashboard_dist_dir() == packaged
+
+
 def test_non_dashboard_path_is_not_handled(tmp_path):
     dist = _dist(tmp_path)
 

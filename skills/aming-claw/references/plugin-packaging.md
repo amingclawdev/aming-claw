@@ -12,9 +12,13 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   control/query them, not spawn duplicate executor workers.
 - The dashboard is served by governance at `/dashboard` from
   `frontend/dashboard/dist`; build it before static smoke testing.
-- Pip install works as a Python package entrypoint, but a one-command packaged
-  desktop plugin still needs a release wrapper that builds/includes dashboard
-  assets and rewrites host-specific config safely.
+- Pip install works as a Python package entrypoint. The release build must run
+  `npm --prefix frontend/dashboard run build` first; that command syncs the
+  dashboard into `agent/governance/dashboard_dist` so the wheel can serve
+  `/dashboard` without a target-machine npm build.
+- A plugin launcher is explicit: `aming-claw launcher` writes a local HTML
+  entry artifact with status/start guidance and a dashboard link. It does not
+  auto-start governance or ServiceManager.
 
 ## Layout
 
@@ -58,22 +62,23 @@ Run these before publishing a local plugin bundle or pip package:
 ```text
 python -m pytest agent/tests/test_package_install.py agent/tests/test_mcp_server_stdio.py agent/tests/test_dashboard_static_route.py -q
 npm --prefix frontend/dashboard run build
+python scripts/build_package.py --skip-dashboard-build
 node frontend/dashboard/scripts/e2e-trunk.mjs --probe --static-route --dashboard http://localhost:40000/dashboard
 ```
 
-Windows-specific smoke: `/api/local/choose-directory` must use the PowerShell
-folder picker fallback when `tkinter` is unavailable. macOS/Linux packaging
-should add native picker fallbacks before claiming full GUI parity; until then,
-manual path entry remains the documented fallback.
+Directory picker smoke: `/api/local/choose-directory` should prefer `tkinter`
+and then use PowerShell on Windows, `osascript` on macOS, and `zenity`/`kdialog`
+on Linux. Manual path entry remains the documented fallback when no GUI picker
+is available.
 
 ## Packaging Gap Matrix
 
 | Surface | Current | Gap Before Public Release |
 | --- | --- | --- |
-| Pip package | `pyproject.toml` exposes `aming-claw`, `aming-governance`, and `aming-governance-host` scripts. | Decide whether wheels include built dashboard assets, or require `npm --prefix frontend/dashboard run build` post-install. Add a release command that verifies static assets exist. |
+| Pip package | `pyproject.toml` exposes `aming-claw`, `aming-governance`, and `aming-governance-host`; dashboard assets are synced into `agent/governance/dashboard_dist` before wheel build. | Run clean wheel install smoke on each release target. |
 | Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; tests ensure paths exist and `.mcp.json` is relocatable. | Add marketplace metadata only when distributing outside this repo; sanitize env and host URLs. |
-| Claude Code project plugin/settings | The same `.mcp.json` stdio server and `skills/aming-claw` instructions can be mirrored into Claude project settings. | Add a checked-in `.claude/settings.json` or install guide only after deciding team-level permission policy. Keep `.claude/settings.local.json` ignored. |
-| Cross-platform desktop | Windows PowerShell folder picker fallback exists. | Add macOS `osascript` and Linux `zenity`/portal fallbacks if native directory picking becomes a v1 requirement. |
+| Claude Code project plugin/settings | Project-level `CLAUDE.md` and `.mcp.json` describe the local MCP contract. | Global Claude Code settings remain out of scope for v1. |
+| Cross-platform desktop | Windows, macOS, and Linux directory picker fallbacks are implemented with manual entry fallback. | Add real-machine smoke evidence for macOS and Linux/WSL before public release. |
 
 ## Publish Caution
 

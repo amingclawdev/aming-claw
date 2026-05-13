@@ -6,7 +6,7 @@
   "description": "aming-claw governance dashboard P0 — operational view of graph snapshots, semantic projection, and operations queue",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/sync-dist-to-python-package.mjs",
     "preview": "vite preview --port 5173",
     "typecheck": "tsc -b --noEmit",
     "e2e:projects": "node scripts/e2e-projects.mjs",

@@ -143,6 +143,24 @@ def _open_local_directory_picker(
                 )
             except Exception as exc:  # pragma: no cover - depends on host desktop
                 errors.append(f"windows picker unavailable: {exc}")
+        elif sys.platform == "darwin":
+            try:
+                return _open_local_directory_picker_macos(
+                    initial_path=initial_path,
+                    title=title,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:  # pragma: no cover - depends on host desktop
+                errors.append(f"macos picker unavailable: {exc}")
+        elif os.name == "posix":
+            try:
+                return _open_local_directory_picker_linux(
+                    initial_path=initial_path,
+                    title=title,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:  # pragma: no cover - depends on host desktop
+                errors.append(f"linux picker unavailable: {exc}")
         raise RuntimeError("local directory picker unavailable: " + "; ".join(errors))
 
     initial_dir = ""
@@ -223,12 +241,104 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     return str(Path(selected).resolve()) if selected else ""
 
 
+def _open_local_directory_picker_macos(
+    initial_path: str = "",
+    title: str = "Choose project directory",
+    timeout_seconds: float = 12.0,
+) -> str:
+    """Fallback folder picker for macOS Python builds without tkinter."""
+    exe = shutil.which("osascript")
+    if not exe:
+        raise RuntimeError("osascript is not available")
+    initial = ""
+    if initial_path:
+        candidate = Path(initial_path).expanduser()
+        if candidate.exists():
+            initial = str(candidate if candidate.is_dir() else candidate.parent)
+    prompt = title.replace('"', '\\"')
+    script = f'set selectedFolder to choose folder with prompt "{prompt}"'
+    if initial:
+        script += f' default location POSIX file "{initial}"'
+    script += "\nPOSIX path of selectedFolder"
+    proc = subprocess.run(
+        [exe, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=max(3.0, min(float(timeout_seconds or 12.0), 60.0)),
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(detail or f"osascript picker exited {proc.returncode}")
+    selected = proc.stdout.strip()
+    return str(Path(selected).resolve()) if selected else ""
+
+
+def _open_local_directory_picker_linux(
+    initial_path: str = "",
+    title: str = "Choose project directory",
+    timeout_seconds: float = 12.0,
+) -> str:
+    """Fallback folder picker for Linux Python builds without tkinter."""
+    initial_dir = ""
+    if initial_path:
+        candidate = Path(initial_path).expanduser()
+        if candidate.exists():
+            initial_dir = str(candidate if candidate.is_dir() else candidate.parent)
+    exe = shutil.which("zenity")
+    if exe:
+        args = [exe, "--file-selection", "--directory", f"--title={title}"]
+        if initial_dir:
+            args.append(f"--filename={initial_dir}{os.sep}")
+    else:
+        exe = shutil.which("kdialog")
+        if exe:
+            args = [exe, "--getexistingdirectory", initial_dir or str(Path.home()), title]
+        else:
+            raise RuntimeError("Linux folder picker requires tkinter, zenity, or kdialog")
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=max(3.0, min(float(timeout_seconds or 12.0), 60.0)),
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(detail or f"{Path(exe).name} picker exited {proc.returncode}")
+    selected = proc.stdout.strip()
+    return str(Path(selected).resolve()) if selected else ""
+
+
+def _repo_dashboard_dist_dir() -> Path:
+    return (Path(__file__).resolve().parents[2] / "frontend" / "dashboard" / "dist").resolve()
+
+
+def _packaged_dashboard_dist_dir() -> Path | None:
+    try:
+        from importlib import resources
+        root = resources.files("agent.governance.dashboard_dist")
+        index = root.joinpath("index.html")
+        if not index.is_file():
+            return None
+        try:
+            return Path(os.fspath(root)).resolve()
+        except TypeError:
+            return None
+    except Exception:
+        return None
+
+
 def _dashboard_dist_dir() -> Path:
     """Return the built dashboard directory served by the governance process."""
     override = str(os.environ.get("GOVERNANCE_DASHBOARD_DIST") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    return (Path(__file__).resolve().parents[2] / "frontend" / "dashboard" / "dist").resolve()
+    repo_dist = _repo_dashboard_dist_dir()
+    if (repo_dist / "index.html").is_file():
+        return repo_dist
+    packaged_dist = _packaged_dashboard_dist_dir()
+    if packaged_dist is not None:
+        return packaged_dist
+    return repo_dist
 
 
 def _path_is_relative_to(path: Path, parent: Path) -> bool:

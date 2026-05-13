@@ -31,7 +31,18 @@ py-modules = ["start_governance", "aming_claw"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent*"]
-namespaces = true
+exclude = [
+  "agent.tests*",
+  "agent.governance.chain_history*",
+  ".worktrees*",
+  "shared-volume*",
+  "runtime*",
+  "frontend*",
+  "dist*",
+  "docs.dev*",
+]
+namespaces = false
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml", "*.json"]
+"agent.governance.dashboard_dist" = ["**/*"]

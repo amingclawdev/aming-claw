@@ -1,0 +1,12 @@
+recursive-include agent/governance/dashboard_dist *
+recursive-include skills/aming-claw *
+include .codex-plugin/plugin.json
+include .mcp.json
+include CLAUDE.md
+prune .worktrees
+prune shared-volume
+prune runtime
+prune dist
+prune frontend/dashboard/node_modules
+prune frontend/dashboard/dist
+prune docs/dev

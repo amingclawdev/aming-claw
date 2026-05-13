@@ -11,6 +11,11 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _workspace_root() -> Path:
+    configured = os.environ.get("AMING_CLAW_HOME") or os.environ.get("CODEX_WORKSPACE") or ""
+    return Path(configured).expanduser().resolve() if configured else Path.cwd().resolve()
+
+
 def _load_env_file(root: Path) -> None:
     env_path = root / ".env"
     if not env_path.exists():
@@ -42,10 +47,12 @@ def configure_host_env(root: Path | None = None) -> dict[str, str]:
     }
 
 
-def main() -> None:
-    root = _repo_root()
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+def main(workspace_root: str | Path | None = None) -> None:
+    root = Path(workspace_root).expanduser().resolve() if workspace_root else _workspace_root()
+    package_root = _repo_root()
+    for candidate in (str(package_root), str(root)):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
     configure_host_env(root)
 
     # Phase A: backfill legacy commits lacking Chain-Version trailer at boot

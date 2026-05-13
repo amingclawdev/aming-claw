@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent.governance import server
 
@@ -283,6 +284,53 @@ def test_local_choose_directory_endpoint_passes_clamped_timeout(tmp_path, monkey
 
     assert payload["ok"] is True
     assert seen["timeout_seconds"] == 60.0
+
+
+def test_macos_directory_picker_uses_osascript(tmp_path, monkeypatch):
+    calls = {}
+    monkeypatch.setattr(server.shutil, "which", lambda name: "/usr/bin/osascript" if name == "osascript" else None)
+
+    def _run(args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout=str(tmp_path), stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", _run)
+
+    selected = server._open_local_directory_picker_macos(title="Pick project", timeout_seconds=4)
+
+    assert selected == str(tmp_path.resolve())
+    assert calls["args"][0] == "/usr/bin/osascript"
+    assert calls["kwargs"]["timeout"] == 4.0
+
+
+def test_linux_directory_picker_uses_zenity(tmp_path, monkeypatch):
+    calls = {}
+    monkeypatch.setattr(server.shutil, "which", lambda name: "/usr/bin/zenity" if name == "zenity" else None)
+
+    def _run(args, **kwargs):
+        calls["args"] = args
+        return SimpleNamespace(returncode=0, stdout=str(tmp_path), stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", _run)
+
+    selected = server._open_local_directory_picker_linux(initial_path=str(tmp_path), title="Pick project")
+
+    assert selected == str(tmp_path.resolve())
+    assert calls["args"][0] == "/usr/bin/zenity"
+    assert "--file-selection" in calls["args"]
+    assert "--directory" in calls["args"]
+
+
+def test_linux_directory_picker_requires_gui_fallback(monkeypatch):
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+
+    try:
+        server._open_local_directory_picker_linux()
+    except RuntimeError as exc:
+        assert "zenity" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError when no Linux picker is available")
 
 
 def test_projects_list_endpoint_returns_registered_projects(monkeypatch):

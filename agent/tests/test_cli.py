@@ -20,7 +20,7 @@ class TestCliHelp:
         runner = CliRunner()
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("init", "bootstrap", "scan", "status", "run-executor"):
+        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor"):
             assert cmd in result.output
 
 
@@ -40,3 +40,23 @@ class TestCliInit:
             runner.invoke(main, ["init"])
             result = runner.invoke(main, ["init"])
             assert "already exists" in result.output
+
+
+class TestCliLauncher:
+    def test_launcher_writes_local_html(self, tmp_path):
+        runner = CliRunner()
+        output = tmp_path / "launcher.html"
+
+        result = runner.invoke(main, [
+            "launcher",
+            "--governance-url",
+            "http://127.0.0.1:45555",
+            "--output",
+            str(output),
+        ])
+
+        assert result.exit_code == 0
+        text = output.read_text(encoding="utf-8")
+        assert "Aming Claw Launcher" in text
+        assert "http://127.0.0.1:45555/dashboard" in text
+        assert "aming-claw start" in text

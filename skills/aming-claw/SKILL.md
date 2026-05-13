@@ -20,6 +20,20 @@ For dashboard/graph E2E work, update repo-owned fixture artifacts first and mate
 5. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
 6. Inspect files only after graph discovery identifies likely owners and reusable modules.
 
+## Local Plugin Launcher
+
+When the user asks for a local plugin entrypoint or the governance runtime is
+offline, offer the explicit launcher flow instead of auto-starting services:
+
+```text
+aming-claw launcher
+aming-claw start
+```
+
+The generated launcher artifact is an HTML guide with the dashboard link and
+copyable commands. It must not execute local commands from a browser button;
+service startup remains an explicit MCP/CLI action.
+
 ## Mutation Rules
 
 - Prefer MCP tools over raw DB access or ad hoc HTTP when a tool exists. See [mcp-tools.md](references/mcp-tools.md).

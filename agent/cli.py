@@ -1,16 +1,21 @@
 """CLI entry point for aming-claw.
 
 Usage:
-    aming-claw init            — create .aming-claw.yaml in current directory
-    aming-claw bootstrap       — bootstrap an external project
-    aming-claw status          — show governance status
-    aming-claw run-executor    — start executor worker
+    aming-claw init            - create .aming-claw.yaml in current directory
+    aming-claw bootstrap       - bootstrap an external project
+    aming-claw status          - show governance status
+    aming-claw start           - start governance in the foreground
+    aming-claw open            - open the dashboard URL
+    aming-claw launcher        - write a local launcher HTML artifact
+    aming-claw run-executor    - start executor worker
 """
 
 import os
 import sys
 import logging
 import json
+import webbrowser
+from pathlib import Path
 
 try:
     import click
@@ -20,6 +25,8 @@ except ImportError:
     sys.exit(1)
 
 log = logging.getLogger(__name__)
+
+DEFAULT_GOVERNANCE_URL = "http://localhost:40000"
 
 _YAML_TEMPLATE = """\
 # aming-claw project configuration
@@ -36,7 +43,7 @@ db_path: ""
 @click.group()
 @click.version_option(package_name="aming-claw")
 def main():
-    """aming-claw — governance-driven workflow platform."""
+    """aming-claw - governance-driven workflow platform."""
     pass
 
 
@@ -91,6 +98,77 @@ def status():
     except Exception as exc:
         click.echo(f"Governance unreachable: {exc}", err=True)
         sys.exit(1)
+
+
+def _dashboard_url(governance_url: str) -> str:
+    return governance_url.rstrip("/") + "/dashboard"
+
+
+def _launcher_html(governance_url: str) -> str:
+    dashboard_url = _dashboard_url(governance_url)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aming Claw Launcher</title>
+  <style>
+    body {{ font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #172033; }}
+    main {{ max-width: 760px; }}
+    a.button {{ display: inline-block; padding: 10px 14px; border: 1px solid #b6c7e6; border-radius: 6px; text-decoration: none; color: #0f3d7a; background: #f6f9ff; }}
+    code {{ background: #f2f5fa; padding: 2px 5px; border-radius: 4px; }}
+    pre {{ background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 6px; overflow: auto; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Aming Claw Launcher</h1>
+    <p>This local launcher never starts governance automatically. Start services explicitly, then open the dashboard.</p>
+    <p><a class="button" href="{dashboard_url}">Open dashboard</a></p>
+    <h2>Start locally</h2>
+    <pre>aming-claw start</pre>
+    <h2>Check status</h2>
+    <pre>aming-claw status</pre>
+    <p>Codex and Claude Code should connect through the project <code>.mcp.json</code> after governance is available at <code>{governance_url}</code>.</p>
+  </main>
+</body>
+</html>
+"""
+
+
+@main.command()
+@click.option("--workspace", default=".", help="Workspace root used for shared-volume and project state.")
+@click.option("--port", default=40000, type=int, help="Governance HTTP port.")
+def start(workspace, port):
+    """Start governance in the foreground without spawning plugin-owned workers."""
+    os.environ["GOVERNANCE_PORT"] = str(port)
+    os.environ.setdefault("AMING_CLAW_HOME", str(Path(workspace).resolve()))
+    import start_governance
+
+    start_governance.main(workspace_root=Path(workspace).resolve())
+
+
+@main.command("open")
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance service base URL.")
+def open_dashboard(governance_url):
+    """Open the dashboard in the default browser."""
+    url = _dashboard_url(governance_url)
+    webbrowser.open(url)
+    click.echo(url)
+
+
+@main.command()
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance service base URL.")
+@click.option("--output", default="", help="Output HTML path. Defaults to .aming-claw/aming-claw-launcher.html.")
+@click.option("--open-browser", is_flag=True, help="Open the generated launcher in the default browser.")
+def launcher(governance_url, output, open_browser):
+    """Write a local launcher HTML artifact with dashboard links and start commands."""
+    target = Path(output) if output else Path.cwd() / ".aming-claw" / "aming-claw-launcher.html"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_launcher_html(governance_url), encoding="utf-8")
+    if open_browser:
+        webbrowser.open(target.resolve().as_uri())
+    click.echo(str(target))
 
 
 @main.command("run-executor")

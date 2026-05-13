@@ -63,6 +63,39 @@ class TestPyprojectOptionalDeps:
         assert "full" in opt
 
 
+class TestPackagedDashboardAssets:
+    def test_pyproject_includes_dashboard_dist_package_data(self):
+        data = _load_pyproject()
+        package_data = data["tool"]["setuptools"]["package-data"]
+        find_config = data["tool"]["setuptools"]["packages"]["find"]
+
+        assert package_data["agent.governance.dashboard_dist"] == ["**/*"]
+        assert find_config["namespaces"] is False
+        assert "agent.tests*" in find_config["exclude"]
+        assert "agent.governance.chain_history*" in find_config["exclude"]
+
+    def test_manifest_includes_dashboard_and_plugin_assets(self):
+        manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+        assert "recursive-include agent/governance/dashboard_dist *" in manifest
+        assert "recursive-include skills/aming-claw *" in manifest
+        assert "include .codex-plugin/plugin.json" in manifest
+        assert "include CLAUDE.md" in manifest
+
+    def test_dashboard_build_sync_script_is_wired_to_npm_build(self):
+        package_json = json.loads((ROOT / "frontend" / "dashboard" / "package.json").read_text(encoding="utf-8"))
+
+        assert (ROOT / "frontend" / "dashboard" / "scripts" / "sync-dist-to-python-package.mjs").is_file()
+        assert "sync-dist-to-python-package.mjs" in package_json["scripts"]["build"]
+
+    def test_cross_platform_package_build_script_exists(self):
+        script = ROOT / "scripts" / "build_package.py"
+
+        assert script.is_file()
+        assert "npm" in script.read_text(encoding="utf-8")
+        assert "build_meta.build_wheel" in script.read_text(encoding="utf-8")
+
+
 class TestLocalPluginPackaging:
     """MVP contract for Codex/Claude local-plugin packaging."""
 
@@ -73,6 +106,7 @@ class TestLocalPluginPackaging:
         assert (ROOT / manifest["skills"]).is_dir()
         assert (ROOT / manifest["mcpServers"]).is_file()
         assert "MCP" in manifest["interface"]["capabilities"]
+        assert (ROOT / "CLAUDE.md").is_file()
 
     def test_mcp_config_is_relocatable_and_uses_stdio_module_entrypoint(self):
         config_text = (ROOT / ".mcp.json").read_text(encoding="utf-8")
