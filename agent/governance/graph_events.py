@@ -2028,6 +2028,22 @@ def _latest_edge_semantic_events(
         """,
         (project_id, branch_ref, branch_ref),
     ).fetchall()
+    def event_rank(event: dict[str, Any]) -> tuple[int, int, str, str, int]:
+        return (
+            1 if str(event.get("snapshot_id") or "") == snapshot_id else 0,
+            1 if branch_ref and str(event.get("branch_ref") or "") == branch_ref else 0,
+            str(event.get("updated_at") or ""),
+            str(event.get("created_at") or ""),
+            int(event.get("event_seq") or 0),
+        )
+
+    def remember_latest(mapping: dict[str, dict[str, Any]], key: str, event: dict[str, Any]) -> None:
+        if not key:
+            return
+        previous = mapping.get(key)
+        if previous is None or event_rank(event) >= event_rank(previous):
+            mapping[key] = event
+
     # Build lookup by target_id and (if available) by stable_edge_key.
     by_target_id: dict[str, dict[str, Any]] = {}
     by_stable_key: dict[str, dict[str, Any]] = {}
@@ -2036,20 +2052,24 @@ def _latest_edge_semantic_events(
         target_id = str(event.get("target_id") or "").strip()
         stable_key = str(event.get("stable_node_key") or "").strip()
         for target_variant in _edge_id_variants(target_id):
-            by_target_id[target_variant] = event
+            remember_latest(by_target_id, target_variant, event)
         if stable_key:
-            by_stable_key[stable_key] = event
+            remember_latest(by_stable_key, stable_key, event)
     # If the caller provided edge_index, prefer stable_edge_key matches —
     # this is what lets a carry-forward'd edge in the new snapshot find
     # the latest semantic event even when target_id was renumbered.
     latest: dict[str, dict[str, Any]] = {}
     if edge_index:
         for edge_id, meta in edge_index.items():
+            candidates: list[dict[str, Any]] = []
             stable_key = str(meta.get("stable_edge_key") or "")
             if stable_key and stable_key in by_stable_key:
-                latest[edge_id] = by_stable_key[stable_key]
-            elif edge_id in by_target_id:
-                latest[edge_id] = by_target_id[edge_id]
+                candidates.append(by_stable_key[stable_key])
+            for edge_variant in _edge_id_variants(edge_id):
+                if edge_variant in by_target_id:
+                    candidates.append(by_target_id[edge_variant])
+            if candidates:
+                latest[edge_id] = max(candidates, key=event_rank)
         return latest
     # Backwards-compat path: no edge_index → return target_id-keyed
     # latest events. Used by older callers that didn't compute the

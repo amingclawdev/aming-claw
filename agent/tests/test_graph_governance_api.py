@@ -1005,6 +1005,98 @@ def test_edge_semantic_projection_accepts_dashboard_pipe_edge_ids(conn, tmp_path
     assert projected["health"]["edge_semantic_missing_count"] == 0
 
 
+def test_edge_semantic_projection_prefers_same_snapshot_pipe_ai_over_carried_rule(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    prev = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-edge-carried-rule",
+        commit_sha="prev",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    current = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-edge-current-ai",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    for snapshot in (prev, current):
+        store.index_graph_snapshot(
+            conn,
+            PID,
+            snapshot["snapshot_id"],
+            nodes=graph["deps_graph"]["nodes"],
+            edges=graph["deps_graph"]["edges"],
+        )
+    nodes_by_id = {node["id"]: node for node in graph["deps_graph"]["nodes"]}
+    edge = graph["deps_graph"]["edges"][0]
+    stable_edge_key = graph_events.stable_edge_key_for_edge(
+        edge,
+        nodes_by_id["L7.1"],
+        nodes_by_id["L7.2"],
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        prev["snapshot_id"],
+        event_type="edge_semantic_enriched",
+        event_kind="imported_semantic_cache",
+        target_type="edge",
+        target_id="L7.1->L7.2:depends_on",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        stable_node_key=stable_edge_key,
+        payload={
+            "semantic_payload": {
+                "relation_purpose": "Rule fallback should not beat same-snapshot AI.",
+                "confidence": 0.55,
+                "evidence": {"source": "edge_semantic_rule"},
+            }
+        },
+        created_by="carry-forward",
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        current["snapshot_id"],
+        event_type="edge_semantic_enriched",
+        event_kind="semantic_job",
+        target_type="edge",
+        target_id="L7.1|L7.2|depends_on",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        payload={
+            "semantic_payload": {
+                "relation_purpose": "Same snapshot pipe AI wins.",
+                "confidence": 0.95,
+                "evidence": {"source": "semantic_ai"},
+            }
+        },
+        created_by="dashboard",
+    )
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": current["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-current-ai"},
+        )
+    )
+
+    edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
+    assert edge_semantic["validity"]["status"] == "edge_semantic_current"
+    assert edge_semantic["semantic"]["relation_purpose"] == "Same snapshot pipe AI wins."
+    assert edge_semantic["source_event"]["snapshot_id"] == current["snapshot_id"]
+    assert projected["health"]["edge_semantic_current_count"] == 1
+    assert projected["health"]["edge_semantic_rule_count"] == 0
+
+
 def test_graph_governance_edge_semantic_jobs_auto_enrich_and_controls(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         server,
