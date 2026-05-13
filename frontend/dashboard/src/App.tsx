@@ -868,7 +868,6 @@ export default function App() {
         onRefresh={handleRefresh}
         onProjectChange={handleProjectChange}
         onOpenAiConfig={() => setAiConfigOpen(true)}
-        onOpenReview={() => setActionPanelOpen(true)}
         liveStatus={liveStatus}
         multiSelectMode={multiSelectMode}
         multiSelectCount={multiSelectIds.size}

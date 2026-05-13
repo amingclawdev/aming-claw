@@ -296,10 +296,20 @@ function verifyProjectImportUiContract() {
   phase("project import UI contract");
   const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
   assert(viewSource.includes('data-testid="project-import-directory"'), "Projects page import directory button is missing");
   assert(viewSource.includes("handleChooseDirectory"), "Projects page does not wire a directory picker handler");
+  assert(viewSource.includes("Directory picker unavailable. Paste the path manually."), "Projects page should gracefully fall back to manual path entry");
   assert(apiSource.includes("/api/local/choose-directory"), "dashboard API client missing directory picker endpoint");
+  assert(serverSource.includes("_open_local_directory_picker_windows"), "backend missing Windows directory picker fallback");
   ok("Projects page exposes import directory picker contract");
+}
+
+function verifyHeaderV1Contract() {
+  phase("header v1 contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  assert(!appSource.includes("onOpenReview={() => setActionPanelOpen(true)}"), "Header should not expose global Action launcher in v1");
+  ok("global Action launcher is hidden for v1");
 }
 
 function verifyEditorJumpWorkspaceContract() {
@@ -323,6 +333,7 @@ async function main() {
   try {
     await http("GET", "/api/health");
     verifyProjectImportUiContract();
+    verifyHeaderV1Contract();
     verifyEditorJumpWorkspaceContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();

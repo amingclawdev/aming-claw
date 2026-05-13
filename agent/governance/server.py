@@ -112,11 +112,22 @@ def _utc_now() -> str:
 
 def _open_local_directory_picker(initial_path: str = "", title: str = "Choose project directory") -> str:
     """Open a local directory picker and return the selected absolute path."""
+    errors: list[str] = []
     try:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as exc:  # pragma: no cover - depends on host Python build
-        raise RuntimeError(f"local directory picker unavailable: {exc}") from exc
+        errors.append(f"tkinter unavailable: {exc}")
+        tk = None
+        filedialog = None
+
+    if tk is None or filedialog is None:
+        if os.name == "nt":
+            try:
+                return _open_local_directory_picker_windows(initial_path=initial_path, title=title)
+            except Exception as exc:  # pragma: no cover - depends on host desktop
+                errors.append(f"windows picker unavailable: {exc}")
+        raise RuntimeError("local directory picker unavailable: " + "; ".join(errors))
 
     initial_dir = ""
     if initial_path:
@@ -144,6 +155,47 @@ def _open_local_directory_picker(initial_path: str = "", title: str = "Choose pr
                 root.destroy()
             except Exception:
                 pass
+
+
+def _open_local_directory_picker_windows(initial_path: str = "", title: str = "Choose project directory") -> str:
+    """Fallback folder picker for Windows Python builds without tkinter."""
+    exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    if not exe:
+        raise RuntimeError("PowerShell is not available")
+    env = os.environ.copy()
+    env["AMING_CLAW_PICKER_INITIAL"] = initial_path
+    env["AMING_CLAW_PICKER_TITLE"] = title
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = $env:AMING_CLAW_PICKER_TITLE
+$dialog.ShowNewFolderButton = $false
+$initial = $env:AMING_CLAW_PICKER_INITIAL
+if ($initial -and (Test-Path -LiteralPath $initial)) {
+  $resolved = Resolve-Path -LiteralPath $initial
+  if ($resolved) { $dialog.SelectedPath = $resolved.Path }
+}
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($dialog.SelectedPath)
+}
+"""
+    args = [exe, "-NoProfile"]
+    if "powershell" in Path(exe).name.lower():
+        args.append("-STA")
+    args.extend(["-Command", script])
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(detail or f"PowerShell picker exited {proc.returncode}")
+    selected = proc.stdout.strip()
+    return str(Path(selected).resolve()) if selected else ""
 
 
 def _dashboard_dist_dir() -> Path:
@@ -815,7 +867,7 @@ def handle_local_choose_directory(ctx: RequestContext):
     try:
         selected = _open_local_directory_picker(initial_path=initial_path, title=title)
     except Exception as exc:
-        return 503, {
+        return {
             "ok": False,
             "selected": False,
             "path": "",

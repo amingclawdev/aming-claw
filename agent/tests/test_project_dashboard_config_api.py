@@ -254,13 +254,12 @@ def test_local_choose_directory_endpoint_handles_unavailable_picker(monkeypatch)
 
     monkeypatch.setattr(server, "_open_local_directory_picker", _raise_unavailable)
 
-    status, payload = server.handle_local_choose_directory(_ctx(
+    payload = server.handle_local_choose_directory(_ctx(
         "dashboard-demo",
         method="POST",
         body={"initial_path": "C:/missing"},
     ))
 
-    assert status == 503
     assert payload["ok"] is False
     assert payload["selected"] is False
     assert payload["manual_entry"] is True

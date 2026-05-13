@@ -176,6 +176,11 @@ export default function ProjectConsoleView({
       if (result.selected && result.path) {
         setWorkspacePath(result.path);
         setNotice({ kind: "success", message: "Directory selected." });
+      } else if (result.error) {
+        setNotice({
+          kind: "info",
+          message: `Directory picker unavailable. Paste the path manually. ${result.error}`,
+        });
       } else {
         setNotice({ kind: "info", message: "No directory selected. Paste a path or choose again." });
       }
