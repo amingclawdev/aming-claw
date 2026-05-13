@@ -16,6 +16,7 @@ tell the user you can help with:
 - Rank PR opportunities: use graph evidence to identify high fan-out nodes, missing tests/docs, suspicious dependencies, semantic drift, review debt, and candidate refactor/test/doc issues.
 - Generate evidence-backed backlog rows: include node ids, primary files, related functions, graph metrics, neighbors, risk, acceptance criteria, target files, and test files.
 - Guide dashboard collaboration: use browser-use to inspect Projects, Graph tree, Inspector, Relations, Functions, Operations Queue, Review Queue, and Backlog as the same shared control plane the user sees.
+- Onboard new users with a Codex-rendered launcher MVP: dashboard link, project initialization path, browser collaboration entry, graph concepts, backlog workflow, and safe startup commands.
 - Run targeted semantic enrichment and review when requested: explain missing/current/hash-unverified/pending-review states, queue/cancel/retry semantics, and the difference between AI-proposed memory and user-approved memory.
 - Drive advanced chain/dev/test/qa workflows only when explicitly needed; MVP work can stay local with graph, backlog, tests, and dashboard checks.
 
@@ -24,6 +25,37 @@ tell the user you can help with:
 Treat the active graph as the project map and the backlog as the work ledger. Before editing code, docs, config, dashboard assets, or runtime state, establish current graph/runtime status, identify the owning nodes/modules, and record the work item.
 For new features or user-visible behavior changes, treat E2E impact as part of the work ledger: run/update the relevant suite and evidence, or file an explicit follow-up backlog row when the E2E is deferred.
 For dashboard/graph E2E work, update repo-owned fixture artifacts first and materialize them into isolated temporary projects; do not hand-edit generated example projects as the source of truth.
+
+## Manual Fix SOP
+
+Use the manual-fix SOP for observer-hotfix, chain rescue, and other bypass
+work where normal chain execution is not the right path. The canonical SOP is
+`docs/governance/manual-fix-sop.md`; the compact session checklist is
+`aming-claw://mf-sop`.
+
+Before editing:
+
+1. Confirm the MF route is justified.
+2. Ensure the backlog row exists with target files, acceptance criteria, and
+   details.
+3. Predeclare/start the MF row when the MCP/HTTP surface is available.
+4. Capture baselines: `git status`, `version_check`, `preflight_check`,
+   `graph_status`, `graph_operations_queue`, and `wf_impact` for target files.
+5. Run graph-first discovery and record the owning nodes or why the file is not
+   graph-mapped.
+6. Record the E2E decision: run it, defer it with a follow-up backlog row, or
+   mark it `e2e_not_applicable` with a reason.
+
+Commit explicit files only, and use Chain trailers for true MF commits:
+
+```text
+Chain-Source-Stage: observer-hotfix
+Chain-Project: aming-claw
+Chain-Bug-Id: <backlog-id>
+```
+
+After commit, re-check version/runtime and graph state, reconcile if the graph
+is stale, then close the backlog row with commit and verification evidence.
 
 ## Start Sequence
 
@@ -35,6 +67,63 @@ For dashboard/graph E2E work, update repo-owned fixture artifacts first and mate
 6. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
 7. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
 8. Inspect files only after graph discovery identifies likely owners and reusable modules.
+
+## Fresh Session Launcher
+
+On the first Aming Claw skill load in a fresh session, show a short
+Codex-rendered launcher block before deep work. This is the MVP for onboarding
+buttons until the dashboard/plugin frontend owns native controls.
+
+First read `aming-claw://current-context` when available. If that resource is
+missing or governance is offline, continue safely with the offline launcher
+state instead of auto-starting services.
+
+The launcher should be status-aware:
+
+- If governance is online, include the dashboard link, project id, runtime
+  version, graph stale state, operations queue count, and open backlog count
+  when known.
+- If governance is offline or current context is missing, show the explicit
+  startup flow:
+
+  ```text
+  aming-claw launcher
+  aming-claw start
+  ```
+
+- If no active graph exists for the selected project, make "Initialize Project"
+  the primary next action.
+- If graph is stale, make "Review Impact / Reconcile Graph" the primary next
+  action.
+- If graph is current, offer "Open Dashboard", "Explore Graph", "View
+  Backlog", and "Start Work".
+
+Codex-owned MVP behavior:
+
+- Render the launcher as a compact Markdown action panel with button-like
+  labels and links/copyable commands. If the host app supports interactive
+  choice buttons, use them; otherwise ask the user to click the link or reply
+  with the action label.
+- Keep the panel short enough to fit above the fold. Do not replace normal
+  task work with a long tutorial.
+- Show it once per fresh session unless the user asks for help, onboarding, or
+  the launcher again.
+- For concept actions, explain only the selected concept first: graph, node,
+  edge, snapshot, semantic enrichment, backlog, or browser collaboration.
+
+Suggested launcher actions:
+
+- Open Dashboard
+- Initialize Project
+- Use Browser Collaboration
+- Explain Graph / Nodes / Edges
+- Check Runtime And Graph
+- View Operations Queue
+- Create Or Update Backlog
+- Start A Code Change
+
+Do not silently start services. Browser or dashboard buttons may open URLs or
+copy commands, but must not execute local shell commands.
 
 ## Visual AI Collaboration
 
@@ -60,17 +149,27 @@ Recommended visual workflow:
 
 ## Local Plugin Launcher
 
-When the user asks for a local plugin entrypoint or the governance runtime is
-offline, offer the explicit launcher flow instead of auto-starting services:
+When the user asks for a local plugin entrypoint, onboarding help, or the
+governance runtime is offline, offer the explicit launcher flow instead of
+auto-starting services:
 
 ```text
 aming-claw launcher
 aming-claw start
 ```
 
-The generated launcher artifact is an HTML guide with the dashboard link and
-copyable commands. It must not execute local commands from a browser button;
-service startup remains an explicit MCP/CLI action.
+The generated launcher artifact may be a Codex-rendered Markdown panel for MVP
+or an HTML/dashboard guide in later iterations. It may include:
+
+- Dashboard link.
+- Project selector or project id.
+- Runtime and graph status summary.
+- Copyable startup commands.
+- Onboarding actions for initialization, graph concepts, backlog, and browser
+  collaboration.
+
+It must not execute local commands from a browser button; service startup
+remains an explicit MCP/CLI action.
 
 ## Mutation Rules
 
