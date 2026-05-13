@@ -1,8 +1,28 @@
-"""Tests for package installation — AC5, AC7, AC10."""
+"""Tests for package and local-plugin installation contracts."""
 
 import importlib
+import json
 import subprocess
 import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_pyproject() -> dict:
+    try:
+        import tomllib
+        with (ROOT / "pyproject.toml").open("rb") as f:
+            return tomllib.load(f)
+    except ImportError:
+        try:
+            import pip._vendor.tomli as _tomli
+            return _tomli.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        except (ImportError, AttributeError):
+            import tomli as _tomli2
+            with (ROOT / "pyproject.toml").open("rb") as f:
+                return _tomli2.load(f)
 
 
 class TestImportWithoutRedis:
@@ -36,23 +56,40 @@ class TestPyprojectOptionalDeps:
     """AC10: pyproject.toml has optional dependency groups."""
 
     def test_optional_deps_in_toml(self):
-        import os
-        toml_path = os.path.join(os.path.dirname(__file__), "..", "..", "pyproject.toml")
-        try:
-            import tomllib
-            with open(toml_path, "rb") as f:
-                data = tomllib.load(f)
-        except ImportError:
-            # Python < 3.11 fallback: use pip's vendored tomli (expects str)
-            try:
-                import pip._vendor.tomli as _tomli
-                with open(toml_path, "r", encoding="utf-8") as f:
-                    data = _tomli.loads(f.read())
-            except (ImportError, AttributeError):
-                import tomli as _tomli2
-                with open(toml_path, "rb") as f:
-                    data = _tomli2.load(f)
+        data = _load_pyproject()
         opt = data["project"]["optional-dependencies"]
         assert "redis" in opt
         assert "docker" in opt
         assert "full" in opt
+
+
+class TestLocalPluginPackaging:
+    """MVP contract for Codex/Claude local-plugin packaging."""
+
+    def test_codex_plugin_manifest_points_to_existing_assets(self):
+        manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+
+        assert manifest["name"] == "aming-claw"
+        assert (ROOT / manifest["skills"]).is_dir()
+        assert (ROOT / manifest["mcpServers"]).is_file()
+        assert "MCP" in manifest["interface"]["capabilities"]
+
+    def test_mcp_config_is_relocatable_and_uses_stdio_module_entrypoint(self):
+        config_text = (ROOT / ".mcp.json").read_text(encoding="utf-8")
+        config = json.loads(config_text)
+        server = config["mcpServers"]["aming-claw"]
+
+        assert server["command"] == "python"
+        assert server["args"][:2] == ["-m", "agent.mcp.server"]
+        assert "--workers" in server["args"]
+        assert server["args"][server["args"].index("--workers") + 1] == "0"
+        assert server["cwd"] == "."
+        assert "C:\\Users\\" not in config_text
+
+    def test_pyproject_exposes_governance_console_scripts(self):
+        data = _load_pyproject()
+
+        scripts = data["project"]["scripts"]
+        assert scripts["aming-claw"] == "agent.cli:main"
+        assert scripts["aming-governance"] == "agent.governance.server:main"
+        assert scripts["aming-governance-host"] == "start_governance:main"

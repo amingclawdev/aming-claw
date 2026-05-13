@@ -3,7 +3,7 @@
     "aming-claw": {
       "command": "python",
       "args": ["-m", "agent.mcp.server", "--project", "aming-claw", "--workers", "0", "--governance-url", "http://localhost:40000"],
-      "cwd": "C:\\Users\\z5866\\Documents\\amingclaw\\aming_claw",
+      "cwd": ".",
       "env": {
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
