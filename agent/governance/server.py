@@ -8233,7 +8233,8 @@ def _edge_semantic_instructions(root: Path, body: dict) -> dict:
 
 
 def _edge_semantic_rule_payload(edge_context: dict, instructions: dict, ai_response: dict | None = None) -> dict:
-    if isinstance(ai_response, dict) and not ai_response.get("_ai_error"):
+    has_ai_response = isinstance(ai_response, dict) and not ai_response.get("_ai_error")
+    if has_ai_response:
         payload = {
             key: value for key, value in ai_response.items()
             if not str(key).startswith("_") and value not in (None, "", [], {})
@@ -8254,12 +8255,12 @@ def _edge_semantic_rule_payload(edge_context: dict, instructions: dict, ai_respo
     relation = relation_labels.get(edge_type, edge_type.replace("_", " "))
     payload.setdefault("relation_purpose", f"{src or 'source'} {relation} {dst or 'target'}.")
     payload.setdefault("confidence", 0.55)
-    payload.setdefault("evidence", {
-        "source": "edge_semantic_rule",
-        "edge_type": edge_type,
-        "src": src,
-        "dst": dst,
-    })
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    evidence.setdefault("source", "semantic_ai" if has_ai_response else "edge_semantic_rule")
+    evidence.setdefault("edge_type", edge_type)
+    evidence.setdefault("src", src)
+    evidence.setdefault("dst", dst)
+    payload["evidence"] = evidence
     payload.setdefault("analyzer_role", instructions.get("analyzer_role") or instructions.get("role") or "")
     payload.setdefault("job_type", "edge")
     return payload

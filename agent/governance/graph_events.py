@@ -568,6 +568,27 @@ def _edge_id(edge: dict[str, Any]) -> str:
     return f"{src}->{dst}:{edge_type}" if src and dst else ""
 
 
+def _edge_id_variants(edge_id: str) -> list[str]:
+    raw = str(edge_id or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    if "|" in raw:
+        parts = [part.strip() for part in raw.split("|")]
+        if len(parts) == 3 and all(parts):
+            variants.insert(0, f"{parts[0]}->{parts[1]}:{parts[2]}")
+    if "->" in raw and ":" in raw:
+        src, rest = raw.split("->", 1)
+        dst, edge_type = rest.rsplit(":", 1)
+        pipe = f"{src}|{dst}|{edge_type}"
+        variants.append(pipe)
+    deduped: list[str] = []
+    for variant in variants:
+        if variant and variant not in deduped:
+            deduped.append(variant)
+    return deduped
+
+
 def _edge_from_id(edge_id: str) -> dict[str, Any]:
     text = str(edge_id or "").strip()
     if "->" not in text:
@@ -2014,8 +2035,8 @@ def _latest_edge_semantic_events(
         event = _row_to_event(row)
         target_id = str(event.get("target_id") or "").strip()
         stable_key = str(event.get("stable_node_key") or "").strip()
-        if target_id:
-            by_target_id[target_id] = event
+        for target_variant in _edge_id_variants(target_id):
+            by_target_id[target_variant] = event
         if stable_key:
             by_stable_key[stable_key] = event
     # If the caller provided edge_index, prefer stable_edge_key matches —
