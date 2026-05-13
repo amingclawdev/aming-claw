@@ -70,9 +70,10 @@ class TestPackagedDashboardAssets:
         find_config = data["tool"]["setuptools"]["packages"]["find"]
 
         assert package_data["agent.governance.dashboard_dist"] == ["**/*"]
-        assert find_config["namespaces"] is False
+        assert find_config["namespaces"] is True
         assert "agent.tests*" in find_config["exclude"]
         assert "agent.governance.chain_history*" in find_config["exclude"]
+        assert (ROOT / "agent" / "governance" / "dashboard_dist" / "assets").is_dir()
 
     def test_manifest_includes_dashboard_and_plugin_assets(self):
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")

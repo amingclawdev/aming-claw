@@ -41,7 +41,7 @@ exclude = [
   "dist*",
   "docs.dev*",
 ]
-namespaces = false
+namespaces = true
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml", "*.json"]
