@@ -9,20 +9,28 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _run_mcp_probe(messages: list[dict]) -> tuple[list[dict], str, int]:
+def _run_mcp_probe(
+    messages: list[dict],
+    *,
+    extra_args: list[str] | None = None,
+    cwd: Path = ROOT,
+) -> tuple[list[dict], str, int]:
+    args = [
+        sys.executable,
+        "-m",
+        "agent.mcp.server",
+        "--project",
+        "aming-claw",
+        "--workers",
+        "0",
+        "--governance-url",
+        "http://127.0.0.1:9",
+    ]
+    if extra_args:
+        args.extend(extra_args)
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "agent.mcp.server",
-            "--project",
-            "aming-claw",
-            "--workers",
-            "0",
-            "--governance-url",
-            "http://127.0.0.1:9",
-        ],
-        cwd=ROOT,
+        args,
+        cwd=cwd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -119,3 +127,44 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     seed = json.loads(responses[4]["result"]["contents"][0]["text"])
     assert seed["project_id"] == "aming-claw"
     assert "graph-native" in " ".join(seed["recommended_first_actions"]).lower()
+
+
+def test_mcp_current_context_prefers_workspace_project_config(tmp_path: Path):
+    workspace = tmp_path / "external-project"
+    workspace.mkdir()
+    (workspace / ".aming-claw.yaml").write_text("project_id: instructor\n", encoding="utf-8")
+
+    responses, stderr, returncode = _run_mcp_probe(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": "aming-claw://current-context"},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": "aming-claw://project/dashboard-e2e-demo/context"},
+            },
+        ],
+        extra_args=["--workspace", str(workspace)],
+    )
+
+    assert returncode == 0
+    assert stderr == ""
+    current_text = responses[0]["result"]["contents"][0]["text"]
+    assert "default_project_id: `aming-claw`" in current_text
+    assert "workspace_project_id: `instructor`" in current_text
+    assert "dashboard_project_id: `-`" in current_text
+    assert "active_project_id: `instructor`" in current_text
+    assert "context_source: `workspace_config`" in current_text
+    assert "dashboard?project=instructor" in current_text
+
+    project_text = responses[1]["result"]["contents"][0]["text"]
+    assert "default_project_id: `aming-claw`" in project_text
+    assert "workspace_project_id: `instructor`" in project_text
+    assert "dashboard_project_id: `dashboard-e2e-demo`" in project_text
+    assert "active_project_id: `dashboard-e2e-demo`" in project_text
+    assert "context_source: `resource_uri`" in project_text

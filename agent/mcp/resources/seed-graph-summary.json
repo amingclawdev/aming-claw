@@ -5,6 +5,7 @@
   "last_curated_commit": "899d676",
   "recommended_first_actions": [
     "Read aming-claw://skill and aming-claw://current-context.",
+    "If the visible dashboard URL has ?project=<id>, read aming-claw://project/<id>/context so graph/backlog calls use the user-selected project instead of the default.",
     "Call graph_query with tool=query_schema before inspecting files; use graph-native discovery before full scans.",
     "Use find_node_by_path, get_node, get_neighbors, degree_summary, high_degree_nodes, function_index, search_structure, and search_semantic before falling back to full repo scans.",
     "If governance is offline, ask the user to run aming-claw start or open the dashboard."

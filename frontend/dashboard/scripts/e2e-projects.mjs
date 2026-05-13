@@ -369,6 +369,26 @@ function verifyProjectScopedFetchContract() {
   ok("dashboard data fetches are explicit per active project");
 }
 
+function verifyProjectContextFallbackContract() {
+  phase("project context fallback contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
+  const mcpSource = readFileSync(path.join(REPO_ROOT, "agent/mcp/server.py"), "utf8");
+  const seedSource = readFileSync(path.join(REPO_ROOT, "agent/mcp/resources/seed-graph-summary.json"), "utf8");
+  assert(appSource.includes("DASHBOARD_WORKSPACE_PARAM"), "Dashboard URL should accept workspace prefill for bootstrap fallback");
+  assert(appSource.includes("shouldFallbackToProjects"), "Dashboard should fallback to Projects for missing/unbuilt graphs");
+  assert(appSource.includes("Project ${requestProjectId} is not registered yet"), "Unknown project should guide the operator to bootstrap");
+  assert(appSource.includes("Graph is not ready for ${requestProjectId}"), "Missing graph should guide the operator to build graph");
+  assert(viewSource.includes("initialWorkspacePath"), "Projects bootstrap form should accept URL/workspace prefill");
+  assert(mcpSource.includes("default_project_id"), "MCP current-context should expose the configured default project id");
+  assert(mcpSource.includes("workspace_project_id"), "MCP current-context should expose workspace-resolved project id");
+  assert(mcpSource.includes("dashboard_project_id"), "MCP current-context should expose dashboard/resource-selected project id");
+  assert(mcpSource.includes("active_project_id"), "MCP current-context should expose the resolved active project id");
+  assert(mcpSource.includes("_project_id_from_workspace_registry"), "MCP current-context should resolve project from registered workspace paths");
+  assert(seedSource.includes("aming-claw://project/<id>/context"), "Seed guidance should direct visible dashboard projects to project-scoped context");
+  ok("dashboard and MCP distinguish default, workspace, dashboard, and active project context");
+}
+
 function verifyProjectGraphActionsGuideContract() {
   phase("project graph actions guide contract");
   const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/ProjectConsoleView.tsx"), "utf8");
@@ -461,6 +481,7 @@ async function main() {
     verifyHeaderV1Contract();
     verifyProjectDisplayNameContract();
     verifyProjectScopedFetchContract();
+    verifyProjectContextFallbackContract();
     verifyProjectGraphActionsGuideContract();
     verifyAiConfigProjectScopeContract();
     verifyQueueLaneCopyContract();

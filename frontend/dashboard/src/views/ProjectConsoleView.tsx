@@ -19,6 +19,7 @@ import {
 interface Props {
   projects: ProjectListItem[];
   currentProjectId: string;
+  initialWorkspacePath?: string;
   loading: boolean;
   onOpenProject(projectId: string): void;
   onOpenAiConfig(): void;
@@ -77,6 +78,7 @@ const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", 
 export default function ProjectConsoleView({
   projects,
   currentProjectId,
+  initialWorkspacePath,
   loading,
   onOpenProject,
   onOpenAiConfig,
@@ -85,14 +87,23 @@ export default function ProjectConsoleView({
   const [runtime, setRuntime] = useState<Record<string, ProjectRuntime>>({});
   const [runtimeLoading, setRuntimeLoading] = useState(false);
   const [refreshToken, setRefreshToken] = useState(0);
-  const [workspacePath, setWorkspacePath] = useState("");
+  const [workspacePath, setWorkspacePath] = useState(initialWorkspacePath ?? "");
   const [projectName, setProjectName] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [actionState, setActionState] = useState<{ key: string; label: string } | null>(null);
   const [actionStartedAt, setActionStartedAt] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const workspacePathInputRef = useRef<HTMLInputElement | null>(null);
+  const appliedInitialWorkspacePathRef = useRef(initialWorkspacePath ?? "");
   const projectKey = useMemo(() => projects.map((p) => p.project_id).join("\u0000"), [projects]);
+
+  useEffect(() => {
+    const next = (initialWorkspacePath ?? "").trim();
+    if (next && appliedInitialWorkspacePathRef.current !== next) {
+      appliedInitialWorkspacePathRef.current = next;
+      setWorkspacePath((prev) => (prev.trim() ? prev : next));
+    }
+  }, [initialWorkspacePath]);
 
   useEffect(() => {
     if (projects.length === 0) {

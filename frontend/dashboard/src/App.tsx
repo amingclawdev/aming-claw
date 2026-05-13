@@ -41,6 +41,7 @@ const DASHBOARD_PROJECT_STORAGE_KEY = "aming-claw.dashboard.projectId";
 const DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY = "aming-claw.dashboard.sidebarCollapsed";
 const DASHBOARD_PROJECT_PARAM = "project";
 const DASHBOARD_VIEW_PARAM = "view";
+const DASHBOARD_WORKSPACE_PARAM = "workspace";
 const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "overview", "graph", "operations", "review", "backlog"];
 
 function normalizeProjectId(value: string | null | undefined): string {
@@ -60,14 +61,17 @@ function readStoredProjectId(): string {
   }
 }
 
-function readDashboardLocation(): { projectId: string; view: ViewName } {
+function readDashboardLocation(): { projectId: string; view: ViewName; hasProjectParam: boolean; workspacePath: string } {
   if (typeof window === "undefined") {
-    return { projectId: DEFAULT_PROJECT_ID, view: "projects" };
+    return { projectId: DEFAULT_PROJECT_ID, view: "projects", hasProjectParam: false, workspacePath: "" };
   }
   const params = new URLSearchParams(window.location.search);
+  const projectParam = params.get(DASHBOARD_PROJECT_PARAM);
   return {
-    projectId: normalizeProjectId(params.get(DASHBOARD_PROJECT_PARAM) || readStoredProjectId()),
+    projectId: normalizeProjectId(projectParam || readStoredProjectId()),
     view: normalizeViewName(params.get(DASHBOARD_VIEW_PARAM)),
+    hasProjectParam: Boolean(projectParam && projectParam.trim()),
+    workspacePath: (params.get(DASHBOARD_WORKSPACE_PARAM) || "").trim(),
   };
 }
 
@@ -130,6 +134,11 @@ interface Toast {
   msg: string;
 }
 
+function shouldFallbackToProjects(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  return error.status === 400 || error.status === 404;
+}
+
 const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
 
 const DEFAULT_AI_MODELS: Record<string, string[]> = {
@@ -169,6 +178,7 @@ export default function App() {
   const [currentProjectId, setCurrentProjectId] = useState(initialLocation.projectId);
   const currentProjectIdRef = useRef(currentProjectId);
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
+  const [bootstrapWorkspacePath, setBootstrapWorkspacePath] = useState(initialLocation.workspacePath);
   const [aiConfig, setAiConfig] = useState<AiConfigResponse | null>(null);
   const [aiConfigOpen, setAiConfigOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
@@ -209,6 +219,7 @@ export default function App() {
       if (currentProjectIdRef.current !== next.projectId) resetProjectScopedUi();
       setCurrentProjectId(next.projectId);
       setView(next.view);
+      setBootstrapWorkspacePath(next.workspacePath);
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -220,17 +231,35 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const [health, status, summary, projection, ops, backlog, projectList, aiCfg] = await Promise.all([
+      const [health, projectList] = await Promise.all([
         api.health(signal),
+        api.projects(signal),
+      ]);
+      setProjects(projectList.projects ?? []);
+      const projectKnown = (projectList.projects ?? []).some((project) => project.project_id === requestProjectId);
+      if (!projectKnown && view === "projects") {
+        setData(null);
+        setAiConfig(null);
+        return;
+      }
+      if (!projectKnown && view !== "projects") {
+        setData(null);
+        setAiConfig(null);
+        setView("projects");
+        setToast({
+          kind: "info",
+          msg: `Project ${requestProjectId} is not registered yet. Use Projects to bootstrap it.`,
+        });
+        return;
+      }
+      const [status, summary, projection, ops, backlog, aiCfg] = await Promise.all([
         api.statusFor(requestProjectId, signal),
         api.activeSummaryFor(requestProjectId, signal),
         api.activeProjectionFor(requestProjectId, signal),
         api.operationsQueueFor(requestProjectId, signal),
         api.backlogFor(requestProjectId, signal),
-        api.projects(signal),
         api.aiConfigFor(requestProjectId, signal),
       ]);
-      setProjects(projectList.projects ?? []);
       setAiConfig(aiCfg);
       const snapshotId = status.active_snapshot_id || summary.snapshot_id;
       const [nodesRes, edgesRes, feedback] = await Promise.all([
@@ -263,13 +292,32 @@ export default function App() {
       });
     } catch (e) {
       if ((e as { name?: string }).name === "AbortError") return;
+      if (shouldFallbackToProjects(e) && view === "projects") {
+        setData(null);
+        setAiConfig(null);
+        setError(null);
+        return;
+      }
+      if (shouldFallbackToProjects(e) && view !== "projects") {
+        setData(null);
+        setAiConfig(null);
+        setView("projects");
+        const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
+        setToast({
+          kind: "info",
+          msg: `Graph is not ready for ${requestProjectId}. Open Projects to bootstrap or build graph.`,
+        });
+        setError(null);
+        console.info("Falling back to Projects view:", msg);
+        return;
+      }
       const msg = e instanceof ApiError ? `${e.message} ${e.body}` : (e as Error).message;
       setError(msg);
       setToast({ kind: "error", msg: `Load failed: ${msg}` });
     } finally {
       setLoading(false);
     }
-  }, [currentProjectId]);
+  }, [currentProjectId, view]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -952,6 +1000,7 @@ export default function App() {
             <ProjectConsoleView
               projects={projects}
               currentProjectId={currentProjectId}
+              initialWorkspacePath={bootstrapWorkspacePath}
               loading={loading}
               onOpenProject={handleOpenProject}
               onOpenAiConfig={() => setAiConfigOpen(true)}

@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import urllib.request
@@ -235,12 +236,12 @@ class AmingClawMCP:
 
     def _read_resource_text(self, uri: str) -> str:
         if uri == "aming-claw://current-context":
-            return self._current_context_text(self.project_id)
+            return self._current_context_text(None)
         prefix = "aming-claw://project/"
         suffix = "/context"
         if uri.startswith(prefix) and uri.endswith(suffix):
             project_id = uri[len(prefix):-len(suffix)]
-            return self._current_context_text(project_id or self.project_id)
+            return self._current_context_text(project_id or None)
         spec = RESOURCE_FILES.get(uri)
         if not spec:
             raise ValueError(f"Unknown resource URI: {uri}")
@@ -265,12 +266,19 @@ class AmingClawMCP:
         spec = RESOURCE_FILES.get(uri)
         return spec[2] if spec else "text/plain"
 
-    def _current_context_text(self, project_id: str) -> str:
-        dashboard_url = f"{self.gov_url}/dashboard?project={project_id}&view=projects"
+    def _current_context_text(self, requested_project_id: str | None) -> str:
+        context = self._resolve_context_project(requested_project_id)
+        project_id = context["active_project_id"]
         health = self._request_json("GET", f"{self.gov_url}/api/health", timeout=2)
         version = self._request_json("GET", f"{self.gov_url}/api/version-check/{project_id}", timeout=2)
         graph = self._request_json("GET", f"{self.gov_url}/api/graph-governance/{project_id}/status", timeout=2)
         ops = self._request_json("GET", f"{self.gov_url}/api/graph-governance/{project_id}/operations/queue", timeout=2)
+        graph_missing = context["graph_missing"]
+        if not graph.get("error"):
+            graph_missing = graph_missing or not str(graph.get("active_snapshot_id") or "").strip()
+        dashboard_view = "projects" if graph_missing else "graph"
+        dashboard_url = f"{self.gov_url}/dashboard?project={project_id}&view={dashboard_view}"
+        dashboard_graph_url = f"{self.gov_url}/dashboard?project={project_id}&view=graph"
         health_line = self._format_context_health(health)
         version_line = self._format_context_version(version)
         graph_line = self._format_context_graph(graph)
@@ -279,9 +287,15 @@ class AmingClawMCP:
             "# Aming Claw Current Context",
             "",
             f"- project_id: `{project_id}`",
+            f"- default_project_id: `{context['default_project_id']}`",
+            f"- workspace_project_id: `{context['workspace_project_id'] or '-'}`",
+            f"- dashboard_project_id: `{context['dashboard_project_id'] or '-'}`",
+            f"- active_project_id: `{project_id}`",
+            f"- context_source: `{context['context_source']}`",
             f"- governance_url: `{self.gov_url}`",
             f"- manager_url: `{self.manager_url}`",
             f"- dashboard_url: `{dashboard_url}`",
+            f"- dashboard_graph_url: `{dashboard_graph_url}`",
             f"- workspace: `{self._workspace}`",
             f"- health: {health_line}",
             f"- version: {version_line}",
@@ -292,13 +306,106 @@ class AmingClawMCP:
             "",
             "1. Read `aming-claw://skill`.",
             "2. Read `aming-claw://seed-graph-summary` if governance is offline or this is a fresh package install.",
-            "3. Check `health`, `version_check`, `graph_status`, `graph_operations_queue`, and open backlog.",
-            "4. Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
-            "5. File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
-            "6. Use the dashboard as a visual control plane when browser-use is available.",
-            "7. If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
+            "3. If the dashboard URL contains `?project=...`, read `aming-claw://project/<project_id>/context` before graph/backlog operations.",
+            "4. If `dashboard_url` opens Projects, bootstrap or build/update graph before drawing conclusions from graph data.",
+            "5. Check `health`, `version_check`, `graph_status`, `graph_operations_queue`, and open backlog.",
+            "6. Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
+            "7. File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
+            "8. Use the dashboard as a visual control plane when browser-use is available.",
+            "9. If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
             "",
         ])
+
+    def _resolve_context_project(self, requested_project_id: str | None) -> dict[str, Any]:
+        default_project_id = self.project_id
+        dashboard_project_id = (requested_project_id or os.getenv("AMING_CLAW_DASHBOARD_PROJECT") or "").strip()
+        projects_payload = self._request_json("GET", f"{self.gov_url}/api/projects", timeout=2)
+        projects = projects_payload.get("projects") if isinstance(projects_payload, dict) else None
+        if not isinstance(projects, list):
+            projects = []
+        workspace_match_project_id = self._project_id_from_workspace_registry(projects)
+        workspace_config_project_id = self._project_id_from_workspace_config()
+        workspace_project_id = workspace_match_project_id or workspace_config_project_id
+
+        if dashboard_project_id:
+            active_project_id = dashboard_project_id
+            context_source = "resource_uri" if requested_project_id else "dashboard_env"
+        elif workspace_project_id:
+            active_project_id = workspace_project_id
+            context_source = "workspace_match" if workspace_match_project_id else "workspace_config"
+        else:
+            active_project_id = default_project_id
+            context_source = "default_project_id"
+
+        project_entry = next(
+            (p for p in projects if isinstance(p, dict) and str(p.get("project_id") or "") == active_project_id),
+            None,
+        )
+        registered = project_entry is not None
+        graph_missing = False
+        if not registered and projects:
+            graph_missing = True
+        elif project_entry is not None and not str(project_entry.get("active_snapshot_id") or "").strip():
+            graph_missing = True
+
+        return {
+            "default_project_id": default_project_id,
+            "workspace_project_id": workspace_project_id,
+            "dashboard_project_id": dashboard_project_id,
+            "active_project_id": active_project_id,
+            "context_source": context_source,
+            "project_registered": registered,
+            "graph_missing": graph_missing,
+        }
+
+    def _project_id_from_workspace_registry(self, projects: list[dict]) -> str:
+        workspace = self._normalized_workspace_path(self._workspace)
+        if not workspace:
+            return ""
+        best = ""
+        best_len = -1
+        for project in projects:
+            if not isinstance(project, dict):
+                continue
+            raw_path = str(project.get("workspace_path") or "").strip()
+            project_path = self._normalized_workspace_path(raw_path)
+            if not project_path:
+                continue
+            # Prefer the most specific registered workspace that contains the
+            # MCP cwd, so sessions opened in a subdirectory still resolve to
+            # the intended project.
+            if workspace == project_path or workspace.startswith(project_path + os.sep):
+                if len(project_path) > best_len:
+                    best = str(project.get("project_id") or "").strip()
+                    best_len = len(project_path)
+        return best
+
+    def _project_id_from_workspace_config(self) -> str:
+        try:
+            workspace = Path(self._workspace).resolve()
+        except Exception:
+            return ""
+        for root in [workspace, *workspace.parents]:
+            config = root / ".aming-claw.yaml"
+            if not config.exists():
+                continue
+            try:
+                text = config.read_text(encoding="utf-8")
+            except Exception:
+                return ""
+            match = re.search(r"(?m)^\s*project_id\s*:\s*['\"]?([^'\"\s#]+)", text)
+            return match.group(1).strip() if match else ""
+        return ""
+
+    @staticmethod
+    def _normalized_workspace_path(path: str) -> str:
+        if not path:
+            return ""
+        try:
+            resolved = str(Path(path).resolve())
+        except Exception:
+            resolved = path
+        return os.path.normcase(os.path.normpath(resolved))
 
     @staticmethod
     def _format_context_health(payload: dict) -> str:
