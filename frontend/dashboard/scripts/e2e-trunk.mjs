@@ -62,6 +62,7 @@ const SEMANTIC_DECISION = String(FLAGS["semantic-decision"] || "accept").trim().
 const SEMANTIC_TIMEOUT_MS = Number(FLAGS["semantic-timeout-ms"] || 180000);
 const KEEP_WORKSPACE = FLAGS.keep === true;
 const RUN_ID = FLAGS["run-id"] || `dashboard-trunk-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 if (!["accept", "reject", "both"].includes(SEMANTIC_DECISION)) {
   throw new Error("--semantic-decision must be accept, reject, or both");
 }
@@ -292,10 +293,16 @@ async function http(method, route, body) {
     init.body = JSON.stringify(body);
   }
   let response;
-  try {
-    response = await fetch(`${BACKEND}${route}`, init);
-  } catch (error) {
-    throw new HttpError(method, route, 0, String(error), body);
+  for (let attempt = 0; attempt <= HTTP_RETRIES; attempt++) {
+    try {
+      response = await fetch(`${BACKEND}${route}`, init);
+      break;
+    } catch (error) {
+      if (attempt >= HTTP_RETRIES) {
+        throw new HttpError(method, route, 0, String(error), body);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
   }
   const text = await response.text();
   let json = null;

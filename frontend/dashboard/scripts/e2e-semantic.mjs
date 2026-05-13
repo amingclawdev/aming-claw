@@ -44,6 +44,7 @@ const SCOPE_RECONCILE_ONLY = FLAGS["scope-reconcile-only"] === true;
 const ACTIONS_ONLY = FLAGS["actions-only"] === true;
 const FORCED_NODE = FLAGS.node || null;
 const FORCED_EDGE = FLAGS.edge || null;
+const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 
 function parseFlags(args) {
   const BOOL = new Set([
@@ -122,10 +123,16 @@ async function http(method, path, body, label) {
     init.body = JSON.stringify(body);
   }
   let res;
-  try {
-    res = await fetch(url, init);
-  } catch (e) {
-    throw new HttpError(method, path, 0, String(e), body);
+  for (let attempt = 0; attempt <= HTTP_RETRIES; attempt++) {
+    try {
+      res = await fetch(url, init);
+      break;
+    } catch (e) {
+      if (attempt >= HTTP_RETRIES) {
+        throw new HttpError(method, path, 0, String(e), body);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
   }
   const text = await res.text();
   let json = null;

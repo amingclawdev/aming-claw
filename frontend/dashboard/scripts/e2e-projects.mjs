@@ -26,6 +26,7 @@ const PARENT_PROJECT = FLAGS.parent || DEFAULT_PARENT;
 const WORKSPACE = path.resolve(FLAGS.workspace || DEFAULT_WORKSPACE);
 const APPLY = FLAGS.apply === true;
 const SKIP_PARENT = FLAGS["skip-parent-isolation"] === true;
+const HTTP_RETRIES = Number(FLAGS["http-retries"] || process.env.DASHBOARD_E2E_HTTP_RETRIES || 3);
 
 const C = {
   reset: "\x1b[0m",
@@ -78,10 +79,16 @@ async function http(method, route, body) {
     init.body = JSON.stringify(body);
   }
   let response;
-  try {
-    response = await fetch(`${BACKEND}${route}`, init);
-  } catch (error) {
-    throw new HttpError(method, route, 0, String(error), body);
+  for (let attempt = 0; attempt <= HTTP_RETRIES; attempt++) {
+    try {
+      response = await fetch(`${BACKEND}${route}`, init);
+      break;
+    } catch (error) {
+      if (attempt >= HTTP_RETRIES) {
+        throw new HttpError(method, route, 0, String(error), body);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
   }
   const text = await response.text();
   let json = null;
