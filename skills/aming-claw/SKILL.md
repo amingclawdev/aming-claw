@@ -5,6 +5,20 @@ description: Use when working in the Aming Claw repo or any governance, dashboar
 
 # Aming Claw
 
+## Capabilities
+
+Use Aming Claw as a local graph-first governance assistant. In a fresh session,
+tell the user you can help with:
+
+- Diagnose project governance state: runtime, ServiceManager, version, active snapshot, graph stale/current, pending scope reconcile, operations queue, semantic queue, and open backlog.
+- Explore graph structure: layers, subsystems, features, hierarchy, node files, function indexes, neighbors, edge evidence, fan-in/fan-out, quality flags, orphan/low-relation signals, and doc/test coverage.
+- Locate code precisely: resolve file paths to nodes, search module/title/file/function metadata, inspect `function_lines`, and fetch bounded file excerpts only after graph lookup.
+- Rank PR opportunities: use graph evidence to identify high fan-out nodes, missing tests/docs, suspicious dependencies, semantic drift, review debt, and candidate refactor/test/doc issues.
+- Generate evidence-backed backlog rows: include node ids, primary files, related functions, graph metrics, neighbors, risk, acceptance criteria, target files, and test files.
+- Guide dashboard collaboration: use browser-use to inspect Projects, Graph tree, Inspector, Relations, Functions, Operations Queue, Review Queue, and Backlog as the same shared control plane the user sees.
+- Run targeted semantic enrichment and review when requested: explain missing/current/hash-unverified/pending-review states, queue/cancel/retry semantics, and the difference between AI-proposed memory and user-approved memory.
+- Drive advanced chain/dev/test/qa workflows only when explicitly needed; MVP work can stay local with graph, backlog, tests, and dashboard checks.
+
 ## Operating Contract
 
 Treat the active graph as the project map and the backlog as the work ledger. Before editing code, docs, config, dashboard assets, or runtime state, establish current graph/runtime status, identify the owning nodes/modules, and record the work item.
@@ -16,9 +30,32 @@ For dashboard/graph E2E work, update repo-owned fixture artifacts first and mate
 1. Confirm the workspace root and project id, normally `aming-claw`.
 2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status` when available.
 3. Check graph state: `graph_status` and `graph_operations_queue`.
-4. Run graph-first discovery before implementation. See [graph-first.md](references/graph-first.md).
-5. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
-6. Inspect files only after graph discovery identifies likely owners and reusable modules.
+4. Call `graph_query` with `tool=query_schema` to discover the live query contract.
+5. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
+6. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
+7. Inspect files only after graph discovery identifies likely owners and reusable modules.
+
+## Visual AI Collaboration
+
+Aming Claw dashboard is the shared cockpit for the user, AI session, and
+governance system. When browser-use is available, open the dashboard to align
+with what the user sees.
+
+- Browser-use may navigate the graph tree, node inspector, Relations, Functions, Operations Queue, Review Queue, Projects, and Backlog.
+- Cross-check visible dashboard state with MCP/Graph API results before drawing conclusions or recommending actions.
+- Use dashboard state to explain graph health, stale/current state, semantic status, pending jobs, review proposals, and backlog/workflow state.
+- Dashboard `vscode://file/...` links are for the human editor. Browser-use does not control VS Code directly.
+- For AI-side code inspection, use graph `function_lines`, `get_file_excerpt`, and workspace tools.
+- For governance actions, use MCP/Graph API. For code edits, use Codex workspace tools after the user has approved the work.
+
+Recommended visual workflow:
+
+1. Open dashboard and select the project.
+2. Verify runtime, graph, operations queue, and semantic/review state.
+3. Inspect candidate nodes or edges in the graph.
+4. Use graph-native queries for precise node, edge, function, and file context.
+5. Use bounded file excerpts or workspace reads only for the narrowed target.
+6. File/update backlog before mutation, then implement and verify.
 
 ## Local Plugin Launcher
 

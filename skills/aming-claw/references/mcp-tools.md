@@ -47,7 +47,15 @@ backlog of record (and `docs/dev/` is gitignored, so they're not committed).
 
 - `graph_status`: active snapshot, graph stale state, pending scope reconcile.
 - `graph_operations_queue`: dashboard-ready operation rows and semantic queue status.
-- `graph_query`: audited graph discovery. Use `search_semantic`, `search_docs`, `get_node`, `get_neighbors`, and `get_file_excerpt`.
+- `graph_query`: audited graph discovery. Start with `query_schema`, then use graph-native tools before filesystem scans:
+  - `find_node_by_path`: resolve a path to owning nodes.
+  - `search_structure`: search node id/title/kind/files/metadata/functions.
+  - `function_index`: search `metadata.functions` and `metadata.function_lines`.
+  - `degree_summary`: exact fan-in/fan-out and edge-type breakdown for a node.
+  - `high_degree_nodes`: rank high fan-in/fan-out candidates.
+  - `get_neighbors`: structural neighbors; pass `include_edge_semantic=true` for semantic edge projection payloads.
+  - `search_semantic`: node semantics, node metadata, and current edge semantic projection.
+  - `search_docs`, `get_node`, and `get_file_excerpt`: docs, exact node fetches, and bounded code excerpts.
 - `graph_pending_scope_queue`: queue/update pending scope reconcile when HEAD and active graph diverge.
 
 Example:
@@ -55,8 +63,17 @@ Example:
 ```json
 {
   "project_id": "aming-claw",
-  "tool": "search_docs",
-  "args": {"query": "manual fix graph-first", "limit": 5}
+  "tool": "query_schema"
+}
+```
+
+```json
+{
+  "project_id": "aming-claw",
+  "tool": "search_structure",
+  "args": {"query": "language adapter", "limit": 10},
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
 }
 ```
 

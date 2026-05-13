@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import posixpath
 import subprocess
 import sys
 import urllib.parse
@@ -268,7 +269,7 @@ TOOLS: list[dict] = [
                 "project_id": {"type": "string"},
                 "tool": {
                     "type": "string",
-                    "description": "Graph query tool, e.g. search_semantic, get_node, get_neighbors, search_docs, get_file_excerpt.",
+                    "description": "Graph query tool, e.g. query_schema, find_node_by_path, search_structure, function_index, degree_summary, high_degree_nodes, search_semantic, get_node, get_neighbors, search_docs, get_file_excerpt.",
                 },
                 "args": {"type": "object"},
                 "snapshot_id": {"type": "string"},
@@ -815,7 +816,7 @@ class ToolDispatcher:
             missing_error = "start_manager_script_missing"
         else:
             script_name = "start-manager.sh"
-            script = os.path.join(self._workspace, "scripts", script_name)
+            script = posixpath.join(str(self._workspace).replace("\\", "/").rstrip("/"), "scripts", script_name)
             cmd = [
                 "bash",
                 script,

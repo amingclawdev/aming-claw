@@ -7,10 +7,16 @@ Use the active graph before inventing modules, moving files, or deciding ownersh
 1. Call `graph_status` for the active snapshot and graph stale state.
 2. Call `graph_operations_queue` for pending scope reconcile, semantic jobs, review queue, and drift.
 3. Use `graph_query` before editing:
-   - `search_semantic` for concepts such as `dashboard semantic drift`, `MCP host ops`, or `language adapter`.
+   - `query_schema` first, so the session learns the live tool list, valid `query_source`, and valid `query_purpose` values.
+   - `find_node_by_path` to resolve a file path to graph node ids.
+   - `search_structure` for module/title/file/function lookup when semantic payload is missing.
+   - `function_index` to locate functions and line ranges from `metadata.function_lines`.
+   - `degree_summary` for exact fan-in/fan-out and edge-type breakdown for a node.
+   - `high_degree_nodes` to rank high fan-out/fan-in candidates for PR opportunity analysis.
+   - `search_semantic` for node semantics, node metadata, and current edge semantic projection payloads.
    - `search_docs` for canonical docs and SOPs.
    - `get_node` for known L4/L7 nodes.
-   - `get_neighbors` around the candidate owner node.
+   - `get_neighbors` around the candidate owner node; pass `include_edge_semantic=true` when edge semantic payloads matter.
    - `get_file_excerpt` for targeted snippets when available.
 4. Run `wf_impact` on candidate files before mutation.
 5. Then inspect files directly.
@@ -20,9 +26,29 @@ Use the active graph before inventing modules, moving files, or deciding ownersh
 ```json
 {
   "project_id": "aming-claw",
-  "tool": "search_semantic",
-  "args": {"query": "dashboard semantic drift operations queue", "limit": 10},
-  "query_purpose": "implementation_owner_discovery"
+  "tool": "query_schema",
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
+}
+```
+
+```json
+{
+  "project_id": "aming-claw",
+  "tool": "find_node_by_path",
+  "args": {"path": "agent/governance/graph_query_trace.py"},
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
+}
+```
+
+```json
+{
+  "project_id": "aming-claw",
+  "tool": "function_index",
+  "args": {"query": "traced_query", "limit": 5},
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
 }
 ```
 
@@ -30,8 +56,19 @@ Use the active graph before inventing modules, moving files, or deciding ownersh
 {
   "project_id": "aming-claw",
   "tool": "get_neighbors",
-  "args": {"node_id": "L7.106", "depth": 1},
-  "query_purpose": "reuse_existing_reconcile_modules"
+  "args": {"node_id": "L7.106", "direction": "both", "include_edge_semantic": true},
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
+}
+```
+
+```json
+{
+  "project_id": "aming-claw",
+  "tool": "high_degree_nodes",
+  "args": {"metric": "fan_out", "edge_types": ["depends_on"], "limit": 20},
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
 }
 ```
 

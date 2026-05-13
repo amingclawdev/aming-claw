@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import graph_events
 from . import graph_snapshot_store as store
 from . import reconcile_feedback
 
@@ -74,6 +75,35 @@ QUERY_PURPOSES = {
     "user_feedback",
     "backlog_filing",
     "api_debug",
+}
+
+GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
+    "list_layers": {"required_args": [], "summary": "Layer counts for the active graph snapshot."},
+    "list_subsystems": {"required_args": [], "summary": "List L3 subsystem/container nodes."},
+    "list_features": {"required_args": [], "summary": "List feature/module nodes, usually L7."},
+    "get_node": {"required_args": ["node_id"], "summary": "Fetch one graph node by id."},
+    "get_neighbors": {
+        "required_args": ["node_id"],
+        "summary": "Fetch structural neighbors; pass include_edge_semantic=true for projection payloads.",
+    },
+    "find_node_by_path": {"required_args": ["path"], "summary": "Resolve a file path to graph node ids."},
+    "search_structure": {"required_args": ["query"], "summary": "Search structural node metadata, files, and functions."},
+    "degree_summary": {"required_args": ["node_id"], "summary": "Return fan-in/fan-out counts independent of neighbor limit."},
+    "high_degree_nodes": {"required_args": [], "summary": "Rank nodes by fan_in, fan_out, or total degree."},
+    "function_index": {"required_args": ["query"], "summary": "Search metadata.functions and function_lines."},
+    "search_semantic": {
+        "required_args": ["query"],
+        "summary": "Search node semantics, node metadata, and current edge semantic projection.",
+    },
+    "search_docs": {"required_args": ["query"], "summary": "Search graph-bound documentation files."},
+    "get_docs": {"required_args": ["node_id"], "summary": "List docs bound to a node."},
+    "get_tests": {"required_args": ["node_id"], "summary": "List tests bound to a node."},
+    "get_config": {"required_args": ["node_id"], "summary": "List config files bound to a node."},
+    "list_unresolved_feedback": {"required_args": [], "summary": "List unresolved graph feedback rows."},
+    "list_low_health_nodes": {"required_args": [], "summary": "List structurally suspicious low-health nodes."},
+    "get_file_excerpt": {"required_args": ["path"], "summary": "Read a bounded excerpt from a project file."},
+    "query_schema": {"required_args": [], "summary": "Discover graph query tools, sources, and purposes."},
+    "list_tools": {"required_args": [], "summary": "Alias for query_schema."},
 }
 
 DEFAULT_BUDGETS: dict[str, dict[str, int]] = {
@@ -169,6 +199,105 @@ def _string_list(raw: Any) -> list[str]:
     return result
 
 
+def _norm_path(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.strip("/")
+
+
+def _flatten_text(value: Any, *, max_items: int = 400) -> list[str]:
+    out: list[str] = []
+
+    def _walk(item: Any) -> None:
+        if len(out) >= max_items or item is None:
+            return
+        if isinstance(item, dict):
+            for key, val in item.items():
+                _walk(key)
+                _walk(val)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for val in item:
+                _walk(val)
+            return
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+
+    _walk(value)
+    return out
+
+
+def _short_symbol_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if "::" in text:
+        text = text.rsplit("::", 1)[-1]
+    return text
+
+
+def _node_files_with_roles(node: dict[str, Any]) -> list[dict[str, str]]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    role_values = [
+        ("primary", node.get("primary_files")),
+        ("secondary", node.get("secondary_files")),
+        ("test", node.get("test_files")),
+        ("config", metadata.get("config_files")),
+        ("artifact", metadata.get("artifact_files")),
+    ]
+    files: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for role, raw in role_values:
+        for path in _string_list(raw):
+            norm = _norm_path(path)
+            key = (role, norm)
+            if norm and key not in seen:
+                files.append({"role": role, "path": norm})
+                seen.add(key)
+    return files
+
+
+def _node_haystack(node: dict[str, Any], semantic: dict[str, Any] | None = None) -> str:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    chunks: list[str] = [
+        str(node.get("node_id") or ""),
+        str(node.get("layer") or ""),
+        str(node.get("title") or ""),
+        str(node.get("kind") or ""),
+    ]
+    chunks.extend(item["path"] for item in _node_files_with_roles(node))
+    chunks.extend(_flatten_text(metadata))
+    if semantic:
+        chunks.extend(_flatten_text(semantic))
+    return " ".join(chunks).lower()
+
+
+def _edge_id(src: str, dst: str, edge_type: str) -> str:
+    return f"{src}->{dst}:{edge_type}"
+
+
+def _projection_edge_semantics(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+) -> dict[str, dict[str, Any]]:
+    try:
+        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+    except Exception:
+        return {}
+    payload = projection.get("projection") if isinstance(projection.get("projection"), dict) else {}
+    edge_semantics = payload.get("edge_semantics") if isinstance(payload.get("edge_semantics"), dict) else {}
+    return {
+        str(edge_id): entry
+        for edge_id, entry in edge_semantics.items()
+        if isinstance(entry, dict)
+    }
+
+
+def _edge_haystack(edge_entry: dict[str, Any]) -> str:
+    return " ".join(_flatten_text(edge_entry)).lower()
+
+
 def _hash(data: Any) -> str:
     return "sha256:" + hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
 
@@ -180,14 +309,16 @@ def _trace_id() -> str:
 def _normalize_source(value: str) -> str:
     source = str(value or "").strip().lower().replace("-", "_")
     if source not in QUERY_SOURCES:
-        raise ValueError(f"invalid query_source: {value!r}")
+        allowed = ", ".join(sorted(QUERY_SOURCES))
+        raise ValueError(f"invalid query_source: {value!r}; allowed: {allowed}")
     return source
 
 
 def _normalize_purpose(value: str) -> str:
     purpose = str(value or "").strip().lower().replace("-", "_")
     if purpose not in QUERY_PURPOSES:
-        raise ValueError(f"invalid query_purpose: {value!r}")
+        allowed = ", ".join(sorted(QUERY_PURPOSES))
+        raise ValueError(f"invalid query_purpose: {value!r}; allowed: {allowed}")
     return purpose
 
 
@@ -623,16 +754,20 @@ def _query_get_neighbors(conn: sqlite3.Connection, project_id: str, snapshot_id:
         """,
         (*params, limit),
     ).fetchall()
-    edges = [
-        {
+    include_edge_semantic = bool(args.get("include_edge_semantic") or args.get("include_semantic_edges"))
+    edge_semantics = _projection_edge_semantics(conn, project_id, snapshot_id) if include_edge_semantic else {}
+    edges = []
+    for row in rows:
+        edge = {
             "src": row["src"],
             "dst": row["dst"],
             "edge_type": row["edge_type"],
             "direction": row["direction"],
             "evidence": _decode(row["evidence_json"], {}),
         }
-        for row in rows
-    ]
+        if include_edge_semantic:
+            edge["edge_semantic"] = edge_semantics.get(_edge_id(row["src"], row["dst"], row["edge_type"]), {})
+        edges.append(edge)
     neighbor_ids = sorted({
         edge["src"] if edge["src"] != node_id else edge["dst"]
         for edge in edges
@@ -648,13 +783,245 @@ def _query_get_neighbors(conn: sqlite3.Connection, project_id: str, snapshot_id:
     return {"node_id": node_id, "edges": edges, "nodes": nodes, "count": len(edges)}
 
 
+def _query_find_node_by_path(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    path = _norm_path(args.get("path") or args.get("file") or args.get("rel_path"))
+    if not path:
+        raise ValueError("path is required")
+    match_mode = str(args.get("match") or "exact").strip().lower()
+    limit = max(1, min(int(args.get("limit") or 50), 200))
+    compact = bool(args.get("compact", True))
+    rows = conn.execute(
+        """
+        SELECT node_id, layer, title, kind, primary_files_json,
+               secondary_files_json, test_files_json, metadata_json
+        FROM graph_nodes_index
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY layer, node_id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        node = _node_from_row(row)
+        matched = []
+        for item in _node_files_with_roles(node):
+            item_path = _norm_path(item.get("path"))
+            ok = item_path == path if match_mode == "exact" else path in item_path
+            if ok:
+                matched.append(item)
+        if not matched:
+            continue
+        matches.append({
+            "node": _compact_node(node) if compact else node,
+            "matched_files": matched,
+        })
+        if len(matches) >= limit:
+            break
+    return {"ok": True, "path": path, "matches": matches, "count": len(matches)}
+
+
+def _query_search_structure(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    query = str(args.get("query") or args.get("q") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = max(1, min(int(args.get("limit") or 50), 200))
+    layer = str(args.get("layer") or "").strip()
+    compact = bool(args.get("compact", True))
+    needle = query.lower()
+    params: list[Any] = [project_id, snapshot_id]
+    layer_sql = ""
+    if layer:
+        layer_sql = "AND layer = ?"
+        params.append(layer)
+    rows = conn.execute(
+        f"""
+        SELECT node_id, layer, title, kind, primary_files_json,
+               secondary_files_json, test_files_json, metadata_json
+        FROM graph_nodes_index
+        WHERE project_id = ? AND snapshot_id = ? {layer_sql}
+        ORDER BY layer, node_id
+        """,
+        params,
+    ).fetchall()
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        node = _node_from_row(row)
+        if needle not in _node_haystack(node):
+            continue
+        matches.append({"result_type": "node", "node": _compact_node(node) if compact else node})
+        if len(matches) >= limit:
+            break
+    return {"ok": True, "query": query, "matches": matches, "count": len(matches)}
+
+
+def _query_degree_summary(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    node_id = str(args.get("node_id") or args.get("id") or "").strip()
+    if not node_id:
+        raise ValueError("node_id is required")
+    edge_types = set(_string_list(args.get("edge_types") or args.get("edge_type")))
+    rows = conn.execute(
+        """
+        SELECT src, dst, edge_type
+        FROM graph_edges_index
+        WHERE project_id = ? AND snapshot_id = ? AND (src = ? OR dst = ?)
+        """,
+        (project_id, snapshot_id, node_id, node_id),
+    ).fetchall()
+    fan_in = 0
+    fan_out = 0
+    by_type: dict[str, dict[str, int]] = {}
+    for row in rows:
+        edge_type = str(row["edge_type"] or "")
+        if edge_types and edge_type not in edge_types:
+            continue
+        bucket = by_type.setdefault(edge_type, {"in": 0, "out": 0, "total": 0})
+        if row["dst"] == node_id:
+            fan_in += 1
+            bucket["in"] += 1
+        if row["src"] == node_id:
+            fan_out += 1
+            bucket["out"] += 1
+        bucket["total"] = bucket["in"] + bucket["out"]
+    node = _get_node_row(conn, project_id, snapshot_id, node_id)
+    return {
+        "ok": bool(node),
+        "node_id": node_id,
+        "node": _compact_node(node) if node else None,
+        "fan_in": fan_in,
+        "fan_out": fan_out,
+        "total": fan_in + fan_out,
+        "by_type": dict(sorted(by_type.items())),
+        "count": fan_in + fan_out,
+    }
+
+
+def _query_high_degree_nodes(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    limit = max(1, min(int(args.get("limit") or 25), 200))
+    metric = str(args.get("metric") or "fan_out").strip().lower()
+    if metric not in {"fan_in", "fan_out", "total"}:
+        raise ValueError("metric must be one of fan_in, fan_out, total")
+    layer = str(args.get("layer") or "").strip()
+    edge_types = set(_string_list(args.get("edge_types") or args.get("edge_type")))
+    exclude_edge_types = set(_string_list(args.get("exclude_edge_types")))
+    nodes = {
+        row["node_id"]: _node_from_row(row)
+        for row in conn.execute(
+            """
+            SELECT node_id, layer, title, kind, primary_files_json,
+                   secondary_files_json, test_files_json, metadata_json
+            FROM graph_nodes_index
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+    }
+    stats: dict[str, dict[str, Any]] = {
+        node_id: {"fan_in": 0, "fan_out": 0, "by_type": {}}
+        for node_id in nodes
+        if not layer or nodes[node_id].get("layer") == layer
+    }
+    for row in conn.execute(
+        """
+        SELECT src, dst, edge_type
+        FROM graph_edges_index
+        WHERE project_id = ? AND snapshot_id = ?
+        """,
+        (project_id, snapshot_id),
+    ).fetchall():
+        edge_type = str(row["edge_type"] or "")
+        if edge_types and edge_type not in edge_types:
+            continue
+        if edge_type in exclude_edge_types:
+            continue
+        src = str(row["src"] or "")
+        dst = str(row["dst"] or "")
+        if src in stats:
+            stats[src]["fan_out"] += 1
+            stats[src].setdefault("by_type", {}).setdefault(edge_type, {"in": 0, "out": 0})
+            stats[src]["by_type"][edge_type]["out"] += 1
+        if dst in stats:
+            stats[dst]["fan_in"] += 1
+            stats[dst].setdefault("by_type", {}).setdefault(edge_type, {"in": 0, "out": 0})
+            stats[dst]["by_type"][edge_type]["in"] += 1
+    items: list[dict[str, Any]] = []
+    for node_id, stat in stats.items():
+        total = int(stat["fan_in"]) + int(stat["fan_out"])
+        items.append({
+            "node": _compact_node(nodes[node_id]),
+            "fan_in": int(stat["fan_in"]),
+            "fan_out": int(stat["fan_out"]),
+            "total": total,
+            "by_type": stat.get("by_type", {}),
+        })
+    items.sort(key=lambda item: (-int(item[metric]), item["node"]["node_id"]))
+    return {
+        "ok": True,
+        "metric": metric,
+        "nodes": items[:limit],
+        "count": len(items[:limit]),
+        "total_ranked": len(items),
+    }
+
+
+def _query_function_index(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    query = str(args.get("query") or args.get("q") or "").strip()
+    node_id_filter = str(args.get("node_id") or args.get("id") or "").strip()
+    if not query and not node_id_filter:
+        raise ValueError("query or node_id is required")
+    limit = max(1, min(int(args.get("limit") or 50), 300))
+    needle = query.lower()
+    rows = conn.execute(
+        """
+        SELECT node_id, layer, title, kind, primary_files_json,
+               secondary_files_json, test_files_json, metadata_json
+        FROM graph_nodes_index
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY layer, node_id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        node = _node_from_row(row)
+        if node_id_filter and node["node_id"] != node_id_filter:
+            continue
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        functions = _string_list(metadata.get("functions"))
+        function_lines = metadata.get("function_lines") if isinstance(metadata.get("function_lines"), dict) else {}
+        for raw_name in functions or list(function_lines):
+            short_name = _short_symbol_name(raw_name)
+            haystack = f"{raw_name} {short_name} {node.get('title', '')} {node.get('node_id', '')}".lower()
+            if needle and needle not in haystack:
+                continue
+            line_pair = function_lines.get(short_name) or function_lines.get(raw_name) or []
+            line_start = int(line_pair[0]) if isinstance(line_pair, list) and line_pair else 0
+            line_end = int(line_pair[1]) if isinstance(line_pair, list) and len(line_pair) > 1 else line_start
+            matches.append({
+                "node": _compact_node(node),
+                "function": raw_name,
+                "short_name": short_name,
+                "line_start": line_start,
+                "line_end": line_end,
+                "primary_file": (_string_list(node.get("primary_files")) or [""])[0],
+            })
+            if len(matches) >= limit:
+                return {"ok": True, "query": query, "matches": matches, "count": len(matches)}
+    return {"ok": True, "query": query, "matches": matches, "count": len(matches)}
+
+
 def _query_search_semantic(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
     query = str(args.get("query") or args.get("q") or "").strip()
     if not query:
         raise ValueError("query is required")
     limit = max(1, min(int(args.get("limit") or 20), 100))
+    scope = str(args.get("scope") or args.get("target") or "all").strip().lower()
+    if scope not in {"all", "node", "nodes", "edge", "edges"}:
+        raise ValueError("scope must be one of all, nodes, edges")
     needle = query.lower()
-    if _table_exists(conn, "graph_semantic_nodes"):
+    include_nodes = scope in {"all", "node", "nodes"}
+    include_edges = scope in {"all", "edge", "edges"}
+    matches: list[dict[str, Any]] = []
+    if include_nodes and _table_exists(conn, "graph_semantic_nodes"):
         rows = conn.execute(
             """
             SELECT n.node_id, n.layer, n.title, n.kind, n.primary_files_json,
@@ -669,7 +1036,7 @@ def _query_search_semantic(conn: sqlite3.Connection, project_id: str, snapshot_i
             """,
             (project_id, snapshot_id),
         ).fetchall()
-    else:
+    elif include_nodes:
         rows = conn.execute(
             """
             SELECT node_id, layer, title, kind, primary_files_json,
@@ -679,35 +1046,44 @@ def _query_search_semantic(conn: sqlite3.Connection, project_id: str, snapshot_i
             """,
             (project_id, snapshot_id),
         ).fetchall()
-    matches: list[dict[str, Any]] = []
-    for row in rows:
-        node = _node_from_row(row)
-        semantic = _decode(row["semantic_json"], {}) if "semantic_json" in row.keys() else {}
-        haystack = " ".join([
-            node.get("node_id", ""),
-            node.get("title", ""),
-            str(semantic.get("feature_name") or ""),
-            str(semantic.get("domain_label") or ""),
-            str(semantic.get("intent") or ""),
-            str(semantic.get("semantic_summary") or ""),
-        ]).lower()
-        if needle not in haystack:
-            continue
-        matches.append({
-            "node": node,
-            "semantic": {
-                "status": row["status"] if "status" in row.keys() else "",
-                "feature_hash": row["feature_hash"] if "feature_hash" in row.keys() else "",
-                "feature_name": semantic.get("feature_name", ""),
-                "domain_label": semantic.get("domain_label", ""),
-                "intent": semantic.get("intent", ""),
-                "semantic_summary": semantic.get("semantic_summary", ""),
-                "quality_flags": semantic.get("quality_flags", []),
-            },
-        })
-        if len(matches) >= limit:
-            break
-    return {"query": query, "matches": matches, "count": len(matches)}
+    else:
+        rows = []
+    if include_nodes:
+        for row in rows:
+            node = _node_from_row(row)
+            semantic = _decode(row["semantic_json"], {}) if "semantic_json" in row.keys() else {}
+            if needle not in _node_haystack(node, semantic):
+                continue
+            matches.append({
+                "result_type": "node",
+                "node": node,
+                "semantic": {
+                    "status": row["status"] if "status" in row.keys() else "",
+                    "feature_hash": row["feature_hash"] if "feature_hash" in row.keys() else "",
+                    "feature_name": semantic.get("feature_name", ""),
+                    "domain_label": semantic.get("domain_label", ""),
+                    "intent": semantic.get("intent", ""),
+                    "semantic_summary": semantic.get("semantic_summary", ""),
+                    "quality_flags": semantic.get("quality_flags", []),
+                },
+            })
+            if len(matches) >= limit:
+                break
+    if include_edges and len(matches) < limit:
+        for edge_id, entry in _projection_edge_semantics(conn, project_id, snapshot_id).items():
+            if needle not in _edge_haystack({"edge_id": edge_id, **entry}):
+                continue
+            matches.append({
+                "result_type": "edge",
+                "edge_id": edge_id,
+                "edge": entry.get("edge") if isinstance(entry.get("edge"), dict) else {},
+                "semantic": entry.get("semantic") if isinstance(entry.get("semantic"), dict) else {},
+                "validity": entry.get("validity") if isinstance(entry.get("validity"), dict) else {},
+                "source_event": entry.get("source_event") if isinstance(entry.get("source_event"), dict) else {},
+            })
+            if len(matches) >= limit:
+                break
+    return {"query": query, "scope": scope, "matches": matches, "count": len(matches)}
 
 
 def _query_search_docs(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any], project_root: str | Path | None) -> dict[str, Any]:
@@ -854,6 +1230,17 @@ def _query_file_excerpt(args: dict[str, Any], project_root: str | Path | None) -
     )
 
 
+def _query_schema() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tools": GRAPH_QUERY_TOOLS,
+        "tool_names": sorted(GRAPH_QUERY_TOOLS),
+        "query_sources": sorted(QUERY_SOURCES),
+        "query_purposes": sorted(QUERY_PURPOSES),
+        "count": len(GRAPH_QUERY_TOOLS),
+    }
+
+
 def run_tool(
     conn: sqlite3.Connection,
     project_id: str,
@@ -876,6 +1263,16 @@ def run_tool(
         return _query_get_node(conn, project_id, snapshot_id, args)
     if tool == "get_neighbors":
         return _query_get_neighbors(conn, project_id, snapshot_id, args)
+    if tool == "find_node_by_path":
+        return _query_find_node_by_path(conn, project_id, snapshot_id, args)
+    if tool == "search_structure":
+        return _query_search_structure(conn, project_id, snapshot_id, args)
+    if tool == "degree_summary":
+        return _query_degree_summary(conn, project_id, snapshot_id, args)
+    if tool == "high_degree_nodes":
+        return _query_high_degree_nodes(conn, project_id, snapshot_id, args)
+    if tool == "function_index":
+        return _query_function_index(conn, project_id, snapshot_id, args)
     if tool == "search_semantic":
         return _query_search_semantic(conn, project_id, snapshot_id, args)
     if tool == "search_docs":
@@ -892,7 +1289,10 @@ def run_tool(
         return _query_list_low_health_nodes(conn, project_id, snapshot_id, args)
     if tool == "get_file_excerpt":
         return _query_file_excerpt(args, project_root)
-    raise ValueError(f"unsupported graph query tool: {tool}")
+    if tool in {"query_schema", "list_tools"}:
+        return _query_schema()
+    allowed = ", ".join(sorted(GRAPH_QUERY_TOOLS))
+    raise ValueError(f"unsupported graph query tool: {tool}; allowed: {allowed}")
 
 
 def traced_query(

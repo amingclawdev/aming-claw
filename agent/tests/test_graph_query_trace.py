@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import graph_snapshot_store as store
 from agent.governance.db import _ensure_schema
@@ -19,6 +20,7 @@ def conn(tmp_path, monkeypatch):
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     _ensure_schema(c)
+    graph_events.ensure_schema(c)
     store.ensure_schema(c)
     graph_query_trace.ensure_schema(c)
     yield c
@@ -57,6 +59,14 @@ def _seed_snapshot(conn, tmp_path):
                     "metadata": {
                         "hierarchy_parent": "L3.1",
                         "function_count": 3,
+                        "functions": [
+                            "agent.governance.server::serve",
+                            "agent.governance.server::Server.start",
+                        ],
+                        "function_lines": {
+                            "serve": [1, 2],
+                            "Server.start": [10, 12],
+                        },
                         "config_files": [".aming-claw.yaml"],
                     },
                 },
@@ -100,6 +110,55 @@ def _seed_snapshot(conn, tmp_path):
     store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
     conn.commit()
     return snapshot["snapshot_id"], project_root
+
+
+def _seed_edge_projection(conn, snapshot_id):
+    projection = {
+        "node_semantics": {},
+        "edge_semantics": {
+            "L7.1->L7.2:depends_on": {
+                "edge_id": "L7.1->L7.2:depends_on",
+                "edge": {
+                    "src": "L7.1",
+                    "dst": "L7.2",
+                    "type": "depends_on",
+                    "edge_type": "depends_on",
+                },
+                "semantic": {
+                    "semantic_label": "server_helper_cache_dependency",
+                    "relation_purpose": "Governance server dispatch invokes the helper cache.",
+                    "risk": {"level": "medium", "reason": "helper cache is a hidden dependency"},
+                },
+                "validity": {"status": "edge_semantic_current", "valid": True},
+                "source_event": {"event_id": "ge-edge-1", "event_type": "edge_semantic_enriched"},
+            }
+        },
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_projections
+          (project_id, snapshot_id, projection_id, base_commit, branch_ref,
+           projection_rule_version, event_watermark, status, projection_json,
+           health_json, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            PID,
+            snapshot_id,
+            "semproj-test",
+            "abc1234",
+            "main",
+            "test",
+            1,
+            "current",
+            json.dumps(projection),
+            json.dumps({"edge_semantic_current_count": 1}),
+            "test",
+            "2026-05-13T00:00:00Z",
+            "2026-05-13T00:00:00Z",
+        ),
+    )
+    conn.commit()
 
 
 def test_trace_records_queries_and_budget_usage(conn, tmp_path):
@@ -159,6 +218,133 @@ def test_query_tools_reuse_graph_files_and_search_docs(conn, tmp_path):
     assert trace["query_source"] == "dashboard"
     assert trace["query_purpose"] == "inspect_node"
     assert trace["usage"]["file_excerpt_chars"] > 0
+
+
+def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+
+    path_result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="find_node_by_path",
+        args={"path": "agent/governance/server.py"},
+        project_root=project_root,
+    )
+    assert path_result["ok"] is True
+    assert path_result["result"]["matches"][0]["node"]["node_id"] == "L7.1"
+    assert path_result["result"]["matches"][0]["matched_files"][0]["role"] == "primary"
+
+    structure = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="search_structure",
+        args={"query": "Server.start"},
+        project_root=project_root,
+    )
+    assert structure["result"]["matches"][0]["node"]["node_id"] == "L7.1"
+
+    functions = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="function_index",
+        args={"query": "serve"},
+        project_root=project_root,
+    )
+    assert functions["result"]["matches"][0]["short_name"] == "serve"
+    assert functions["result"]["matches"][0]["line_start"] == 1
+
+    degree = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="degree_summary",
+        args={"node_id": "L7.1"},
+        project_root=project_root,
+    )
+    assert degree["result"]["fan_in"] == 1
+    assert degree["result"]["fan_out"] == 1
+    assert degree["result"]["by_type"]["depends_on"]["out"] == 1
+
+    high_degree = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="high_degree_nodes",
+        args={"metric": "fan_out", "edge_types": ["depends_on"]},
+        project_root=project_root,
+    )
+    assert high_degree["result"]["nodes"][0]["node"]["node_id"] == "L7.1"
+
+
+def test_graph_native_queries_search_edge_projection_and_neighbor_semantics(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    _seed_edge_projection(conn, snapshot_id)
+
+    semantic = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="search_semantic",
+        args={"query": "helper cache", "scope": "edges"},
+        project_root=project_root,
+    )
+    assert semantic["result"]["matches"][0]["result_type"] == "edge"
+    assert semantic["result"]["matches"][0]["edge_id"] == "L7.1->L7.2:depends_on"
+    assert semantic["result"]["matches"][0]["validity"]["status"] == "edge_semantic_current"
+
+    neighbors = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="get_neighbors",
+        args={"node_id": "L7.1", "direction": "out", "include_edge_semantic": True},
+        project_root=project_root,
+    )
+    edge = neighbors["result"]["edges"][0]
+    assert edge["edge_semantic"]["semantic"]["semantic_label"] == "server_helper_cache_dependency"
+
+
+def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="query_schema",
+        project_root=project_root,
+    )
+
+    assert result["ok"] is True
+    assert "find_node_by_path" in result["result"]["tool_names"]
+    assert "observer" in result["result"]["query_sources"]
+    assert "prompt_context_build" in result["result"]["query_purposes"]
 
 
 def test_budget_blocks_queries_after_limit(conn, tmp_path):

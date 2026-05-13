@@ -2747,6 +2747,66 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
     assert finished["trace"]["status"] == "complete"
 
 
+def test_graph_governance_query_api_exposes_graph_native_discovery(conn):
+    graph = _graph()
+    graph["deps_graph"]["nodes"][0]["metadata"]["functions"] = [
+        "agent.governance.server::serve"
+    ]
+    graph["deps_graph"]["nodes"][0]["metadata"]["function_lines"] = {"serve": [5, 9]}
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-query-native-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    conn.commit()
+
+    schema = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"snapshot_id": "active", "tool": "query_schema"},
+        )
+    )
+    assert "find_node_by_path" in schema["result"]["tool_names"]
+
+    by_path = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "find_node_by_path",
+                "args": {"path": "agent/governance/server.py"},
+            },
+        )
+    )
+    assert by_path["result"]["matches"][0]["node"]["node_id"] == "L7.1"
+
+    functions = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "function_index",
+                "args": {"query": "serve"},
+            },
+        )
+    )
+    assert functions["result"]["matches"][0]["line_start"] == 5
+
+
 def test_graph_governance_queue_finalize_and_abandon_api(conn):
     old = store.create_graph_snapshot(
         conn,
