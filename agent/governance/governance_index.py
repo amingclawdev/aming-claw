@@ -25,6 +25,7 @@ from agent.governance.graph_snapshot_store import (
     ensure_schema as ensure_graph_snapshot_schema,
     get_active_graph_snapshot,
 )
+from agent.governance.governance_hints import apply_binding_hints_to_graph_nodes
 from agent.governance.project_profile import ProjectProfile, discover_project_profile
 from agent.governance.reconcile_file_inventory import (
     build_file_inventory,
@@ -49,6 +50,16 @@ def _json(data: Any) -> str:
 def _hash_payload(payload: Any) -> str:
     data = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return sorted(_json_safe(item) for item in value)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -175,7 +186,7 @@ def _nodes_from_candidate_graph(candidate_graph: dict[str, Any] | None) -> list[
     if not isinstance(deps, dict):
         return []
     nodes = deps.get("nodes") or []
-    return [dict(node) for node in nodes if isinstance(node, dict)]
+    return [node for node in nodes if isinstance(node, dict)]
 
 
 def merge_feature_hashes_into_graph_nodes(
@@ -471,6 +482,17 @@ def build_governance_index(
         source_snapshot, source_nodes = load_active_snapshot_nodes(conn, project_id)
         index_scope = "active_snapshot" if source_snapshot else "no_graph"
 
+    if source_nodes:
+        governance_hint_bindings = apply_binding_hints_to_graph_nodes(root, source_nodes)
+    else:
+        governance_hint_bindings = {
+            "hint_count": 0,
+            "applied_count": 0,
+            "skipped_count": 0,
+            "applied": [],
+            "skipped": [],
+        }
+
     if file_inventory is None:
         file_inventory = build_file_inventory(
             project_root=str(root),
@@ -510,6 +532,7 @@ def build_governance_index(
         "symbol_count": symbol_index.get("symbol_count", 0),
         "doc_heading_count": doc_index.get("heading_count", 0),
         "feature_count": feature_index.get("feature_count", 0),
+        "governance_hint_bindings": governance_hint_bindings,
     })
 
     return {
@@ -522,9 +545,10 @@ def build_governance_index(
         "active_snapshot": dict(source_snapshot) if source_snapshot else {},
         "active_node_count": len(source_nodes),
         "index_scope": index_scope,
-        "profile": asdict(profile),
+        "profile": _json_safe(asdict(profile)),
         "file_inventory": file_inventory,
         "file_inventory_summary": summarize_file_inventory(file_inventory),
+        "governance_hint_bindings": governance_hint_bindings,
         "symbol_index": symbol_index,
         "doc_index": doc_index,
         "feature_index": feature_index,

@@ -239,3 +239,54 @@ def test_build_governance_index_can_use_candidate_graph_before_activation(conn, 
     assert rows["tests/test_service.py"]["attached_node_ids"] == ["L7.candidate"]
     assert rows["tests/test_service.py"]["attachment_role"] == "test"
     assert index["feature_index"]["features"][0]["node_id"] == "L7.candidate"
+
+
+def test_build_governance_index_attaches_orphan_doc_from_governance_hint(conn, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_project(project)
+    (project / "docs" / "orphan.md").write_text(
+        "<!-- governance-hint\n"
+        '{"attach_to_node":{"target_module":"src.demo_app.service","role":"doc"}}'
+        "\n-->\n# Orphan Service Notes\n",
+        encoding="utf-8",
+    )
+    candidate_graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.service",
+                    "layer": "L7",
+                    "title": "Demo Service",
+                    "kind": "feature",
+                    "primary": ["src/demo_app/service.py"],
+                    "secondary": [],
+                    "test": ["tests/test_service.py"],
+                    "metadata": {"module": "src.demo_app.service"},
+                }
+            ],
+            "edges": [],
+        }
+    }
+
+    index = build_governance_index(
+        conn,
+        PID,
+        project,
+        run_id="index-hint-test",
+        commit_sha="def5678",
+        candidate_graph=candidate_graph,
+        snapshot_id="full-def5678-hint",
+        snapshot_kind="full",
+    )
+
+    node = candidate_graph["deps_graph"]["nodes"][0]
+    assert node["secondary"] == ["docs/orphan.md"]
+    assert index["governance_hint_bindings"]["applied_count"] == 1
+    rows = {row["path"]: row for row in index["file_inventory"]}
+    assert rows["docs/orphan.md"]["scan_status"] == "secondary_attached"
+    assert rows["docs/orphan.md"]["graph_status"] == "attached"
+    assert rows["docs/orphan.md"]["attached_node_ids"] == ["L7.service"]
+    assert rows["docs/orphan.md"]["attachment_role"] == "doc"
+    feature = index["feature_index"]["features"][0]
+    assert any(ref["path"] == "docs/orphan.md" for ref in feature["doc_refs"])

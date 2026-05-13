@@ -3047,6 +3047,16 @@ def build_rebase_candidate_graph(
         1 for link in dependency_links
         if str(link.get("source") or "").split(".", 1)[0] != str(link.get("target") or "").split(".", 1)[0]
     )
+    try:
+        from agent.governance.governance_hints import apply_binding_hints_to_graph_nodes
+        governance_hint_bindings = apply_binding_hints_to_graph_nodes(project_root, out_nodes)
+    except Exception as exc:
+        governance_hint_bindings = {
+            "hint_count": 0,
+            "applied_count": 0,
+            "skipped_count": 0,
+            "error": str(exc),
+        }
 
     graph_payload = {
         "version": 1,
@@ -3103,6 +3113,7 @@ def build_rebase_candidate_graph(
             "cycle_suppressed_dependency_count": len(dependency_warnings),
             "dependency_warning_count": len(dependency_warnings),
             "dependency_warning_sample": dependency_warnings[:25],
+            "governance_hint_bindings": governance_hint_bindings,
         },
     }
     return graph_payload

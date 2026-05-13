@@ -931,7 +931,17 @@ def run_state_only_full_reconcile(
         file_inventory=file_inventory,
     )
     hash_metadata_merge = merge_feature_hashes_into_graph_nodes(candidate_graph, governance_index)
+    enriched_inventory = governance_index.get("file_inventory")
+    if isinstance(enriched_inventory, list):
+        file_inventory = _normalize_inventory_commit(
+            [row for row in enriched_inventory if isinstance(row, dict)],
+            commit_sha=commit,
+        )
+        notes["file_inventory_summary"] = governance_index.get("file_inventory_summary") or {}
+    notes["governance_hint_bindings"] = governance_index.get("governance_hint_bindings") or {}
     notes["governance_index_hash_metadata"] = hash_metadata_merge
+    nodes = _deps_graph_nodes(candidate_graph)
+    edges = _deps_graph_edges(candidate_graph)
     with sqlite_write_lock():
         snapshot = create_graph_snapshot(
             conn,
