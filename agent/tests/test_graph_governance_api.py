@@ -1119,8 +1119,27 @@ def test_edge_semantic_auto_enrich_ai_response_projects_current(conn, tmp_path, 
         "_require_graph_governance_operator",
         lambda _ctx, _conn, _action: {"role": "observer"},
     )
+    auto_ai_body = server._edge_semantic_ai_body(
+        {"options": {"auto_enrich": True}},
+        "sid",
+        auto_enrich=True,
+    )
+    assert auto_ai_body["semantic_use_ai"] is True
+    assert "semantic_use_ai" not in server._edge_semantic_ai_body(
+        {"semantic_mode": "auto"},
+        "sid",
+        auto_enrich=True,
+    )
+    assert server._edge_semantic_ai_body(
+        {"semantic_use_ai": False},
+        "sid",
+        auto_enrich=True,
+    )["semantic_use_ai"] is False
+
+    ai_body = {}
 
     def fake_ai_call(_project_id, _root, _body):
+        ai_body.update(_body)
         return lambda _stage, _payload: {
             "relation_purpose": "AI confirms the feature depends on the dependency.",
             "confidence": 0.93,
@@ -1164,6 +1183,7 @@ def test_edge_semantic_auto_enrich_ai_response_projects_current(conn, tmp_path, 
     assert payload["queued_count"] == 1
     assert payload["enriched_count"] == 1
     assert payload["ai_error_count"] == 0
+    assert ai_body["semantic_use_ai"] is True
     assert payload["jobs"][0]["semantic_source"] == "semantic_ai"
 
     projected = server.handle_graph_governance_snapshot_semantic_projection_build(

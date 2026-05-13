@@ -8213,6 +8213,36 @@ def _edge_semantic_auto_enrich_enabled(body: dict) -> bool:
     )
 
 
+def _edge_semantic_auto_enrich_requests_ai(body: dict) -> bool:
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    mode = str(
+        body.get("semantic_mode")
+        or body.get("mode")
+        or options.get("semantic_mode")
+        or options.get("mode")
+        or ""
+    ).strip().lower().replace("-", "_")
+    return bool(
+        body.get("auto_enrich")
+        or body.get("run")
+        or body.get("run_now")
+        or options.get("auto_enrich")
+        or options.get("run")
+        or mode in {"run", "run_now", "auto_enrich"}
+    )
+
+
+def _edge_semantic_ai_body(body: dict, snapshot_id: str, *, auto_enrich: bool) -> dict:
+    ai_body = {**body, "snapshot_id": snapshot_id}
+    if (
+        auto_enrich
+        and _edge_semantic_auto_enrich_requests_ai(body)
+        and _semantic_use_ai_from_body(ai_body) is None
+    ):
+        ai_body["semantic_use_ai"] = True
+    return ai_body
+
+
 def _edge_semantic_instructions(root: Path, body: dict) -> dict:
     try:
         from .reconcile_semantic_config import load_semantic_enrichment_config
@@ -8848,7 +8878,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             ai_call = _semantic_ai_call_from_body(
                 project_id,
                 root,
-                {**body, "snapshot_id": snapshot_id},
+                _edge_semantic_ai_body(body, snapshot_id, auto_enrich=auto_enrich),
             )
             with sqlite_write_lock():
                 events = []
