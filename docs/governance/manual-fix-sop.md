@@ -248,6 +248,31 @@ for `current`, `stale`, `missing`, and `blocked` suite status. Chain integration
 is tracked separately in backlog rows and is not required for manual execution of
 this rule.
 
+#### R14.1 Artifact-backed E2E Flow
+
+For dashboard, graph, bootstrap, project-management, file-hygiene, and semantic
+operator paths, prefer artifact-backed fixture generation over hand-editing
+generated example projects:
+
+1. Extend the repo-owned fixture artifact first, usually
+   `docs/fixtures/<fixture>/l4-*.md`, by adding or updating the
+   `governance-hint` metadata and fenced `file path="..."` blocks.
+2. Materialize the artifact into an isolated temporary workspace, not into
+   `examples/*`, for E2E execution:
+   `node scripts/materialize-fixture.mjs --root <temp-project> --artifact <artifact> --project-id <e2e-project>`.
+3. Initialize/commit the generated fixture workspace before bootstrap so graph
+   snapshots are commit-anchored and root repo status remains clean.
+4. Add or update the E2E scenario to operate on the generated fixture: bootstrap
+   or full-reconcile, make a fixture commit, run Update graph/scope reconcile,
+   then assert dashboard/API state against the active snapshot.
+5. For orphan file handling, the artifact must include an intentionally orphaned
+   doc/test/config file. The E2E writes a governance hint, commits that fixture
+   file, runs Update graph, and asserts that the file is attached to the chosen
+   node.
+6. If the E2E is deferred, file a backlog row with the missing artifact,
+   scenario, expected assertions, and reason for deferral before closing the MF
+   row.
+
 ---
 
 ## 4. False Positive Evidence Standard

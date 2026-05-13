@@ -17,6 +17,8 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 5. Run graph-first discovery and list reused nodes/modules in the working notes or final summary.
 6. For new features or user-visible behavior changes, record the E2E impact decision:
    - run or add/update the relevant E2E and record evidence;
+   - for dashboard/graph/bootstrap/file-hygiene paths, update the repo-owned fixture artifact first, materialize it into an isolated temp project, then run the E2E against that generated project;
+   - for orphan file flows, put the orphan doc/test/config file in the fixture artifact, let the E2E write the governance hint, commit the fixture change, run Update graph, and assert the binding;
    - file a follow-up backlog row when live-AI, DB-mutating, slow, or human-approval E2E is deferred;
    - write `e2e_not_applicable` with a reason for docs-only or non-runtime changes.
 

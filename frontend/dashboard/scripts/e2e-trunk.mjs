@@ -35,6 +35,13 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "../../..");
 const DEFAULT_PROJECT = "dashboard-e2e-fixture";
 const DEFAULT_WORKSPACE = path.join(os.tmpdir(), "aming-claw-dashboard-e2e", DEFAULT_PROJECT);
+const DEFAULT_FIXTURE_ARTIFACT = path.join(
+  REPO_ROOT,
+  "docs",
+  "fixtures",
+  "external-governance-demo",
+  "l4-smoke-fixture.md",
+);
 
 const FLAGS = parseFlags(process.argv.slice(2));
 const BACKEND = FLAGS.backend || process.env.VITE_BACKEND_URL || "http://localhost:40000";
@@ -45,6 +52,7 @@ const DASHBOARD = FLAGS.dashboard || process.env.DASHBOARD_URL || process.env.VI
 const PROJECT = FLAGS.project || process.env.VITE_PROJECT_ID || DEFAULT_PROJECT;
 const WORKSPACE = path.resolve(FLAGS.workspace || DEFAULT_WORKSPACE);
 const ARTIFACTS = path.resolve(FLAGS.artifacts || path.join(WORKSPACE, ".aming-claw", "e2e-artifacts"));
+const FIXTURE_ARTIFACT = path.resolve(FLAGS["fixture-artifact"] || DEFAULT_FIXTURE_ARTIFACT);
 const RESET = FLAGS.reset === true;
 const PROBE_ONLY = FLAGS.probe === true;
 const SKIP_DASHBOARD = FLAGS["skip-dashboard"] === true;
@@ -82,6 +90,7 @@ const context = {
   project: PROJECT,
   workspace: WORKSPACE,
   artifacts: ARTIFACTS,
+  fixtureArtifact: FIXTURE_ARTIFACT,
   runId: RUN_ID,
   baselineCommit: "",
   targetCommit: "",
@@ -92,6 +101,7 @@ const context = {
   reconciledStatus: null,
   reconciledNode: null,
   semantic: null,
+  orphanAttach: null,
   e2eEvidence: null,
 };
 
@@ -372,6 +382,7 @@ function buildReport() {
     run_id: RUN_ID,
     project_id: PROJECT,
     workspace: WORKSPACE,
+    fixture_artifact: FIXTURE_ARTIFACT,
     backend: BACKEND,
     dashboard: SKIP_DASHBOARD ? "" : DASHBOARD,
     semantic_live: SEMANTIC_LIVE,
@@ -381,6 +392,7 @@ function buildReport() {
     target_commit: context.targetCommit,
     active_snapshot_id: context.reconciledStatus?.active_snapshot_id || context.baselineStatus?.active_snapshot_id || "",
     semantic: context.semantic,
+    orphan_attach: context.orphanAttach,
     e2e_evidence: context.e2eEvidence,
     results,
   };
@@ -391,170 +403,24 @@ function writeReport() {
 }
 
 function writeFixtureFiles() {
-  const config = `version: 2
-project_id: ${PROJECT}
-name: "Dashboard E2E Fixture"
-language: typescript
-
-testing:
-  unit_command: "node tests/smoke.test.mjs"
-  e2e_command: "node ${normalizePath(path.relative(WORKSPACE, path.join(SCRIPT_DIR, "e2e-trunk.mjs")))} --project ${PROJECT} --workspace ."
-  allowed_commands:
-    - executable: "node"
-      args_prefixes: ["tests/smoke.test.mjs"]
-  e2e:
-    auto_run: false
-    default_timeout_sec: 900
-    max_parallel: 1
-    require_clean_worktree: true
-    evidence_retention_days: 14
-    suites:
-      dashboard.semantic.safe:
-        label: "Dashboard semantic trunk safe path"
-        command: "node ${normalizePath(path.relative(WORKSPACE, path.join(SCRIPT_DIR, "e2e-trunk.mjs")))} --project ${PROJECT} --workspace . --skip-dashboard"
-        live_ai: false
-        mutates_db: true
-        requires_human_approval: false
-        isolation_project: "${PROJECT}"
-        trigger:
-          paths:
-            - "src/**"
-            - "tests/**"
-            - ".aming-claw.yaml"
-          tags: ["dashboard", "semantic"]
-      dashboard.semantic.live.reject:
-        label: "Dashboard live semantic reject path"
-        command: "node ${normalizePath(path.relative(WORKSPACE, path.join(SCRIPT_DIR, "e2e-trunk.mjs")))} --project ${PROJECT} --workspace . --semantic-live --semantic-decision reject --skip-dashboard"
-        live_ai: true
-        mutates_db: true
-        requires_human_approval: true
-        isolation_project: "${PROJECT}"
-        trigger:
-          paths:
-            - "src/**"
-          tags: ["semantic-review", "reject"]
-
-governance:
-  enabled: true
-  test_tool_label: "node"
-
-graph:
-  exclude_paths:
-    - "node_modules"
-    - "dist"
-    - "coverage"
-    - ".aming-claw/e2e-artifacts"
-  ignore_globs:
-    - "**/node_modules/**"
-    - "**/dist/**"
-    - "**/coverage/**"
-    - "**/.aming-claw/e2e-artifacts/**"
-  nested_projects:
-    mode: "exclude"
-    roots: []
-
-ai:
-  routing:
-    pm:
-      provider: "openai"
-      model: "gpt-5.5"
-    dev:
-      provider: "openai"
-      model: "gpt-5.4"
-    tester:
-      provider: "openai"
-      model: "gpt-5.4"
-    qa:
-      provider: "openai"
-      model: "gpt-5.5"
-    semantic:
-      provider: "anthropic"
-      model: "claude-opus-4-7"
-`;
-
-  writeText(path.join(WORKSPACE, ".aming-claw.yaml"), config);
-  writeText(
-    path.join(WORKSPACE, ".gitignore"),
-    `node_modules/
-dist/
-coverage/
-.aming-claw/e2e-artifacts/
-`,
+  const materializer = path.join(REPO_ROOT, "scripts", "materialize-fixture.mjs");
+  const output = command(
+    "node",
+    [
+      materializer,
+      "--root",
+      WORKSPACE,
+      "--artifact",
+      FIXTURE_ARTIFACT,
+      "--project-id",
+      PROJECT,
+      "--project-name",
+      "Dashboard E2E Fixture",
+    ],
+    REPO_ROOT,
   );
-  writeText(
-    path.join(WORKSPACE, "package.json"),
-    `{"name":"${PROJECT}","private":true,"type":"module","scripts":{"test":"node tests/smoke.test.mjs"}}\n`,
-  );
-  writeText(
-    path.join(WORKSPACE, "README.md"),
-    `# Dashboard E2E Fixture
-
-This project is generated by the dashboard trunk E2E harness.
-
-It intentionally includes TypeScript source, a test, docs, and ignored output
-folders so the graph builder can prove project bootstrap and reconcile behavior
-without mutating the main aming-claw workspace.
-`,
-  );
-  writeText(
-    path.join(WORKSPACE, "src", "api.ts"),
-    `export interface Task {
-  id: string;
-  title: string;
-  status: "queued" | "running" | "done";
-}
-
-export async function fetchTasks(): Promise<Task[]> {
-  return [
-    { id: "fixture-1", title: "Check graph snapshot", status: "queued" },
-    { id: "fixture-2", title: "Review pending reconcile", status: "running" },
-  ];
-}
-
-export function summarizeTasks(tasks: Task[]): string {
-  const open = tasks.filter((task) => task.status !== "done").length;
-  return \`\${open}/\${tasks.length} open\`;
-}
-
-export function queueDepth(tasks: Task[]): number {
-  return tasks.filter((task) => task.status === "queued").length;
-}
-`,
-  );
-  writeText(
-    path.join(WORKSPACE, "src", "App.tsx"),
-    `import { fetchTasks, queueDepth, summarizeTasks, type Task } from "./api";
-
-export async function loadDashboardSummary(): Promise<string> {
-  const tasks: Task[] = await fetchTasks();
-  return summarizeTasks(tasks);
-}
-
-export async function loadQueueDepth(): Promise<number> {
-  const tasks: Task[] = await fetchTasks();
-  return queueDepth(tasks);
-}
-
-export function renderDashboardTitle(projectName: string): string {
-  return \`\${projectName} dashboard\`;
-}
-`,
-  );
-  writeText(
-    path.join(WORKSPACE, "tests", "smoke.test.mjs"),
-    `import { readFileSync } from "node:fs";
-import { join } from "node:path";
-
-const src = readFileSync(join(process.cwd(), "src", "api.ts"), "utf8");
-if (!src.includes("summarizeTasks")) {
-  throw new Error("fixture api is missing summarizeTasks");
-}
-console.log("fixture smoke ok");
-`,
-  );
-  writeText(path.join(WORKSPACE, "node_modules", "ignored.js"), "export const ignored = true;\n");
-  writeText(path.join(WORKSPACE, "dist", "bundle.js"), "export const bundled = true;\n");
-  writeText(path.join(WORKSPACE, "coverage", "coverage.json"), "{\"ignored\":true}\n");
+  info(output);
+  return output;
 }
 
 function ensureGitRepository() {
@@ -580,7 +446,7 @@ function ensureGitRepository() {
 }
 
 function mutateFixtureForScopeReconcile() {
-  const file = path.join(WORKSPACE, "src", "api.ts");
+  const file = path.join(WORKSPACE, "web", "widget.ts");
   const runToken = RUN_ID.replace(/[^a-zA-Z0-9]/g, "").slice(-10);
   const marker = `// E2E_TRUNK_MARKER_START
 export function formatTrunkRunLabel(count: number): string {
@@ -593,7 +459,7 @@ export function formatTrunkRunLabel(count: number): string {
     ? before.replace(/\/\/ E2E_TRUNK_MARKER_START[\s\S]*?\/\/ E2E_TRUNK_MARKER_END\s*/m, marker)
     : `${before.trimEnd()}\n\n${marker}`;
   writeText(file, updated);
-  git(["add", "src/api.ts"], WORKSPACE);
+  git(["add", "web/widget.ts"], WORKSPACE);
   const dirty = git(["status", "--porcelain"], WORKSPACE);
   assert(dirty, "fixture mutation did not change git state");
   git(["commit", "-m", `dashboard trunk change ${RUN_ID}`], WORKSPACE);
@@ -622,6 +488,28 @@ function assertNoIgnoredPaths(nodes, files) {
     || item.includes(".aming-claw/e2e-artifacts/"),
   );
   assert(ignored.length === 0, `ignored paths leaked into graph: ${ignored.slice(0, 5).join(", ")}`);
+}
+
+function findFileRow(files, relPath) {
+  const needle = normalizePath(relPath);
+  return (files || []).find((row) => {
+    const rowPath = normalizePath(row.path || "");
+    return rowPath === needle || rowPath.endsWith(`/${needle}`);
+  });
+}
+
+function attachedNodeIds(row) {
+  const raw = row?.attached_node_ids || row?.node_ids || [];
+  if (Array.isArray(raw)) return raw.map(String);
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map(String) : [String(parsed)];
+    } catch {
+      return raw.split(",").map((item) => item.trim()).filter(Boolean);
+    }
+  }
+  return [];
 }
 
 function queuedAiJobCount(ops) {
@@ -891,11 +779,18 @@ async function stepFixtureProject() {
     rmSync(WORKSPACE, { recursive: true, force: true });
   }
   mkdirSync(WORKSPACE, { recursive: true });
-  const shouldWrite = RESET || !existsSync(path.join(WORKSPACE, ".aming-claw.yaml"));
+  const shouldWrite = RESET
+    || !existsSync(path.join(WORKSPACE, ".aming-claw.yaml"))
+    || !existsSync(path.join(WORKSPACE, ".aming-claw", "e2e-artifacts", "materialize-manifest.json"));
   if (shouldWrite) writeFixtureFiles();
   const commit = ensureGitRepository();
   const smoke = command("node", ["tests/smoke.test.mjs"], WORKSPACE);
-  assert(smoke.includes("fixture smoke ok"), "fixture smoke test failed");
+  assert(
+    smoke.includes("fixture smoke ok") || smoke.includes("external governance mixed smoke ok"),
+    "fixture smoke test failed",
+  );
+  const widgetSmoke = command("node", ["tests/widget.test.mjs"], WORKSPACE);
+  assert(widgetSmoke.includes("external governance widget smoke ok"), "fixture widget smoke test failed");
   return { workspace: WORKSPACE, project: PROJECT, baseline_commit: commit, reset: RESET, wrote_fixture: shouldWrite };
 }
 
@@ -927,11 +822,11 @@ async function stepGraphBaseline() {
   assert((bundle.summary.counts?.features || 0) > 0, "summary features count is zero");
   assert((bundle.nodes || []).length > 0, "nodes list is empty");
   assertNoIgnoredPaths(bundle.nodes, bundle.files);
-  const apiNode = findNodeForPath(bundle.nodes, "src/api.ts");
-  assert(apiNode, "src/api.ts node not found");
+  const apiNode = findNodeForPath(bundle.nodes, "web/widget.ts");
+  assert(apiNode, "web/widget.ts node not found");
   const funcs = functionNames(apiNode);
-  assert(funcs.some((name) => name.includes("summarizeTasks")), "src/api.ts functions did not include summarizeTasks");
-  assert(apiNode.metadata?.function_lines, "src/api.ts node missing metadata.function_lines");
+  assert(funcs.some((name) => name.includes("buildQuoteView")), "web/widget.ts functions did not include buildQuoteView");
+  assert(apiNode.metadata?.function_lines, "web/widget.ts node missing metadata.function_lines");
   assert(queuedAiJobCount(bundle.ops) === 0, "baseline queued AI semantic jobs unexpectedly present");
   context.baselineStatus = bundle.status;
   context.baselineSummary = bundle.summary;
@@ -945,8 +840,7 @@ async function stepGraphBaseline() {
   };
 }
 
-async function stepTrunkCommitAndReconcile() {
-  const targetCommit = mutateFixtureForScopeReconcile();
+async function materializePendingScope(targetCommit, { layer, action }) {
   const stale = await waitFor("graph stale status", async () => {
     const status = await http("GET", `/api/graph-governance/${pid(PROJECT)}/status`);
     return status.current_state?.graph_stale?.is_stale ? status : null;
@@ -957,19 +851,19 @@ async function stepTrunkCommitAndReconcile() {
     commit_sha: targetCommit,
     parent_commit_sha: stale.current_state.graph_stale.active_graph_commit || stale.graph_snapshot_commit || "",
     actor: "dashboard_e2e",
-    evidence: { source: "dashboard_trunk_e2e", run_id: RUN_ID, layer: "L4" },
+    evidence: { source: "dashboard_trunk_e2e", run_id: RUN_ID, layer, action },
   });
 
   const result = await http("POST", `/api/graph-governance/${pid(PROJECT)}/reconcile/pending-scope`, {
     target_commit_sha: targetCommit,
-    run_id: `dashboard-trunk-scope-${shortCommit(targetCommit)}-${Date.now()}`,
+    run_id: `dashboard-trunk-${action}-${shortCommit(targetCommit)}-${Date.now()}`,
     actor: "dashboard_e2e",
     activate: true,
     semantic_enrich: true,
     semantic_use_ai: false,
     enqueue_stale: false,
     semantic_skip_completed: true,
-    notes_extra: { source: "dashboard_trunk_e2e", run_id: RUN_ID, action: "scope_reconcile" },
+    notes_extra: { source: "dashboard_trunk_e2e", run_id: RUN_ID, action },
   });
 
   const current = await waitFor("graph current status", async () => {
@@ -979,6 +873,15 @@ async function stepTrunkCommitAndReconcile() {
   }, { timeoutMs: 90000, intervalMs: 1500 });
   assert((current.pending_scope_reconcile_count || 0) === 0, "pending scope reconcile should be empty after materialize");
   context.reconciledStatus = current;
+  return { stale, result, current };
+}
+
+async function stepTrunkCommitAndReconcile() {
+  const targetCommit = mutateFixtureForScopeReconcile();
+  const { stale, result, current } = await materializePendingScope(targetCommit, {
+    layer: "L4",
+    action: "scope_reconcile",
+  });
   return {
     target_commit: targetCommit,
     stale_snapshot: stale.active_snapshot_id,
@@ -993,8 +896,8 @@ async function stepDashboardApiConsistency() {
   assert(bundle.status.active_snapshot_id === bundle.summary.snapshot_id, "status/summary snapshot mismatch");
   assert(bundle.ops.active_snapshot_id === bundle.status.active_snapshot_id, "operations queue snapshot mismatch");
   assert(queuedAiJobCount(bundle.ops) === 0, "scope reconcile queued AI semantic jobs unexpectedly");
-  const apiNode = findNodeForPath(bundle.nodes, "src/api.ts");
-  assert(apiNode, "src/api.ts node missing after reconcile");
+  const apiNode = findNodeForPath(bundle.nodes, "web/widget.ts");
+  assert(apiNode, "web/widget.ts node missing after reconcile");
   const funcs = functionNames(apiNode);
   assert(funcs.some((name) => name.includes("formatTrunkRunLabel")), "reconciled node missing new trunk function");
   const lineKeys = Object.keys(apiNode.metadata?.function_lines || {});
@@ -1007,6 +910,64 @@ async function stepDashboardApiConsistency() {
     semantic_projection_status: bundle.projection?.status || bundle.projection?.projection?.status || "unknown",
     functions: funcs,
   };
+}
+
+async function stepOrphanHintAttach() {
+  const orphanPath = "docs/orphan-dashboard-note.md";
+  const bundle = await loadRuntimeBundle(PROJECT);
+  const snapshotId = bundle.snapshotId;
+  const targetNode = findNodeForPath(bundle.nodes, "web/widget.ts");
+  assert(targetNode?.node_id, "orphan attach target node web/widget.ts missing");
+  const orphanBefore = findFileRow(bundle.files, orphanPath);
+  assert(orphanBefore, `${orphanPath} file inventory row missing`);
+  assert(String(orphanBefore.scan_status || "") === "orphan", `${orphanPath} should start as orphan, got ${orphanBefore.scan_status}`);
+
+  const attach = await http("POST", snapshotPath(PROJECT, snapshotId, "/file-hygiene/hints/attach"), {
+    path: orphanPath,
+    target_node_id: targetNode.node_id,
+    role: "doc",
+    project_root: WORKSPACE,
+    actor: "dashboard_trunk_e2e",
+  });
+  assert(attach.ok === true, "orphan attach hint endpoint returned ok=false");
+  assert(attach.state === "written_uncommitted", `orphan attach state was ${attach.state}`);
+  assert(attach.requires_commit === true, "orphan attach did not require a commit");
+  assert(attach.update_graph_after_commit === true, "orphan attach did not request Update graph after commit");
+  const orphanText = readText(path.join(WORKSPACE, orphanPath));
+  assert(orphanText.includes("governance-hint"), "orphan file missing written governance-hint");
+  assert(orphanText.includes(targetNode.node_id), "orphan governance-hint missing target node id");
+
+  git(["add", orphanPath], WORKSPACE);
+  const dirty = git(["status", "--porcelain"], WORKSPACE);
+  assert(dirty.includes(orphanPath), "orphan hint write did not dirty the fixture git workspace");
+  git(["commit", "-m", `dashboard e2e attach orphan hint ${RUN_ID}`], WORKSPACE);
+  context.targetCommit = git(["rev-parse", "HEAD"], WORKSPACE);
+
+  await materializePendingScope(context.targetCommit, {
+    layer: "L7",
+    action: "orphan_hint_attach",
+  });
+
+  const afterBundle = await loadRuntimeBundle(PROJECT);
+  const orphanAfter = findFileRow(afterBundle.files, orphanPath);
+  assert(orphanAfter, `${orphanPath} missing after orphan attach reconcile`);
+  const attachedIds = attachedNodeIds(orphanAfter);
+  const targetAfter = findNodeForPath(afterBundle.nodes, "web/widget.ts");
+  assert(
+    attachedIds.includes(targetNode.node_id) || allNodePaths(targetAfter).includes(orphanPath),
+    `orphan doc was not attached to ${targetNode.node_id}; attached=${attachedIds.join(",")}`,
+  );
+  context.reconciledNode = targetAfter || targetNode;
+  context.orphanAttach = {
+    path: orphanPath,
+    target_node_id: targetNode.node_id,
+    hint_written: attach.hint_written,
+    before_scan_status: orphanBefore.scan_status,
+    after_scan_status: orphanAfter.scan_status,
+    attached_node_ids: attachedIds,
+    commit: context.targetCommit,
+  };
+  return context.orphanAttach;
 }
 
 async function stepSemanticJobsPath() {
@@ -1088,9 +1049,9 @@ async function stepScenarioBranches() {
     },
     {
       id: "L7.docs-orphans",
-      depends_on: "L5",
-      status: "ready",
-      note: "Generate docs with node binding markers and assert orphan handling.",
+      depends_on: "L6",
+      status: context.orphanAttach ? "covered" : "ready",
+      note: "Artifact creates an orphan doc; E2E writes a governance hint, commits it, updates graph, and asserts node binding.",
     },
     {
       id: "L7.semantic-cancel",
@@ -1140,9 +1101,11 @@ async function recordRunEvidence(status = "passed") {
     covered_node_ids: coveredNodeIds,
     covered_files: [
       ".aming-claw.yaml",
-      "src/api.ts",
-      "src/App.tsx",
+      "web/widget.ts",
+      "web/checkout.ts",
+      "docs/orphan-dashboard-note.md",
       "tests/smoke.test.mjs",
+      "tests/widget.test.mjs",
     ],
     metadata: {
       semantic_live: SEMANTIC_LIVE,
@@ -1174,9 +1137,10 @@ async function main() {
     await runStep("L3", "Graph baseline assertions", stepGraphBaseline);
     await runStep("L4", "Trunk commit and scope reconcile", stepTrunkCommitAndReconcile);
     await runStep("L5", "Dashboard/API consistency", stepDashboardApiConsistency);
-    await runStep("L6", "Semantic jobs path", stepSemanticJobsPath);
-    await runStep("L7", "Scenario branch registry", stepScenarioBranches);
-    await runStep("L8", "Cleanup and artifacts", stepCleanupAndArtifacts);
+    await runStep("L6", "Orphan governance hint attach", stepOrphanHintAttach);
+    await runStep("L7", "Semantic jobs path", stepSemanticJobsPath);
+    await runStep("L8", "Scenario branch registry", stepScenarioBranches);
+    await runStep("L9", "Cleanup and artifacts", stepCleanupAndArtifacts);
     await recordRunEvidence("passed");
     writeReport();
     console.log("");

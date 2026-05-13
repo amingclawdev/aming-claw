@@ -101,6 +101,7 @@ Add future dashboard E2E coverage by extending the governance hint and file bloc
     "tsconfig.json",
     "README.md",
     "docs/usage.md",
+    "docs/orphan-dashboard-note.md",
     "docs/l4/quote-contract.md",
     "docs/l4/pricing-state.md",
     "docs/l4/test-coverage.md",
@@ -266,6 +267,9 @@ Graph smoke coverage:
   beside the TypeScript sources.
 - L4 assets: quote schema, pricing state, and coverage docs are present so the
   dashboard can display code, docs, tests, config, and contract files together.
+- Orphan attach: `docs/orphan-dashboard-note.md` intentionally starts without a
+  governance hint so dashboard E2E can bind it to a selected node, commit, and
+  update graph.
 ````
 
 #### docs/usage.md
@@ -303,6 +307,24 @@ Related L4 assets:
 - `docs/l4/test-coverage.md` maps smoke tests to the code paths.
 - `contracts/quote.schema.json` is the file-backed schema used by dashboard
   smoke checks.
+````
+
+#### docs/orphan-dashboard-note.md
+
+````file path="docs/orphan-dashboard-note.md"
+# Orphan Dashboard Note
+
+This note is deliberately generated without a governance hint and without a
+stable feature reference. It exists so dashboard E2E can exercise the operator
+flow for orphan file handling:
+
+1. the initial graph snapshot lists this file as an orphan doc;
+2. the dashboard/API writes a governance-hint comment that targets a selected
+   feature node;
+3. the E2E commits that file change;
+4. Update graph/scope reconcile materializes the doc binding on the target node.
+
+The note should remain unbound until the E2E explicitly writes the hint.
 ````
 
 #### docs/l4/quote-contract.md
@@ -683,6 +705,7 @@ const checkout = readFileSync(join(process.cwd(), "web", "checkout.ts"), "utf8")
 const contract = readFileSync(join(process.cwd(), "contracts", "quote.schema.json"), "utf8");
 const pricing = readFileSync(join(process.cwd(), "state", "pricing-rules.json"), "utf8");
 const l4Doc = readFileSync(join(process.cwd(), "docs", "l4", "quote-contract.md"), "utf8");
+const orphanDoc = readFileSync(join(process.cwd(), "docs", "orphan-dashboard-note.md"), "utf8");
 const manifest = JSON.parse(
   readFileSync(join(process.cwd(), ".aming-claw", "e2e-artifacts", "materialize-manifest.json"), "utf8"),
 );
@@ -719,8 +742,16 @@ if (!l4Doc.includes("quote.v1") || !l4Doc.includes("src/demo_app/service.py")) {
   throw new Error("L4 quote contract doc is missing code binding markers");
 }
 
+if (!orphanDoc.includes("deliberately generated without a governance hint")) {
+  throw new Error("orphan dashboard note fixture is missing");
+}
+
 if (!manifest.hint_count || !manifest.files.includes("src/demo_app/service.py")) {
   throw new Error("L4 fixture materializer did not load governance hints or service materialization block");
+}
+
+if (!manifest.files.includes("docs/orphan-dashboard-note.md")) {
+  throw new Error("L4 fixture materializer did not include the orphan dashboard note");
 }
 
 console.log("external governance mixed smoke ok");

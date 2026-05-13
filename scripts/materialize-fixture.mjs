@@ -1,20 +1,31 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const DEFAULT_ROOT = "examples/external-governance-demo";
-const DEFAULT_ARTIFACT = "docs/fixtures/external-governance-demo/l4-smoke-fixture.md";
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(SCRIPT_DIR, "..");
+const DEFAULT_ROOT = join(tmpdir(), "aming-claw-fixtures", "external-governance-demo");
+const DEFAULT_ARTIFACT = join(REPO_ROOT, "docs", "fixtures", "external-governance-demo", "l4-smoke-fixture.md");
 
 const ROOT = resolveArg("--root") ?? resolve(DEFAULT_ROOT);
 const ARTIFACT = resolveArg("--artifact") ?? resolve(DEFAULT_ARTIFACT);
+const PROJECT_ID = rawArg("--project-id");
+const PROJECT_NAME = rawArg("--project-name");
 
 function resolveArg(name) {
+  const value = rawArg(name);
+  return value ? resolve(value) : null;
+}
+
+function rawArg(name) {
   const index = process.argv.indexOf(name);
   if (index === -1) return null;
   const value = process.argv[index + 1];
   if (!value || value.startsWith("--")) {
     throw new Error(`${name} requires a value`);
   }
-  return resolve(value);
+  return value;
 }
 
 function assertInsideRoot(path) {
@@ -48,6 +59,21 @@ function parseFiles(markdown) {
   return files;
 }
 
+function replaceYamlScalar(content, key, value) {
+  if (!value) return content;
+  const escaped = JSON.stringify(String(value));
+  const re = new RegExp(`^${key}:\\s*.*$`, "m");
+  return content.replace(re, `${key}: ${escaped}`);
+}
+
+function transformFileContent(relPath, content) {
+  if (relPath !== ".aming-claw.yaml") return content;
+  let next = content;
+  next = replaceYamlScalar(next, "project_id", PROJECT_ID);
+  next = replaceYamlScalar(next, "name", PROJECT_NAME);
+  return next;
+}
+
 function writeManifest({ files, hints }) {
   const manifestPath = resolve(ROOT, ".aming-claw", "e2e-artifacts", "materialize-manifest.json");
   assertInsideRoot(manifestPath);
@@ -57,6 +83,10 @@ function writeManifest({ files, hints }) {
     JSON.stringify(
       {
         artifact: relative(ROOT, ARTIFACT).split(sep).join("/"),
+        source_artifact: ARTIFACT,
+        root: ROOT,
+        project_id: PROJECT_ID || null,
+        project_name: PROJECT_NAME || null,
         file_count: files.length,
         hint_count: hints.length,
         files: files.map((file) => file.relPath),
@@ -84,7 +114,7 @@ for (const file of files) {
   const target = resolve(ROOT, file.relPath);
   assertInsideRoot(target);
   mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, `${file.content}\n`, "utf8");
+  writeFileSync(target, `${transformFileContent(file.relPath, file.content)}\n`, "utf8");
 }
 
 writeManifest({ files, hints });
