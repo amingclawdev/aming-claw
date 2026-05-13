@@ -864,7 +864,6 @@ export default function App() {
         projectId={currentProjectId}
         projects={projects}
         aiConfig={aiConfig}
-        reviewBadge={data?.feedback?.summary?.visible_group_count ?? 0}
         onRefresh={handleRefresh}
         onProjectChange={handleProjectChange}
         onOpenAiConfig={() => setAiConfigOpen(true)}

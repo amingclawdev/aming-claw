@@ -233,7 +233,7 @@ def test_local_choose_directory_endpoint_returns_selected_path(tmp_path, monkeyp
     monkeypatch.setattr(
         server,
         "_open_local_directory_picker",
-        lambda initial_path="", title="": str(tmp_path),
+        lambda initial_path="", title="", timeout_seconds=12.0: str(tmp_path),
     )
 
     payload = server.handle_local_choose_directory(_ctx(
@@ -249,7 +249,7 @@ def test_local_choose_directory_endpoint_returns_selected_path(tmp_path, monkeyp
 
 
 def test_local_choose_directory_endpoint_handles_unavailable_picker(monkeypatch):
-    def _raise_unavailable(initial_path="", title=""):
+    def _raise_unavailable(initial_path="", title="", timeout_seconds=12.0):
         raise RuntimeError("picker unavailable")
 
     monkeypatch.setattr(server, "_open_local_directory_picker", _raise_unavailable)
@@ -264,6 +264,25 @@ def test_local_choose_directory_endpoint_handles_unavailable_picker(monkeypatch)
     assert payload["selected"] is False
     assert payload["manual_entry"] is True
     assert "picker unavailable" in payload["error"]
+
+
+def test_local_choose_directory_endpoint_passes_clamped_timeout(tmp_path, monkeypatch):
+    seen = {}
+
+    def _select(initial_path="", title="", timeout_seconds=12.0):
+        seen["timeout_seconds"] = timeout_seconds
+        return str(tmp_path)
+
+    monkeypatch.setattr(server, "_open_local_directory_picker", _select)
+
+    payload = server.handle_local_choose_directory(_ctx(
+        "dashboard-demo",
+        method="POST",
+        body={"timeout_seconds": 120},
+    ))
+
+    assert payload["ok"] is True
+    assert seen["timeout_seconds"] == 60.0
 
 
 def test_projects_list_endpoint_returns_registered_projects(monkeypatch):

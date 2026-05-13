@@ -110,7 +110,19 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _open_local_directory_picker(initial_path: str = "", title: str = "Choose project directory") -> str:
+def _clamped_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _open_local_directory_picker(
+    initial_path: str = "",
+    title: str = "Choose project directory",
+    timeout_seconds: float = 12.0,
+) -> str:
     """Open a local directory picker and return the selected absolute path."""
     errors: list[str] = []
     try:
@@ -124,7 +136,11 @@ def _open_local_directory_picker(initial_path: str = "", title: str = "Choose pr
     if tk is None or filedialog is None:
         if os.name == "nt":
             try:
-                return _open_local_directory_picker_windows(initial_path=initial_path, title=title)
+                return _open_local_directory_picker_windows(
+                    initial_path=initial_path,
+                    title=title,
+                    timeout_seconds=timeout_seconds,
+                )
             except Exception as exc:  # pragma: no cover - depends on host desktop
                 errors.append(f"windows picker unavailable: {exc}")
         raise RuntimeError("local directory picker unavailable: " + "; ".join(errors))
@@ -157,7 +173,11 @@ def _open_local_directory_picker(initial_path: str = "", title: str = "Choose pr
                 pass
 
 
-def _open_local_directory_picker_windows(initial_path: str = "", title: str = "Choose project directory") -> str:
+def _open_local_directory_picker_windows(
+    initial_path: str = "",
+    title: str = "Choose project directory",
+    timeout_seconds: float = 12.0,
+) -> str:
     """Fallback folder picker for Windows Python builds without tkinter."""
     exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
     if not exe:
@@ -184,13 +204,18 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     if "powershell" in Path(exe).name.lower():
         args.append("-STA")
     args.extend(["-Command", script])
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=300,
-    )
+    try:
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=max(3.0, min(float(timeout_seconds or 12.0), 60.0)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        if exc.cmd:
+            raise RuntimeError("directory picker timed out; paste the path manually") from exc
+        raise
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(detail or f"PowerShell picker exited {proc.returncode}")
@@ -864,8 +889,13 @@ def handle_local_choose_directory(ctx: RequestContext):
     """
     initial_path = str(ctx.body.get("initial_path") or ctx.body.get("workspace_path") or "").strip()
     title = str(ctx.body.get("title") or "Choose project directory").strip() or "Choose project directory"
+    timeout_seconds = _clamped_float(ctx.body.get("timeout_seconds"), default=12.0, minimum=3.0, maximum=60.0)
     try:
-        selected = _open_local_directory_picker(initial_path=initial_path, title=title)
+        selected = _open_local_directory_picker(
+            initial_path=initial_path,
+            title=title,
+            timeout_seconds=timeout_seconds,
+        )
     except Exception as exc:
         return {
             "ok": False,

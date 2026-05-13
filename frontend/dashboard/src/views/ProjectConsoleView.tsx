@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type {
   ActiveSummaryResponse,
   BacklogResponse,
@@ -88,6 +88,7 @@ export default function ProjectConsoleView({
   const [projectName, setProjectName] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [actionState, setActionState] = useState<{ key: string; label: string } | null>(null);
+  const workspacePathInputRef = useRef<HTMLInputElement | null>(null);
   const projectKey = useMemo(() => projects.map((p) => p.project_id).join("\u0000"), [projects]);
 
   useEffect(() => {
@@ -166,13 +167,20 @@ export default function ProjectConsoleView({
   };
 
   const handleChooseDirectory = async () => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 9000);
     setActionState({ key: "choose-directory", label: "Choosing directory" });
-    setNotice({ kind: "info", message: "Choose a project directory..." });
+    setNotice({
+      kind: "info",
+      message: "Opening the local directory picker. You can paste the workspace path manually and continue.",
+    });
+    window.setTimeout(() => workspacePathInputRef.current?.focus(), 0);
     try {
       const result = await api.chooseLocalDirectory({
         initial_path: workspacePath.trim() || undefined,
         title: "Import project directory",
-      });
+        timeout_seconds: 8,
+      }, controller.signal);
       if (result.selected && result.path) {
         setWorkspacePath(result.path);
         setNotice({ kind: "success", message: "Directory selected." });
@@ -185,12 +193,17 @@ export default function ProjectConsoleView({
         setNotice({ kind: "info", message: "No directory selected. Paste a path or choose again." });
       }
     } catch (error) {
+      const timedOut = error instanceof DOMException && error.name === "AbortError";
       setNotice({
-        kind: "error",
-        message: `Directory picker unavailable: ${errorMessage(error)} Paste the path manually.`,
+        kind: "info",
+        message: timedOut
+          ? "Directory picker did not respond. Paste the path manually, then click Bootstrap."
+          : `Directory picker unavailable. Paste the path manually. ${errorMessage(error)}`,
       });
     } finally {
+      window.clearTimeout(timeout);
       setActionState(null);
+      window.setTimeout(() => workspacePathInputRef.current?.focus(), 0);
     }
   };
 
@@ -310,6 +323,7 @@ export default function ProjectConsoleView({
             <span>Workspace path</span>
             <input
               data-testid="project-import-workspace-path"
+              ref={workspacePathInputRef}
               value={workspacePath}
               onChange={(event) => setWorkspacePath(event.target.value)}
               placeholder="C:\\path\\to\\project"
@@ -319,7 +333,7 @@ export default function ProjectConsoleView({
             type="button"
             className="action-btn project-import-directory-btn"
             data-testid="project-import-directory"
-            disabled={Boolean(actionState)}
+            disabled={actionState?.key === "choose-directory"}
             onClick={handleChooseDirectory}
           >
             {actionState?.key === "choose-directory" ? "Choosing..." : "Choose directory"}
@@ -335,7 +349,7 @@ export default function ProjectConsoleView({
           <button
             className="action-btn action-btn-primary"
             data-testid="project-import-bootstrap"
-            disabled={Boolean(actionState)}
+            disabled={actionState?.key === "bootstrap"}
           >
             {actionState?.key === "bootstrap" ? "Bootstrapping..." : "Bootstrap"}
           </button>

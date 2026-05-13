@@ -18,14 +18,12 @@ interface Props {
   projectId: string;
   projects: ProjectListItem[];
   aiConfig?: AiConfigResponse | null;
-  reviewBadge?: number;
   // SSE liveness: green dot when streaming, amber while reconnecting, gray
   // when offline. Drives the "live" pill next to the snapshot status.
   liveStatus?: LiveStatus;
   onRefresh(): void;
   onProjectChange(projectId: string): void;
   onOpenAiConfig(): void;
-  onOpenReview?(): void;
   // Multi-select mode (batch AI enrich many nodes/edges at once). When ON,
   // graph clicks add/remove from a bucket and the header shows the count +
   // Confirm / Clear / Exit controls. OFF state shows just the "Multi-select"
@@ -48,12 +46,10 @@ export default function Header({
   projectId,
   projects,
   aiConfig,
-  reviewBadge,
   liveStatus = "offline",
   onRefresh,
   onProjectChange,
   onOpenAiConfig,
-  onOpenReview,
   multiSelectMode = false,
   multiSelectCount = 0,
   batchEnrichBusy = false,
@@ -145,16 +141,6 @@ export default function Header({
           />
         </div>
       </div>
-
-      {onOpenReview ? (
-        <button className="btn-action" onClick={onOpenReview} title="Open Review Queue">
-          <span className="btn-action-icon">⚖</span>
-          <span>Action</span>
-          {reviewBadge != null && reviewBadge > 0 ? (
-            <span className="btn-action-badge">{reviewBadge}</span>
-          ) : null}
-        </button>
-      ) : null}
 
       <button
         className="btn-action"

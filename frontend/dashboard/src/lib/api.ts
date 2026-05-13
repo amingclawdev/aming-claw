@@ -114,7 +114,10 @@ export const api = {
   ) {
     return postJSON<BootstrapProjectResponse>("/api/project/bootstrap", payload, signal);
   },
-  chooseLocalDirectory(payload: { initial_path?: string; title?: string } = {}, signal?: AbortSignal) {
+  chooseLocalDirectory(
+    payload: { initial_path?: string; title?: string; timeout_seconds?: number } = {},
+    signal?: AbortSignal,
+  ) {
     return postJSON<LocalDirectoryPickerResponse>("/api/local/choose-directory", payload, signal);
   },
   aiConfig(signal?: AbortSignal) {

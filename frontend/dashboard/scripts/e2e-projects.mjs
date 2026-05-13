@@ -300,15 +300,22 @@ function verifyProjectImportUiContract() {
   assert(viewSource.includes('data-testid="project-import-directory"'), "Projects page import directory button is missing");
   assert(viewSource.includes("handleChooseDirectory"), "Projects page does not wire a directory picker handler");
   assert(viewSource.includes("Directory picker unavailable. Paste the path manually."), "Projects page should gracefully fall back to manual path entry");
+  assert(viewSource.includes("AbortController"), "Projects page directory picker must client-timeout instead of hanging");
+  assert(viewSource.includes("actionState?.key === \"bootstrap\""), "Bootstrap button should remain usable while directory picker is trying");
   assert(apiSource.includes("/api/local/choose-directory"), "dashboard API client missing directory picker endpoint");
+  assert(apiSource.includes("timeout_seconds?: number"), "dashboard API client missing directory picker timeout contract");
   assert(serverSource.includes("_open_local_directory_picker_windows"), "backend missing Windows directory picker fallback");
+  assert(serverSource.includes("directory picker timed out; paste the path manually"), "backend picker fallback should timeout into manual entry");
   ok("Projects page exposes import directory picker contract");
 }
 
 function verifyHeaderV1Contract() {
   phase("header v1 contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const headerSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/Header.tsx"), "utf8");
   assert(!appSource.includes("onOpenReview={() => setActionPanelOpen(true)}"), "Header should not expose global Action launcher in v1");
+  assert(!headerSource.includes(">Action<"), "Header component should not render the global Action launcher in v1");
+  assert(!headerSource.includes("onOpenReview"), "Header component should not accept the global Action launcher prop in v1");
   ok("global Action launcher is hidden for v1");
 }
 
