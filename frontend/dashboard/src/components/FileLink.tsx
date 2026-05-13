@@ -1,16 +1,18 @@
 import { useState } from "react";
-import { copyToClipboard, editorConfigured, editorScheme, editorUrl } from "../lib/editor";
+import { copyToClipboard, editorScheme, editorUrl, isEditorConfigured } from "../lib/editor";
 
 interface Props {
   path: string;
   line?: number;
   className?: string;
   showCopy?: boolean;
+  workspaceRoot?: string;
 }
 
-export default function FileLink({ path, line, className = "", showCopy = true }: Props) {
+export default function FileLink({ path, line, className = "", showCopy = true, workspaceRoot }: Props) {
   const [copied, setCopied] = useState(false);
-  const url = editorUrl(path, line);
+  const configured = isEditorConfigured(workspaceRoot);
+  const url = editorUrl(path, line, undefined, workspaceRoot);
 
   async function onCopy(e: React.MouseEvent) {
     e.preventDefault();
@@ -21,7 +23,7 @@ export default function FileLink({ path, line, className = "", showCopy = true }
     window.setTimeout(() => setCopied(false), 1200);
   }
 
-  const tooltip = editorConfigured
+  const tooltip = configured
     ? `Open in ${editorScheme}\n${path}${line ? ` : ${line}` : ""}`
     : `${path}\n(set VITE_WORKSPACE_ROOT to enable editor jump)`;
 

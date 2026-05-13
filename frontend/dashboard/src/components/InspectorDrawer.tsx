@@ -17,7 +17,7 @@ import {
   type SubtreeAggregate,
 } from "../lib/semantic";
 import FileLink from "./FileLink";
-import { editorConfigured, editorScheme, editorUrl } from "../lib/editor";
+import { editorScheme, editorUrl, isEditorConfigured } from "../lib/editor";
 import type { PinnedEdge } from "./FocusCard";
 import type { ActionKind, ActionTarget } from "./ActionControlPanel";
 import RetryFeedbackModal from "./RetryFeedbackModal";
@@ -42,6 +42,7 @@ interface Props {
   onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
   tab?: Tab;
   onTabChange?(tab: Tab): void;
+  workspaceRoot?: string;
 }
 
 interface EdgeProps {
@@ -59,6 +60,7 @@ interface EdgeProps {
   onRetry?(feedbackIds: string[], nodeId: string, rationale: string): Promise<void> | void;
   tab: Tab;
   onTabChange(tab: Tab): void;
+  workspaceRoot?: string;
 }
 
 export type Tab = "overview" | "files" | "relations" | "functions" | "problems";
@@ -103,6 +105,7 @@ export default function InspectorDrawer({
   onRetry,
   tab: controlledTab,
   onTabChange,
+  workspaceRoot,
 }: Props) {
   // All hooks must run unconditionally — keep this block above any early return.
   const [internalTab, setInternalTab] = useState<Tab>("overview");
@@ -155,6 +158,7 @@ export default function InspectorDrawer({
         onRetry={onRetry}
         tab={tab}
         onTabChange={setTab}
+        workspaceRoot={workspaceRoot}
       />
     );
   }
@@ -237,11 +241,11 @@ export default function InspectorDrawer({
             onOpenProblems={() => setTab("problems")}
           />
         ) : null}
-        {tab === "files" ? <FilesTab node={node} /> : null}
+        {tab === "files" ? <FilesTab node={node} workspaceRoot={workspaceRoot} /> : null}
         {tab === "relations" ? (
           <RelationsTab node={node} edges={edges} byId={byId} onSelectNode={onSelectNode} />
         ) : null}
-        {tab === "functions" ? <NodeFunctionsTab node={node} /> : null}
+        {tab === "functions" ? <NodeFunctionsTab node={node} workspaceRoot={workspaceRoot} /> : null}
         {tab === "problems" ? (
           <NodeProblemsTab node={node} allNodes={allNodes} byParent={byParent} />
         ) : null}
@@ -590,6 +594,7 @@ function EdgeInspector({
   onRetry,
   tab,
   onTabChange,
+  workspaceRoot,
 }: EdgeProps) {
   const src = byId.get(edge.src) ?? null;
   const dst = byId.get(edge.dst) ?? null;
@@ -765,13 +770,16 @@ function EdgeInspector({
             dst={dst}
             onSelectNode={onSelectNode}
             edgeSemantic={edgeSemEntry}
+            workspaceRoot={workspaceRoot}
           />
         ) : null}
-        {tab === "files" ? <EdgeFilesTab src={src} dst={dst} /> : null}
+        {tab === "files" ? <EdgeFilesTab src={src} dst={dst} workspaceRoot={workspaceRoot} /> : null}
         {tab === "relations" ? (
           <EdgeRelationsTab edge={edge} edges={edges} byId={byId} onSelectNode={onSelectNode} />
         ) : null}
-        {tab === "functions" ? <EdgeFunctionsTab edge={edge} src={src} dst={dst} /> : null}
+        {tab === "functions" ? (
+          <EdgeFunctionsTab edge={edge} src={src} dst={dst} workspaceRoot={workspaceRoot} />
+        ) : null}
         {tab === "problems" ? <EdgeProblemsTab edge={edge} sem={edgeSemEntry} /> : null}
       </div>
     </aside>
@@ -784,12 +792,14 @@ function EdgeOverviewTab({
   dst,
   onSelectNode,
   edgeSemantic,
+  workspaceRoot,
 }: {
   edge: PinnedEdge;
   src: NodeRecord | null;
   dst: NodeRecord | null;
   onSelectNode(id: string): void;
   edgeSemantic?: Record<string, unknown> | null;
+  workspaceRoot?: string;
 }) {
   return (
     <>
@@ -818,12 +828,14 @@ function EdgeOverviewTab({
         node={src}
         fallbackId={edge.src}
         onSelectNode={onSelectNode}
+        workspaceRoot={workspaceRoot}
       />
       <EdgeEndpointSection
         label="Target"
         node={dst}
         fallbackId={edge.dst}
         onSelectNode={onSelectNode}
+        workspaceRoot={workspaceRoot}
       />
     </>
   );
@@ -907,7 +919,15 @@ function EdgeSemanticSection({ sem }: { sem: Record<string, unknown> }) {
   );
 }
 
-function EdgeFilesTab({ src, dst }: { src: NodeRecord | null; dst: NodeRecord | null }) {
+function EdgeFilesTab({
+  src,
+  dst,
+  workspaceRoot,
+}: {
+  src: NodeRecord | null;
+  dst: NodeRecord | null;
+  workspaceRoot?: string;
+}) {
   const groups: { label: string; node: NodeRecord | null }[] = [
     { label: "Source", node: src },
     { label: "Target", node: dst },
@@ -926,20 +946,30 @@ function EdgeFilesTab({ src, dst }: { src: NodeRecord | null; dst: NodeRecord | 
   }
   return (
     <>
-      {!editorConfigured ? (
+      {!isEditorConfigured(workspaceRoot) ? (
         <div className="inspector-banner">
           <strong>Editor jump disabled.</strong> Set <span className="mono">VITE_WORKSPACE_ROOT</span>{" "}
           in <span className="mono">.env.local</span> to enable click-to-open.
         </div>
       ) : null}
       {groups.map((g) =>
-        g.node ? <EdgeFilesGroup key={g.label} label={g.label} node={g.node} /> : null,
+        g.node ? (
+          <EdgeFilesGroup key={g.label} label={g.label} node={g.node} workspaceRoot={workspaceRoot} />
+        ) : null,
       )}
     </>
   );
 }
 
-function EdgeFilesGroup({ label, node }: { label: string; node: NodeRecord }) {
+function EdgeFilesGroup({
+  label,
+  node,
+  workspaceRoot,
+}: {
+  label: string;
+  node: NodeRecord;
+  workspaceRoot?: string;
+}) {
   const sections: { key: string; label: string; files?: string[] }[] = [
     { key: "primary", label: "Primary", files: node.primary_files },
     { key: "secondary", label: "Secondary", files: node.secondary_files },
@@ -970,7 +1000,7 @@ function EdgeFilesGroup({ label, node }: { label: string; node: NodeRecord }) {
             <ul className="file-list">
               {s.files.map((f) => (
                 <li key={f}>
-                  <FileLink path={f} />
+                  <FileLink path={f} workspaceRoot={workspaceRoot} />
                 </li>
               ))}
             </ul>
@@ -1104,11 +1134,13 @@ function EdgeEndpointSection({
   node,
   fallbackId,
   onSelectNode,
+  workspaceRoot,
 }: {
   label: string;
   node: NodeRecord | null;
   fallbackId: string;
   onSelectNode(id: string): void;
+  workspaceRoot?: string;
 }) {
   if (!node) {
     return (
@@ -1138,7 +1170,7 @@ function EdgeEndpointSection({
         {node.primary_files && node.primary_files.length > 0 ? (
           <div className="endpoint-card-files">
             {node.primary_files.map((f) => (
-              <FileLink key={f} path={f} showCopy={false} />
+              <FileLink key={f} path={f} showCopy={false} workspaceRoot={workspaceRoot} />
             ))}
           </div>
         ) : null}
@@ -1179,10 +1211,12 @@ function FunctionsSection({
   node,
   title = "Functions",
   idHint,
+  workspaceRoot,
 }: {
   node: NodeRecord;
   title?: string;
   idHint?: string;
+  workspaceRoot?: string;
 }) {
   // Function lines come from the graph itself — backend persists
   // `metadata.function_lines: { "ShortName": [start, end] }` (graph adapter
@@ -1208,7 +1242,7 @@ function FunctionsSection({
           {idHint ? `${idHint} · ` : ""}
           {node.metadata?.functions?.length}
         </span>
-        {editorConfigured ? (
+        {isEditorConfigured(workspaceRoot) ? (
           <span className="head-hint" style={{ marginLeft: "auto" }}>
             {resolvedCount > 0
               ? `${resolvedCount} mapped to ${editorScheme}`
@@ -1219,7 +1253,12 @@ function FunctionsSection({
       <ul className="fn-list">
         {(node.metadata?.functions ?? []).map((fn) => (
           <li key={fn}>
-            <FunctionLink symbol={fn} primaryFiles={node.primary_files} lineMap={lineMap} />
+            <FunctionLink
+              symbol={fn}
+              primaryFiles={node.primary_files}
+              lineMap={lineMap}
+              workspaceRoot={workspaceRoot}
+            />
           </li>
         ))}
       </ul>
@@ -1282,10 +1321,12 @@ function FunctionLink({
   symbol,
   primaryFiles,
   lineMap,
+  workspaceRoot,
 }: {
   symbol: string;
   primaryFiles?: string[];
   lineMap: Map<string, number> | null;
+  workspaceRoot?: string;
 }) {
   const file = primaryFiles?.[0];
   const shortName = symbol.split("::").slice(-1)[0];
@@ -1297,7 +1338,7 @@ function FunctionLink({
     lineMap?.get(shortName) ??
     lineMap?.get(shortName.split(".").slice(-1)[0]) ??
     null;
-  const url = file ? editorUrl(file, line ?? undefined) : null;
+  const url = file ? editorUrl(file, line ?? undefined, undefined, workspaceRoot) : null;
   const tooltip = `${symbol}${file ? `\n→ ${file}${line ? `:${line}` : ""}` : ""}`;
   return (
     <span className="fn-link" title={tooltip}>
@@ -1318,7 +1359,7 @@ function FunctionLink({
   );
 }
 
-function FilesTab({ node }: { node: NodeRecord }) {
+function FilesTab({ node, workspaceRoot }: { node: NodeRecord; workspaceRoot?: string }) {
   const sections: { key: string; label: string; files?: string[] }[] = [
     { key: "primary", label: "Primary", files: node.primary_files },
     { key: "secondary", label: "Secondary", files: node.secondary_files },
@@ -1336,7 +1377,7 @@ function FilesTab({ node }: { node: NodeRecord }) {
   }
   return (
     <>
-      {!editorConfigured ? (
+      {!isEditorConfigured(workspaceRoot) ? (
         <div className="inspector-banner">
           <strong>Editor jump disabled.</strong> Set <span className="mono">VITE_WORKSPACE_ROOT</span>{" "}
           in <span className="mono">.env.local</span> to enable click-to-open.
@@ -1352,7 +1393,7 @@ function FilesTab({ node }: { node: NodeRecord }) {
           </div>
           <ul className="file-list">
             <li>
-              <FileLink path={fallback} />
+              <FileLink path={fallback} workspaceRoot={workspaceRoot} />
             </li>
           </ul>
         </section>
@@ -1362,7 +1403,7 @@ function FilesTab({ node }: { node: NodeRecord }) {
           <section key={s.key} className="inspector-section">
             <div className="inspector-section-title">
               {s.label} <span className="head-hint">{s.files.length}</span>
-              {editorConfigured ? (
+              {isEditorConfigured(workspaceRoot) ? (
                 <span className="head-hint" style={{ marginLeft: "auto" }}>
                   open in {editorScheme}
                 </span>
@@ -1371,7 +1412,7 @@ function FilesTab({ node }: { node: NodeRecord }) {
             <ul className="file-list">
               {s.files.map((f) => (
                 <li key={f}>
-                  <FileLink path={f} />
+                  <FileLink path={f} workspaceRoot={workspaceRoot} />
                 </li>
               ))}
             </ul>
@@ -1476,7 +1517,7 @@ function RelationsTab({
 // Functions tab — for L7 leaves with functions, hands off to FunctionsSection
 // so the rich "jump to <editor>" links are reused. For L4 / no-function
 // cases falls back to a helpful "n/a" message explaining why.
-function NodeFunctionsTab({ node }: { node: NodeRecord }) {
+function NodeFunctionsTab({ node, workspaceRoot }: { node: NodeRecord; workspaceRoot?: string }) {
   const functions = node.metadata?.functions ?? [];
   const isL4 = node.layer === "L4";
   if (isL4) {
@@ -1509,7 +1550,7 @@ function NodeFunctionsTab({ node }: { node: NodeRecord }) {
   }
   // Populated → reuse FunctionsSection so the editor-jump UI stays consistent
   // with the rest of the inspector. Single source of truth for function rows.
-  return <FunctionsSection node={node} />;
+  return <FunctionsSection node={node} workspaceRoot={workspaceRoot} />;
 }
 
 // Problems tab — explains the feature-health deductions for this node.
@@ -1666,17 +1707,24 @@ function EdgeFunctionsTab({
   edge,
   src,
   dst,
+  workspaceRoot,
 }: {
   edge: PinnedEdge;
   src: NodeRecord | null;
   dst: NodeRecord | null;
+  workspaceRoot?: string;
 }) {
   const srcFns = src?.metadata?.functions ?? [];
   const dstFns = dst?.metadata?.functions ?? [];
   return (
     <>
       {src && srcFns.length > 0 ? (
-        <FunctionsSection node={src} title="Source functions" idHint={src.node_id ?? edge.src} />
+        <FunctionsSection
+          node={src}
+          title="Source functions"
+          idHint={src.node_id ?? edge.src}
+          workspaceRoot={workspaceRoot}
+        />
       ) : (
         <section className="inspector-section">
           <div className="inspector-section-title">
@@ -1686,7 +1734,12 @@ function EdgeFunctionsTab({
         </section>
       )}
       {dst && dstFns.length > 0 ? (
-        <FunctionsSection node={dst} title="Target functions" idHint={dst.node_id ?? edge.dst} />
+        <FunctionsSection
+          node={dst}
+          title="Target functions"
+          idHint={dst.node_id ?? edge.dst}
+          workspaceRoot={workspaceRoot}
+        />
       ) : (
         <section className="inspector-section">
           <div className="inspector-section-title">

@@ -17,19 +17,26 @@ const EDITOR_SCHEME = ((import.meta.env.VITE_EDITOR_SCHEME as string | undefined
 export const editorConfigured: boolean = RAW_ROOT.trim().length > 0;
 export const editorScheme: string = EDITOR_SCHEME;
 
-const NORMALIZED_ROOT = (() => {
-  if (!RAW_ROOT) return "";
+function normalizeRoot(root: string | undefined | null): string {
+  if (!root) return "";
   // Normalize backslashes (Windows) to forward slashes for URI building.
   // Strip a trailing slash so we always join with a single one.
-  return RAW_ROOT.replace(/\\/g, "/").replace(/\/+$/, "");
-})();
+  return root.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+const NORMALIZED_ROOT = normalizeRoot(RAW_ROOT);
 
 export const workspaceRoot = NORMALIZED_ROOT;
 
-function joinAbsolute(rel: string): string {
-  if (!NORMALIZED_ROOT) return "";
+export function isEditorConfigured(rootOverride?: string | null): boolean {
+  return normalizeRoot(rootOverride || RAW_ROOT).length > 0;
+}
+
+function joinAbsolute(rel: string, rootOverride?: string | null): string {
+  const root = normalizeRoot(rootOverride || RAW_ROOT);
+  if (!root) return "";
   const cleanRel = rel.replace(/\\/g, "/").replace(/^\/+/, "");
-  return `${NORMALIZED_ROOT}/${cleanRel}`;
+  return `${root}/${cleanRel}`;
 }
 
 /**
@@ -39,9 +46,14 @@ function joinAbsolute(rel: string): string {
  * Line + column are 1-based. Most editors silently ignore them when not
  * present in the URI.
  */
-export function editorUrl(relPath: string, line?: number, col?: number): string | null {
-  if (!editorConfigured) return null;
-  const abs = joinAbsolute(relPath);
+export function editorUrl(
+  relPath: string,
+  line?: number,
+  col?: number,
+  rootOverride?: string | null,
+): string | null {
+  if (!isEditorConfigured(rootOverride)) return null;
+  const abs = joinAbsolute(relPath, rootOverride);
   // Windows absolute paths look like "C:/foo" — VS Code wants the URI
   // form "vscode://file/C:/foo". JetBrains expects an unencoded path
   // in a query string. We pick per scheme.

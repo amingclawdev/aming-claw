@@ -302,6 +302,20 @@ function verifyProjectImportUiContract() {
   ok("Projects page exposes import directory picker contract");
 }
 
+function verifyEditorJumpWorkspaceContract() {
+  phase("editor jump workspace contract");
+  const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
+  const editorSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/editor.ts"), "utf8");
+  const fileLinkSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/FileLink.tsx"), "utf8");
+  const inspectorSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/components/InspectorDrawer.tsx"), "utf8");
+  assert(appSource.includes("activeWorkspaceRoot"), "App does not derive the active project workspace root");
+  assert(appSource.includes("workspaceRoot={activeWorkspaceRoot}"), "App does not pass workspace root into the inspector");
+  assert(editorSource.includes("rootOverride"), "editorUrl does not accept a workspace root override");
+  assert(fileLinkSource.includes("workspaceRoot?: string"), "FileLink cannot receive an active project workspace root");
+  assert(inspectorSource.includes("workspaceRoot={workspaceRoot}"), "Inspector does not propagate workspace root to file/function links");
+  ok("editor jump resolves through active project workspace contract");
+}
+
 async function main() {
   console.log(c("bold", "dashboard-projects-e2e"));
   console.log(c("dim", `backend=${BACKEND} project=${PROJECT} workspace=${WORKSPACE} apply=${APPLY}`));
@@ -309,6 +323,7 @@ async function main() {
   try {
     await http("GET", "/api/health");
     verifyProjectImportUiContract();
+    verifyEditorJumpWorkspaceContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();
     const runtime = await verifyGraphRuntime(project);

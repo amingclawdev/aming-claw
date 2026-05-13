@@ -763,6 +763,10 @@ export default function App() {
     if (!data || !selectedNodeId) return null;
     return data.nodes.find((n) => n.node_id === selectedNodeId) ?? null;
   }, [data, selectedNodeId]);
+  const activeWorkspaceRoot = useMemo(
+    () => projects.find((p) => p.project_id === currentProjectId)?.workspace_path || "",
+    [currentProjectId, projects],
+  );
 
   const handleSelectNode = useCallback((id: string) => {
     // Tree / drawer / FocusCard navigation always sets focus, even in
@@ -953,6 +957,7 @@ export default function App() {
                       | Record<string, unknown>
                       | undefined) ?? null
                   }
+                  workspaceRoot={activeWorkspaceRoot}
                   onSelectNode={handleSelectNode}
                   onClose={() => {
                     setSelectedNodeId(null);
