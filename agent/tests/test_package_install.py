@@ -91,8 +91,10 @@ class TestPackagedDashboardAssets:
         assert "recursive-include agent/governance/dashboard_dist *" in manifest
         assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
+        assert "recursive-include skills/aming-claw-launcher *" in manifest
         assert "include LICENSE" in manifest
         assert "include .codex-plugin/plugin.json" in manifest
+        assert "include .claude-plugin/plugin.json" in manifest
         assert "include .agents/plugins/marketplace.json" in manifest
         assert "include CLAUDE.md" in manifest
 
@@ -168,3 +170,42 @@ class TestLocalPluginPackaging:
         assert scripts["aming-claw"] == "agent.cli:main"
         assert scripts["aming-governance"] == "agent.governance.server:main"
         assert scripts["aming-governance-host"] == "start_governance:main"
+
+
+class TestClaudePluginPackaging:
+    """MVP contract for Claude Code local-plugin packaging (parity with Codex)."""
+
+    def test_claude_plugin_manifest_exists_and_is_valid_json(self):
+        manifest_path = ROOT / ".claude-plugin" / "plugin.json"
+        assert manifest_path.is_file(), "missing .claude-plugin/plugin.json"
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        assert manifest["name"] == "aming-claw"
+        assert manifest.get("description"), "manifest must declare a description"
+
+    def test_claude_plugin_auto_discovered_assets_exist(self):
+        # Claude Code auto-discovers skills/ and .mcp.json from the plugin root,
+        # so the manifest itself does not have to point at them. We assert they
+        # exist where the runtime expects them.
+        assert (ROOT / "skills" / "aming-claw" / "SKILL.md").is_file()
+        assert (ROOT / "skills" / "aming-claw-launcher" / "SKILL.md").is_file()
+        assert (ROOT / ".mcp.json").is_file()
+        assert (ROOT / "CLAUDE.md").is_file()
+
+    def test_claude_launcher_skill_documents_cli_surface(self):
+        skill = (ROOT / "skills" / "aming-claw-launcher" / "SKILL.md").read_text(encoding="utf-8")
+
+        assert skill.startswith("---"), "launcher skill must start with YAML frontmatter"
+        assert "name: aming-claw-launcher" in skill
+        assert "description:" in skill
+        # Launcher skill must document the preview/start/open/status surface.
+        for command in ("aming-claw launcher", "aming-claw start", "aming-claw status", "aming-claw open"):
+            assert command in skill, f"launcher skill missing reference to `{command}`"
+        # Launcher skill must hand off to the main governance skill for non-preview work.
+        assert "aming-claw/SKILL.md" in skill
+
+    def test_claude_plugin_manifest_does_not_leak_user_machine_paths(self):
+        manifest_text = (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+        assert "C:\\Users\\" not in manifest_text
+        assert "/home/" not in manifest_text

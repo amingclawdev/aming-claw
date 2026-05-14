@@ -1,0 +1,18 @@
+{
+  "name": "aming-claw",
+  "version": "0.1.0",
+  "description": "Graph-first governance workflow guard for Aming Claw. Bundles the aming-claw governance skill, the aming-claw-launcher onboarding skill, and the project MCP server (.mcp.json) so Claude Code sessions start with backlog/MF discipline, ServiceManager-aware runtime checks, and dashboard governance context.",
+  "author": {
+    "name": "Aming Claw"
+  },
+  "homepage": "https://github.com/web3ToolBoxDev/aming_claw",
+  "repository": "https://github.com/web3ToolBoxDev/aming_claw",
+  "keywords": [
+    "governance",
+    "graph",
+    "dashboard",
+    "mcp",
+    "manual-fix",
+    "workflow"
+  ]
+}

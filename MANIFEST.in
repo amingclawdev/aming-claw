@@ -1,8 +1,10 @@
 recursive-include agent/governance/dashboard_dist *
 recursive-include agent/mcp/resources *
 recursive-include skills/aming-claw *
+recursive-include skills/aming-claw-launcher *
 include LICENSE
 include .codex-plugin/plugin.json
+include .claude-plugin/plugin.json
 include .agents/plugins/marketplace.json
 include .mcp.json
 include CLAUDE.md

@@ -6,6 +6,9 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 
 - Codex local plugin shape is present: `.codex-plugin/plugin.json`,
   `skills/aming-claw/`, and `.mcp.json`.
+- Claude Code local plugin shape is present: `.claude-plugin/plugin.json`
+  at the repo root; `skills/` and `.mcp.json` are auto-discovered. Skills
+  are namespaced `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher`.
 - MCP runs through the stdio module entrypoint:
   `python -m agent.mcp.server --project aming-claw --workers 0`.
 - Governance and ServiceManager stay host-owned. Plugin MCP sessions should
@@ -22,18 +25,38 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 
 ## Layout
 
-- `.codex-plugin/plugin.json`: plugin manifest.
+- `.codex-plugin/plugin.json`: Codex local plugin manifest (explicit
+  `skills` and `mcpServers` pointers).
 - `.agents/plugins/marketplace.json`: repo-local Codex marketplace entry that
   installs this root plugin by default for local/plugin sessions.
-- `skills/aming-claw/`: session-loadable skill and references.
+- `.claude-plugin/plugin.json`: Claude Code plugin manifest. `skills/` and
+  `.mcp.json` are auto-discovered from the plugin root, so the manifest only
+  declares `name` + `description` + metadata.
+- `skills/aming-claw/`: main governance skill loaded for graph, backlog, MF,
+  semantic, and chain work.
+- `skills/aming-claw-launcher/`: onboarding skill loaded for preview, start,
+  status, and dashboard flows.
 - `.mcp.json`: active MCP server config using `agent.mcp.server`.
 
-The manifest points to:
+The Codex manifest points to:
 
 ```json
 {
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"
+}
+```
+
+The Claude Code manifest relies on auto-discovery — no explicit pointers
+needed for skills or MCP. Sample shape:
+
+```json
+{
+  "name": "aming-claw",
+  "version": "0.1.0",
+  "description": "Graph-first governance workflow guard ...",
+  "author": { "name": "Aming Claw" },
+  "keywords": ["governance", "graph", "mcp"]
 }
 ```
 
@@ -53,9 +76,10 @@ needed.
 `.mcp.json` must remain relocatable. Use `"cwd": "."` and avoid absolute
 developer-machine paths such as `C:\Users\...`; package tests enforce this.
 
-Claude Code reads project-scoped MCP servers from `.mcp.json`; Codex local
-plugin packaging reads the plugin manifest's `mcpServers` pointer. Keeping the
-same stdio entrypoint lets both surfaces reuse one MCP contract.
+Claude Code reads project-scoped MCP servers from `.mcp.json` (auto-discovered
+from the plugin root when packaged as a plugin); Codex local plugin packaging
+reads the plugin manifest's `mcpServers` pointer. Keeping the same stdio
+entrypoint at `.mcp.json` lets both surfaces reuse one MCP contract.
 
 ## Compatibility Checks
 
@@ -79,7 +103,7 @@ is available.
 | --- | --- | --- |
 | Pip package | `pyproject.toml` exposes `aming-claw`, `aming-governance`, and `aming-governance-host`; dashboard assets are synced into `agent/governance/dashboard_dist` before wheel build. | Run clean wheel install smoke on each release target. |
 | Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; `.agents/plugins/marketplace.json` points at the repo root plugin and marks it installed by default for local sessions. Tests ensure paths exist and `.mcp.json` is relocatable. | Sanitize env and host URLs before publishing outside trusted local/team installs. |
-| Claude Code project plugin/settings | Project-level `CLAUDE.md` and `.mcp.json` describe the local MCP contract. | Global Claude Code settings remain out of scope for v1. |
+| Claude Code local plugin | `.claude-plugin/plugin.json` at repo root + project-level `CLAUDE.md` + `.mcp.json`. Skills auto-discovered as `/aming-claw:aming-claw` (governance) and `/aming-claw:aming-claw-launcher` (onboarding). Install via `/plugin marketplace add <path-or-git-url>` then `/plugin install aming-claw@<marketplace>`. | Add `.claude-plugin/marketplace.json` only when distributing outside this repo; sanitize env/host URLs. Global Claude Code settings remain out of scope. |
 | Cross-platform desktop | Windows, macOS, and Linux directory picker fallbacks are implemented with manual entry fallback. | Add real-machine smoke evidence for macOS and Linux/WSL before public release. |
 
 ## Publish Caution
