@@ -39,7 +39,8 @@ export type ViewName = "projects" | "overview" | "graph" | "operations" | "revie
 
 const DASHBOARD_PROJECT_STORAGE_KEY = "aming-claw.dashboard.projectId";
 const DASHBOARD_SIDEBAR_COLLAPSED_STORAGE_KEY = "aming-claw.dashboard.sidebarCollapsed";
-const DASHBOARD_PROJECT_PARAM = "project";
+const DASHBOARD_PROJECT_ID_PARAM = "project_id";
+const DASHBOARD_LEGACY_PROJECT_PARAM = "project";
 const DASHBOARD_VIEW_PARAM = "view";
 const DASHBOARD_WORKSPACE_PARAM = "workspace";
 const DASHBOARD_VIEWS: readonly ViewName[] = ["projects", "overview", "graph", "operations", "review", "backlog"];
@@ -66,7 +67,9 @@ function readDashboardLocation(): { projectId: string; view: ViewName; hasProjec
     return { projectId: DEFAULT_PROJECT_ID, view: "projects", hasProjectParam: false, workspacePath: "" };
   }
   const params = new URLSearchParams(window.location.search);
-  const projectParam = params.get(DASHBOARD_PROJECT_PARAM);
+  const projectIdParam = params.get(DASHBOARD_PROJECT_ID_PARAM);
+  const legacyProjectParam = params.get(DASHBOARD_LEGACY_PROJECT_PARAM);
+  const projectParam = projectIdParam?.trim() ? projectIdParam : legacyProjectParam;
   return {
     projectId: normalizeProjectId(projectParam || readStoredProjectId()),
     view: normalizeViewName(params.get(DASHBOARD_VIEW_PARAM)),
@@ -106,7 +109,8 @@ function writeDashboardLocation(projectId: string, view: ViewName, mode: "push" 
   if (typeof window === "undefined") return;
   const nextProjectId = normalizeProjectId(projectId);
   const url = new URL(window.location.href);
-  url.searchParams.set(DASHBOARD_PROJECT_PARAM, nextProjectId);
+  url.searchParams.set(DASHBOARD_PROJECT_ID_PARAM, nextProjectId);
+  url.searchParams.delete(DASHBOARD_LEGACY_PROJECT_PARAM);
   url.searchParams.set(DASHBOARD_VIEW_PARAM, view);
   const nextUrl = `${url.pathname}${url.search}${url.hash}`;
   const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;

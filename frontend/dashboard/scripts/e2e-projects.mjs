@@ -386,6 +386,11 @@ function verifyProjectScopedFetchContract() {
   phase("project-scoped fetch contract");
   const appSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/App.tsx"), "utf8");
   const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  assert(appSource.includes('const DASHBOARD_PROJECT_ID_PARAM = "project_id"'), "Dashboard should expose canonical project_id URL parameter");
+  assert(appSource.includes('const DASHBOARD_LEGACY_PROJECT_PARAM = "project"'), "Dashboard should retain legacy project URL fallback");
+  assert(appSource.includes("projectIdParam?.trim() ? projectIdParam : legacyProjectParam"), "Dashboard should prefer explicit project_id over legacy project param");
+  assert(appSource.includes("url.searchParams.set(DASHBOARD_PROJECT_ID_PARAM"), "Dashboard should write canonical project_id URLs");
+  assert(appSource.includes("url.searchParams.delete(DASHBOARD_LEGACY_PROJECT_PARAM)"), "Dashboard should remove stale legacy project URL param");
   assert(appSource.includes("const requestProjectId = currentProjectId"), "fetchAll should capture the active project_id for one request cycle");
   assert(appSource.includes("setAiConfig(null)"), "Project switch should clear stale AI config before the next project load");
   for (const token of ["statusFor(requestProjectId", "activeSummaryFor(requestProjectId", "activeProjectionFor(requestProjectId", "operationsQueueFor(requestProjectId", "backlogFor(requestProjectId", "nodesFor(requestProjectId", "edgesFor(requestProjectId", "feedbackQueueFor(requestProjectId"]) {

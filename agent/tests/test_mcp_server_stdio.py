@@ -167,7 +167,7 @@ def test_mcp_current_context_prefers_workspace_project_config(tmp_path: Path):
     assert "dashboard_project_id: `-`" in current_text
     assert "active_project_id: `instructor`" in current_text
     assert "context_source: `workspace_config`" in current_text
-    assert "dashboard?project=instructor" in current_text
+    assert "dashboard?project_id=instructor" in current_text
 
     project_text = responses[1]["result"]["contents"][0]["text"]
     assert "default_project_id: `aming-claw`" in project_text
@@ -241,7 +241,7 @@ def test_mcp_current_context_online_current_graph_shows_minimal_actions(tmp_path
     text = server._current_context_text("instructor")
 
     assert "project_id: `instructor`" in text
-    assert "dashboard?project=instructor&view=graph" in text
+    assert "dashboard?project_id=instructor&view=graph" in text
     assert "graph: snapshot `full-abcdef-1234` stale `False` pending_scope `0`" in text
     assert "operations_queue: count `3`" in text
     assert "backlog: open `4`" in text
@@ -285,7 +285,7 @@ def test_mcp_current_context_online_missing_graph_opens_projects(tmp_path: Path)
 
     text = server._current_context_text("instructor")
 
-    assert "dashboard?project=instructor&view=projects" in text
+    assert "dashboard?project_id=instructor&view=projects" in text
     actions = _primary_action_lines(text)
     assert len(actions) == 3
     assert "Initialize Project" in actions[0]

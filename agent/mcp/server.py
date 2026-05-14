@@ -278,8 +278,8 @@ class AmingClawMCP:
         if not graph.get("error"):
             graph_missing = graph_missing or not str(graph.get("active_snapshot_id") or "").strip()
         dashboard_view = "projects" if graph_missing else "graph"
-        dashboard_url = f"{self.gov_url}/dashboard?project={project_id}&view={dashboard_view}"
-        dashboard_graph_url = f"{self.gov_url}/dashboard?project={project_id}&view=graph"
+        dashboard_url = f"{self.gov_url}/dashboard?project_id={project_id}&view={dashboard_view}"
+        dashboard_graph_url = f"{self.gov_url}/dashboard?project_id={project_id}&view=graph"
         health_line = self._format_context_health(health)
         version_line = self._format_context_version(version)
         graph_line = self._format_context_graph(graph)
