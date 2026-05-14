@@ -74,3 +74,7 @@ See [API Overview](docs/api/README.md) for the full API reference.
 - **2026-03-28**: Phase 8 Chain Context — event-sourced chain runtime context, crash recovery, retry prompt fallback
 - **2026-03-26**: Auto-chain fully wired. PM → Dev → Test → QA → Merge → Deploy runs end-to-end with gate validation
 - **2026-03-26**: Old Telegram bot system fully removed. Unified on Governance API. Observer pattern is now the primary interaction model
+
+## License
+
+Aming Claw is licensed under the Functional Source License, Version 1.1, MIT Future License (FSL-1.1-MIT). See [LICENSE](LICENSE).

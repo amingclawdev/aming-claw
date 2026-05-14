@@ -2,6 +2,7 @@
   "name": "aming-claw",
   "version": "0.1.0",
   "description": "Codex plugin packaging for Aming Claw governance skills and MCP tools.",
+  "license": "FSL-1.1-MIT",
   "keywords": [
     "governance",
     "graph",

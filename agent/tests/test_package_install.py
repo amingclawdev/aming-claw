@@ -62,6 +62,15 @@ class TestPyprojectOptionalDeps:
         assert "docker" in opt
         assert "full" in opt
 
+    def test_project_license_points_to_fsl_file(self):
+        data = _load_pyproject()
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+
+        assert data["project"]["license"] == {"file": "LICENSE"}
+        assert "Functional Source License, Version 1.1, MIT Future License" in license_text
+        assert "FSL-1.1-MIT" in license_text
+        assert "Copyright 2026 Aming Claw" in license_text
+
 
 class TestPackagedDashboardAssets:
     def test_pyproject_includes_dashboard_dist_package_data(self):
@@ -82,6 +91,7 @@ class TestPackagedDashboardAssets:
         assert "recursive-include agent/governance/dashboard_dist *" in manifest
         assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
+        assert "include LICENSE" in manifest
         assert "include .codex-plugin/plugin.json" in manifest
         assert "include .agents/plugins/marketplace.json" in manifest
         assert "include CLAUDE.md" in manifest
@@ -107,6 +117,7 @@ class TestLocalPluginPackaging:
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 
         assert manifest["name"] == "aming-claw"
+        assert manifest["license"] == "FSL-1.1-MIT"
         assert (ROOT / manifest["skills"]).is_dir()
         assert (ROOT / manifest["mcpServers"]).is_file()
         assert "MCP" in manifest["interface"]["capabilities"]
