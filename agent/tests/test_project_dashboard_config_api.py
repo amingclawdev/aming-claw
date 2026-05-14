@@ -188,6 +188,44 @@ def test_project_ai_config_endpoint_updates_project_routing(tmp_path, monkeypatc
     assert payload["project_config"]["ai"]["routing"]["semantic"]["model"] == "claude-sonnet-4-5"
 
 
+def test_project_ai_config_update_creates_missing_project_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server.project_service,
+        "list_projects",
+        lambda: [{
+            "project_id": "dashboard-demo",
+            "workspace_path": str(tmp_path),
+            "status": "active",
+        }],
+    )
+
+    payload = server.handle_project_ai_config_update(_ctx(
+        "dashboard-demo",
+        method="POST",
+        body={
+            "routing": {
+                "semantic": {"provider": "anthropic", "model": "claude-opus-4-7"},
+                "dev": {"provider": "openai", "model": "gpt-5.4"},
+            },
+            "actor": "dashboard-test",
+        },
+    ))
+
+    config_path = tmp_path / ".aming-claw.yaml"
+    assert config_path.is_file()
+    assert payload["ok"] is True
+    assert payload["updated"] is True
+    assert payload["project_config_error"] == ""
+    assert payload["project_config"]["ai"]["routing"]["semantic"] == {
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+    }
+    assert payload["project_config"]["ai"]["routing"]["dev"]["model"] == "gpt-5.4"
+    text = config_path.read_text(encoding="utf-8")
+    assert "project_id: dashboard-demo" in text
+    assert "language:" in text
+
+
 def test_project_git_ref_endpoints_return_and_persist_selected_ref(tmp_path, monkeypatch):
     projects = {
         "dashboard-demo": {

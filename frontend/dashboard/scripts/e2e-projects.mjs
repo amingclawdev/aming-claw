@@ -440,6 +440,7 @@ function verifyAiConfigProjectScopeContract() {
   assert(appSource.includes("aiConfig={aiConfig}"), "Action modal should receive active project AI config");
   assert(actionSource.includes("AI enrich blocked: configure this project's semantic provider/model"), "Action modal should block unconfigured live AI");
   assert(actionSource.includes("tool.status !== \"detected\""), "Action modal should block missing local CLI tools");
+  assert(serverSource.includes("update_project_ai_routing(root, routing, project_id=project_id)"), "AI config save should create/update the active project's local config");
   assert(serverSource.includes("tool_health"), "Backend ai-config response should expose tool health");
   assert(serverSource.includes("AI_MODEL_CATALOG"), "Backend ai-config response should expose model catalog");
   ok("AI config shows local CLI requirements and blocks unconfigured live enrich");

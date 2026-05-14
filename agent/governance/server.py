@@ -1488,7 +1488,7 @@ def handle_project_ai_config_update(ctx: RequestContext):
     try:
         from project_config import update_project_ai_routing
 
-        cfg = update_project_ai_routing(root, routing)
+        cfg = update_project_ai_routing(root, routing, project_id=project_id)
     except Exception as exc:
         return 400, {"error": f"ai config update failed: {exc}"}
     if cfg.project_id != project_id:

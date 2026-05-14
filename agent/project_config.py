@@ -697,6 +697,8 @@ def _routing_map(raw: Any) -> Dict[str, Dict[str, str]]:
 def update_project_ai_routing(
     workspace_path: Path,
     routing: Dict[str, Dict[str, str]],
+    *,
+    project_id: str = "",
 ) -> ProjectConfig:
     """Update ``ai.routing`` in a project's local config file and reload it.
 
@@ -705,14 +707,25 @@ def update_project_ai_routing(
     """
     workspace_path = Path(workspace_path)
     config_file = _find_config_file(workspace_path)
-    if not config_file:
-        raise FileNotFoundError(
-            f"No .aming-claw.yaml or .aming-claw.json found at {workspace_path}"
-        )
-    if config_file.suffix == ".json":
-        raw = _try_load_json(config_file)
+    if config_file:
+        if config_file.suffix == ".json":
+            raw = _try_load_json(config_file)
+        else:
+            raw = _try_load_yaml(config_file)
     else:
-        raw = _try_load_yaml(config_file)
+        detected = generate_default_config(str(workspace_path), project_id or workspace_path.name)
+        raw = {
+            "project_id": project_id or detected.project_id,
+            "language": detected.language,
+            "testing": {
+                "unit_command": detected.testing.unit_command,
+            },
+            "governance": {
+                "enabled": detected.governance.enabled,
+                "test_tool_label": detected.governance.test_tool_label,
+            },
+        }
+        config_file = workspace_path / ".aming-claw.yaml"
     if not isinstance(raw, dict):
         raw = {}
 
