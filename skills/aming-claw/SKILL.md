@@ -83,6 +83,8 @@ The launcher should be status-aware:
 - If governance is online, include the dashboard link, project id, runtime
   version, graph stale state, operations queue count, and open backlog count
   when known.
+- If the active project differs from the plugin default project, call that out
+  before recommending graph or backlog actions.
 - If governance is offline or current context is missing, show the explicit
   startup flow:
 
@@ -95,8 +97,8 @@ The launcher should be status-aware:
   the primary next action.
 - If graph is stale, make "Review Impact / Reconcile Graph" the primary next
   action.
-- If graph is current, offer "Open Dashboard", "Explore Graph", "View
-  Backlog", and "Start Work".
+- If graph is current, keep the primary actions to three: "Check Current
+  Project Status", "Find PR Opportunities", and "Explain Graph Concepts".
 
 Codex-owned MVP behavior:
 
@@ -104,6 +106,9 @@ Codex-owned MVP behavior:
   labels and links/copyable commands. If the host app supports interactive
   choice buttons, use them; otherwise ask the user to click the link or reply
   with the action label.
+- Prefer the `## Primary Next Actions` emitted by
+  `aming-claw://current-context` or `aming-claw://project/<project_id>/context`;
+  do not expand it into a long menu unless the user asks.
 - Keep the panel short enough to fit above the fold. Do not replace normal
   task work with a long tutorial.
 - Show it once per fresh session unless the user asks for help, onboarding, or
@@ -111,16 +116,13 @@ Codex-owned MVP behavior:
 - For concept actions, explain only the selected concept first: graph, node,
   edge, snapshot, semantic enrichment, backlog, or browser collaboration.
 
-Suggested launcher actions:
+Suggested action labels:
 
-- Open Dashboard
+- Check Current Project Status
+- Find PR Opportunities
+- Explain Graph Concepts
 - Initialize Project
-- Use Browser Collaboration
-- Explain Graph / Nodes / Edges
-- Check Runtime And Graph
-- View Operations Queue
-- Create Or Update Backlog
-- Start A Code Change
+- Update Graph
 
 Do not silently start services. Browser or dashboard buttons may open URLs or
 copy commands, but must not execute local shell commands.

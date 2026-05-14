@@ -273,6 +273,7 @@ class AmingClawMCP:
         version = self._request_json("GET", f"{self.gov_url}/api/version-check/{project_id}", timeout=2)
         graph = self._request_json("GET", f"{self.gov_url}/api/graph-governance/{project_id}/status", timeout=2)
         ops = self._request_json("GET", f"{self.gov_url}/api/graph-governance/{project_id}/operations/queue", timeout=2)
+        backlog = self._request_json("GET", f"{self.gov_url}/api/backlog/{project_id}?status=OPEN", timeout=2)
         graph_missing = context["graph_missing"]
         if not graph.get("error"):
             graph_missing = graph_missing or not str(graph.get("active_snapshot_id") or "").strip()
@@ -283,6 +284,19 @@ class AmingClawMCP:
         version_line = self._format_context_version(version)
         graph_line = self._format_context_graph(graph)
         ops_line = self._format_context_ops(ops)
+        backlog_line = self._format_context_backlog(backlog)
+        project_note = self._format_context_project_note(context)
+        primary_actions = self._context_primary_actions(
+            context=context,
+            health=health,
+            graph=graph,
+            dashboard_url=dashboard_url,
+        )
+        project_note_lines = [f"- selected_project_note: {project_note}"] if project_note else []
+        action_lines = [
+            f"{idx}. **{label}** - {detail}"
+            for idx, (label, detail) in enumerate(primary_actions, start=1)
+        ]
         return "\n".join([
             "# Aming Claw Current Context",
             "",
@@ -301,18 +315,20 @@ class AmingClawMCP:
             f"- version: {version_line}",
             f"- graph: {graph_line}",
             f"- operations_queue: {ops_line}",
+            f"- backlog: {backlog_line}",
+            *project_note_lines,
             "",
-            "## Startup Checklist",
+            "## Primary Next Actions",
             "",
-            "1. Read `aming-claw://skill`.",
-            "2. Read `aming-claw://seed-graph-summary` if governance is offline or this is a fresh package install.",
-            "3. If the dashboard URL contains `?project=...`, read `aming-claw://project/<project_id>/context` before graph/backlog operations.",
-            "4. If `dashboard_url` opens Projects, bootstrap or build/update graph before drawing conclusions from graph data.",
-            "5. Check `health`, `version_check`, `graph_status`, `graph_operations_queue`, and open backlog.",
-            "6. Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
-            "7. File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
-            "8. Use the dashboard as a visual control plane when browser-use is available.",
-            "9. If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
+            *action_lines,
+            "",
+            "## Guardrails",
+            "",
+            "- Read `aming-claw://skill` before mutations.",
+            "- Call `graph_query` with `tool=query_schema` before broad filesystem scans.",
+            "- File or update a backlog row before code, docs, config, dashboard, runtime, or graph mutations.",
+            "- Use browser-use/dashboard as the shared visual control plane when available.",
+            "- If governance is offline, ask the user to run `aming-claw start` or open the launcher; do not silently start services.",
             "",
         ])
 
@@ -439,6 +455,75 @@ class AmingClawMCP:
         if payload.get("error"):
             return f"`unavailable` ({payload['error']})"
         return f"count `{payload.get('count', '-')}`"
+
+    @staticmethod
+    def _format_context_backlog(payload: dict) -> str:
+        if payload.get("error"):
+            return f"`unavailable` ({payload['error']})"
+        count = payload.get("count")
+        if count is None and isinstance(payload.get("bugs"), list):
+            count = len(payload["bugs"])
+        return f"open `{count if count is not None else '-'}`"
+
+    @staticmethod
+    def _format_context_project_note(context: dict[str, Any]) -> str:
+        active = context.get("active_project_id")
+        default = context.get("default_project_id")
+        if active and default and active != default:
+            return (
+                f"active project `{active}` differs from default `{default}`; "
+                "use the active project for graph and backlog actions."
+            )
+        return ""
+
+    @staticmethod
+    def _context_graph_state(context: dict[str, Any], graph: dict) -> str:
+        if graph.get("error"):
+            return "unknown"
+        if context.get("graph_missing") or not str(graph.get("active_snapshot_id") or "").strip():
+            return "missing"
+        state = graph.get("current_state") or {}
+        stale = (state.get("graph_stale") or {}).get("is_stale")
+        if stale is True:
+            return "stale"
+        if stale is False:
+            return "current"
+        return "unknown"
+
+    @classmethod
+    def _context_primary_actions(
+        cls,
+        *,
+        context: dict[str, Any],
+        health: dict,
+        graph: dict,
+        dashboard_url: str,
+    ) -> list[tuple[str, str]]:
+        if health.get("error"):
+            return [
+                ("Start Services", "run `aming-claw launcher` then `aming-claw start`; MCP will not auto-start services."),
+                ("Read Seed Graph", "open `aming-claw://seed-graph-summary` for packaged project context."),
+                ("Check Current Project Status", "read this resource again after governance is online."),
+            ]
+
+        graph_state = cls._context_graph_state(context, graph)
+        if graph_state == "missing":
+            return [
+                ("Initialize Project", f"open `{dashboard_url}` and bootstrap or build the graph."),
+                ("Check Current Project Status", "confirm active project, runtime, graph, queue, and backlog before analysis."),
+                ("Explain Graph Concepts", "ask for a short explanation of graph, node, edge, snapshot, and backlog."),
+            ]
+        if graph_state == "stale":
+            return [
+                ("Update Graph", f"open `{dashboard_url}` and run the visible graph update action."),
+                ("Check Current Project Status", "review graph stale/current, operations queue, and open backlog."),
+                ("Find PR Opportunities", "after graph is current, rank candidates by graph evidence."),
+            ]
+        return [
+            ("Check Current Project Status", "summarize runtime, graph, operations queue, semantic/review state, and backlog."),
+            ("Find PR Opportunities", "use graph-native queries for high fan-out, low coverage, docs/tests gaps, and risky edges."),
+            ("Explain Graph Concepts", "give the user a compact graph/node/edge/snapshot/backlog walkthrough."),
+        ]
 
     def run(self) -> None:
         """Start services, enter stdin read loop, shutdown on EOF."""

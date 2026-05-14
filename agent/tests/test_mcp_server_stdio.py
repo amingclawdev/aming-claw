@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+from agent.mcp.server import AmingClawMCP
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -123,6 +126,10 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     assert "project_id: `aming-claw`" in context_text
     assert "dashboard_url:" in context_text
     assert "health: `unavailable`" in context_text
+    assert "backlog: `unavailable`" in context_text
+    assert "## Primary Next Actions" in context_text
+    assert "Start Services" in context_text
+    assert "aming-claw start" in context_text
     assert "Call `graph_query` with `tool=query_schema`" in context_text
     seed = json.loads(responses[4]["result"]["contents"][0]["text"])
     assert seed["project_id"] == "aming-claw"
@@ -168,3 +175,119 @@ def test_mcp_current_context_prefers_workspace_project_config(tmp_path: Path):
     assert "dashboard_project_id: `dashboard-e2e-demo`" in project_text
     assert "active_project_id: `dashboard-e2e-demo`" in project_text
     assert "context_source: `resource_uri`" in project_text
+
+
+def _server_with_context_payloads(
+    tmp_path: Path,
+    *,
+    graph: dict,
+    project_id: str = "instructor",
+    projects: list[dict] | None = None,
+    backlog_count: int = 2,
+    health: dict | None = None,
+) -> AmingClawMCP:
+    workspace = tmp_path / project_id
+    workspace.mkdir()
+    if projects is None:
+        projects = [
+            {
+                "project_id": project_id,
+                "workspace_path": str(workspace),
+                "active_snapshot_id": graph.get("active_snapshot_id"),
+            }
+        ]
+    server = AmingClawMCP(
+        project_id="aming-claw",
+        governance_url="http://governance.test",
+        manager_url="http://manager.test",
+        workspace=str(workspace),
+        redis_url="redis://unused",
+    )
+
+    def fake_request(method: str, url: str, data: dict | None = None, timeout: int = 15) -> dict:
+        if url.endswith("/api/projects"):
+            return {"projects": projects}
+        if url.endswith("/api/health"):
+            return health or {"status": "ok", "version": "test-version"}
+        if "/api/version-check/" in url:
+            return {"head": "abcdef123456", "dirty": False, "runtime_match": True}
+        if "/api/graph-governance/" in url and url.endswith("/status"):
+            return graph
+        if "/api/graph-governance/" in url and url.endswith("/operations/queue"):
+            return {"count": 3}
+        if "/api/backlog/" in url:
+            return {"count": backlog_count, "bugs": [{} for _ in range(backlog_count)]}
+        return {"error": f"unexpected url {url}"}
+
+    server._request_json = fake_request  # type: ignore[method-assign]
+    return server
+
+
+def _primary_action_lines(context_text: str) -> list[str]:
+    return [line for line in context_text.splitlines() if re.match(r"^\d+\. \*\*", line)]
+
+
+def test_mcp_current_context_online_current_graph_shows_minimal_actions(tmp_path: Path):
+    server = _server_with_context_payloads(
+        tmp_path,
+        graph={
+            "active_snapshot_id": "full-abcdef-1234",
+            "pending_scope_reconcile_count": 0,
+            "current_state": {"graph_stale": {"is_stale": False}},
+        },
+        backlog_count=4,
+    )
+
+    text = server._current_context_text("instructor")
+
+    assert "project_id: `instructor`" in text
+    assert "dashboard?project=instructor&view=graph" in text
+    assert "graph: snapshot `full-abcdef-1234` stale `False` pending_scope `0`" in text
+    assert "operations_queue: count `3`" in text
+    assert "backlog: open `4`" in text
+    assert "selected_project_note: active project `instructor` differs from default `aming-claw`" in text
+    actions = _primary_action_lines(text)
+    assert len(actions) == 3
+    assert "Check Current Project Status" in actions[0]
+    assert "Find PR Opportunities" in actions[1]
+    assert "Explain Graph Concepts" in actions[2]
+
+
+def test_mcp_current_context_online_stale_graph_prioritizes_update(tmp_path: Path):
+    server = _server_with_context_payloads(
+        tmp_path,
+        graph={
+            "active_snapshot_id": "scope-abcdef-1234",
+            "pending_scope_reconcile_count": 1,
+            "current_state": {"graph_stale": {"is_stale": True}},
+        },
+    )
+
+    text = server._current_context_text("instructor")
+
+    actions = _primary_action_lines(text)
+    assert len(actions) == 3
+    assert "Update Graph" in actions[0]
+    assert "Check Current Project Status" in actions[1]
+    assert "Find PR Opportunities" in actions[2]
+
+
+def test_mcp_current_context_online_missing_graph_opens_projects(tmp_path: Path):
+    server = _server_with_context_payloads(
+        tmp_path,
+        graph={
+            "active_snapshot_id": "",
+            "pending_scope_reconcile_count": 0,
+            "current_state": {},
+        },
+        projects=[{"project_id": "instructor", "workspace_path": str(tmp_path / "instructor"), "active_snapshot_id": ""}],
+    )
+
+    text = server._current_context_text("instructor")
+
+    assert "dashboard?project=instructor&view=projects" in text
+    actions = _primary_action_lines(text)
+    assert len(actions) == 3
+    assert "Initialize Project" in actions[0]
+    assert "Check Current Project Status" in actions[1]
+    assert "Explain Graph Concepts" in actions[2]
