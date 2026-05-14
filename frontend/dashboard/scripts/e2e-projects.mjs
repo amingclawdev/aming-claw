@@ -217,6 +217,7 @@ async function verifyGraphRuntime(project) {
   const edges = await http("GET", snapshotPath(PROJECT, status.active_snapshot_id, "/edges?limit=4000"));
 
   assert((summary.counts?.features || summary.health?.semantic_health?.feature_count || 0) > 0, "summary has no features");
+  verifySummaryHealthTaxonomy(summary);
   assert(Array.isArray(nodes.nodes) && nodes.nodes.length > 0, "nodes[] is empty");
   assert(Array.isArray(edges.edges), "edges[] missing");
 
@@ -244,6 +245,21 @@ async function verifyGraphRuntime(project) {
     ok("example graph is current for its workspace");
   }
   return { status, summary, ops, nodes, edges, inspectable, project };
+}
+
+function verifySummaryHealthTaxonomy(summary) {
+  const h = summary.health || {};
+  const project = Number(h.project_health_score);
+  const structure = Number(h.structure_health_score);
+  const semantic = Number(h.semantic_health_score);
+  assert(Number.isFinite(project), "summary health project_health_score is missing");
+  if (Number.isFinite(structure) && Number.isFinite(semantic) && Math.abs(structure - semantic) > 0.01) {
+    assert(
+      Math.abs(project - structure) <= 0.01,
+      `project_health_score should prefer structure health (${structure}) over semantic health (${semantic}); got ${project}`,
+    );
+  }
+  ok(`project health taxonomy project=${project} structure=${Number.isFinite(structure) ? structure : "-"} semantic=${Number.isFinite(semantic) ? semantic : "-"}`);
 }
 
 async function buildFullGraph() {
@@ -338,6 +354,18 @@ function verifyHeaderV1Contract() {
   assert(!headerSource.includes(">Action<"), "Header component should not render the global Action launcher in v1");
   assert(!headerSource.includes("onOpenReview"), "Header component should not accept the global Action launcher prop in v1");
   ok("global Action launcher is hidden for v1");
+}
+
+function verifySummaryHealthSourceContract() {
+  phase("summary health taxonomy contract");
+  const storeSource = readFileSync(path.join(REPO_ROOT, "agent/governance/graph_snapshot_store.py"), "utf8");
+  const scoreBlock = storeSource.indexOf("project_score = (");
+  const structureFallback = storeSource.indexOf('else structure.get("score")', scoreBlock);
+  const semanticFallback = storeSource.indexOf('else semantic.get("score")', scoreBlock);
+  assert(scoreBlock >= 0, "summary health project_score block is missing");
+  assert(structureFallback > scoreBlock, "project health should include structure fallback");
+  assert(semanticFallback > structureFallback, "project health should prefer structure before semantic fallback");
+  ok("project_health_score falls back legacy -> structure -> semantic");
 }
 
 function verifyProjectDisplayNameContract() {
@@ -479,6 +507,7 @@ async function main() {
     verifyProjectImportUiContract();
     verifyProjectProgressContract();
     verifyHeaderV1Contract();
+    verifySummaryHealthSourceContract();
     verifyProjectDisplayNameContract();
     verifyProjectScopedFetchContract();
     verifyProjectContextFallbackContract();

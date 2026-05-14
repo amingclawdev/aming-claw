@@ -2322,6 +2322,41 @@ def test_graph_governance_commit_anchored_dashboard_p0_apis(conn, monkeypatch):
     assert summary["graph_correction_patches"]["high_risk_proposed_count"] == 1
 
 
+def test_graph_governance_summary_project_health_prefers_structure_when_no_legacy_score(conn):
+    graph = _graph()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-health-taxonomy",
+        commit_sha="health-taxonomy",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        actor="observer",
+        projection_id="semproj-health-taxonomy",
+        backfill_existing=False,
+    )
+
+    summary = server.handle_graph_governance_snapshot_summary(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+
+    health = summary["health"]
+    assert health["structure_health_score"] > health["semantic_health_score"]
+    assert health["project_health_score"] == health["structure_health_score"]
+
+
 def test_graph_governance_summary_exposes_file_hygiene_review_samples(conn, tmp_path):
     snapshot = store.create_graph_snapshot(
         conn,

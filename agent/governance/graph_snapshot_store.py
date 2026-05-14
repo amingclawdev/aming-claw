@@ -1640,16 +1640,16 @@ def _dashboard_health(
         latest_review=latest_review,
         review_meta=review_meta,
     )
-    legacy_score = (
+    project_score = (
         legacy.get("project_health_score")
         if legacy.get("project_health_score") is not None
-        else semantic.get("score")
-        if semantic.get("score") is not None
         else structure.get("score")
+        if structure.get("score") is not None
+        else semantic.get("score")
     )
     return {
         **legacy,
-        "project_health_score": legacy_score,
+        "project_health_score": project_score,
         "structure_health_score": structure.get("score"),
         "semantic_health_score": semantic.get("score"),
         "project_insight_health_score": insight.get("score"),
