@@ -5321,23 +5321,68 @@ def handle_graph_governance_full_reconcile(ctx: RequestContext):
 
 @route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope")
 def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
-    """Create a state-only scope candidate from queued pending scope rows."""
+    """Create a state-only scope candidate and activate it when requested.
+
+    The old dashboard contract required callers to POST /pending-scope first,
+    which left a visible queued operation while the long synchronous build ran.
+    The direct Update graph contract lets this endpoint create the transient
+    pending row itself, mark it running, then consume it in the same request.
+    """
     project_id = ctx.get_project_id()
     body = ctx.body
     root = _graph_governance_project_root(project_id, body)
     from .state_reconcile import run_pending_scope_reconcile_candidate
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
     semantic_use_ai = _semantic_use_ai_from_body(body)
     semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
 
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope")
+        target_commit = str(body.get("target_commit_sha") or "").strip()
+        direct_pending_created = False
+        if target_commit and bool(body.get("ensure_pending_scope", True)):
+            pending = store.list_pending_scope_reconcile(
+                conn,
+                project_id,
+                commit_shas=[target_commit],
+                statuses=[
+                    store.PENDING_STATUS_QUEUED,
+                    store.PENDING_STATUS_RUNNING,
+                    store.PENDING_STATUS_FAILED,
+                ],
+            )
+            if not pending:
+                active = store.get_active_graph_snapshot(conn, project_id) or {}
+                parent_commit = str(
+                    body.get("parent_commit_sha") or active.get("commit_sha") or ""
+                )
+                with sqlite_write_lock():
+                    row = store.queue_pending_scope_reconcile(
+                        conn,
+                        project_id,
+                        commit_sha=target_commit,
+                        parent_commit_sha=parent_commit,
+                        status=store.PENDING_STATUS_RUNNING,
+                        evidence={
+                            "source": "direct_update_graph",
+                            "actor": body.get("actor", "api"),
+                            "parent_commit_sha": parent_commit,
+                        },
+                    )
+                    direct_pending_created = (
+                        row.get("status") == store.PENDING_STATUS_RUNNING
+                        if isinstance(row, dict)
+                        else False
+                    )
+                    conn.commit()
         try:
             result = run_pending_scope_reconcile_candidate(
                 conn,
                 project_id,
                 root,
-                target_commit_sha=str(body.get("target_commit_sha") or ""),
+                target_commit_sha=target_commit,
                 run_id=str(body.get("run_id") or ""),
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
@@ -5376,7 +5421,57 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
             )
         except (KeyError, ValueError) as exc:
+            if direct_pending_created:
+                with sqlite_write_lock():
+                    conn.execute(
+                        """
+                        UPDATE pending_scope_reconcile
+                        SET status = ?, evidence_json = ?
+                        WHERE project_id = ? AND commit_sha = ?
+                        """,
+                        (
+                            store.PENDING_STATUS_FAILED,
+                            json.dumps(
+                                {
+                                    "source": "direct_update_graph",
+                                    "error": str(exc),
+                                    "target_commit_sha": target_commit,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            project_id,
+                            target_commit,
+                        ),
+                    )
+                    conn.commit()
             _raise_graph_api_validation(exc)
+        except Exception as exc:
+            if direct_pending_created:
+                with sqlite_write_lock():
+                    conn.execute(
+                        """
+                        UPDATE pending_scope_reconcile
+                        SET status = ?, evidence_json = ?
+                        WHERE project_id = ? AND commit_sha = ?
+                        """,
+                        (
+                            store.PENDING_STATUS_FAILED,
+                            json.dumps(
+                                {
+                                    "source": "direct_update_graph",
+                                    "error": str(exc),
+                                    "target_commit_sha": target_commit,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            project_id,
+                            target_commit,
+                        ),
+                    )
+                    conn.commit()
+            raise
         conn.commit()
         return 201, result
     finally:

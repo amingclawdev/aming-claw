@@ -3083,6 +3083,77 @@ def test_graph_governance_queue_finalize_and_abandon_api(conn):
     assert abandoned["status"] == store.SNAPSHOT_STATUS_ABANDONED
 
 
+def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monkeypatch):
+    """Direct Update graph should not require a prior /pending-scope call."""
+    from agent.governance import state_reconcile
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+
+    active = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-old",
+        commit_sha="old",
+        snapshot_kind="scope",
+        graph_json=_graph("L7.1"),
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"])
+    conn.commit()
+
+    captured = {}
+
+    def fake_run_pending_scope(conn_arg, project_id, root, **kwargs):
+        rows = store.list_pending_scope_reconcile(
+            conn_arg,
+            project_id,
+            commit_shas=["head"],
+            statuses=[store.PENDING_STATUS_RUNNING],
+        )
+        captured["rows"] = rows
+        captured["kwargs"] = kwargs
+        conn_arg.execute(
+            """
+            UPDATE pending_scope_reconcile
+            SET status = ?, snapshot_id = ?
+            WHERE project_id = ? AND commit_sha = ?
+            """,
+            (store.PENDING_STATUS_MATERIALIZED, "scope-head", project_id, "head"),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": "scope-head",
+            "covered_pending_count": 1,
+            "pending_rows_bound": 1,
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_pending_scope_reconcile_candidate", fake_run_pending_scope)
+
+    code, result = server.handle_graph_governance_pending_scope_materialize(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": "head",
+                "parent_commit_sha": "old",
+                "actor": "dashboard",
+                "activate": True,
+            },
+        )
+    )
+
+    assert code == 201
+    assert result["ok"] is True
+    assert captured["kwargs"]["target_commit_sha"] == "head"
+    assert captured["rows"], "handler should create a running row before materializing"
+    assert captured["rows"][0]["status"] == store.PENDING_STATUS_RUNNING
+
+    final_rows = store.list_pending_scope_reconcile(conn, PID, commit_shas=["head"])
+    assert final_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
+
+
 def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
     project = tmp_path / "project"
     primary = project / "agent" / "governance" / "server.py"

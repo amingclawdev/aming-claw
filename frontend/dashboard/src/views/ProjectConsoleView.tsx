@@ -280,16 +280,9 @@ export default function ProjectConsoleView({
     setNotice({ kind: "info", message: `Updating graph for ${project.project_id}...` });
     try {
       const graphStale = row?.status?.current_state?.graph_stale;
-      if (graphStale?.is_stale) {
-        await api.queuePendingScopeFor(project.project_id, {
-          commit_sha: targetCommit,
-          parent_commit_sha: graphStale.active_graph_commit || row?.status?.graph_snapshot_commit || "",
-          actor: "dashboard",
-          evidence: { source: "dashboard_project_console", action: "update_graph" },
-        });
-      }
       const result = await api.materializePendingScopeFor(project.project_id, {
         target_commit_sha: targetCommit,
+        parent_commit_sha: graphStale?.active_graph_commit || row?.status?.graph_snapshot_commit || "",
         run_id: `dashboard-scope-${project.project_id}-${shortCommit(targetCommit)}-${Date.now()}`,
         actor: "dashboard",
         activate: true,

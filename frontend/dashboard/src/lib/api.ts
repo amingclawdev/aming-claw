@@ -311,8 +311,8 @@ export const api = {
       signal,
     );
   },
-  // Reconcile actions are wired but disabled in P0 unless the user opts in;
-  // surfaced through the stale-graph banner.
+  // Legacy explicit queue API. Normal dashboard Update graph uses the direct
+  // materialize endpoint below so users do not see a stale queued task.
   queueScopeReconcile(opts: { commit_sha: string; parent_commit_sha?: string; actor?: string }, signal?: AbortSignal) {
     return postJSON<{
       ok: boolean;
@@ -336,13 +336,13 @@ export const api = {
       signal,
     );
   },
-  // MF-2026-05-10-014: incrementally materialize the queued pending-scope
-  // row(s) into a candidate snapshot AND activate it in one round-trip.
-  // MF-012's hook then auto-rebuilds the projection on activation.
+  // Direct Update graph: materialize a scope candidate and activate it in one
+  // round-trip. Backend creates/consumes transient pending-scope bookkeeping
+  // when no queued row exists.
   // dry_run=false here means "really build the snapshot"; AI is opt-in via
   // semantic_use_ai (default false → rule-based + carry-forward only).
   materializeAndActivatePendingScope(
-    opts: { target_commit_sha: string; semantic_use_ai?: boolean; actor?: string },
+    opts: { target_commit_sha: string; parent_commit_sha?: string; semantic_use_ai?: boolean; actor?: string },
     signal?: AbortSignal,
   ) {
     return postJSON<{
@@ -353,6 +353,7 @@ export const api = {
       `/api/graph-governance/${pid()}/reconcile/pending-scope`,
       {
         target_commit_sha: opts.target_commit_sha,
+        parent_commit_sha: opts.parent_commit_sha,
         actor: opts.actor ?? "dashboard_user",
         semantic_use_ai: opts.semantic_use_ai ?? false,
         activate: true,
@@ -684,6 +685,7 @@ export interface GraphReconcilePayload {
   run_id?: string;
   target_commit_sha?: string;
   commit_sha?: string;
+  parent_commit_sha?: string;
   actor?: string;
   activate?: boolean;
   semantic_enrich?: boolean;

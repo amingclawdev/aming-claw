@@ -391,36 +391,14 @@ export default function App() {
     setReconcilePhase("materializing");
     setReconcileDetail(`target ${headCommit.slice(0, 7)}`);
     try {
-      // Step 1: enqueue the pending-scope row.
-      const queueRes = await api.queueScopeReconcile({
-        commit_sha: headCommit,
-        parent_commit_sha: snapCommit ?? undefined,
-        actor: "dashboard_user",
-      });
-      const queueStatus = queueRes.pending_scope_reconcile?.status ?? "queued";
-      // Store preserves waived/materialized across upserts (graph_snapshot_store
-      // .queue_pending_scope_reconcile:2313). Tell the operator clearly that
-      // a previously cancelled commit will not re-queue without a new commit.
-      if (queueStatus === "waived" || queueStatus === "materialized") {
-        setReconcilePhase("error");
-        setReconcileDetail(
-          `${headCommit.slice(0, 7)} is already ${queueStatus} — make a new commit to re-arm`,
-        );
-        setToast({
-          kind: "info",
-          msg:
-            `Reconcile NOT queued · ${headCommit.slice(0, 7)} is already ${queueStatus} ` +
-            `(this commit was previously ${queueStatus === "waived" ? "cancelled" : "materialized"}). ` +
-            `Make a new commit on main to re-arm.`,
-        });
-        return;
-      }
-      // Step 2: materialize + activate in one round-trip (MF-2026-05-10-014).
-      // MF-2026-05-10-012's activate hook auto-rebuilds the projection.
+      // Direct materialize + activate in one round-trip. The backend creates
+      // and consumes any transient pending-scope bookkeeping internally, so the
+      // operator does not see a separate queued scope-reconcile task.
       setReconcilePhase("materializing");
       setReconcileDetail(`building snapshot for ${headCommit.slice(0, 7)}`);
       const runRes = await api.materializeAndActivatePendingScope({
         target_commit_sha: headCommit,
+        parent_commit_sha: snapCommit ?? undefined,
         semantic_use_ai: false, // rule-based + carry-forward only; no AI billed
         actor: "dashboard_user",
       });
