@@ -83,6 +83,7 @@ class TestPackagedDashboardAssets:
         assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
         assert "include .codex-plugin/plugin.json" in manifest
+        assert "include .agents/plugins/marketplace.json" in manifest
         assert "include CLAUDE.md" in manifest
 
     def test_dashboard_build_sync_script_is_wired_to_npm_build(self):
@@ -113,6 +114,22 @@ class TestLocalPluginPackaging:
         assert any("aming-claw://skill" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         assert any("aming-claw://seed-graph-summary" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         assert (ROOT / "CLAUDE.md").is_file()
+
+    def test_codex_local_marketplace_installs_plugin_by_default(self):
+        marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+
+        assert marketplace["name"] == "aming-claw-local"
+        assert marketplace["interface"]["displayName"] == "Aming Claw Local"
+        plugins = marketplace["plugins"]
+        assert len(plugins) == 1
+        plugin = plugins[0]
+        assert plugin["name"] == "aming-claw"
+        assert plugin["source"] == {"source": "local", "path": "."}
+        assert plugin["policy"]["installation"] == "INSTALLED_BY_DEFAULT"
+        assert plugin["policy"]["authentication"] == "ON_INSTALL"
+        assert plugin["category"] == "Productivity"
+        assert (ROOT / plugin["source"]["path"] / ".codex-plugin" / "plugin.json").is_file()
 
     def test_mcp_seed_graph_resource_is_packaged(self):
         seed = ROOT / "agent" / "mcp" / "resources" / "seed-graph-summary.json"

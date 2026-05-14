@@ -1,0 +1,20 @@
+{
+  "name": "aming-claw-local",
+  "interface": {
+    "displayName": "Aming Claw Local"
+  },
+  "plugins": [
+    {
+      "name": "aming-claw",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -23,6 +23,8 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 ## Layout
 
 - `.codex-plugin/plugin.json`: plugin manifest.
+- `.agents/plugins/marketplace.json`: repo-local Codex marketplace entry that
+  installs this root plugin by default for local/plugin sessions.
 - `skills/aming-claw/`: session-loadable skill and references.
 - `.mcp.json`: active MCP server config using `agent.mcp.server`.
 
@@ -76,7 +78,7 @@ is available.
 | Surface | Current | Gap Before Public Release |
 | --- | --- | --- |
 | Pip package | `pyproject.toml` exposes `aming-claw`, `aming-governance`, and `aming-governance-host`; dashboard assets are synced into `agent/governance/dashboard_dist` before wheel build. | Run clean wheel install smoke on each release target. |
-| Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; tests ensure paths exist and `.mcp.json` is relocatable. | Add marketplace metadata only when distributing outside this repo; sanitize env and host URLs. |
+| Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; `.agents/plugins/marketplace.json` points at the repo root plugin and marks it installed by default for local sessions. Tests ensure paths exist and `.mcp.json` is relocatable. | Sanitize env and host URLs before publishing outside trusted local/team installs. |
 | Claude Code project plugin/settings | Project-level `CLAUDE.md` and `.mcp.json` describe the local MCP contract. | Global Claude Code settings remain out of scope for v1. |
 | Cross-platform desktop | Windows, macOS, and Linux directory picker fallbacks are implemented with manual entry fallback. | Add real-machine smoke evidence for macOS and Linux/WSL before public release. |
 
