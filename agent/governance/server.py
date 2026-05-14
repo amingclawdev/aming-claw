@@ -6096,23 +6096,36 @@ def _accept_semantic_enrichment_for_feedback_items(
         # whose pending_review row was already flipped by an earlier accept.
         if target_id:
             try:
-                cur = conn.execute(
-                    """
-                    UPDATE graph_semantic_nodes
-                    SET status = 'ai_complete'
-                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
-                      AND status = 'pending_review'
-                    """,
-                    (project_id, snapshot_id, target_id),
-                )
-                if cur.rowcount > 0:
-                    node_ids_flipped.append(target_id)
-                elif target_type_hint == "edge":
-                    edge_ids_flipped.append(target_id)
+                if target_type_hint == "edge":
+                    cur = conn.execute(
+                        """
+                        UPDATE graph_semantic_edges
+                        SET status = 'ai_complete'
+                        WHERE project_id = ? AND snapshot_id = ? AND edge_id = ?
+                          AND status = 'pending_review'
+                        """,
+                        (project_id, snapshot_id, target_id),
+                    )
+                    if cur.rowcount > 0:
+                        edge_ids_flipped.append(target_id)
+                    else:
+                        edge_ids_flipped.append(target_id)
                 else:
-                    # Best-effort default — assume node target so callers that
-                    # don't tag target_type don't lose accounting.
-                    node_ids_flipped.append(target_id)
+                    cur = conn.execute(
+                        """
+                        UPDATE graph_semantic_nodes
+                        SET status = 'ai_complete'
+                        WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                          AND status = 'pending_review'
+                        """,
+                        (project_id, snapshot_id, target_id),
+                    )
+                    if cur.rowcount > 0:
+                        node_ids_flipped.append(target_id)
+                    else:
+                        # Best-effort default — assume node target so callers that
+                        # don't tag target_type don't lose accounting.
+                        node_ids_flipped.append(target_id)
             except Exception as exc:  # noqa: BLE001 - advisory; record + keep going
                 errors.append({"feedback_id": fid, "target_id": target_id, "error": str(exc)})
         for eid in event_ids:
@@ -7797,6 +7810,8 @@ def _edge_semantic_job_status(event: dict) -> str:
     # status=proposed.
     if event_status == "ai_reviewing":
         return "running"
+    if event_status == "proposed":
+        return "pending_review"
     event_type = str(event.get("event_type") or "").strip()
     if event_type == "edge_semantic_enriched":
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -8357,6 +8372,173 @@ def _edge_semantic_rule_payload(edge_context: dict, instructions: dict, ai_respo
     payload.setdefault("analyzer_role", instructions.get("analyzer_role") or instructions.get("role") or "")
     payload.setdefault("job_type", "edge")
     return payload
+
+
+def _edge_semantic_payload_source(payload: dict) -> str:
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    return str(evidence.get("source") or "").strip()
+
+
+def _normalize_explicit_edge_semantic_payload(payload: dict) -> dict:
+    normalized = dict(payload or {})
+    evidence = normalized.get("evidence") if isinstance(normalized.get("evidence"), dict) else {}
+    evidence = dict(evidence)
+    evidence.setdefault("source", "semantic_ai")
+    normalized["evidence"] = evidence
+    normalized.setdefault("job_type", "edge")
+    return normalized
+
+
+def _edge_semantic_identity(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    raw_edge: dict,
+    edge_context: dict,
+) -> tuple[str, str]:
+    from . import graph_events
+    from . import graph_snapshot_store as store
+
+    src_node_id = str(edge_context.get("src") or raw_edge.get("src") or raw_edge.get("source") or "")
+    dst_node_id = str(edge_context.get("dst") or raw_edge.get("dst") or raw_edge.get("target") or "")
+    edge_for_hash = dict(raw_edge or {})
+    edge_for_hash.setdefault("src", src_node_id)
+    edge_for_hash.setdefault("dst", dst_node_id)
+    edge_for_hash.setdefault(
+        "edge_type",
+        str(edge_context.get("edge_type") or raw_edge.get("edge_type") or raw_edge.get("type") or "depends_on"),
+    )
+    src_node_meta: dict | None = None
+    dst_node_meta: dict | None = None
+    try:
+        nodes = store.list_graph_snapshot_nodes(
+            conn,
+            project_id,
+            snapshot_id,
+            include_semantic=False,
+            limit=5000,
+        )
+        nodes_by_id = {
+            str(node.get("node_id") or node.get("id") or ""): node
+            for node in nodes
+        }
+        src_node_meta = nodes_by_id.get(src_node_id)
+        dst_node_meta = nodes_by_id.get(dst_node_id)
+    except Exception:
+        pass
+    return (
+        graph_events.stable_edge_key_for_edge(edge_for_hash, src_node_meta, dst_node_meta),
+        graph_events.edge_signature_hash_for_edge(edge_for_hash, src_node_meta, dst_node_meta),
+    )
+
+
+def _write_edge_semantic_pending_review(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    edge_id: str,
+    stable_edge_key: str,
+    edge_signature_hash: str,
+    semantic_payload: dict,
+    source_event_id: str,
+) -> None:
+    from . import reconcile_semantic_enrichment as semantic
+
+    semantic._ensure_semantic_state_schema(conn)
+    semantic_entry = {
+        "edge_id": edge_id,
+        "stable_edge_key": stable_edge_key,
+        "edge_signature_hash": edge_signature_hash,
+        "semantic_payload": semantic_payload,
+        "status": "pending_review",
+        "source_event_id": source_event_id,
+        "updated_at": "",
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_edges
+          (project_id, snapshot_id, edge_id, status,
+           edge_signature_hash, semantic_json,
+           source_event_id, feedback_round, batch_index, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, snapshot_id, edge_id) DO UPDATE SET
+          status = excluded.status,
+          edge_signature_hash = excluded.edge_signature_hash,
+          semantic_json = excluded.semantic_json,
+          source_event_id = excluded.source_event_id,
+          updated_at = excluded.updated_at
+        """,
+        (
+            project_id,
+            snapshot_id,
+            edge_id,
+            "pending_review",
+            edge_signature_hash,
+            json.dumps(semantic_entry, ensure_ascii=False),
+            source_event_id,
+            0,
+            None,
+            "",
+        ),
+    )
+
+
+def _submit_edge_semantic_review_feedback(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    edge_id: str,
+    event_id: str,
+    actor: str,
+    source: str,
+) -> None:
+    from . import reconcile_feedback
+
+    reconcile_feedback.submit_feedback_item(
+        project_id,
+        snapshot_id,
+        feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+        issue={
+            "issue": f"AI edge semantic enrichment generated for {edge_id} — awaiting operator review",
+            "target_id": edge_id,
+            "target_type": "edge",
+            "priority": "P3",
+            "evidence": {
+                "source": source,
+                "edge_id": edge_id,
+                "linked_event_ids": [event_id] if event_id else [],
+            },
+        },
+        actor=actor,
+    )
+
+
+def _publish_semantic_job_enqueued(
+    project_id: str,
+    snapshot_id: str,
+    queued_count: int,
+    *,
+    target_scope: str = "node",
+    source: str,
+) -> None:
+    if int(queued_count or 0) <= 0:
+        return
+    try:
+        from . import event_bus
+
+        event_bus.publish(
+            "semantic_job.enqueued",
+            {
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "queued_count": int(queued_count or 0),
+                "target_scope": target_scope,
+                "source": source,
+            },
+        )
+    except Exception:
+        pass
 
 
 def _edge_semantic_ai_payload(
@@ -9009,10 +9191,24 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                         except Exception as exc:  # noqa: BLE001 - record failed edge job in events
                             ai_response = {"_ai_error": str(exc)}
                             ai_error_count += 1
-                    semantic_payload = explicit_semantic or _edge_semantic_rule_payload(
+                    semantic_payload = (
+                        _normalize_explicit_edge_semantic_payload(explicit_semantic)
+                        if explicit_semantic
+                        else _edge_semantic_rule_payload(
+                            edge_context,
+                            instructions,
+                            ai_response=ai_response,
+                        )
+                    )
+                    ai_failed = isinstance(ai_response, dict) and bool(ai_response.get("_ai_error"))
+                    semantic_source = _edge_semantic_payload_source(semantic_payload)
+                    review_required = (not ai_failed) and semantic_source != "edge_semantic_rule"
+                    stable_edge_key, edge_signature_hash = _edge_semantic_identity(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        raw_edge,
                         edge_context,
-                        instructions,
-                        ai_response=ai_response,
                     )
                     enriched = graph_events.create_event(
                         conn,
@@ -9022,7 +9218,15 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                         event_kind="semantic_job",
                         target_type="edge",
                         target_id=edge["edge_id"],
-                        status="failed" if isinstance(ai_response, dict) and ai_response.get("_ai_error") else "observed",
+                        status=(
+                            graph_events.EVENT_STATUS_FAILED
+                            if ai_failed
+                            else graph_events.EVENT_STATUS_PROPOSED
+                            if review_required
+                            else graph_events.EVENT_STATUS_OBSERVED
+                        ),
+                        stable_node_key=stable_edge_key,
+                        feature_hash=edge_signature_hash,
                         payload={
                             "semantic_session_job_id": session_job_id,
                             "edge": raw_edge,
@@ -9045,6 +9249,28 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                         },
                         created_by=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
                     )
+                    if review_required:
+                        _write_edge_semantic_pending_review(
+                            conn,
+                            project_id,
+                            snapshot_id,
+                            edge_id=edge["edge_id"],
+                            stable_edge_key=stable_edge_key,
+                            edge_signature_hash=edge_signature_hash,
+                            semantic_payload=semantic_payload,
+                            source_event_id=str(enriched.get("event_id") or ""),
+                        )
+                        try:
+                            _submit_edge_semantic_review_feedback(
+                                project_id,
+                                snapshot_id,
+                                edge_id=edge["edge_id"],
+                                event_id=str(enriched.get("event_id") or ""),
+                                actor=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                                source="semantic_jobs_api",
+                            )
+                        except Exception:
+                            pass
                     events.append(enriched)
                     enriched_count += 1
                 conn.commit()
@@ -9053,25 +9279,16 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             jobs = [job for job in jobs if str(job.get("edge_id") or "") in target_edge_ids]
             # MF-2026-05-10-017: publish semantic_job.enqueued so the
             # event-driven worker picks up unenriched edge_semantic_requested
-            # events. Only fires when at least one edge was requested without
-            # being inline-enriched (otherwise the worker would have nothing
-            # left to do — the enriched events are already OBSERVED).
+            # events. Inline-enriched AI payloads are proposed for review, so
+            # the worker has nothing left to claim for those rows.
             unenriched_count = requested_count - enriched_count
-            if unenriched_count > 0:
-                try:
-                    from . import event_bus
-                    event_bus.publish(
-                        "semantic_job.enqueued",
-                        {
-                            "project_id": project_id,
-                            "snapshot_id": snapshot_id,
-                            "queued_count": unenriched_count,
-                            "target_scope": "edge",
-                            "source": "semantic_jobs_create_api_edge",
-                        },
-                    )
-                except Exception:
-                    pass
+            _publish_semantic_job_enqueued(
+                project_id,
+                snapshot_id,
+                unenriched_count,
+                target_scope="edge",
+                source="semantic_jobs_create_api_edge",
+            )
             return 202, {
                 "ok": True,
                 "project_id": project_id,
@@ -9250,25 +9467,26 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             jobs = [job for job in jobs if str(job.get("node_id") or "") in target_set][:job_limit]
         counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
         progress = _semantic_job_progress(counts)
-        queued_count = int(result_summary.get("ai_selected_count") or 0)
-        queued_ops = _semantic_queued_ops(jobs[:queued_count], "node_semantic") if queued_count else []
+        pending_jobs = [
+            job for job in jobs
+            if str(job.get("status") or "") in {"ai_pending", "pending_ai"}
+        ]
+        queued_count = (
+            len(pending_jobs)
+            if target_ids
+            else int(result_summary.get("ai_selected_count") or 0) or len(pending_jobs)
+        )
+        queued_ops = _semantic_queued_ops(pending_jobs[:queued_count], "node_semantic") if queued_count else []
         # MF-2026-05-10-016: kick the event-driven semantic worker so it
         # immediately drains the newly enqueued ai_pending rows. Best-effort —
         # if EventBus or worker fails the rows still wait for startup catchup.
-        if queued_count > 0:
-            try:
-                from . import event_bus
-                event_bus.publish(
-                    "semantic_job.enqueued",
-                    {
-                        "project_id": project_id,
-                        "snapshot_id": snapshot_id,
-                        "queued_count": queued_count,
-                        "source": "semantic_jobs_create_api",
-                    },
-                )
-            except Exception:
-                pass
+        _publish_semantic_job_enqueued(
+            project_id,
+            snapshot_id,
+            queued_count,
+            target_scope="node",
+            source="semantic_jobs_create_api",
+        )
         return 202, {
             "ok": True,
             "project_id": project_id,
@@ -9323,6 +9541,7 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
         semantic_use_ai = False
     elif semantic_mode == "auto" and semantic_use_ai is None:
         semantic_use_ai = True
+    enqueue_stale = bool(body.get("enqueue_stale", False))
     semantic_ai_call = _semantic_ai_call_from_body(project_id, root, {**body, "snapshot_id": snapshot_id})
 
     feedback_items = body.get("feedback_items")
@@ -9355,9 +9574,20 @@ def handle_graph_governance_snapshot_semantic_enrich(ctx: RequestContext):
                 **_semantic_ai_config_kwargs_from_body(body),
                 **_semantic_selector_kwargs_from_body(body),
                 semantic_config_path=body.get("semantic_config_path"),
+                enqueue_stale=enqueue_stale,
             )
         except (KeyError, ValueError) as exc:
             _raise_graph_api_validation(exc)
+        if enqueue_stale:
+            counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
+            queued_count = int(counts.get("ai_pending", 0) or 0) + int(counts.get("pending_ai", 0) or 0)
+            _publish_semantic_job_enqueued(
+                project_id,
+                snapshot_id,
+                queued_count,
+                target_scope="node",
+                source="semantic_enrich_api",
+            )
         result.setdefault("automation", {})
         result["automation"].update({
             "semantic_mode": semantic_mode,

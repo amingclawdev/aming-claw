@@ -519,6 +519,10 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
         "_require_graph_governance_operator",
         lambda _ctx, _conn, _action: {"role": "observer"},
     )
+    from agent.governance import event_bus
+
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(event_bus, "publish", lambda event, payload: published.append((event, payload)))
     snapshot = store.create_graph_snapshot(
         conn,
         PID,
@@ -561,6 +565,18 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
     assert payload["operator_request"]["analyzer"]["model"]
     assert payload["batch_plan"]["target_scope"] == "node"
     assert payload["batch_plan"]["target_ids"] == ["L7.1"]
+    assert published == [
+        (
+            "semantic_job.enqueued",
+            {
+                "project_id": PID,
+                "snapshot_id": snapshot["snapshot_id"],
+                "queued_count": 1,
+                "target_scope": "node",
+                "source": "semantic_jobs_create_api",
+            },
+        )
+    ]
 
     listed = server.handle_graph_governance_snapshot_semantic_jobs_list(
         _ctx(
@@ -912,6 +928,7 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
     )
     assert status == 202
     assert enriched["events"][0]["event_type"] == "edge_semantic_enriched"
+    assert enriched["events"][0]["status"] == graph_events.EVENT_STATUS_PROPOSED
 
     projected = server.handle_graph_governance_snapshot_semantic_projection_build(
         _ctx(
@@ -921,10 +938,9 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
         )
     )
     edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
-    assert edge_semantic["validity"]["status"] == "edge_semantic_current"
-    assert edge_semantic["semantic"]["relation_purpose"] == "Feature Node calls Dependency Node."
-    assert projected["health"]["edge_semantic_current_count"] == 1
-    assert projected["health"]["edge_semantic_coverage_ratio"] == 1.0
+    assert edge_semantic["validity"]["status"] == "edge_semantic_requested"
+    assert projected["health"]["edge_semantic_current_count"] == 0
+    assert projected["health"]["edge_semantic_coverage_ratio"] == 0.0
     edge_jobs = server.handle_graph_governance_snapshot_semantic_jobs_list(
         _ctx(
             {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
@@ -932,9 +948,41 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
         )
     )
     assert edge_jobs["count"] == 1
-    assert edge_jobs["jobs"][0]["status"] == "ai_complete"
+    assert edge_jobs["jobs"][0]["status"] == "pending_review"
     assert edge_jobs["jobs"][0]["semantic"]["relation_purpose"] == "Feature Node calls Dependency Node."
-    assert edge_jobs["summary"]["progress"]["complete"] == 1
+
+    feedback_items = reconcile_feedback.list_feedback_items(PID, snapshot["snapshot_id"])
+    edge_id_variants = set(server._semantic_edge_id_variants("L7.1|L7.2|depends_on"))
+    edge_feedback = [
+        item for item in feedback_items
+        if item.get("target_type") == "edge" and item.get("target_id") in edge_id_variants
+    ]
+    assert edge_feedback, "inline edge semantic proposal must create review feedback"
+    decision = server.handle_graph_governance_snapshot_feedback_decision(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "actor": "observer",
+                "feedback_ids": [edge_feedback[0]["feedback_id"]],
+                "action": "accept_semantic_enrichment",
+            },
+        )
+    )
+    assert decision["semantic_enrichment_accepted"]["edge_ids_flipped"] == ["L7.1->L7.2:depends_on"]
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-accepted"},
+        )
+    )
+    edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
+    assert edge_semantic["validity"]["status"] == "edge_semantic_current"
+    assert edge_semantic["semantic"]["relation_purpose"] == "Feature Node calls Dependency Node."
+    assert projected["health"]["edge_semantic_current_count"] == 1
+    assert projected["health"]["edge_semantic_coverage_ratio"] == 1.0
 
     summary = server.handle_graph_governance_snapshot_summary(
         _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
@@ -945,6 +993,97 @@ def test_graph_governance_edge_semantic_projection_tracks_requested_and_enriched
     assert semantic_health["edge_semantic_requested_count"] == 0
     assert semantic_health["edge_semantic_missing_count"] == 0
     assert semantic_health["edge_semantic_coverage_ratio"] == 1.0
+
+
+def test_graph_governance_edge_semantic_inline_reject_stays_unprojected(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph_with_dependency()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-edge-inline-reject",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    status, enriched = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "edge",
+                "edges": [{"src": "L7.1", "dst": "L7.2", "edge_type": "depends_on"}],
+                "edge_semantics": [
+                    {
+                        "src": "L7.1",
+                        "dst": "L7.2",
+                        "edge_type": "depends_on",
+                        "relation_purpose": "Rejected payload must not become current.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "actor": "semantic-ai",
+            },
+        )
+    )
+    assert status == 202
+    event_id = enriched["events"][0]["event_id"]
+    assert enriched["events"][0]["status"] == graph_events.EVENT_STATUS_PROPOSED
+
+    feedback_items = reconcile_feedback.list_feedback_items(PID, snapshot["snapshot_id"])
+    edge_feedback = [
+        item for item in feedback_items
+        if item.get("target_type") == "edge" and item.get("target_id") == "L7.1->L7.2:depends_on"
+    ]
+    assert edge_feedback
+    decision = server.handle_graph_governance_snapshot_feedback_decision(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "actor": "observer",
+                "feedback_ids": [edge_feedback[0]["feedback_id"]],
+                "action": "reject_false_positive",
+            },
+        )
+    )
+    assert decision["semantic_enrichment_rejected"]["edge_ids_cleared"] == ["L7.1->L7.2:depends_on"]
+    event = graph_events.get_event(conn, PID, snapshot["snapshot_id"], event_id)
+    assert event["status"] == graph_events.EVENT_STATUS_REJECTED
+    pending_edges = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM graph_semantic_edges
+        WHERE project_id=? AND snapshot_id=? AND edge_id=?
+        """,
+        (PID, snapshot["snapshot_id"], "L7.1->L7.2:depends_on"),
+    ).fetchone()
+    assert pending_edges["count"] == 0
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-inline-reject"},
+        )
+    )
+    edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
+    assert edge_semantic["validity"]["status"] == "edge_semantic_missing"
+    assert projected["health"]["edge_semantic_current_count"] == 0
+    assert projected["health"]["edge_semantic_missing_count"] == 1
 
 
 def test_edge_semantic_projection_accepts_dashboard_pipe_edge_ids(conn, tmp_path, monkeypatch):
@@ -1276,13 +1415,45 @@ def test_edge_semantic_auto_enrich_ai_response_projects_current(conn, tmp_path, 
     assert payload["enriched_count"] == 1
     assert payload["ai_error_count"] == 0
     assert ai_body["semantic_use_ai"] is True
+    assert payload["events"][-1]["status"] == graph_events.EVENT_STATUS_PROPOSED
     assert payload["jobs"][0]["semantic_source"] == "semantic_ai"
+    assert payload["jobs"][0]["status"] == "pending_review"
 
     projected = server.handle_graph_governance_snapshot_semantic_projection_build(
         _ctx(
             {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
             method="POST",
             body={"actor": "observer", "projection_id": "semproj-edge-auto-ai"},
+        )
+    )
+    edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
+    assert edge_semantic["validity"]["status"] == "edge_semantic_requested"
+    assert projected["health"]["edge_semantic_current_count"] == 0
+    assert projected["health"]["edge_semantic_missing_count"] == 1
+
+    feedback_items = reconcile_feedback.list_feedback_items(PID, snapshot["snapshot_id"])
+    edge_id_variants = set(server._semantic_edge_id_variants("L7.1|L7.2|depends_on"))
+    edge_feedback = [
+        item for item in feedback_items
+        if item.get("target_type") == "edge" and item.get("target_id") in edge_id_variants
+    ]
+    assert edge_feedback
+    server.handle_graph_governance_snapshot_feedback_decision(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "actor": "observer",
+                "feedback_ids": [edge_feedback[0]["feedback_id"]],
+                "action": "accept_semantic_enrichment",
+            },
+        )
+    )
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={"actor": "observer", "projection_id": "semproj-edge-auto-ai-accepted"},
         )
     )
     edge_semantic = projected["projection"]["edge_semantics"]["L7.1->L7.2:depends_on"]
@@ -3018,6 +3189,73 @@ def test_graph_governance_semantic_review_queue_waits_for_ai_semantics(conn, tmp
     assert enriched["summary"]["ai_complete_count"] == 0
     assert enriched["feedback_queue"]["blocked"] is True
     assert enriched["feedback_queue"]["gate"]["reason"] == "semantic_ai_not_complete"
+    rows = conn.execute(
+        "SELECT COUNT(*) AS count FROM graph_semantic_jobs WHERE project_id=? AND snapshot_id=?",
+        (PID, snapshot["snapshot_id"]),
+    ).fetchone()
+    assert rows["count"] == 0
+
+
+def test_graph_governance_semantic_enrich_enqueue_stale_publishes_worker_event(
+    conn, tmp_path, monkeypatch
+):
+    from agent.governance import event_bus
+
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(event_bus, "publish", lambda event, payload: published.append((event, payload)))
+    project = tmp_path / "project"
+    primary = project / "agent" / "governance" / "server.py"
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    primary.write_text("def handle_graph_governance():\n    return 'ok'\n", encoding="utf-8")
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-enqueue-stale-api",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    enriched = server.handle_graph_governance_snapshot_semantic_enrich(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "actor": "observer",
+                "semantic_mode": "manual",
+                "use_ai": False,
+                "enqueue_stale": True,
+            },
+        )
+    )
+
+    assert enriched["ok"] is True
+    rows = conn.execute(
+        "SELECT node_id, status FROM graph_semantic_jobs WHERE project_id=? AND snapshot_id=?",
+        (PID, snapshot["snapshot_id"]),
+    ).fetchall()
+    assert [dict(row) for row in rows] == [{"node_id": "L7.1", "status": "ai_pending"}]
+    assert published == [
+        (
+            "semantic_job.enqueued",
+            {
+                "project_id": PID,
+                "snapshot_id": snapshot["snapshot_id"],
+                "queued_count": 1,
+                "target_scope": "node",
+                "source": "semantic_enrich_api",
+            },
+        )
+    ]
 
 
 def test_graph_governance_semantic_enrich_can_run_full_global_review_after_semantic(conn, tmp_path):
