@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import hashlib
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -55,6 +56,47 @@ def _save_projects(data: dict):
     path = _projects_file()
     with open(str(path), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _ensure_clean_git_worktree_for_graph(workspace: Path) -> dict:
+    """Require clean git state before commit-bound graph snapshots are built."""
+    try:
+        root_proc = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return {"is_git_repo": False, "dirty": False, "reason": "git unavailable"}
+    if root_proc.returncode != 0:
+        return {"is_git_repo": False, "dirty": False}
+    git_root_raw = (root_proc.stdout or "").strip()
+    git_root = Path(git_root_raw).resolve() if git_root_raw else workspace.resolve()
+    try:
+        status_proc = subprocess.run(
+            ["git", "-C", str(git_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        raise ValidationError(f"cannot inspect git worktree before graph build: {exc}") from exc
+    if status_proc.returncode != 0:
+        detail = (status_proc.stderr or status_proc.stdout or "").strip()
+        raise ValidationError(f"cannot inspect git worktree before graph build: {detail}")
+    dirty = [line for line in (status_proc.stdout or "").splitlines() if line.strip()]
+    if dirty:
+        sample = "; ".join(dirty[:5])
+        more = "" if len(dirty) <= 5 else f"; +{len(dirty) - 5} more"
+        raise ValidationError(
+            "cannot bootstrap graph from a dirty git worktree; "
+            "graph snapshots are commit-bound. Commit or stash local changes "
+            f"before bootstrap. Dirty files: {sample}{more}"
+        )
+    return {"is_git_repo": True, "dirty": False, "git_root": str(git_root)}
 
 
 def _progress_with_elapsed(progress: object) -> object:
@@ -666,6 +708,7 @@ def bootstrap_project(
 
     pid = config.project_id or project_name or ws.name.lower().replace("_", "-")
     pid = _normalize_project_id(pid)
+    git_gate = _ensure_clean_git_worktree_for_graph(ws)
     update_project_operation_progress(
         pid,
         operation="bootstrap",
@@ -747,6 +790,7 @@ def bootstrap_project(
                     "source": "bootstrap_project_v2",
                     "effective_exclude_roots": effective_excludes,
                     "scan_depth": scan_depth,
+                    "git_gate": git_gate,
                 },
                 semantic_enrich=True,
                 semantic_use_ai=False,
@@ -832,6 +876,7 @@ def bootstrap_project(
         "snapshot_id": reconcile_result.get("snapshot_id", ""),
         "activation": reconcile_result.get("activation") or {},
         "bootstrap_mode": "snapshot_full_reconcile",
+        "git_gate": git_gate,
     }
     update_project_operation_progress(
         pid,

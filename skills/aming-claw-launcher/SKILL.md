@@ -24,11 +24,13 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
    aming-claw start
    ```
 
-   This runs `start_governance.main` with `GOVERNANCE_PORT` from `--port`
-   (default `40000`). It is a long-running service command; do not run it as a
-   normal one-shot Codex tool call and wait for it to exit. ServiceManager is
-   started independently (see project rules in `CLAUDE.md`); do not let the
-   plugin session spawn executor workers.
+   This checks `GOVERNANCE_PORT` from `--port` (default `40000`) first. If
+   Aming Claw governance is already healthy, it prints the dashboard URL and
+   exits. If another process owns the port, it reports a conflict. Otherwise it
+   runs `start_governance.main` as a long-running foreground service; do not run
+   that path as a normal one-shot Codex tool call and wait for it to exit.
+   ServiceManager is started independently (see project rules in `CLAUDE.md`);
+   do not let the plugin session spawn executor workers.
 
 3. Confirm health (CLI):
 
@@ -39,7 +41,7 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 
    Or, when MCP is available, prefer structured probes for a richer snapshot:
 
-   - `runtime_status` — governance + ServiceManager + version_check in one call.
+   - `runtime_status(project_id="<project_id>")` — governance + ServiceManager + version_check in one call.
    - `version_check` — HEAD vs CHAIN_VERSION + dirty files.
    - `graph_status` — active graph snapshot + stale check + semantic drift summary.
    - `health` — bare governance ping.
@@ -78,7 +80,21 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
    aming-claw open
    ```
 
-   Default URL: `http://localhost:40000/dashboard`. The dashboard is served by governance from `frontend/dashboard/dist` and is the shared cockpit for user + AI + governance.
+   Default URL: `http://localhost:40000/dashboard`. The root path `/` is not
+   the dashboard and may return `404` without meaning governance failed.
+   Governance serves the dashboard from packaged static assets. No build is
+   needed when `agent/governance/dashboard_dist/index.html` or
+   `frontend/dashboard/dist/index.html` already exists. In a raw checkout with
+   missing assets, run:
+
+   ```text
+   cd frontend/dashboard
+   npm install
+   npm run build
+   ```
+
+   If `/api/health` is OK but `/dashboard` returns `503`, report dashboard
+   static assets as missing instead of reporting governance as down.
 
 6. Plugin aftercare:
 
@@ -86,6 +102,33 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
    the current Codex thread loaded the plugin. After installing or updating the
    plugin, tell the user to reload Codex or open a new Codex session, then
    verify that the Aming Claw skill and `mcp__aming_claw` tools are visible.
+   Treat ServiceManager/executor offline as degraded runtime, not as dashboard
+   or governance failure.
+
+## Current Workspace Registration
+
+Starting governance or opening the dashboard does not register the current
+workspace. If `GET /api/projects` is empty or does not include the active
+workspace, ask before bootstrap unless the user explicitly requested
+initialize/register/bootstrap.
+
+Use governance on port `40000`, not the ServiceManager sidecar on `40101`:
+
+```text
+POST http://127.0.0.1:40000/api/project/bootstrap
+```
+
+For explicit bootstrap, infer the project id from the folder name and use common
+excludes such as `node_modules`, `dist`, `build`, `.expo`, `.next`, and
+`coverage`. Bootstrap builds a commit-bound graph; if the workspace is a dirty
+git repo, ask the user to commit/stash first.
+
+## MVP Graph Model
+
+The Aming Claw repo itself can use `aming-claw://seed-graph-summary` as packaged
+MVP navigation when no active `aming-claw` graph exists. That is not an install
+failure. Target/user projects need a registered active graph before graph-backed
+claims are available.
 
 ## CLI Surface (`agent/cli.py`)
 
@@ -156,9 +199,10 @@ If governance is offline or this is a fresh install:
    aming-claw start
    ```
 
-   Make clear that `aming-claw start` is long-running and should stay open in
-   its own terminal; the assistant should return to status checks instead of
-   waiting for the command to exit.
+   Make clear that `aming-claw start` only exits immediately when governance is
+   already healthy or the port is conflicting. When it starts governance, it is
+   long-running and should stay open in its own terminal; the assistant should
+   return to status checks instead of waiting for the command to exit.
 
 4. After plugin install, tell the user to reload Codex/open a new session. The
    current thread may not hot-load newly installed skills or MCP tools.

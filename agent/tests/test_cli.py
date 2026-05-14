@@ -63,6 +63,39 @@ class TestCliLauncher:
         assert "aming-claw start" in text
 
 
+class TestCliStart:
+    def test_start_exits_when_governance_already_healthy(self, monkeypatch, tmp_path):
+        import agent.cli as cli
+
+        runner = CliRunner()
+        monkeypatch.setattr(
+            cli,
+            "_probe_governance",
+            lambda port: {"status": "ok", "service": "governance", "version": "abc123", "port": port},
+        )
+        monkeypatch.setattr(cli, "_port_is_open", lambda port: False)
+
+        result = runner.invoke(main, ["start", "--workspace", str(tmp_path), "--port", "45555"])
+
+        assert result.exit_code == 0
+        assert "Governance already running on port 45555" in result.output
+        assert "http://localhost:45555/dashboard" in result.output
+
+    def test_start_reports_non_governance_port_conflict(self, monkeypatch, tmp_path):
+        import agent.cli as cli
+
+        runner = CliRunner()
+        monkeypatch.setattr(cli, "_probe_governance", lambda port: None)
+        monkeypatch.setattr(cli, "_port_is_open", lambda port: True)
+        monkeypatch.setattr(cli, "_port_owner_hint", lambda port: " PID=1234")
+
+        result = runner.invoke(main, ["start", "--workspace", str(tmp_path), "--port", "45555"])
+
+        assert result.exit_code != 0
+        assert "Port 45555 is already in use PID=1234" in result.output
+        assert "not Aming Claw governance" in result.output
+
+
 class TestCliPlugin:
     def test_plugin_install_dry_run_prints_plan(self, tmp_path):
         runner = CliRunner()
@@ -91,7 +124,7 @@ class TestCliPlugin:
                 "plugins": [
                     {
                         "name": "aming-claw",
-                        "source": {"source": "local", "path": "."},
+                        "source": {"source": "local", "path": "./"},
                     }
                 ],
             },
@@ -123,3 +156,5 @@ class TestCliPlugin:
         assert result.exit_code == 0
         assert "Aming Claw plugin doctor" in result.output
         assert "Restart/reload Codex" in result.output
+        assert "dashboard_static_assets" in result.output
+        assert "ai_cli_openai" in result.output

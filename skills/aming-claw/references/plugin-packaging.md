@@ -14,8 +14,13 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   `python -m agent.mcp.server --project aming-claw --workers 0`.
 - Governance and ServiceManager stay host-owned. Plugin MCP sessions should
   control/query them, not spawn duplicate executor workers.
-- The dashboard is served by governance at `/dashboard` from
-  `frontend/dashboard/dist`; build it before static smoke testing.
+- The dashboard is served by governance at `/dashboard`. The root path `/` is
+  not the dashboard and may return `404`.
+- Dashboard static assets are required. No build is needed if
+  `agent/governance/dashboard_dist/index.html` or
+  `frontend/dashboard/dist/index.html` exists. Raw checkouts missing both should
+  run `npm --prefix frontend/dashboard install` and
+  `npm --prefix frontend/dashboard run build` before static smoke testing.
 - Pip install works as a Python package entrypoint. The release build must run
   `npm --prefix frontend/dashboard run build` first; that command syncs the
   dashboard into `agent/governance/dashboard_dist` so the wheel can serve
@@ -28,13 +33,18 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   checkout, validate Codex/Claude plugin assets, optionally pip-install the
   runtime, and print next steps. They do not silently install credentials or
   mutate global editor settings.
+- Installing plugin assets, installing the Python package, starting governance,
+  serving the dashboard, loading MCP tools in the current Codex/Claude session,
+  and ServiceManager/executor health are separate states. After plugin install
+  or update, open a new editor session before expecting new skills/MCP tools.
 
 ## Layout
 
 - `.codex-plugin/plugin.json`: Codex local plugin manifest (explicit
   `skills` and `mcpServers` pointers).
 - `.agents/plugins/marketplace.json`: repo-local Codex marketplace entry that
-  installs this root plugin by default for local/plugin sessions.
+  installs this root plugin by default for local/plugin sessions. Keep
+  `source.path` as `"./"` so Codex CLI treats it as an explicit local source.
 - `.claude-plugin/plugin.json`: Claude Code plugin manifest. `skills/` and
   `.mcp.json` are auto-discovered from the plugin root, so the manifest only
   declares `name` + `description` + metadata.

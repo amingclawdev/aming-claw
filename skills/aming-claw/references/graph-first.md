@@ -2,10 +2,18 @@
 
 Use the active graph before inventing modules, moving files, or deciding ownership.
 
+For target/user projects, graph-backed claims require a registered active graph.
+For Aming Claw internals during MVP, `aming-claw://seed-graph-summary` is an
+acceptable packaged navigation fallback when no active `aming-claw` graph
+exists; use bounded file reads for exact code and do not overclaim node-level
+evidence in that fallback mode.
+
 ## Minimum Discovery
 
 1. Call `graph_status` for the active snapshot and graph stale state.
 2. Call `graph_operations_queue` for pending scope reconcile, semantic jobs, review queue, and drift.
+   If graph is stale, prefer direct Update graph (`/reconcile/pending-scope`
+   with `activate=true`) over explicit pending-scope queueing.
 3. Use `graph_query` before editing:
    - `query_schema` first, so the session learns the live tool list, valid `query_source`, and valid `query_purpose` values.
    - `find_node_by_path` to resolve a file path to graph node ids.
@@ -20,6 +28,10 @@ Use the active graph before inventing modules, moving files, or deciding ownersh
    - `get_file_excerpt` for targeted snippets when available.
 4. Run `wf_impact` on candidate files before mutation.
 5. Then inspect files directly.
+
+Graph snapshots are commit-bound. Reconcile/build/update flows should use a
+clean worktree. If dirty files exist, commit/stash unrelated work or switch to
+an isolated clean worktree before claiming graph state reflects current code.
 
 ## Example Query Payloads
 

@@ -97,7 +97,10 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
         from . import db as governance_db
         from . import reconcile_semantic_enrichment as semantic
         from .reconcile_semantic_ai import build_semantic_ai_call
-        from .reconcile_semantic_config import load_semantic_enrichment_config
+        from .reconcile_semantic_config import (
+            apply_project_ai_routing,
+            load_semantic_enrichment_config,
+        )
         from . import reconcile_feedback
 
         conn = governance_db.get_connection(project_id)
@@ -130,7 +133,10 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
             log.info("semantic_worker: claim_id=%s node_ids=%s",
                      claim_id, list(node_ids)[:5])
             root = _project_root_for(project_id)
-            cfg = load_semantic_enrichment_config(project_root=root)
+            cfg = apply_project_ai_routing(
+                load_semantic_enrichment_config(project_root=root),
+                project_id=project_id,
+            )
             try:
                 ai_call = build_semantic_ai_call(
                     semantic_config=cfg,
@@ -319,7 +325,10 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
         from . import graph_events
         from . import reconcile_feedback
         from .reconcile_semantic_ai import build_semantic_ai_call
-        from .reconcile_semantic_config import load_semantic_enrichment_config
+        from .reconcile_semantic_config import (
+            apply_project_ai_routing,
+            load_semantic_enrichment_config,
+        )
 
         conn = governance_db.get_connection(project_id)
         try:
@@ -360,7 +369,10 @@ def _drain_edge(project_id: str, snapshot_id: str) -> None:
             log.info("semantic_worker: edge drain %s/%s candidates=%d",
                      project_id, snapshot_id, len(rows))
             root = _project_root_for(project_id)
-            cfg = load_semantic_enrichment_config(project_root=root)
+            cfg = apply_project_ai_routing(
+                load_semantic_enrichment_config(project_root=root),
+                project_id=project_id,
+            )
             try:
                 ai_call = build_semantic_ai_call(
                     semantic_config=cfg,

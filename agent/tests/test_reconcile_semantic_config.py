@@ -9,6 +9,7 @@ from agent.governance.reconcile_semantic_config import (
     DEFAULT_CONFIG_PATH,
     PROJECT_OVERRIDE_PATH,
     SemanticConfigValidationError,
+    apply_project_ai_routing,
     load_semantic_enrichment_config,
 )
 from agent.governance import reconcile_semantic_ai
@@ -51,6 +52,27 @@ def test_default_semantic_config_loads_state_only_profile():
     assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"
     assert payload["prompt_template"]
     assert Path(DEFAULT_CONFIG_PATH).exists()
+
+
+def test_project_ai_routing_overrides_semantic_provider_and_model(monkeypatch):
+    config = load_semantic_enrichment_config()
+    monkeypatch.setattr(
+        "agent.governance.project_service.get_project_config_metadata",
+        lambda project_id: {
+            "project_id": project_id,
+            "ai": {
+                "routing": {
+                    "semantic": {"provider": "openai", "model": "gpt-5.5"}
+                }
+            },
+        },
+    )
+
+    updated = apply_project_ai_routing(config, project_id="demo-project")
+
+    assert updated.provider == "openai"
+    assert updated.model == "gpt-5.5"
+    assert "demo-project:ai.routing.semantic" in updated.override_path
 
 
 def test_legacy_role_field_maps_to_chain_role_not_analyzer(tmp_path):

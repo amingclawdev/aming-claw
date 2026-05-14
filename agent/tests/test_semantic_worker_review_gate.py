@@ -521,6 +521,8 @@ def test_f_drain_edge_creates_proposed_event_and_feedback(conn, monkeypatch):
         return _StubCfg()
 
     def _stub_build_ai_call(*, semantic_config, project_id, snapshot_id, project_root):
+        assert semantic_config.provider == "openai"
+        assert semantic_config.model == "gpt-5.5"
         def _ai(stage, payload):
             assert stage == "edge"
             assert payload["edge"]["src"] == "L7.1"
@@ -539,6 +541,13 @@ def test_f_drain_edge_creates_proposed_event_and_feedback(conn, monkeypatch):
     monkeypatch.setattr(
         "agent.governance.reconcile_semantic_config.load_semantic_enrichment_config",
         _stub_load_cfg,
+    )
+    monkeypatch.setattr(
+        "agent.governance.project_service.get_project_config_metadata",
+        lambda project_id: {
+            "project_id": project_id,
+            "ai": {"routing": {"semantic": {"provider": "openai", "model": "gpt-5.5"}}},
+        },
     )
     monkeypatch.setattr(
         "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",

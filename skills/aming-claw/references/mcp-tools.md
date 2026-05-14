@@ -7,9 +7,12 @@ Prefer MCP tools over raw SQLite or hand-rolled HTTP calls when the tool exists.
 - `health`: governance service health.
 - `version_check`: HEAD, chain version, dirty files, and runtime match.
 - `runtime_status`: combined governance, ServiceManager, and version state.
+  Pass `project_id`, for example `runtime_status(project_id="aming-claw")`.
 - `preflight_check`: system, version, graph, coverage, and queue baseline.
 
 Use these at session start, after commits, and before closing a backlog row.
+ServiceManager or executor offline means runtime is degraded for chain/executor
+work; it does not by itself mean governance or the dashboard is down.
 
 ## AI Config And Local Runtime
 
@@ -43,6 +46,16 @@ Status wording must separate command detection from real AI availability:
 
 Do not run a real Codex or Claude model call as a readiness check unless the
 user explicitly asks; it may spend quota or trigger interactive login.
+
+## Semantic Enrichment
+
+Use the dashboard AI Enrich action or `POST /semantic/jobs` for MVP semantic
+work. The flow is queue -> worker -> Review Queue -> accept/reject ->
+projection. Treat `ai_complete` as "AI proposal generated", not as trusted or
+approved memory.
+
+`/semantic-enrich` is a lower-level admin/debug/rebuild endpoint. Do not use it
+as the default operator path.
 
 ## Backlog
 
@@ -89,7 +102,25 @@ backlog of record (and `docs/dev/` is gitignored, so they're not committed).
   - `get_neighbors`: structural neighbors; pass `include_edge_semantic=true` for semantic edge projection payloads.
   - `search_semantic`: node semantics, node metadata, and current edge semantic projection.
   - `search_docs`, `get_node`, and `get_file_excerpt`: docs, exact node fetches, and bounded code excerpts.
-- `graph_pending_scope_queue`: queue/update pending scope reconcile when HEAD and active graph diverge.
+- Direct Update graph is the preferred MVP path when HEAD and the active graph diverge:
+  call governance `POST /api/graph-governance/{project_id}/reconcile/pending-scope`
+  with `target_commit_sha`, `activate=true`, and `semantic_use_ai=false`. The
+  backend creates and consumes transient pending-scope bookkeeping in one
+  request, so operators should not see a stale queued `scope_reconcile` row.
+- `graph_pending_scope_queue`: legacy/debug helper for explicitly queueing a
+  pending scope row. Do not use it as the default dashboard/plugin Update graph
+  flow.
+
+## Governance Hint
+
+Governance Hint is the safe MVP path for binding orphan doc/test/config files to
+existing graph nodes. It writes a source-controlled `governance-hint` comment,
+returns `written_uncommitted`, and requires a commit plus Update Graph/reconcile
+before graph materialization.
+
+Only use it for files already present in snapshot inventory with
+`scan_status=orphan`. If the API reports `file inventory row not found`, update
+the graph first so the file inventory can see the new file.
 
 Example:
 

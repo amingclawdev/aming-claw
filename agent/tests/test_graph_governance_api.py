@@ -622,6 +622,106 @@ def test_graph_governance_semantic_jobs_endpoint_enqueues_existing_semantic_jobs
     assert events["events"][0]["payload"]["batch_plan"]["target_ids"] == ["L7.1"]
 
 
+def test_semantic_jobs_operator_request_uses_project_ai_routing(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "get_project_config_metadata",
+        lambda project_id: {
+            "project_id": project_id,
+            "ai": {
+                "routing": {
+                    "semantic": {"provider": "openai", "model": "gpt-5.5"}
+                }
+            },
+        },
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-jobs-project-routing",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    status, payload = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "node",
+                "target_ids": ["L7.1"],
+                "options": {"skip_current": False},
+                "created_by": "dashboard_user",
+            },
+        )
+    )
+
+    assert status == 202
+    analyzer = payload["operator_request"]["analyzer"]
+    assert analyzer["provider"] == "openai"
+    assert analyzer["model"] == "gpt-5.5"
+    assert "ai.routing.semantic" in analyzer["override_path"]
+
+
+def test_semantic_jobs_requires_project_route_when_registry_config_exists(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    monkeypatch.setattr(
+        server.project_service,
+        "get_project_config_metadata",
+        lambda project_id: {"project_id": project_id, "ai": {"routing": {}}},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-jobs-missing-project-routing",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    with pytest.raises(ValidationError, match="AI enrich blocked"):
+        server.handle_graph_governance_snapshot_semantic_jobs_create(
+            _ctx(
+                {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+                method="POST",
+                body={
+                    "project_root": str(tmp_path),
+                    "target_scope": "node",
+                    "target_ids": ["L7.1"],
+                    "options": {"skip_current": False},
+                    "created_by": "dashboard_user",
+                },
+            )
+        )
+
+
 def test_graph_governance_semantic_jobs_endpoint_records_edge_requests_as_events(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         server,

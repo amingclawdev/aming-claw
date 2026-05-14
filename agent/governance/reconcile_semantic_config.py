@@ -536,6 +536,39 @@ def load_semantic_enrichment_config(
     )
 
 
+def apply_project_ai_routing(
+    config: SemanticAnalyzerConfig,
+    *,
+    project_id: str | None = None,
+) -> SemanticAnalyzerConfig:
+    """Apply central project AI routing to a semantic config when present."""
+    project_key = str(project_id or "").strip()
+    if not project_key:
+        return config
+    try:
+        from . import project_service
+
+        project_config = project_service.get_project_config_metadata(project_key)
+    except Exception:
+        return config
+    ai_config = project_config.get("ai") if isinstance(project_config, dict) else {}
+    routing = ai_config.get("routing") if isinstance(ai_config, dict) else {}
+    route = routing.get("semantic") if isinstance(routing, dict) else {}
+    if not isinstance(route, dict):
+        return config
+    provider = str(route.get("provider") or "").strip()
+    model = str(route.get("model") or "").strip()
+    if provider:
+        config.provider = provider
+    if model:
+        config.model = model
+    if provider or model:
+        marker = f"aming_claw_registry:{project_key}:ai.routing.semantic"
+        existing = str(getattr(config, "override_path", "") or "").strip()
+        config.override_path = f"{existing}; {marker}" if existing else marker
+    return config
+
+
 __all__ = [
     "DEFAULT_CONFIG_PATH",
     "PROJECT_OVERRIDE_PATH",
@@ -546,5 +579,6 @@ __all__ = [
     "SemanticAutomationPolicy",
     "SemanticInputPolicy",
     "SemanticJobProfile",
+    "apply_project_ai_routing",
     "load_semantic_enrichment_config",
 ]

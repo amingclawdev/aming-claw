@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import shlex
 import subprocess
 import sys
@@ -26,6 +27,18 @@ REQUIRED_PLUGIN_FILES = (
     "skills/aming-claw-launcher/SKILL.md",
     ".mcp.json",
 )
+AI_CLI_REQUIREMENTS = {
+    "openai": {
+        "runtime": "Codex CLI",
+        "command": "codex",
+        "env_var": "CODEX_BIN",
+    },
+    "anthropic": {
+        "runtime": "Claude Code CLI",
+        "command": "claude",
+        "env_var": "CLAUDE_BIN",
+    },
+}
 
 
 @dataclass
@@ -147,6 +160,50 @@ def _run(
         ) from exc
 
 
+def _spawn_long_running(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    dry_run: bool = False,
+    commands: Optional[list[CommandRecord]] = None,
+) -> None:
+    record = CommandRecord(args=[str(part) for part in args], cwd=str(cwd), skipped=dry_run)
+    if commands is not None:
+        commands.append(record)
+    if dry_run:
+        return
+
+    log_path = cwd / ".aming-claw-start.log"
+    try:
+        log_handle = log_path.open("ab")
+    except OSError as exc:
+        raise PluginInstallError(f"cannot open start log {log_path}: {exc}") from exc
+
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(
+            [str(part) for part in args],
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            **popen_kwargs,
+        )
+    except FileNotFoundError as exc:
+        raise PluginInstallError(f"command not found: {args[0]}") from exc
+    except OSError as exc:
+        raise PluginInstallError(f"failed to start long-running service: {exc}") from exc
+    finally:
+        log_handle.close()
+
+
 def validate_plugin_root(plugin_root: Path) -> list[str]:
     root = plugin_root.expanduser().resolve()
     missing = [rel for rel in REQUIRED_PLUGIN_FILES if not (root / rel).is_file()]
@@ -222,6 +279,12 @@ def _check_marketplace(plugin_root: Path) -> DoctorCheck:
             "fail",
             f"source.path={raw_path!r} resolves to {resolved}, but no .codex-plugin/plugin.json was found",
         )
+    if not (raw_path.startswith("./") or raw_path.startswith("../") or os.path.isabs(raw_path)):
+        return _doctor_check(
+            "codex_marketplace",
+            "warn",
+            f"source.path={raw_path!r} resolves to {resolved}; prefer './' for Codex CLI local plugin paths",
+        )
     return _doctor_check(
         "codex_marketplace",
         "ok",
@@ -272,6 +335,99 @@ def _check_governance(governance_url: str) -> DoctorCheck:
     return _doctor_check("governance_health", "warn", f"{url} returned {payload}")
 
 
+def _check_dashboard_assets(plugin_root: Path) -> DoctorCheck:
+    candidates = [
+        plugin_root / "agent" / "governance" / "dashboard_dist" / "index.html",
+        plugin_root / "frontend" / "dashboard" / "dist" / "index.html",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return _doctor_check("dashboard_static_assets", "ok", str(candidate))
+    return _doctor_check(
+        "dashboard_static_assets",
+        "warn",
+        "missing dashboard index; run `cd frontend/dashboard && npm install && npm run build` in a raw checkout",
+    )
+
+
+def _check_dashboard_route(governance_url: str) -> DoctorCheck:
+    url = governance_url.rstrip("/") + "/dashboard"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            status = getattr(response, "status", response.getcode())
+    except urllib.error.HTTPError as exc:
+        return _doctor_check(
+            "dashboard_http_route",
+            "warn",
+            f"{url} returned HTTP {exc.code}; root `/` is not the dashboard",
+        )
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return _doctor_check("dashboard_http_route", "warn", f"{url}: {exc}")
+    if status == 200:
+        return _doctor_check("dashboard_http_route", "ok", f"{url} returned 200")
+    return _doctor_check("dashboard_http_route", "warn", f"{url} returned HTTP {status}")
+
+
+def _check_manager_health(manager_url: str = "http://127.0.0.1:40101") -> DoctorCheck:
+    url = manager_url.rstrip("/") + "/api/manager/health"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        return _doctor_check(
+            "service_manager_health",
+            "warn",
+            f"{url}: {exc}; governance/dashboard can still be usable, chain/executor is degraded",
+        )
+    if payload.get("ok") is True:
+        version = payload.get("runtime_version") or ""
+        detail = f"{url} ok"
+        if version:
+            detail += f", runtime_version={version}"
+        return _doctor_check("service_manager_health", "ok", detail)
+    return _doctor_check("service_manager_health", "warn", f"{url} returned {payload}")
+
+
+def _check_ai_cli(provider: str, requirement: dict[str, str]) -> DoctorCheck:
+    env_var = requirement["env_var"]
+    configured = os.environ.get(env_var, "").strip()
+    command = configured or requirement["command"]
+    resolved = command if os.path.isabs(command) else shutil.which(command)
+    label = requirement["runtime"]
+    if not resolved:
+        return _doctor_check(
+            f"ai_cli_{provider}",
+            "warn",
+            f"{label} missing; expected `{requirement['command']}` or {env_var}",
+        )
+    try:
+        proc = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return _doctor_check(
+            f"ai_cli_{provider}",
+            "warn",
+            f"{label} found at {resolved}, but version probe failed: {exc}",
+        )
+    version = (proc.stdout or proc.stderr or "").strip().splitlines()[0:1]
+    if proc.returncode != 0:
+        return _doctor_check(
+            f"ai_cli_{provider}",
+            "warn",
+            f"{label} found at {resolved}, but version probe exited {proc.returncode}",
+        )
+    suffix = f", version {version[0]}" if version else ""
+    return _doctor_check(
+        f"ai_cli_{provider}",
+        "ok",
+        f"{label}: detected at {resolved}{suffix}, auth unknown",
+    )
+
+
 def doctor_plugin(
     *,
     plugin_root: Optional[Union[Path, str]] = None,
@@ -293,14 +449,19 @@ def doctor_plugin(
     result.checks.append(_check_marketplace(root))
     result.checks.append(_check_mcp_config(root))
     result.checks.append(_check_codex_config(Path(codex_config).expanduser() if codex_config else default_codex_config_path()))
+    result.checks.append(_check_dashboard_assets(root))
+    for provider, requirement in AI_CLI_REQUIREMENTS.items():
+        result.checks.append(_check_ai_cli(provider, requirement))
     if check_governance:
         result.checks.append(_check_governance(governance_url))
+        result.checks.append(_check_dashboard_route(governance_url))
+        result.checks.append(_check_manager_health(os.environ.get("MANAGER_URL", "http://127.0.0.1:40101")))
 
     result.manual_steps.extend(
         [
             "Restart/reload Codex or open a new session after installing the plugin; existing threads may not hot-load new skills/MCP tools.",
             "In the new session, confirm the Aming Claw skill is visible and mcp__aming_claw tools are available.",
-            "Remember: `aming-claw start` only starts governance; it does not prove the Codex plugin was loaded.",
+            "Remember: `aming-claw start` only starts governance; it does not prove plugin loading, dashboard assets, ServiceManager, executor, or AI auth.",
         ]
     )
     return result
@@ -389,7 +550,7 @@ def install_from_git(
 
     started = False
     if start:
-        _run(
+        _spawn_long_running(
             [python, "-m", "agent.cli", "start"],
             cwd=plugin_root,
             dry_run=dry_run,

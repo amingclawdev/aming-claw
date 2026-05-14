@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from agent.plugin_installer import (
+    AI_CLI_REQUIREMENTS,
     PluginInstallError,
+    _check_ai_cli,
     doctor_plugin,
     format_result,
     format_doctor_result,
@@ -25,7 +27,7 @@ def _write_plugin_fixture(root: Path) -> None:
             "plugins": [
                 {
                     "name": "aming-claw",
-                    "source": {"source": "local", "path": "."},
+                    "source": {"source": "local", "path": "./"},
                     "policy": {"installation": "INSTALLED_BY_DEFAULT"},
                 }
             ],
@@ -116,8 +118,34 @@ def test_doctor_plugin_validates_aftercare_without_governance(tmp_path):
         "codex_marketplace",
         "mcp_config",
         "codex_config",
+        "dashboard_static_assets",
+        "ai_cli_openai",
+        "ai_cli_anthropic",
     }
     assert "Restart/reload Codex" in format_doctor_result(result)
+    assert "auth unknown" in format_doctor_result(result) or "missing" in format_doctor_result(result)
+
+
+def test_ai_cli_check_uses_env_override(monkeypatch, tmp_path):
+    fake_codex = tmp_path / "codex-custom"
+    monkeypatch.setenv("CODEX_BIN", str(fake_codex))
+
+    class _Proc:
+        returncode = 0
+        stdout = "codex-cli 9.9.9\n"
+        stderr = ""
+
+    def fake_run(args, **_kwargs):
+        assert args == [str(fake_codex), "--version"]
+        return _Proc()
+
+    monkeypatch.setattr("agent.plugin_installer.subprocess.run", fake_run)
+
+    check = _check_ai_cli("openai", AI_CLI_REQUIREMENTS["openai"])
+
+    assert check.status == "ok"
+    assert str(fake_codex) in check.detail
+    assert "auth unknown" in check.detail
 
 
 def test_doctor_plugin_flags_bad_marketplace_path(tmp_path):

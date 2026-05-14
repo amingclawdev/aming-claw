@@ -384,3 +384,53 @@ def test_bootstrap_project_uses_snapshot_full_reconcile(tmp_path, monkeypatch):
     assert observed["semantic_use_ai"] is False
     assert observed["semantic_enqueue_stale"] is False
     assert observed["notes_extra"]["effective_exclude_roots"] == ["examples"]
+
+
+def test_bootstrap_git_gate_rejects_dirty_worktree(tmp_path, monkeypatch):
+    from agent.governance import project_service
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class _Proc:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "rev-parse" in args:
+            return _Proc(stdout=str(workspace))
+        if "status" in args:
+            return _Proc(stdout=" M src/app.py\n?? notes.md\n")
+        return _Proc(returncode=1, stderr="unexpected")
+
+    monkeypatch.setattr(project_service.subprocess, "run", fake_run)
+
+    with pytest.raises(project_service.ValidationError, match="dirty git worktree"):
+        project_service._ensure_clean_git_worktree_for_graph(workspace)
+
+    assert any("rev-parse" in call for call in calls)
+    assert any("status" in call for call in calls)
+
+
+def test_bootstrap_git_gate_allows_non_git_workspace(tmp_path, monkeypatch):
+    from agent.governance import project_service
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class _Proc:
+        returncode = 128
+        stdout = ""
+        stderr = "not a git repository"
+
+    monkeypatch.setattr(project_service.subprocess, "run", lambda *args, **kwargs: _Proc())
+
+    assert project_service._ensure_clean_git_worktree_for_graph(workspace) == {
+        "is_git_repo": False,
+        "dirty": False,
+    }

@@ -179,8 +179,8 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
 
       <div className="backlog-guidance">
         <div>
-          <strong>Project memory.</strong> Backlog rows stay read-only here; orphan file binding
-          writes source-controlled hints that reconcile can materialize.
+          <strong>Project memory.</strong> Backlog rows stay read-only here; Governance Hint orphan
+          binding writes source-controlled hints that reconcile can materialize.
         </div>
         <span className="mono">manual filing hidden in v1</span>
       </div>
@@ -194,14 +194,14 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
 
       <div className="section">
         <div className="section-head">
-          Orphan file binding{" "}
+          Governance Hint / Orphan file binding{" "}
           <span className="head-hint">
             {filesLoading ? "loading" : `${attachableFiles.length} orphan files · write hint, commit, then Update graph`}
           </span>
         </div>
         <div className="backlog-guidance backlog-guidance-amber">
           <div>
-            <strong>Direct write flow.</strong> This writes a governance hint into the selected file only.
+            <strong>Source-controlled graph correction.</strong> This writes a governance hint into the selected file only.
             Commit that file before clicking <span className="mono">Update graph</span>, because reconcile reads committed source.
           </div>
           <span className="mono">state: source write → commit → graph update</span>

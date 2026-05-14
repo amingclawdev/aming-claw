@@ -16,7 +16,12 @@ import sys
 import logging
 import json
 import webbrowser
+import socket
+import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Optional
 
 try:
     import click
@@ -105,6 +110,56 @@ def _dashboard_url(governance_url: str) -> str:
     return governance_url.rstrip("/") + "/dashboard"
 
 
+def _probe_governance(port: int, *, timeout: float = 2.0) -> Optional[dict]:
+    url = f"http://127.0.0.1:{port}/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - localhost probe
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _port_is_open(port: int, *, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _port_owner_hint(port: int) -> str:
+    if sys.platform.startswith("win"):
+        try:
+            proc = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            return ""
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+                if parts[1].endswith(f":{port}"):
+                    return f" PID={parts[-1]}"
+        return ""
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return ""
+    pid = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    return f" PID={pid}" if pid else ""
+
+
 def _launcher_html(governance_url: str) -> str:
     dashboard_url = _dashboard_url(governance_url)
     return f"""<!doctype html>
@@ -146,6 +201,19 @@ def _launcher_html(governance_url: str) -> str:
 @click.option("--port", default=40000, type=int, help="Governance HTTP port.")
 def start(workspace, port):
     """Start governance in the foreground without spawning plugin-owned workers."""
+    health = _probe_governance(port)
+    if health and health.get("status") == "ok" and health.get("service") == "governance":
+        dashboard = _dashboard_url(f"http://localhost:{port}")
+        version = health.get("version") or health.get("runtime_version") or "unknown"
+        click.echo(f"Governance already running on port {port} (version {version}).")
+        click.echo(f"Dashboard: {dashboard}")
+        return
+    if _port_is_open(port):
+        owner = _port_owner_hint(port)
+        raise click.ClickException(
+            f"Port {port} is already in use{owner}, but /api/health is not Aming Claw governance. "
+            "Stop that process or choose a different --port."
+        )
     os.environ["GOVERNANCE_PORT"] = str(port)
     os.environ.setdefault("AMING_CLAW_HOME", str(Path(workspace).resolve()))
     import start_governance

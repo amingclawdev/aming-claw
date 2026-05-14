@@ -26,12 +26,122 @@ Treat the active graph as the project map and the backlog as the work ledger. Be
 For new features or user-visible behavior changes, treat E2E impact as part of the work ledger: run/update the relevant suite and evidence, or file an explicit follow-up backlog row when the E2E is deferred.
 For dashboard/graph E2E work, update repo-owned fixture artifacts first and materialize them into isolated temporary projects; do not hand-edit generated example projects as the source of truth.
 
+## MVP Capability Matrix
+
+Stable MVP capabilities:
+
+- Register/bootstrap a target project after explicit user approval.
+- Build or update a commit-bound project graph.
+- Query graph structure, files, functions, docs/tests, neighbors, fan-in/fan-out, and bounded file excerpts.
+- Show and file backlog rows with graph evidence.
+- Run targeted AI Enrich for selected nodes or edges, then review and accept/reject proposed semantic memory.
+- Use Governance Hint to bind orphan doc/test/config files to existing nodes.
+- Use the dashboard with browser-use as the shared visual control plane.
+
+Limited or deferred capabilities:
+
+- Chain dev/test/qa/merge automation is experimental in MVP. Prefer Manual Fix for ordinary MVP implementation unless the user explicitly asks for chain execution.
+- Function-level call graph persistence is planned but not yet a required MVP graph primitive.
+- Arbitrary graph editing, node moves, ownership rewrites, dependency rewrites, and automatic topology mutation are out of scope.
+
+## MVP Graph Model
+
+Aming Claw's MVP is primarily a governance tool for other local projects. A
+target project must be registered/bootstraped before graph-native claims can
+use node, function, edge, or coverage evidence.
+
+The Aming Claw repo itself does not need an active local graph snapshot for the
+plugin to be usable. When working on Aming Claw internals and no active
+`project_id="aming-claw"` snapshot exists, use `aming-claw://seed-graph-summary`
+as the packaged navigation map for core surfaces, then use bounded workspace
+search/file reads for exact code. Do not claim node-level or function-level
+graph evidence for Aming Claw itself unless an active `aming-claw` graph exists.
+
+A missing active graph for `aming-claw` is not an install failure. A missing
+active graph for the user's target project means the project should be
+registered/bootstraped before graph-backed governance is available.
+
+## Commit-Bound Graph
+
+Graph snapshots are commit-bound. They represent the selected ref/HEAD commit,
+not dirty worktree state. Full reconcile, scope reconcile, bootstrap graph
+builds, and Update Graph should use a clean worktree.
+
+If the worktree is dirty, do not call that a graph bug. Tell the user:
+
+```text
+Graph snapshots are commit-bound. Commit/stash unrelated local changes before reconcile, or use an isolated clean worktree for candidate-only inspection.
+```
+
+## Current Workspace Not Registered
+
+If governance is running but `GET /api/projects` does not include the active
+workspace, do not silently bootstrap it. Project bootstrap mutates governance
+state: it writes the project registry/DB, scans the workspace, and creates graph
+snapshot state.
+
+Ask the user before registering unless they explicitly requested
+initialization, registration, or bootstrap. Use governance, not ServiceManager:
+
+- Correct API: `POST http://127.0.0.1:40000/api/project/bootstrap`.
+- Do not use `http://127.0.0.1:40101/` for project bootstrap; port `40101` is
+  the ServiceManager sidecar.
+
+For an explicit "initialize this project" request, infer `project_id` from the
+folder name, `workspace_path` from the current workspace root, language from
+project files when obvious, and common excludes such as `node_modules`, `dist`,
+`build`, `.expo`, `.next`, and `coverage`. After bootstrap, open:
+`http://127.0.0.1:40000/dashboard?project_id=<project_id>&view=projects`.
+
+## Semantic Enrichment MVP
+
+Recommended path: dashboard AI Enrich or `POST /semantic/jobs` -> semantic
+worker -> Review Queue -> accept/reject -> semantic projection. The
+`/semantic-enrich` endpoint is a lower-level admin/debug/rebuild path, not the
+default MVP workflow.
+
+`ai_complete` means AI generated a proposal or worker output; it does not mean
+trusted memory. Accepted semantics become trusted only after the operator
+approves the Review Queue item and projection materializes it.
+
+Before queueing live AI work, check `/api/projects/{project_id}/ai-config`.
+Project-level `ai.routing.semantic` wins over the global semantic config. If
+the project semantic provider/model is missing, AI Enrich is blocked until AI
+config is saved for that project.
+
+## Governance Hint MVP
+
+Governance Hint is the MVP-safe graph-structure correction path for orphan
+doc/test/config files that already appear in the snapshot file inventory with
+`scan_status=orphan`.
+
+It writes source-controlled evidence into the file, returns
+`written_uncommitted`, and does not mutate the graph DB directly. The user or
+agent must commit the hint file and then run Update Graph/reconcile before the
+binding appears in the graph. Repeating the same path + target node + role is
+idempotent.
+
+Use Governance Hint when an orphan doc/test/config file clearly belongs to an
+existing node. Do not create nodes, edit the DB, move ownership, change primary
+files, rewrite hierarchy/dependency edges, or invent function-call relations
+through this flow. If the API says `file inventory row not found`, run Update
+Graph first so the file enters snapshot inventory, then retry.
+
+When summarizing work, explicitly report whether a hint is still uncommitted or
+not yet materialized into the graph.
+
 ## Manual Fix SOP
 
 Use the manual-fix SOP for observer-hotfix, chain rescue, and other bypass
 work where normal chain execution is not the right path. The canonical SOP is
 `docs/governance/manual-fix-sop.md`; the compact session checklist is
 `aming-claw://mf-sop`.
+
+During MVP, Chain is not the default path for routine implementation. Use MF
+for ordinary MVP fixes/features when needed, but do not treat MF as a bypass of
+governance: backlog, graph discovery, tests, explicit commit files, Chain
+trailers, post-commit scope reconcile, and backlog close still apply. This is a
+temporary MVP mode; when Chain is stable, return to Chain-first development.
 
 Before editing:
 
@@ -60,7 +170,7 @@ is stale, then close the backlog row with commit and verification evidence.
 ## Start Sequence
 
 1. Confirm the workspace root and project id, normally `aming-claw`.
-2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status` when available.
+2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status(project_id="<project_id>")` when available.
 3. Check graph state: `graph_status` and `graph_operations_queue`.
 4. If governance is offline or this is a fresh install, read `aming-claw://seed-graph-summary` for packaged MVP structure before asking the user to start services.
 5. For AI or semantic work, check local AI runtime readiness through the project AI config before queueing jobs.
@@ -241,7 +351,7 @@ Before closing a row:
 3. Commit explicit files only.
 4. Restart/redeploy governance or ServiceManager when runtime code changed.
 5. Re-run `version_check` and confirm runtime matches HEAD.
-6. Check graph status and operations queue; if graph is stale, queue/perform scope reconcile before claiming dashboard state is current.
+6. Check graph status and operations queue; if graph is stale, run direct Update graph/scope reconcile before claiming dashboard state is current. Explicit pending-scope queueing is legacy/debug only.
 7. Confirm E2E impact is current, deferred with a backlog row, or explicitly not applicable.
 8. Close the backlog row with commit evidence.
 

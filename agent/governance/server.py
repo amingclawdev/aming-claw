@@ -2714,10 +2714,17 @@ def _semantic_ai_call_from_body(project_id: str, root: Path, body: dict):
         return None
     try:
         from .reconcile_semantic_ai import build_semantic_ai_call
-        from .reconcile_semantic_config import load_semantic_enrichment_config
+        from .reconcile_semantic_config import (
+            apply_project_ai_routing,
+            load_semantic_enrichment_config,
+        )
         semantic_config = load_semantic_enrichment_config(
             project_root=root,
             config_path=body.get("semantic_config_path"),
+        )
+        semantic_config = apply_project_ai_routing(
+            semantic_config,
+            project_id=project_id,
         )
         if body.get("semantic_ai_provider") is not None:
             semantic_config.provider = str(body.get("semantic_ai_provider") or "")
@@ -4406,7 +4413,11 @@ def _prepare_file_hygiene_action(conn, store, project_id: str, snapshot_id: str,
     )
     row = _find_file_inventory_row(files_result, path)
     if not row:
-        raise ValidationError(f"file inventory row not found: {path}")
+        raise ValidationError(
+            f"file inventory row not found: {path}. "
+            "Run Update graph/reconcile first so the file appears in the "
+            "snapshot file inventory before filing a hygiene action."
+        )
 
     file_kind = str(row.get("file_kind") or "unknown")
     event_type = _file_hygiene_event_type(action, file_kind, node_id=node_id)
@@ -4558,7 +4569,11 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
         )
         row = _find_file_inventory_row(files_result, path)
         if not row:
-            raise ValidationError(f"file inventory row not found: {path}")
+            raise ValidationError(
+                f"file inventory row not found: {path}. "
+                "Run Update graph/reconcile first so the file appears in the "
+                "snapshot file inventory before writing a governance hint."
+            )
         if row.get("attached_node_ids"):
             raise ValidationError("file is already attached to a node")
         scan_status = str(row.get("scan_status") or "")
@@ -8341,6 +8356,7 @@ def _semantic_jobs_operator_request(
     snapshot_id: str,
     root: Path,
     *,
+    project_id: str,
     target_scope: str,
     target_ids: list[str],
     layers: list[str],
@@ -8359,12 +8375,16 @@ def _semantic_jobs_operator_request(
         or "dashboard"
     )
     try:
-        from .reconcile_semantic_config import load_semantic_enrichment_config
+        from .reconcile_semantic_config import (
+            apply_project_ai_routing,
+            load_semantic_enrichment_config,
+        )
 
         config = load_semantic_enrichment_config(
             project_root=root,
             config_path=body.get("semantic_config_path"),
         )
+        config = apply_project_ai_routing(config, project_id=project_id)
         analyzer = config.summary()
     except Exception as exc:  # noqa: BLE001 - metadata should not block queue creation
         analyzer = {"error": str(exc)}
@@ -8394,6 +8414,30 @@ def _semantic_jobs_operator_request(
         },
         "batch_plan": batch_plan,
     }
+
+
+def _project_semantic_route_ready(project_id: str) -> tuple[bool, bool]:
+    """Return (has_project_config, has_semantic_route) for AI queue gating."""
+    try:
+        project_config = project_service.get_project_config_metadata(project_id)
+    except Exception:
+        return False, False
+    if not isinstance(project_config, dict) or not project_config:
+        return False, False
+    ai_config = project_config.get("ai") if isinstance(project_config.get("ai"), dict) else {}
+    routing = ai_config.get("routing") if isinstance(ai_config.get("routing"), dict) else {}
+    route = routing.get("semantic") if isinstance(routing.get("semantic"), dict) else {}
+    provider = str(route.get("provider") or "").strip()
+    model = str(route.get("model") or "").strip()
+    return True, bool(provider and model)
+
+
+def _require_project_semantic_route_for_jobs(project_id: str) -> None:
+    has_project_config, has_semantic_route = _project_semantic_route_ready(project_id)
+    if has_project_config and not has_semantic_route:
+        raise ValidationError(
+            "AI enrich blocked: configure this project's semantic provider/model in AI config first."
+        )
 
 
 def _edge_semantic_auto_enrich_enabled(body: dict) -> bool:
@@ -8445,13 +8489,20 @@ def _edge_semantic_ai_body(body: dict, snapshot_id: str, *, auto_enrich: bool) -
     return ai_body
 
 
-def _edge_semantic_instructions(root: Path, body: dict) -> dict:
+def _edge_semantic_instructions(project_id: str, root: Path, body: dict) -> dict:
     try:
-        from .reconcile_semantic_config import load_semantic_enrichment_config
+        from .reconcile_semantic_config import (
+            apply_project_ai_routing,
+            load_semantic_enrichment_config,
+        )
 
         config = load_semantic_enrichment_config(
             project_root=root,
             config_path=body.get("semantic_config_path"),
+        )
+        config = apply_project_ai_routing(
+            config,
+            project_id=project_id,
         )
         return config.to_instruction_payload("edge")
     except Exception as exc:  # noqa: BLE001 - queue metadata should not block dashboard actions
@@ -9190,6 +9241,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.jobs.create")
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        _require_project_semantic_route_for_jobs(project_id)
         dry_run = _semantic_jobs_dry_run(body)
         if _semantic_jobs_target_scope(body) in {"edge", "edges"}:
             from . import graph_events
@@ -9220,6 +9272,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 body,
                 snapshot_id,
                 root,
+                project_id=project_id,
                 target_scope="edge",
                 target_ids=[edge["edge_id"] for edge in edge_targets],
                 layers=[],
@@ -9243,7 +9296,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                     "queued_ops": [],
                 }
             auto_enrich = _edge_semantic_auto_enrich_enabled(body)
-            instructions = _edge_semantic_instructions(root, body)
+            instructions = _edge_semantic_instructions(project_id, root, body)
             ai_call = _semantic_ai_call_from_body(
                 project_id,
                 root,
@@ -9446,6 +9499,7 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
             body,
             snapshot_id,
             root,
+            project_id=project_id,
             target_scope=_semantic_jobs_target_scope(body),
             target_ids=requested_target_ids,
             layers=requested_layers,
