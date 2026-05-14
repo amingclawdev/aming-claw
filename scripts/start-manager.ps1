@@ -1,5 +1,8 @@
 param(
     [switch]$Takeover,
+    # SM and MCP are independent. Takeover restarts manager/executor only by default;
+    # pass -StopMcp for an explicit full host cleanup.
+    [switch]$StopMcp,
     [string]$Project = "aming-claw",
     # Windows cold-start (sidecar + aiohttp + executor Python init + per-project chain history backfill)
     # takes 21-25s base + up to 30s for incremental backfill scans; 90s gives safe margin
@@ -160,10 +163,14 @@ if ($Takeover) {
         Stop-ManagerProcessTree -TargetPid $id
     }
 
-    $mcpPids = @(Get-McpServerProcesses | Select-Object -ExpandProperty ProcessId -Unique)
-    foreach ($id in $mcpPids) {
-        Write-Host "Takeover: stopping existing MCP server PID=$id ..."
-        Stop-ManagerProcessTree -TargetPid $id
+    if ($StopMcp) {
+        $mcpPids = @(Get-McpServerProcesses | Select-Object -ExpandProperty ProcessId -Unique)
+        foreach ($id in $mcpPids) {
+            Write-Host "Takeover: stopping existing MCP server PID=$id ..."
+            Stop-ManagerProcessTree -TargetPid $id
+        }
+    } else {
+        Write-Host "Takeover: leaving MCP server processes running. Pass -StopMcp for explicit MCP cleanup."
     }
 }
 

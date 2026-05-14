@@ -30,6 +30,17 @@ def test_start_manager_takeover_process_cleanup_is_best_effort():
     assert "Stop-ManagerProcessTree -TargetPid $id" in script
 
 
+def test_start_manager_takeover_does_not_stop_mcp_without_explicit_flag():
+    script = _script_text()
+
+    assert "[switch]$StopMcp" in script
+    assert "Takeover: leaving MCP server processes running" in script
+    assert "Pass -StopMcp for explicit MCP cleanup" in script
+    assert "if ($StopMcp) {" in script
+    assert "Get-McpServerProcesses | Select-Object -ExpandProperty ProcessId -Unique" in script
+    assert "Takeover: stopping existing MCP server PID=$id" in script
+
+
 def test_start_manager_posix_script_bootstraps_service_manager_without_takeover():
     script = START_MANAGER_SH.read_text(encoding="utf-8")
 
