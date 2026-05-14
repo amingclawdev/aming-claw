@@ -17,18 +17,24 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 
    Writes `.aming-claw/aming-claw-launcher.html` with the dashboard link and start commands. Add `--open-browser` to open it in the default browser, or `--governance-url <url>` to target a non-default host. The launcher never starts services on its own.
 
-2. Start governance in the foreground (host-owned, no plugin-spawned workers):
+2. Start governance in the foreground from a separate terminal/window
+   (host-owned, no plugin-spawned workers):
 
    ```text
    aming-claw start
    ```
 
-   This runs `start_governance.main` with `GOVERNANCE_PORT` from `--port` (default `40000`). ServiceManager is started independently (see project rules in `CLAUDE.md`); do not let the plugin session spawn executor workers.
+   This runs `start_governance.main` with `GOVERNANCE_PORT` from `--port`
+   (default `40000`). It is a long-running service command; do not run it as a
+   normal one-shot Codex tool call and wait for it to exit. ServiceManager is
+   started independently (see project rules in `CLAUDE.md`); do not let the
+   plugin session spawn executor workers.
 
 3. Confirm health (CLI):
 
    ```text
    aming-claw status
+   aming-claw plugin doctor
    ```
 
    Or, when MCP is available, prefer structured probes for a richer snapshot:
@@ -46,6 +52,13 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 
    Default URL: `http://localhost:40000/dashboard`. The dashboard is served by governance from `frontend/dashboard/dist` and is the shared cockpit for user + AI + governance.
 
+5. Plugin aftercare:
+
+   `aming-claw start` only starts the governance service. It does not prove that
+   the current Codex thread loaded the plugin. After installing or updating the
+   plugin, tell the user to reload Codex or open a new Codex session, then
+   verify that the Aming Claw skill and `mcp__aming_claw` tools are visible.
+
 ## CLI Surface (`agent/cli.py`)
 
 | Command | Purpose |
@@ -53,8 +66,9 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 | `aming-claw init` | Write `.aming-claw.yaml` in the current directory. |
 | `aming-claw bootstrap --path <dir> --name <id>` | Register an external project under governance. |
 | `aming-claw scan --path <dir> --project-id <id>` | Scan an external project into a `.aming-claw` candidate workspace. |
-| `aming-claw start --port 40000 --workspace .` | Start governance in the foreground. |
+| `aming-claw start --port 40000 --workspace .` | Start governance in the foreground from a separate terminal/window. |
 | `aming-claw status` | GET `/api/health` against the running governance service. |
+| `aming-claw plugin doctor [--plugin-root <dir>]` | Run read-only aftercare checks for plugin assets, marketplace path, MCP config, Codex config hints, and governance health. |
 | `aming-claw open --governance-url <url>` | Open the dashboard in the default browser. |
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
 | `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, and print next steps. |
@@ -84,24 +98,43 @@ If governance is offline or this is a fresh install:
    git clone https://github.com/amingclawdev/aming-claw.git
    cd aming-claw
    pip install -e .
+   ```
+
+   Then ask the user to start governance in a separate terminal/window:
+
+   ```text
+   cd aming-claw
    python -m agent.cli start
+   ```
+
+   Then run:
+
+   ```text
+   python -m agent.cli plugin doctor --plugin-root .
    ```
 
    If the CLI is already available, use:
 
    ```text
    aming-claw plugin install https://github.com/amingclawdev/aming-claw
+   aming-claw plugin doctor
    ```
 
 2. Read `aming-claw://seed-graph-summary` (packaged MVP structure) when the MCP resource is available — do not invent module locations.
-3. Show the explicit startup flow rather than auto-running:
+3. Show the explicit startup flow rather than auto-running it inline:
 
    ```text
    aming-claw launcher
    aming-claw start
    ```
 
-4. After the user starts services, re-run `runtime_status` and confirm `version_check.ok == true` before recommending any mutation.
+   Make clear that `aming-claw start` is long-running and should stay open in
+   its own terminal; the assistant should return to status checks instead of
+   waiting for the command to exit.
+
+4. After plugin install, tell the user to reload Codex/open a new session. The
+   current thread may not hot-load newly installed skills or MCP tools.
+5. After the user starts services, re-run `runtime_status` and confirm `version_check.ok == true` before recommending any mutation.
 
 ## When to Hand Off
 
@@ -114,7 +147,10 @@ Use the main `aming-claw` skill (`skills/aming-claw/SKILL.md`) for:
 
 ## What Not To Do
 
-- Do not auto-start governance from a tool call. Always show `aming-claw start` and wait for the user.
+- Do not auto-start governance from a tool call. Always show `aming-claw start`
+  as a separate-terminal command and wait for the user.
+- Do not treat `aming-claw start` as plugin verification. Use
+  `aming-claw plugin doctor` and a new Codex session visibility check.
 - Do not bypass `aming-claw start` with `docker compose up` or raw `python -m agent.governance.server` unless the user is explicitly debugging.
 - Do not modify `governance.db`, the version chain, or graph state from launcher flows — those go through the main `aming-claw` skill.
 - Do not click HTML launcher buttons that would execute local shell commands. The launcher artifact is documentation, not a remote control.

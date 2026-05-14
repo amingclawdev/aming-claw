@@ -9,6 +9,8 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Union
@@ -59,6 +61,37 @@ class InstallResult:
                 for cmd in self.commands
             ],
             "next_steps": list(self.next_steps),
+        }
+
+
+@dataclass
+class DoctorCheck:
+    name: str
+    status: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "status": self.status, "detail": self.detail}
+
+
+@dataclass
+class DoctorResult:
+    plugin_root: str
+    governance_url: str
+    checks: list[DoctorCheck] = field(default_factory=list)
+    manual_steps: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return all(check.status != "fail" for check in self.checks)
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "plugin_root": self.plugin_root,
+            "governance_url": self.governance_url,
+            "checks": [check.to_dict() for check in self.checks],
+            "manual_steps": list(self.manual_steps),
         }
 
 
@@ -137,6 +170,142 @@ def validate_plugin_root(plugin_root: Path) -> list[str]:
     return list(REQUIRED_PLUGIN_FILES)
 
 
+def default_codex_config_path() -> Path:
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _default_doctor_root() -> Path:
+    cwd = Path.cwd()
+    if (cwd / ".codex-plugin" / "plugin.json").is_file():
+        return cwd.resolve()
+    return plugin_root_for(DEFAULT_REPO_URL, default_install_root())
+
+
+def _doctor_check(name: str, status: str, detail: str = "") -> DoctorCheck:
+    return DoctorCheck(name=name, status=status, detail=detail)
+
+
+def _read_json_file(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _check_marketplace(plugin_root: Path) -> DoctorCheck:
+    marketplace_path = plugin_root / ".agents" / "plugins" / "marketplace.json"
+    try:
+        marketplace = _read_json_file(marketplace_path)
+    except Exception as exc:
+        return _doctor_check("codex_marketplace", "fail", f"{marketplace_path}: {exc}")
+
+    plugins = marketplace.get("plugins") if isinstance(marketplace, dict) else []
+    match = next(
+        (
+            item
+            for item in plugins or []
+            if isinstance(item, dict) and item.get("name") == "aming-claw"
+        ),
+        None,
+    )
+    if not match:
+        return _doctor_check("codex_marketplace", "fail", "missing plugin entry `aming-claw`")
+
+    source = match.get("source") if isinstance(match.get("source"), dict) else {}
+    raw_path = str(source.get("path") or "").strip()
+    if not raw_path:
+        return _doctor_check("codex_marketplace", "fail", "missing source.path")
+
+    # Codex marketplace paths are resolved relative to the marketplace root,
+    # not relative to `.agents/plugins/marketplace.json`.
+    resolved = (plugin_root / raw_path).resolve()
+    if not (resolved / ".codex-plugin" / "plugin.json").is_file():
+        return _doctor_check(
+            "codex_marketplace",
+            "fail",
+            f"source.path={raw_path!r} resolves to {resolved}, but no .codex-plugin/plugin.json was found",
+        )
+    return _doctor_check(
+        "codex_marketplace",
+        "ok",
+        f"{marketplace_path} -> source.path {raw_path!r} resolves to {resolved}",
+    )
+
+
+def _check_mcp_config(plugin_root: Path) -> DoctorCheck:
+    path = plugin_root / ".mcp.json"
+    try:
+        payload = _read_json_file(path)
+    except Exception as exc:
+        return _doctor_check("mcp_config", "fail", f"{path}: {exc}")
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
+    if not isinstance(servers, dict) or "aming-claw" not in servers:
+        return _doctor_check("mcp_config", "fail", "missing mcpServers.aming-claw")
+    return _doctor_check("mcp_config", "ok", str(path))
+
+
+def _check_codex_config(path: Path) -> DoctorCheck:
+    if not path.is_file():
+        return _doctor_check(
+            "codex_config",
+            "warn",
+            f"{path} not found; install may still work through a repo-local marketplace, but restart Codex/new session is required",
+        )
+    text = path.read_text(encoding="utf-8", errors="replace")
+    has_marketplace = "marketplace" in text.lower()
+    has_plugin = "aming-claw" in text and ("aming-claw-local" in text or ".agents" in text)
+    if has_marketplace and has_plugin:
+        return _doctor_check("codex_config", "ok", f"{path} references aming-claw marketplace/plugin")
+    return _doctor_check(
+        "codex_config",
+        "warn",
+        f"{path} exists but no obvious aming-claw marketplace/plugin entry was found",
+    )
+
+
+def _check_governance(governance_url: str) -> DoctorCheck:
+    url = governance_url.rstrip("/") + "/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        return _doctor_check("governance_health", "warn", f"{url}: {exc}")
+    if payload.get("status") == "ok" or payload.get("ok") is True:
+        return _doctor_check("governance_health", "ok", f"{url} status ok")
+    return _doctor_check("governance_health", "warn", f"{url} returned {payload}")
+
+
+def doctor_plugin(
+    *,
+    plugin_root: Optional[Union[Path, str]] = None,
+    governance_url: str = "http://localhost:40000",
+    codex_config: Optional[Union[Path, str]] = None,
+    check_governance: bool = True,
+) -> DoctorResult:
+    """Run read-only aftercare checks for a local plugin install."""
+
+    root = Path(plugin_root).expanduser().resolve() if plugin_root else _default_doctor_root()
+    result = DoctorResult(plugin_root=str(root), governance_url=governance_url)
+
+    try:
+        validated = validate_plugin_root(root)
+        result.checks.append(_doctor_check("plugin_assets", "ok", ", ".join(validated)))
+    except PluginInstallError as exc:
+        result.checks.append(_doctor_check("plugin_assets", "fail", str(exc)))
+
+    result.checks.append(_check_marketplace(root))
+    result.checks.append(_check_mcp_config(root))
+    result.checks.append(_check_codex_config(Path(codex_config).expanduser() if codex_config else default_codex_config_path()))
+    if check_governance:
+        result.checks.append(_check_governance(governance_url))
+
+    result.manual_steps.extend(
+        [
+            "Restart/reload Codex or open a new session after installing the plugin; existing threads may not hot-load new skills/MCP tools.",
+            "In the new session, confirm the Aming Claw skill is visible and mcp__aming_claw tools are available.",
+            "Remember: `aming-claw start` only starts governance; it does not prove the Codex plugin was loaded.",
+        ]
+    )
+    return result
+
+
 def clone_or_update(
     repo_url: str,
     plugin_root: Path,
@@ -170,7 +339,12 @@ def build_next_steps(plugin_root: Path, python_executable: str) -> list[str]:
         f"Claude Code: /plugin marketplace add {root}",
         "Claude Code: /plugin install aming-claw@aming-claw-local",
         f"Codex: open {root} or add its local plugin marketplace, then use the Aming Claw skill.",
-        f"Start services: {python_executable} -m agent.cli start --workspace {root}",
+        "Reload Codex or open a new session after plugin install; current threads may not hot-load new skills/MCP tools.",
+        f"Verify install: {python_executable} -m agent.cli plugin doctor --plugin-root {root}",
+        "Start services in a separate terminal/window; this is a long-running command:",
+        f"  cd {root}",
+        f"  {python_executable} -m agent.cli start --workspace {root}",
+        "Do not wait for the start command to exit; verify with `aming-claw status` or the dashboard.",
         "Dashboard: http://localhost:40000/dashboard",
     ]
 
@@ -257,6 +431,25 @@ def format_result(result: InstallResult) -> str:
     lines.append("")
     lines.append("Next steps:")
     lines.extend(f"  {step}" for step in result.next_steps)
+    return "\n".join(lines)
+
+
+def format_doctor_result(result: DoctorResult) -> str:
+    lines = [
+        "Aming Claw plugin doctor",
+        f"  plugin root:    {result.plugin_root}",
+        f"  governance url: {result.governance_url}",
+        f"  overall:        {'ok' if result.ok else 'needs attention'}",
+        "",
+        "Checks:",
+    ]
+    for check in result.checks:
+        detail = f" - {check.detail}" if check.detail else ""
+        lines.append(f"  [{check.status}] {check.name}{detail}")
+    if result.manual_steps:
+        lines.append("")
+        lines.append("Manual aftercare:")
+        lines.extend(f"  - {step}" for step in result.manual_steps)
     return "\n".join(lines)
 
 

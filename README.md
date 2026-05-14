@@ -31,9 +31,22 @@ Please install Aming Claw from GitHub:
 https://github.com/amingclawdev/aming-claw
 
 If `aming-claw` is not available on PATH, run this Windows PowerShell bootstrap:
+$installRoot="$env:USERPROFILE\.aming-claw\plugins"
+$root=Join-Path $installRoot "aming-claw"
 $dst="$env:TEMP\install_aming_claw.py"
 Invoke-WebRequest https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py -OutFile $dst
-python $dst https://github.com/amingclawdev/aming-claw --start
+python $dst https://github.com/amingclawdev/aming-claw --install-root $installRoot
+
+Run the read-only aftercare check:
+cd "$root"
+python -m agent.cli plugin doctor --plugin-root "$root" --skip-governance
+
+Do not run `aming-claw start` or installer `--start` inline in Codex. It is a
+long-running service command. Start it in a separate terminal/window:
+Start-Process powershell -ArgumentList "-NoExit","-Command","cd `"$root`"; python -m agent.cli start"
+
+Reload Codex or open a new Codex session after plugin install; the current
+thread may not hot-load newly installed skills or MCP tools.
 
 After install, open http://localhost:40000/dashboard, load the Aming Claw
 skill/MCP, then check runtime_status, graph_status, and backlog before changing
@@ -45,14 +58,18 @@ On macOS/Linux, the same raw installer can be run with:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py \
   -o /tmp/install_aming_claw.py
-python3 /tmp/install_aming_claw.py https://github.com/amingclawdev/aming-claw --start
+python3 /tmp/install_aming_claw.py https://github.com/amingclawdev/aming-claw
+cd ~/.aming-claw/plugins/aming-claw
+python3 -m agent.cli plugin doctor --plugin-root ~/.aming-claw/plugins/aming-claw --skip-governance
+nohup python3 -m agent.cli start > ~/.aming-claw/aming-claw.log 2>&1 &
 ```
 
 If an older Aming Claw runtime is already installed, update the plugin checkout
 directly:
 
 ```bash
-aming-claw plugin install https://github.com/amingclawdev/aming-claw --start
+aming-claw plugin install https://github.com/amingclawdev/aming-claw
+aming-claw plugin doctor
 ```
 
 If the host cannot install Git plugins directly yet, clone once and use the
@@ -62,15 +79,36 @@ repo-local package:
 git clone https://github.com/amingclawdev/aming-claw.git
 cd aming-claw
 pip install -e .
+```
+
+Then start governance in a separate terminal and leave it running:
+
+```bash
 aming-claw start
 ```
 
 If the `aming-claw` console script is not on `PATH` yet, run the same CLI
-through Python:
+through Python: `python -m agent.cli start`.
+
+After installing or updating the plugin, reload Codex or open a new Codex
+session. Plugin load and governance startup are separate: `aming-claw start`
+only starts the local governance service, while the Codex plugin/skill/MCP
+must be loaded by Codex itself.
+
+Run the read-only aftercare check when troubleshooting a fresh install:
 
 ```bash
-python -m agent.cli start
+aming-claw plugin doctor
 ```
+
+Expected checks:
+
+- `.codex-plugin/plugin.json` exists.
+- `.agents/plugins/marketplace.json` contains `aming-claw`.
+- The marketplace `source.path` resolves to the Aming Claw plugin root.
+- `.mcp.json` contains `mcpServers.aming-claw`.
+- Governance health is reachable after services are started.
+- A new Codex session can see the Aming Claw skill and MCP tools.
 
 Open the local launcher or dashboard:
 
@@ -113,6 +151,10 @@ Codex does not auto-start Aming Claw services. Start them explicitly:
 ```bash
 aming-claw start
 ```
+
+`aming-claw start` is a foreground, long-running service command. Do not ask
+Codex to wait for it as a one-shot task; run it in a separate terminal/window,
+then return to Codex and verify with `runtime_status` or `aming-claw status`.
 
 If the CLI is already available, it can update a local plugin checkout from the
 public Git URL:

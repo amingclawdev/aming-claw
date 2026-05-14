@@ -186,6 +186,36 @@ class TestLocalPluginPackaging:
         assert ".codex-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
         assert ".claude-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
 
+    def test_codex_marketplace_path_resolves_to_plugin_root(self):
+        marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+        plugin = next(item for item in marketplace["plugins"] if item["name"] == "aming-claw")
+        source_path = plugin["source"]["path"]
+
+        # Codex marketplace source paths are relative to the marketplace root.
+        resolved = (ROOT / source_path).resolve()
+        assert (resolved / ".codex-plugin" / "plugin.json").is_file()
+        # Guard the common mistake: resolving relative to .agents/plugins would
+        # point at the marketplace folder, not the plugin root.
+        assert not ((marketplace_path.parent / source_path) / ".codex-plugin" / "plugin.json").is_file()
+
+    def test_readme_git_install_does_not_inline_long_running_start(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        install_lines = [
+            line
+            for line in readme.splitlines()
+            if "install_from_git.py" in line
+            or "aming-claw plugin install https://github.com/amingclawdev/aming-claw" in line
+        ]
+        assert install_lines
+        assert all("--start" not in line for line in install_lines)
+        assert "long-running service command" in readme
+        assert "Start-Process powershell" in readme
+        assert "nohup python3 -m agent.cli start" in readme
+        assert "plugin doctor" in readme
+        assert "open a new Codex session" in readme
+
 
 class TestClaudePluginPackaging:
     """MVP contract for Claude Code local-plugin packaging (parity with Codex)."""

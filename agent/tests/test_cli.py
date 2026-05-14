@@ -1,6 +1,7 @@
 """Tests for agent.cli — AC1, AC8."""
 
 import os
+import json
 import pytest
 
 try:
@@ -80,3 +81,45 @@ class TestCliPlugin:
         assert "Aming Claw plugin bootstrap" in result.output
         assert "git clone" in result.output
         assert "Claude Code: /plugin marketplace add" in result.output
+
+    def test_plugin_doctor_reports_aftercare(self, tmp_path):
+        runner = CliRunner()
+        for rel, text in {
+            ".codex-plugin/plugin.json": {"name": "aming-claw"},
+            ".agents/plugins/marketplace.json": {
+                "name": "aming-claw-local",
+                "plugins": [
+                    {
+                        "name": "aming-claw",
+                        "source": {"source": "local", "path": "."},
+                    }
+                ],
+            },
+            ".claude-plugin/plugin.json": {"name": "aming-claw"},
+            ".claude-plugin/marketplace.json": {"name": "aming-claw-local", "plugins": []},
+            ".mcp.json": {"mcpServers": {"aming-claw": {"command": "python"}}},
+        }.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(text), encoding="utf-8")
+        for rel in ("skills/aming-claw/SKILL.md", "skills/aming-claw-launcher/SKILL.md"):
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("---\nname: test\n---\n", encoding="utf-8")
+
+        config = tmp_path / "config.toml"
+        config.write_text('marketplace = "aming-claw-local"\nplugin = "aming-claw"\n', encoding="utf-8")
+
+        result = runner.invoke(main, [
+            "plugin",
+            "doctor",
+            "--plugin-root",
+            str(tmp_path),
+            "--codex-config",
+            str(config),
+            "--skip-governance",
+        ])
+
+        assert result.exit_code == 0
+        assert "Aming Claw plugin doctor" in result.output
+        assert "Restart/reload Codex" in result.output

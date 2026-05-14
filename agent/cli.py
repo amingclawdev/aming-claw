@@ -227,5 +227,29 @@ def plugin_install(repo_url, install_root, ref, python_executable, no_pip, start
         click.echo(format_result(result))
 
 
+@plugin.command("doctor")
+@click.option("--plugin-root", default="", help="Local Aming Claw plugin checkout root.")
+@click.option("--governance-url", default="http://localhost:40000", help="Governance service URL.")
+@click.option("--codex-config", default="", help="Optional Codex config.toml path.")
+@click.option("--skip-governance", is_flag=True, help="Skip governance health probe.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def plugin_doctor(plugin_root, governance_url, codex_config, skip_governance, json_output):
+    """Run read-only aftercare checks for a local plugin install."""
+    from agent.plugin_installer import doctor_plugin, format_doctor_result
+
+    result = doctor_plugin(
+        plugin_root=plugin_root or None,
+        governance_url=governance_url,
+        codex_config=codex_config or None,
+        check_governance=not skip_governance,
+    )
+    if json_output:
+        click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(format_doctor_result(result))
+    if not result.ok:
+        raise click.exceptions.Exit(1)
+
+
 if __name__ == "__main__":
     main()

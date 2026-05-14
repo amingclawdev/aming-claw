@@ -7,7 +7,9 @@ import pytest
 
 from agent.plugin_installer import (
     PluginInstallError,
+    doctor_plugin,
     format_result,
+    format_doctor_result,
     install_from_git,
     plugin_root_for,
     slug_from_repo_url,
@@ -18,7 +20,16 @@ from agent.plugin_installer import (
 def _write_plugin_fixture(root: Path) -> None:
     for rel, text in {
         ".codex-plugin/plugin.json": {"name": "aming-claw"},
-        ".agents/plugins/marketplace.json": {"name": "aming-claw-local", "plugins": []},
+        ".agents/plugins/marketplace.json": {
+            "name": "aming-claw-local",
+            "plugins": [
+                {
+                    "name": "aming-claw",
+                    "source": {"source": "local", "path": "."},
+                    "policy": {"installation": "INSTALLED_BY_DEFAULT"},
+                }
+            ],
+        },
         ".claude-plugin/plugin.json": {"name": "aming-claw"},
         ".claude-plugin/marketplace.json": {"name": "aming-claw-local", "plugins": []},
         ".mcp.json": {"mcpServers": {"aming-claw": {"command": "python"}}},
@@ -83,3 +94,46 @@ def test_install_from_git_validate_only_existing_checkout(tmp_path):
     assert result.validated_files
     assert result.commands == []
     assert str(plugin_root) in format_result(result)
+
+
+def test_doctor_plugin_validates_aftercare_without_governance(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_config = tmp_path / "config.toml"
+    codex_config.write_text(
+        'marketplace = "aming-claw-local"\nplugin = "aming-claw"\n',
+        encoding="utf-8",
+    )
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        check_governance=False,
+    )
+
+    assert result.ok is True
+    assert {check.name for check in result.checks} >= {
+        "plugin_assets",
+        "codex_marketplace",
+        "mcp_config",
+        "codex_config",
+    }
+    assert "Restart/reload Codex" in format_doctor_result(result)
+
+
+def test_doctor_plugin_flags_bad_marketplace_path(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    marketplace = tmp_path / ".agents" / "plugins" / "marketplace.json"
+    payload = json.loads(marketplace.read_text(encoding="utf-8"))
+    payload["plugins"][0]["source"]["path"] = ".agents/plugins"
+    marketplace.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=tmp_path / "missing-config.toml",
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_marketplace"].status == "fail"
+    assert ".codex-plugin/plugin.json" in checks["codex_marketplace"].detail
