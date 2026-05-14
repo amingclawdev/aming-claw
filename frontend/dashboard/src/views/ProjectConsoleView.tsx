@@ -415,51 +415,53 @@ export default function ProjectConsoleView({
           <span><strong>Build graph</strong> runs a full local scan for a new or broken graph.</span>
           <span><strong>Update graph</strong> catches an existing graph up to the selected ref/HEAD without live AI calls.</span>
         </div>
-        <div className="card">
-          <table className="table project-console-table">
-            <thead>
-              <tr>
-                <th>Project</th>
-                <th style={{ width: 170 }}>Ref</th>
-                <th style={{ width: 150 }}>Graph</th>
-                <th style={{ width: 170 }}>Snapshot</th>
-                <th style={{ width: 150 }}>Scale</th>
-                <th style={{ width: 140 }}>Work</th>
-                <th style={{ width: 180 }}>AI</th>
-                <th>Workspace</th>
-                <th style={{ width: 150 }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((project) => {
-                const row = runtime[project.project_id];
-                const selected = project.project_id === currentProjectId;
-                return (
-                  <ProjectRow
-                    key={project.project_id}
-                    project={project}
-                    runtime={row}
-                    selected={selected}
-                    lifecycle={lifecycleFor(project, row)}
-                    busyLabel={busyLabelFor(project.project_id, actionState)}
-                    localElapsed={busyLabelFor(project.project_id, actionState) ? elapsedLabel(actionStartedAt, nowMs) : undefined}
-                    onOpenProject={onOpenProject}
-                    onOpenAiConfig={onOpenAiConfig}
-                    onBuildGraph={() => handleBuildGraph(project)}
-                    onUpdateGraph={() => handleUpdateGraph(project, row)}
-                    onSelectRef={(selectedRef) => handleSelectRef(project, selectedRef)}
-                  />
-                );
-              })}
-              {rows.length === 0 ? (
+        <div className="card project-console-table-card">
+          <div className="project-console-table-wrap">
+            <table className="table project-console-table">
+              <thead>
                 <tr>
-                  <td colSpan={9} className="empty" style={{ padding: 16 }}>
-                    No registered projects.
-                  </td>
+                  <th>Project</th>
+                  <th style={{ width: 170 }}>Ref</th>
+                  <th style={{ width: 150 }}>Graph</th>
+                  <th style={{ width: 170 }}>Snapshot</th>
+                  <th style={{ width: 150 }}>Scale</th>
+                  <th style={{ width: 140 }}>Work</th>
+                  <th style={{ width: 180 }}>AI</th>
+                  <th>Workspace</th>
+                  <th style={{ width: 150 }}>Actions</th>
                 </tr>
-              ) : null}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {rows.map((project) => {
+                  const row = runtime[project.project_id];
+                  const selected = project.project_id === currentProjectId;
+                  return (
+                    <ProjectRow
+                      key={project.project_id}
+                      project={project}
+                      runtime={row}
+                      selected={selected}
+                      lifecycle={lifecycleFor(project, row)}
+                      busyLabel={busyLabelFor(project.project_id, actionState)}
+                      localElapsed={busyLabelFor(project.project_id, actionState) ? elapsedLabel(actionStartedAt, nowMs) : undefined}
+                      onOpenProject={onOpenProject}
+                      onOpenAiConfig={onOpenAiConfig}
+                      onBuildGraph={() => handleBuildGraph(project)}
+                      onUpdateGraph={() => handleUpdateGraph(project, row)}
+                      onSelectRef={(selectedRef) => handleSelectRef(project, selectedRef)}
+                    />
+                  );
+                })}
+                {rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="empty" style={{ padding: 16 }}>
+                      No registered projects.
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
