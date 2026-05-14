@@ -30,8 +30,8 @@ Implemented in `c632ba3`:
 Clone or update the repo:
 
 ```bash
-git clone git@github.com:web3ToolBoxDev/aming_claw.git
-cd aming_claw
+git clone https://github.com/amingclawdev/aming-claw.git
+cd aming-claw
 git checkout main
 git pull --ff-only origin main
 git rev-parse --short HEAD

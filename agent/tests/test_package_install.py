@@ -92,6 +92,7 @@ class TestPackagedDashboardAssets:
         assert "recursive-include agent/mcp/resources *" in manifest
         assert "recursive-include skills/aming-claw *" in manifest
         assert "recursive-include skills/aming-claw-launcher *" in manifest
+        assert "recursive-include docs/assets *.png" in manifest
         assert "include LICENSE" in manifest
         assert "include .codex-plugin/plugin.json" in manifest
         assert "include .claude-plugin/plugin.json" in manifest
@@ -184,6 +185,8 @@ class TestClaudePluginPackaging:
 
         assert manifest["name"] == "aming-claw"
         assert manifest.get("description"), "manifest must declare a description"
+        assert manifest["homepage"] == "https://github.com/amingclawdev/aming-claw"
+        assert manifest["repository"] == "https://github.com/amingclawdev/aming-claw"
 
     def test_claude_plugin_auto_discovered_assets_exist(self):
         # Claude Code auto-discovers skills/ and .mcp.json from the plugin root,
@@ -210,6 +213,8 @@ class TestClaudePluginPackaging:
         manifest_text = (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         assert "C:\\Users\\" not in manifest_text
         assert "/home/" not in manifest_text
+        assert "web3ToolBoxDev" not in manifest_text
+        assert "aming_claw.git" not in manifest_text
 
     def test_claude_local_marketplace_points_to_root_plugin(self):
         marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"
