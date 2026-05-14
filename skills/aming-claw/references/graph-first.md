@@ -27,7 +27,11 @@ evidence in that fallback mode.
    - `get_node` for known L4/L7 nodes.
    - `get_neighbors` around the candidate owner node; pass `include_edge_semantic=true` when edge semantic payloads matter.
    - `get_file_excerpt` for targeted snippets when available.
-4. Run `wf_impact` on candidate files before mutation.
+4. Run `wf_impact` on candidate files before mutation only when the project has
+   an imported workflow acceptance graph. If `wf_summary` or `wf_impact`
+   returns `needs_import_graph=true`, record that precondition and continue with
+   snapshot graph evidence (`graph_query`, `graph_status`) instead of treating
+   `total_nodes=0` as a healthy baseline.
 5. Then inspect files directly.
 
 Graph snapshots are commit-bound. Reconcile/build/update flows should use a
@@ -44,6 +48,9 @@ an isolated clean worktree before claiming graph state reflects current code.
   "query_purpose": "prompt_context_build"
 }
 ```
+
+Subtool parameters always go under `args`; top-level `path`, `query`, `limit`,
+or `node_id` values are ignored/rejected by the MCP schema.
 
 ```json
 {

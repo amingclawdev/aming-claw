@@ -228,6 +228,12 @@ plugin:
 /plugin install aming-claw@aming-claw-local
 ```
 
+Claude plugin installation only loads plugin/skill assets in Claude Code. It
+does not install Python dependencies, start governance, prove MCP tools are
+visible in the current session, or validate Claude/Codex CLI auth. After
+install/update, open a new Claude session, verify the skill/MCP tools are
+visible, and check `runtime_status(project_id="<id>")` before making changes.
+
 If your Claude Code build does not support Git marketplace URLs yet, clone the
 repo and add the local checkout instead:
 
@@ -242,6 +248,10 @@ aming-claw start
 /plugin marketplace add /path/to/aming-claw
 /plugin install aming-claw@aming-claw-local
 ```
+
+If a Claude Code sandbox blocks downloading and executing a raw GitHub installer
+script, use the explicit clone/local-marketplace path above instead of treating
+that as a governance runtime failure.
 
 The Claude plugin exposes the main governance skill and the launcher skill:
 

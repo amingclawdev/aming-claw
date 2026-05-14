@@ -155,7 +155,10 @@ Before editing:
    details.
 3. Predeclare/start the MF row when the MCP/HTTP surface is available.
 4. Capture baselines: `git status`, `version_check`, `preflight_check`,
-   `graph_status`, `graph_operations_queue`, and `wf_impact` for target files.
+   `graph_status`, and `graph_operations_queue`. Use `wf_impact` only when the
+   project has an imported workflow acceptance graph; if `wf_*` returns
+   `needs_import_graph=true`, record that precondition instead of treating
+   `total_nodes=0` as healthy.
 5. Run graph-first discovery and record the owning nodes or why the file is not
    graph-mapped.
 6. Record the E2E decision: run it, defer it with a follow-up backlog row, or
@@ -175,7 +178,7 @@ is stale, then close the backlog row with commit and verification evidence.
 ## Start Sequence
 
 1. Confirm the workspace root and project id, normally `aming-claw`.
-2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status(project_id="<project_id>")` when available.
+2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status(project_id="<project_id>")` when available. If the live runtime is older than the documented skill contract or lacks `graph_query(tool=query_schema)`, stop and ask for reload/redeploy/update before relying on new graph tools.
 3. Check graph state: `graph_status` and `graph_operations_queue`.
 4. If governance is offline or this is a fresh install, read `aming-claw://seed-graph-summary` for packaged MVP structure before asking the user to start services.
 5. For AI or semantic work, check local AI runtime readiness through the project AI config before queueing jobs.

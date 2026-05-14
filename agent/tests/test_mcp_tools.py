@@ -271,6 +271,42 @@ def test_mcp_runtime_status_runtime_mismatch_is_degraded_but_usable():
     assert "governance_redeploy_or_restart_sm" in status["recommended_actions"]
 
 
+def test_mcp_version_check_preserves_governance_and_workspace_heads(monkeypatch):
+    governance = _Recorder()
+
+    def api(method: str, path: str, data: dict | None = None) -> dict:
+        governance.calls.append((method, path, data))
+        if path == "/api/version-check/aming-claw":
+            return {
+                "ok": False,
+                "head": "gov-old",
+                "chain_version": "chain-old",
+                "dirty": False,
+                "message": "HEAD (gov-old) != CHAIN_VERSION (chain-old)",
+            }
+        return {"ok": True}
+
+    def fake_check_output(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            return b"workspace-new\n"
+        if cmd[:3] == ["git", "diff", "--name-only"]:
+            return b""
+        if cmd[:3] == ["git", "log", "--oneline"]:
+            return b"workspace-new commit\n"
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(mcp_tools.subprocess, "check_output", fake_check_output)
+    dispatcher = ToolDispatcher(api_fn=api, worker_pool=None, service_mgr=None, workspace=".")
+
+    result = dispatcher.dispatch("version_check", {"project_id": "aming-claw"})
+
+    assert result["head"] == "workspace-new"
+    assert result["mcp_workspace_head"] == "workspace-new"
+    assert result["governance_synced_head"] == "gov-old"
+    assert "MCP workspace HEAD (workspace-new) != CHAIN_VERSION (chain-old)" in result["message"]
+    assert "governance synced HEAD (gov-old) differs from MCP workspace HEAD (workspace-new)" in result["message"]
+
+
 def test_mcp_manager_start_refuses_takeover_from_mcp():
     governance = _Recorder()
     dispatcher = _dispatcher(governance, _Recorder())

@@ -99,10 +99,12 @@ needed.
 `.mcp.json` must remain relocatable. Use `"cwd": "."` and avoid absolute
 developer-machine paths such as `C:\Users\...`; package tests enforce this.
 
-Claude Code reads project-scoped MCP servers from `.mcp.json` (auto-discovered
-from the plugin root when packaged as a plugin); Codex local plugin packaging
-reads the plugin manifest's `mcpServers` pointer. Keeping the same stdio
-entrypoint at `.mcp.json` lets both surfaces reuse one MCP contract.
+Claude Code can read project-scoped MCP servers from `.mcp.json` when the
+workspace/plugin host loads that file. Treat MCP visibility as a separate
+runtime check: plugin skill install does not by itself prove Claude Code loaded
+`mcpServers`. Codex local plugin packaging reads the plugin manifest's
+`mcpServers` pointer. Keeping the same stdio entrypoint at `.mcp.json` lets both
+surfaces reuse one MCP contract.
 
 ## Compatibility Checks
 
@@ -127,7 +129,7 @@ is available.
 | --- | --- | --- |
 | Pip package | `pyproject.toml` exposes `aming-claw`, `aming-governance`, and `aming-governance-host`; dashboard assets are synced into `agent/governance/dashboard_dist` before wheel build. | Run clean wheel install smoke on each release target. |
 | Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; `.agents/plugins/marketplace.json` points at the repo root plugin and marks it installed by default for local sessions. `aming-claw plugin install <git-url>` prepares a user-local checkout for hosts that need an explicit local plugin root. Tests ensure paths exist and `.mcp.json` is relocatable. | Sanitize env and host URLs before publishing outside trusted local/team installs. Host-native "paste Git URL to install" support still depends on the editor/plugin host. |
-| Claude Code local plugin | `.claude-plugin/plugin.json` at repo root + project-level `CLAUDE.md` + `.mcp.json`; `.claude-plugin/marketplace.json` makes the repo a local marketplace. Skills auto-discovered as `/aming-claw:aming-claw` (governance) and `/aming-claw:aming-claw-launcher` (onboarding). Install via `/plugin marketplace add <path-or-git-url>` then `/plugin install aming-claw@aming-claw-local`. | Sanitize env/host URLs before publishing outside trusted local/team installs. Global Claude Code settings remain out of scope. |
+| Claude Code local plugin | `.claude-plugin/plugin.json` at repo root, `.claude-plugin/marketplace.json`, skills, and `.mcp.json`. Skills should be visible as `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher`; MCP visibility must be verified separately because host schema/loading behavior can differ by Claude Code version. | Sanitize env/host URLs before publishing outside trusted local/team installs. Resolve marketplace/MCP manifest validation warnings before public release. Global Claude Code settings remain out of scope. |
 | Cross-platform desktop | Windows, macOS, and Linux directory picker fallbacks are implemented with manual entry fallback. | Add real-machine smoke evidence for macOS and Linux/WSL before public release. |
 
 ## Publish Caution

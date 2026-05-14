@@ -374,6 +374,31 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
     assert high_degree["result"]["nodes"][0]["node"]["node_id"] == "L7.1"
 
 
+def test_list_features_defaults_to_compact_budget_safe_payload(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="list_features",
+        args={},
+        project_root=project_root,
+    )
+
+    assert result["ok"] is True
+    payload = result["result"]
+    assert payload["compact"] is True
+    assert payload["include_semantic"] is False
+    assert payload["count"] == 2
+    first = payload["features"][0]
+    assert "semantic" not in first
+    assert "function_calls" not in first["metadata"]
+
+
 def test_get_file_excerpt_accepts_start_line_end_line_aliases(conn, tmp_path):
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
     source = project_root / "agent" / "governance" / "server.py"

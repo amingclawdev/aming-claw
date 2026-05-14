@@ -221,6 +221,22 @@ def _norm_path(value: Any) -> str:
     return text.strip("/")
 
 
+def _bool_arg(args: dict[str, Any], key: str, *, default: bool = False) -> bool:
+    value = args.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _flatten_text(value: Any, *, max_items: int = 400) -> list[str]:
     out: list[str] = []
 
@@ -716,14 +732,32 @@ def _query_list_subsystems(conn: sqlite3.Connection, project_id: str, snapshot_i
 def _query_list_features(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
     limit = max(1, min(int(args.get("limit") or 200), 1000))
     l3_id = str(args.get("l3_id") or args.get("parent_id") or "").strip()
-    nodes = store.list_graph_snapshot_nodes(conn, project_id, snapshot_id, layer=str(args.get("layer") or "L7"), limit=1000)
+    compact = _bool_arg(args, "compact", default=True)
+    include_semantic = _bool_arg(args, "include_semantic", default=not compact)
+    nodes = store.list_graph_snapshot_nodes(
+        conn,
+        project_id,
+        snapshot_id,
+        layer=str(args.get("layer") or "L7"),
+        limit=1000,
+        include_semantic=include_semantic,
+    )
     if l3_id:
         nodes = [
             node for node in nodes
             if str((node.get("metadata") or {}).get("hierarchy_parent") or "") == l3_id
         ]
     nodes = nodes[:limit]
-    return {"features": nodes, "count": len(nodes), "l3_id": l3_id}
+    if compact:
+        nodes = [_compact_node(node) for node in nodes]
+    return {
+        "features": nodes,
+        "count": len(nodes),
+        "l3_id": l3_id,
+        "limit": limit,
+        "compact": compact,
+        "include_semantic": include_semantic,
+    }
 
 
 def _query_get_node(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:

@@ -206,6 +206,10 @@ If governance is offline or this is a fresh install:
 
 4. After plugin install, tell the user to reload Codex/open a new session. The
    current thread may not hot-load newly installed skills or MCP tools.
+   For Claude Code, plugin install loads skills only; it does not install the
+   Python runtime, start governance, prove MCP visibility in the current
+   session, or validate CLI auth. If the sandbox blocks a remote installer
+   script, prefer an explicit `git clone` plus local marketplace install.
 5. After the user starts services, re-run `runtime_status` and confirm `version_check.ok == true` before recommending any mutation.
 
 ## When to Hand Off

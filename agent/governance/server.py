@@ -10544,8 +10544,33 @@ def handle_coverage_check(ctx: RequestContext):
 @route("GET", "/api/wf/{project_id}/summary")
 def handle_summary(ctx: RequestContext):
     project_id = ctx.get_project_id()
+    try:
+        graph = project_service.load_project_graph(project_id)
+    except ValidationError as e:
+        return _workflow_graph_missing(project_id, str(e))
     with DBContext(project_id) as conn:
-        return state_service.get_summary(conn, project_id)
+        summary = state_service.get_summary(conn, project_id)
+    summary["ok"] = True
+    summary["workflow_graph_nodes"] = graph.node_count()
+    return summary
+
+
+def _workflow_graph_missing(project_id: str, detail: str = "") -> dict:
+    return {
+        "ok": False,
+        "project_id": project_id,
+        "error": "workflow_graph_missing",
+        "needs_import_graph": True,
+        "total_nodes": 0,
+        "by_status": {},
+        "message": (
+            f"No workflow acceptance graph found for project {project_id!r}. "
+            f"Run POST /api/wf/{project_id}/import-graph before using wf_summary, "
+            "wf_impact, or node_update."
+        ),
+        "detail": detail,
+        "next_action": f"POST /api/wf/{project_id}/import-graph",
+    }
 
 
 @route("GET", "/api/wf/{project_id}/preflight-check")
@@ -10785,7 +10810,12 @@ def handle_impact(ctx: RequestContext):
     # Default: match both primary and secondary (doc/test reverse traceability)
     primary_only = ctx.query.get("file_policy", "") == "primary_only"
 
-    graph = project_service.load_project_graph(project_id)
+    try:
+        graph = project_service.load_project_graph(project_id)
+    except ValidationError as e:
+        result = _workflow_graph_missing(project_id, str(e))
+        result["files"] = files
+        return result
 
     with DBContext(project_id) as conn:
         def get_status(nid):
@@ -11614,6 +11644,8 @@ def handle_version_check(ctx: RequestContext):
         return {
             "ok": True, "project_id": pid,
             "head": version if trailer_state else "unknown",
+            "governance_synced_head": "",
+            "trailer_head": trailer_state.get("version", "") if trailer_state else "",
             "chain_version": version if trailer_state else "(not set)",
             "dirty": trailer_state["dirty"] if trailer_state else False,
             "dirty_files": trailer_state["dirty_files"] if trailer_state else [],
@@ -11669,6 +11701,8 @@ def handle_version_check(ctx: RequestContext):
         "ok": ok,
         "project_id": pid,
         "head": git_head or (trailer_state["version"] if trailer_state else "unknown"),
+        "governance_synced_head": git_head,
+        "trailer_head": trailer_state.get("version", "") if trailer_state else "",
         "chain_version": chain_ver,
         "chain_updated_at": row["updated_at"],
         "dirty": bool(dirty_files),

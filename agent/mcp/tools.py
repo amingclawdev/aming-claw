@@ -752,6 +752,9 @@ class ToolDispatcher:
             pid = args["project_id"]
             # Get chain_version from governance DB
             result = self._api("GET", f"/api/version-check/{pid}")
+            governance_head = str(result.get("head") or "")
+            if governance_head:
+                result.setdefault("governance_synced_head", governance_head)
             # Enrich with git dirty check (MCP runs on host, has git)
             import subprocess, os
             workspace = os.environ.get("CODEX_WORKSPACE",
@@ -761,6 +764,7 @@ class ToolDispatcher:
                     ["git", "rev-parse", "HEAD"],
                     cwd=workspace, timeout=5
                 ).decode().strip()
+                result["mcp_workspace_head"] = head
                 result["head"] = head
                 dirty = subprocess.check_output(
                     ["git", "diff", "--name-only"],
@@ -782,7 +786,16 @@ class ToolDispatcher:
                         cwd=workspace, timeout=5
                     ).decode().strip().splitlines()
                     result["commits_since_chain"] = len(commits)
-                    result["message"] = (result.get("message", "") + "; " if result.get("message") else "") + f"{len(commits)} manual commits"
+                    result["message"] = (
+                        (result.get("message", "") + "; " if result.get("message") else "")
+                        + f"MCP workspace HEAD ({head}) != CHAIN_VERSION ({chain_ver}); "
+                        + f"{len(commits)} manual commits"
+                    )
+                if governance_head and governance_head != head:
+                    result["message"] = (
+                        (result.get("message", "") + "; " if result.get("message") else "")
+                        + f"governance synced HEAD ({governance_head}) differs from MCP workspace HEAD ({head})"
+                    )
             except Exception:
                 pass  # fail-open if git unavailable
             return result

@@ -69,9 +69,10 @@ During MVP, some observer-hotfix/manual-fix flows are stored as
 `mf_type=chain_rescue`. Treat that as the internal audited MF bucket, not as a
 requirement that ordinary implementation must run through chain automation.
 
-**HTTP fallback when the MCP backlog tools are not registered on this client**
-(observed 2026-05-10 — `mcp__aming-claw__backlog_*` not exposed by current
-MCP server). Use governance HTTP routes directly:
+**HTTP fallback when MCP tools are unavailable in the current client/session.**
+Current Aming Claw plugin sessions should expose the `backlog_*` MCP tools; if
+the client did not hot-load MCP yet, reload/open a new session or use
+governance HTTP routes directly:
 
 - `GET  /api/backlog/{project_id}` — list (returns `{bugs: [...], count}`).
 - `GET  /api/backlog/{project_id}/{bug_id}` — fetch one row.
@@ -106,6 +107,21 @@ backlog of record (and `docs/dev/` is gitignored, so they're not committed).
   - `get_neighbors`: structural neighbors; pass `include_edge_semantic=true` for semantic edge projection payloads.
   - `search_semantic`: node semantics, node metadata, and current edge semantic projection.
   - `search_docs`, `get_node`, and `get_file_excerpt`: docs, exact node fetches, and bounded code excerpts.
+
+All graph-query subtool parameters must be nested under the `args` object. Do
+not flatten `path`, `query`, `limit`, or `node_id` at the top level.
+
+Good:
+
+```json
+{"project_id":"aming-claw","tool":"find_node_by_path","args":{"path":"agent/governance/server.py"}}
+```
+
+Bad:
+
+```json
+{"project_id":"aming-claw","tool":"find_node_by_path","path":"agent/governance/server.py"}
+```
 - Direct Update graph is the preferred MVP path when HEAD and the active graph diverge:
   call governance `POST /api/graph-governance/{project_id}/reconcile/pending-scope`
   with `target_commit_sha`, `activate=true`, and `semantic_use_ai=false`. The
@@ -150,6 +166,13 @@ Example:
 - `wf_summary`: node verification summary.
 - `wf_impact`: impacted nodes for target files.
 - `node_update`: update node verification status with evidence only after real verification.
+
+The `wf_*` tools read the older acceptance/workflow graph (`graph.json`), not
+the snapshot graph used by `graph_status`/`graph_query`. They require
+`POST /api/wf/{project_id}/import-graph` first. If the response has
+`needs_import_graph=true`, do not treat `total_nodes=0` as a healthy empty
+project; either import the workflow graph or rely on snapshot graph governance
+instead.
 
 ## Tasks And Observer
 
