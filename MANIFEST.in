@@ -5,6 +5,7 @@ recursive-include skills/aming-claw-launcher *
 include LICENSE
 include .codex-plugin/plugin.json
 include .claude-plugin/plugin.json
+include .claude-plugin/marketplace.json
 include .agents/plugins/marketplace.json
 include .mcp.json
 include CLAUDE.md

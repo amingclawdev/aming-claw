@@ -1,0 +1,14 @@
+{
+  "name": "aming-claw-local",
+  "owner": {
+    "name": "Aming Claw"
+  },
+  "plugins": [
+    {
+      "name": "aming-claw",
+      "source": ".",
+      "description": "Graph-first governance workflow guard: governance and launcher skills plus the project MCP server.",
+      "version": "0.1.0"
+    }
+  ]
+}

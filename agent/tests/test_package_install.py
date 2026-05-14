@@ -95,6 +95,7 @@ class TestPackagedDashboardAssets:
         assert "include LICENSE" in manifest
         assert "include .codex-plugin/plugin.json" in manifest
         assert "include .claude-plugin/plugin.json" in manifest
+        assert "include .claude-plugin/marketplace.json" in manifest
         assert "include .agents/plugins/marketplace.json" in manifest
         assert "include CLAUDE.md" in manifest
 
@@ -209,3 +210,20 @@ class TestClaudePluginPackaging:
         manifest_text = (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         assert "C:\\Users\\" not in manifest_text
         assert "/home/" not in manifest_text
+
+    def test_claude_local_marketplace_points_to_root_plugin(self):
+        marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"
+        assert marketplace_path.is_file(), "missing .claude-plugin/marketplace.json"
+
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+
+        assert marketplace["name"] == "aming-claw-local"
+        assert marketplace["owner"]["name"], "marketplace must declare an owner name"
+
+        plugins = marketplace["plugins"]
+        assert len(plugins) == 1
+        plugin = plugins[0]
+        assert plugin["name"] == "aming-claw"
+        # Same-repo plugin: marketplace root == plugin root == repo root.
+        assert plugin["source"] == "."
+        assert (ROOT / plugin["source"] / ".claude-plugin" / "plugin.json").is_file()
