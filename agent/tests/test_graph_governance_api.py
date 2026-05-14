@@ -3154,6 +3154,54 @@ def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monk
     assert final_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
 
 
+def test_pending_scope_materialize_already_current_is_idempotent(conn, tmp_path, monkeypatch):
+    """Direct Update graph should treat an active target commit as a no-op success."""
+    from agent.governance import state_reconcile
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+
+    active = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-head",
+        commit_sha="head",
+        snapshot_kind="scope",
+        graph_json=_graph("L7.1"),
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"])
+    conn.commit()
+
+    def fail_if_materializer_runs(*_args, **_kwargs):
+        raise AssertionError("already-current direct update should not rematerialize")
+
+    monkeypatch.setattr(
+        state_reconcile,
+        "run_pending_scope_reconcile_candidate",
+        fail_if_materializer_runs,
+    )
+
+    code, result = server.handle_graph_governance_pending_scope_materialize(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_commit_sha": "head",
+                "parent_commit_sha": "head",
+                "actor": "dashboard",
+                "activate": True,
+            },
+        )
+    )
+
+    assert code == 200
+    assert result["ok"] is True
+    assert result["status"] == "already_current"
+    assert result["snapshot_id"] == "scope-head"
+    assert store.list_pending_scope_reconcile(conn, PID, commit_shas=["head"]) == []
+
+
 def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
     project = tmp_path / "project"
     primary = project / "agent" / "governance" / "server.py"

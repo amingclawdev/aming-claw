@@ -5355,6 +5355,17 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
             )
             if not pending:
                 active = store.get_active_graph_snapshot(conn, project_id) or {}
+                if str(active.get("commit_sha") or "").strip() == target_commit:
+                    return 200, {
+                        "ok": True,
+                        "project_id": project_id,
+                        "status": "already_current",
+                        "reason": "already_current",
+                        "target_commit_sha": target_commit,
+                        "snapshot_id": active.get("snapshot_id") or "",
+                        "active_snapshot_id": active.get("snapshot_id") or "",
+                        "pending_count": 0,
+                    }
                 parent_commit = str(
                     body.get("parent_commit_sha") or active.get("commit_sha") or ""
                 )
@@ -5420,6 +5431,24 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 # by passing `enqueue_stale: true` in the body.
                 semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
             )
+            if (
+                isinstance(result, dict)
+                and result.get("ok") is False
+                and result.get("reason") == "no_pending_scope_reconcile"
+                and target_commit
+            ):
+                active = store.get_active_graph_snapshot(conn, project_id) or {}
+                if str(active.get("commit_sha") or "").strip() == target_commit:
+                    result = {
+                        "ok": True,
+                        "project_id": project_id,
+                        "status": "already_current",
+                        "reason": "already_current",
+                        "target_commit_sha": target_commit,
+                        "snapshot_id": active.get("snapshot_id") or "",
+                        "active_snapshot_id": active.get("snapshot_id") or "",
+                        "pending_count": 0,
+                    }
         except (KeyError, ValueError) as exc:
             if direct_pending_created:
                 with sqlite_write_lock():
