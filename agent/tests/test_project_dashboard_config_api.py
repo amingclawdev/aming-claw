@@ -210,6 +210,50 @@ def test_project_ai_config_endpoint_updates_project_routing(tmp_path, monkeypatc
     assert data["projects"]["dashboard-demo"]["project_config"]["ai"]["routing"]["dev"]["model"] == "gpt-5.4-mini"
 
 
+def test_project_ai_config_endpoint_merges_partial_routing(tmp_path, monkeypatch):
+    data = _patch_project_registry(
+        monkeypatch,
+        {
+            "version": 1,
+            "projects": {
+                "dashboard-demo": {
+                    "project_id": "dashboard-demo",
+                    "workspace_path": str(tmp_path),
+                    "status": "active",
+                    "project_config": {
+                        "project_id": "dashboard-demo",
+                        "language": "typescript",
+                        "ai": {
+                            "routing": {
+                                "pm": {"provider": "openai", "model": "gpt-5.5"},
+                                "dev": {"provider": "openai", "model": "gpt-5.4"},
+                                "semantic": {"provider": "anthropic", "model": "claude-opus-4-7"},
+                            }
+                        },
+                    },
+                },
+            },
+        },
+    )
+
+    payload = server.handle_project_ai_config_update(_ctx(
+        "dashboard-demo",
+        method="POST",
+        body={
+            "routing": {
+                "semantic": {"provider": "openai", "model": "gpt-5.4-mini"},
+            },
+            "actor": "dashboard-test",
+        },
+    ))
+
+    routing = payload["project_config"]["ai"]["routing"]
+    assert routing["semantic"] == {"provider": "openai", "model": "gpt-5.4-mini"}
+    assert routing["pm"] == {"provider": "openai", "model": "gpt-5.5"}
+    assert routing["dev"] == {"provider": "openai", "model": "gpt-5.4"}
+    assert data["projects"]["dashboard-demo"]["project_config"]["ai"]["routing"]["pm"]["model"] == "gpt-5.5"
+
+
 def test_project_ai_config_update_stores_missing_project_config_in_registry(tmp_path, monkeypatch):
     data = _patch_project_registry(
         monkeypatch,

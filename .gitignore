@@ -162,6 +162,9 @@ agent/governance/graph.rebase.overlay.json.bak
 phase_z_llm_cache/
 agent/governance/dashboard_dist/*
 !agent/governance/dashboard_dist/__init__.py
+!agent/governance/dashboard_dist/index.html
+!agent/governance/dashboard_dist/assets/
+!agent/governance/dashboard_dist/assets/*
 
 # Observer / auto-chain runtime-state files (must not be staged)
 .recent-tasks.json

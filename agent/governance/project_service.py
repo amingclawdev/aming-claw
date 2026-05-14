@@ -14,6 +14,9 @@ import os
 import sys
 import hashlib
 import subprocess
+import tempfile
+import threading
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -28,6 +31,8 @@ from . import state_service
 from . import role_service
 from . import audit_service
 from .errors import ValidationError, AuthError, PermissionDeniedError
+
+_PROJECTS_LOCK = threading.RLock()
 
 
 def _projects_file() -> Path:
@@ -46,16 +51,54 @@ def _hash_password(password: str) -> str:
 
 def _load_projects() -> dict:
     path = _projects_file()
-    if path.exists():
-        with open(str(path), "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"version": 1, "projects": {}}
+    if not path.exists():
+        return {"version": 1, "projects": {}}
+    last_error = None
+    for attempt in range(3):
+        try:
+            with _PROJECTS_LOCK:
+                with open(str(path), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("version", 1)
+                data.setdefault("projects", {})
+                return data
+            raise ValueError("projects registry root must be a JSON object")
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.03)
+                continue
+            break
+    raise ValidationError(f"project registry is not valid JSON: {path}: {last_error}")
 
 
 def _save_projects(data: dict):
     path = _projects_file()
-    with open(str(path), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = ""
+    with _PROJECTS_LOCK:
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_name = f.name
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        finally:
+            if tmp_name:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _ensure_clean_git_worktree_for_graph(workspace: Path) -> dict:
@@ -527,7 +570,9 @@ def update_project_ai_routing_metadata(
 
     payload["project_id"] = project_id
     ai_raw = payload.get("ai") if isinstance(payload.get("ai"), dict) else {}
-    ai_raw["routing"] = _sanitize_ai_routing(routing)
+    merged_routing = _sanitize_ai_routing(ai_raw.get("routing") if isinstance(ai_raw.get("routing"), dict) else {})
+    merged_routing.update(_sanitize_ai_routing(routing))
+    ai_raw["routing"] = merged_routing
     payload["ai"] = ai_raw
 
     entry["project_config"] = payload

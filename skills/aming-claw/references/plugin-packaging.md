@@ -44,7 +44,8 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   `skills` and `mcpServers` pointers).
 - `.agents/plugins/marketplace.json`: repo-local Codex marketplace entry that
   installs this root plugin by default for local/plugin sessions. Keep
-  `source.path` as `"./"` so Codex CLI treats it as an explicit local source.
+  `source.path` as `"./."`; plain `"./"` normalizes to an empty local plugin
+  source path in current Codex CLI builds.
 - `.claude-plugin/plugin.json`: Claude Code plugin manifest. `skills/` and
   `.mcp.json` are auto-discovered from the plugin root, so the manifest only
   declares `name` + `description` + metadata.

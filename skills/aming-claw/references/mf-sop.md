@@ -7,6 +7,9 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 1. Confirm chain/MF route is justified. Routine feature work should use the normal chain when possible.
 2. Ensure a backlog row exists with target files, acceptance criteria, and details.
 3. Predeclare/start the MF row with an MF id.
+   - In MVP, API/storage may show `mf_type=chain_rescue` for observer-hotfix or
+     manual-fix work. Treat it as the internal audited MF bucket, not as a sign
+     that chain execution is required.
 4. Capture baselines:
    - `git status`;
    - `version_check`;

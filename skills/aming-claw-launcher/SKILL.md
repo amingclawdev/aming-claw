@@ -36,7 +36,7 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 
    ```text
    aming-claw status
-   aming-claw plugin doctor
+   aming-claw plugin doctor --python <path-to-python-3.9-or-newer>
    ```
 
    Or, when MCP is available, prefer structured probes for a richer snapshot:
@@ -139,7 +139,7 @@ claims are available.
 | `aming-claw scan --path <dir> --project-id <id>` | Scan an external project into a `.aming-claw` candidate workspace. |
 | `aming-claw start --port 40000 --workspace .` | Start governance in the foreground from a separate terminal/window. |
 | `aming-claw status` | GET `/api/health` against the running governance service. |
-| `aming-claw plugin doctor [--plugin-root <dir>]` | Run read-only aftercare checks for plugin assets, marketplace path, MCP config, Codex config hints, and governance health. |
+| `aming-claw plugin doctor [--plugin-root <dir>] [--python <python3.9+>]` | Run read-only aftercare checks for plugin assets, marketplace path, MCP config, Codex config hints, Python runtime, dashboard assets, AI CLI probes, and governance health. |
 | `aming-claw open --governance-url <url>` | Open the dashboard in the default browser. |
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
 | `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, and print next steps. |
@@ -181,7 +181,7 @@ If governance is offline or this is a fresh install:
    Then run:
 
    ```text
-   python -m agent.cli plugin doctor --plugin-root .
+   python -m agent.cli plugin doctor --plugin-root . --python python
    ```
 
    If the CLI is already available, use:

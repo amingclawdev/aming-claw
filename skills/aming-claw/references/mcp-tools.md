@@ -65,6 +65,9 @@ as the default operator path.
 - `backlog_close`: close with commit evidence.
 
 For MF work, use the backlog row as the single source of scope, target files, acceptance, and commit evidence.
+During MVP, some observer-hotfix/manual-fix flows are stored as
+`mf_type=chain_rescue`. Treat that as the internal audited MF bucket, not as a
+requirement that ordinary implementation must run through chain automation.
 
 **HTTP fallback when the MCP backlog tools are not registered on this client**
 (observed 2026-05-10 — `mcp__aming-claw__backlog_*` not exposed by current

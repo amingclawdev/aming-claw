@@ -41,7 +41,9 @@ Stable MVP capabilities:
 Limited or deferred capabilities:
 
 - Chain dev/test/qa/merge automation is experimental in MVP. Prefer Manual Fix for ordinary MVP implementation unless the user explicitly asks for chain execution.
-- Function-level call graph persistence is planned but not yet a required MVP graph primitive.
+- Function-level call graph queries are available for supported adapters through
+  `function_callees`, `function_callers`, and `high_function_degree`; dashboard
+  visualization is still evolving.
 - Arbitrary graph editing, node moves, ownership rewrites, dependency rewrites, and automatic topology mutation are out of scope.
 
 ## MVP Graph Model
@@ -142,6 +144,9 @@ for ordinary MVP fixes/features when needed, but do not treat MF as a bypass of
 governance: backlog, graph discovery, tests, explicit commit files, Chain
 trailers, post-commit scope reconcile, and backlog close still apply. This is a
 temporary MVP mode; when Chain is stable, return to Chain-first development.
+Some API responses may normalize observer-hotfix/manual-fix work to the
+internal `chain_rescue` MF type. During MVP, treat that value as the audited MF
+bucket, not as a requirement that ordinary implementation must use chain.
 
 Before editing:
 

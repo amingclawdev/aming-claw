@@ -27,7 +27,7 @@ def _write_plugin_fixture(root: Path) -> None:
             "plugins": [
                 {
                     "name": "aming-claw",
-                    "source": {"source": "local", "path": "./"},
+                    "source": {"source": "local", "path": "./."},
                     "policy": {"installation": "INSTALLED_BY_DEFAULT"},
                 }
             ],
@@ -165,3 +165,67 @@ def test_doctor_plugin_flags_bad_marketplace_path(tmp_path):
     assert result.ok is False
     assert checks["codex_marketplace"].status == "fail"
     assert ".codex-plugin/plugin.json" in checks["codex_marketplace"].detail
+
+
+def test_doctor_plugin_rejects_empty_root_marketplace_path(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    marketplace = tmp_path / ".agents" / "plugins" / "marketplace.json"
+    payload = json.loads(marketplace.read_text(encoding="utf-8"))
+    payload["plugins"][0]["source"]["path"] = "./"
+    marketplace.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=tmp_path / "missing-config.toml",
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_marketplace"].status == "fail"
+    assert "empty local plugin path" in checks["codex_marketplace"].detail
+
+
+def test_doctor_plugin_rejects_manifest_with_too_many_default_prompts(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    manifest = tmp_path / ".codex-plugin" / "plugin.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["interface"] = {"defaultPrompt": ["one", "two", "three", "four"]}
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=tmp_path / "missing-config.toml",
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_manifest"].status == "fail"
+    assert "at most 3" in checks["codex_manifest"].detail
+
+
+def test_install_from_git_rejects_unsupported_python_before_pip(tmp_path, monkeypatch):
+    repo_url = "https://github.com/amingclawdev/aming-claw.git"
+    plugin_root = plugin_root_for(repo_url, tmp_path)
+    _write_plugin_fixture(plugin_root)
+
+    def fake_run(args, **_kwargs):
+        class _Proc:
+            returncode = 0
+            stdout = "Python 3.8.18\n"
+            stderr = ""
+
+        assert args == ["old-python", "--version"]
+        return _Proc()
+
+    monkeypatch.setattr("agent.plugin_installer.subprocess.run", fake_run)
+
+    with pytest.raises(PluginInstallError, match="requires Python 3.9"):
+        install_from_git(
+            repo_url,
+            install_root=tmp_path,
+            validate_only=True,
+            python_executable="old-python",
+            install_package=True,
+        )

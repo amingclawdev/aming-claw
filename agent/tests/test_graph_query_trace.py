@@ -374,6 +374,82 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
     assert high_degree["result"]["nodes"][0]["node"]["node_id"] == "L7.1"
 
 
+def test_get_file_excerpt_accepts_start_line_end_line_aliases(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    source = project_root / "agent" / "governance" / "server.py"
+    source.write_text(
+        "\n".join(f"line {idx}" for idx in range(1, 121)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="get_file_excerpt",
+        args={"path": "agent/governance/server.py", "start_line": 92, "end_line": 95},
+        project_root=project_root,
+    )
+
+    assert result["ok"] is True
+    excerpt = result["result"]
+    assert excerpt["line_start"] == 92
+    assert excerpt["line_end"] == 95
+    assert "line 92" in excerpt["excerpt"]
+    assert "line 1\n" not in excerpt["excerpt"]
+
+
+def test_function_call_query_reports_truncation_instead_of_scanning_forever(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="function_callees",
+        args={"query": "serve", "max_scan": 1, "limit": 10},
+        project_root=project_root,
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["truncated"] is False
+    assert result["result"]["scanned_facts"] == 1
+
+    row = conn.execute(
+        "SELECT metadata_json FROM graph_nodes_index WHERE project_id=? AND snapshot_id=? AND node_id=?",
+        (PID, snapshot_id, "L7.1"),
+    ).fetchone()
+    metadata = json.loads(row["metadata_json"])
+    metadata["function_calls"].append({**metadata["function_calls"][0], "caller_short": "serve_again"})
+    conn.execute(
+        "UPDATE graph_nodes_index SET metadata_json=? WHERE project_id=? AND snapshot_id=? AND node_id=?",
+        (json.dumps(metadata), PID, snapshot_id, "L7.1"),
+    )
+    conn.commit()
+
+    truncated = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="function_callees",
+        args={"query": "no-such-function", "max_scan": 1, "limit": 10},
+        project_root=project_root,
+    )
+
+    assert truncated["ok"] is True
+    assert truncated["result"]["truncated"] is True
+    assert truncated["result"]["truncation_reason"] == "max_scan"
+
+
 def test_graph_native_queries_search_edge_projection_and_neighbor_semantics(conn, tmp_path):
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
     _seed_edge_projection(conn, snapshot_id)
@@ -425,6 +501,51 @@ def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
     assert "find_node_by_path" in result["result"]["tool_names"]
     assert "observer" in result["result"]["query_sources"]
     assert "prompt_context_build" in result["result"]["query_purposes"]
+    assert result["result"]["tools"]["high_function_degree"]["args"]["metric"]["enum"] == [
+        "fan_in",
+        "fan_out",
+        "total",
+    ]
+    assert "timeout_ms" in result["result"]["tools"]["function_callees"]["optional_args"]
+
+
+def test_snapshot_orphan_file_filter_excludes_attached_rows(conn, tmp_path):
+    graph = {"deps_graph": {"nodes": [], "edges": []}}
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-filter",
+        commit_sha="abc9999",
+        snapshot_kind="full",
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "docs/actionable.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "attached_node_ids": [],
+            },
+            {
+                "path": "docs/already-bound.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "attached",
+                "attached_node_ids": ["L7.1"],
+                "attached_to": "L7.1",
+            },
+        ],
+    )
+
+    result = store.list_graph_snapshot_files(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        scan_status="orphan",
+    )
+
+    assert result["filtered_count"] == 1
+    assert result["files"][0]["path"] == "docs/actionable.md"
 
 
 def test_budget_blocks_queries_after_limit(conn, tmp_path):

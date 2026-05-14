@@ -141,7 +141,7 @@ class TestLocalPluginPackaging:
         assert len(plugins) == 1
         plugin = plugins[0]
         assert plugin["name"] == "aming-claw"
-        assert plugin["source"] == {"source": "local", "path": "./"}
+        assert plugin["source"] == {"source": "local", "path": "./."}
         assert plugin["policy"]["installation"] == "INSTALLED_BY_DEFAULT"
         assert plugin["policy"]["authentication"] == "ON_INSTALL"
         assert plugin["category"] == "Productivity"
@@ -194,6 +194,7 @@ class TestLocalPluginPackaging:
 
         # Codex marketplace source paths are relative to the marketplace root.
         assert source_path.startswith("./")
+        assert source_path not in {".", "./"}
         resolved = (ROOT / source_path).resolve()
         assert (resolved / ".codex-plugin" / "plugin.json").is_file()
         # Guard the common mistake: resolving relative to .agents/plugins would

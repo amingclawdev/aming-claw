@@ -34,18 +34,29 @@ If `aming-claw` is not available on PATH, run this Windows PowerShell bootstrap:
 $installRoot="$env:USERPROFILE\.aming-claw\plugins"
 $root=Join-Path $installRoot "aming-claw"
 $dst="$env:TEMP\install_aming_claw.py"
+$py="python"
+$version=& $py --version 2>&1
+if ($version -notmatch "Python 3\.(9|1[0-9])|Python [4-9]\.") {
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    $candidate=& py -3 -c "import sys; print(sys.executable)"
+    if ($candidate) { $py=$candidate.Trim(); $version=& $py --version 2>&1 }
+  }
+}
+if ($version -notmatch "Python 3\.(9|1[0-9])|Python [4-9]\.") {
+  throw "Aming Claw requires Python 3.9+. Current python is: $version. Install Python 3.9+ or pass a full Python path."
+}
 Invoke-WebRequest https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py -OutFile $dst
-python $dst https://github.com/amingclawdev/aming-claw --install-root $installRoot
+& $py $dst https://github.com/amingclawdev/aming-claw --install-root $installRoot --python $py
 
 Run the read-only aftercare check:
 cd "$root"
-python -m agent.cli plugin doctor --plugin-root "$root" --skip-governance
+& $py -m agent.cli plugin doctor --plugin-root "$root" --skip-governance --python $py
 
 Do not run `aming-claw start` or installer `--start` inline in Codex unless you
 only need the idempotent health check. If governance is already healthy it exits
 after printing the dashboard URL; otherwise it starts the foreground service and
 should run in a separate terminal/window:
-Start-Process powershell -ArgumentList "-NoExit","-Command","cd `"$root`"; python -m agent.cli start"
+Start-Process powershell -ArgumentList "-NoExit","-Command","cd `"$root`"; & `"$py`" -m agent.cli start"
 
 Reload Codex or open a new Codex session after plugin install; the current
 thread may not hot-load newly installed skills or MCP tools.
@@ -65,6 +76,9 @@ cd ~/.aming-claw/plugins/aming-claw
 python3 -m agent.cli plugin doctor --plugin-root ~/.aming-claw/plugins/aming-claw --skip-governance
 nohup python3 -m agent.cli start > ~/.aming-claw/aming-claw.log 2>&1 &
 ```
+
+If `python3 --version` is below 3.9, rerun the installer and doctor with a
+Python 3.9+ executable path using `--python /path/to/python3.9-or-newer`.
 
 If an older Aming Claw runtime is already installed, update the plugin checkout
 directly:
@@ -107,7 +121,8 @@ Expected checks:
 
 - `.codex-plugin/plugin.json` exists.
 - `.agents/plugins/marketplace.json` contains `aming-claw`.
-- The marketplace `source.path` resolves to the Aming Claw plugin root.
+- The marketplace `source.path` is non-empty and resolves to the Aming Claw
+  plugin root. For this root checkout it should be `./.`, not plain `./`.
 - `.mcp.json` contains `mcpServers.aming-claw`.
 - Dashboard static assets are present, or doctor prints the exact build fallback.
 - Local Codex/Claude CLI commands are detected when available; detection still

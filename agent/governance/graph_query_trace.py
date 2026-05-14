@@ -91,9 +91,21 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "degree_summary": {"required_args": ["node_id"], "summary": "Return fan-in/fan-out counts independent of neighbor limit."},
     "high_degree_nodes": {"required_args": [], "summary": "Rank nodes by fan_in, fan_out, or total degree."},
     "function_index": {"required_args": ["query"], "summary": "Search metadata.functions and function_lines."},
-    "function_callees": {"required_args": ["query"], "summary": "List resolved callees for a function or node."},
-    "function_callers": {"required_args": ["query"], "summary": "List resolved callers for a function or node."},
-    "high_function_degree": {"required_args": [], "summary": "Rank functions by caller/callee counts."},
+    "function_callees": {
+        "required_args": ["query"],
+        "summary": "List resolved callees for a function or node.",
+        "optional_args": ["limit", "timeout_ms", "max_scan"],
+    },
+    "function_callers": {
+        "required_args": ["query"],
+        "summary": "List resolved callers for a function or node.",
+        "optional_args": ["limit", "timeout_ms", "max_scan"],
+    },
+    "high_function_degree": {
+        "required_args": [],
+        "summary": "Rank functions by caller/callee counts.",
+        "args": {"metric": {"enum": ["fan_in", "fan_out", "total"], "default": "total"}},
+    },
     "search_semantic": {
         "required_args": ["query"],
         "summary": "Search node semantics, node metadata, and current edge semantic projection.",
@@ -1060,6 +1072,9 @@ def _query_function_calls(
     if not query and not node_id_filter:
         raise ValueError("query or node_id is required")
     limit = max(1, min(int(args.get("limit") or 50), 300))
+    timeout_ms = max(50, min(int(args.get("timeout_ms") or 1500), 10_000))
+    max_scan = max(1, min(int(args.get("max_scan") or 25_000), 500_000))
+    deadline = time.perf_counter() + (timeout_ms / 1000.0)
     nodes = _function_call_nodes(conn, project_id, snapshot_id)
     by_module = {
         str((node.get("metadata") or {}).get("module") or ""): node
@@ -1068,12 +1083,24 @@ def _query_function_calls(
     }
     rows: list[dict[str, Any]] = []
     source_key = "function_calls" if direction == "callees" else "function_called_by"
+    scanned = 0
+    truncated = False
+    truncation_reason = ""
     for node in nodes:
         metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
         facts = metadata.get(source_key) if isinstance(metadata.get(source_key), list) else []
         for fact in facts:
             if not isinstance(fact, dict):
                 continue
+            scanned += 1
+            if scanned > max_scan:
+                truncated = True
+                truncation_reason = "max_scan"
+                break
+            if time.perf_counter() > deadline:
+                truncated = True
+                truncation_reason = "timeout"
+                break
             caller_node = by_module.get(str(fact.get("caller_module") or ""))
             callee_node = by_module.get(str(fact.get("callee_module") or ""))
             caller_node_id = str((caller_node or {}).get("node_id") or "")
@@ -1099,8 +1126,22 @@ def _query_function_calls(
                 "resolution": fact.get("resolution", ""),
             })
             if len(rows) >= limit:
-                return {"ok": True, "query": query, "direction": direction, "matches": rows, "count": len(rows)}
-    return {"ok": True, "query": query, "direction": direction, "matches": rows, "count": len(rows)}
+                truncated = True
+                truncation_reason = "limit"
+                break
+        if truncated:
+            break
+    return {
+        "ok": True,
+        "query": query,
+        "direction": direction,
+        "matches": rows,
+        "count": len(rows),
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+        "scanned_facts": scanned,
+        "limit": limit,
+    }
 
 
 def _query_high_function_degree(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -1362,11 +1403,17 @@ def _query_file_excerpt(args: dict[str, Any], project_root: str | Path | None) -
     path = str(args.get("path") or args.get("rel_path") or "").strip()
     if not path:
         raise ValueError("path is required")
+    line_start = args.get("line_start")
+    if line_start is None:
+        line_start = args.get("start_line")
+    line_end = args.get("line_end")
+    if line_end is None:
+        line_end = args.get("end_line")
     return reconcile_feedback.read_project_excerpt(
         project_root,
         path,
-        line_start=int(args.get("line_start") or 1),
-        line_end=int(args["line_end"]) if args.get("line_end") is not None else None,
+        line_start=int(line_start or 1),
+        line_end=int(line_end) if line_end is not None else None,
         max_lines=int(args.get("max_lines") or 80),
         max_chars=int(args.get("max_chars") or 8000),
     )

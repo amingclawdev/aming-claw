@@ -18,6 +18,7 @@ from typing import Iterable, Optional, Sequence, Union
 
 
 DEFAULT_REPO_URL = "https://github.com/amingclawdev/aming-claw"
+MIN_PYTHON_VERSION = (3, 9)
 REQUIRED_PLUGIN_FILES = (
     ".codex-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
@@ -246,6 +247,77 @@ def _read_json_file(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _parse_python_version(text: str) -> Optional[tuple[int, int, int]]:
+    match = re.search(r"Python\s+(\d+)\.(\d+)(?:\.(\d+))?", str(text or ""))
+    if not match:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+    )
+
+
+def _python_version_check(python_executable: str) -> DoctorCheck:
+    try:
+        proc = subprocess.run(
+            [python_executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception as exc:
+        return _doctor_check(
+            "python_runtime",
+            "fail",
+            f"{python_executable}: cannot run --version ({exc})",
+        )
+    version_text = (proc.stdout or proc.stderr or "").strip()
+    parsed = _parse_python_version(version_text)
+    if proc.returncode != 0 or parsed is None:
+        return _doctor_check(
+            "python_runtime",
+            "fail",
+            f"{python_executable}: cannot determine Python version ({version_text or proc.returncode})",
+        )
+    required = ".".join(str(part) for part in MIN_PYTHON_VERSION)
+    found = ".".join(str(part) for part in parsed)
+    if parsed < (*MIN_PYTHON_VERSION, 0):
+        return _doctor_check(
+            "python_runtime",
+            "fail",
+            f"{python_executable}: Python {found} detected; Aming Claw requires Python {required}+; pass --python <path-to-python-{required}-or-newer>",
+        )
+    return _doctor_check("python_runtime", "ok", f"{python_executable}: Python {found}")
+
+
+def _ensure_supported_python(python_executable: str) -> None:
+    check = _python_version_check(python_executable)
+    if check.status != "ok":
+        raise PluginInstallError(check.detail)
+
+
+def _check_codex_manifest(plugin_root: Path) -> DoctorCheck:
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    try:
+        manifest = _read_json_file(manifest_path)
+    except Exception as exc:
+        return _doctor_check("codex_manifest", "fail", f"{manifest_path}: {exc}")
+    interface = manifest.get("interface") if isinstance(manifest, dict) else {}
+    prompts = interface.get("defaultPrompt") if isinstance(interface, dict) else []
+    if prompts is None:
+        prompts = []
+    if not isinstance(prompts, list):
+        return _doctor_check("codex_manifest", "fail", "interface.defaultPrompt must be a list")
+    if len(prompts) > 3:
+        return _doctor_check("codex_manifest", "fail", "interface.defaultPrompt must contain at most 3 prompts")
+    too_long = [str(prompt) for prompt in prompts if len(str(prompt)) > 128]
+    if too_long:
+        return _doctor_check("codex_manifest", "fail", "interface.defaultPrompt entries must be <=128 chars")
+    return _doctor_check("codex_manifest", "ok", f"{manifest_path} defaultPrompt count={len(prompts)}")
+
+
 def _check_marketplace(plugin_root: Path) -> DoctorCheck:
     marketplace_path = plugin_root / ".agents" / "plugins" / "marketplace.json"
     try:
@@ -269,6 +341,12 @@ def _check_marketplace(plugin_root: Path) -> DoctorCheck:
     raw_path = str(source.get("path") or "").strip()
     if not raw_path:
         return _doctor_check("codex_marketplace", "fail", "missing source.path")
+    if raw_path in {".", "./"}:
+        return _doctor_check(
+            "codex_marketplace",
+            "fail",
+            f"source.path={raw_path!r} normalizes to an empty local plugin path for Codex CLI; use './.' for a root plugin checkout",
+        )
 
     # Codex marketplace paths are resolved relative to the marketplace root,
     # not relative to `.agents/plugins/marketplace.json`.
@@ -283,7 +361,13 @@ def _check_marketplace(plugin_root: Path) -> DoctorCheck:
         return _doctor_check(
             "codex_marketplace",
             "warn",
-            f"source.path={raw_path!r} resolves to {resolved}; prefer './' for Codex CLI local plugin paths",
+            f"source.path={raw_path!r} resolves to {resolved}; prefer './.' for root Codex CLI local plugin paths",
+        )
+    if raw_path == "./.":
+        return _doctor_check(
+            "codex_marketplace",
+            "ok",
+            f"{marketplace_path} -> source.path './.' resolves to root plugin {resolved}",
         )
     return _doctor_check(
         "codex_marketplace",
@@ -346,7 +430,7 @@ def _check_dashboard_assets(plugin_root: Path) -> DoctorCheck:
     return _doctor_check(
         "dashboard_static_assets",
         "warn",
-        "missing dashboard index; run `cd frontend/dashboard && npm install && npm run build` in a raw checkout",
+        "missing dashboard index; installed plugins should include agent/governance/dashboard_dist/index.html. In a raw checkout, run `cd frontend/dashboard && npm install && npm run build`.",
     )
 
 
@@ -434,6 +518,7 @@ def doctor_plugin(
     governance_url: str = "http://localhost:40000",
     codex_config: Optional[Union[Path, str]] = None,
     check_governance: bool = True,
+    python_executable: Optional[str] = None,
 ) -> DoctorResult:
     """Run read-only aftercare checks for a local plugin install."""
 
@@ -446,6 +531,8 @@ def doctor_plugin(
     except PluginInstallError as exc:
         result.checks.append(_doctor_check("plugin_assets", "fail", str(exc)))
 
+    result.checks.append(_python_version_check(python_executable or sys.executable))
+    result.checks.append(_check_codex_manifest(root))
     result.checks.append(_check_marketplace(root))
     result.checks.append(_check_mcp_config(root))
     result.checks.append(_check_codex_config(Path(codex_config).expanduser() if codex_config else default_codex_config_path()))
@@ -541,6 +628,8 @@ def install_from_git(
 
     installed_package = False
     if install_package:
+        if not dry_run:
+            _ensure_supported_python(python)
         _run(
             [python, "-m", "pip", "install", "-e", str(plugin_root)],
             dry_run=dry_run,

@@ -1164,8 +1164,12 @@ def list_graph_snapshot_files(
     def _matches(row: dict[str, Any]) -> bool:
         if file_kind and str(row.get("file_kind") or "") != file_kind:
             return False
-        if scan_status and str(row.get("scan_status") or "") != scan_status:
-            return False
+        if scan_status:
+            row_scan_status = str(row.get("scan_status") or "")
+            if row_scan_status != scan_status:
+                return False
+            if scan_status == "orphan" and (row.get("attached_node_ids") or row.get("attached_to")):
+                return False
         if graph_status and str(row.get("graph_status") or "") != graph_status:
             return False
         if decision and str(row.get("decision") or "") != decision:
