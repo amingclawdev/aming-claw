@@ -418,17 +418,28 @@ export default function ProjectConsoleView({
         <div className="card project-console-table-card">
           <div className="project-console-table-wrap">
             <table className="table project-console-table">
+              <colgroup>
+                <col className="project-console-col-project" />
+                <col className="project-console-col-ref" />
+                <col className="project-console-col-graph" />
+                <col className="project-console-col-snapshot" />
+                <col className="project-console-col-scale" />
+                <col className="project-console-col-work" />
+                <col className="project-console-col-ai" />
+                <col className="project-console-col-workspace" />
+                <col className="project-console-col-actions" />
+              </colgroup>
               <thead>
                 <tr>
                   <th>Project</th>
-                  <th style={{ width: 170 }}>Ref</th>
-                  <th style={{ width: 150 }}>Graph</th>
-                  <th style={{ width: 170 }}>Snapshot</th>
-                  <th style={{ width: 150 }}>Scale</th>
-                  <th style={{ width: 140 }}>Work</th>
-                  <th style={{ width: 180 }}>AI</th>
+                  <th>Ref</th>
+                  <th>Graph</th>
+                  <th>Snapshot</th>
+                  <th>Scale</th>
+                  <th>Work</th>
+                  <th>AI</th>
                   <th>Workspace</th>
-                  <th style={{ width: 150 }}>Actions</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>

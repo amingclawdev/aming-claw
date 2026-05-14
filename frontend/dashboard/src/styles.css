@@ -1189,13 +1189,28 @@ a:hover { text-decoration: underline; }
 }
 
 .project-console-table {
-  min-width: 1180px;
+  min-width: 1540px;
   table-layout: fixed;
 }
 
 .project-console-table td {
   vertical-align: top;
 }
+
+.project-console-table th,
+.project-console-table td {
+  overflow: hidden;
+}
+
+.project-console-col-project { width: 220px; }
+.project-console-col-ref { width: 180px; }
+.project-console-col-graph { width: 150px; }
+.project-console-col-snapshot { width: 180px; }
+.project-console-col-scale { width: 150px; }
+.project-console-col-work { width: 140px; }
+.project-console-col-ai { width: 210px; }
+.project-console-col-workspace { width: 260px; }
+.project-console-col-actions { width: 150px; }
 
 .project-console-selected {
   background: #eef2ff;
@@ -1215,7 +1230,7 @@ a:hover { text-decoration: underline; }
 
 .project-console-name .cell-strong {
   min-width: 0;
-  max-width: 180px;
+  max-width: 160px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1261,7 +1276,7 @@ a:hover { text-decoration: underline; }
 
 .project-console-workspace {
   display: block;
-  max-width: min(360px, 32vw);
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4150,7 +4165,7 @@ svg.graph-svg path.ghit:hover {
   }
 
   .project-console-table {
-    min-width: 1060px;
+    min-width: 1540px;
   }
 
   .inspector-drawer,
