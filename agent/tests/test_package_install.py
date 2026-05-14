@@ -99,6 +99,7 @@ class TestPackagedDashboardAssets:
         assert "include .claude-plugin/marketplace.json" in manifest
         assert "include .agents/plugins/marketplace.json" in manifest
         assert "include CLAUDE.md" in manifest
+        assert "include scripts/install_from_git.py" in manifest
 
     def test_dashboard_build_sync_script_is_wired_to_npm_build(self):
         package_json = json.loads((ROOT / "frontend" / "dashboard" / "package.json").read_text(encoding="utf-8"))
@@ -173,6 +174,18 @@ class TestLocalPluginPackaging:
         assert scripts["aming-governance"] == "agent.governance.server:main"
         assert scripts["aming-governance-host"] == "start_governance:main"
 
+    def test_git_url_plugin_installer_script_is_packaged(self):
+        script = ROOT / "scripts" / "install_from_git.py"
+
+        assert script.is_file()
+        assert "agent.plugin_installer" in script.read_text(encoding="utf-8")
+
+        from agent.plugin_installer import DEFAULT_REPO_URL, REQUIRED_PLUGIN_FILES
+
+        assert DEFAULT_REPO_URL == "https://github.com/amingclawdev/aming-claw"
+        assert ".codex-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
+        assert ".claude-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
+
 
 class TestClaudePluginPackaging:
     """MVP contract for Claude Code local-plugin packaging (parity with Codex)."""
@@ -204,7 +217,13 @@ class TestClaudePluginPackaging:
         assert "name: aming-claw-launcher" in skill
         assert "description:" in skill
         # Launcher skill must document the preview/start/open/status surface.
-        for command in ("aming-claw launcher", "aming-claw start", "aming-claw status", "aming-claw open"):
+        for command in (
+            "aming-claw launcher",
+            "aming-claw start",
+            "aming-claw status",
+            "aming-claw open",
+            "aming-claw plugin install",
+        ):
             assert command in skill, f"launcher skill missing reference to `{command}`"
         # Launcher skill must hand off to the main governance skill for non-preview work.
         assert "aming-claw/SKILL.md" in skill

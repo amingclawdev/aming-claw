@@ -10,6 +10,7 @@ include .claude-plugin/marketplace.json
 include .agents/plugins/marketplace.json
 include .mcp.json
 include CLAUDE.md
+include scripts/install_from_git.py
 prune .worktrees
 prune shared-volume
 prune runtime

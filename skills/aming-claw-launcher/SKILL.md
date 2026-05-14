@@ -57,6 +57,7 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 | `aming-claw status` | GET `/api/health` against the running governance service. |
 | `aming-claw open --governance-url <url>` | Open the dashboard in the default browser. |
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
+| `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, and print next steps. |
 | `aming-claw run-executor` | Start an executor worker directly. Normally ServiceManager owns this — only use for explicit debugging. |
 
 ## Project-Local Plugin Contract
@@ -69,15 +70,38 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 
 If governance is offline or this is a fresh install:
 
-1. Read `aming-claw://seed-graph-summary` (packaged MVP structure) when the MCP resource is available — do not invent module locations.
-2. Show the explicit startup flow rather than auto-running:
+1. If the user asks to install from a Git URL, prefer the host-native plugin
+   flow first:
+
+   ```text
+   Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
+   ```
+
+   If the host cannot install Git plugins directly yet, ask the user to clone
+   once and run:
+
+   ```text
+   git clone https://github.com/amingclawdev/aming-claw.git
+   cd aming-claw
+   pip install -e .
+   python -m agent.cli start
+   ```
+
+   If the CLI is already available, use:
+
+   ```text
+   aming-claw plugin install https://github.com/amingclawdev/aming-claw
+   ```
+
+2. Read `aming-claw://seed-graph-summary` (packaged MVP structure) when the MCP resource is available — do not invent module locations.
+3. Show the explicit startup flow rather than auto-running:
 
    ```text
    aming-claw launcher
    aming-claw start
    ```
 
-3. After the user starts services, re-run `runtime_status` and confirm `version_check.ok == true` before recommending any mutation.
+4. After the user starts services, re-run `runtime_status` and confirm `version_check.ok == true` before recommending any mutation.
 
 ## When to Hand Off
 

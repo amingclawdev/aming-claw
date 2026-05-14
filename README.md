@@ -17,11 +17,27 @@ Requirements:
 - Node.js/npm when rebuilding the dashboard from source
 - Codex or Claude Code for the plugin/skill workflow
 
+If you are starting from a plugin host, give it the repository URL:
+
+```text
+Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
+```
+
+If the host cannot install Git plugins directly yet, clone once and use the
+repo-local package:
+
 ```bash
 git clone https://github.com/amingclawdev/aming-claw.git
 cd aming-claw
 pip install -e .
 aming-claw start
+```
+
+If the `aming-claw` console script is not on `PATH` yet, run the same CLI
+through Python:
+
+```bash
+python -m agent.cli start
 ```
 
 Open the local launcher or dashboard:
@@ -64,6 +80,13 @@ Codex does not auto-start Aming Claw services. Start them explicitly:
 
 ```bash
 aming-claw start
+```
+
+If the CLI is already available, it can update a local plugin checkout from the
+public Git URL:
+
+```bash
+aming-claw plugin install https://github.com/amingclawdev/aming-claw
 ```
 
 ### Claude Code
@@ -161,6 +184,7 @@ memory.
 
 ```bash
 aming-claw launcher        # write/open the local launcher
+aming-claw plugin install  # clone/update local plugin assets from Git
 aming-claw start           # start governance locally
 aming-claw open            # open the dashboard
 aming-claw status          # check governance health
@@ -176,6 +200,20 @@ For MVP distribution, use Git rather than PyPI:
 git clone https://github.com/amingclawdev/aming-claw.git
 cd aming-claw
 pip install -e .
+```
+
+For an already-installed Aming Claw CLI, refresh a user-local plugin checkout
+from Git:
+
+```bash
+aming-claw plugin install https://github.com/amingclawdev/aming-claw
+```
+
+For a cloned checkout before the console script is on `PATH`, run the installer
+through Python:
+
+```bash
+python scripts/install_from_git.py https://github.com/amingclawdev/aming-claw
 ```
 
 Python-only installation from Git is also possible:

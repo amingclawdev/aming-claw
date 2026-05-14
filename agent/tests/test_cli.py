@@ -20,7 +20,7 @@ class TestCliHelp:
         runner = CliRunner()
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor"):
+        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor", "plugin"):
             assert cmd in result.output
 
 
@@ -60,3 +60,23 @@ class TestCliLauncher:
         assert "Aming Claw Launcher" in text
         assert "http://127.0.0.1:45555/dashboard" in text
         assert "aming-claw start" in text
+
+
+class TestCliPlugin:
+    def test_plugin_install_dry_run_prints_plan(self, tmp_path):
+        runner = CliRunner()
+
+        result = runner.invoke(main, [
+            "plugin",
+            "install",
+            "https://github.com/amingclawdev/aming-claw.git",
+            "--install-root",
+            str(tmp_path),
+            "--dry-run",
+            "--no-pip",
+        ])
+
+        assert result.exit_code == 0
+        assert "Aming Claw plugin bootstrap" in result.output
+        assert "git clone" in result.output
+        assert "Claude Code: /plugin marketplace add" in result.output

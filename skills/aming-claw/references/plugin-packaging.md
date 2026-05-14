@@ -23,6 +23,11 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 - A plugin launcher is explicit: `aming-claw launcher` writes a local HTML
   entry artifact with status/start guidance and a dashboard link. It does not
   auto-start governance or ServiceManager.
+- Git URL bootstrap is explicit: `aming-claw plugin install <repo-url>` and
+  `python scripts/install_from_git.py <repo-url>` clone/update a user-local
+  checkout, validate Codex/Claude plugin assets, optionally pip-install the
+  runtime, and print next steps. They do not silently install credentials or
+  mutate global editor settings.
 
 ## Layout
 
@@ -42,6 +47,8 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 - `skills/aming-claw-launcher/`: onboarding skill loaded for preview, start,
   status, and dashboard flows.
 - `.mcp.json`: active MCP server config using `agent.mcp.server`.
+- `agent/plugin_installer.py` + `scripts/install_from_git.py`: Git URL plugin
+  installer used by the CLI and first-run fallback flows.
 
 The Codex manifest points to:
 
@@ -92,6 +99,7 @@ Run these before publishing a local plugin bundle or pip package:
 
 ```text
 python -m pytest agent/tests/test_package_install.py agent/tests/test_mcp_server_stdio.py agent/tests/test_dashboard_static_route.py -q
+python -m pytest agent/tests/test_plugin_installer.py agent/tests/test_cli.py -q
 npm --prefix frontend/dashboard run build
 python scripts/build_package.py --skip-dashboard-build
 node frontend/dashboard/scripts/e2e-trunk.mjs --probe --static-route --dashboard http://localhost:40000/dashboard
@@ -107,7 +115,7 @@ is available.
 | Surface | Current | Gap Before Public Release |
 | --- | --- | --- |
 | Pip package | `pyproject.toml` exposes `aming-claw`, `aming-governance`, and `aming-governance-host`; dashboard assets are synced into `agent/governance/dashboard_dist` before wheel build. | Run clean wheel install smoke on each release target. |
-| Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; `.agents/plugins/marketplace.json` points at the repo root plugin and marks it installed by default for local sessions. Tests ensure paths exist and `.mcp.json` is relocatable. | Sanitize env and host URLs before publishing outside trusted local/team installs. |
+| Codex local plugin | `.codex-plugin/plugin.json` points at skills and `.mcp.json`; `.agents/plugins/marketplace.json` points at the repo root plugin and marks it installed by default for local sessions. `aming-claw plugin install <git-url>` prepares a user-local checkout for hosts that need an explicit local plugin root. Tests ensure paths exist and `.mcp.json` is relocatable. | Sanitize env and host URLs before publishing outside trusted local/team installs. Host-native "paste Git URL to install" support still depends on the editor/plugin host. |
 | Claude Code local plugin | `.claude-plugin/plugin.json` at repo root + project-level `CLAUDE.md` + `.mcp.json`; `.claude-plugin/marketplace.json` makes the repo a local marketplace. Skills auto-discovered as `/aming-claw:aming-claw` (governance) and `/aming-claw:aming-claw-launcher` (onboarding). Install via `/plugin marketplace add <path-or-git-url>` then `/plugin install aming-claw@aming-claw-local`. | Sanitize env/host URLs before publishing outside trusted local/team installs. Global Claude Code settings remain out of scope. |
 | Cross-platform desktop | Windows, macOS, and Linux directory picker fallbacks are implemented with manual entry fallback. | Add real-machine smoke evidence for macOS and Linux/WSL before public release. |
 

@@ -4,6 +4,7 @@ Usage:
     aming-claw init            - create .aming-claw.yaml in current directory
     aming-claw bootstrap       - bootstrap an external project
     aming-claw status          - show governance status
+    aming-claw plugin install  - install/update plugin assets from Git
     aming-claw start           - start governance in the foreground
     aming-claw open            - open the dashboard URL
     aming-claw launcher        - write a local launcher HTML artifact
@@ -127,6 +128,10 @@ def _launcher_html(governance_url: str) -> str:
     <p><a class="button" href="{dashboard_url}">Open dashboard</a></p>
     <h2>Start locally</h2>
     <pre>aming-claw start</pre>
+    <p>If the console script is not on PATH yet, use:</p>
+    <pre>python -m agent.cli start</pre>
+    <h2>Install/update plugin from Git</h2>
+    <pre>aming-claw plugin install https://github.com/amingclawdev/aming-claw</pre>
     <h2>Check status</h2>
     <pre>aming-claw status</pre>
     <p>Codex and Claude Code should connect through the project <code>.mcp.json</code> after governance is available at <code>{governance_url}</code>.</p>
@@ -176,6 +181,50 @@ def run_executor():
     """Start the executor worker."""
     from agent.executor_worker import main as worker_main
     worker_main()
+
+
+@main.group()
+def plugin():
+    """Install and validate local Aming Claw plugin assets."""
+    pass
+
+
+@plugin.command("install")
+@click.argument("repo_url", required=False)
+@click.option("--install-root", default="", help="User-local plugin cache root.")
+@click.option("--ref", default="", help="Optional branch, tag, or commit to checkout.")
+@click.option("--python", "python_executable", default=sys.executable, help="Python executable for pip/start commands.")
+@click.option("--no-pip", is_flag=True, help="Clone and validate only; do not pip install.")
+@click.option("--start", is_flag=True, help="Run the start command after install.")
+@click.option("--dry-run", is_flag=True, help="Print planned commands without changing state.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+@click.option("--validate-only", is_flag=True, help="Validate the computed checkout path without cloning or fetching.")
+def plugin_install(repo_url, install_root, ref, python_executable, no_pip, start, dry_run, json_output, validate_only):
+    """Clone/update the plugin from a Git URL and print next steps."""
+    from agent.plugin_installer import (
+        DEFAULT_REPO_URL,
+        PluginInstallError,
+        format_result,
+        install_from_git,
+    )
+
+    try:
+        result = install_from_git(
+            repo_url or DEFAULT_REPO_URL,
+            install_root=install_root or None,
+            ref=ref,
+            python_executable=python_executable,
+            install_package=not no_pip,
+            start=start,
+            dry_run=dry_run,
+            validate_only=validate_only,
+        )
+    except PluginInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_output:
+        click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(format_result(result))
 
 
 if __name__ == "__main__":
