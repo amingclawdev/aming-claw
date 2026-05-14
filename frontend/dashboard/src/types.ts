@@ -124,6 +124,12 @@ export interface NodeMetadata {
   // Map key is the short symbol name (`DecisionValidator.__init__`), value is
   // a `[start_line, end_line]` 1-based pair.
   function_lines?: Record<string, [number, number]>;
+  function_calls?: FunctionCallFact[];
+  function_called_by?: FunctionCallFact[];
+  function_weak_calls?: FunctionWeakCallFact[];
+  function_call_count?: number;
+  function_called_by_count?: number;
+  function_weak_call_count?: number;
   graph_metrics?: {
     fan_in?: number;
     fan_out?: number;
@@ -141,6 +147,34 @@ export interface NodeMetadata {
   asset_key?: string;
   kind?: string;
   aggregate_asset?: boolean;
+}
+
+export interface FunctionCallFact {
+  caller?: string;
+  caller_short?: string;
+  caller_module?: string;
+  caller_file?: string;
+  caller_line?: [number, number];
+  callee?: string;
+  callee_short?: string;
+  callee_module?: string;
+  callee_file?: string;
+  callee_line?: [number, number];
+  confidence?: string;
+  resolution?: string;
+}
+
+export interface FunctionWeakCallFact {
+  caller?: string;
+  caller_short?: string;
+  caller_module?: string;
+  caller_file?: string;
+  caller_line?: [number, number];
+  raw_target?: string;
+  candidates?: string[];
+  confidence?: string;
+  resolution?: string;
+  reason?: string;
 }
 
 export interface NodeSemantic {

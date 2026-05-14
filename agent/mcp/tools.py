@@ -269,7 +269,7 @@ TOOLS: list[dict] = [
                 "project_id": {"type": "string"},
                 "tool": {
                     "type": "string",
-                    "description": "Graph query tool, e.g. query_schema, find_node_by_path, search_structure, function_index, degree_summary, high_degree_nodes, search_semantic, get_node, get_neighbors, search_docs, get_file_excerpt.",
+                    "description": "Graph query tool, e.g. query_schema, find_node_by_path, search_structure, function_index, function_callers, function_callees, high_function_degree, degree_summary, high_degree_nodes, search_semantic, get_node, get_neighbors, search_docs, get_file_excerpt.",
                 },
                 "args": {"type": "object"},
                 "snapshot_id": {"type": "string"},

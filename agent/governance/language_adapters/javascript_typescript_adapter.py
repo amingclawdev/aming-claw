@@ -68,6 +68,21 @@ _HTTP_METHOD_RE = re.compile(
     + _API_LITERAL_RE_FRAGMENT,
     re.IGNORECASE | re.MULTILINE,
 )
+_CALL_RE = re.compile(
+    r"""\b(?P<name>[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*(?:<[^>\r\n]+>)?\(""",
+    re.MULTILINE,
+)
+_CONTROL_CALL_NAMES = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "function",
+    "return",
+    "typeof",
+    "new",
+}
 
 
 class JavaScriptTypescriptAdapter:
@@ -141,6 +156,15 @@ class JavaScriptTypescriptAdapter:
             seen.add(key)
             symbols.append(symbol)
         symbols.sort(key=lambda item: (int(item.get("lineno") or 0), str(item.get("name") or "")))
+        for symbol in symbols:
+            if symbol.get("kind") != "function":
+                continue
+            symbol["calls"] = _extract_calls_for_symbol(
+                source or "",
+                int(symbol.get("lineno") or 1),
+                int(symbol.get("end_lineno") or symbol.get("lineno") or 1),
+                str(symbol.get("name") or ""),
+            )
         return symbols
 
     def parse_imports(self, file_path: str, source: str = "") -> List[Dict[str, Any]]:
@@ -204,6 +228,28 @@ class JavaScriptTypescriptAdapter:
 
 def _line_number(source: str, offset: int) -> int:
     return (source or "")[:offset].count("\n") + 1
+
+
+def _extract_calls_for_symbol(source: str, start_lineno: int, end_lineno: int, owner_name: str) -> List[str]:
+    lines = (source or "").splitlines()
+    start = max(0, int(start_lineno or 1) - 1)
+    end = max(start + 1, min(len(lines), int(end_lineno or start_lineno or 1)))
+    body = "\n".join(lines[start:end])
+    owner_short = owner_name.split(".")[-1]
+    calls: List[str] = []
+    seen: set[str] = set()
+    for match in _CALL_RE.finditer(body):
+        name = str(match.group("name") or "").strip()
+        first = name.split(".", 1)[0]
+        if not name or first in _CONTROL_CALL_NAMES:
+            continue
+        if name == owner_name or name == owner_short or name.endswith(f".{owner_short}"):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        calls.append(name)
+    return calls
 
 
 def _find_matching_brace(source: str, open_offset: int) -> int:

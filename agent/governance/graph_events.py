@@ -2055,6 +2055,20 @@ def _latest_edge_semantic_events(
             remember_latest(by_target_id, target_variant, event)
         if stable_key:
             remember_latest(by_stable_key, stable_key, event)
+    def target_id_fallback_matches_current_edge(
+        event: dict[str, Any],
+        *,
+        stable_key: str,
+        current_edge_signature_hash: str,
+    ) -> bool:
+        event_stable_key = str(event.get("stable_node_key") or "").strip()
+        if stable_key and event_stable_key:
+            return event_stable_key == stable_key
+        stored_signature_hash = str(event.get("feature_hash") or "").strip()
+        if current_edge_signature_hash and stored_signature_hash:
+            return _hash_values_equal(stored_signature_hash, current_edge_signature_hash)
+        return False
+
     # If the caller provided edge_index, prefer stable_edge_key matches —
     # this is what lets a carry-forward'd edge in the new snapshot find
     # the latest semantic event even when target_id was renumbered.
@@ -2063,11 +2077,18 @@ def _latest_edge_semantic_events(
         for edge_id, meta in edge_index.items():
             candidates: list[dict[str, Any]] = []
             stable_key = str(meta.get("stable_edge_key") or "")
+            edge_signature_hash = str(meta.get("edge_signature_hash") or "")
             if stable_key and stable_key in by_stable_key:
                 candidates.append(by_stable_key[stable_key])
             for edge_variant in _edge_id_variants(edge_id):
                 if edge_variant in by_target_id:
-                    candidates.append(by_target_id[edge_variant])
+                    event = by_target_id[edge_variant]
+                    if target_id_fallback_matches_current_edge(
+                        event,
+                        stable_key=stable_key,
+                        current_edge_signature_hash=edge_signature_hash,
+                    ):
+                        candidates.append(event)
             if candidates:
                 latest[edge_id] = max(candidates, key=event_rank)
         return latest
@@ -2476,6 +2497,11 @@ def build_semantic_projection(
         edge_carry_index[eid] = {
             "edge_id": eid,
             "stable_edge_key": stable_edge_key_for_edge(
+                edge,
+                node_lookup_for_edges.get(src),
+                node_lookup_for_edges.get(dst),
+            ),
+            "edge_signature_hash": edge_signature_hash_for_edge(
                 edge,
                 node_lookup_for_edges.get(src),
                 node_lookup_for_edges.get(dst),

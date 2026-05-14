@@ -1233,6 +1233,11 @@ function FunctionsSection({
   }, [node.metadata?.function_lines]);
 
   const resolvedCount = lineMap?.size ?? 0;
+  const functionCalls = node.metadata?.function_calls ?? [];
+  const functionCalledBy = node.metadata?.function_called_by ?? [];
+  const weakCalls = node.metadata?.function_weak_calls ?? [];
+  const callPreview = functionCalls.slice(0, 8);
+  const callerPreview = functionCalledBy.slice(0, 8);
 
   return (
     <section className="inspector-section">
@@ -1262,6 +1267,43 @@ function FunctionsSection({
           </li>
         ))}
       </ul>
+      {functionCalls.length > 0 || functionCalledBy.length > 0 || weakCalls.length > 0 ? (
+        <div style={{ marginTop: 12 }}>
+          <div className="inspector-section-title" style={{ fontSize: 9, marginBottom: 6 }}>
+            Function call graph{" "}
+            <span className="head-hint">
+              out {functionCalls.length} · in {functionCalledBy.length}
+              {weakCalls.length > 0 ? ` · weak ${weakCalls.length}` : ""}
+            </span>
+          </div>
+          {callPreview.length > 0 ? (
+            <ul className="link-list" style={{ marginBottom: 8 }}>
+              {callPreview.map((fact, index) => (
+                <li key={`${fact.caller}-${fact.callee}-${index}`}>
+                  <span className="link-row link-row-static">
+                    <span className="edge-arrow">→</span>
+                    <span className="link-name mono">{fact.caller_short || shortSymbol(fact.caller || "")}</span>
+                    <span className="link-meta mono">{fact.callee_short || shortSymbol(fact.callee || "")}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {callerPreview.length > 0 ? (
+            <ul className="link-list">
+              {callerPreview.map((fact, index) => (
+                <li key={`${fact.callee}-${fact.caller}-${index}`}>
+                  <span className="link-row link-row-static">
+                    <span className="edge-arrow">←</span>
+                    <span className="link-name mono">{fact.callee_short || shortSymbol(fact.callee || "")}</span>
+                    <span className="link-meta mono">{fact.caller_short || shortSymbol(fact.caller || "")}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1989,6 +2031,10 @@ function nodeTypeLabel(node: NodeRecord, isContainer: boolean): string {
 function shortTitle(t: string): string {
   const parts = t.split(".");
   return parts.length > 2 ? parts.slice(-2).join(".") : t;
+}
+
+function shortSymbol(symbol: string): string {
+  return symbol.split("::").slice(-1)[0] || symbol;
 }
 
 function nonEmpty(...values: (string | undefined)[]): string {

@@ -19,6 +19,7 @@ evidence in that fallback mode.
    - `find_node_by_path` to resolve a file path to graph node ids.
    - `search_structure` for module/title/file/function lookup when semantic payload is missing.
    - `function_index` to locate functions and line ranges from `metadata.function_lines`.
+   - `function_callers`, `function_callees`, and `high_function_degree` for persisted function-level call evidence.
    - `degree_summary` for exact fan-in/fan-out and edge-type breakdown for a node.
    - `high_degree_nodes` to rank high fan-out/fan-in candidates for PR opportunity analysis.
    - `search_semantic` for node semantics, node metadata, and current edge semantic projection payloads.
@@ -59,6 +60,16 @@ an isolated clean worktree before claiming graph state reflects current code.
   "project_id": "aming-claw",
   "tool": "function_index",
   "args": {"query": "traced_query", "limit": 5},
+  "query_source": "observer",
+  "query_purpose": "prompt_context_build"
+}
+```
+
+```json
+{
+  "project_id": "aming-claw",
+  "tool": "function_callees",
+  "args": {"query": "traced_query", "limit": 20},
   "query_source": "observer",
   "query_purpose": "prompt_context_build"
 }

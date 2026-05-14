@@ -20,7 +20,9 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     CallGraph,
     FunctionMeta,
     ModuleInfo,
+    build_function_call_facts,
     build_call_graph,
+    enrich_nodes_with_function_call_facts,
     handle_cycle,
     parse_production_modules,
     tarjan_scc,
@@ -276,6 +278,35 @@ class TestBuildCallGraph:
         assert len(graph.weak_edges) == 0
         assert "mod_a::helper" in graph.edges.get("mod_caller::work", [])
         assert "mod_b::helper" not in graph.edges.get("mod_caller::work", [])
+
+    def test_build_function_call_facts_persists_callers_and_callees(self):
+        """MVP graph metadata can carry function-level call evidence."""
+        modules = _make_modules({
+            "mod_a": {
+                "functions": [
+                    {"name": "helper", "calls": []},
+                ],
+            },
+            "mod_b": {
+                "import_map": {"helper": "mod_a.helper"},
+                "functions": [
+                    {"name": "work", "calls": ["helper"]},
+                ],
+            },
+        })
+        graph = build_call_graph(modules)
+
+        facts = build_function_call_facts(modules, graph)
+        nodes = [
+            {"module": "mod_a", "node_id": "mod_a"},
+            {"module": "mod_b", "node_id": "mod_b"},
+        ]
+        enrich_nodes_with_function_call_facts(nodes, facts)
+
+        assert nodes[1]["function_calls"][0]["caller"] == "mod_b::work"
+        assert nodes[1]["function_calls"][0]["callee"] == "mod_a::helper"
+        assert nodes[0]["function_called_by"][0]["caller"] == "mod_b::work"
+        assert nodes[0]["function_called_by_count"] == 1
 
 
 # ===========================================================================

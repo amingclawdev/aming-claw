@@ -395,3 +395,79 @@ def test_latest_edge_semantic_events_finds_cross_snapshot(conn):
     )
     assert "L7.1->L7.2:depends_on" in latest
     assert latest["L7.1->L7.2:depends_on"]["snapshot_id"] == snap_a["snapshot_id"]
+
+
+def test_latest_edge_semantic_events_rejects_target_id_reuse_when_stable_key_differs(conn):
+    """A reused L-id edge id must not inherit semantics for a different stable edge."""
+    snap_a, _ = _create_snapshot(
+        conn, "snap-edge-old", "commitA", ["L7.1", "L7.2"],
+        [{"source": "L7.1", "target": "L7.2", "edge_type": "depends_on"}],
+    )
+    edge_id = "L7.1->L7.2:depends_on"
+    graph_events.create_event(
+        conn, PID, snap_a["snapshot_id"],
+        event_type="edge_semantic_enriched",
+        event_kind="semantic_job",
+        target_type="edge",
+        target_id=edge_id,
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        stable_node_key="old-stable-edge",
+        feature_hash="old-edge-signature",
+        payload={"semantic_payload": {"relation_purpose": "old relation"}},
+    )
+    snap_b, _ = _create_snapshot(
+        conn, "snap-edge-new", "commitB", ["L7.1", "L7.2"],
+        [{"source": "L7.1", "target": "L7.2", "edge_type": "depends_on"}],
+    )
+
+    latest = graph_events._latest_edge_semantic_events(
+        conn,
+        PID,
+        snap_b["snapshot_id"],
+        edge_index={
+            edge_id: {
+                "stable_edge_key": "new-stable-edge",
+                "edge_signature_hash": "new-edge-signature",
+            }
+        },
+    )
+
+    assert edge_id not in latest
+
+
+def test_latest_edge_semantic_events_allows_legacy_target_id_when_signature_matches(conn):
+    """Old rows without stable_edge_key can still carry forward by matching signature."""
+    snap_a, _ = _create_snapshot(
+        conn, "snap-edge-legacy", "commitA", ["L7.1", "L7.2"],
+        [{"source": "L7.1", "target": "L7.2", "edge_type": "depends_on"}],
+    )
+    edge_id = "L7.1->L7.2:depends_on"
+    graph_events.create_event(
+        conn, PID, snap_a["snapshot_id"],
+        event_type="edge_semantic_enriched",
+        event_kind="semantic_job",
+        target_type="edge",
+        target_id=edge_id,
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        feature_hash="same-edge-signature",
+        payload={"semantic_payload": {"relation_purpose": "legacy relation"}},
+    )
+    snap_b, _ = _create_snapshot(
+        conn, "snap-edge-current", "commitB", ["L7.1", "L7.2"],
+        [{"source": "L7.1", "target": "L7.2", "edge_type": "depends_on"}],
+    )
+
+    latest = graph_events._latest_edge_semantic_events(
+        conn,
+        PID,
+        snap_b["snapshot_id"],
+        edge_index={
+            edge_id: {
+                "stable_edge_key": "current-stable-edge",
+                "edge_signature_hash": "same-edge-signature",
+            }
+        },
+    )
+
+    assert latest[edge_id]["snapshot_id"] == snap_a["snapshot_id"]
+    assert latest[edge_id]["feature_hash"] == "same-edge-signature"

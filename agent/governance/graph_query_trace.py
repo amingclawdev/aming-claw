@@ -91,6 +91,9 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "degree_summary": {"required_args": ["node_id"], "summary": "Return fan-in/fan-out counts independent of neighbor limit."},
     "high_degree_nodes": {"required_args": [], "summary": "Rank nodes by fan_in, fan_out, or total degree."},
     "function_index": {"required_args": ["query"], "summary": "Search metadata.functions and function_lines."},
+    "function_callees": {"required_args": ["query"], "summary": "List resolved callees for a function or node."},
+    "function_callers": {"required_args": ["query"], "summary": "List resolved callers for a function or node."},
+    "high_function_degree": {"required_args": [], "summary": "Rank functions by caller/callee counts."},
     "search_semantic": {
         "required_args": ["query"],
         "summary": "Search node semantics, node metadata, and current edge semantic projection.",
@@ -1009,6 +1012,145 @@ def _query_function_index(conn: sqlite3.Connection, project_id: str, snapshot_id
     return {"ok": True, "query": query, "matches": matches, "count": len(matches)}
 
 
+def _function_call_nodes(conn: sqlite3.Connection, project_id: str, snapshot_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT node_id, layer, title, kind, primary_files_json,
+               secondary_files_json, test_files_json, metadata_json
+        FROM graph_nodes_index
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY layer, node_id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    return [_node_from_row(row) for row in rows]
+
+
+def _function_fact_matches(fact: dict[str, Any], query: str, node_id: str, direction: str) -> bool:
+    if node_id:
+        module_key = "caller_module" if direction == "callees" else "callee_module"
+        # The node id itself is matched after module->node enrichment in the caller.
+        if str(fact.get(module_key) or "") == node_id:
+            return True
+    if not query:
+        return True
+    needle = query.lower()
+    fields = [
+        "caller",
+        "caller_short",
+        "caller_module",
+        "callee",
+        "callee_short",
+        "callee_module",
+        "raw_target",
+    ]
+    return any(needle in str(fact.get(field) or "").lower() for field in fields)
+
+
+def _query_function_calls(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    args: dict[str, Any],
+    *,
+    direction: str,
+) -> dict[str, Any]:
+    query = str(args.get("query") or args.get("q") or args.get("function") or "").strip()
+    node_id_filter = str(args.get("node_id") or args.get("id") or "").strip()
+    if not query and not node_id_filter:
+        raise ValueError("query or node_id is required")
+    limit = max(1, min(int(args.get("limit") or 50), 300))
+    nodes = _function_call_nodes(conn, project_id, snapshot_id)
+    by_module = {
+        str((node.get("metadata") or {}).get("module") or ""): node
+        for node in nodes
+        if isinstance(node.get("metadata"), dict)
+    }
+    rows: list[dict[str, Any]] = []
+    source_key = "function_calls" if direction == "callees" else "function_called_by"
+    for node in nodes:
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        facts = metadata.get(source_key) if isinstance(metadata.get(source_key), list) else []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            caller_node = by_module.get(str(fact.get("caller_module") or ""))
+            callee_node = by_module.get(str(fact.get("callee_module") or ""))
+            caller_node_id = str((caller_node or {}).get("node_id") or "")
+            callee_node_id = str((callee_node or {}).get("node_id") or "")
+            if node_id_filter:
+                expected = caller_node_id if direction == "callees" else callee_node_id
+                if expected != node_id_filter:
+                    continue
+            if not _function_fact_matches(fact, query, node_id_filter, direction):
+                continue
+            rows.append({
+                "caller": fact.get("caller", ""),
+                "caller_short": fact.get("caller_short", _short_symbol_name(fact.get("caller", ""))),
+                "caller_node": _compact_node(caller_node) if caller_node else {},
+                "caller_file": fact.get("caller_file", ""),
+                "caller_line": fact.get("caller_line", [0, 0]),
+                "callee": fact.get("callee", ""),
+                "callee_short": fact.get("callee_short", _short_symbol_name(fact.get("callee", ""))),
+                "callee_node": _compact_node(callee_node) if callee_node else {},
+                "callee_file": fact.get("callee_file", ""),
+                "callee_line": fact.get("callee_line", [0, 0]),
+                "confidence": fact.get("confidence", ""),
+                "resolution": fact.get("resolution", ""),
+            })
+            if len(rows) >= limit:
+                return {"ok": True, "query": query, "direction": direction, "matches": rows, "count": len(rows)}
+    return {"ok": True, "query": query, "direction": direction, "matches": rows, "count": len(rows)}
+
+
+def _query_high_function_degree(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    metric = str(args.get("metric") or "total").strip().lower()
+    if metric not in {"fan_in", "fan_out", "total"}:
+        raise ValueError("metric must be fan_in, fan_out, or total")
+    limit = max(1, min(int(args.get("limit") or 25), 100))
+    nodes = _function_call_nodes(conn, project_id, snapshot_id)
+    by_module = {
+        str((node.get("metadata") or {}).get("module") or ""): node
+        for node in nodes
+        if isinstance(node.get("metadata"), dict)
+    }
+    stats: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        facts = metadata.get("function_calls") if isinstance(metadata.get("function_calls"), list) else []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            caller = str(fact.get("caller") or "")
+            callee = str(fact.get("callee") or "")
+            if caller:
+                item = stats.setdefault(caller, {
+                    "function": caller,
+                    "short_name": fact.get("caller_short") or _short_symbol_name(caller),
+                    "module": fact.get("caller_module") or "",
+                    "node": _compact_node(by_module.get(str(fact.get("caller_module") or ""))) if by_module.get(str(fact.get("caller_module") or "")) else {},
+                    "fan_in": 0,
+                    "fan_out": 0,
+                })
+                item["fan_out"] += 1
+            if callee:
+                item = stats.setdefault(callee, {
+                    "function": callee,
+                    "short_name": fact.get("callee_short") or _short_symbol_name(callee),
+                    "module": fact.get("callee_module") or "",
+                    "node": _compact_node(by_module.get(str(fact.get("callee_module") or ""))) if by_module.get(str(fact.get("callee_module") or "")) else {},
+                    "fan_in": 0,
+                    "fan_out": 0,
+                })
+                item["fan_in"] += 1
+    items = []
+    for item in stats.values():
+        item["total"] = int(item.get("fan_in") or 0) + int(item.get("fan_out") or 0)
+        items.append(item)
+    items.sort(key=lambda item: (-int(item.get(metric) or 0), str(item.get("function") or "")))
+    return {"ok": True, "metric": metric, "functions": items[:limit], "count": len(items[:limit]), "total_ranked": len(items)}
+
+
 def _query_search_semantic(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:
     query = str(args.get("query") or args.get("q") or "").strip()
     if not query:
@@ -1273,6 +1415,12 @@ def run_tool(
         return _query_high_degree_nodes(conn, project_id, snapshot_id, args)
     if tool == "function_index":
         return _query_function_index(conn, project_id, snapshot_id, args)
+    if tool == "function_callees":
+        return _query_function_calls(conn, project_id, snapshot_id, args, direction="callees")
+    if tool == "function_callers":
+        return _query_function_calls(conn, project_id, snapshot_id, args, direction="callers")
+    if tool == "high_function_degree":
+        return _query_high_function_degree(conn, project_id, snapshot_id, args)
     if tool == "search_semantic":
         return _query_search_semantic(conn, project_id, snapshot_id, args)
     if tool == "search_docs":

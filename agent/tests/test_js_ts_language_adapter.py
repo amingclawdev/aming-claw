@@ -75,6 +75,12 @@ function scopedPaths() {
     assert any(row["name"] == "submit" and row["kind"] == "function" for row in symbols)
     assert any(row["name"] == "api.health" and row["kind"] == "function" for row in symbols)
     assert any(row["name"] == "api.nodes" and row["kind"] == "function" for row in symbols)
+    render = next(row for row in symbols if row["name"] == "renderDashboard")
+    submit = next(row for row in symbols if row["name"] == "submit")
+    health = next(row for row in symbols if row["name"] == "api.health")
+    assert "fetch" in render["calls"]
+    assert "axios.post" in submit["calls"]
+    assert "getJSON" in health["calls"]
 
     relations = adapter.extract_relations("web/src/App.tsx", source)
     triples = {(row["relation_type"], row["target"], row["target_kind"]) for row in relations}

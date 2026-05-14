@@ -372,6 +372,11 @@ def _function_meta_from_adapter_symbols(
             for item in (symbol.get("decorators") if isinstance(symbol.get("decorators"), list) else [])
             if str(item)
         ]
+        calls = [
+            str(item)
+            for item in (symbol.get("calls") if isinstance(symbol.get("calls"), list) else [])
+            if str(item)
+        ]
         functions.append(FunctionMeta(
             module=module_name,
             name=name,
@@ -379,7 +384,7 @@ def _function_meta_from_adapter_symbols(
             lineno=lineno,
             end_lineno=end_lineno,
             decorators=decorators,
-            calls=[],
+            calls=calls,
             is_entry=name in {"main", "App", "handler"},
         ))
     return functions
@@ -1766,6 +1771,109 @@ def build_module_dependency_edges(
     return out
 
 
+def _function_short_name(qname: str) -> str:
+    return str(qname or "").rsplit("::", 1)[-1]
+
+
+def _function_line_range(func: FunctionMeta | None) -> List[int]:
+    if not func:
+        return [0, 0]
+    start = int(func.lineno or 0)
+    end = int(func.end_lineno or start or 0)
+    return [start, end]
+
+
+def build_function_call_facts(
+    modules: Dict[str, ModuleInfo],
+    call_graph: CallGraph,
+) -> Dict[str, Dict[str, Any]]:
+    """Build per-module function call facts for graph metadata/query tools.
+
+    Module-level `depends_on` remains the structural graph edge. These facts are
+    an additive detail layer for AI inspection, function jump, and local impact
+    reasoning.
+    """
+    facts: Dict[str, Dict[str, Any]] = {
+        module_name: {"calls": [], "called_by": [], "weak_calls": []}
+        for module_name in modules
+    }
+    module_paths = {module_name: module.path for module_name, module in modules.items()}
+
+    def append_unique(bucket: List[Dict[str, Any]], item: Dict[str, Any]) -> None:
+        key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if all(json.dumps(existing, sort_keys=True, ensure_ascii=False) != key for existing in bucket):
+            bucket.append(item)
+
+    for caller, targets in sorted((call_graph.edges or {}).items()):
+        caller_func = call_graph.all_functions.get(caller)
+        caller_module = _module_from_qname(caller)
+        if caller_module not in facts:
+            continue
+        for target in sorted(set(targets or [])):
+            target_func = call_graph.all_functions.get(target)
+            target_module = _module_from_qname(target)
+            if target_module not in facts:
+                continue
+            item = {
+                "caller": caller,
+                "caller_short": _function_short_name(caller),
+                "caller_module": caller_module,
+                "caller_file": module_paths.get(caller_module, ""),
+                "caller_line": _function_line_range(caller_func),
+                "callee": target,
+                "callee_short": _function_short_name(target),
+                "callee_module": target_module,
+                "callee_file": module_paths.get(target_module, ""),
+                "callee_line": _function_line_range(target_func),
+                "confidence": "strong",
+                "resolution": "resolved",
+            }
+            append_unique(facts[caller_module]["calls"], item)
+            append_unique(facts[target_module]["called_by"], item)
+
+    for weak in sorted(call_graph.weak_edges or [], key=lambda item: (item.caller, item.target)):
+        caller_module = _module_from_qname(weak.caller)
+        if caller_module not in facts:
+            continue
+        caller_func = call_graph.all_functions.get(weak.caller)
+        append_unique(facts[caller_module]["weak_calls"], {
+            "caller": weak.caller,
+            "caller_short": _function_short_name(weak.caller),
+            "caller_module": caller_module,
+            "caller_file": module_paths.get(caller_module, ""),
+            "caller_line": _function_line_range(caller_func),
+            "raw_target": weak.target,
+            "candidates": list(weak.candidates or []),
+            "confidence": "weak",
+            "resolution": "ambiguous",
+            "reason": weak.reason,
+        })
+
+    for bucket in facts.values():
+        bucket["calls"].sort(key=lambda item: (item.get("caller", ""), item.get("callee", "")))
+        bucket["called_by"].sort(key=lambda item: (item.get("callee", ""), item.get("caller", "")))
+        bucket["weak_calls"].sort(key=lambda item: (item.get("caller", ""), item.get("raw_target", "")))
+    return facts
+
+
+def enrich_nodes_with_function_call_facts(
+    nodes: List[Dict[str, Any]],
+    function_call_facts: Dict[str, Dict[str, Any]],
+) -> None:
+    for node in nodes:
+        module_name = str(node.get("module") or node.get("node_id") or "")
+        facts = function_call_facts.get(module_name) or {}
+        calls = list(facts.get("calls") or [])
+        called_by = list(facts.get("called_by") or [])
+        weak_calls = list(facts.get("weak_calls") or [])
+        node["function_calls"] = calls
+        node["function_called_by"] = called_by
+        node["function_weak_calls"] = weak_calls
+        node["function_call_count"] = len(calls)
+        node["function_called_by_count"] = len(called_by)
+        node["function_weak_call_count"] = len(weak_calls)
+
+
 def _score_architecture_signals(module_name: str, rels: List[Dict[str, Any]]) -> Dict[str, Any]:
     tokens = _module_name_tokens(module_name)
     rel_types = {str(rel.get("relation_type") or "") for rel in rels}
@@ -2722,6 +2830,12 @@ def build_rebase_candidate_graph(
                 "function_count": node.get("function_count", 0),
                 "functions": node.get("functions") or [],
                 "function_lines": node.get("function_lines") or {},
+                "function_calls": node.get("function_calls") or [],
+                "function_called_by": node.get("function_called_by") or [],
+                "function_weak_calls": node.get("function_weak_calls") or [],
+                "function_call_count": node.get("function_call_count", 0),
+                "function_called_by_count": node.get("function_called_by_count", 0),
+                "function_weak_call_count": node.get("function_weak_call_count", 0),
                 "config_files": sorted({p for p in config_files if p}),
                 "architecture_signals": node.get("architecture_signals") or {},
                 "typed_relations": node.get("typed_relations") or [],
@@ -3876,6 +3990,8 @@ def build_graph_v2_from_symbols(
         TypedRelation(**rel) if isinstance(rel, dict) else rel
         for rel in typed_relations
     ])]
+    function_call_facts = build_function_call_facts(modules, call_graph)
+    enrich_nodes_with_function_call_facts(nodes, function_call_facts)
     enrich_nodes_with_architecture_signals(nodes, typed_relations)
     architecture_graph = build_architecture_graph(nodes, typed_relations)
     module_dependency_edges = build_module_dependency_edges(modules, call_graph)
@@ -3905,6 +4021,7 @@ def build_graph_v2_from_symbols(
             "nodes": nodes,
             "feature_clusters": feature_clusters,
             "typed_relations": typed_relations,
+            "function_call_facts": function_call_facts,
             "architecture_graph": architecture_graph,
             "module_dependency_edges": module_dependency_edges,
             "file_inventory": file_inventory,
@@ -3940,6 +4057,7 @@ def build_graph_v2_from_symbols(
             "nodes": nodes,
             "feature_clusters": feature_clusters,
             "typed_relations": typed_relations,
+            "function_call_facts": function_call_facts,
             "architecture_graph": architecture_graph,
             "module_dependency_edges": module_dependency_edges,
             "file_inventory": file_inventory,

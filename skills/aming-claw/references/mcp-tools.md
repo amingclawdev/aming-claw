@@ -97,6 +97,7 @@ backlog of record (and `docs/dev/` is gitignored, so they're not committed).
   - `find_node_by_path`: resolve a path to owning nodes.
   - `search_structure`: search node id/title/kind/files/metadata/functions.
   - `function_index`: search `metadata.functions` and `metadata.function_lines`.
+  - `function_callers`, `function_callees`, `high_function_degree`: inspect persisted function-level call facts when the active graph was built with function call metadata.
   - `degree_summary`: exact fan-in/fan-out and edge-type breakdown for a node.
   - `high_degree_nodes`: rank high fan-in/fan-out candidates.
   - `get_neighbors`: structural neighbors; pass `include_edge_semantic=true` for semantic edge projection payloads.

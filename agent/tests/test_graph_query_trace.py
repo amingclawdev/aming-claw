@@ -67,6 +67,24 @@ def _seed_snapshot(conn, tmp_path):
                             "serve": [1, 2],
                             "Server.start": [10, 12],
                         },
+                        "function_calls": [
+                            {
+                                "caller": "agent.governance.server::serve",
+                                "caller_short": "serve",
+                                "caller_module": "agent.governance.server",
+                                "caller_file": "agent/governance/server.py",
+                                "caller_line": [1, 2],
+                                "callee": "agent.governance.helper::helper",
+                                "callee_short": "helper",
+                                "callee_module": "agent.governance.helper",
+                                "callee_file": "agent/governance/helper.py",
+                                "callee_line": [1, 2],
+                                "confidence": "strong",
+                                "resolution": "resolved",
+                            }
+                        ],
+                        "function_call_count": 1,
+                        "function_called_by_count": 0,
                         "config_files": [".aming-claw.yaml"],
                     },
                 },
@@ -79,6 +97,27 @@ def _seed_snapshot(conn, tmp_path):
                     "metadata": {
                         "hierarchy_parent": "L3.1",
                         "function_count": 55,
+                        "module": "agent.governance.helper",
+                        "functions": ["agent.governance.helper::helper"],
+                        "function_lines": {"helper": [1, 2]},
+                        "function_called_by": [
+                            {
+                                "caller": "agent.governance.server::serve",
+                                "caller_short": "serve",
+                                "caller_module": "agent.governance.server",
+                                "caller_file": "agent/governance/server.py",
+                                "caller_line": [1, 2],
+                                "callee": "agent.governance.helper::helper",
+                                "callee_short": "helper",
+                                "callee_module": "agent.governance.helper",
+                                "callee_file": "agent/governance/helper.py",
+                                "callee_line": [1, 2],
+                                "confidence": "strong",
+                                "resolution": "resolved",
+                            }
+                        ],
+                        "function_call_count": 0,
+                        "function_called_by_count": 1,
                     },
                 },
             ],
@@ -264,6 +303,47 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
     )
     assert functions["result"]["matches"][0]["short_name"] == "serve"
     assert functions["result"]["matches"][0]["line_start"] == 1
+
+    callees = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="function_callees",
+        args={"query": "serve"},
+        project_root=project_root,
+    )
+    assert callees["result"]["matches"][0]["callee_short"] == "helper"
+    assert callees["result"]["matches"][0]["callee_node"]["node_id"] == "L7.2"
+
+    callers = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="function_callers",
+        args={"query": "helper"},
+        project_root=project_root,
+    )
+    assert callers["result"]["matches"][0]["caller_short"] == "serve"
+
+    high_fn = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="high_function_degree",
+        args={"metric": "fan_out"},
+        project_root=project_root,
+    )
+    assert high_fn["result"]["functions"][0]["short_name"] == "serve"
+    assert high_fn["result"]["functions"][0]["fan_out"] == 1
 
     degree = graph_query_trace.traced_query(
         conn,
