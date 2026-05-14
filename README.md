@@ -23,6 +23,38 @@ If you are starting from a plugin host, give it the repository URL:
 Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
 ```
 
+For Codex, this copy-paste prompt is the lowest-friction path when the
+`aming-claw` command is not installed or is not on `PATH` yet:
+
+```text
+Please install Aming Claw from GitHub:
+https://github.com/amingclawdev/aming-claw
+
+If `aming-claw` is not available on PATH, run this Windows PowerShell bootstrap:
+$dst="$env:TEMP\install_aming_claw.py"
+Invoke-WebRequest https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py -OutFile $dst
+python $dst https://github.com/amingclawdev/aming-claw --start
+
+After install, open http://localhost:40000/dashboard, load the Aming Claw
+skill/MCP, then check runtime_status, graph_status, and backlog before changing
+code.
+```
+
+On macOS/Linux, the same raw installer can be run with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py \
+  -o /tmp/install_aming_claw.py
+python3 /tmp/install_aming_claw.py https://github.com/amingclawdev/aming-claw --start
+```
+
+If an older Aming Claw runtime is already installed, update the plugin checkout
+directly:
+
+```bash
+aming-claw plugin install https://github.com/amingclawdev/aming-claw --start
+```
+
 If the host cannot install Git plugins directly yet, clone once and use the
 repo-local package:
 
