@@ -11,6 +11,39 @@ Prefer MCP tools over raw SQLite or hand-rolled HTTP calls when the tool exists.
 
 Use these at session start, after commits, and before closing a backlog row.
 
+## AI Config And Local Runtime
+
+Use the project AI config endpoint before queueing AI Enrich or claiming that
+chain/executor work is ready:
+
+- HTTP fallback: `GET /api/projects/{project_id}/ai-config`.
+- Check `tool_health.openai` and `tool_health.anthropic` for local CLI probe
+  status, path, runtime, command, and version.
+- Check `project_config.ai.routing` for project-specific role/provider/model
+  routes. The `semantic` route must have both provider and model before live AI
+  semantic enrichment should run.
+- Check `semantic.use_ai_default` for the semantic worker default and
+  `model_catalog` for valid provider/model choices.
+
+Provider mapping:
+
+- `openai` -> Codex CLI, command `codex`, optional override `CODEX_BIN`.
+- `anthropic` -> Claude Code CLI, command `claude`, optional override
+  `CLAUDE_BIN`.
+
+Status wording must separate command detection from real AI availability:
+
+- `detected`: local command exists and version probe worked.
+- `auth unknown`: version probe does not prove login or model-call success.
+- `missing`: command or configured path is absent.
+- `routing missing`: project semantic provider/model is unset; block AI Enrich
+  and ask the user to configure AI config.
+- `executor degraded`: ServiceManager/executor is unavailable, so automatic
+  chain/executor work is not ready even if CLIs are detected.
+
+Do not run a real Codex or Claude model call as a readiness check unless the
+user explicitly asks; it may spend quota or trigger interactive login.
+
 ## Backlog
 
 - `backlog_list`: find open rows by status/priority.

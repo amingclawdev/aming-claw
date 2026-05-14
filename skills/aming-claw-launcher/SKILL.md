@@ -44,7 +44,35 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
    - `graph_status` — active graph snapshot + stale check + semantic drift summary.
    - `health` — bare governance ping.
 
-4. Open the dashboard:
+4. Check local AI runtime readiness for the selected project before promising
+   AI Enrich or chain/executor work:
+
+   - HTTP fallback: `GET /api/projects/{project_id}/ai-config`.
+   - Inspect `tool_health.openai`, `tool_health.anthropic`,
+     `project_config.ai.routing`, `semantic.use_ai_default`, and
+     `model_catalog`.
+   - `openai` maps to the local Codex CLI command `codex`; `CODEX_BIN` may
+     override the path.
+   - `anthropic` maps to the local Claude Code CLI command `claude`;
+     `CLAUDE_BIN` may override the path.
+   - A detected CLI only means the command and version probe worked. Treat
+     authentication as unknown unless the user explicitly asks for a real check.
+   - If the semantic provider/model is unset, report that AI Enrich is blocked
+     until AI config is saved for the project.
+   - If ServiceManager or executor is unavailable, report chain/executor as
+     degraded even when local AI CLIs are detected.
+
+   Suggested status copy:
+
+   ```text
+   Codex CLI: detected at <path>, version <version>, auth unknown.
+   Claude CLI: detected at <path>, version <version>, auth unknown.
+   Semantic route: <provider/model or unset>.
+   AI Enrich: ready / blocked because <reason>.
+   Chain executor: ready / degraded because <reason>.
+   ```
+
+5. Open the dashboard:
 
    ```text
    aming-claw open
@@ -52,7 +80,7 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
 
    Default URL: `http://localhost:40000/dashboard`. The dashboard is served by governance from `frontend/dashboard/dist` and is the shared cockpit for user + AI + governance.
 
-5. Plugin aftercare:
+6. Plugin aftercare:
 
    `aming-claw start` only starts the governance service. It does not prove that
    the current Codex thread loaded the plugin. After installing or updating the

@@ -63,10 +63,55 @@ is stale, then close the backlog row with commit and verification evidence.
 2. Check runtime health with MCP/HTTP: `health`, `version_check`, and `runtime_status` when available.
 3. Check graph state: `graph_status` and `graph_operations_queue`.
 4. If governance is offline or this is a fresh install, read `aming-claw://seed-graph-summary` for packaged MVP structure before asking the user to start services.
-5. Call `graph_query` with `tool=query_schema` to discover the live query contract.
-6. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
-7. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
-8. Inspect files only after graph discovery identifies likely owners and reusable modules.
+5. For AI or semantic work, check local AI runtime readiness through the project AI config before queueing jobs.
+6. Call `graph_query` with `tool=query_schema` to discover the live query contract.
+7. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
+8. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
+9. Inspect files only after graph discovery identifies likely owners and reusable modules.
+
+## Local AI Runtime Readiness
+
+Before claiming AI Enrich, semantic review, or chain/executor readiness, inspect
+the selected project's AI config:
+
+- HTTP fallback: `GET /api/projects/{project_id}/ai-config`.
+- Read `tool_health.openai`, `tool_health.anthropic`,
+  `project_config.ai.routing`, `semantic.use_ai_default`, and `model_catalog`.
+- `openai` uses the local Codex CLI command `codex`; `CODEX_BIN` may override
+  the executable path.
+- `anthropic` uses the local Claude Code CLI command `claude`; `CLAUDE_BIN`
+  may override the executable path.
+
+Report these states separately:
+
+- `CLI detected`: the command exists and a version probe succeeded.
+- `auth unknown`: version probing does not prove login or real model execution.
+- `missing`: the CLI is absent or the configured path is wrong.
+- `routing missing`: the project has no semantic provider/model; AI Enrich must
+  be blocked and the user should configure AI config first.
+- `ServiceManager/executor unavailable`: automatic chain/executor work is
+  degraded even when the local CLIs are present.
+
+Use a compact status shape when helping the user:
+
+```text
+Codex CLI: detected at <path>, version <version>, auth unknown.
+Claude CLI: detected at <path>, version <version>, auth unknown.
+Semantic route: <provider/model or unset>.
+AI Enrich: ready / blocked because <reason>.
+Chain executor: ready / degraded because <reason>.
+```
+
+Do not treat `codex --version` or `claude --version` as proof that a real AI
+task can run. Real model calls or login checks must be explicit user-approved
+actions so the session does not spend quota or trigger an interactive login by
+surprise.
+
+Dashboard behavior is the contract: if the semantic provider/model is missing,
+surface "AI enrich blocked: configure this project's semantic provider/model in
+AI config first." For MVP project registration flows, AI config writes should
+go through the Aming Claw project registry instead of defaulting to a target
+project root file.
 
 ## Fresh Session Launcher
 
