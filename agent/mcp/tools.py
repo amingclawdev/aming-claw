@@ -433,6 +433,51 @@ TOOLS: list[dict] = [
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
+def _runtime_status_classification(
+    governance: dict[str, Any],
+    manager: dict[str, Any],
+    version: dict[str, Any],
+) -> dict[str, Any]:
+    gov_ok = str(governance.get("status") or "").lower() == "ok" or bool(governance.get("ok"))
+    manager_ok = bool(manager.get("ok"))
+    version_ok = bool(version.get("ok"))
+    runtime_match = bool(version.get("runtime_match"))
+    dirty = bool(version.get("dirty"))
+    strict_ok = bool(gov_ok and manager_ok and version_ok and runtime_match and not dirty)
+
+    if not gov_ok:
+        severity = "blocking"
+        summary = "Governance API is unavailable; graph, backlog, and dashboard actions are blocked."
+    elif not manager_ok:
+        severity = "degraded"
+        summary = "Governance is usable, but ServiceManager is offline so executor actions are unavailable."
+    elif dirty:
+        severity = "warning"
+        summary = "Governance is usable, but the worktree has uncommitted files."
+    elif not version_ok or not runtime_match:
+        severity = "degraded"
+        summary = "Governance graph/backlog queries are usable, but runtime versions are out of sync."
+    else:
+        severity = "ok"
+        summary = "Governance runtime is healthy."
+
+    usable = severity != "blocking"
+    return {
+        "ok": usable,
+        "strict_ok": strict_ok,
+        "severity": severity,
+        "usable": usable,
+        "summary": summary,
+        "capabilities": {
+            "dashboard": gov_ok,
+            "graph_queries": gov_ok,
+            "backlog": gov_ok,
+            "service_manager": manager_ok,
+            "executor": bool(manager_ok and runtime_match and not dirty),
+        },
+    }
+
+
 class ToolDispatcher:
     """Routes MCP tool calls to governance API or in-process worker pool."""
 
@@ -680,13 +725,9 @@ class ToolDispatcher:
             governance = self._api("GET", "/api/health")
             manager = self._manager_api("GET", "/api/manager/health")
             version = self._api("GET", f"/api/version-check/{pid}")
+            classification = _runtime_status_classification(governance, manager, version)
             status = {
-                "ok": bool(
-                    governance.get("status") == "ok"
-                    and manager.get("ok")
-                    and version.get("ok")
-                    and version.get("runtime_match")
-                ),
+                **classification,
                 "project_id": pid,
                 "governance": governance,
                 "manager": manager,
@@ -699,7 +740,7 @@ class ToolDispatcher:
                 status["recommended_actions"].append("manager_start")
             if version.get("dirty"):
                 status["recommended_actions"].append("commit_or_stash_dirty_files")
-            if version.get("ok") and not version.get("runtime_match"):
+            if not version.get("runtime_match"):
                 status["recommended_actions"].append("governance_redeploy_or_restart_sm")
             return status
 

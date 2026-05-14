@@ -37,6 +37,25 @@ class _RuntimeGovRecorder(_Recorder):
         return {"ok": True, "method": method, "path": path, "data": data}
 
 
+class _RuntimeMismatchGovRecorder(_Recorder):
+    def api(self, method: str, path: str, data: dict | None = None) -> dict:
+        self.calls.append((method, path, data))
+        if path == "/api/health":
+            return {"status": "ok", "version": "new1234"}
+        if path == "/api/version-check/aming-claw":
+            return {
+                "ok": False,
+                "head": "new1234",
+                "chain_version": "old1234",
+                "dirty": False,
+                "runtime_match": False,
+                "gov_runtime_version": "new1234",
+                "sm_runtime_version": "old1234",
+                "message": "HEAD (new1234) != CHAIN_VERSION (old1234)",
+            }
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+
 def _dispatcher(recorder: _Recorder, manager: _Recorder | None = None) -> ToolDispatcher:
     return ToolDispatcher(
         api_fn=recorder.api,
@@ -220,6 +239,10 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     status = dispatcher.dispatch("runtime_status", {"project_id": "aming-claw"})
 
     assert status["ok"] is True
+    assert status["strict_ok"] is True
+    assert status["severity"] == "ok"
+    assert status["usable"] is True
+    assert status["capabilities"]["graph_queries"] is True
     assert status["governance"]["status"] == "ok"
     assert status["manager"]["ok"] is True
     assert status["version_check"]["runtime_match"] is True
@@ -228,6 +251,24 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
         ("GET", "/api/version-check/aming-claw", None),
     ]
     assert manager.calls == [("GET", "/api/manager/health", None)]
+
+
+def test_mcp_runtime_status_runtime_mismatch_is_degraded_but_usable():
+    governance = _RuntimeMismatchGovRecorder()
+    manager = _Recorder()
+    dispatcher = _dispatcher(governance, manager)
+
+    status = dispatcher.dispatch("runtime_status", {"project_id": "aming-claw"})
+
+    assert status["ok"] is True
+    assert status["strict_ok"] is False
+    assert status["severity"] == "degraded"
+    assert status["usable"] is True
+    assert status["capabilities"]["graph_queries"] is True
+    assert status["capabilities"]["backlog"] is True
+    assert status["capabilities"]["executor"] is False
+    assert "Governance graph/backlog queries are usable" in status["summary"]
+    assert "governance_redeploy_or_restart_sm" in status["recommended_actions"]
 
 
 def test_mcp_manager_start_refuses_takeover_from_mcp():
