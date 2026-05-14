@@ -1236,8 +1236,6 @@ function FunctionsSection({
   const functionCalls = node.metadata?.function_calls ?? [];
   const functionCalledBy = node.metadata?.function_called_by ?? [];
   const weakCalls = node.metadata?.function_weak_calls ?? [];
-  const callPreview = functionCalls.slice(0, 8);
-  const callerPreview = functionCalledBy.slice(0, 8);
 
   return (
     <section className="inspector-section">
@@ -1267,19 +1265,77 @@ function FunctionsSection({
           </li>
         ))}
       </ul>
-      {functionCalls.length > 0 || functionCalledBy.length > 0 || weakCalls.length > 0 ? (
-        <div style={{ marginTop: 12 }}>
-          <div className="inspector-section-title" style={{ fontSize: 9, marginBottom: 6 }}>
-            Function call graph{" "}
-            <span className="head-hint">
-              out {functionCalls.length} · in {functionCalledBy.length}
-              {weakCalls.length > 0 ? ` · weak ${weakCalls.length}` : ""}
-            </span>
+      <FunctionCallGraphBlock
+        node={node}
+        functionCalls={functionCalls}
+        functionCalledBy={functionCalledBy}
+        weakCalls={weakCalls}
+      />
+    </section>
+  );
+}
+
+function hasFunctionCallIndex(node: NodeRecord): boolean {
+  const metadata = node.metadata;
+  if (!metadata) return false;
+  return (
+    Array.isArray(metadata.function_calls) ||
+    Array.isArray(metadata.function_called_by) ||
+    Array.isArray(metadata.function_weak_calls) ||
+    typeof metadata.function_call_count === "number" ||
+    typeof metadata.function_called_by_count === "number" ||
+    typeof metadata.function_weak_call_count === "number"
+  );
+}
+
+function shouldShowFunctionCallGraph(node: NodeRecord): boolean {
+  return (node.metadata?.functions?.length ?? 0) > 0 || hasFunctionCallIndex(node);
+}
+
+function FunctionCallGraphBlock({
+  node,
+  functionCalls = node.metadata?.function_calls ?? [],
+  functionCalledBy = node.metadata?.function_called_by ?? [],
+  weakCalls = node.metadata?.function_weak_calls ?? [],
+}: {
+  node: NodeRecord;
+  functionCalls?: NonNullable<NonNullable<NodeRecord["metadata"]>["function_calls"]>;
+  functionCalledBy?: NonNullable<NonNullable<NodeRecord["metadata"]>["function_called_by"]>;
+  weakCalls?: NonNullable<NonNullable<NodeRecord["metadata"]>["function_weak_calls"]>;
+}) {
+  const hasIndex = hasFunctionCallIndex(node);
+  const callPreview = functionCalls.slice(0, 8);
+  const callerPreview = functionCalledBy.slice(0, 8);
+  const weakPreview = weakCalls.slice(0, 4);
+  const hasFacts = functionCalls.length > 0 || functionCalledBy.length > 0 || weakCalls.length > 0;
+  if (!shouldShowFunctionCallGraph(node)) return null;
+  return (
+    <div className="function-call-block">
+      <div className="inspector-section-title function-call-title">
+        Function call graph{" "}
+        <span className="head-hint">
+          out {functionCalls.length} · in {functionCalledBy.length}
+          {weakCalls.length > 0 ? ` · weak ${weakCalls.length}` : ""}
+        </span>
+      </div>
+      {!hasIndex ? (
+        <div className="empty empty-compact">
+          Function calls are not indexed in this snapshot.
+          <div className="empty-hint">
+            Rebuild or Update graph with the current Aming Claw version to populate{" "}
+            <span className="mono">metadata.function_calls</span>.
           </div>
+        </div>
+      ) : !hasFacts ? (
+        <div className="empty empty-compact">
+          No function call relations captured for this node.
+        </div>
+      ) : (
+        <>
           {callPreview.length > 0 ? (
-            <ul className="link-list" style={{ marginBottom: 8 }}>
+            <ul className="link-list function-call-list">
               {callPreview.map((fact, index) => (
-                <li key={`${fact.caller}-${fact.callee}-${index}`}>
+                <li key={`callee-${fact.caller}-${fact.callee}-${index}`}>
                   <span className="link-row link-row-static">
                     <span className="edge-arrow">→</span>
                     <span className="link-name mono">{fact.caller_short || shortSymbol(fact.caller || "")}</span>
@@ -1290,9 +1346,9 @@ function FunctionsSection({
             </ul>
           ) : null}
           {callerPreview.length > 0 ? (
-            <ul className="link-list">
+            <ul className="link-list function-call-list">
               {callerPreview.map((fact, index) => (
-                <li key={`${fact.callee}-${fact.caller}-${index}`}>
+                <li key={`caller-${fact.callee}-${fact.caller}-${index}`}>
                   <span className="link-row link-row-static">
                     <span className="edge-arrow">←</span>
                     <span className="link-name mono">{fact.callee_short || shortSymbol(fact.callee || "")}</span>
@@ -1302,9 +1358,22 @@ function FunctionsSection({
               ))}
             </ul>
           ) : null}
-        </div>
-      ) : null}
-    </section>
+          {weakPreview.length > 0 ? (
+            <ul className="link-list function-call-list">
+              {weakPreview.map((fact, index) => (
+                <li key={`weak-${fact.caller}-${fact.raw_target}-${index}`}>
+                  <span className="link-row link-row-static">
+                    <span className="edge-arrow">?</span>
+                    <span className="link-name mono">{fact.caller_short || shortSymbol(fact.caller || "")}</span>
+                    <span className="link-meta mono">{fact.raw_target || "unresolved"}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -1509,9 +1578,6 @@ function RelationsTab({
       if (peer) out.push({ peer, type: t, direction: "in" });
     }
   });
-  if (out.length === 0) {
-    return <div className="empty">No typed relations attached.</div>;
-  }
   // Group by type
   const byType = new Map<string, typeof out>();
   out.forEach((row) => {
@@ -1522,6 +1588,7 @@ function RelationsTab({
   const groups = Array.from(byType.entries()).sort();
   return (
     <>
+      {out.length === 0 ? <div className="empty">No typed relations attached.</div> : null}
       {groups.map(([type, rows]) => (
         <section key={type} className="inspector-section">
           <div className="inspector-section-title">
@@ -1546,6 +1613,11 @@ function RelationsTab({
           </ul>
         </section>
       ))}
+      {shouldShowFunctionCallGraph(node) ? (
+        <section className="inspector-section">
+          <FunctionCallGraphBlock node={node} />
+        </section>
+      ) : null}
     </>
   );
 }

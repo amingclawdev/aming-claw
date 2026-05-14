@@ -1573,6 +1573,24 @@ a:hover { text-decoration: underline; }
   gap: 8px;
   min-width: 160px;
 }
+
+.function-call-block {
+  margin-top: 12px;
+  min-width: 0;
+}
+
+.function-call-title {
+  font-size: 9px;
+  margin-bottom: 6px;
+}
+
+.function-call-list {
+  margin-bottom: 8px;
+}
+
+.function-call-list:last-child {
+  margin-bottom: 0;
+}
 .progress-bar {
   flex: 1;
   min-width: 70px;
