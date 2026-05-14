@@ -713,19 +713,9 @@ def update_project_ai_routing(
         else:
             raw = _try_load_yaml(config_file)
     else:
-        detected = generate_default_config(str(workspace_path), project_id or workspace_path.name)
-        raw = {
-            "project_id": project_id or detected.project_id,
-            "language": detected.language,
-            "testing": {
-                "unit_command": detected.testing.unit_command,
-            },
-            "governance": {
-                "enabled": detected.governance.enabled,
-                "test_tool_label": detected.governance.test_tool_label,
-            },
-        }
-        config_file = workspace_path / ".aming-claw.yaml"
+        raise FileNotFoundError(
+            f"No .aming-claw.yaml or .aming-claw.json found at {workspace_path}"
+        )
     if not isinstance(raw, dict):
         raw = {}
 

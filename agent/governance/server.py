@@ -22,7 +22,7 @@ _agent_dir = str(Path(__file__).resolve().parents[1])
 if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
-from .errors import GovernanceError
+from .errors import GovernanceError, ValidationError
 from .dirty_worktree import filter_dirty_files
 import logging
 import sqlite3
@@ -1162,6 +1162,15 @@ def handle_project_register(ctx: RequestContext):
             return 500, {"error": f"registration failed: {e}"}
 
     # workspace_registry removed — workspace info stored in governance projects.json
+    try:
+        project_service.set_project_config_metadata(
+            project_id,
+            project_service.project_config_to_metadata(config),
+            source="workspace_config",
+            actor="register",
+        )
+    except Exception:
+        pass
 
     return 201, {
         "project_id": project_id,
@@ -1175,6 +1184,104 @@ def handle_project_register(ctx: RequestContext):
     }
 
 
+def _project_workspace_for_config(project_id: str) -> Path:
+    """Resolve a registered project workspace for dashboard config APIs."""
+    try:
+        return _graph_governance_project_root(project_id, {})
+    except Exception:
+        pass
+    for project in project_service.list_projects():
+        if project.get("project_id") == project_id and project.get("workspace_path"):
+            return Path(str(project["workspace_path"])).resolve()
+    if project_id == "aming-claw":
+        return Path(__file__).resolve().parents[2]
+    if Path("/workspace").exists():
+        return Path("/workspace")
+    raise ValidationError(f"no workspace registered for {project_id}")
+
+
+def _normalize_project_config_payload(
+    project_id: str,
+    payload: dict,
+    *,
+    source: str,
+    write_target: str = "aming-claw project registry",
+    local_config_error: str = "",
+) -> dict:
+    out = dict(payload or {})
+    out["project_id"] = str(out.get("project_id") or project_id)
+    out.setdefault("language", "python")
+    out.setdefault("testing", {})
+    out.setdefault("build", {})
+    out.setdefault("deploy", {})
+    out.setdefault("governance", {})
+    out.setdefault("graph", {})
+    out.setdefault("ai", {})
+    if not isinstance(out["ai"], dict):
+        out["ai"] = {}
+    out["ai"].setdefault("routing", {})
+    out["config_source"] = source
+    out["write_target"] = write_target
+    if local_config_error:
+        out["local_config_error"] = local_config_error
+    return out
+
+
+def _registry_project_config(project_id: str) -> tuple[dict, str]:
+    entry = project_service.get_project(project_id) or {}
+    payload = project_service.get_project_config_metadata(project_id)
+    source = str(entry.get("project_config_source") or "aming_claw_registry")
+    return payload, source
+
+
+def _resolved_project_config_payload(
+    project_id: str,
+    root: Path,
+    *,
+    allow_generated: bool = True,
+) -> dict:
+    """Resolve project config without writing into the governed workspace."""
+    local_error = ""
+    try:
+        from project_config import load_project_config
+
+        config = load_project_config(root)
+        payload = project_service.project_config_to_metadata(config)
+        source = "workspace_config"
+    except Exception as exc:
+        local_error = str(exc)
+        payload, source = _registry_project_config(project_id)
+        if not payload:
+            if not allow_generated:
+                raise
+            from project_config import generate_default_config
+
+            config = generate_default_config(str(root), project_id)
+            payload = project_service.project_config_to_metadata(config)
+            payload["project_id"] = project_id
+            source = "generated_default"
+
+    registry_payload, registry_source = _registry_project_config(project_id)
+    registry_routing = (
+        registry_payload.get("ai", {}).get("routing", {})
+        if isinstance(registry_payload.get("ai"), dict)
+        else {}
+    )
+    if registry_routing:
+        ai_payload = payload.get("ai") if isinstance(payload.get("ai"), dict) else {}
+        ai_payload["routing"] = dict(registry_routing)
+        payload["ai"] = ai_payload
+        source = registry_source or "aming_claw_registry"
+
+    return _normalize_project_config_payload(
+        project_id,
+        payload,
+        source=source,
+        write_target="aming-claw project registry",
+        local_config_error=local_error if source != "workspace_config" else "",
+    )
+
+
 @route("GET", "/api/projects/{project_id}/config")
 def handle_project_config(ctx: RequestContext):
     """Return resolved project config."""
@@ -1185,49 +1292,9 @@ def handle_project_config(ctx: RequestContext):
 
     project_id = ctx.get_project_id()
     try:
-        from project_config import e2e_config_to_dict, effective_graph_exclude_roots, load_project_config
-        from pathlib import Path
-        # Try governance project workspace_path, then /workspace fallback
-        proj_data = project_service.list_projects()
-        ws_path = None
-        for p in proj_data:
-            if p.get("project_id") == project_id:
-                ws_path = p.get("workspace_path", "")
-                break
-        if ws_path:
-            config = load_project_config(Path(ws_path))
-        elif project_id == "aming-claw":
-            config = load_project_config(Path(__file__).resolve().parents[2])
-        elif Path('/workspace').exists():
-            config = load_project_config(Path('/workspace'))
-        else:
-            return 404, {'error': f'no workspace registered for {project_id}'}
-        return {
-            "project_id": config.project_id,
-            "language": config.language,
-            "testing": {
-                "unit_command": config.testing.unit_command,
-                "e2e_command": config.testing.e2e_command,
-                "e2e": e2e_config_to_dict(config.testing.e2e),
-            },
-            "build": {"command": config.build.command, "release_checks": config.build.release_checks},
-            "deploy": {"strategy": config.deploy.strategy, "service_rules_count": len(config.deploy.service_rules)},
-            "governance": {
-                "enabled": config.governance.enabled,
-                "test_tool_label": config.governance.test_tool_label,
-                "exclude_roots": list(getattr(config.governance, "exclude_roots", []) or []),
-            },
-            "graph": {
-                "exclude_paths": list(getattr(config.graph, "exclude_paths", []) or []),
-                "ignore_globs": list(getattr(config.graph, "ignore_globs", []) or []),
-                "nested_projects": {
-                    "mode": getattr(config.graph.nested_projects, "mode", "exclude"),
-                    "roots": list(getattr(config.graph.nested_projects, "roots", []) or []),
-                },
-                "effective_exclude_roots": effective_graph_exclude_roots(config),
-            },
-            "ai": {"routing": dict(getattr(config.ai, "routing", {}) or {})},
-        }
+        root = _project_workspace_for_config(project_id)
+        payload = _resolved_project_config_payload(project_id, root)
+        return payload
     except Exception as e:
         return 404, {"error": f"config not found: {e}"}
 
@@ -1237,15 +1304,14 @@ def handle_project_e2e_config(ctx: RequestContext):
     """Return the resolved E2E suite registry for a project."""
     project_id = ctx.get_project_id()
     try:
-        root = _graph_governance_project_root(project_id, {})
-        from project_config import e2e_config_to_dict, load_project_config
-
-        config = load_project_config(root)
+        root = _project_workspace_for_config(project_id)
+        config = _resolved_project_config_payload(project_id, root)
         return {
             "ok": True,
-            "project_id": config.project_id,
+            "project_id": config.get("project_id") or project_id,
             "workspace_path": str(root),
-            "e2e": e2e_config_to_dict(config.testing.e2e),
+            "e2e": ((config.get("testing") or {}).get("e2e") or {}),
+            "config_source": config.get("config_source", ""),
         }
     except Exception as exc:
         return 404, {"error": f"e2e config not found: {exc}"}
@@ -1437,18 +1503,12 @@ def handle_project_ai_config(ctx: RequestContext):
 
     project_config = {}
     project_config_error = ""
+    project_config_source = ""
+    write_target = "aming-claw project registry"
     try:
-        from project_config import e2e_config_to_dict, load_project_config
-
-        cfg = load_project_config(root)
-        project_config = {
-            "ai": {"routing": dict(getattr(cfg.ai, "routing", {}) or {})},
-            "testing": {"e2e": e2e_config_to_dict(cfg.testing.e2e)},
-            "graph": {
-                "exclude_paths": list(getattr(cfg.graph, "exclude_paths", []) or []),
-                "ignore_globs": list(getattr(cfg.graph, "ignore_globs", []) or []),
-            },
-        }
+        project_config = _resolved_project_config_payload(project_id, root)
+        project_config_source = str(project_config.get("config_source") or "")
+        write_target = str(project_config.get("write_target") or write_target)
     except Exception as exc:
         project_config_error = str(exc)
 
@@ -1456,7 +1516,9 @@ def handle_project_ai_config(ctx: RequestContext):
         "project_id": project_id,
         "workspace_path": str(root),
         "project_config": project_config,
+        "project_config_source": project_config_source,
         "project_config_error": project_config_error,
+        "write_target": write_target,
         "pipeline": pipeline,
         "pipeline_error": pipeline_error,
         "role_routing": role_routing,
@@ -1476,25 +1538,25 @@ def handle_project_ai_config(ctx: RequestContext):
 
 @route("POST", "/api/projects/{project_id}/ai-config")
 def handle_project_ai_config_update(ctx: RequestContext):
-    """Update project-level ai.routing in .aming-claw.yaml/.json."""
+    """Update project-level ai.routing in Aming-claw's central registry."""
     project_id = ctx.get_project_id()
     routing = ctx.body.get("routing")
     if not isinstance(routing, dict):
         return 400, {"error": "routing object is required"}
     try:
-        root = _graph_governance_project_root(project_id, {})
+        root = _project_workspace_for_config(project_id)
     except Exception as exc:
         return 404, {"error": f"project root not found: {exc}"}
     try:
-        from project_config import update_project_ai_routing
-
-        cfg = update_project_ai_routing(root, routing, project_id=project_id)
+        base_config = _resolved_project_config_payload(project_id, root)
+        project_service.update_project_ai_routing_metadata(
+            project_id,
+            routing,
+            base_config=base_config,
+            actor=str(ctx.body.get("actor") or "dashboard"),
+        )
     except Exception as exc:
         return 400, {"error": f"ai config update failed: {exc}"}
-    if cfg.project_id != project_id:
-        return 409, {
-            "error": f"config project_id {cfg.project_id!r} does not match route project_id {project_id!r}"
-        }
     payload = handle_project_ai_config(ctx)
     if isinstance(payload, tuple):
         return payload
@@ -1502,6 +1564,7 @@ def handle_project_ai_config_update(ctx: RequestContext):
     payload["updated"] = True
     payload["read_only"] = False
     payload["write_supported"] = True
+    payload["write_target"] = "aming-claw project registry"
     return payload
 
 

@@ -651,6 +651,9 @@ export interface E2EImpactResponse {
 export interface ProjectConfigResponse {
   project_id: string;
   language: string;
+  config_source?: string;
+  write_target?: string;
+  local_config_error?: string;
   testing?: { unit_command?: string; e2e_command?: string; e2e?: E2EConfig };
   graph?: {
     exclude_paths?: string[];
@@ -714,6 +717,8 @@ export interface AiConfigResponse {
   read_only?: boolean;
   write_supported?: boolean;
   project_config?: ProjectConfigResponse;
+  project_config_source?: string;
+  write_target?: string;
   role_routing?: Record<string, { provider?: string; model?: string; source?: string }>;
   tool_health?: Record<string, {
     provider?: string;

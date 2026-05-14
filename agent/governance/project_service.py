@@ -337,6 +337,165 @@ def update_project_metadata(project_id: str, updates: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "password_hash"}
 
 
+def _sanitize_ai_routing(routing: dict) -> dict:
+    """Normalize dashboard role routing before storing it in projects.json."""
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(routing, dict):
+        return out
+    for role, route in routing.items():
+        role_key = str(role or "").strip().lower()
+        if not role_key:
+            continue
+        if isinstance(route, dict):
+            provider = str(route.get("provider") or "").strip()
+            model = str(route.get("model") or "").strip()
+        else:
+            provider = ""
+            model = str(route or "").strip()
+        if provider or model:
+            out[role_key] = {"provider": provider, "model": model}
+    return out
+
+
+def _copy_json_dict(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        return json.loads(json.dumps(raw))
+    except (TypeError, ValueError):
+        return dict(raw)
+
+
+def project_config_to_metadata(config) -> dict:
+    """Serialize a ProjectConfig-like object for central registry storage."""
+    try:
+        from project_config import e2e_config_to_dict, effective_graph_exclude_roots
+    except Exception:
+        e2e_config_to_dict = None
+        effective_graph_exclude_roots = None
+
+    testing = getattr(config, "testing", None)
+    build = getattr(config, "build", None)
+    deploy = getattr(config, "deploy", None)
+    governance = getattr(config, "governance", None)
+    graph = getattr(config, "graph", None)
+    nested = getattr(graph, "nested_projects", None)
+    ai = getattr(config, "ai", None)
+    e2e = getattr(testing, "e2e", None)
+    e2e_payload = e2e_config_to_dict(e2e) if e2e_config_to_dict and e2e is not None else {}
+    effective_excludes = (
+        effective_graph_exclude_roots(config) if effective_graph_exclude_roots else []
+    )
+    return {
+        "project_id": str(getattr(config, "project_id", "") or "").strip(),
+        "language": str(getattr(config, "language", "") or "python").strip(),
+        "testing": {
+            "unit_command": str(getattr(testing, "unit_command", "") or ""),
+            "e2e_command": str(getattr(testing, "e2e_command", "") or ""),
+            "e2e": e2e_payload,
+        },
+        "build": {
+            "command": str(getattr(build, "command", "") or ""),
+            "release_checks": list(getattr(build, "release_checks", []) or []),
+        },
+        "deploy": {
+            "strategy": str(getattr(deploy, "strategy", "") or "none"),
+            "service_rules_count": len(getattr(deploy, "service_rules", []) or []),
+        },
+        "governance": {
+            "enabled": bool(getattr(governance, "enabled", False)),
+            "test_tool_label": str(getattr(governance, "test_tool_label", "") or ""),
+            "exclude_roots": list(getattr(governance, "exclude_roots", []) or []),
+        },
+        "graph": {
+            "exclude_paths": list(getattr(graph, "exclude_paths", []) or []),
+            "ignore_globs": list(getattr(graph, "ignore_globs", []) or []),
+            "nested_projects": {
+                "mode": str(getattr(nested, "mode", "exclude") or "exclude"),
+                "roots": list(getattr(nested, "roots", []) or []),
+            },
+            "effective_exclude_roots": list(effective_excludes or []),
+        },
+        "ai": {
+            "routing": _sanitize_ai_routing(getattr(ai, "routing", {}) or {}),
+        },
+    }
+
+
+def get_project_config_metadata(project_id: str) -> dict:
+    """Return the central project config snapshot stored in projects.json."""
+    project_id = _normalize_project_id(project_id)
+    entry = get_project(project_id) or {}
+    return _copy_json_dict(entry.get("project_config"))
+
+
+def set_project_config_metadata(
+    project_id: str,
+    config: dict,
+    *,
+    source: str = "aming_claw_registry",
+    actor: str = "",
+) -> dict:
+    """Persist a central, non-invasive project config snapshot."""
+    project_id = _normalize_project_id(project_id)
+    projects = _load_projects()
+    entry = projects["projects"].get(project_id)
+    if not entry:
+        raise ValidationError(f"Project {project_id!r} not registered")
+
+    payload = _copy_json_dict(config)
+    payload["project_id"] = project_id
+    entry["project_config"] = payload
+    entry["project_config_source"] = source or "aming_claw_registry"
+    entry["project_config_updated_at"] = _utc_iso()
+    entry["project_config_updated_by"] = actor or "system"
+    _save_projects(projects)
+    return {k: v for k, v in entry.items() if k != "password_hash"}
+
+
+def update_project_ai_routing_metadata(
+    project_id: str,
+    routing: dict,
+    *,
+    base_config=None,
+    actor: str = "",
+) -> dict:
+    """Persist dashboard AI routing in Aming-claw's registry, not the target repo."""
+    project_id = _normalize_project_id(project_id)
+    projects = _load_projects()
+    entry = projects["projects"].get(project_id)
+    if not entry:
+        raise ValidationError(f"Project {project_id!r} not registered")
+
+    payload = _copy_json_dict(entry.get("project_config"))
+    if not payload and base_config is not None:
+        payload = (
+            _copy_json_dict(base_config)
+            if isinstance(base_config, dict)
+            else project_config_to_metadata(base_config)
+        )
+    if not payload:
+        payload = {
+            "project_id": project_id,
+            "language": "python",
+            "testing": {"unit_command": "python -m pytest", "e2e": {}},
+            "graph": {"exclude_paths": [], "ignore_globs": [], "effective_exclude_roots": []},
+            "ai": {"routing": {}},
+        }
+
+    payload["project_id"] = project_id
+    ai_raw = payload.get("ai") if isinstance(payload.get("ai"), dict) else {}
+    ai_raw["routing"] = _sanitize_ai_routing(routing)
+    payload["ai"] = ai_raw
+
+    entry["project_config"] = payload
+    entry["project_config_source"] = "aming_claw_registry"
+    entry["project_config_updated_at"] = _utc_iso()
+    entry["project_config_updated_by"] = actor or "dashboard"
+    _save_projects(projects)
+    return {k: v for k, v in entry.items() if k != "password_hash"}
+
+
 def update_project_operation_progress(
     project_id: str,
     *,
@@ -474,8 +633,10 @@ def bootstrap_project(
     # Step 1: Config discovery
     try:
         config = load_project_config(ws)
+        config_source = "workspace_config"
     except (FileNotFoundError, ValueError):
         config = generate_default_config(str(ws), project_name)
+        config_source = "generated_default"
 
     if config_override:
         # Apply overrides
@@ -650,22 +811,14 @@ def bootstrap_project(
         raise ValidationError(f"Bootstrap failed: {e}")
 
     # Build response
-    config_dict = {
-        "project_id": config.project_id or pid,
-        "language": config.language,
-        "testing": {"unit_command": config.testing.unit_command},
-        "deploy": {"strategy": config.deploy.strategy},
-        "graph": {
-            "exclude_paths": list(getattr(config.graph, "exclude_paths", []) or []),
-            "ignore_globs": list(getattr(config.graph, "ignore_globs", []) or []),
-            "nested_projects": {
-                "mode": getattr(config.graph.nested_projects, "mode", "exclude"),
-                "roots": list(getattr(config.graph.nested_projects, "roots", []) or []),
-            },
-            "effective_exclude_roots": effective_graph_exclude_roots(config),
-        },
-        "ai": {"routing": dict(getattr(config.ai, "routing", {}) or {})},
-    }
+    config_dict = project_config_to_metadata(config)
+    config_dict["project_id"] = pid
+    set_project_config_metadata(
+        pid,
+        config_dict,
+        source=config_source,
+        actor="bootstrap",
+    )
 
     result = {
         "project_id": pid,

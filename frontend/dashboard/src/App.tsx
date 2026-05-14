@@ -1213,10 +1213,17 @@ function AiConfigDialog({
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const semanticReadiness = semanticAiReadiness(config);
-  const configPath = config?.workspace_path ? `${config.workspace_path.replace(/[/\\]$/, "")}/.aming-claw.yaml` : "";
+  const writeTarget =
+    config?.write_target ||
+    config?.project_config?.write_target ||
+    "aming-claw project registry";
+  const projectConfigSource =
+    config?.project_config_source ||
+    config?.project_config?.config_source ||
+    "";
   const semanticSource =
     config?.semantic?.override_path ||
-    (projectRouting.semantic ? configPath : config?.semantic?.source_path) ||
+    (projectRouting.semantic ? writeTarget : config?.semantic?.source_path) ||
     "";
 
   const effectiveRouteFor = (role: string) => {
@@ -1226,7 +1233,7 @@ function AiConfigDialog({
     }
     const projectRoute = projectRouting[role];
     if (projectRoute?.provider || projectRoute?.model) {
-      return { ...projectRoute, source: ".aming-claw.yaml" };
+      return { ...projectRoute, source: projectConfigSource || "aming-claw registry" };
     }
     const fallback = role === "semantic" ? config?.semantic : roleRouting[role];
     return fallback ? { ...fallback, source: role === "semantic" ? "semantic default" : "global default" } : null;
@@ -1306,8 +1313,8 @@ function AiConfigDialog({
           <div className="config-kv">
             <span>Workspace</span>
             <span className="mono">{config?.workspace_path || "—"}</span>
-            <span>Writes</span>
-            <span className="mono">{configPath || "—"}</span>
+            <span>Stores</span>
+            <span className="mono">{writeTarget || "—"}</span>
             <span>Semantic source</span>
             <span className="mono">{semanticSource || "unset"}</span>
           </div>
@@ -1380,7 +1387,7 @@ function AiConfigDialog({
               {saving ? "Saving..." : "Save routing"}
             </button>
             <span className="config-dialog-sub">
-              {config?.write_supported === false ? "write disabled" : "writes .aming-claw.yaml"}
+              {config?.write_supported === false ? "write disabled" : "writes Aming-claw registry"}
             </span>
           </div>
           {message ? <div className={`config-warning ${message.kind}`}>{message.text}</div> : null}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,6 +65,18 @@ def _write_project_config(root: Path) -> None:
         ]),
         encoding="utf-8",
     )
+
+
+def _patch_project_registry(monkeypatch, data: dict) -> dict:
+    monkeypatch.setattr(server.project_service, "_load_projects", lambda: data)
+
+    def _save_projects(updated: dict) -> None:
+        snapshot = json.loads(json.dumps(updated))
+        data.clear()
+        data.update(snapshot)
+
+    monkeypatch.setattr(server.project_service, "_save_projects", _save_projects)
+    return data
 
 
 def test_project_config_endpoint_exposes_governance_exclude_roots(tmp_path, monkeypatch):
@@ -147,6 +160,7 @@ def test_project_ai_config_endpoint_returns_writable_dashboard_contract(tmp_path
     assert payload["project_id"] == "dashboard-demo"
     assert payload["read_only"] is False
     assert payload["write_supported"] is True
+    assert payload["write_target"] == "aming-claw project registry"
     assert "role_routing" in payload
     assert "semantic" in payload
     assert payload["model_catalog"]["models"]["anthropic"]
@@ -159,15 +173,20 @@ def test_project_ai_config_endpoint_returns_writable_dashboard_contract(tmp_path
 
 def test_project_ai_config_endpoint_updates_project_routing(tmp_path, monkeypatch):
     _write_project_config(tmp_path)
-    monkeypatch.setattr(
-        server.project_service,
-        "list_projects",
-        lambda: [{
-            "project_id": "dashboard-demo",
-            "workspace_path": str(tmp_path),
-            "status": "active",
-        }],
+    data = _patch_project_registry(
+        monkeypatch,
+        {
+            "version": 1,
+            "projects": {
+                "dashboard-demo": {
+                    "project_id": "dashboard-demo",
+                    "workspace_path": str(tmp_path),
+                    "status": "active",
+                },
+            },
+        },
     )
+    before = (tmp_path / ".aming-claw.yaml").read_text(encoding="utf-8")
 
     payload = server.handle_project_ai_config_update(_ctx(
         "dashboard-demo",
@@ -186,17 +205,24 @@ def test_project_ai_config_endpoint_updates_project_routing(tmp_path, monkeypatc
     assert payload["updated"] is True
     assert payload["project_config"]["ai"]["routing"]["dev"]["model"] == "gpt-5.4-mini"
     assert payload["project_config"]["ai"]["routing"]["semantic"]["model"] == "claude-sonnet-4-5"
+    assert payload["project_config_source"] == "aming_claw_registry"
+    assert (tmp_path / ".aming-claw.yaml").read_text(encoding="utf-8") == before
+    assert data["projects"]["dashboard-demo"]["project_config"]["ai"]["routing"]["dev"]["model"] == "gpt-5.4-mini"
 
 
-def test_project_ai_config_update_creates_missing_project_config(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        server.project_service,
-        "list_projects",
-        lambda: [{
-            "project_id": "dashboard-demo",
-            "workspace_path": str(tmp_path),
-            "status": "active",
-        }],
+def test_project_ai_config_update_stores_missing_project_config_in_registry(tmp_path, monkeypatch):
+    data = _patch_project_registry(
+        monkeypatch,
+        {
+            "version": 1,
+            "projects": {
+                "dashboard-demo": {
+                    "project_id": "dashboard-demo",
+                    "workspace_path": str(tmp_path),
+                    "status": "active",
+                },
+            },
+        },
     )
 
     payload = server.handle_project_ai_config_update(_ctx(
@@ -212,18 +238,81 @@ def test_project_ai_config_update_creates_missing_project_config(tmp_path, monke
     ))
 
     config_path = tmp_path / ".aming-claw.yaml"
-    assert config_path.is_file()
+    assert not config_path.exists()
     assert payload["ok"] is True
     assert payload["updated"] is True
     assert payload["project_config_error"] == ""
+    assert payload["project_config_source"] == "aming_claw_registry"
+    assert payload["write_target"] == "aming-claw project registry"
     assert payload["project_config"]["ai"]["routing"]["semantic"] == {
         "provider": "anthropic",
         "model": "claude-opus-4-7",
     }
     assert payload["project_config"]["ai"]["routing"]["dev"]["model"] == "gpt-5.4"
-    text = config_path.read_text(encoding="utf-8")
-    assert "project_id: dashboard-demo" in text
-    assert "language:" in text
+    assert data["projects"]["dashboard-demo"]["project_config"]["ai"]["routing"]["semantic"]["model"] == "claude-opus-4-7"
+
+
+def test_project_config_endpoint_uses_registry_fallback_without_local_file(tmp_path, monkeypatch):
+    _patch_project_registry(
+        monkeypatch,
+        {
+            "version": 1,
+            "projects": {
+                "dashboard-demo": {
+                    "project_id": "dashboard-demo",
+                    "workspace_path": str(tmp_path),
+                    "status": "active",
+                    "project_config_source": "aming_claw_registry",
+                    "project_config": {
+                        "project_id": "dashboard-demo",
+                        "language": "typescript",
+                        "testing": {"unit_command": "npm test", "e2e": {}},
+                        "graph": {"exclude_paths": ["node_modules"], "ignore_globs": []},
+                        "ai": {
+                            "routing": {
+                                "semantic": {
+                                    "provider": "anthropic",
+                                    "model": "claude-opus-4-7",
+                                }
+                            }
+                        },
+                    },
+                },
+            },
+        },
+    )
+
+    payload = server.handle_project_config(_ctx("dashboard-demo"))
+
+    assert payload["project_id"] == "dashboard-demo"
+    assert payload["config_source"] == "aming_claw_registry"
+    assert payload["language"] == "typescript"
+    assert payload["ai"]["routing"]["semantic"]["model"] == "claude-opus-4-7"
+
+
+def test_project_config_endpoint_generates_non_invasive_default_for_no_config(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    _patch_project_registry(
+        monkeypatch,
+        {
+            "version": 1,
+            "projects": {
+                "dashboard-demo": {
+                    "project_id": "dashboard-demo",
+                    "workspace_path": str(tmp_path),
+                    "status": "active",
+                },
+            },
+        },
+    )
+
+    payload = server.handle_project_config(_ctx("dashboard-demo"))
+
+    assert not (tmp_path / ".aming-claw.yaml").exists()
+    assert payload["project_id"] == "dashboard-demo"
+    assert payload["config_source"] == "generated_default"
+    assert payload["language"] == "javascript"
+    assert payload["testing"]["unit_command"] == "npm test"
 
 
 def test_project_git_ref_endpoints_return_and_persist_selected_ref(tmp_path, monkeypatch):
