@@ -263,11 +263,15 @@ def plugin():
 @click.option("--ref", default="", help="Optional branch, tag, or commit to checkout.")
 @click.option("--python", "python_executable", default=sys.executable, help="Python executable for pip/start commands.")
 @click.option("--no-pip", is_flag=True, help="Clone and validate only; do not pip install.")
+@click.option("--no-codex-install", is_flag=True, help="Do not install Codex plugin cache/config.")
+@click.option("--codex-home", default="", help="Override Codex home for plugin cache/config.")
+@click.option("--codex-config", default="", help="Override Codex config.toml path.")
+@click.option("--codex-marketplace-root", default="", help="Override generated Codex marketplace root.")
 @click.option("--start", is_flag=True, help="Run the start command after install.")
 @click.option("--dry-run", is_flag=True, help="Print planned commands without changing state.")
 @click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
 @click.option("--validate-only", is_flag=True, help="Validate the computed checkout path without cloning or fetching.")
-def plugin_install(repo_url, install_root, ref, python_executable, no_pip, start, dry_run, json_output, validate_only):
+def plugin_install(repo_url, install_root, ref, python_executable, no_pip, no_codex_install, codex_home, codex_config, codex_marketplace_root, start, dry_run, json_output, validate_only):
     """Clone/update the plugin from a Git URL and print next steps."""
     from agent.plugin_installer import (
         DEFAULT_REPO_URL,
@@ -283,6 +287,10 @@ def plugin_install(repo_url, install_root, ref, python_executable, no_pip, start
             ref=ref,
             python_executable=python_executable,
             install_package=not no_pip,
+            install_codex_plugin=not no_codex_install,
+            codex_home=codex_home or None,
+            codex_config=codex_config or None,
+            codex_marketplace_root=codex_marketplace_root or None,
             start=start,
             dry_run=dry_run,
             validate_only=validate_only,
@@ -299,10 +307,11 @@ def plugin_install(repo_url, install_root, ref, python_executable, no_pip, start
 @click.option("--plugin-root", default="", help="Local Aming Claw plugin checkout root.")
 @click.option("--governance-url", default="http://localhost:40000", help="Governance service URL.")
 @click.option("--codex-config", default="", help="Optional Codex config.toml path.")
+@click.option("--codex-home", default="", help="Optional Codex home for plugin cache checks.")
 @click.option("--python", "python_executable", default=sys.executable, help="Python executable to validate for local runtime.")
 @click.option("--skip-governance", is_flag=True, help="Skip governance health probe.")
 @click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
-def plugin_doctor(plugin_root, governance_url, codex_config, python_executable, skip_governance, json_output):
+def plugin_doctor(plugin_root, governance_url, codex_config, codex_home, python_executable, skip_governance, json_output):
     """Run read-only aftercare checks for a local plugin install."""
     from agent.plugin_installer import doctor_plugin, format_doctor_result
 
@@ -310,6 +319,7 @@ def plugin_doctor(plugin_root, governance_url, codex_config, python_executable, 
         plugin_root=plugin_root or None,
         governance_url=governance_url,
         codex_config=codex_config or None,
+        codex_home=codex_home or None,
         python_executable=python_executable,
         check_governance=not skip_governance,
     )

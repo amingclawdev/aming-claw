@@ -13,12 +13,16 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Union
 
 
 DEFAULT_REPO_URL = "https://github.com/amingclawdev/aming-claw"
 MIN_PYTHON_VERSION = (3, 9)
+CODEX_MARKETPLACE_NAME = "aming-claw-local"
+CODEX_PLUGIN_NAME = "aming-claw"
+CODEX_PLUGIN_ID = f"{CODEX_PLUGIN_NAME}@{CODEX_MARKETPLACE_NAME}"
 REQUIRED_PLUGIN_FILES = (
     ".codex-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
@@ -27,6 +31,12 @@ REQUIRED_PLUGIN_FILES = (
     "skills/aming-claw/SKILL.md",
     "skills/aming-claw-launcher/SKILL.md",
     ".mcp.json",
+)
+CODEX_PLUGIN_PAYLOAD = (
+    ".codex-plugin",
+    "skills",
+    ".mcp.json",
+    "README.md",
 )
 AI_CLI_REQUIREMENTS = {
     "openai": {
@@ -56,7 +66,12 @@ class InstallResult:
     plugin_root: str
     dry_run: bool
     installed_package: bool
+    installed_codex_plugin: bool
     started: bool
+    codex_home: str = ""
+    codex_cache_path: str = ""
+    codex_marketplace_root: str = ""
+    codex_config_path: str = ""
     validated_files: list[str] = field(default_factory=list)
     commands: list[CommandRecord] = field(default_factory=list)
     next_steps: list[str] = field(default_factory=list)
@@ -68,6 +83,11 @@ class InstallResult:
             "plugin_root": self.plugin_root,
             "dry_run": self.dry_run,
             "installed_package": self.installed_package,
+            "installed_codex_plugin": self.installed_codex_plugin,
+            "codex_home": self.codex_home,
+            "codex_cache_path": self.codex_cache_path,
+            "codex_marketplace_root": self.codex_marketplace_root,
+            "codex_config_path": self.codex_config_path,
             "started": self.started,
             "validated_files": list(self.validated_files),
             "commands": [
@@ -232,6 +252,178 @@ def default_codex_config_path() -> Path:
     return Path.home() / ".codex" / "config.toml"
 
 
+def default_codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".codex"
+
+
+def default_codex_marketplace_root() -> Path:
+    return Path.home() / ".aming-claw" / "codex-marketplaces" / CODEX_MARKETPLACE_NAME
+
+
+def _read_codex_manifest_version(plugin_root: Path) -> str:
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    if not manifest_path.is_file():
+        return "0.1.0"
+    manifest = _read_json_file(manifest_path)
+    version = str(manifest.get("version") or "").strip()
+    return version or "0.1.0"
+
+
+def codex_cache_plugin_root(
+    plugin_root: Path,
+    *,
+    codex_home: Optional[Union[Path, str]] = None,
+) -> Path:
+    home = Path(codex_home).expanduser() if codex_home else default_codex_home()
+    version = _read_codex_manifest_version(plugin_root)
+    return home / "plugins" / "cache" / CODEX_MARKETPLACE_NAME / CODEX_PLUGIN_NAME / version
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _copy_plugin_payload(plugin_root: Path, target_root: Path, *, dry_run: bool = False) -> None:
+    source_root = plugin_root.expanduser().resolve()
+    target = target_root.expanduser().resolve()
+    if dry_run:
+        return
+    target.mkdir(parents=True, exist_ok=True)
+    for rel in CODEX_PLUGIN_PAYLOAD:
+        source = source_root / rel
+        if not source.exists():
+            continue
+        destination = target / rel
+        if source.is_dir():
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(source, destination)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
+def install_codex_plugin_cache(
+    plugin_root: Path,
+    *,
+    codex_home: Optional[Union[Path, str]] = None,
+    dry_run: bool = False,
+    commands: Optional[list[CommandRecord]] = None,
+) -> Path:
+    target = codex_cache_plugin_root(plugin_root, codex_home=codex_home)
+    home = Path(codex_home).expanduser().resolve() if codex_home else default_codex_home().resolve()
+    if not _is_relative_to(target, home / "plugins" / "cache"):
+        raise PluginInstallError(f"refusing to write Codex plugin cache outside {home / 'plugins' / 'cache'}: {target}")
+    if commands is not None:
+        commands.append(CommandRecord(args=["install-codex-cache", str(target)], skipped=dry_run))
+    _copy_plugin_payload(plugin_root, target, dry_run=dry_run)
+    return target
+
+
+def _codex_marketplace_payload() -> dict:
+    return {
+        "name": CODEX_MARKETPLACE_NAME,
+        "interface": {"displayName": "Aming Claw Local"},
+        "plugins": [
+            {
+                "name": CODEX_PLUGIN_NAME,
+                "source": {"source": "local", "path": f"./{CODEX_PLUGIN_NAME}"},
+                "policy": {
+                    "installation": "INSTALLED_BY_DEFAULT",
+                    "authentication": "ON_INSTALL",
+                },
+                "category": "Productivity",
+            }
+        ],
+    }
+
+
+def install_codex_marketplace(
+    plugin_root: Path,
+    *,
+    marketplace_root: Optional[Union[Path, str]] = None,
+    dry_run: bool = False,
+    commands: Optional[list[CommandRecord]] = None,
+) -> Path:
+    root = Path(marketplace_root).expanduser() if marketplace_root else default_codex_marketplace_root()
+    root = root.resolve()
+    agents_root = root / ".agents" / "plugins"
+    plugin_target = agents_root / CODEX_PLUGIN_NAME
+    if commands is not None:
+        commands.append(CommandRecord(args=["install-codex-marketplace", str(root)], skipped=dry_run))
+    if dry_run:
+        return root
+    agents_root.mkdir(parents=True, exist_ok=True)
+    (agents_root / "marketplace.json").write_text(
+        json.dumps(_codex_marketplace_payload(), indent=2),
+        encoding="utf-8",
+    )
+    _copy_plugin_payload(plugin_root, plugin_target, dry_run=False)
+    return root
+
+
+def _toml_quote(value: Union[str, Path]) -> str:
+    text = str(value)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_table_pattern(table_name: str) -> re.Pattern[str]:
+    escaped = re.escape(table_name)
+    return re.compile(rf"(?ms)^\[{escaped}\]\s*\r?\n.*?(?=^\[|\Z)")
+
+
+def _upsert_toml_table(text: str, table_name: str, block_body: str) -> str:
+    block = f"[{table_name}]\n{block_body.rstrip()}\n"
+    pattern = _toml_table_pattern(table_name)
+    if pattern.search(text):
+        return pattern.sub(block, text).rstrip() + "\n"
+    prefix = text.rstrip()
+    return (prefix + "\n\n" if prefix else "") + block
+
+
+def configure_codex_plugin(
+    *,
+    codex_config: Optional[Union[Path, str]] = None,
+    marketplace_root: Optional[Union[Path, str]] = None,
+    dry_run: bool = False,
+    commands: Optional[list[CommandRecord]] = None,
+) -> Path:
+    config_path = Path(codex_config).expanduser() if codex_config else default_codex_config_path()
+    market_root = Path(marketplace_root).expanduser() if marketplace_root else default_codex_marketplace_root()
+    if commands is not None:
+        commands.append(CommandRecord(args=["configure-codex-plugin", str(config_path)], skipped=dry_run))
+    if dry_run:
+        return config_path
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    text = config_path.read_text(encoding="utf-8", errors="replace") if config_path.is_file() else ""
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    text = _upsert_toml_table(
+        text,
+        f"marketplaces.{CODEX_MARKETPLACE_NAME}",
+        "\n".join(
+            [
+                'source_type = "local"',
+                f"source = {_toml_quote(market_root.resolve())}",
+                f"last_updated = {_toml_quote(timestamp)}",
+            ]
+        ),
+    )
+    text = _upsert_toml_table(
+        text,
+        f'plugins."{CODEX_PLUGIN_ID}"',
+        "enabled = true",
+    )
+    config_path.write_text(text, encoding="utf-8")
+    return config_path
+
+
 def _default_doctor_root() -> Path:
     cwd = Path.cwd()
     if (cwd / ".codex-plugin" / "plugin.json").is_file():
@@ -345,29 +537,28 @@ def _check_marketplace(plugin_root: Path) -> DoctorCheck:
         return _doctor_check(
             "codex_marketplace",
             "fail",
-            f"source.path={raw_path!r} normalizes to an empty local plugin path for Codex CLI; use './.' for a root plugin checkout",
+            f"source.path={raw_path!r} normalizes to an empty local plugin path for Codex CLI",
         )
 
-    # Codex marketplace paths are resolved relative to the marketplace root,
-    # not relative to `.agents/plugins/marketplace.json`.
-    resolved = (plugin_root / raw_path).resolve()
-    if not (resolved / ".codex-plugin" / "plugin.json").is_file():
-        return _doctor_check(
-            "codex_marketplace",
-            "fail",
-            f"source.path={raw_path!r} resolves to {resolved}, but no .codex-plugin/plugin.json was found",
-        )
-    if not (raw_path.startswith("./") or raw_path.startswith("../") or os.path.isabs(raw_path)):
+    marketplace_root = marketplace_path.parent.resolve()
+    resolved = (marketplace_root / raw_path).resolve()
+    if not _is_relative_to(resolved, marketplace_root):
         return _doctor_check(
             "codex_marketplace",
             "warn",
-            f"source.path={raw_path!r} resolves to {resolved}; prefer './.' for root Codex CLI local plugin paths",
+            f"{marketplace_path} is a repo-local compatibility manifest; source.path={raw_path!r} escapes the Codex marketplace root. The installer writes a generated marketplace/cache for real Codex CLI loading.",
         )
-    if raw_path == "./.":
+    if not (resolved / ".codex-plugin" / "plugin.json").is_file():
         return _doctor_check(
             "codex_marketplace",
-            "ok",
-            f"{marketplace_path} -> source.path './.' resolves to root plugin {resolved}",
+            "warn",
+            f"source.path={raw_path!r} resolves to {resolved}, but no .codex-plugin/plugin.json was found",
+        )
+    if not raw_path.startswith("./"):
+        return _doctor_check(
+            "codex_marketplace",
+            "warn",
+            f"source.path={raw_path!r} resolves to {resolved}; prefer './{CODEX_PLUGIN_NAME}' inside the marketplace root",
         )
     return _doctor_check(
         "codex_marketplace",
@@ -388,22 +579,101 @@ def _check_mcp_config(plugin_root: Path) -> DoctorCheck:
     return _doctor_check("mcp_config", "ok", str(path))
 
 
+def _extract_toml_table(text: str, table_name: str) -> str:
+    text = text.lstrip("\ufeff")
+    match = _toml_table_pattern(table_name).search(text)
+    return match.group(0) if match else ""
+
+
+def _extract_toml_string(block: str, key: str) -> str:
+    match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*(['\"])(.*?)\1\s*$", block)
+    if not match:
+        return ""
+    value = match.group(2)
+    if match.group(1) == '"':
+        value = value.replace("\\\\", "\\").replace('\\"', '"')
+    return value
+
+
+def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
+    marketplace_path = root / ".agents" / "plugins" / "marketplace.json"
+    try:
+        marketplace = _read_json_file(marketplace_path)
+    except Exception as exc:
+        return False, f"{marketplace_path}: {exc}"
+    plugins = marketplace.get("plugins") if isinstance(marketplace, dict) else []
+    match = next(
+        (
+            item
+            for item in plugins or []
+            if isinstance(item, dict) and item.get("name") == CODEX_PLUGIN_NAME
+        ),
+        None,
+    )
+    if not match:
+        return False, f"{marketplace_path}: missing plugin entry `{CODEX_PLUGIN_NAME}`"
+    source = match.get("source") if isinstance(match.get("source"), dict) else {}
+    raw_path = str(source.get("path") or "").strip()
+    if not raw_path:
+        return False, f"{marketplace_path}: missing source.path"
+    marketplace_root = marketplace_path.parent.resolve()
+    resolved = (marketplace_root / raw_path).resolve()
+    if not _is_relative_to(resolved, marketplace_root):
+        return False, f"{marketplace_path}: source.path {raw_path!r} escapes marketplace root"
+    if not (resolved / ".codex-plugin" / "plugin.json").is_file():
+        return False, f"{marketplace_path}: source.path {raw_path!r} has no .codex-plugin/plugin.json"
+    return True, f"{marketplace_path} -> {resolved}"
+
+
+def _codex_plugin_enabled(text: str) -> bool:
+    block = _extract_toml_table(text, f'plugins."{CODEX_PLUGIN_ID}"')
+    return bool(re.search(r"(?m)^\s*enabled\s*=\s*true\s*$", block, flags=re.IGNORECASE))
+
+
 def _check_codex_config(path: Path) -> DoctorCheck:
     if not path.is_file():
         return _doctor_check(
             "codex_config",
             "warn",
-            f"{path} not found; install may still work through a repo-local marketplace, but restart Codex/new session is required",
+            f"{path} not found; run `aming-claw plugin install` to enable {CODEX_PLUGIN_ID}",
         )
     text = path.read_text(encoding="utf-8", errors="replace")
-    has_marketplace = "marketplace" in text.lower()
-    has_plugin = "aming-claw" in text and ("aming-claw-local" in text or ".agents" in text)
-    if has_marketplace and has_plugin:
-        return _doctor_check("codex_config", "ok", f"{path} references aming-claw marketplace/plugin")
+    plugin_enabled = _codex_plugin_enabled(text)
+    marketplace_block = _extract_toml_table(text, f"marketplaces.{CODEX_MARKETPLACE_NAME}")
+    marketplace_source = _extract_toml_string(marketplace_block, "source")
+    if plugin_enabled and marketplace_source:
+        ok, detail = _validate_codex_marketplace_root(Path(marketplace_source).expanduser())
+        if not ok:
+            return _doctor_check("codex_config", "fail", f"{path}: {detail}")
+        return _doctor_check("codex_config", "ok", f"{path} enables {CODEX_PLUGIN_ID}; {detail}")
+    if plugin_enabled:
+        return _doctor_check(
+            "codex_config",
+            "ok",
+            f"{path} enables {CODEX_PLUGIN_ID}; no marketplace source configured, so Codex relies on installed cache",
+        )
     return _doctor_check(
         "codex_config",
         "warn",
-        f"{path} exists but no obvious aming-claw marketplace/plugin entry was found",
+        f"{path} exists but {CODEX_PLUGIN_ID} is not enabled",
+    )
+
+
+def _check_codex_cache(plugin_root: Path, *, codex_home: Optional[Union[Path, str]] = None, codex_config: Optional[Path] = None) -> DoctorCheck:
+    home = Path(codex_home).expanduser() if codex_home else (
+        codex_config.parent if codex_config else default_codex_home()
+    )
+    try:
+        cache_root = codex_cache_plugin_root(plugin_root, codex_home=home)
+    except Exception as exc:
+        return _doctor_check("codex_plugin_cache", "fail", f"cannot compute cache path: {exc}")
+    manifest = cache_root / ".codex-plugin" / "plugin.json"
+    if manifest.is_file():
+        return _doctor_check("codex_plugin_cache", "ok", f"{manifest}")
+    return _doctor_check(
+        "codex_plugin_cache",
+        "fail",
+        f"missing installed plugin cache at {cache_root}; run `aming-claw plugin install`",
     )
 
 
@@ -517,6 +787,7 @@ def doctor_plugin(
     plugin_root: Optional[Union[Path, str]] = None,
     governance_url: str = "http://localhost:40000",
     codex_config: Optional[Union[Path, str]] = None,
+    codex_home: Optional[Union[Path, str]] = None,
     check_governance: bool = True,
     python_executable: Optional[str] = None,
 ) -> DoctorResult:
@@ -535,7 +806,9 @@ def doctor_plugin(
     result.checks.append(_check_codex_manifest(root))
     result.checks.append(_check_marketplace(root))
     result.checks.append(_check_mcp_config(root))
-    result.checks.append(_check_codex_config(Path(codex_config).expanduser() if codex_config else default_codex_config_path()))
+    codex_config_path = Path(codex_config).expanduser() if codex_config else default_codex_config_path()
+    result.checks.append(_check_codex_config(codex_config_path))
+    result.checks.append(_check_codex_cache(root, codex_home=codex_home, codex_config=codex_config_path))
     result.checks.append(_check_dashboard_assets(root))
     for provider, requirement in AI_CLI_REQUIREMENTS.items():
         result.checks.append(_check_ai_cli(provider, requirement))
@@ -584,10 +857,9 @@ def clone_or_update(
 def build_next_steps(plugin_root: Path, python_executable: str) -> list[str]:
     root = str(plugin_root)
     return [
+        f"Codex: plugin cache and config are installed for `{CODEX_PLUGIN_ID}`; reload Codex or open a new session, then confirm the Aming Claw skill/MCP tools are visible.",
         f"Claude Code: /plugin marketplace add {root}",
         "Claude Code: /plugin install aming-claw@aming-claw-local",
-        f"Codex: open {root} or add its local plugin marketplace, then use the Aming Claw skill.",
-        "Reload Codex or open a new session after plugin install; current threads may not hot-load new skills/MCP tools.",
         f"Verify install: {python_executable} -m agent.cli plugin doctor --plugin-root {root}",
         "Start services in a separate terminal/window; this is a long-running command:",
         f"  cd {root}",
@@ -604,6 +876,10 @@ def install_from_git(
     ref: str = "",
     python_executable: Optional[str] = None,
     install_package: bool = True,
+    install_codex_plugin: bool = True,
+    codex_home: Optional[Union[Path, str]] = None,
+    codex_config: Optional[Union[Path, str]] = None,
+    codex_marketplace_root: Optional[Union[Path, str]] = None,
     start: bool = False,
     dry_run: bool = False,
     validate_only: bool = False,
@@ -637,6 +913,34 @@ def install_from_git(
         )
         installed_package = not dry_run
 
+    codex_cache_path = ""
+    codex_marketplace_path = ""
+    codex_config_path = ""
+    installed_codex_plugin = False
+    if install_codex_plugin and not validate_only:
+        cache_target = install_codex_plugin_cache(
+            plugin_root,
+            codex_home=codex_home,
+            dry_run=dry_run,
+            commands=commands,
+        )
+        marketplace_target = install_codex_marketplace(
+            plugin_root,
+            marketplace_root=codex_marketplace_root,
+            dry_run=dry_run,
+            commands=commands,
+        )
+        config_target = configure_codex_plugin(
+            codex_config=codex_config,
+            marketplace_root=marketplace_target,
+            dry_run=dry_run,
+            commands=commands,
+        )
+        codex_cache_path = str(cache_target)
+        codex_marketplace_path = str(marketplace_target)
+        codex_config_path = str(config_target)
+        installed_codex_plugin = not dry_run
+
     started = False
     if start:
         _spawn_long_running(
@@ -653,6 +957,11 @@ def install_from_git(
         plugin_root=str(plugin_root),
         dry_run=dry_run,
         installed_package=installed_package,
+        installed_codex_plugin=installed_codex_plugin,
+        codex_home=str(Path(codex_home).expanduser() if codex_home else default_codex_home()),
+        codex_cache_path=codex_cache_path,
+        codex_marketplace_root=codex_marketplace_path,
+        codex_config_path=codex_config_path,
         started=started,
         validated_files=validated,
         commands=commands,
@@ -678,6 +987,15 @@ def format_result(result: InstallResult) -> str:
         lines.append("")
         lines.append("Validated plugin assets:")
         lines.extend(f"  - {rel}" for rel in result.validated_files)
+    if result.codex_cache_path or result.codex_config_path:
+        lines.append("")
+        lines.append("Codex plugin install:")
+        if result.codex_cache_path:
+            lines.append(f"  cache:       {result.codex_cache_path}")
+        if result.codex_marketplace_root:
+            lines.append(f"  marketplace: {result.codex_marketplace_root}")
+        if result.codex_config_path:
+            lines.append(f"  config:      {result.codex_config_path}")
     lines.append("")
     lines.append("Next steps:")
     lines.extend(f"  {step}" for step in result.next_steps)
@@ -712,6 +1030,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref", default="", help="Optional branch, tag, or commit to checkout.")
     parser.add_argument("--python", default=sys.executable, help="Python executable for pip/start commands.")
     parser.add_argument("--no-pip", action="store_true", help="Clone and validate only; do not pip install.")
+    parser.add_argument("--no-codex-install", action="store_true", help="Do not install Codex plugin cache/config.")
+    parser.add_argument("--codex-home", default="", help="Override Codex home for plugin cache/config.")
+    parser.add_argument("--codex-config", default="", help="Override Codex config.toml path.")
+    parser.add_argument("--codex-marketplace-root", default="", help="Override generated Codex marketplace root.")
     parser.add_argument("--start", action="store_true", help="Run the start command after install.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned commands without changing state.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
@@ -733,6 +1055,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             ref=args.ref,
             python_executable=args.python,
             install_package=not args.no_pip,
+            install_codex_plugin=not args.no_codex_install,
+            codex_home=args.codex_home or None,
+            codex_config=args.codex_config or None,
+            codex_marketplace_root=args.codex_marketplace_root or None,
             start=args.start,
             dry_run=args.dry_run,
             validate_only=args.validate_only,

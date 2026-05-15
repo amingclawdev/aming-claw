@@ -121,8 +121,12 @@ Expected checks:
 
 - `.codex-plugin/plugin.json` exists.
 - `.agents/plugins/marketplace.json` contains `aming-claw`.
-- The marketplace `source.path` is non-empty and resolves to the Aming Claw
-  plugin root. For this root checkout it should be `./.`, not plain `./`.
+- Codex config enables `aming-claw@aming-claw-local`.
+- Codex plugin cache contains
+  `plugins/cache/aming-claw-local/aming-claw/<version>/.codex-plugin/plugin.json`.
+- The generated Codex marketplace path is valid. A repo-local marketplace file
+  may be reported as a compatibility warning; real Codex CLI loading uses the
+  installed cache plus generated marketplace/config.
 - `.mcp.json` contains `mcpServers.aming-claw`.
 - Dashboard static assets are present, or doctor prints the exact build fallback.
 - Local Codex/Claude CLI commands are detected when available; detection still
@@ -188,8 +192,11 @@ Aming Claw ships its plugin files inside this repository:
 
 ### Codex
 
-Open the cloned `aming-claw` directory in Codex. The repo-local marketplace and
-project `.mcp.json` provide the Aming Claw skill and MCP server contract.
+Install through `aming-claw plugin install <git-url>` or the raw installer
+shown above. The installer writes Codex config, a generated local marketplace,
+and the versioned plugin cache that real Codex CLI startup reads. Opening the
+cloned directory alone is useful for development, but it is not the same as a
+verified Codex plugin install.
 
 In a new session, ask Codex to use the Aming Claw skill and check runtime state:
 
@@ -217,6 +224,12 @@ public Git URL:
 ```bash
 aming-claw plugin install https://github.com/amingclawdev/aming-claw
 ```
+
+That installer clones/updates the checkout, installs the Python package, writes
+Codex config, and installs a versioned Codex plugin cache. It is not just a
+README prompt. Run `aming-claw plugin doctor` afterward; if Codex CLI would
+fail to find the plugin cache or generated marketplace, doctor should not report
+overall OK.
 
 ### Claude Code
 

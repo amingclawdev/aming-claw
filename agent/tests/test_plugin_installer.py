@@ -7,11 +7,15 @@ import pytest
 
 from agent.plugin_installer import (
     AI_CLI_REQUIREMENTS,
+    CODEX_PLUGIN_ID,
     PluginInstallError,
     _check_ai_cli,
+    configure_codex_plugin,
     doctor_plugin,
     format_result,
     format_doctor_result,
+    install_codex_marketplace,
+    install_codex_plugin_cache,
     install_from_git,
     plugin_root_for,
     slug_from_repo_url,
@@ -100,15 +104,19 @@ def test_install_from_git_validate_only_existing_checkout(tmp_path):
 
 def test_doctor_plugin_validates_aftercare_without_governance(tmp_path):
     _write_plugin_fixture(tmp_path)
-    codex_config = tmp_path / "config.toml"
-    codex_config.write_text(
-        'marketplace = "aming-claw-local"\nplugin = "aming-claw"\n',
-        encoding="utf-8",
+    codex_home = tmp_path / "codex-home"
+    marketplace_root = tmp_path / "marketplace-root"
+    install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+    codex_config = configure_codex_plugin(
+        codex_config=codex_home / "config.toml",
+        marketplace_root=marketplace_root,
     )
 
     result = doctor_plugin(
         plugin_root=tmp_path,
         codex_config=codex_config,
+        codex_home=codex_home,
         check_governance=False,
     )
 
@@ -116,6 +124,7 @@ def test_doctor_plugin_validates_aftercare_without_governance(tmp_path):
     assert {check.name for check in result.checks} >= {
         "plugin_assets",
         "codex_marketplace",
+        "codex_plugin_cache",
         "mcp_config",
         "codex_config",
         "dashboard_static_assets",
@@ -162,8 +171,7 @@ def test_doctor_plugin_flags_bad_marketplace_path(tmp_path):
     )
 
     checks = {check.name: check for check in result.checks}
-    assert result.ok is False
-    assert checks["codex_marketplace"].status == "fail"
+    assert checks["codex_marketplace"].status == "warn"
     assert ".codex-plugin/plugin.json" in checks["codex_marketplace"].detail
 
 
@@ -184,6 +192,54 @@ def test_doctor_plugin_rejects_empty_root_marketplace_path(tmp_path):
     assert result.ok is False
     assert checks["codex_marketplace"].status == "fail"
     assert "empty local plugin path" in checks["codex_marketplace"].detail
+
+
+def test_doctor_plugin_fails_when_enabled_cache_is_missing(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    marketplace_root = tmp_path / "marketplace-root"
+    install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+    codex_config = configure_codex_plugin(
+        codex_config=codex_home / "config.toml",
+        marketplace_root=marketplace_root,
+    )
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        codex_home=codex_home,
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_plugin_cache"].status == "fail"
+    assert "missing installed plugin cache" in checks["codex_plugin_cache"].detail
+
+
+def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+
+    target = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+
+    assert target == codex_home / "plugins" / "cache" / "aming-claw-local" / "aming-claw" / "0.1.0"
+    assert (target / ".codex-plugin" / "plugin.json").is_file()
+    assert (target / "skills" / "aming-claw" / "SKILL.md").is_file()
+
+
+def test_configure_codex_plugin_enables_plugin_and_valid_marketplace(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    marketplace_root = install_codex_marketplace(tmp_path, marketplace_root=tmp_path / "marketplace-root")
+    config_path = configure_codex_plugin(
+        codex_config=tmp_path / "config.toml",
+        marketplace_root=marketplace_root,
+    )
+    text = config_path.read_text(encoding="utf-8")
+
+    assert f'[plugins."{CODEX_PLUGIN_ID}"]' in text
+    assert "enabled = true" in text
+    assert str(marketplace_root).replace("\\", "\\\\") in text
 
 
 def test_doctor_plugin_rejects_manifest_with_too_many_default_prompts(tmp_path):

@@ -131,7 +131,7 @@ class TestLocalPluginPackaging:
         assert any("aming-claw://seed-graph-summary" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         assert (ROOT / "CLAUDE.md").is_file()
 
-    def test_codex_local_marketplace_installs_plugin_by_default(self):
+    def test_codex_repo_marketplace_compatibility_metadata_exists(self):
         marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
         marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
 
@@ -186,19 +186,21 @@ class TestLocalPluginPackaging:
         assert ".codex-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
         assert ".claude-plugin/plugin.json" in REQUIRED_PLUGIN_FILES
 
-    def test_codex_marketplace_path_resolves_to_plugin_root(self):
+    def test_codex_repo_marketplace_path_is_a_compatibility_path(self):
         marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
         marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
         plugin = next(item for item in marketplace["plugins"] if item["name"] == "aming-claw")
         source_path = plugin["source"]["path"]
 
-        # Codex marketplace source paths are relative to the marketplace root.
+        # This repo-local metadata is kept for compatibility. The real Codex
+        # CLI loader is validated through the generated marketplace plus the
+        # versioned plugins/cache layout installed by agent.plugin_installer.
         assert source_path.startswith("./")
         assert source_path not in {".", "./"}
         resolved = (ROOT / source_path).resolve()
         assert (resolved / ".codex-plugin" / "plugin.json").is_file()
-        # Guard the common mistake: resolving relative to .agents/plugins would
-        # point at the marketplace folder, not the plugin root.
+        # Resolving this file relative to .agents/plugins demonstrates why the
+        # installer must generate a Codex-compatible marketplace root.
         assert not ((marketplace_path.parent / source_path) / ".codex-plugin" / "plugin.json").is_file()
 
     def test_readme_git_install_does_not_inline_long_running_start(self):

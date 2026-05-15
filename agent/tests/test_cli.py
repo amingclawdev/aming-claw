@@ -7,6 +7,11 @@ import pytest
 try:
     from click.testing import CliRunner
     from agent.cli import main
+    from agent.plugin_installer import (
+        configure_codex_plugin,
+        install_codex_marketplace,
+        install_codex_plugin_cache,
+    )
     HAS_CLICK = True
 except ImportError:
     HAS_CLICK = False
@@ -124,7 +129,7 @@ class TestCliPlugin:
                 "plugins": [
                     {
                         "name": "aming-claw",
-                        "source": {"source": "local", "path": "./"},
+                        "source": {"source": "local", "path": "./."},
                     }
                 ],
             },
@@ -140,8 +145,13 @@ class TestCliPlugin:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("---\nname: test\n---\n", encoding="utf-8")
 
-        config = tmp_path / "config.toml"
-        config.write_text('marketplace = "aming-claw-local"\nplugin = "aming-claw"\n', encoding="utf-8")
+        codex_home = tmp_path / "codex-home"
+        marketplace_root = install_codex_marketplace(tmp_path, marketplace_root=tmp_path / "marketplace-root")
+        install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+        config = configure_codex_plugin(
+            codex_config=codex_home / "config.toml",
+            marketplace_root=marketplace_root,
+        )
 
         result = runner.invoke(main, [
             "plugin",
@@ -150,6 +160,8 @@ class TestCliPlugin:
             str(tmp_path),
             "--codex-config",
             str(config),
+            "--codex-home",
+            str(codex_home),
             "--skip-governance",
         ])
 

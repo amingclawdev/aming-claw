@@ -102,6 +102,10 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
    the current Codex thread loaded the plugin. After installing or updating the
    plugin, tell the user to reload Codex or open a new Codex session, then
    verify that the Aming Claw skill and `mcp__aming_claw` tools are visible.
+   A reload only addresses current-session hot loading. If `codex exec` reports
+   `failed to load plugin`, `plugin is not installed`, or invalid marketplace
+   paths, run `aming-claw plugin install` and `aming-claw plugin doctor` first;
+   do not present reload as the primary fix.
    Treat ServiceManager/executor offline as degraded runtime, not as dashboard
    or governance failure.
 
@@ -139,10 +143,10 @@ claims are available.
 | `aming-claw scan --path <dir> --project-id <id>` | Scan an external project into a `.aming-claw` candidate workspace. |
 | `aming-claw start --port 40000 --workspace .` | Start governance in the foreground from a separate terminal/window. |
 | `aming-claw status` | GET `/api/health` against the running governance service. |
-| `aming-claw plugin doctor [--plugin-root <dir>] [--python <python3.9+>]` | Run read-only aftercare checks for plugin assets, marketplace path, MCP config, Codex config hints, Python runtime, dashboard assets, AI CLI probes, and governance health. |
+| `aming-claw plugin doctor [--plugin-root <dir>] [--python <python3.9+>]` | Run read-only aftercare checks for plugin assets, generated marketplace, versioned Codex plugin cache, MCP config, Codex config hints, Python runtime, dashboard assets, AI CLI probes, and governance health. |
 | `aming-claw open --governance-url <url>` | Open the dashboard in the default browser. |
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
-| `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, and print next steps. |
+| `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, install Codex cache/config, and print next steps. |
 | `aming-claw run-executor` | Start an executor worker directly. Normally ServiceManager owns this — only use for explicit debugging. |
 
 ## Project-Local Plugin Contract
