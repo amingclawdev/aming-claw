@@ -110,7 +110,7 @@ surprises users often enough that we call it out.
 
 ## Demos
 
-Short clips are being recorded — each placeholder image will be replaced with the actual GIF or video.
+Recorded clips of the V1 workflows.
 
 ### Install and verify
 
@@ -147,12 +147,6 @@ Run targeted AI Enrich, watch Operations Queue, then accept or reject the Review
 ![Governance Hint — bind an orphan file to a node via a committed comment](docs/assets/demos/governance-hint.gif)
 
 Bind an orphan doc/test/config file to a node, commit the hint, run Update Graph.
-
-### Shared AI cockpit
-
-![coming soon](docs/assets/demos/shared-cockpit-placeholder.svg)
-
-Use browser-use/dashboard inspection while MCP queries confirm the same node, queue, or backlog state.
 
 ## Use Cases
 
