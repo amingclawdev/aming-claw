@@ -567,6 +567,126 @@ def _check_marketplace(plugin_root: Path) -> DoctorCheck:
     )
 
 
+def _check_claude_marketplace(plugin_root: Path) -> DoctorCheck:
+    marketplace_path = plugin_root / ".claude-plugin" / "marketplace.json"
+    try:
+        marketplace = _read_json_file(marketplace_path)
+    except Exception as exc:
+        return _doctor_check("claude_marketplace", "fail", f"{marketplace_path}: {exc}")
+
+    if not isinstance(marketplace, dict):
+        return _doctor_check("claude_marketplace", "fail", f"{marketplace_path}: top-level must be an object")
+    if not str(marketplace.get("name") or "").strip():
+        return _doctor_check("claude_marketplace", "fail", "missing top-level `name`")
+
+    owner = marketplace.get("owner")
+    if not isinstance(owner, dict) or not str(owner.get("name") or "").strip():
+        return _doctor_check("claude_marketplace", "fail", "missing or empty `owner.name`")
+
+    plugins = marketplace.get("plugins")
+    match = next(
+        (
+            item
+            for item in plugins or []
+            if isinstance(item, dict) and item.get("name") == "aming-claw"
+        ),
+        None,
+    )
+    if not match:
+        return _doctor_check("claude_marketplace", "fail", "missing plugin entry `aming-claw`")
+
+    source = str(match.get("source") or "").strip()
+    if not source:
+        return _doctor_check("claude_marketplace", "fail", "missing plugins[].source")
+    if not source.startswith("./"):
+        # Claude Code 2.1.140 rejects bare "." as Invalid input; "./" is the
+        # canonical relative form (see MF-2026-05-15-CLAUDE-MARKETPLACE-SOURCE-SCHEMA).
+        return _doctor_check(
+            "claude_marketplace",
+            "fail",
+            f"plugins[].source={source!r} must start with './' (Claude Code rejects bare '.' as Invalid input)",
+        )
+
+    metadata = marketplace.get("metadata")
+    if not isinstance(metadata, dict) or not str(metadata.get("description") or "").strip():
+        # claude plugin validate warns when metadata.description is missing.
+        return _doctor_check(
+            "claude_marketplace",
+            "warn",
+            f"{marketplace_path}: missing metadata.description (claude plugin validate warns)",
+        )
+
+    return _doctor_check(
+        "claude_marketplace",
+        "ok",
+        f"{marketplace_path} -> name={marketplace.get('name')!r} source={source!r} metadata.description set",
+    )
+
+
+def _check_claude_manifest(plugin_root: Path) -> DoctorCheck:
+    manifest_path = plugin_root / ".claude-plugin" / "plugin.json"
+    try:
+        manifest = _read_json_file(manifest_path)
+    except Exception as exc:
+        return _doctor_check("claude_manifest", "fail", f"{manifest_path}: {exc}")
+
+    if not isinstance(manifest, dict):
+        return _doctor_check("claude_manifest", "fail", f"{manifest_path}: top-level must be an object")
+    for field in ("name", "version", "description"):
+        if not str(manifest.get(field) or "").strip():
+            return _doctor_check("claude_manifest", "fail", f"missing or empty `{field}`")
+
+    mcp_servers = manifest.get("mcpServers")
+    if mcp_servers is None:
+        # mcpServers is optional in the Claude Code schema; without it the plugin
+        # install will not expose any MCP server (see MF #2a manifest fix).
+        return _doctor_check(
+            "claude_manifest",
+            "warn",
+            f"{manifest_path}: no `mcpServers` declared; plugin install will not expose an MCP server",
+        )
+
+    if isinstance(mcp_servers, str):
+        if not mcp_servers.strip():
+            return _doctor_check("claude_manifest", "fail", "`mcpServers` path is empty")
+    elif isinstance(mcp_servers, dict):
+        if not mcp_servers:
+            return _doctor_check("claude_manifest", "fail", "`mcpServers` object is empty")
+        for server_name, spec in mcp_servers.items():
+            if not isinstance(spec, dict):
+                return _doctor_check(
+                    "claude_manifest",
+                    "fail",
+                    f"mcpServers[{server_name!r}] must be an object",
+                )
+            command = str(spec.get("command") or "").strip()
+            if not command:
+                return _doctor_check(
+                    "claude_manifest",
+                    "fail",
+                    f"mcpServers[{server_name!r}].command must be non-empty",
+                )
+            args = spec.get("args")
+            if not isinstance(args, list):
+                return _doctor_check(
+                    "claude_manifest",
+                    "fail",
+                    f"mcpServers[{server_name!r}].args must be a list",
+                )
+    else:
+        return _doctor_check(
+            "claude_manifest",
+            "fail",
+            "`mcpServers` must be a path string or an object map of server specs",
+        )
+
+    return _doctor_check(
+        "claude_manifest",
+        "ok",
+        f"{manifest_path} -> name={manifest.get('name')!r} mcpServers declared",
+    )
+
+
 def _check_mcp_config(plugin_root: Path) -> DoctorCheck:
     path = plugin_root / ".mcp.json"
     try:
@@ -805,6 +925,8 @@ def doctor_plugin(
     result.checks.append(_python_version_check(python_executable or sys.executable))
     result.checks.append(_check_codex_manifest(root))
     result.checks.append(_check_marketplace(root))
+    result.checks.append(_check_claude_manifest(root))
+    result.checks.append(_check_claude_marketplace(root))
     result.checks.append(_check_mcp_config(root))
     codex_config_path = Path(codex_config).expanduser() if codex_config else default_codex_config_path()
     result.checks.append(_check_codex_config(codex_config_path))

@@ -10,6 +10,8 @@ from agent.plugin_installer import (
     CODEX_PLUGIN_ID,
     PluginInstallError,
     _check_ai_cli,
+    _check_claude_manifest,
+    _check_claude_marketplace,
     configure_codex_plugin,
     doctor_plugin,
     format_result,
@@ -36,8 +38,25 @@ def _write_plugin_fixture(root: Path) -> None:
                 }
             ],
         },
-        ".claude-plugin/plugin.json": {"name": "aming-claw"},
-        ".claude-plugin/marketplace.json": {"name": "aming-claw-local", "plugins": []},
+        ".claude-plugin/plugin.json": {
+            "name": "aming-claw",
+            "version": "0.1.0",
+            "description": "Test plugin.",
+            "mcpServers": {
+                "aming-claw": {
+                    "command": "python",
+                    "args": ["-m", "agent.mcp.server"],
+                }
+            },
+        },
+        ".claude-plugin/marketplace.json": {
+            "name": "aming-claw-local",
+            "metadata": {"description": "Test marketplace."},
+            "owner": {"name": "Aming Claw"},
+            "plugins": [
+                {"name": "aming-claw", "source": "./", "version": "0.1.0"}
+            ],
+        },
         ".mcp.json": {"mcpServers": {"aming-claw": {"command": "python"}}},
     }.items():
         path = root / rel
@@ -125,6 +144,8 @@ def test_doctor_plugin_validates_aftercare_without_governance(tmp_path):
         "plugin_assets",
         "codex_marketplace",
         "codex_plugin_cache",
+        "claude_marketplace",
+        "claude_manifest",
         "mcp_config",
         "codex_config",
         "dashboard_static_assets",
@@ -285,3 +306,115 @@ def test_install_from_git_rejects_unsupported_python_before_pip(tmp_path, monkey
             python_executable="old-python",
             install_package=True,
         )
+
+
+def test_check_claude_marketplace_passes_on_valid_manifest(tmp_path):
+    claude_dir = tmp_path / ".claude-plugin"
+    claude_dir.mkdir()
+    (claude_dir / "marketplace.json").write_text(
+        json.dumps({
+            "name": "aming-claw-local",
+            "metadata": {"description": "Test marketplace."},
+            "owner": {"name": "Aming Claw"},
+            "plugins": [
+                {"name": "aming-claw", "source": "./", "version": "0.1.0"}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    check = _check_claude_marketplace(tmp_path)
+    assert check.status == "ok"
+
+
+def test_check_claude_marketplace_fails_on_bare_dot_source(tmp_path):
+    """MF #1 P0: claude plugin validate rejects plugins[].source=='.' as Invalid input."""
+    claude_dir = tmp_path / ".claude-plugin"
+    claude_dir.mkdir()
+    (claude_dir / "marketplace.json").write_text(
+        json.dumps({
+            "name": "aming-claw-local",
+            "metadata": {"description": "Test."},
+            "owner": {"name": "Aming Claw"},
+            "plugins": [
+                {"name": "aming-claw", "source": ".", "version": "0.1.0"}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    check = _check_claude_marketplace(tmp_path)
+    assert check.status == "fail"
+    assert "must start with './'" in check.detail
+
+
+def test_check_claude_marketplace_warns_on_missing_metadata_description(tmp_path):
+    """MF #1 secondary: claude plugin validate warns when metadata.description is missing."""
+    claude_dir = tmp_path / ".claude-plugin"
+    claude_dir.mkdir()
+    (claude_dir / "marketplace.json").write_text(
+        json.dumps({
+            "name": "aming-claw-local",
+            "owner": {"name": "Aming Claw"},
+            "plugins": [
+                {"name": "aming-claw", "source": "./", "version": "0.1.0"}
+            ],
+        }),
+        encoding="utf-8",
+    )
+    check = _check_claude_marketplace(tmp_path)
+    assert check.status == "warn"
+    assert "metadata.description" in check.detail
+
+
+def test_check_claude_manifest_passes_when_mcpservers_declared(tmp_path):
+    """MF #2a: declared mcpServers is the manifest-level fix."""
+    claude_dir = tmp_path / ".claude-plugin"
+    claude_dir.mkdir()
+    (claude_dir / "plugin.json").write_text(
+        json.dumps({
+            "name": "aming-claw",
+            "version": "0.1.0",
+            "description": "Test plugin.",
+            "mcpServers": {
+                "aming-claw": {
+                    "command": "python",
+                    "args": ["-m", "agent.mcp.server"],
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    check = _check_claude_manifest(tmp_path)
+    assert check.status == "ok"
+
+
+def test_check_claude_manifest_warns_when_no_mcpservers(tmp_path):
+    """Without mcpServers the Claude plugin install will not expose an MCP server."""
+    claude_dir = tmp_path / ".claude-plugin"
+    claude_dir.mkdir()
+    (claude_dir / "plugin.json").write_text(
+        json.dumps({
+            "name": "aming-claw",
+            "version": "0.1.0",
+            "description": "Test plugin.",
+        }),
+        encoding="utf-8",
+    )
+    check = _check_claude_manifest(tmp_path)
+    assert check.status == "warn"
+    assert "mcpServers" in check.detail
+
+
+def test_check_claude_manifest_fails_when_required_field_missing(tmp_path):
+    claude_dir = tmp_path / ".claude-plugin"
+    claude_dir.mkdir()
+    (claude_dir / "plugin.json").write_text(
+        json.dumps({
+            "name": "aming-claw",
+            "version": "0.1.0",
+            # description intentionally missing
+        }),
+        encoding="utf-8",
+    )
+    check = _check_claude_manifest(tmp_path)
+    assert check.status == "fail"
+    assert "description" in check.detail
