@@ -29,7 +29,7 @@ Help the user start and verify Aming Claw locally. Never spawn governance silent
    exits. If another process owns the port, it reports a conflict. Otherwise it
    runs `start_governance.main` as a long-running foreground service; do not run
    that path as a normal one-shot Codex tool call and wait for it to exit.
-   ServiceManager is started independently (see project rules in `CLAUDE.md`);
+   ServiceManager is started independently;
    do not let the plugin session spawn executor workers.
 
 3. Confirm health (CLI):
@@ -152,8 +152,7 @@ claims are available.
 ## Project-Local Plugin Contract
 
 - MCP server config: `.mcp.json` at repo root, stdio entrypoint `python -m agent.mcp.server --project aming-claw --workers 0 --governance-url http://localhost:40000`. Plugin sessions keep `--workers 0`; ServiceManager owns executor lifecycle.
-- Project rules: `CLAUDE.md` at repo root (graph-first discovery, backlog before mutation, MF SOP, dashboard E2E impact).
-- This skill is auto-discovered through the Claude Code plugin manifest at `.claude-plugin/plugin.json`. It is namespaced as `/aming-claw:aming-claw-launcher`.
+- This skill is auto-discovered through the Claude Code plugin manifest at `.claude-plugin/plugin.json`. It is namespaced as `/aming-claw:aming-claw-launcher`. (Note: `CLAUDE.md` at repo root is **workspace** project rules — loaded by Claude Code when the repo is opened as a workspace, not part of plugin context; plugin-time guidance lives in this skill.)
 
 ## Offline / Fresh Install
 
@@ -239,5 +238,5 @@ Use the main `aming-claw` skill (`skills/aming-claw/SKILL.md`) for:
 
 - Main governance skill: [SKILL.md](../aming-claw/SKILL.md).
 - CLI source: [cli.py](../../agent/cli.py).
-- Project rules: [CLAUDE.md](../../CLAUDE.md).
+- Workspace project rules: [CLAUDE.md](../../CLAUDE.md) (workspace-only context; plugin-time guidance lives in this skill, not in CLAUDE.md).
 - Plugin packaging notes: [plugin-packaging.md](../aming-claw/references/plugin-packaging.md).
