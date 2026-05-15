@@ -114,7 +114,7 @@ Short clips are being recorded — each placeholder image will be replaced with 
 
 ### Install and verify
 
-![coming soon](docs/assets/demos/install-verify-placeholder.svg)
+![Install and verify — URL drop, plugin doctor, governance start, dashboard opens](docs/assets/demos/install-verify.gif)
 
 URL drop → `aming-claw plugin doctor` → `aming-claw start` → open `/dashboard`.
 
@@ -126,25 +126,25 @@ Choose a clean project, build the graph, watch nodes appear in Projects/Graph.
 
 ### Inspect code through the graph
 
-![coming soon](docs/assets/demos/inspect-placeholder.svg)
+![Inspect the graph — select a node and jump to functions, relations, and files](docs/assets/demos/inspect.gif)
 
 Select a node, open Files / Functions / Relations, jump to a function line in the editor.
 
 ### Find a PR opportunity
 
-![coming soon](docs/assets/demos/pr-opportunity-placeholder.svg)
+![Find a PR opportunity — turn graph evidence into a backlog row](docs/assets/demos/pr-opportunity.gif)
 
 Use low health, missing tests/docs, or high fan-out to file a graph-backed backlog row.
 
 ### AI Enrich review
 
-![coming soon](docs/assets/demos/ai-enrich-placeholder.svg)
+![AI Enrich review — queue, propose, accept or reject in Review Queue](docs/assets/demos/ai-enrich.gif)
 
 Run targeted AI Enrich, watch Operations Queue, then accept or reject the Review Queue proposal.
 
 ### Governance Hint
 
-![coming soon](docs/assets/demos/governance-hint-placeholder.svg)
+![Governance Hint — bind an orphan file to a node via a committed comment](docs/assets/demos/governance-hint.gif)
 
 Bind an orphan doc/test/config file to a node, commit the hint, run Update Graph.
 
