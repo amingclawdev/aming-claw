@@ -240,23 +240,63 @@ when the user's prompt contains an explicit completion trigger:
 When triggered, run the bootstrap with tool calls instead of showing commands
 to the user:
 
-1. If `aming-claw` is not on `PATH`, install the Python runtime first. For a
-   Claude Code session the marketplace clone is typically at
-   `~/.claude/plugins/marketplaces/aming-claw-local` (Windows:
-   `%USERPROFILE%\.claude\plugins\marketplaces\aming-claw-local`); run
-   `pip install -e <that-path>`. If the CLI is already on `PATH`, prefer
-   `aming-claw plugin install <git-url>` — it does pip install + marketplace
-   refresh + versioned Codex cache in one call.
-2. Start governance in the background — `aming-claw start` is long-running and
-   will block the foreground tool call:
+1. **Install plugin (marketplace + cache).** Try Claude Code slash commands
+   first:
+   - `/plugin marketplace add <git-url>`
+   - `/plugin install <plugin-name>@<marketplace-id>` (typically
+     `aming-claw@aming-claw-local`)
+
+   `/plugin` is a CLI-harness slash command, not a tool. If the assistant gets
+   "tool not available", "slash commands cannot be invoked from a tool", or
+   similar errors, **do NOT ask the user to type the slash commands**. Fall
+   back to manual replication — `/plugin` only does file-level work that the
+   assistant can do too:
+
+   a. `git clone --depth=1 <git-url> ~/.claude/plugins/marketplaces/<marketplace-id>/`
+      (Windows path: `%USERPROFILE%\.claude\plugins\marketplaces\<marketplace-id>\`).
+   b. Read `.claude-plugin/marketplace.json` from the clone to get the plugin
+      name and version (currently `aming-claw` / `0.1.0`).
+   c. Copy the marketplace clone into the plugin cache and drop `.git`:
+      `mkdir -p ~/.claude/plugins/cache/<marketplace-id>/<plugin>/ &&`
+      `cp -R ~/.claude/plugins/marketplaces/<marketplace-id> ~/.claude/plugins/cache/<marketplace-id>/<plugin>/<version> &&`
+      `rm -rf ~/.claude/plugins/cache/<marketplace-id>/<plugin>/<version>/.git`.
+      On Windows use `New-Item -ItemType Directory -Force` + `Copy-Item -Recurse` +
+      `Remove-Item -Recurse -Force`.
+   d. **Merge** (do not overwrite) an entry into
+      `~/.claude/plugins/installed_plugins.json` for
+      `"<plugin>@<marketplace-id>"`:
+      `{"scope": "user", "installPath": "<abs path to cache .../<version>/>",`
+      `"version": "<version>", "installedAt": "<ISO-8601 UTC now>",`
+      `"lastUpdated": "<ISO-8601 UTC now>",`
+      `"gitCommitSha": "<marketplace HEAD sha>"}`.
+   e. **Merge** an entry into `~/.claude/plugins/known_marketplaces.json` for
+      `<marketplace-id>`:
+      `{"source": {"source": "github", "repo": "<owner>/<repo>"},`
+      `"installLocation": "<abs path to marketplaces/<marketplace-id>>",`
+      `"lastUpdated": "<ISO-8601 UTC now>"}`.
+
+2. **Install Python runtime.** Run `pip install -e <abs path to marketplace
+   clone>`. If `aming-claw` is already on `PATH`, prefer `aming-claw plugin
+   install <git-url>` — that wraps pip install + marketplace refresh +
+   versioned Codex cache in one call.
+
+3. **Start governance in the background** — `aming-claw start` is long-running
+   and will block the foreground tool call:
    - Windows: `Start-Process powershell -ArgumentList "-NoExit","-Command","aming-claw start"`.
    - macOS/Linux: `nohup aming-claw start > ~/.aming-claw/start.log 2>&1 &`.
-3. Poll `aming-claw status` (or `GET http://localhost:40000/api/health`) for up
-   to ~30 seconds until governance reports healthy on port `40000`.
-4. Run `aming-claw open` to launch the dashboard.
-5. Tell the user the dashboard is up at `http://localhost:40000/dashboard` and
-   ask them to reload Claude Code (or open a new session) so the plugin's MCP
-   tools and skills load in the active session.
+
+4. **Poll** `aming-claw status` (or `GET http://localhost:40000/api/health`) for
+   up to ~30 seconds until governance reports healthy on port `40000`.
+
+5. **Open the dashboard.** Run `aming-claw open`.
+
+6. **Announce the new-session requirement.** Do not phrase this as "reload and
+   then it works" — the dashboard works *now* in the current session, but
+   skills and MCP tools require a new session. Say something close to:
+
+   > "Plugin is installed. The dashboard works now. To use Aming Claw skills
+   > and MCP tools inside Claude Code conversations, open a new Claude Code
+   > session."
 
 Do not enter one-shot mode when:
 

@@ -72,6 +72,32 @@ aming-claw" or "one-shot install" trigger the launcher skill's one-shot
 mode for re-bootstrap in future sessions. First-run troubleshooting and
 raw installer scripts are in [Install Details](#install-details).
 
+### After installation: open a new Claude Code session
+
+The Claude Code session you installed Aming Claw in **won't** load the plugin's
+skills or MCP tools — Claude Code reads plugin paths at session start, so
+changes apply only to **new** sessions.
+
+**Works immediately (no new session needed):**
+
+- The `aming-claw` CLI on your `PATH`
+- `aming-claw start` brings up governance on port `40000`
+- The dashboard at `http://localhost:40000/dashboard`
+- `aming-claw open` to launch a browser to it
+
+**Requires a new session:**
+
+- The `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher` skills
+- The `mcp__plugin_aming-claw_aming-claw__*` MCP tools (`health`,
+  `runtime_status`, `task_*`, `backlog_*`, `graph_*`, etc.)
+
+> **TL;DR**: After install, open a new Claude Code session to use Aming Claw
+> *inside* your Claude Code conversations. The dashboard works in the current
+> session.
+
+This is a Claude Code framework behavior, not specific to Aming Claw — but it
+surprises users often enough that we call it out.
+
 ## Key Terms
 
 - **Commit-bound graph** — graph state pinned 1:1 to a specific git commit; queries return what was true at that commit. The snapshot id encodes the commit (e.g. `scope-aefef99-a554`).
