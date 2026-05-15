@@ -1,26 +1,37 @@
 # Aming Claw — System Architecture
 
 > **Canonical architecture document** — Single source of truth for the Aming Claw system architecture.
-> Last updated: 2026-04-05 | Phase 2 Documentation Consolidation
+> Last updated: 2026-05-15 | Trailer-priority version-gate update
 
 ## 1. Overview
 
-Aming Claw is an AI-driven project governance system that coordinates multiple agent roles (Coordinator, PM, Dev, Tester, QA, Observer) through an automated task chain. The system runs as **host-based services** with optional Docker dependencies for auxiliary services.
+Aming Claw V1 is a local graph-first governance system. Its stable MVP path is:
+register a target project, build a commit-bound graph, inspect the project
+through dashboard/MCP tools, file evidence-backed backlog, and execute small
+Manual Fix changes with tests and graph updates.
+
+The broader system also contains an automated multi-role chain
+(Coordinator, PM, Dev, Tester, QA, Observer), but that chain/executor path is
+experimental in V1. Treat it as an advanced capability rather than the default
+user workflow.
 
 ### Design Principles
 
+- **Commit-bound graph as state variable** — every graph snapshot is pinned 1:1 to a git commit, so queries return what was true at that commit. Updating code requires re-materializing the snapshot; the graph is not edited in place.
 - **SQLite is the source of truth** — semantic layers (FTS5, embeddings) help *find* objects; they never serve as final state.
 - **Rules before AI** — conflict detection and task routing use zero-token rule engines before invoking AI models.
 - **Degrade before interrupt** — mem0/semantic search down falls back to FTS5; index write failure preserves the primary record with async retry.
+- **Source-controlled graph mutations** — graph corrections enter through tracked-file mechanisms (Governance Hint comments, accepted Review Queue proposals, backfill evidence with `backfill_reason`), not direct state writes. Every change is auditable through git history.
 - **Single responsibility** — each component owns exactly one concern.
 
 ## 2. Component Architecture
 
 ```
 Host Machine (primary runtime)
-├── Governance Service     :40000   ← Rule engine, task registry, workflow, audit, memory, auto-chain
-├── Service Manager                 ← Executor supervisor (monitor thread, circuit breaker)
-└── Executor Worker                 ← Task execution via Claude CLI / provider backends
+├── Governance Service     :40000   ← Dashboard, project registry, graph, backlog, review, API
+├── MCP Server                      ← Graph/backlog/runtime tools for Codex/Claude sessions
+├── Service Manager                 ← Optional executor supervisor for chain automation
+└── Executor Worker                 ← Experimental V1 task execution path
 
 Optional Docker Dependencies
 ├── Telegram Gateway       :40010   ← Message ingress/egress
@@ -30,7 +41,17 @@ Optional Docker Dependencies
 
 ### 2.1 Governance Service (`:40000`)
 
-The governance service is the central control plane, running on the host at `http://localhost:40000`. It provides:
+The governance service is the central control plane, running on the host at
+`http://localhost:40000`. In V1 it provides:
+
+- **Dashboard** — local UI served at `/dashboard`
+- **Project Registry** — registered workspaces, AI routing, graph status
+- **Graph Governance** — commit-bound snapshots, graph query, file inventory,
+  semantic projection, and Update Graph
+- **Backlog** — canonical issue/work ledger
+- **Review Queue** — human approval gate for AI-generated semantics
+
+It also provides advanced and legacy surfaces:
 
 - **Task Registry** — CRUD for tasks with status lifecycle (queued → claimed → succeeded/failed)
 - **Workflow Engine** — Acceptance graph import, node state tracking, verify-update API
@@ -142,9 +163,13 @@ When `observer_mode=ON`:
 - Marking nodes as t2_pass/qa_pass without verification
 - Skipping governance chain for code changes
 
-## 4. Auto-Chain Pipeline
+## 4. Auto-Chain Pipeline (Experimental In V1)
 
-The auto-chain is the core workflow automation that progresses tasks through governance stages.
+The auto-chain is the long-term workflow automation that progresses tasks
+through governance stages. It is not the default V1 implementation path. For
+ordinary V1 fixes and features, use Manual Fix with backlog-first, graph-first,
+focused tests, Chain trailers, post-commit Update Graph, and backlog close
+evidence.
 
 ### Stage Sequence
 
@@ -221,19 +246,33 @@ Key file: `agent/governance/conflict_rules.py`
 
 ## 7. Version Control Integration
 
-### Version Gate
+### Version Gate (Trailer-Priority, 2026-05-01 migration)
 
-The executor syncs git HEAD to governance DB every 60s (only on change). The version gate checks:
-- `chain_version` in DB matches current git HEAD
-- Dirty files check (excluding `.claude/` paths)
-- Downgraded to warning-only (D3 fix) to prevent false blocks
+`chain_version` is derived from the git `Chain-Source-Stage` trailer, not from a
+DB column. The gate walks back from `HEAD` until it finds a commit carrying a
+`Chain-Source-Stage:` trailer (e.g. `observer-hotfix`, `merge`, `deploy`) and
+treats that commit's short hash as the canonical chain anchor.
+
+- `chain_trailer.get_chain_state()` is the primary read path used by
+  `handle_version_check` in `agent/governance/server.py`.
+- `POST /api/version-update` is **deprecated** — it returns
+  `{"deprecated_write_ignored": true, "source": "git_trailer"}` and no longer
+  updates state. Any pre-trailer code path that wrote `chain_version` to the DB
+  is now a no-op.
+- Manual Fix commits MUST include a `Chain-Source-Stage:` trailer (typical value
+  `observer-hotfix`). Without the trailer the walker falls back to an earlier
+  trailered commit, leaving `HEAD != CHAIN_VERSION` and blocking dispatch.
+- Dirty-file scope excludes `.claude/` paths (D5 fix) and uses prefix-match for
+  short vs. full hashes (B35 fix).
 
 ### Merge Flow
 
-1. Dev task completes in worktree branch
-2. Merge stage cherry-picks/merges to main
-3. `version-update` API called with new HEAD
-4. `chain_version` updated in governance DB
+1. Dev task completes in worktree branch.
+2. Merge stage cherry-picks/merges to main and writes a commit carrying
+   `Chain-Source-Stage: merge` (or `observer-hotfix` for MF).
+3. Next `version_check` walks the trailer chain on the current git HEAD; the
+   newly trailered commit becomes the chain anchor immediately, no DB write
+   required.
 
 ## 8. API Surface
 
@@ -283,6 +322,8 @@ Redis Pub/Sub → Telegram Reply
 
 ## 10. Symmetric Redeploy Architecture (PR-2: sm↔gov contract)
 
+> Experimental in V1 — the redeploy contract is exercised by the chain-automation deploy stage. The V1 local plugin path does not require it.
+
 The governance service and service manager implement a **symmetric redeploy** contract where each service can restart the other, but neither can restart itself. This prevents the indeterminate state that occurs when a process attempts self-restart.
 
 ### Contract Design
@@ -316,6 +357,8 @@ Service Manager (SM)                    Governance Service (GOV)
 - Both endpoints share the same 5-step pipeline: validate → lock → signal → restart → health-check
 
 ## 11. Auto-Infer Pipeline (A4a: dev → QA hook)
+
+> Experimental in V1 — the auto-infer hook runs in the chain-automation Dev → QA transition. V1 Manual Fix flows use explicit Update Graph after commit instead.
 
 The auto-infer pipeline automatically infers acceptance graph changes from dev task outputs. This replaces the manual process of updating `acceptance-graph.md` after code changes.
 

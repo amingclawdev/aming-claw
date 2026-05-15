@@ -1,21 +1,281 @@
 # Aming Claw
 
-Aming Claw is a local AI governance workspace for turning a codebase into a
-queryable graph, then using that graph to guide AI-assisted issue discovery,
-backlog filing, and PR work.
+Aming Claw turns your codebase into a **commit-bound queryable graph** that
+Codex and Claude Code share as a substrate — for code understanding, multi-AI
+collaboration, evidence-backed backlog, and auditable AI-assisted changes.
 
-The MVP is intentionally local-first: clone the repo, start the governance
-service, load the Codex or Claude Code plugin from the cloned checkout, then use
-the dashboard and MCP tools against your projects.
+Local-first MVP: clone the repo, start the governance service, install the
+Codex or Claude Code plugin, then use the dashboard and MCP tools against your
+projects.
+
+## Contents
+
+- [Quick Start](#quick-start)
+- [Key Terms](#key-terms)
+- [Demos](#demos)
+- [Use Cases](#use-cases)
+- [V1 MVP Snapshot](#v1-mvp-snapshot)
+- [Install Details](#install-details)
+- [Runtime Boundaries](#runtime-boundaries)
+- [Plugin Components](#plugin-components)
+- [Workflow](#workflow)
+- [CLI](#cli)
+- [Packaging](#packaging)
+- [Governance Contract](#governance-contract)
+- [Status & Contributing](#status--contributing)
+- [Documentation](#documentation)
+- [License](#license)
 
 ## Quick Start
 
-Requirements:
+Start with the AI host you use. The longer requirements, raw installer commands,
+and troubleshooting notes are in [Install Details](#install-details).
+
+### Codex
+
+Ask Codex to install from the GitHub repo:
+
+```text
+Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
+```
+
+If the `aming-claw` CLI is already available, you can run the same install
+directly:
+
+```bash
+aming-claw plugin install https://github.com/amingclawdev/aming-claw
+```
+
+Reload Codex or open a new Codex session after install. First-run startup and
+verification steps are in [Install Details](#install-details).
+
+### Claude Code
+
+Paste this once — Claude bootstraps the plugin end-to-end:
+
+```text
+Install aming-claw end-to-end from https://github.com/amingclawdev/aming-claw:
+1. Run `/plugin marketplace add https://github.com/amingclawdev/aming-claw`
+2. Run `/plugin install aming-claw@aming-claw-local`
+3. pip install -e the marketplace clone at
+   ~/.claude/plugins/marketplaces/aming-claw-local
+   (Windows: %USERPROFILE%\.claude\plugins\marketplaces\aming-claw-local)
+4. Start `aming-claw start` in a background terminal
+5. Run `aming-claw open` to launch the dashboard
+6. Remind me to reload Claude Code so the plugin's MCP tools and skills load
+```
+
+Steps 1–2 only copy the skill files; pip install adds the Python runtime,
+`aming-claw start` boots governance on port `40000`, `aming-claw open`
+launches the dashboard. After reloading, phrases like "install and start
+aming-claw" or "one-shot install" trigger the launcher skill's one-shot
+mode for re-bootstrap in future sessions. First-run troubleshooting and
+raw installer scripts are in [Install Details](#install-details).
+
+## Key Terms
+
+- **Commit-bound graph** — graph state pinned 1:1 to a specific git commit; queries return what was true at that commit. The snapshot id encodes the commit (e.g. `scope-aefef99-a554`).
+- **Manual Fix (MF)** — the audit-trailed change workflow: predeclare a backlog row → graph-first discovery → scoped edit → focused tests → commit with Chain trailers → graph reconcile → close the row. V1's default implementation path in place of chain automation.
+- **Update Graph / scope reconcile** — re-materialize the graph snapshot to track new commits. Triggered after a Manual Fix lands so subsequent queries see the latest code.
+- **Operations Queue** — dashboard view of in-flight graph operations: snapshot builds, semantic enrichment jobs, reconcile work, governance hint patches.
+- **Review Queue** — dashboard view where AI-proposed semantic memories wait for human accept/reject; nothing becomes trusted project memory until an operator approves.
+- **Governance Hint** — graph mutation written as a comment in a tracked file (committed, then applied at the next reconcile). Source-controlled, reversible, audit-trailed — the only safe way to bind orphan doc/test/config files to nodes.
+- **AI Enrich** — request the AI provider to generate a semantic summary/intent/risk for selected nodes or edges. Proposals land in Review Queue; the AI provider is the local `claude` or `codex` CLI (see [AI Providers](#ai-providers)).
+
+## Demos
+
+Short clips are being recorded — each placeholder image will be replaced with the actual GIF or video.
+
+### Install and verify
+
+![coming soon](docs/assets/demos/install-verify-placeholder.svg)
+
+URL drop → `aming-claw plugin doctor` → `aming-claw start` → open `/dashboard`.
+
+### Bootstrap a project
+
+![coming soon](docs/assets/demos/bootstrap-placeholder.svg)
+
+Choose a clean project, build the graph, watch nodes appear in Projects/Graph.
+
+### Inspect code through the graph
+
+![coming soon](docs/assets/demos/inspect-placeholder.svg)
+
+Select a node, open Files / Functions / Relations, jump to a function line in the editor.
+
+### Find a PR opportunity
+
+![coming soon](docs/assets/demos/pr-opportunity-placeholder.svg)
+
+Use low health, missing tests/docs, or high fan-out to file a graph-backed backlog row.
+
+### AI Enrich review
+
+![coming soon](docs/assets/demos/ai-enrich-placeholder.svg)
+
+Run targeted AI Enrich, watch Operations Queue, then accept or reject the Review Queue proposal.
+
+### Governance Hint
+
+![coming soon](docs/assets/demos/governance-hint-placeholder.svg)
+
+Bind an orphan doc/test/config file to a node, commit the hint, run Update Graph.
+
+### Shared AI cockpit
+
+![coming soon](docs/assets/demos/shared-cockpit-placeholder.svg)
+
+Use browser-use/dashboard inspection while MCP queries confirm the same node, queue, or backlog state.
+
+## Use Cases
+
+### Govern AI-assisted fixes
+
+For V1, use Manual Fix rather than chain automation for normal implementation:
+file/update backlog, inspect the graph first, edit only scoped files, run
+focused tests, commit with evidence, then Update Graph.
+
+### Hand off work between AI agents
+
+Use graph, backlog, queue state, and commit evidence as the shared project
+ledger between Codex, Claude Code, and future agent workers. One AI can file a
+backlog row, another can inspect the same graph evidence, implement a scoped
+fix, and a third can review or continue the task without depending on fragile
+chat history.
+
+### Share the dashboard view with an AI agent
+
+Keep the dashboard open while Codex or Claude Code uses MCP graph tools. The
+human sees project health, graph structure, queue state, review proposals, and
+backlog; the AI uses the same evidence to explain and act.
+
+### Find credible PR opportunities
+
+Use the graph to inspect unknown open-source projects, locate weak modules,
+missing tests/docs, high fan-out functions, stale semantics, and isolated files.
+Turn the evidence into backlog rows before implementing a focused PR.
+
+### Review semantic memory before trusting it
+
+Run AI Enrich on selected nodes or edges, then accept or reject the proposal in
+Review Queue. `ai_complete` means the AI produced a proposal, not that the
+project memory is trusted.
+
+### Repair graph structure safely
+
+Use Governance Hint to bind orphan doc/test/config files to an existing node.
+The hint is written as source-controlled evidence and only takes effect after
+commit plus Update Graph.
+
+## V1 MVP Snapshot
+
+Aming Claw V1 is focused on one practical loop: help a human and an AI agent
+understand a local project through a commit-bound graph, find credible PR
+opportunities, record them in backlog, and execute small governed fixes.
+
+Stable V1 capabilities:
+
+- Register a target project explicitly, then build or update its local graph.
+- Explore nodes, files, functions, docs, tests, relations, fan-in/fan-out, and
+  bounded source excerpts through the dashboard or MCP graph tools.
+- Use the dashboard as a shared visual control plane for the user and AI
+  session.
+- File backlog rows with graph evidence and use Manual Fix discipline for
+  implementation work.
+- Run targeted AI Enrich on selected nodes or edges, then accept or reject the
+  proposed semantic memory in Review Queue.
+- Use Governance Hint to bind orphan doc/test/config files to existing nodes
+  through source-controlled evidence.
+
+V1 boundaries to keep visible:
+
+- Chain dev/test/qa/merge automation is experimental. The recommended V1
+  implementation path is Manual Fix with backlog-first, graph-first, tests,
+  explicit commits, and Update Graph after commit.
+- ServiceManager/executor degraded means chain automation is degraded; it does
+  not mean governance, dashboard, graph query, or backlog are broken.
+- Full semantic coverage is not required for V1. AI-generated semantics are
+  proposals until reviewed and accepted.
+- Function-level call queries exist for supported snapshots, but dashboard
+  visualization is still evolving.
+- Governance Hint is not arbitrary graph editing. It only binds orphan
+  doc/test/config files that already appear in snapshot inventory.
+- Plugin install, governance startup, dashboard availability, MCP visibility,
+  ServiceManager health, and local AI CLI readiness are separate states.
+
+Best-fit V1 use cases:
+
+- Open-source contributors inspect unfamiliar projects through the graph, find
+  evidence-backed improvement opportunities (missing tests/docs, high-coupling
+  modules, stale semantics), and file focused PRs with graph-backed
+  justification.
+- AI agents use graph-first discovery instead of broad repository search when
+  onboarding to an unfamiliar project.
+- Maintainers use the dashboard to find missing tests/docs, high-coupling
+  modules, stale semantics, and reviewable backlog items.
+- A user and AI session share the same dashboard view while the AI performs
+  MCP-backed graph, backlog, and semantic operations.
+
+## Install Details
+
+### First Run And Verify
+
+Start governance in a separate terminal:
+
+```bash
+aming-claw start
+```
+
+Then open:
+
+```text
+http://localhost:40000/dashboard
+```
+
+Run the read-only check when you want to confirm the local install:
+
+```bash
+aming-claw plugin doctor
+```
+
+`aming-claw start` only starts the local governance service. It does not prove
+that Codex/Claude loaded the plugin, MCP tools, dashboard static files,
+ServiceManager, executor, or AI CLI auth.
+
+### Requirements
 
 - Python 3.9+
 - Git
 - Node.js/npm when rebuilding the dashboard from source
-- Codex or Claude Code for the plugin/skill workflow
+- Codex or Claude Code as the plugin host (loads skill + MCP tools)
+- A working `claude` and/or `codex` CLI on `PATH` — Aming Claw's AI features
+  (AI Enrich, semantic review, chain handlers that spawn AI sub-tasks) shell
+  out to the local CLI rather than calling Anthropic/OpenAI directly. See
+  [AI Providers](#ai-providers) below.
+
+### AI Providers
+
+AI-driven features in Aming Claw **call the local Claude Code or Codex CLI as
+a subprocess** — Aming Claw does not make direct API calls to Anthropic or
+OpenAI. As a consequence:
+
+- You need a working `claude` and/or `codex` executable on `PATH`. Override
+  the path with `CLAUDE_BIN` / `CODEX_BIN` env vars if needed.
+- The CLI must be **logged in**. Aming Claw probes `--version` to confirm the
+  binary exists, but cannot verify auth — `runtime_status` / `plugin doctor`
+  report `auth unknown` until a real model call succeeds.
+- Each project's AI config must declare a `semantic` provider/model
+  (`GET /api/projects/{project_id}/ai-config`). `openai` routes use the Codex
+  CLI; `anthropic` routes use the Claude Code CLI. AI Enrich is blocked if
+  the semantic route is unset.
+- `.env` `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are **not** consumed by AI
+  Enrich — the local CLI's own auth is the source of truth.
+
+If a CLI is missing or routing is unset, the dashboard's AI Enrich button
+surfaces the specific reason (e.g., `missing`, `routing missing`); structural
+graph queries, backlog, and Manual Fix still work without any AI CLI. See
+[Runtime Boundaries](#runtime-boundaries) for the full state model.
 
 If you are starting from a plugin host, give it the repository URL:
 
@@ -23,62 +283,28 @@ If you are starting from a plugin host, give it the repository URL:
 Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
 ```
 
-For Codex, this copy-paste prompt is the lowest-friction path when the
-`aming-claw` command is not installed or is not on `PATH` yet:
+For Codex, the lowest-friction path when `aming-claw` is not yet on `PATH` is
+to ask Codex to install from GitHub (the [Quick Start](#quick-start) prompt
+does this in one line). When you need the raw bootstrap script verbatim —
+Windows PowerShell or macOS/Linux `curl` — see
+[`docs/install/codex-bootstrap.md`](docs/install/codex-bootstrap.md).
+
+### Claude Code install detail
+
+In Claude Code, install from the Git URL:
 
 ```text
-Please install Aming Claw from GitHub:
-https://github.com/amingclawdev/aming-claw
-
-If `aming-claw` is not available on PATH, run this Windows PowerShell bootstrap:
-$installRoot="$env:USERPROFILE\.aming-claw\plugins"
-$root=Join-Path $installRoot "aming-claw"
-$dst="$env:TEMP\install_aming_claw.py"
-$py="python"
-$version=& $py --version 2>&1
-if ($version -notmatch "Python 3\.(9|1[0-9])|Python [4-9]\.") {
-  if (Get-Command py -ErrorAction SilentlyContinue) {
-    $candidate=& py -3 -c "import sys; print(sys.executable)"
-    if ($candidate) { $py=$candidate.Trim(); $version=& $py --version 2>&1 }
-  }
-}
-if ($version -notmatch "Python 3\.(9|1[0-9])|Python [4-9]\.") {
-  throw "Aming Claw requires Python 3.9+. Current python is: $version. Install Python 3.9+ or pass a full Python path."
-}
-Invoke-WebRequest https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py -OutFile $dst
-& $py $dst https://github.com/amingclawdev/aming-claw --install-root $installRoot --python $py
-
-Run the read-only aftercare check:
-cd "$root"
-& $py -m agent.cli plugin doctor --plugin-root "$root" --skip-governance --python $py
-
-Do not run `aming-claw start` or installer `--start` inline in Codex unless you
-only need the idempotent health check. If governance is already healthy it exits
-after printing the dashboard URL; otherwise it starts the foreground service and
-should run in a separate terminal/window:
-Start-Process powershell -ArgumentList "-NoExit","-Command","cd `"$root`"; & `"$py`" -m agent.cli start"
-
-Reload Codex or open a new Codex session after plugin install; the current
-thread may not hot-load newly installed skills or MCP tools.
-
-After install, open http://localhost:40000/dashboard, load the Aming Claw
-skill/MCP in a new session, then check `runtime_status(project_id="<id>")`,
-`graph_status`, and backlog before changing code.
+/plugin marketplace add https://github.com/amingclawdev/aming-claw
+/plugin install aming-claw@aming-claw-local
 ```
 
-On macOS/Linux, the same raw installer can be run with:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/amingclawdev/aming-claw/main/scripts/install_from_git.py \
-  -o /tmp/install_aming_claw.py
-python3 /tmp/install_aming_claw.py https://github.com/amingclawdev/aming-claw
-cd ~/.aming-claw/plugins/aming-claw
-python3 -m agent.cli plugin doctor --plugin-root ~/.aming-claw/plugins/aming-claw --skip-governance
-nohup python3 -m agent.cli start > ~/.aming-claw/aming-claw.log 2>&1 &
-```
-
-If `python3 --version` is below 3.9, rerun the installer and doctor with a
-Python 3.9+ executable path using `--python /path/to/python3.9-or-newer`.
+Reload Claude Code or open a new session after install. Plugin install loads
+plugin/skill assets and the MCP server declaration only — it does **not**
+install Python dependencies, start governance, or prove MCP tools are visible
+in the current session. To get a fully-working install (Python package + Codex
+cache when relevant + doctor-verified), pair it with `aming-claw plugin
+install <git-url>` from the CLI side, or use the clone fallback below if a
+Claude Code sandbox blocks the remote URL.
 
 If an older Aming Claw runtime is already installed, update the plugin checkout
 directly:
@@ -127,6 +353,12 @@ Expected checks:
 - The generated Codex marketplace path is valid. A repo-local marketplace file
   may be reported as a compatibility warning; real Codex CLI loading uses the
   installed cache plus generated marketplace/config.
+- `.claude-plugin/marketplace.json` schema: `plugins[].source` starts with
+  `"./"` and `metadata.description` is present (`claude plugin validate`
+  fails or warns otherwise).
+- `.claude-plugin/plugin.json` schema: `name` + `version` + `description`
+  present; if `mcpServers` is declared, basic shape is checked (command +
+  args).
 - `.mcp.json` contains `mcpServers.aming-claw`.
 - Dashboard static assets are present, or doctor prints the exact build fallback.
 - Local Codex/Claude CLI commands are detected when available; detection still
@@ -134,7 +366,7 @@ Expected checks:
 - Governance health is reachable after services are started.
 - `/dashboard` returns `200` when governance is running and static assets exist.
 - ServiceManager is either reachable or reported as degraded for chain/executor.
-- A new Codex session can see the Aming Claw skill and MCP tools.
+- A new Codex or Claude Code session can see the Aming Claw skill and MCP tools.
 
 Open the local launcher or dashboard:
 
@@ -178,98 +410,61 @@ Codex/Claude session loaded the plugin, that dashboard assets exist, that
 ServiceManager/executor are online, or that Codex/Claude CLI auth is valid.
 Reload/open a new editor session after installing or updating plugin assets.
 
-## Load The Plugin
+## Plugin Components
 
-Aming Claw ships its plugin files inside this repository:
+Aming Claw ships these assets in the repo:
 
-- `.codex-plugin/plugin.json`
-- `.agents/plugins/marketplace.json`
-- `.claude-plugin/plugin.json`
-- `.claude-plugin/marketplace.json`
-- `.mcp.json`
-- `skills/aming-claw/`
-- `skills/aming-claw-launcher/`
+- `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` — Codex plugin + local marketplace
+- `.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json` — Claude plugin + local marketplace
+- `.mcp.json` — MCP server contract (read when the repo is opened as a workspace; the CLI installer also generates cache-aware overrides for plugin-mode loading)
+- `skills/aming-claw/` — main governance skill
+- `skills/aming-claw-launcher/` — onboarding/launcher skill
 
-### Codex
+After install, the plugin exposes two skills (Claude Code namespacing shown):
 
-Install through `aming-claw plugin install <git-url>` or the raw installer
-shown above. The installer writes Codex config, a generated local marketplace,
-and the versioned plugin cache that real Codex CLI startup reads. Opening the
-cloned directory alone is useful for development, but it is not the same as a
-verified Codex plugin install.
+- `/aming-claw:aming-claw`
+- `/aming-claw:aming-claw-launcher`
 
-In a new session, ask Codex to use the Aming Claw skill and check runtime state:
+### What `aming-claw plugin install` writes
+
+The CLI installer (`aming-claw plugin install <git-url>` or
+`python scripts/install_from_git.py <git-url>`) is not just a `git clone`:
+
+- Clones/updates the plugin checkout under `~/.aming-claw/plugins/<slug>`.
+- Installs the Python package (`pip install -e .`) so the CLI and MCP server
+  are importable.
+- Writes Codex config + a generated local marketplace + a versioned plugin
+  cache at `~/.codex/plugins/cache/aming-claw-local/aming-claw/<version>/`
+  that real Codex CLI startup reads.
+
+Run `aming-claw plugin doctor` after install. If the cache or generated
+marketplace is missing/inconsistent, doctor reports `fail` (not just `ok`).
+A passing doctor verifies the on-disk install and generated config; still open
+or reload a Codex/Claude session and confirm the skill/MCP tools are visible.
+
+### Post-Install Verification
+
+In a new Codex or Claude Code session, ask the AI to use the Aming Claw skill:
 
 ```text
 Use the Aming Claw skill. Check runtime_status(project_id="<id>"), graph_status, and backlog before changing code.
 ```
 
-Codex does not auto-start Aming Claw services. Start them explicitly:
+Confirm visibility:
 
-```bash
-aming-claw start
-```
+- Skills `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher` resolve.
+- MCP tool `mcp__aming_claw__health` returns `ok`.
+- `runtime_status` returns aggregated governance + ServiceManager + version_check state.
 
-`aming-claw start` first checks port `40000`: if Aming Claw governance is
-already healthy, it prints the dashboard URL and exits; if another process owns
-the port, it fails with a conflict message. When governance is not running, it
-starts a foreground, long-running service. Do not ask Codex to wait for that as
-a one-shot task; treat that path as a long-running service command, run it in a
-separate terminal/window, then return to Codex and verify with `runtime_status`
-or `aming-claw status`.
+Plugin install loads plugin/skill assets and the MCP server declaration; it
+does not install Python dependencies (unless using the CLI installer above),
+start governance, or validate AI CLI auth. Start governance separately with
+`aming-claw start`. See [Runtime Boundaries](#runtime-boundaries) for the full
+state model.
 
-If the CLI is already available, it can update a local plugin checkout from the
-public Git URL:
-
-```bash
-aming-claw plugin install https://github.com/amingclawdev/aming-claw
-```
-
-That installer clones/updates the checkout, installs the Python package, writes
-Codex config, and installs a versioned Codex plugin cache. It is not just a
-README prompt. Run `aming-claw plugin doctor` afterward; if Codex CLI would
-fail to find the plugin cache or generated marketplace, doctor should not report
-overall OK.
-
-### Claude Code
-
-From Claude Code, add the Git repository as a marketplace and install the
-plugin:
-
-```text
-/plugin marketplace add https://github.com/amingclawdev/aming-claw
-/plugin install aming-claw@aming-claw-local
-```
-
-Claude plugin installation only loads plugin/skill assets in Claude Code. It
-does not install Python dependencies, start governance, prove MCP tools are
-visible in the current session, or validate Claude/Codex CLI auth. After
-install/update, open a new Claude session, verify the skill/MCP tools are
-visible, and check `runtime_status(project_id="<id>")` before making changes.
-
-If your Claude Code build does not support Git marketplace URLs yet, clone the
-repo and add the local checkout instead:
-
-```bash
-git clone https://github.com/amingclawdev/aming-claw.git
-cd aming-claw
-pip install -e .
-aming-claw start
-```
-
-```text
-/plugin marketplace add /path/to/aming-claw
-/plugin install aming-claw@aming-claw-local
-```
-
-If a Claude Code sandbox blocks downloading and executing a raw GitHub installer
-script, use the explicit clone/local-marketplace path above instead of treating
-that as a governance runtime failure.
-
-The Claude plugin exposes the main governance skill and the launcher skill:
-
-- `/aming-claw:aming-claw`
-- `/aming-claw:aming-claw-launcher`
+If a Claude Code sandbox blocks the remote installer script path, use the clone
+fallback from [Install Details](#install-details) — that's an environment policy,
+not a governance failure.
 
 ## Workflow
 
@@ -294,61 +489,6 @@ For Aming Claw internals, an active local `project_id="aming-claw"` graph is not
 required for the plugin to be usable. Use `aming-claw://seed-graph-summary` as
 the packaged MVP navigation map when no active self graph exists. Target/user
 projects need bootstrap before graph-backed claims are available.
-
-## Dashboard
-
-### Projects
-
-Register projects, switch active workspaces, configure AI routing, and trigger
-graph builds or updates.
-
-![Projects dashboard](docs/assets/dashboard-projects.png)
-
-### Graph
-
-Explore the project structure, dependency relations, health, files, tests, docs,
-and function indexes.
-
-![Graph dashboard](docs/assets/dashboard-graph.png)
-
-### AI Enrich
-
-AI Enrich generates semantic summaries, intent, risk, and evidence for selected
-nodes or edges. Generated semantics are not trusted memory until reviewed by an
-operator.
-
-Use selected-node or selected-edge enrichment first on large projects to control
-cost and review scope.
-
-![AI enrich action](docs/assets/dashboard-ai-enrich.png)
-
-Typical AI Enrich flow:
-
-1. Select a graph node or edge.
-2. Click `AI enrich`.
-3. Watch the job in Operations Queue.
-4. Review the proposed semantic memory.
-5. Accept, reject, or retry.
-6. Use accepted semantics for backlog and PR planning.
-
-AI Enrich uses the selected project's AI routing. Configure the `semantic`
-provider/model in AI config first. OpenAI routes use the local Codex CLI
-(`codex`, override with `CODEX_BIN`); Anthropic routes use Claude Code CLI
-(`claude`, override with `CLAUDE_BIN`). Version detection only means
-`auth unknown`; it does not prove a real model call will succeed.
-
-### Operations Queue
-
-Track graph updates, semantic jobs, review work, and background operations.
-
-![Operations queue](docs/assets/dashboard-operations.png)
-
-### Review Queue
-
-Review AI-generated semantic proposals before they become trusted project
-memory.
-
-![Review queue](docs/assets/dashboard-review-queue.png)
 
 ## CLI
 
@@ -414,6 +554,20 @@ When working on Aming Claw itself, follow the project governance contract:
 4. Follow `skills/aming-claw/references/mf-sop.md` for manual fixes.
 5. Evaluate whether E2E evidence is needed for dashboard or graph behavior.
 
+## Status & Contributing
+
+**Status**: V1 MVP. Verified end-to-end on both Codex and Claude Code (the
+Claude `/plugin install` path was the most recent install-blocker, now fixed).
+Stable for local multi-AI dev and governance workflows. Chain dev/test/qa/merge
+automation and bulk AI semantic enrichment remain experimental — see
+[V1 MVP Snapshot](#v1-mvp-snapshot).
+
+**Bug reports / feature requests**:
+https://github.com/amingclawdev/aming-claw/issues
+
+**Plugin packaging deep-dive for contributors**: see
+[`skills/aming-claw/references/plugin-packaging.md`](skills/aming-claw/references/plugin-packaging.md).
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
@@ -422,6 +576,7 @@ When working on Aming Claw itself, follow the project governance contract:
 - [Configuration Reference](docs/config/README.md)
 - [API Overview](docs/api/README.md)
 - [Plugin Packaging Notes](skills/aming-claw/references/plugin-packaging.md)
+- [Codex Bootstrap Scripts](docs/install/codex-bootstrap.md)
 
 ## License
 

@@ -1,54 +1,55 @@
 # Governance Documentation
 
-This directory contains governance-related documentation for the Aming Claw project.
+This directory contains the deeper governance references behind the V1 local
+plugin experience. For first-time users, start with [README.md](../../README.md)
+and [onboarding.md](../onboarding.md); this directory is for operators and
+agents who need the rules behind backlog, Manual Fix, graph governance, and the
+experimental chain.
 
-<!-- RECONCILE-FEATURE-INDEX:START -->
-## Generated Indices
+## V1 Governance Model
 
-| File | Description |
-|------|-------------|
-| [feature-index.md](feature-index.md) | Reconcile feature index: 171/171 approved feature nodes, 107 doc gaps, 26 test gaps |
-<!-- RECONCILE-FEATURE-INDEX:END -->
+V1 is graph-first and local-first:
+
+- The dashboard and MCP graph tools are the primary control plane.
+- Target projects must be explicitly registered/bootstraped before graph-backed
+  claims are available.
+- Graph snapshots are commit-bound and should be built from a clean worktree.
+- Backlog rows are the canonical work ledger; do not file work by editing
+  `docs/dev` scratch files.
+- Manual Fix is the normal V1 implementation path while chain automation is
+  experimental. MF still requires backlog-first, graph-first, focused tests,
+  Chain trailers, post-commit Update Graph, and backlog close evidence.
+- AI Enrich creates proposals that require Review Queue approval before they
+  become trusted semantic memory.
+
+## V1 Entry Points
+
+| Need | Start Here |
+| --- | --- |
+| Install and run locally | [README.md](../../README.md) |
+| Register a target project | [onboarding.md](../onboarding.md) |
+| Configure project YAML and AI routing | [config/aming-claw-yaml.md](../config/aming-claw-yaml.md) |
+| Use MCP tools and graph queries | [skills MCP guide](../../skills/aming-claw/references/mcp-tools.md) |
+| Follow Manual Fix in V1 | [skills MF checklist](../../skills/aming-claw/references/mf-sop.md) |
+| Package Codex/Claude plugins | [plugin packaging notes](../../skills/aming-claw/references/plugin-packaging.md) |
 
 ## Specifications
 
-| File | Description |
-|------|-------------|
-| [acceptance-graph.md](acceptance-graph.md) | Acceptance graph: verification nodes and criteria |
-| [design-spec-full.md](design-spec-full.md) | Design specification: memory, coordinator, executor |
-| [prd-full.md](prd-full.md) | Product requirements: memory, coordinator, executor |
+| File | V1 Status | Description |
+| --- | --- | --- |
+| [manual-fix-sop.md](manual-fix-sop.md) | Active (R11 stale — pre-2026-05-01 trailer migration) | Canonical MF history and constraints. Use the compact skill checklist for day-to-day V1 work; R11's `/api/version-update` description is deprecated under trailer-priority. |
+| [version-control.md](version-control.md) | Active | Version gate and Chain trailer lifecycle. |
+| [memory.md](memory.md) | Active | SQLite/FTS memory backend and semantic search notes. |
+| [acceptance-graph.md](acceptance-graph.md) | Advanced | Older workflow acceptance graph; distinct from the snapshot graph used by dashboard. |
+| [auto-chain.md](auto-chain.md) | Experimental in V1 | PM -> Dev -> Test -> QA -> Merge automation. Not the default V1 implementation path. |
+| [gates.md](gates.md) | Experimental in V1 | Gate definitions for chain automation. |
+| [conflict-rules.md](conflict-rules.md) | Advanced | Task conflict rules. |
+| [audit-process.md](audit-process.md) | Advanced | Chain full-process audit procedure. |
+| [reconcile-workflow.md](reconcile-workflow.md) | Advanced | Reconcile design for graph/workflow repair. |
+| [feature-index.md](feature-index.md) | Generated/reference | Reconcile feature index; may lag the active dashboard snapshot. |
 
-## Processes
+## Historical Material
 
-| File | Description |
-|------|-------------|
-| [implementation-process.md](implementation-process.md) | Document lifecycle: proposal → plan → execution record |
-| [manual-fix-sop.md](manual-fix-sop.md) | Manual fix standard operating procedure (v3) |
-| [version-control.md](version-control.md) | Version gate and chain_version lifecycle |
-| [audit-process.md](audit-process.md) | Chain full-process audit procedure |
-
-## Rules & Policies
-
-| File | Description |
-|------|-------------|
-| [auto-chain.md](auto-chain.md) | Auto-chain dispatch: PM→Dev→Test→QA→Merge pipeline |
-| [gates.md](gates.md) | Gate definitions: checkpoint, t2_pass, qa_pass, release |
-| [conflict-rules.md](conflict-rules.md) | Task conflict detection: 5-rule engine |
-| [memory.md](memory.md) | Memory backend: FTS5 + semantic search |
-
-## Current Status
-
-**Quick links for new sessions:**
-
-| What | Where |
-|------|-------|
-| **Session handoff** | [docs/dev/session-status.md](../dev/session-status.md) |
-| **Bug backlog** | [docs/dev/bug-and-fix-backlog.md](../dev/bug-and-fix-backlog.md) |
-| **Active execution** | [docs/dev/current-graph-doc-2026-04-06.md](../dev/current-graph-doc-2026-04-06.md) |
-| **Graph health** | 29 nodes, 905 tests pass — run `mcp__aming-claw__preflight_check` |
-
-## Active Plans
-
-| Plan | Status | Execution Record | Next Step |
-|------|--------|-----------------|-----------|
-| [plan-graph-driven-doc.md](plan-graph-driven-doc.md) | Step 2 ✅ | [current-graph-doc-2026-04-06](../dev/current-graph-doc-2026-04-06.md) | Step 3: Level 1 changes |
+Files under `docs/dev/` are handoffs, proposals, scratch notes, and historical
+audit records. They are useful for maintainers, but they are not the V1 user
+entry point and should not be treated as the canonical backlog.

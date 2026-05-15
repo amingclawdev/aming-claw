@@ -1,179 +1,139 @@
-# Aming Claw — Onboarding Guide
+# Aming Claw V1 Onboarding Guide
 
-This guide covers project setup and first-task creation for both self-governance
-(the aming-claw project itself) and external project onboarding.
+This guide describes the V1 path for using Aming Claw to govern another local
+project. V1 is local-first: start governance, open the dashboard, explicitly
+register a clean target project, build the graph, then use dashboard/MCP tools
+to inspect, file backlog, and plan PR work.
 
-## 1. Project Setup
+## 1. Start Aming Claw
 
-### 1.1 Configuration File
-
-Every project managed by aming-claw needs a `.aming-claw.yaml` configuration file
-at the repository root. This file defines the project identity and governance settings.
-
-```yaml
-# .aming-claw.yaml
-project_id: my-project
-governance_url: http://localhost:40000
-roles:
-  - coordinator
-  - pm
-  - dev
-  - tester
-  - qa
-  - gatekeeper
-  - observer
-```
-
-### 1.2 Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GOVERNANCE_URL` | `http://localhost:40000` | Governance API endpoint |
-| `EXECUTOR_POLL_INTERVAL` | `10` | Seconds between task polls |
-| `MAX_CONCURRENT_WORKERS` | `2` | Parallel executor workers (1-5) |
-| `ROLE_CONFIG_DIR` | `config/roles` | Custom role config directory |
-
-### 1.3 Role Configuration (YAML)
-
-Role configs live in `config/roles/default/{role}.yaml`. Each file defines:
-- `version` — Config schema version
-- `role` — Role name
-- `max_turns` — Maximum Claude CLI turns
-- `tools` — Allowed Claude tools
-- `permissions` — `can`/`cannot` action lists
-- `prompt_template` — System prompt for the role
-
-To customize roles per-project, create overrides in `config/roles/{project_id}/{role}.yaml`.
-Override files are merged on top of defaults at startup.
-
-## 2. Acceptance Graph Definition
-
-The acceptance graph defines verification nodes that track project quality gates.
-
-### 2.1 Graph Structure
-
-Nodes are organized in layers:
-- **L1** — Core infrastructure (must pass before L2)
-- **L2** — Feature modules
-- **L3** — Integration / E2E
-
-Each node has a status lifecycle: `pending` → `testing` → `t2_pass` → `qa_pass`
-
-### 2.2 Defining Nodes
-
-Use the governance API to register nodes:
+Install from the repository or plugin flow in [README.md](../README.md), then
+verify the install before starting governance:
 
 ```bash
-curl -X POST http://localhost:40000/api/wf/my-project/node \
-  -H "Content-Type: application/json" \
-  -d '{"node_id": "L1.1", "description": "Core module tests", "depends_on": []}'
+aming-claw plugin doctor
 ```
 
-Or define nodes in the PM PRD output — the auto-chain will register them.
+The doctor is read-only. It reports missing CLI, marketplace, manifest, or MCP
+config issues; fix anything that reads `fail` before continuing.
 
-## 3. API Import
-
-### 3.1 Python API
-
-```python
-from agent.governance.client import GovernanceClient
-
-client = GovernanceClient(project_id="my-project")
-tasks = client.list_tasks(status="queued")
-```
-
-### 3.2 REST API
+Then start governance in a separate terminal:
 
 ```bash
-# Health check
-curl http://localhost:40000/api/health
-
-# List tasks
-curl http://localhost:40000/api/task/my-project/list
-
-# Workflow summary
-curl http://localhost:40000/api/wf/my-project/summary
+aming-claw start
 ```
 
-## 4. Creating Your First PM Task
+Open:
 
-The auto-chain flow starts with a PM task:
-
-```bash
-curl -X POST http://localhost:40000/api/task/my-project/create \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "pm",
-    "prompt": "Analyze requirements for feature X and produce a PRD with target files, acceptance criteria, and test plan.",
-    "metadata": {}
-  }'
+```text
+http://localhost:40000/dashboard
 ```
 
-The executor picks up the PM task, runs Claude with the PM role prompt,
-and the auto-chain creates subsequent dev → test → qa → gatekeeper → merge tasks.
+The root path `/` is not the dashboard and may return `404`.
 
-## 5. Verification
+## 2. Register A Target Project
 
-### 5.1 Check Task Status
+Project registration is explicit. Do not silently register a workspace just
+because `/api/projects` is empty.
 
-```bash
-curl http://localhost:40000/api/task/my-project/list?status=succeeded
+Use the dashboard Projects page first:
+
+1. Choose or paste the target workspace path.
+2. Give it a project name/id.
+3. Click Bootstrap or Build graph.
+4. Watch progress in Projects/Operations Queue.
+
+Bootstrap mutates Aming Claw governance state: it writes project registry/DB
+rows, scans the workspace, and creates a commit-bound graph snapshot. It uses
+governance on port `40000`, not ServiceManager on `40101`.
+
+API fallback:
+
+```http
+POST http://127.0.0.1:40000/api/project/bootstrap
 ```
 
-### 5.2 Check Version Gate
+Use common excludes for generated folders:
 
-```bash
-curl http://localhost:40000/api/version-check/my-project
+```text
+node_modules, dist, build, .expo, .next, coverage
 ```
 
-### 5.3 Run Tests Locally
+If the target workspace is a dirty git repo, commit/stash first. Dirty
+worktree rejection is intentional because graph snapshots are commit-bound.
 
-```bash
-pytest agent/tests/ -v
-```
+## 3. Project Config In V1
 
-## 6. Self-Governance Setup (aming-claw)
+V1 stores most user project metadata in the Aming Claw project registry. It
+should not default to creating or mutating `.aming-claw.yaml` in the target
+project root unless the user explicitly chooses a source-controlled config.
 
-The aming-claw project governs itself. The `.aming-claw.yaml` config at the repo root
-defines `project_id: aming-claw`.
+For source-controlled projects that want a config file, see
+[config/aming-claw-yaml.md](config/aming-claw-yaml.md). The key V1 sections are:
 
-Key differences from external project onboarding:
-- The governance server runs on the host (port 40000), not in Docker
-- The executor worker runs on the host under `agent/service_manager.py` supervision — **start it explicitly** via `.\scripts\start-manager.ps1 -Takeover` or `python -m agent.service_manager`. The MCP server does NOT start it (`.mcp.json` uses `--workers 0`). See [docs/deployment.md §5](deployment.md) for full details.
-- Role configs are in `config/roles/default/`
-- All code changes go through the auto-chain: PM → Dev → Test → QA → Gatekeeper → Merge
+- `project_id` and `language`.
+- `graph.exclude_paths` / `graph.ignore_globs`.
+- `testing.e2e` suite metadata.
+- `ai.routing`, especially the `semantic` provider/model.
 
-## 7. External Project Onboarding
+## 4. First Useful Actions
 
-To onboard an external project:
+After graph build:
 
-1. **Create `.aming-claw.yaml`** in the external project's repo root
-2. **Start governance server** pointing to the external project
-3. **Import the acceptance graph** — define L1/L2/L3 nodes for the project
-4. **Create initial PM task** — the auto-chain handles the rest
-5. **Configure role overrides** (optional) — place custom YAML in `config/roles/{project_id}/`
+1. Open Graph and inspect L1/L2/L3/L4/L7 hierarchy.
+2. Select candidate nodes and review Files, Relations, Functions, and Problems.
+3. Use AI or MCP graph queries for `function_index`, fan-in/fan-out, docs/tests,
+   and bounded source excerpts.
+4. File backlog rows with node ids, target files, tests, risk, and acceptance
+   criteria.
+5. For implementation, use Manual Fix in V1 unless the user explicitly asks to
+   test experimental chain automation. The MF checklist
+   (predeclare backlog → graph-first discovery → focused tests → Chain trailer
+   commit → Update Graph → backlog close) lives in
+   [skills/aming-claw/references/mf-sop.md](../skills/aming-claw/references/mf-sop.md).
 
-### 7.1 External Project Config Example
+## 5. AI Enrich
 
-```yaml
-# .aming-claw.yaml (in external project root)
-project_id: my-external-project
-governance_url: http://localhost:40000
-```
+Configure the project's `semantic` provider/model in AI config before live
+semantic jobs. OpenAI routes use Codex CLI (`codex`); Anthropic routes use
+Claude Code CLI (`claude`). Version detection does not prove authentication.
 
-### 7.2 Custom Role Overrides
+> Cost expectation: AI Enrich subprocess-spawns the local CLI per node/edge,
+> so token use scales linearly with the selection size. On a fresh project of a
+> few hundred nodes, start with 5–10 nodes you actually care about, watch the
+> Review Queue, and only run repository-wide enrichment after the routing and
+> prompt template are tuned.
 
-Create project-specific role configs:
+Recommended flow:
 
-```bash
-mkdir -p config/roles/my-external-project
-# Override PM max_turns for this project
-cat > config/roles/my-external-project/pm.yaml <<EOF
-max_turns: 30
-tools:
-  - Read
-  - Grep
-EOF
-```
+1. Select a node or edge.
+2. Run AI Enrich.
+3. Watch Operations Queue.
+4. Review the proposed semantic memory.
+5. Accept, reject, or retry in Review Queue.
 
-Override files are merged on top of defaults — only specify fields you want to change.
+`ai_complete` means a proposal exists. It is not trusted project memory until
+reviewed and accepted.
+
+## 6. Governance Hint
+
+Governance Hint is the V1-safe graph correction path for orphan doc/test/config
+files that already appear in snapshot file inventory.
+
+It writes a source-controlled hint into the file, then requires:
+
+1. Commit the hint.
+2. Update Graph/reconcile.
+3. Confirm the file is attached to the expected node.
+
+It does not create nodes, rewrite ownership, move hierarchy edges, or edit
+dependency/function-call relations.
+
+## 7. What Is Not The V1 Default
+
+- Auto-chain PM -> Dev -> Test -> QA -> Merge is experimental in V1.
+- ServiceManager/executor degraded is not a dashboard/graph failure.
+- Workflow acceptance graph tools (`wf_*`) are separate from the snapshot graph
+  and require import before use.
+- Telegram, Redis, dbservice, and full production deployment are advanced
+  surfaces, not required for the local plugin MVP.

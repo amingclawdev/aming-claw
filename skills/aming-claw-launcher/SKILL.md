@@ -1,11 +1,11 @@
 ---
 name: aming-claw-launcher
-description: Use when a user wants to preview, start, or onboard onto Aming Claw — first-time setup, opening the dashboard, checking runtime status, or learning the basic CLI surface. Triggers on "preview aming-claw", "start aming-claw", "launcher", "open dashboard", "is governance running", "how do I run this", or any onboarding question. Defers to the main aming-claw skill for graph, backlog, manual-fix, semantic, or chain work.
+description: Use when a user wants to preview, start, onboard onto Aming Claw, open the dashboard, check runtime status, learn the basic CLI, or perform an end-to-end install. Triggers on "preview aming-claw", "start aming-claw", "launcher", "open dashboard", "is governance running", "how do I run this", "install and start", "install and open dashboard", "one-shot install", "full install", "install end-to-end", or any onboarding question. Defers to the main aming-claw skill for graph, backlog, manual-fix, semantic, or chain work.
 ---
 
 # Aming Claw Launcher
 
-Help the user start and verify Aming Claw locally. Never spawn governance silently — show the explicit command and let the user run it.
+Help the user start and verify Aming Claw locally. Default mode is show-the-command-and-wait — never spawn governance silently. Switch to one-shot mode only when the user explicitly invokes it (see [One-Shot Install Mode](#one-shot-install-mode) below).
 
 ## Preview Flow
 
@@ -224,10 +224,51 @@ Use the main `aming-claw` skill (`skills/aming-claw/SKILL.md`) for:
 - Chain debugging, version-gate, semantic reconcile, drift analysis.
 - Dashboard governance flows beyond the basic preview.
 
+## One-Shot Install Mode
+
+Default behavior is "show the command and wait." Switch to one-shot mode only
+when the user's prompt contains an explicit completion trigger:
+
+- "install and start"
+- "install and open dashboard"
+- "install end-to-end"
+- "one-shot install"
+- "full install"
+- "install + start"
+- "bootstrap aming-claw end-to-end"
+
+When triggered, run the bootstrap with tool calls instead of showing commands
+to the user:
+
+1. If `aming-claw` is not on `PATH`, install the Python runtime first. For a
+   Claude Code session the marketplace clone is typically at
+   `~/.claude/plugins/marketplaces/aming-claw-local` (Windows:
+   `%USERPROFILE%\.claude\plugins\marketplaces\aming-claw-local`); run
+   `pip install -e <that-path>`. If the CLI is already on `PATH`, prefer
+   `aming-claw plugin install <git-url>` — it does pip install + marketplace
+   refresh + versioned Codex cache in one call.
+2. Start governance in the background — `aming-claw start` is long-running and
+   will block the foreground tool call:
+   - Windows: `Start-Process powershell -ArgumentList "-NoExit","-Command","aming-claw start"`.
+   - macOS/Linux: `nohup aming-claw start > ~/.aming-claw/start.log 2>&1 &`.
+3. Poll `aming-claw status` (or `GET http://localhost:40000/api/health`) for up
+   to ~30 seconds until governance reports healthy on port `40000`.
+4. Run `aming-claw open` to launch the dashboard.
+5. Tell the user the dashboard is up at `http://localhost:40000/dashboard` and
+   ask them to reload Claude Code (or open a new session) so the plugin's MCP
+   tools and skills load in the active session.
+
+Do not enter one-shot mode when:
+
+- The user only asks to start, only asks to open, or only asks for status.
+- The user asks for a dry-run, preview, or "show me the commands first".
+- Governance is already healthy — just confirm health and run `aming-claw open`.
+
 ## What Not To Do
 
-- Do not auto-start governance from a tool call. Always show `aming-claw start`
-  as a separate-terminal command and wait for the user.
+- Do not auto-start governance from a tool call **unless the user explicitly
+  invoked One-Shot Install Mode** (see section above). Default behavior is to
+  show `aming-claw start` as a separate-terminal command and wait for the user.
 - Do not treat `aming-claw start` as plugin verification. Use
   `aming-claw plugin doctor` and a new Codex session visibility check.
 - Do not bypass `aming-claw start` with `docker compose up` or raw `python -m agent.governance.server` unless the user is explicitly debugging.

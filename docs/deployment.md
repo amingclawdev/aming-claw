@@ -3,24 +3,36 @@
 > **Canonical deployment document** — Host-based deployment for development and production.
 > Last updated: 2026-04-20 | Correct MCP startup behavior (`--workers 0` does NOT auto-start executor)
 
+## V1 Local Plugin Path
+
+For V1 users, the recommended deployment is local plugin mode:
+
+1. Install from `https://github.com/amingclawdev/aming-claw`.
+2. Start governance with `aming-claw start` in a separate terminal.
+3. Open `http://localhost:40000/dashboard`.
+4. Load the Codex or Claude Code skill/MCP in a new session.
+5. Bootstrap a target project from the dashboard and build/update its graph.
+
+This path requires governance and packaged dashboard static assets. It does not
+require ServiceManager, executor, Redis, Telegram, or dbservice for the main
+dashboard/graph/backlog workflow. ServiceManager/executor degraded should be
+reported as a chain automation warning, not as a failed dashboard deployment.
+
 ## 1. Prerequisites
 
 ### System Requirements
 
-- **Python 3.11+** with pip
-- **Node.js 18+** (for MCP server)
+- **Python 3.9+** with pip for the V1 CLI/plugin runtime
+- **Node.js/npm** only when rebuilding dashboard assets from source
 - **Git** (with worktree support)
-- **Docker** and **Docker Compose** (for optional services)
-- **Claude CLI** (`claude` command available in PATH)
-- **Redis** (via Docker or host install)
+- **Codex CLI** (`codex`) for OpenAI-backed local AI routes when used
+- **Claude Code CLI** (`claude`) for Anthropic-backed local AI routes when used
+- **Docker**, **Redis**, Telegram, and dbservice only for optional/advanced
+  services
 
 ### Environment Variables
 
 ```bash
-# Required
-export GOV_PROJECT_ID="aming-claw"
-export GOV_TOKEN="gov-<your-token>"
-
 # Optional
 export MEMORY_BACKEND="local"          # local | docker | cloud
 export TELEGRAM_BOT_TOKEN="<token>"    # Required for Telegram gateway
@@ -42,7 +54,8 @@ Optional Docker Dependencies
 └── Redis                  :40079   ← Pub/sub, cache
 ```
 
-**All governance operations run on the host at `http://localhost:40000`.**
+**All V1 governance and dashboard operations run on the host at
+`http://localhost:40000`.**
 
 ## 3. MCP Configuration (`.mcp.json`)
 
@@ -65,18 +78,34 @@ The MCP server exposes the governance tools to Claude Code. It is configured wit
 
 Place this file in the project root. Claude Code reads it automatically on session start, but it only wires up the MCP tools — process supervision is separate.
 
+On Windows, replace `"command": "python"` with `"command": "py"` and `"args": ["-3", "-m", "agent.mcp", "--workers", "0"]` if the bare `python` is not on `PATH`. The bootstrap script in [install/codex-bootstrap.md](install/codex-bootstrap.md) auto-detects the right Python 3.9+ interpreter.
+
 ## 4. Governance Service Startup
 
 The governance service is a prerequisite for everything else (MCP, executor, gateway). Start it first.
 
-### Option A: One-click launcher (Recommended, Windows)
+### Option A: CLI start (Recommended for V1)
+
+```bash
+aming-claw start
+```
+
+This command first checks whether governance is already healthy on port
+`40000`. If healthy, it prints the dashboard URL and exits. Otherwise it starts
+a foreground, long-running governance service that should stay open in a
+separate terminal/window.
+
+### Option B: Legacy one-click launcher (Windows)
 
 ```powershell
 # Starts governance + ServiceManager + Docker services in the correct order
 .\start.ps1
 ```
 
-### Option B: Direct start
+### Option C: Direct start (advanced / dev only)
+
+Use this only when you are debugging the governance server itself. New users
+should use Option A.
 
 ```bash
 # Start governance service directly on the host (not Docker)
@@ -90,13 +119,17 @@ curl http://localhost:40000/api/health
 # Expected: {"status": "ok", "version": "...", "pid": ...}
 ```
 
-## 5. Executor Lifecycle
+## 5. Executor Lifecycle (Advanced / Experimental In V1)
 
-The executor worker **must be launched under ServiceManager supervision**. The MCP server will NOT start it (because `.mcp.json` uses `--workers 0`). Orphan executors started by any other means have no crash recovery and no deploy-signal handling.
+The V1 dashboard/graph/backlog path does not require the executor. If you are
+testing chain automation, the executor worker **must be launched under
+ServiceManager supervision**. The MCP server will NOT start it because
+`.mcp.json` uses `--workers 0`. Orphan executors started by any other means
+have no crash recovery and no deploy-signal handling.
 
-MCP may expose host-ops tools (`manager_health`, `manager_start`, `governance_redeploy`, `executor_respawn`, `runtime_status`) to call ServiceManager or its sidecar. These tools are a fixed-command repair facade, not MCP ownership of the executor lifecycle. The MCP `manager_start` bootstrap currently targets the Windows PowerShell script; POSIX bootstrap scripts are tracked separately.
+MCP may expose host-ops tools (`manager_health`, `manager_start`, `governance_redeploy`, `executor_respawn`, `runtime_status`) to call ServiceManager or its sidecar. These tools are a fixed-command repair facade, not MCP ownership of the executor lifecycle. The MCP `manager_start` bootstrap currently targets the Windows PowerShell script; an equivalent POSIX bootstrap is not yet provided — on macOS/Linux, invoke `python -m agent.service_manager` directly (see the cross-platform example below).
 
-### Starting ServiceManager (required)
+### Starting ServiceManager (chain/executor only)
 
 ```powershell
 # Windows — acquires the singleton lock on port 39103 and supervises executor_worker
@@ -201,44 +234,47 @@ docker compose -f docker-compose.governance.yml logs -f telegram-gateway
 
 | Service | Port | Depends On | Required? |
 |---------|------|------------|-----------|
-| Governance | 40000 | — | **Yes** (host) |
-| Manager HTTP | 40101 | Governance | **Yes** (host, PR1) |
-| Executor | — | Governance | **Yes** (host) |
-| Redis | 40079 | — | Recommended |
+| Governance | 40000 | - | **Yes** for V1 dashboard/graph |
+| Dashboard static assets | served by 40000 | Governance | **Yes** for dashboard UI |
+| Manager HTTP | 40101 | Governance | Advanced; required for chain/executor operations |
+| Executor | - | Governance + ServiceManager | Experimental in V1 |
+| Redis | 40079 | - | Optional |
 | Telegram GW | 40010 | Governance, Redis | Optional |
 | dbservice | 40002 | — | Optional (for semantic search) |
 
 ## 9. First-Time Setup
 
+### V1 Plugin Setup
+
 ```bash
-# 1. Clone and install dependencies
-git clone <repo-url> && cd aming_claw
-pip install -r requirements.txt
+# 1. Install from Git
+git clone https://github.com/amingclawdev/aming-claw.git
+cd aming-claw
+pip install -e .
 
-# 2. Start optional Docker dependencies
+# 2. Start governance
+aming-claw start
+
+# 3. Open dashboard
+aming-claw open
+```
+
+Then use the Projects page to bootstrap a clean target workspace and build its
+graph. No governance token, Redis service, workflow graph import, or executor is
+required for the V1 dashboard/graph/backlog path.
+
+### Advanced Chain Setup
+
+Only use this path when testing the experimental executor/chain stack:
+
+```bash
 docker compose -f docker-compose.governance.yml up -d redis
-
-# 3. Start governance service
-python agent/governance/server.py --port 40000
-
-# 4. Initialize project (first time only)
-python init_project.py
-# Enter project name and password → obtain governance token
-
-# 5. Import acceptance graph
-curl -X POST http://localhost:40000/api/wf/aming-claw/import-graph \
-  -H "X-Gov-Token: gov-<token>" \
-  -d '{"md_path": "docs/governance/acceptance-graph.md"}'
-
-# 6. Register dbservice domain pack (if using dbservice)
-curl -s -X POST http://localhost:40002/knowledge/register-pack \
-  -H "Content-Type: application/json" \
-  -d '{"domain": "development", "types": {...}}'
-
-# 7. Configure .mcp.json and open Claude Code session
+python -m agent.service_manager --project aming-claw --governance-url http://localhost:40000 --workspace "$PWD"
 ```
 
 ## 10. Workspace and Worktree Routing
+
+> Experimental in V1 — worktrees are used by the chain-automation executor. Manual Fix flows commit on the main worktree and do not require worktree isolation.
 
 The executor uses git worktrees for task isolation:
 
@@ -258,26 +294,15 @@ merge task → cherry-pick to main → worktree cleaned up
 
 ### After Host Reboot
 
-```powershell
-# Option A (recommended): one-click launcher brings everything up in order
-.\start.ps1
-```
-
 ```bash
-# Option B: manual, step-by-step
-# 1. Start Docker services
-docker compose -f docker-compose.governance.yml up -d
-
-# 2. Start governance (host, port 40000)
-python -m agent.governance.server --port 40000
-
-# 3. Start ServiceManager (supervises executor)
-python -m agent.service_manager   # or: .\scripts\start-manager.ps1 -Takeover
-
-# 4. Open Claude Code session — MCP tools attach to the already-running services
+aming-claw start
+aming-claw open
 ```
 
-### After Crash
+For chain/executor testing, start ServiceManager separately after governance is
+healthy.
+
+### After Executor Crash
 
 The executor automatically recovers on restart:
 - Orphaned claimed tasks are requeued
@@ -300,14 +325,17 @@ If governance DB becomes locked (known issue after version-update):
 # Governance health
 curl http://localhost:40000/api/health
 
+# Dashboard
+curl http://localhost:40000/dashboard
+
 # Version gate status
 curl http://localhost:40000/api/version-check/aming-claw
 
-# Task queue
-curl http://localhost:40000/api/task/aming-claw/list
+# Project registry
+curl http://localhost:40000/api/projects
 
-# Workflow summary
-curl http://localhost:40000/api/wf/aming-claw/summary
+# Graph status
+curl http://localhost:40000/api/graph-governance/aming-claw/status
 ```
 
 ### Executor Monitoring
@@ -319,12 +347,19 @@ Use MCP tools in Claude Code:
 
 ## 13. Known Issues
 
+### Active
+
 | Issue | Workaround |
 |-------|------------|
-| DB lock after version-update | Restart governance service |
-| VERSION file lags 1 commit | Force DB sync after merge, don't amend |
 | Gateway code changes need rebuild | `docker compose build telegram-gateway && up -d` |
-| Dirty workspace gate false positive | `.claude/` paths auto-filtered (D5 fix) |
+
+### Historical (resolved by 2026-05-01 trailer-priority migration)
+
+| Issue | Resolution |
+|-------|------------|
+| DB lock after version-update | `/api/version-update` is deprecated and no longer writes DB state — the lock path is gone. |
+| VERSION file lags 1 commit | `chain_version` is derived from the git `Chain-Source-Stage` trailer; no VERSION file involved. |
+| Dirty workspace gate false positive | `.claude/` filter (D5) + short/full hash prefix-match (B35) ship in current main. |
 
 ## 14. Data Persistence
 
