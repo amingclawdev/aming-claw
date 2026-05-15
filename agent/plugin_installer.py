@@ -456,7 +456,7 @@ def _upsert_toml_table(text: str, table_name: str, block_body: str) -> str:
     block = f"[{table_name}]\n{block_body.rstrip()}\n"
     pattern = _toml_table_pattern(table_name)
     if pattern.search(text):
-        return pattern.sub(block, text).rstrip() + "\n"
+        return pattern.sub(lambda _match: block, text).rstrip() + "\n"
     prefix = text.rstrip()
     return (prefix + "\n\n" if prefix else "") + block
 

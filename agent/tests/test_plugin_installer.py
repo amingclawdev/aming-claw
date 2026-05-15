@@ -13,6 +13,7 @@ from agent.plugin_installer import (
     _check_claude_manifest,
     _check_claude_marketplace,
     _load_toml_text,
+    _upsert_toml_table,
     configure_codex_plugin,
     doctor_plugin,
     format_result,
@@ -320,6 +321,20 @@ def test_configure_codex_plugin_enables_plugin_and_valid_marketplace(tmp_path):
     assert "enabled = true" in text
     assert parsed["marketplaces"]["aming-claw-local"]["source"] == str(marketplace_root.resolve())
     assert f"source = '{marketplace_root.resolve()}'" in text
+
+
+def test_upsert_toml_table_replaces_windows_path_without_regex_escape_error():
+    old_text = "[marketplaces.aming-claw-local]\nsource = 'old'\n"
+    windows_path = "C:" + "\\Users\\z5866\\.aming-claw\\plugins\\aming-claw"
+
+    text = _upsert_toml_table(
+        old_text,
+        "marketplaces.aming-claw-local",
+        f"source_type = \"local\"\nsource = '{windows_path}'",
+    )
+
+    parsed = _load_toml_text(text)
+    assert parsed["marketplaces"]["aming-claw-local"]["source"] == windows_path
 
 
 def test_doctor_plugin_fails_on_invalid_codex_config_toml(tmp_path):
