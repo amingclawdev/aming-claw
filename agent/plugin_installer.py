@@ -310,10 +310,68 @@ def _copy_plugin_payload(plugin_root: Path, target_root: Path, *, dry_run: bool 
             shutil.copy2(source, destination)
 
 
+def _cache_runtime_mcp_config(plugin_root: Path, *, python_executable: Optional[str] = None) -> dict:
+    source_path = plugin_root.expanduser().resolve() / ".mcp.json"
+    payload = _read_json_file(source_path)
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
+    if not isinstance(servers, dict):
+        servers = {}
+    server = dict(servers.get("aming-claw") or {})
+
+    runtime_root = str(plugin_root.expanduser().resolve())
+    server["command"] = python_executable or str(server.get("command") or "python")
+    if not isinstance(server.get("args"), list) or not server["args"]:
+        server["args"] = [
+            "-m",
+            "agent.mcp.server",
+            "--project",
+            "aming-claw",
+            "--workers",
+            "0",
+            "--governance-url",
+            "http://localhost:40000",
+        ]
+    server["cwd"] = runtime_root
+
+    env = server.get("env") if isinstance(server.get("env"), dict) else {}
+    env = dict(env)
+    pythonpath = str(env.get("PYTHONPATH") or "")
+    parts = [part for part in pythonpath.split(os.pathsep) if part]
+    if runtime_root not in parts:
+        parts.insert(0, runtime_root)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    server["env"] = env
+
+    payload["mcpServers"] = servers
+    payload["mcpServers"]["aming-claw"] = server
+    return payload
+
+
+def _write_cache_runtime_mcp_config(
+    plugin_root: Path,
+    target_root: Path,
+    *,
+    python_executable: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
+    if dry_run:
+        return
+    target = target_root.expanduser().resolve() / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            _cache_runtime_mcp_config(plugin_root, python_executable=python_executable),
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def install_codex_plugin_cache(
     plugin_root: Path,
     *,
     codex_home: Optional[Union[Path, str]] = None,
+    python_executable: Optional[str] = None,
     dry_run: bool = False,
     commands: Optional[list[CommandRecord]] = None,
 ) -> Path:
@@ -324,6 +382,12 @@ def install_codex_plugin_cache(
     if commands is not None:
         commands.append(CommandRecord(args=["install-codex-cache", str(target)], skipped=dry_run))
     _copy_plugin_payload(plugin_root, target, dry_run=dry_run)
+    _write_cache_runtime_mcp_config(
+        plugin_root,
+        target,
+        python_executable=python_executable,
+        dry_run=dry_run,
+    )
     return target
 
 
@@ -349,6 +413,7 @@ def install_codex_marketplace(
     plugin_root: Path,
     *,
     marketplace_root: Optional[Union[Path, str]] = None,
+    python_executable: Optional[str] = None,
     dry_run: bool = False,
     commands: Optional[list[CommandRecord]] = None,
 ) -> Path:
@@ -366,11 +431,19 @@ def install_codex_marketplace(
         encoding="utf-8",
     )
     _copy_plugin_payload(plugin_root, plugin_target, dry_run=False)
+    _write_cache_runtime_mcp_config(
+        plugin_root,
+        plugin_target,
+        python_executable=python_executable,
+        dry_run=False,
+    )
     return root
 
 
 def _toml_quote(value: Union[str, Path]) -> str:
     text = str(value)
+    if "'" not in text:
+        return f"'{text}'"
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
@@ -699,6 +772,22 @@ def _check_mcp_config(plugin_root: Path) -> DoctorCheck:
     return _doctor_check("mcp_config", "ok", str(path))
 
 
+def _load_toml_text(text: str) -> dict:
+    try:
+        import tomllib  # type: ignore[import-not-found]
+
+        return tomllib.loads(text)
+    except ImportError:
+        try:
+            import pip._vendor.tomli as tomli  # type: ignore[import-not-found]
+
+            return tomli.loads(text)
+        except (ImportError, AttributeError):
+            import tomli  # type: ignore[import-not-found]
+
+            return tomli.loads(text)
+
+
 def _extract_toml_table(text: str, table_name: str) -> str:
     text = text.lstrip("\ufeff")
     match = _toml_table_pattern(table_name).search(text)
@@ -713,6 +802,37 @@ def _extract_toml_string(block: str, key: str) -> str:
     if match.group(1) == '"':
         value = value.replace("\\\\", "\\").replace('\\"', '"')
     return value
+
+
+def _validate_mcp_runtime_entrypoint(mcp_path: Path) -> tuple[bool, str]:
+    try:
+        payload = _read_json_file(mcp_path)
+    except Exception as exc:
+        return False, f"{mcp_path}: {exc}"
+    servers = payload.get("mcpServers") if isinstance(payload, dict) else {}
+    server = servers.get("aming-claw") if isinstance(servers, dict) else None
+    if not isinstance(server, dict):
+        return False, f"{mcp_path}: missing mcpServers.aming-claw"
+    command = str(server.get("command") or "").strip()
+    if not command:
+        return False, f"{mcp_path}: mcpServers.aming-claw.command is empty"
+    args = server.get("args")
+    if not isinstance(args, list) or "agent.mcp.server" not in [str(arg) for arg in args]:
+        return False, f"{mcp_path}: mcpServers.aming-claw.args must launch agent.mcp.server"
+
+    cwd = Path(str(server.get("cwd") or ".")).expanduser()
+    if not cwd.is_absolute():
+        cwd = (mcp_path.parent / cwd).resolve()
+    runtime_paths = [cwd]
+    env = server.get("env") if isinstance(server.get("env"), dict) else {}
+    for item in str(env.get("PYTHONPATH") or "").split(os.pathsep):
+        if item:
+            runtime_paths.append(Path(item).expanduser())
+    for candidate in runtime_paths:
+        if (candidate / "agent" / "mcp" / "server.py").is_file():
+            return True, f"{mcp_path}: runtime import root {candidate}"
+    checked = ", ".join(str(path) for path in runtime_paths)
+    return False, f"{mcp_path}: cannot import agent.mcp.server from cwd/PYTHONPATH ({checked})"
 
 
 def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
@@ -742,7 +862,10 @@ def _validate_codex_marketplace_root(root: Path) -> tuple[bool, str]:
         return False, f"{marketplace_path}: source.path {raw_path!r} escapes marketplace root"
     if not (resolved / ".codex-plugin" / "plugin.json").is_file():
         return False, f"{marketplace_path}: source.path {raw_path!r} has no .codex-plugin/plugin.json"
-    return True, f"{marketplace_path} -> {resolved}"
+    mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(resolved / ".mcp.json")
+    if not mcp_ok:
+        return False, mcp_detail
+    return True, f"{marketplace_path} -> {resolved}; {mcp_detail}"
 
 
 def _codex_plugin_enabled(text: str) -> bool:
@@ -758,9 +881,17 @@ def _check_codex_config(path: Path) -> DoctorCheck:
             f"{path} not found; run `aming-claw plugin install` to enable {CODEX_PLUGIN_ID}",
         )
     text = path.read_text(encoding="utf-8", errors="replace")
-    plugin_enabled = _codex_plugin_enabled(text)
-    marketplace_block = _extract_toml_table(text, f"marketplaces.{CODEX_MARKETPLACE_NAME}")
-    marketplace_source = _extract_toml_string(marketplace_block, "source")
+    try:
+        parsed = _load_toml_text(text)
+    except Exception as exc:
+        return _doctor_check("codex_config", "fail", f"{path}: invalid TOML ({exc})")
+
+    plugins = parsed.get("plugins") if isinstance(parsed, dict) else {}
+    plugin_table = plugins.get(CODEX_PLUGIN_ID) if isinstance(plugins, dict) else {}
+    plugin_enabled = isinstance(plugin_table, dict) and plugin_table.get("enabled") is True
+    marketplaces = parsed.get("marketplaces") if isinstance(parsed, dict) else {}
+    marketplace_table = marketplaces.get(CODEX_MARKETPLACE_NAME) if isinstance(marketplaces, dict) else {}
+    marketplace_source = str(marketplace_table.get("source") or "") if isinstance(marketplace_table, dict) else ""
     if plugin_enabled and marketplace_source:
         ok, detail = _validate_codex_marketplace_root(Path(marketplace_source).expanduser())
         if not ok:
@@ -789,7 +920,10 @@ def _check_codex_cache(plugin_root: Path, *, codex_home: Optional[Union[Path, st
         return _doctor_check("codex_plugin_cache", "fail", f"cannot compute cache path: {exc}")
     manifest = cache_root / ".codex-plugin" / "plugin.json"
     if manifest.is_file():
-        return _doctor_check("codex_plugin_cache", "ok", f"{manifest}")
+        mcp_ok, mcp_detail = _validate_mcp_runtime_entrypoint(cache_root / ".mcp.json")
+        if not mcp_ok:
+            return _doctor_check("codex_plugin_cache", "fail", mcp_detail)
+        return _doctor_check("codex_plugin_cache", "ok", f"{manifest}; {mcp_detail}")
     return _doctor_check(
         "codex_plugin_cache",
         "fail",
@@ -1043,12 +1177,14 @@ def install_from_git(
         cache_target = install_codex_plugin_cache(
             plugin_root,
             codex_home=codex_home,
+            python_executable=python,
             dry_run=dry_run,
             commands=commands,
         )
         marketplace_target = install_codex_marketplace(
             plugin_root,
             marketplace_root=codex_marketplace_root,
+            python_executable=python,
             dry_run=dry_run,
             commands=commands,
         )

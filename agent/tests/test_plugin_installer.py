@@ -12,6 +12,7 @@ from agent.plugin_installer import (
     _check_ai_cli,
     _check_claude_manifest,
     _check_claude_marketplace,
+    _load_toml_text,
     configure_codex_plugin,
     doctor_plugin,
     format_result,
@@ -57,7 +58,23 @@ def _write_plugin_fixture(root: Path) -> None:
                 {"name": "aming-claw", "source": "./", "version": "0.1.0"}
             ],
         },
-        ".mcp.json": {"mcpServers": {"aming-claw": {"command": "python"}}},
+        ".mcp.json": {
+            "mcpServers": {
+                "aming-claw": {
+                    "command": "python",
+                    "args": [
+                        "-m",
+                        "agent.mcp.server",
+                        "--project",
+                        "aming-claw",
+                        "--workers",
+                        "0",
+                    ],
+                    "cwd": ".",
+                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+                }
+            }
+        },
     }.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +84,9 @@ def _write_plugin_fixture(root: Path) -> None:
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("---\nname: test\n---\n", encoding="utf-8")
+    server_path = root / "agent" / "mcp" / "server.py"
+    server_path.parent.mkdir(parents=True, exist_ok=True)
+    server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
 
 
 def test_slug_from_repo_url_handles_https_and_git_suffix():
@@ -242,11 +262,48 @@ def test_install_codex_plugin_cache_uses_versioned_codex_loader_layout(tmp_path)
     _write_plugin_fixture(tmp_path)
     codex_home = tmp_path / "codex-home"
 
-    target = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    target = install_codex_plugin_cache(tmp_path, codex_home=codex_home, python_executable="python3.12")
 
     assert target == codex_home / "plugins" / "cache" / "aming-claw-local" / "aming-claw" / "0.1.0"
     assert (target / ".codex-plugin" / "plugin.json").is_file()
     assert (target / "skills" / "aming-claw" / "SKILL.md").is_file()
+    assert not (target / "agent" / "mcp" / "server.py").exists()
+
+    mcp = json.loads((target / ".mcp.json").read_text(encoding="utf-8"))
+    server = mcp["mcpServers"]["aming-claw"]
+    assert server["command"] == "python3.12"
+    assert server["cwd"] == str(tmp_path.resolve())
+    assert str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(":") or str(tmp_path.resolve()) in server["env"]["PYTHONPATH"].split(";")
+    assert server["args"][:2] == ["-m", "agent.mcp.server"]
+
+
+def test_doctor_plugin_fails_when_cache_mcp_cannot_import_runtime(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    marketplace_root = tmp_path / "marketplace-root"
+    cache_target = install_codex_plugin_cache(tmp_path, codex_home=codex_home)
+    install_codex_marketplace(tmp_path, marketplace_root=marketplace_root)
+    codex_config = configure_codex_plugin(
+        codex_config=codex_home / "config.toml",
+        marketplace_root=marketplace_root,
+    )
+    mcp_path = cache_target / ".mcp.json"
+    payload = json.loads(mcp_path.read_text(encoding="utf-8"))
+    payload["mcpServers"]["aming-claw"]["cwd"] = "."
+    payload["mcpServers"]["aming-claw"]["env"].pop("PYTHONPATH", None)
+    mcp_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        codex_home=codex_home,
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_plugin_cache"].status == "fail"
+    assert "cannot import agent.mcp.server" in checks["codex_plugin_cache"].detail
 
 
 def test_configure_codex_plugin_enables_plugin_and_valid_marketplace(tmp_path):
@@ -257,10 +314,30 @@ def test_configure_codex_plugin_enables_plugin_and_valid_marketplace(tmp_path):
         marketplace_root=marketplace_root,
     )
     text = config_path.read_text(encoding="utf-8")
+    parsed = _load_toml_text(text)
 
     assert f'[plugins."{CODEX_PLUGIN_ID}"]' in text
     assert "enabled = true" in text
-    assert str(marketplace_root).replace("\\", "\\\\") in text
+    assert parsed["marketplaces"]["aming-claw-local"]["source"] == str(marketplace_root.resolve())
+    assert f"source = '{marketplace_root.resolve()}'" in text
+
+
+def test_doctor_plugin_fails_on_invalid_codex_config_toml(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    codex_config = tmp_path / "config.toml"
+    codex_config.write_text("[plugins.\n", encoding="utf-8")
+
+    result = doctor_plugin(
+        plugin_root=tmp_path,
+        codex_config=codex_config,
+        codex_home=tmp_path / "codex-home",
+        check_governance=False,
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.ok is False
+    assert checks["codex_config"].status == "fail"
+    assert "invalid TOML" in checks["codex_config"].detail
 
 
 def test_doctor_plugin_rejects_manifest_with_too_many_default_prompts(tmp_path):
