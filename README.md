@@ -1,5 +1,6 @@
 # Aming Claw
 
+[![SafeSkill 50/100](https://img.shields.io/badge/SafeSkill-50%2F100_Use%20with%20Caution-orange)](https://safeskill.dev/scan/amingclawdev-aming-claw)
 Aming Claw is a local AI governance workspace for turning a codebase into a
 queryable graph, then using that graph to guide AI-assisted issue discovery,
 backlog filing, and PR work.
