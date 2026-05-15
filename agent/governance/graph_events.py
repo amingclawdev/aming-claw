@@ -2083,10 +2083,13 @@ def _latest_edge_semantic_events(
             for edge_variant in _edge_id_variants(edge_id):
                 if edge_variant in by_target_id:
                     event = by_target_id[edge_variant]
-                    if target_id_fallback_matches_current_edge(
-                        event,
-                        stable_key=stable_key,
-                        current_edge_signature_hash=edge_signature_hash,
+                    if (
+                        str(event.get("snapshot_id") or "") == snapshot_id
+                        or target_id_fallback_matches_current_edge(
+                            event,
+                            stable_key=stable_key,
+                            current_edge_signature_hash=edge_signature_hash,
+                        )
                     ):
                         candidates.append(event)
             if candidates:
