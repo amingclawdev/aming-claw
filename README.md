@@ -1,12 +1,12 @@
 # Aming Claw
 
-Aming Claw turns your codebase into a **commit-bound queryable graph** that
-Codex and Claude Code share as a substrate — for code understanding, multi-AI
-collaboration, evidence-backed backlog, and auditable AI-assisted changes.
+**Your AI agent and you, sharing the same dashboard.**
 
-Local-first MVP: clone the repo, start the governance service, install the
-Codex or Claude Code plugin, then use the dashboard and MCP tools against your
-projects.
+Open source workspace for AI-coded development. See what AI is touching in
+real-time, audit every change, review proposals before they land in your
+codebase. Multi-language (Python/TypeScript), MCP-native, local-first.
+
+![Aming Claw — AI session and dashboard side by side, sharing the same project evidence](docs/assets/hero.gif)
 
 ## Contents
 
