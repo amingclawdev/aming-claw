@@ -23,8 +23,12 @@ evidence in that fallback mode.
    - `degree_summary` for exact fan-in/fan-out and edge-type breakdown for a node.
    - `high_degree_nodes` to rank high fan-out/fan-in candidates for PR opportunity analysis.
    - `search_semantic` for node semantics, node metadata, and current edge semantic projection payloads.
+   - `list_features` for budget-safe L7/L4 lists. It defaults to
+     `compact=true` and does not include semantic payloads unless
+     `include_semantic=true` is passed.
    - `search_docs` for canonical docs and SOPs.
-   - `get_node` for known L4/L7 nodes.
+   - `get_node` for known L4/L7 nodes; pass `include_semantic=true` for exact
+     node semantic memory and `compact=true` for a short semantic summary.
    - `get_neighbors` around the candidate owner node; pass `include_edge_semantic=true` when edge semantic payloads matter.
    - `get_file_excerpt` for targeted snippets when available.
 4. Run `wf_impact` on candidate files before mutation only when the project has
@@ -51,6 +55,11 @@ an isolated clean worktree before claiming graph state reflects current code.
 
 Subtool parameters always go under `args`; top-level `path`, `query`, `limit`,
 or `node_id` values are ignored/rejected by the MCP schema.
+
+Use compact queries first. To inspect semantics without blowing the response
+budget, prefer `search_semantic`, `get_node` with `compact=true`, or
+`get_neighbors` with `include_edge_semantic=true`. Only request
+`compact=false` for a small, known target.
 
 ```json
 {

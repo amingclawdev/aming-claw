@@ -104,9 +104,23 @@ backlog of record (and `docs/dev/` is gitignored, so they're not committed).
   - `function_callers`, `function_callees`, `high_function_degree`: inspect persisted function-level call facts when the active graph was built with function call metadata.
   - `degree_summary`: exact fan-in/fan-out and edge-type breakdown for a node.
   - `high_degree_nodes`: rank high fan-in/fan-out candidates.
+  - `list_features`: budget-safe L7/L4 lists; default is `compact=true` and
+    `include_semantic=false`.
   - `get_neighbors`: structural neighbors; pass `include_edge_semantic=true` for semantic edge projection payloads.
   - `search_semantic`: node semantics, node metadata, and current edge semantic projection.
   - `search_docs`, `get_node`, and `get_file_excerpt`: docs, exact node fetches, and bounded code excerpts.
+
+Semantic access is explicit:
+
+- Use `search_semantic` for semantic keyword search across nodes and current
+  edge projection payloads.
+- Use `get_node` with `include_semantic=true` for one known node. Add
+  `compact=true` when a short status/intent/domain summary is enough.
+- Use `get_neighbors` with `include_edge_semantic=true` for edge semantics
+  around a node.
+- Use `list_features` with `include_semantic=true` only for bounded lists. In
+  compact mode it returns compact semantic overlays; use `compact=false` only
+  for small, deliberate result sets.
 
 All graph-query subtool parameters must be nested under the `args` object. Do
 not flatten `path`, `query`, `limit`, or `node_id` at the top level.

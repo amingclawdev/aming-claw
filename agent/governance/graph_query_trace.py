@@ -80,11 +80,28 @@ QUERY_PURPOSES = {
 GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "list_layers": {"required_args": [], "summary": "Layer counts for the active graph snapshot."},
     "list_subsystems": {"required_args": [], "summary": "List L3 subsystem/container nodes."},
-    "list_features": {"required_args": [], "summary": "List feature/module nodes, usually L7."},
-    "get_node": {"required_args": ["node_id"], "summary": "Fetch one graph node by id."},
+    "list_features": {
+        "required_args": [],
+        "summary": "List feature/module nodes, usually L7; compact=true by default.",
+        "optional_args": ["limit", "layer", "l3_id", "parent_id", "compact", "include_semantic"],
+        "args": {
+            "compact": {"default": True, "description": "Return budget-safe node payloads."},
+            "include_semantic": {
+                "default": "false when compact=true, true when compact=false",
+                "description": "Attach node semantic overlays; compact mode returns compact semantic summaries.",
+            },
+        },
+    },
+    "get_node": {
+        "required_args": ["node_id"],
+        "summary": "Fetch one graph node by id; include_semantic=true by default.",
+        "optional_args": ["compact", "include_semantic", "include_feedback", "feedback_limit"],
+    },
     "get_neighbors": {
         "required_args": ["node_id"],
         "summary": "Fetch structural neighbors; pass include_edge_semantic=true for projection payloads.",
+        "optional_args": ["direction", "limit", "include_edge_semantic", "include_semantic_edges"],
+        "args": {"direction": {"enum": ["in", "out", "both"], "default": "both"}},
     },
     "find_node_by_path": {"required_args": ["path"], "summary": "Resolve a file path to graph node ids."},
     "search_structure": {"required_args": ["query"], "summary": "Search structural node metadata, files, and functions."},
@@ -109,6 +126,8 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "search_semantic": {
         "required_args": ["query"],
         "summary": "Search node semantics, node metadata, and current edge semantic projection.",
+        "optional_args": ["scope", "target", "limit"],
+        "args": {"scope": {"enum": ["all", "nodes", "edges"], "default": "all"}},
     },
     "search_docs": {"required_args": ["query"], "summary": "Search graph-bound documentation files."},
     "get_docs": {"required_args": ["node_id"], "summary": "List docs bound to a node."},
@@ -581,7 +600,7 @@ def _compact_node(node: dict[str, Any]) -> dict[str, Any]:
     graph_metrics = metadata.get("graph_metrics") if isinstance(metadata.get("graph_metrics"), dict) else {}
     functions = metadata.get("functions") if isinstance(metadata.get("functions"), list) else []
     config_files = _string_list(metadata.get("config_files"))
-    return {
+    compact = {
         "node_id": node.get("node_id", ""),
         "layer": node.get("layer", ""),
         "title": node.get("title", ""),
@@ -606,6 +625,10 @@ def _compact_node(node: dict[str, Any]) -> dict[str, Any]:
             },
         },
     }
+    semantic = node.get("semantic")
+    if isinstance(semantic, dict):
+        compact["semantic"] = _compact_semantic(semantic)
+    return compact
 
 
 def _compact_semantic(semantic: dict[str, Any]) -> dict[str, Any]:

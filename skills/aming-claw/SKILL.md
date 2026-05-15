@@ -183,7 +183,7 @@ is stale, then close the backlog row with commit and verification evidence.
 4. If governance is offline or this is a fresh install, read `aming-claw://seed-graph-summary` for packaged MVP structure before asking the user to start services.
 5. For AI or semantic work, check local AI runtime readiness through the project AI config before queueing jobs.
 6. Call `graph_query` with `tool=query_schema` to discover the live query contract.
-7. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `function_index`, `function_callers`, `function_callees`, `high_function_degree`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. See [graph-first.md](references/graph-first.md).
+7. Run graph-first discovery before implementation. Prefer `find_node_by_path`, `search_structure`, `list_features`, `function_index`, `function_callers`, `function_callees`, `high_function_degree`, `degree_summary`, `high_degree_nodes`, `get_neighbors`, and `search_semantic` before broad filesystem scans. Start with compact graph queries; use `search_semantic`, `get_node(include_semantic=true)`, or `get_neighbors(include_edge_semantic=true)` for semantic payloads. See [graph-first.md](references/graph-first.md).
 8. Read or create the backlog row before any mutation. For MF/observer-hotfix work, predeclare/start the MF row first.
 9. Inspect files only after graph discovery identifies likely owners and reusable modules.
 

@@ -8,6 +8,7 @@ import pytest
 from agent.governance import graph_events
 from agent.governance import graph_query_trace
 from agent.governance import graph_snapshot_store as store
+from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance.db import _ensure_schema
 
 
@@ -195,6 +196,37 @@ def _seed_edge_projection(conn, snapshot_id):
             "test",
             "2026-05-13T00:00:00Z",
             "2026-05-13T00:00:00Z",
+        ),
+    )
+    conn.commit()
+
+
+def _seed_node_semantic(conn, snapshot_id):
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_nodes
+          (project_id, snapshot_id, node_id, status, feature_hash,
+           file_hashes_json, semantic_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            PID,
+            snapshot_id,
+            "L7.1",
+            "ai_complete",
+            "fh-server",
+            "{}",
+            json.dumps(
+                {
+                    "feature_name": "Governance Server",
+                    "domain_label": "runtime.governance",
+                    "intent": "Serve graph governance APIs.",
+                    "semantic_summary": "Runtime API for graph governance.",
+                    "quality_flags": ["reviewed"],
+                }
+            ),
+            "2026-05-14T00:00:00Z",
         ),
     )
     conn.commit()
@@ -399,6 +431,31 @@ def test_list_features_defaults_to_compact_budget_safe_payload(conn, tmp_path):
     assert "function_calls" not in first["metadata"]
 
 
+def test_list_features_can_opt_into_compact_semantic_overlay(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    _seed_node_semantic(conn, snapshot_id)
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="list_features",
+        args={"compact": True, "include_semantic": True, "limit": 1},
+        project_root=project_root,
+    )
+
+    assert result["ok"] is True
+    payload = result["result"]
+    assert payload["compact"] is True
+    assert payload["include_semantic"] is True
+    assert payload["features"][0]["semantic"]["feature_name"] == "Governance Server"
+    assert payload["features"][0]["semantic"]["status"] == "ai_complete"
+    assert "semantic_summary" not in payload["features"][0]["semantic"]
+
+
 def test_get_file_excerpt_accepts_start_line_end_line_aliases(conn, tmp_path):
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
     source = project_root / "agent" / "governance" / "server.py"
@@ -530,6 +587,23 @@ def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
         "fan_in",
         "fan_out",
         "total",
+    ]
+    list_features = result["result"]["tools"]["list_features"]
+    assert list_features["args"]["compact"]["default"] is True
+    assert "include_semantic" in list_features["optional_args"]
+    assert result["result"]["tools"]["get_node"]["optional_args"][:2] == [
+        "compact",
+        "include_semantic",
+    ]
+    assert result["result"]["tools"]["get_neighbors"]["args"]["direction"]["enum"] == [
+        "in",
+        "out",
+        "both",
+    ]
+    assert result["result"]["tools"]["search_semantic"]["args"]["scope"]["enum"] == [
+        "all",
+        "nodes",
+        "edges",
     ]
     assert "timeout_ms" in result["result"]["tools"]["function_callees"]["optional_args"]
 
