@@ -287,3 +287,18 @@ class TestClaudePluginPackaging:
         # Source must be "./" not bare "." — Claude Code rejects "." as Invalid input.
         assert plugin["source"] == "./"
         assert (ROOT / plugin["source"] / ".claude-plugin" / "plugin.json").is_file()
+
+    def test_claude_plugin_declares_mcp_servers(self):
+        """Claude plugin manifest must declare mcpServers so plugin install exposes the MCP server (otherwise Claude Code reports MCP servers (0))."""
+        manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        servers = manifest.get("mcpServers")
+        assert servers, "Claude plugin manifest must declare mcpServers"
+        assert "aming-claw" in servers, "mcpServers must include 'aming-claw'"
+        aming = servers["aming-claw"]
+        assert aming.get("command") == "python"
+        args = aming.get("args") or []
+        assert "-m" in args and "agent.mcp.server" in args
+        # cwd must use ${CLAUDE_PLUGIN_ROOT} so python -m agent.mcp.server can
+        # locate the agent package in the plugin install dir, not the caller's
+        # CWD which is unpredictable after install.
+        assert aming.get("cwd") == "${CLAUDE_PLUGIN_ROOT}"
