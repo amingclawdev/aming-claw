@@ -120,7 +120,7 @@ URL drop → `aming-claw plugin doctor` → `aming-claw start` → open `/dashbo
 
 ### Bootstrap a project
 
-![coming soon](docs/assets/demos/bootstrap-placeholder.svg)
+![Bootstrap a project — pick a workspace, build the commit-bound graph, watch nodes appear](docs/assets/demos/bootstrap.gif)
 
 Choose a clean project, build the graph, watch nodes appear in Projects/Graph.
 
