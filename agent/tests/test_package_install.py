@@ -276,6 +276,7 @@ class TestClaudePluginPackaging:
         marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
 
         assert marketplace["name"] == "aming-claw-local"
+        assert marketplace["metadata"]["description"], "marketplace must declare metadata.description"
         assert marketplace["owner"]["name"], "marketplace must declare an owner name"
 
         plugins = marketplace["plugins"]
@@ -283,5 +284,6 @@ class TestClaudePluginPackaging:
         plugin = plugins[0]
         assert plugin["name"] == "aming-claw"
         # Same-repo plugin: marketplace root == plugin root == repo root.
-        assert plugin["source"] == "."
+        # Source must be "./" not bare "." — Claude Code rejects "." as Invalid input.
+        assert plugin["source"] == "./"
         assert (ROOT / plugin["source"] / ".claude-plugin" / "plugin.json").is_file()
