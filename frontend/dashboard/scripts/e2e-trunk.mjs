@@ -430,6 +430,19 @@ function writeFixtureFiles() {
   return output;
 }
 
+function fixtureNeedsMaterialize() {
+  const required = [
+    ".aming-claw.yaml",
+    path.join(".aming-claw", "e2e-artifacts", "materialize-manifest.json"),
+    path.join("docs", "orphan-dashboard-note.md"),
+  ];
+  if (required.some((relPath) => !existsSync(path.join(WORKSPACE, relPath)))) {
+    return true;
+  }
+  const orphanText = readText(path.join(WORKSPACE, "docs", "orphan-dashboard-note.md"));
+  return orphanText.includes("governance-hint");
+}
+
 function ensureGitRepository() {
   if (!existsSync(path.join(WORKSPACE, ".git"))) {
     git(["init", "-b", "main"], WORKSPACE, { allowFail: true });
@@ -531,6 +544,21 @@ function nodeSemanticOps(ops, nodeId) {
   return (ops.operations || []).filter((op) =>
     op.operation_type === "node_semantic" && String(op.target_id || "") === nodeId,
   );
+}
+
+async function ensureSemanticRouting() {
+  const response = await http("POST", `/api/projects/${pid(PROJECT)}/ai-config`, {
+    routing: {
+      semantic: {
+        provider: "openai",
+        model: "gpt-5.4-mini",
+      },
+    },
+    actor: "dashboard_trunk_e2e",
+  });
+  const semantic = response.project_config?.ai?.routing?.semantic || {};
+  assert(semantic.provider && semantic.model, "semantic routing was not saved for e2e fixture");
+  return semantic;
 }
 
 function semanticJobPayload(node, { dryRun }) {
@@ -786,9 +814,7 @@ async function stepFixtureProject() {
     rmSync(WORKSPACE, { recursive: true, force: true });
   }
   mkdirSync(WORKSPACE, { recursive: true });
-  const shouldWrite = RESET
-    || !existsSync(path.join(WORKSPACE, ".aming-claw.yaml"))
-    || !existsSync(path.join(WORKSPACE, ".aming-claw", "e2e-artifacts", "materialize-manifest.json"));
+  const shouldWrite = RESET || fixtureNeedsMaterialize();
   if (shouldWrite) writeFixtureFiles();
   const commit = ensureGitRepository();
   const smoke = command("node", ["tests/smoke.test.mjs"], WORKSPACE);
@@ -988,6 +1014,7 @@ async function stepSemanticJobsPath() {
   assert(snapshotId, "semantic path requires reconciled active snapshot");
   assert(node?.node_id, "semantic path requires reconciled target node");
 
+  const semanticRouting = await ensureSemanticRouting();
   await cancelAllQueuedSemantic(snapshotId);
   await clearTerminalSemanticJobs(snapshotId);
 
@@ -1006,6 +1033,7 @@ async function stepSemanticJobsPath() {
     context.semantic = {
       snapshot_id: snapshotId,
       node_id: node.node_id,
+      routing: semanticRouting,
       dry_run: { planned_count: dry.planned_count, queued_count: dry.queued_count },
       queue: { skipped: true, reason: "safe path uses dry_run only" },
       cancel_sweep: { cancelled_count: cancelSweep.cancelled_count ?? 0, status: cancelSweep.status || "" },
