@@ -6,7 +6,7 @@ Open source workspace for AI-coded development. See what AI is touching in
 real-time, audit every change, review proposals before they land in your
 codebase. Multi-language (Python/TypeScript), MCP-native, local-first.
 
-![Aming Claw — AI session and dashboard side by side, sharing the same project evidence](docs/assets/hero.gif)
+![Aming Claw — AI session and dashboard side by side, sharing the same project evidence](docs/assets/hero.png)
 
 ## Contents
 
