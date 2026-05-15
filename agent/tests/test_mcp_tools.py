@@ -56,6 +56,12 @@ class _RuntimeMismatchGovRecorder(_Recorder):
         return {"ok": True, "method": method, "path": path, "data": data}
 
 
+class _OfflineGovRecorder(_Recorder):
+    def api(self, method: str, path: str, data: dict | None = None) -> dict:
+        self.calls.append((method, path, data))
+        return {"ok": False, "error": "<urlopen error timed out>"}
+
+
 def _dispatcher(recorder: _Recorder, manager: _Recorder | None = None) -> ToolDispatcher:
     return ToolDispatcher(
         api_fn=recorder.api,
@@ -271,6 +277,22 @@ def test_mcp_runtime_status_runtime_mismatch_is_degraded_but_usable():
     assert "governance_redeploy_or_restart_sm" in status["recommended_actions"]
 
 
+def test_mcp_runtime_status_governance_offline_reports_loaded_mcp():
+    governance = _OfflineGovRecorder()
+    manager = _Recorder()
+    dispatcher = _dispatcher(governance, manager)
+
+    status = dispatcher.dispatch("runtime_status", {"project_id": "aming-claw"})
+
+    assert status["ok"] is False
+    assert status["severity"] == "blocking"
+    assert status["governance"]["governance_online"] is False
+    assert status["governance"]["mcp_loaded"] is True
+    assert status["version_check"]["governance_online"] is False
+    assert "start_governance" in status["recommended_actions"]
+    assert "MCP server is loaded" in status["governance"]["message"]
+
+
 def test_mcp_version_check_preserves_governance_and_workspace_heads(monkeypatch):
     governance = _Recorder()
 
@@ -305,6 +327,30 @@ def test_mcp_version_check_preserves_governance_and_workspace_heads(monkeypatch)
     assert result["governance_synced_head"] == "gov-old"
     assert "MCP workspace HEAD (workspace-new) != CHAIN_VERSION (chain-old)" in result["message"]
     assert "governance synced HEAD (gov-old) differs from MCP workspace HEAD (workspace-new)" in result["message"]
+
+
+def test_mcp_version_check_governance_offline_preserves_workspace_head(monkeypatch):
+    governance = _OfflineGovRecorder()
+
+    def fake_check_output(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            return b"workspace-new\n"
+        if cmd[:3] == ["git", "diff", "--name-only"]:
+            return b""
+        return b""
+
+    monkeypatch.setattr(mcp_tools.subprocess, "check_output", fake_check_output)
+    dispatcher = ToolDispatcher(api_fn=governance.api, worker_pool=None, service_mgr=None, workspace=".")
+
+    result = dispatcher.dispatch("version_check", {"project_id": "aming-claw"})
+
+    assert result["ok"] is False
+    assert result["governance_online"] is False
+    assert result["mcp_loaded"] is True
+    assert result["recommended_action"] == "start_governance"
+    assert result["mcp_workspace_head"] == "workspace-new"
+    assert result["head"] == "workspace-new"
+    assert "MCP server is loaded" in result["message"]
 
 
 def test_mcp_manager_start_refuses_takeover_from_mcp():

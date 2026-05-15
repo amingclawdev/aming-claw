@@ -13,6 +13,10 @@ Prefer MCP tools over raw SQLite or hand-rolled HTTP calls when the tool exists.
 Use these at session start, after commits, and before closing a backlog row.
 ServiceManager or executor offline means runtime is degraded for chain/executor
 work; it does not by itself mean governance or the dashboard is down.
+If a runtime tool returns `governance_online=false`, the MCP server and skill
+loaded successfully but the governance HTTP service is offline or timed out.
+Tell the user to start it with `aming-claw start` or the launcher, then retry;
+do not describe that state as a plugin or MCP install failure.
 
 ## AI Config And Local Runtime
 

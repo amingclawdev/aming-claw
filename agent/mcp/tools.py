@@ -478,6 +478,28 @@ def _runtime_status_classification(
     }
 
 
+def _governance_offline_hint(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    has_error = bool(payload.get("error"))
+    is_online = str(payload.get("status") or "").lower() == "ok" or bool(payload.get("ok"))
+    if not has_error or is_online:
+        return payload
+    enriched = dict(payload)
+    enriched.setdefault("ok", False)
+    enriched.setdefault("governance_online", False)
+    enriched.setdefault("mcp_loaded", True)
+    enriched.setdefault("service_required", "governance")
+    enriched.setdefault("recommended_action", "start_governance")
+    enriched.setdefault(
+        "message",
+        "MCP server is loaded, but the Aming Claw governance HTTP service is "
+        "offline or timed out. Start it with `aming-claw start` or the "
+        "launcher, then retry.",
+    )
+    return enriched
+
+
 class ToolDispatcher:
     """Routes MCP tool calls to governance API or in-process worker pool."""
 
@@ -722,9 +744,9 @@ class ToolDispatcher:
 
         if name == "runtime_status":
             pid = args["project_id"]
-            governance = self._api("GET", "/api/health")
+            governance = _governance_offline_hint(self._api("GET", "/api/health"))
             manager = self._manager_api("GET", "/api/manager/health")
-            version = self._api("GET", f"/api/version-check/{pid}")
+            version = _governance_offline_hint(self._api("GET", f"/api/version-check/{pid}"))
             classification = _runtime_status_classification(governance, manager, version)
             status = {
                 **classification,
@@ -734,7 +756,9 @@ class ToolDispatcher:
                 "version_check": version,
                 "recommended_actions": [],
             }
-            if governance.get("status") != "ok":
+            if governance.get("governance_online") is False:
+                status["recommended_actions"].append("start_governance")
+            elif governance.get("status") != "ok":
                 status["recommended_actions"].append("governance_redeploy")
             if not manager.get("ok"):
                 status["recommended_actions"].append("manager_start")
@@ -746,12 +770,12 @@ class ToolDispatcher:
 
         # --- System ---
         if name == "health":
-            return self._api("GET", "/api/health")
+            return _governance_offline_hint(self._api("GET", "/api/health"))
 
         if name == "version_check":
             pid = args["project_id"]
             # Get chain_version from governance DB
-            result = self._api("GET", f"/api/version-check/{pid}")
+            result = _governance_offline_hint(self._api("GET", f"/api/version-check/{pid}"))
             governance_head = str(result.get("head") or "")
             if governance_head:
                 result.setdefault("governance_synced_head", governance_head)
