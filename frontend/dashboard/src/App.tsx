@@ -145,6 +145,22 @@ function shouldFallbackToProjects(error: unknown): boolean {
 
 const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
 
+function emptyOperationsQueue(projectId: string, snapshotId: string): OperationsQueueResponse {
+  return {
+    ok: true,
+    project_id: projectId,
+    snapshot_id: snapshotId,
+    active_snapshot_id: snapshotId,
+    count: 0,
+    operations: [],
+    summary: {
+      by_type: {},
+      by_status: {},
+      pending_scope_reconcile_count: 0,
+    },
+  };
+}
+
 const DEFAULT_AI_MODELS: Record<string, string[]> = {
   anthropic: ["claude-opus-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5"],
   openai: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
@@ -256,11 +272,10 @@ export default function App() {
         });
         return;
       }
-      const [status, summary, projection, ops, backlog, aiCfg] = await Promise.all([
+      const [status, summary, projection, backlog, aiCfg] = await Promise.all([
         api.statusFor(requestProjectId, signal),
         api.activeSummaryFor(requestProjectId, signal),
         api.activeProjectionFor(requestProjectId, signal),
-        api.operationsQueueFor(requestProjectId, signal),
         api.backlogFor(requestProjectId, signal),
         api.aiConfigFor(requestProjectId, signal),
       ]);
@@ -289,11 +304,25 @@ export default function App() {
         projection,
         nodes: mergedWithHealth,
         edges: edgesRes.edges,
-        ops,
+        ops: emptyOperationsQueue(requestProjectId, snapshotId),
         feedback,
         backlog,
         loadedAt: new Date().toISOString(),
       });
+      api.operationsQueueFor(requestProjectId, signal)
+        .then((ops) => {
+          setData((current) => {
+            if (!current) return current;
+            const currentProjectId = current.status.project_id || current.summary.project_id;
+            const currentSnapshotId = current.status.active_snapshot_id || current.summary.snapshot_id;
+            if (currentProjectId !== requestProjectId || currentSnapshotId !== snapshotId) return current;
+            return { ...current, ops };
+          });
+        })
+        .catch((opsError) => {
+          if ((opsError as { name?: string }).name === "AbortError") return;
+          console.warn("Operations queue refresh failed", opsError);
+        });
     } catch (e) {
       if ((e as { name?: string }).name === "AbortError") return;
       if (shouldFallbackToProjects(e) && view === "projects") {

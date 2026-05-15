@@ -162,6 +162,7 @@ graph:
   exclude_paths:
     - "examples"
     - "docs/dev"
+    - "agent/governance/dashboard_dist"
     - ".worktrees"
     - ".claude/worktrees"
   ignore_globs:
@@ -169,6 +170,7 @@ graph:
     - "**/.next/**"
     - "**/dist/**"
     - "**/build/**"
+    - "agent/governance/dashboard_dist/**"
   nested_projects:
     mode: "exclude"
     roots:
