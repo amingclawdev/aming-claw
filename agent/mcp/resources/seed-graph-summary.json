@@ -37,6 +37,8 @@
       "paths": [
         "agent/mcp/server.py",
         ".codex-plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
         "skills/aming-claw/SKILL.md",
         "skills/aming-claw/references/mcp-tools.md"
       ],

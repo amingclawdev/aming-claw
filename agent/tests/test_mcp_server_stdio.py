@@ -134,6 +134,9 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     seed = json.loads(responses[4]["result"]["contents"][0]["text"])
     assert seed["project_id"] == "aming-claw"
     assert "graph-native" in " ".join(seed["recommended_first_actions"]).lower()
+    mcp_surface = next(s for s in seed["core_surfaces"] if s["name"] == "mcp-plugin")
+    assert ".codex-plugin/plugin.json" in mcp_surface["paths"]
+    assert ".claude-plugin/plugin.json" in mcp_surface["paths"]
 
 
 def test_mcp_current_context_prefers_workspace_project_config(tmp_path: Path):

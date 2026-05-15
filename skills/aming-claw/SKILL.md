@@ -16,7 +16,7 @@ tell the user you can help with:
 - Rank PR opportunities: use graph evidence to identify high fan-out nodes, missing tests/docs, suspicious dependencies, semantic drift, review debt, and candidate refactor/test/doc issues.
 - Generate evidence-backed backlog rows: include node ids, primary files, related functions, graph metrics, neighbors, risk, acceptance criteria, target files, and test files.
 - Guide dashboard collaboration: use browser-use to inspect Projects, Graph tree, Inspector, Relations, Functions, Operations Queue, Review Queue, and Backlog as the same shared control plane the user sees.
-- Onboard new users with a Codex-rendered launcher MVP: dashboard link, project initialization path, browser collaboration entry, graph concepts, backlog workflow, and safe startup commands.
+- Onboard new users with a host-rendered launcher MVP: dashboard link, project initialization path, browser collaboration entry, graph concepts, backlog workflow, and safe startup commands.
 - Run targeted semantic enrichment and review when requested: explain missing/current/hash-unverified/pending-review states, queue/cancel/retry semantics, and the difference between AI-proposed memory and user-approved memory.
 - Drive advanced chain/dev/test/qa workflows only when explicitly needed; MVP work can stay local with graph, backlog, tests, and dashboard checks.
 
@@ -234,7 +234,7 @@ project root file.
 ## Fresh Session Launcher
 
 On the first Aming Claw skill load in a fresh session, show a short
-Codex-rendered launcher block before deep work. This is the MVP for onboarding
+host-rendered launcher block before deep work. This is the MVP for onboarding
 buttons until the dashboard/plugin frontend owns native controls.
 
 First read `aming-claw://current-context` when available. If that resource is
@@ -263,7 +263,7 @@ The launcher should be status-aware:
 - If graph is current, keep the primary actions to three: "Check Current
   Project Status", "Find PR Opportunities", and "Explain Graph Concepts".
 
-Codex-owned MVP behavior:
+Host-owned MVP behavior:
 
 - Render the launcher as a compact Markdown action panel with button-like
   labels and links/copyable commands. If the host app supports interactive
@@ -323,7 +323,7 @@ aming-claw launcher
 aming-claw start
 ```
 
-The generated launcher artifact may be a Codex-rendered Markdown panel for MVP
+The generated launcher artifact may be a host-rendered Markdown panel for MVP
 or an HTML/dashboard guide in later iterations. It may include:
 
 - Dashboard link.
