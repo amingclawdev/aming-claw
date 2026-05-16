@@ -68,6 +68,9 @@ as the default operator path.
 - `backlog_get`: inspect the selected row.
 - `backlog_upsert`: create/update a row before code or doc mutations.
 - `backlog_close`: close with commit evidence.
+- `backlog_export`: export backlog rows as portable JSON for transfer or backup.
+- `backlog_import`: import portable backlog JSON with `skip`, `overwrite`, or
+  `fail` conflict handling and optional dry-run.
 
 For MF work, use the backlog row as the single source of scope, target files, acceptance, and commit evidence.
 During MVP, some observer-hotfix/manual-fix flows are stored as
@@ -92,6 +95,11 @@ governance HTTP routes directly:
 - `POST /api/backlog/{project_id}/{bug_id}/start-mf` — mark MF in progress.
 - `POST /api/backlog/{project_id}/{bug_id}/close` — close with commit
   evidence after the MF lands.
+- `GET  /api/backlog/{project_id}/portable/export` — export portable JSON.
+  Optional query: `status`, `priority`, `bug_id` (comma-separated).
+- `POST /api/backlog/{project_id}/portable/import` — import portable JSON.
+  Body: `payload`, `on_conflict` (`skip`/`overwrite`/`fail`), `dry_run`,
+  `actor`.
 
 **Do not "file" backlog by writing a markdown doc into `docs/dev/`** — the
 canonical store is `backlog_bugs` table behind these routes. The

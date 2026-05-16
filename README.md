@@ -509,6 +509,18 @@ not a governance failure.
 8. Review and accept or reject proposed semantic memory.
 9. File backlog rows and PR opportunities with graph evidence.
 
+Backlog rows can be moved between machines through a portable JSON export:
+
+```bash
+aming-claw backlog export --project-id <id> --output backlog.json
+aming-claw backlog import --project-id <id> --input backlog.json
+```
+
+Import defaults to `--on-conflict skip`, so existing bug ids on the target
+machine are not overwritten. Use `--dry-run` to preview the insert/update/skip
+counts, or `--on-conflict overwrite` when the export should replace target
+rows.
+
 Project bootstrap is explicit. Do not silently register a workspace just
 because `/api/projects` is empty. Bootstrap writes Aming Claw registry/DB state,
 scans the workspace, and builds a commit-bound graph snapshot through
@@ -528,6 +540,8 @@ aming-claw launcher        # write/open the local launcher
 aming-claw plugin install  # clone/update local plugin assets from Git
 aming-claw plugin update --check # check Git remote and refresh update state
 aming-claw plugin update --apply # fast-forward plugin checkout and write restart obligations
+aming-claw backlog export --project-id <id> --output backlog.json
+aming-claw backlog import --project-id <id> --input backlog.json --dry-run
 aming-claw start           # start governance locally
 aming-claw open            # open the dashboard
 aming-claw status          # check governance health

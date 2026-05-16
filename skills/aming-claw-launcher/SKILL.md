@@ -148,6 +148,7 @@ claims are available.
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
 | `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, install Codex cache/config, and print next steps. |
 | `aming-claw plugin update --check\|--apply [<git-url>]` | Check a Git-backed plugin checkout for updates, apply fast-forward updates, refresh install surfaces, and write local restart/reload obligations. |
+| `aming-claw backlog export\|import --project-id <id>` | Move backlog rows between local machines with portable JSON, dry-run, and explicit conflict handling. |
 | `aming-claw mf precommit-check [--plugin-state <json>]` | Run local manual-fix pre-commit guards, including plugin update/restart state blockers. |
 | `aming-claw run-executor` | Start an executor worker directly. Normally ServiceManager owns this — only use for explicit debugging. |
 

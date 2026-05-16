@@ -232,6 +232,35 @@ TOOLS: list[dict] = [
             "required": ["project_id", "bug_id"],
         },
     },
+    {
+        "name": "backlog_export",
+        "description": "Export backlog rows as a portable JSON payload.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "status": {"type": "string", "description": "Optional status filter, e.g. OPEN or FIXED"},
+                "priority": {"type": "string", "description": "Optional priority filter, e.g. P1"},
+                "bug_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional bug ids to export"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "backlog_import",
+        "description": "Import portable backlog rows into a project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "payload": {"type": "object", "description": "Portable backlog export payload"},
+                "on_conflict": {"type": "string", "enum": ["skip", "overwrite", "fail"], "description": "Existing bug id behavior"},
+                "dry_run": {"type": "boolean", "description": "Validate and report planned changes without writing rows"},
+                "actor": {"type": "string"},
+            },
+            "required": ["project_id", "payload"],
+        },
+    },
     # --- Graph Governance ---
     {
         "name": "graph_status",
@@ -623,6 +652,28 @@ class ToolDispatcher:
                 if args.get(key)
             }
             return self._api("POST", f"/api/backlog/{pid}/{bug_id}/close", body)
+
+        if name == "backlog_export":
+            pid = args["project_id"]
+            query = {
+                key: args[key]
+                for key in ("status", "priority")
+                if args.get(key)
+            }
+            bug_ids = args.get("bug_ids") or []
+            if bug_ids:
+                query["bug_id"] = ",".join(str(item) for item in bug_ids)
+            qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+            return self._api("GET", f"/api/backlog/{pid}/portable/export{qs}")
+
+        if name == "backlog_import":
+            pid = args["project_id"]
+            body = {
+                key: args[key]
+                for key in ("payload", "on_conflict", "dry_run", "actor")
+                if key in args and args[key] is not None
+            }
+            return self._api("POST", f"/api/backlog/{pid}/portable/import", body)
 
         # --- Graph governance tools ---
         if name == "graph_status":

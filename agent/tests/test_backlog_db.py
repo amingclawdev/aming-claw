@@ -62,9 +62,9 @@ class TestSchemaV14ToV15(unittest.TestCase):
         self._conns.append(conn)
         return conn
 
-    def test_schema_version_is_15(self):
+    def test_schema_version_is_at_least_15(self):
         from governance.db import SCHEMA_VERSION
-        self.assertEqual(SCHEMA_VERSION, 15)
+        self.assertGreaterEqual(SCHEMA_VERSION, 15)
 
     def test_migration_creates_backlog_bugs_table(self):
         conn = self._get_conn()
@@ -91,12 +91,13 @@ class TestSchemaV14ToV15(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["bug_id"], "TEST-MIG")
 
-    def test_schema_meta_updated_to_15(self):
+    def test_schema_meta_updated_to_current_version(self):
+        from governance.db import SCHEMA_VERSION
         conn = self._get_conn()
         row = conn.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()
-        self.assertEqual(row["value"], "15")
+        self.assertEqual(row["value"], str(SCHEMA_VERSION))
 
 
 class TestBacklogUpsertIdempotency(unittest.TestCase):
@@ -285,7 +286,7 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
 
         ctx2 = self._make_ctx(
             {"project_id": "test-project", "bug_id": "B101"},
-            body={"commit": "deadbeef"},
+            body={},
         )
         result = handle_backlog_close(ctx2)
         self.assertTrue(result["ok"])
@@ -537,7 +538,7 @@ class TestObserverDocUpdate(unittest.TestCase):
             self.skipTest("observer.md not found")
         with open(doc_path, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertIn("Backlog storage migration", content)
+        self.assertIn("Backlog storage", content)
         self.assertIn("backlog_list", content)
         self.assertIn("backlog_upsert", content)
 

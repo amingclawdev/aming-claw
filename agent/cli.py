@@ -6,6 +6,8 @@ Usage:
     aming-claw status          - show governance status
     aming-claw plugin install  - install/update plugin assets from Git
     aming-claw plugin update   - check/apply plugin updates from Git
+    aming-claw backlog export  - export portable backlog JSON
+    aming-claw backlog import  - import portable backlog JSON
     aming-claw start           - start governance in the foreground
     aming-claw open            - open the dashboard URL
     aming-claw launcher        - write a local launcher HTML artifact
@@ -21,6 +23,7 @@ import webbrowser
 import socket
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -120,6 +123,29 @@ def _probe_governance(port: int, *, timeout: float = 2.0) -> Optional[dict]:
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _http_json(method: str, url: str, payload: dict | None = None, *, timeout: float = 30.0) -> tuple[int, dict]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local governance URL by default
+            body = resp.read().decode("utf-8")
+            parsed = json.loads(body) if body else {}
+            return resp.status, parsed if isinstance(parsed, dict) else {"ok": False, "error": "non_object_response"}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {"ok": False, "error": "http_error", "message": body}
+        if not isinstance(parsed, dict):
+            parsed = {"ok": False, "error": "http_error", "message": body}
+        return exc.code, parsed
 
 
 def _port_is_open(port: int, *, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
@@ -251,6 +277,88 @@ def run_executor():
     """Start the executor worker."""
     from agent.executor_worker import main as worker_main
     worker_main()
+
+
+@main.group()
+def backlog():
+    """Export and import portable backlog data."""
+    pass
+
+
+@backlog.command("export")
+@click.option("--project-id", default="aming-claw", help="Governance project id.")
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance service base URL.")
+@click.option("--output", default="", help="Output JSON path. Prints JSON to stdout when omitted.")
+@click.option("--status", default="", help="Optional backlog status filter, e.g. OPEN or FIXED.")
+@click.option("--priority", default="", help="Optional priority filter, e.g. P1.")
+@click.option("--bug-id", "bug_ids", multiple=True, help="Optional bug id to export. Can be repeated.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON even when --output is used.")
+def backlog_export(project_id, governance_url, output, status, priority, bug_ids, json_output):
+    """Export backlog rows as portable JSON."""
+    query = {
+        key: value
+        for key, value in {
+            "status": status,
+            "priority": priority,
+            "bug_id": ",".join(bug_ids),
+        }.items()
+        if value
+    }
+    qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+    url = f"{governance_url.rstrip('/')}/api/backlog/{urllib.parse.quote(project_id, safe='')}/portable/export{qs}"
+    code, payload = _http_json("GET", url)
+    if code >= 400 or payload.get("ok") is False:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        raise click.exceptions.Exit(1)
+
+    if output:
+        target = Path(output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    if json_output or not output:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo(f"Exported {payload.get('row_count', 0)} backlog row(s) to {output}")
+
+
+@backlog.command("import")
+@click.option("--project-id", default="aming-claw", help="Governance project id.")
+@click.option("--governance-url", default=DEFAULT_GOVERNANCE_URL, help="Governance service base URL.")
+@click.option("--input", "input_path", required=True, help="Input JSON path, or '-' for stdin.")
+@click.option("--on-conflict", default="skip", type=click.Choice(["skip", "overwrite", "fail"]), help="How to handle existing bug ids.")
+@click.option("--dry-run", is_flag=True, help="Validate and report planned changes without writing rows.")
+@click.option("--actor", default="cli", help="Actor recorded in the import result.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def backlog_import_cmd(project_id, governance_url, input_path, on_conflict, dry_run, actor, json_output):
+    """Import portable backlog JSON into a governance project."""
+    try:
+        raw = sys.stdin.read() if input_path == "-" else Path(input_path).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"Cannot read backlog import JSON: {exc}") from exc
+
+    url = f"{governance_url.rstrip('/')}/api/backlog/{urllib.parse.quote(project_id, safe='')}/portable/import"
+    body = {
+        "payload": payload,
+        "on_conflict": on_conflict,
+        "dry_run": dry_run,
+        "actor": actor,
+    }
+    code, result = _http_json("POST", url, body)
+    if json_output:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            "Backlog import "
+            f"{'dry-run ' if dry_run else ''}"
+            f"inserted={result.get('inserted_count', 0)} "
+            f"updated={result.get('updated_count', 0)} "
+            f"skipped={result.get('skipped_count', 0)} "
+            f"errors={result.get('error_count', 0)}"
+        )
+    if code >= 400 or not result.get("ok", False):
+        raise click.exceptions.Exit(1)
 
 
 @main.group()

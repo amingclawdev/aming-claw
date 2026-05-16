@@ -80,6 +80,8 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "backlog_get",
         "backlog_upsert",
         "backlog_close",
+        "backlog_export",
+        "backlog_import",
         "graph_status",
         "graph_operations_queue",
         "graph_query",
@@ -113,6 +115,23 @@ def test_mcp_backlog_tools_route_to_governance_api():
             "commit": "abc1234",
         },
     )
+    dispatcher.dispatch(
+        "backlog_export",
+        {
+            "project_id": "aming-claw",
+            "status": "OPEN",
+            "bug_ids": ["BUG-1", "BUG-2"],
+        },
+    )
+    dispatcher.dispatch(
+        "backlog_import",
+        {
+            "project_id": "aming-claw",
+            "payload": {"schema": "aming-claw.backlog.export", "rows": []},
+            "on_conflict": "skip",
+            "dry_run": True,
+        },
+    )
 
     assert recorder.calls[0] == (
         "POST",
@@ -123,6 +142,20 @@ def test_mcp_backlog_tools_route_to_governance_api():
         "POST",
         "/api/backlog/aming-claw/OPT-BACKLOG-MCP-PLUGIN-TOOLS-PARITY/close",
         {"commit": "abc1234"},
+    )
+    assert recorder.calls[2] == (
+        "GET",
+        "/api/backlog/aming-claw/portable/export?status=OPEN&bug_id=BUG-1%2CBUG-2",
+        None,
+    )
+    assert recorder.calls[3] == (
+        "POST",
+        "/api/backlog/aming-claw/portable/import",
+        {
+            "payload": {"schema": "aming-claw.backlog.export", "rows": []},
+            "on_conflict": "skip",
+            "dry_run": True,
+        },
     )
 
 

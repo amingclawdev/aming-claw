@@ -12846,6 +12846,57 @@ def handle_backlog_list(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/backlog/{project_id}/portable/export")
+def handle_backlog_portable_export(ctx: RequestContext):
+    """Export backlog rows as a portable JSON payload."""
+    pid = ctx.path_params["project_id"]
+    status_filter = str(ctx.query.get("status") or "")
+    priority_filter = str(ctx.query.get("priority") or "")
+    bug_ids = _query_statuses(ctx.query, "bug_id")
+    conn = get_connection(pid)
+    try:
+        from . import backlog_portable
+        return backlog_portable.export_backlog_portable(
+            conn,
+            pid,
+            status=status_filter,
+            priority=priority_filter,
+            bug_ids=bug_ids,
+        )
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/backlog/{project_id}/portable/import")
+def handle_backlog_portable_import(ctx: RequestContext):
+    """Import portable backlog rows into the local project DB."""
+    pid = ctx.path_params["project_id"]
+    body = ctx.body
+    payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+    on_conflict = str(body.get("on_conflict") or "skip")
+    dry_run = _query_bool(ctx.query, "dry_run", bool(body.get("dry_run", False)))
+    actor = str(body.get("actor") or "api")
+    conn = get_connection(pid)
+    try:
+        from . import backlog_portable
+        try:
+            result = backlog_portable.import_backlog_portable(
+                conn,
+                pid,
+                payload,
+                on_conflict=on_conflict,
+                dry_run=dry_run,
+                actor=actor,
+            )
+        except ValueError as exc:
+            raise GovernanceError("invalid_backlog_import", str(exc), 400) from exc
+        if not result.get("ok"):
+            return 409, result
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/backlog/{project_id}/{bug_id}")
 def handle_backlog_get(ctx: RequestContext):
     """Get a single backlog bug by ID. Returns 404 if missing."""

@@ -89,7 +89,7 @@ class TestCliHelp:
         runner = CliRunner()
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor", "plugin", "mf"):
+        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor", "backlog", "plugin", "mf"):
             assert cmd in result.output
 
 
@@ -303,6 +303,91 @@ class TestCliPlugin:
         assert payload["ok"] is False
         assert payload["status"] == "failed"
         assert "plugin checkout not found" in payload["error"]
+
+
+class TestCliBacklog:
+    def test_backlog_export_writes_payload(self, monkeypatch, tmp_path):
+        import agent.cli as cli
+
+        calls = []
+
+        def fake_http(method, url, payload=None, timeout=30.0):
+            calls.append((method, url, payload))
+            return 200, {
+                "schema": "aming-claw.backlog.export",
+                "schema_version": 1,
+                "project_id": "aming-claw",
+                "row_count": 1,
+                "rows": [{"bug_id": "BUG-1"}],
+            }
+
+        monkeypatch.setattr(cli, "_http_json", fake_http)
+        runner = CliRunner()
+        output = tmp_path / "backlog.json"
+
+        result = runner.invoke(main, [
+            "backlog",
+            "export",
+            "--project-id",
+            "aming-claw",
+            "--status",
+            "OPEN",
+            "--bug-id",
+            "BUG-1",
+            "--output",
+            str(output),
+        ])
+
+        assert result.exit_code == 0
+        assert "Exported 1 backlog row" in result.output
+        assert json.loads(output.read_text(encoding="utf-8"))["rows"][0]["bug_id"] == "BUG-1"
+        assert calls[0][0] == "GET"
+        assert "/api/backlog/aming-claw/portable/export" in calls[0][1]
+        assert "status=OPEN" in calls[0][1]
+
+    def test_backlog_import_posts_payload_and_exits_nonzero_on_conflict(self, monkeypatch, tmp_path):
+        import agent.cli as cli
+
+        input_path = tmp_path / "backlog.json"
+        input_path.write_text(json.dumps({
+            "schema": "aming-claw.backlog.export",
+            "schema_version": 1,
+            "rows": [{"bug_id": "BUG-1"}],
+        }), encoding="utf-8")
+        calls = []
+
+        def fake_http(method, url, payload=None, timeout=30.0):
+            calls.append((method, url, payload))
+            return 409, {
+                "ok": False,
+                "inserted_count": 0,
+                "updated_count": 0,
+                "skipped_count": 0,
+                "error_count": 1,
+                "errors": [{"bug_id": "BUG-1", "error": "bug_id already exists"}],
+            }
+
+        monkeypatch.setattr(cli, "_http_json", fake_http)
+        runner = CliRunner()
+
+        result = runner.invoke(main, [
+            "backlog",
+            "import",
+            "--project-id",
+            "aming-claw",
+            "--input",
+            str(input_path),
+            "--on-conflict",
+            "fail",
+            "--json-output",
+        ])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert calls[0][0] == "POST"
+        assert calls[0][2]["on_conflict"] == "fail"
+        assert calls[0][2]["payload"]["rows"][0]["bug_id"] == "BUG-1"
 
 
 class TestCliMf:
