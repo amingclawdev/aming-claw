@@ -2,6 +2,7 @@
 
 import os
 import json
+import subprocess
 import pytest
 
 try:
@@ -11,12 +12,74 @@ try:
         configure_codex_plugin,
         install_codex_marketplace,
         install_codex_plugin_cache,
+        plugin_root_for,
     )
     HAS_CLICK = True
 except ImportError:
     HAS_CLICK = False
 
 pytestmark = pytest.mark.skipif(not HAS_CLICK, reason="click not installed")
+
+
+def _git(args: list[str], cwd):
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _write_cli_plugin_fixture(root):
+    for rel, text in {
+        ".codex-plugin/plugin.json": {"name": "aming-claw"},
+        ".agents/plugins/marketplace.json": {
+            "name": "aming-claw-local",
+            "plugins": [
+                {"name": "aming-claw", "source": {"source": "local", "path": "./."}}
+            ],
+        },
+        ".claude-plugin/plugin.json": {
+            "name": "aming-claw",
+            "version": "0.1.0",
+            "description": "Test plugin.",
+            "mcpServers": {"aming-claw": {"command": "python", "args": ["-m", "agent.mcp.server"]}},
+        },
+        ".claude-plugin/marketplace.json": {
+            "name": "aming-claw-local",
+            "metadata": {"description": "Test marketplace."},
+            "owner": {"name": "Aming Claw"},
+            "plugins": [{"name": "aming-claw", "source": "./", "version": "0.1.0"}],
+        },
+        ".mcp.json": {"mcpServers": {"aming-claw": {"command": "python"}}},
+    }.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(text), encoding="utf-8")
+    for rel in ("skills/aming-claw/SKILL.md", "skills/aming-claw-launcher/SKILL.md"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\nname: test\n---\n", encoding="utf-8")
+    server_path = root / "agent" / "mcp" / "server.py"
+    server_path.parent.mkdir(parents=True, exist_ok=True)
+    server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
+
+
+def _make_cli_remote_plugin_repo(tmp_path):
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    _git(["init", "--bare", str(remote)], tmp_path)
+    source.mkdir()
+    _git(["init"], source)
+    _git(["checkout", "-b", "main"], source)
+    _write_cli_plugin_fixture(source)
+    _git(["add", "."], source)
+    _git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial plugin"], source)
+    _git(["remote", "add", "origin", str(remote)], source)
+    _git(["push", "-u", "origin", "main"], source)
+    return remote
 
 
 class TestCliHelp:
@@ -190,6 +253,56 @@ class TestCliPlugin:
         assert "Restart/reload Codex" in result.output
         assert "dashboard_static_assets" in result.output
         assert "ai_cli_openai" in result.output
+
+    def test_plugin_update_check_json_reports_current(self, tmp_path):
+        runner = CliRunner()
+        remote = _make_cli_remote_plugin_repo(tmp_path)
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        plugin_root = plugin_root_for(str(remote), install_root)
+        _git(["clone", str(remote), str(plugin_root)], install_root)
+        _git(["checkout", "main"], plugin_root)
+
+        result = runner.invoke(main, [
+            "plugin",
+            "update",
+            str(remote),
+            "--check",
+            "--install-root",
+            str(install_root),
+            "--plugin-state",
+            str(tmp_path / "state.json"),
+            "--no-pip",
+            "--no-codex-install",
+            "--json-output",
+        ])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        assert payload["status"] == "current"
+        assert payload["update_available"] is False
+
+    def test_plugin_update_missing_checkout_exits_nonzero(self, tmp_path):
+        runner = CliRunner()
+
+        result = runner.invoke(main, [
+            "plugin",
+            "update",
+            "https://example.com/aming-claw.git",
+            "--check",
+            "--install-root",
+            str(tmp_path / "missing-install"),
+            "--plugin-state",
+            str(tmp_path / "state.json"),
+            "--json-output",
+        ])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["status"] == "failed"
+        assert "plugin checkout not found" in payload["error"]
 
 
 class TestCliMf:

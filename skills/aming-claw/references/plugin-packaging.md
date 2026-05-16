@@ -34,6 +34,13 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   runtime, install the versioned Codex plugin cache, generate a Codex-compatible
   local marketplace, update Codex config, and print next steps. They do not
   silently install credentials.
+- Git URL update is explicit: `aming-claw plugin update --check` fetches the
+  configured remote and writes local update state, while
+  `aming-claw plugin update --apply` fast-forwards the checkout, refreshes the
+  Python/Codex install surfaces, and records whether MCP, governance, or
+  ServiceManager must be reloaded/restarted before MF close. After those
+  actions are complete, rerun `aming-claw plugin update --check` to mark the
+  installed commit current.
 - Installing plugin assets, installing the Python package, starting governance,
   serving the dashboard, loading MCP tools in the current Codex/Claude session,
   and ServiceManager/executor health are separate states. After plugin install

@@ -461,6 +461,13 @@ Run `aming-claw plugin doctor` after install. If the cache or generated
 marketplace is missing/inconsistent, doctor reports `fail` (not just `ok`).
 A passing doctor verifies the on-disk install and generated config; still open
 or reload a Codex/Claude session and confirm the skill/MCP tools are visible.
+Use `aming-claw plugin update --check` to fetch the configured Git remote,
+compare the installed checkout with the remote commit, and refresh the local
+plugin update state. Use `aming-claw plugin update --apply` to fast-forward the
+checkout, refresh the Python/Codex install surfaces, and write restart/reload
+obligations for MCP, governance, or ServiceManager when changed files require
+operator action. After completing those restarts/reloads, run
+`aming-claw plugin update --check` again to mark the installed commit current.
 Starting governance is a separate long-running service command; keep it in its
 own terminal instead of expecting plugin install to start it. On Windows use a
 separate shell such as `Start-Process powershell`; on macOS/Linux a detached
@@ -519,6 +526,8 @@ projects need bootstrap before graph-backed claims are available.
 ```bash
 aming-claw launcher        # write/open the local launcher
 aming-claw plugin install  # clone/update local plugin assets from Git
+aming-claw plugin update --check # check Git remote and refresh update state
+aming-claw plugin update --apply # fast-forward plugin checkout and write restart obligations
 aming-claw start           # start governance locally
 aming-claw open            # open the dashboard
 aming-claw status          # check governance health

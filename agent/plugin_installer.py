@@ -144,6 +144,62 @@ class PluginInstallError(RuntimeError):
     """Raised when a Git URL plugin bootstrap step cannot complete."""
 
 
+@dataclass
+class PluginUpdateResult:
+    repo_url: str
+    install_root: str
+    plugin_root: str
+    action: str
+    status: str
+    ref: str = ""
+    dry_run: bool = False
+    update_available: bool = False
+    applied: bool = False
+    installed_package: bool = False
+    installed_codex_plugin: bool = False
+    installed_commit: str = ""
+    remote_commit: str = ""
+    changed_files: list[str] = field(default_factory=list)
+    changed_surfaces: list[str] = field(default_factory=list)
+    restart_required: dict[str, dict[str, Any]] = field(default_factory=dict)
+    plugin_state_path: str = ""
+    error: str = ""
+    commands: list[CommandRecord] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.status != "failed"
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "repo_url": self.repo_url,
+            "install_root": self.install_root,
+            "plugin_root": self.plugin_root,
+            "action": self.action,
+            "status": self.status,
+            "ref": self.ref,
+            "dry_run": self.dry_run,
+            "update_available": self.update_available,
+            "applied": self.applied,
+            "installed_package": self.installed_package,
+            "installed_codex_plugin": self.installed_codex_plugin,
+            "installed_commit": self.installed_commit,
+            "remote_commit": self.remote_commit,
+            "changed_files": list(self.changed_files),
+            "changed_surfaces": list(self.changed_surfaces),
+            "restart_required": self.restart_required,
+            "plugin_state_path": self.plugin_state_path,
+            "error": self.error,
+            "commands": [
+                {"args": list(cmd.args), "cwd": cmd.cwd, "skipped": cmd.skipped}
+                for cmd in self.commands
+            ],
+            "next_steps": list(self.next_steps),
+        }
+
+
 def default_install_root() -> Path:
     raw = os.environ.get("AMING_CLAW_PLUGIN_HOME", "").strip()
     if raw:
@@ -220,6 +276,53 @@ def _git_commit(plugin_root: Path, *, short: bool = False) -> str:
     except Exception:
         return ""
     return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _git_capture(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: int = 15,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(part) for part in args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git_output(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: int = 15,
+) -> str:
+    proc = _git_capture(args, cwd=cwd, timeout=timeout)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise PluginInstallError(f"command failed ({proc.returncode}): {_command_text(args)}{suffix}")
+    return proc.stdout.strip()
+
+
+def _git_output_optional(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: int = 15,
+) -> str:
+    try:
+        proc = _git_capture(args, cwd=cwd, timeout=timeout)
+    except Exception:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _git_rev_parse(root: Path, rev: str) -> str:
+    return _git_output_optional(["git", "rev-parse", "--verify", f"{rev}^{{commit}}"], cwd=root)
 
 
 def _spawn_long_running(
@@ -606,6 +709,7 @@ def normalize_plugin_update_state(payload: Optional[dict[str, Any]]) -> dict[str
         "update_status": status,
         "last_checked_at": str(raw.get("last_checked_at") or ""),
         "last_applied_at": str(raw.get("last_applied_at") or ""),
+        "last_error": str(raw.get("last_error") or ""),
         "changed_surfaces": [
             str(item)
             for item in raw.get("changed_surfaces", [])
@@ -624,6 +728,7 @@ def write_plugin_update_state(
     remote_commit: str = "",
     changed_surfaces: Optional[list[str]] = None,
     restart_required: Optional[dict[str, Any]] = None,
+    last_error: str = "",
     state_path: Optional[Union[Path, str]] = None,
     dry_run: bool = False,
 ) -> Path:
@@ -644,6 +749,7 @@ def write_plugin_update_state(
             "update_status": update_status,
             "last_checked_at": now if remote_commit else "",
             "last_applied_at": now if update_status in {"current", "applied_pending_restart"} else "",
+            "last_error": last_error,
             "changed_surfaces": changed_surfaces or [],
             "restart_required": restart_required or _restart_required_template(),
         }
@@ -705,7 +811,8 @@ def plugin_update_state_status(
     elif update_status == "unknown":
         warnings.append("plugin update state unknown")
     elif update_status == "failed":
-        blockers.append("plugin update failed")
+        detail = f": {state['last_error']}" if state.get("last_error") else ""
+        blockers.append(f"plugin update failed{detail}")
 
     pending_components = []
     for component, restart in state["restart_required"].items():
@@ -729,6 +836,398 @@ def plugin_update_state_status(
         "warnings": warnings,
         "state": state,
     }
+
+
+def classify_plugin_changed_surfaces(changed_files: Sequence[str]) -> list[str]:
+    """Classify changed paths into runtime surfaces that need operator action."""
+
+    surfaces: set[str] = set()
+    for raw_path in changed_files:
+        path = str(raw_path).replace("\\", "/").lstrip("./")
+        if not path:
+            continue
+        if (
+            path == ".mcp.json"
+            or path == "README.md"
+            or path.startswith(".codex-plugin/")
+            or path.startswith(".claude-plugin/")
+            or path.startswith(".agents/plugins/")
+            or path.startswith("skills/")
+            or path.startswith("agent/mcp/")
+            or path in {"agent/plugin_installer.py", "agent/cli.py"}
+        ):
+            surfaces.add("mcp")
+        if (
+            path == "start_governance.py"
+            or path.startswith("agent/governance/")
+        ):
+            surfaces.add("governance")
+        if path in {
+            "agent/service_manager.py",
+            "agent/manager_http_server.py",
+            "scripts/start-manager.sh",
+            "scripts/start-manager.ps1",
+        }:
+            surfaces.add("service_manager")
+    return [component for component in PLUGIN_RESTART_COMPONENTS if component in surfaces]
+
+
+def plugin_restart_required_for_surfaces(
+    surfaces: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    restart = _restart_required_template()
+    reasons = {
+        "mcp": (
+            "plugin MCP, skill, manifest, or runtime entrypoint changed",
+            "reload Codex/Claude or open a new session",
+        ),
+        "governance": (
+            "governance service files changed",
+            "redeploy or restart governance",
+        ),
+        "service_manager": (
+            "ServiceManager files changed",
+            "restart ServiceManager",
+        ),
+    }
+    for component in surfaces:
+        if component not in restart:
+            continue
+        reason, satisfied_by = reasons[component]
+        restart[component] = {
+            "required": True,
+            "reason": reason,
+            "satisfied_by": satisfied_by,
+            "satisfied": False,
+        }
+    return restart
+
+
+def _require_git_checkout(plugin_root: Path) -> None:
+    if not (plugin_root / ".git").exists():
+        raise PluginInstallError(
+            f"plugin checkout not found at {plugin_root}; run `aming-claw plugin install` first"
+        )
+
+
+def _current_git_branch(plugin_root: Path) -> str:
+    return _git_output_optional(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=plugin_root,
+    )
+
+
+def _remote_ref_candidates(plugin_root: Path, ref: str) -> list[str]:
+    if ref:
+        return [
+            f"refs/remotes/origin/{ref}",
+            f"origin/{ref}",
+            f"refs/tags/{ref}",
+            ref,
+        ]
+    upstream = _git_output_optional(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        cwd=plugin_root,
+    )
+    candidates = [upstream] if upstream else []
+    branch = _current_git_branch(plugin_root)
+    if branch and branch != "HEAD":
+        candidates.append(f"refs/remotes/origin/{branch}")
+        candidates.append(f"origin/{branch}")
+    return [candidate for candidate in candidates if candidate]
+
+
+def _resolve_remote_commit(plugin_root: Path, ref: str) -> str:
+    candidates = _remote_ref_candidates(plugin_root, ref)
+    for candidate in candidates:
+        commit = _git_rev_parse(plugin_root, candidate)
+        if commit:
+            return commit
+    if ref:
+        raise PluginInstallError(f"cannot resolve remote ref `{ref}` after fetch")
+    raise PluginInstallError(
+        "cannot resolve upstream remote for plugin checkout; pass --ref or set branch upstream"
+    )
+
+
+def _changed_files_between(plugin_root: Path, old_commit: str, new_commit: str) -> list[str]:
+    if not old_commit or not new_commit or old_commit == new_commit:
+        return []
+    output = _git_output(
+        ["git", "diff", "--name-only", old_commit, new_commit],
+        cwd=plugin_root,
+        timeout=20,
+    )
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _apply_plugin_commit(
+    plugin_root: Path,
+    remote_commit: str,
+    *,
+    commands: list[CommandRecord],
+    dry_run: bool,
+) -> None:
+    branch = _current_git_branch(plugin_root)
+    if branch and branch != "HEAD":
+        _run(
+            ["git", "merge", "--ff-only", remote_commit],
+            cwd=plugin_root,
+            dry_run=dry_run,
+            commands=commands,
+        )
+    else:
+        _run(
+            ["git", "checkout", "--detach", remote_commit],
+            cwd=plugin_root,
+            dry_run=dry_run,
+            commands=commands,
+        )
+
+
+def _write_failed_plugin_update_state(
+    *,
+    plugin_root: Path,
+    repo_url: str,
+    ref: str,
+    remote_commit: str,
+    error: str,
+    state_path: Optional[Union[Path, str]],
+    dry_run: bool,
+) -> str:
+    path = write_plugin_update_state(
+        plugin_root=plugin_root,
+        repo_url=repo_url,
+        ref=ref,
+        update_status="failed",
+        remote_commit=remote_commit,
+        last_error=error,
+        state_path=state_path,
+        dry_run=dry_run,
+    )
+    return str(path)
+
+
+def update_plugin_from_git(
+    repo_url: str = DEFAULT_REPO_URL,
+    *,
+    install_root: Optional[Union[Path, str]] = None,
+    ref: str = "",
+    apply_update: bool = False,
+    python_executable: Optional[str] = None,
+    install_package: bool = True,
+    install_codex_plugin: bool = True,
+    codex_home: Optional[Union[Path, str]] = None,
+    codex_config: Optional[Union[Path, str]] = None,
+    codex_marketplace_root: Optional[Union[Path, str]] = None,
+    state_path: Optional[Union[Path, str]] = None,
+    dry_run: bool = False,
+) -> PluginUpdateResult:
+    """Check or apply a Git-backed plugin update and refresh local state."""
+
+    root = Path(install_root).expanduser() if install_root else default_install_root()
+    plugin_root = plugin_root_for(repo_url, root)
+    python = python_executable or sys.executable
+    commands: list[CommandRecord] = []
+    action = "apply" if apply_update else "check"
+    installed_commit = _git_commit(plugin_root)
+    remote_commit = ""
+    restart_required = _restart_required_template()
+    changed_files: list[str] = []
+    changed_surfaces: list[str] = []
+    state_target = str(Path(state_path).expanduser() if state_path else default_plugin_update_state_path())
+
+    try:
+        _require_git_checkout(plugin_root)
+        _run(
+            ["git", "fetch", "--all", "--prune"],
+            cwd=plugin_root,
+            dry_run=dry_run,
+            commands=commands,
+        )
+        if dry_run:
+            status = "dry_run"
+            next_steps = ["Run without --dry-run to refresh plugin update state or apply the update."]
+            return PluginUpdateResult(
+                repo_url=repo_url,
+                install_root=str(root.expanduser().resolve()),
+                plugin_root=str(plugin_root),
+                action=action,
+                status=status,
+                ref=ref,
+                dry_run=True,
+                installed_commit=installed_commit,
+                plugin_state_path=state_target,
+                commands=commands,
+                next_steps=next_steps,
+            )
+
+        remote_commit = _resolve_remote_commit(plugin_root, ref)
+        installed_commit = _git_commit(plugin_root)
+        changed_files = _changed_files_between(plugin_root, installed_commit, remote_commit)
+        changed_surfaces = classify_plugin_changed_surfaces(changed_files)
+
+        if installed_commit == remote_commit:
+            state_target = str(write_plugin_update_state(
+                plugin_root=plugin_root,
+                repo_url=repo_url,
+                ref=ref,
+                update_status="current",
+                remote_commit=remote_commit,
+                changed_surfaces=[],
+                restart_required=restart_required,
+                state_path=state_path,
+            ))
+            return PluginUpdateResult(
+                repo_url=repo_url,
+                install_root=str(root.expanduser().resolve()),
+                plugin_root=str(plugin_root),
+                action=action,
+                status="current",
+                ref=ref,
+                installed_commit=installed_commit,
+                remote_commit=remote_commit,
+                plugin_state_path=state_target,
+                commands=commands,
+                next_steps=["Plugin checkout is already current."],
+            )
+
+        if not apply_update:
+            state_target = str(write_plugin_update_state(
+                plugin_root=plugin_root,
+                repo_url=repo_url,
+                ref=ref,
+                update_status="available",
+                remote_commit=remote_commit,
+                changed_surfaces=changed_surfaces,
+                restart_required=restart_required,
+                state_path=state_path,
+            ))
+            return PluginUpdateResult(
+                repo_url=repo_url,
+                install_root=str(root.expanduser().resolve()),
+                plugin_root=str(plugin_root),
+                action=action,
+                status="available",
+                ref=ref,
+                update_available=True,
+                installed_commit=installed_commit,
+                remote_commit=remote_commit,
+                changed_files=changed_files,
+                changed_surfaces=changed_surfaces,
+                restart_required=restart_required,
+                plugin_state_path=state_target,
+                commands=commands,
+                next_steps=["Run `aming-claw plugin update --apply` to fast-forward the local plugin checkout."],
+            )
+
+        _apply_plugin_commit(plugin_root, remote_commit, commands=commands, dry_run=dry_run)
+        validated = validate_plugin_root(plugin_root)
+        installed_package = False
+        if install_package:
+            _ensure_supported_python(python)
+            _run(
+                [python, "-m", "pip", "install", "-e", str(plugin_root)],
+                dry_run=False,
+                commands=commands,
+            )
+            installed_package = True
+
+        installed_codex_plugin = False
+        if install_codex_plugin:
+            cache_target = install_codex_plugin_cache(
+                plugin_root,
+                codex_home=codex_home,
+                python_executable=python,
+                commands=commands,
+            )
+            marketplace_target = install_codex_marketplace(
+                plugin_root,
+                marketplace_root=codex_marketplace_root,
+                python_executable=python,
+                commands=commands,
+            )
+            configure_codex_plugin(
+                codex_config=codex_config,
+                marketplace_root=marketplace_target,
+                commands=commands,
+            )
+            installed_codex_plugin = bool(cache_target)
+
+        restart_required = plugin_restart_required_for_surfaces(changed_surfaces)
+        update_status = (
+            "applied_pending_restart"
+            if any(item.get("required") for item in restart_required.values())
+            else "current"
+        )
+        state_target = str(write_plugin_update_state(
+            plugin_root=plugin_root,
+            repo_url=repo_url,
+            ref=ref,
+            update_status=update_status,
+            remote_commit=remote_commit,
+            changed_surfaces=changed_surfaces,
+            restart_required=restart_required,
+            state_path=state_path,
+        ))
+        next_steps = [
+            "Restart/reload any required surfaces listed in the plugin update state.",
+            f"Verify update: {python} -m agent.cli plugin doctor --plugin-root {plugin_root}",
+            "After restart/reload, run `aming-claw plugin update --check` to mark the installed commit current.",
+        ]
+        if validated:
+            next_steps.append("Then run `aming-claw mf precommit-check` to confirm no plugin update blockers remain.")
+        return PluginUpdateResult(
+            repo_url=repo_url,
+            install_root=str(root.expanduser().resolve()),
+            plugin_root=str(plugin_root),
+            action=action,
+            status=update_status,
+            ref=ref,
+            applied=True,
+            installed_package=installed_package,
+            installed_codex_plugin=installed_codex_plugin,
+            installed_commit=installed_commit,
+            remote_commit=remote_commit,
+            changed_files=changed_files,
+            changed_surfaces=changed_surfaces,
+            restart_required=restart_required,
+            plugin_state_path=state_target,
+            commands=commands,
+            next_steps=next_steps,
+        )
+    except Exception as exc:
+        error = str(exc)
+        try:
+            state_target = _write_failed_plugin_update_state(
+                plugin_root=plugin_root,
+                repo_url=repo_url,
+                ref=ref,
+                remote_commit=remote_commit,
+                error=error,
+                state_path=state_path,
+                dry_run=dry_run,
+            )
+        except Exception:
+            pass
+        return PluginUpdateResult(
+            repo_url=repo_url,
+            install_root=str(root.expanduser().resolve()),
+            plugin_root=str(plugin_root),
+            action=action,
+            status="failed",
+            ref=ref,
+            dry_run=dry_run,
+            installed_commit=installed_commit,
+            remote_commit=remote_commit,
+            changed_files=changed_files,
+            changed_surfaces=changed_surfaces,
+            restart_required=restart_required,
+            plugin_state_path=state_target,
+            error=error,
+            commands=commands,
+            next_steps=["Resolve the error, then rerun `aming-claw plugin update --check`."],
+        )
 
 
 def _parse_python_version(text: str) -> Optional[tuple[int, int, int]]:
@@ -1523,6 +2022,60 @@ def format_result(result: InstallResult) -> str:
     lines.append("")
     lines.append("Next steps:")
     lines.extend(f"  {step}" for step in result.next_steps)
+    return "\n".join(lines)
+
+
+def format_plugin_update_result(result: PluginUpdateResult) -> str:
+    lines = [
+        "Aming Claw plugin update",
+        f"  repo:        {result.repo_url}",
+        f"  plugin root: {result.plugin_root}",
+        f"  action:      {result.action}",
+        f"  status:      {result.status}",
+        f"  dry run:     {str(result.dry_run).lower()}",
+    ]
+    if result.installed_commit or result.remote_commit:
+        lines.append("")
+        lines.append("Commits:")
+        if result.installed_commit:
+            lines.append(f"  installed: {result.installed_commit}")
+        if result.remote_commit:
+            lines.append(f"  remote:    {result.remote_commit}")
+    if result.error:
+        lines.append("")
+        lines.append(f"Error: {result.error}")
+    if result.commands:
+        lines.append("")
+        lines.append("Commands:")
+        for command in result.commands:
+            prefix = "  would run:" if command.skipped else "  ran:"
+            cwd = f" (cwd={command.cwd})" if command.cwd else ""
+            lines.append(f"{prefix} {_command_text(command.args)}{cwd}")
+    if result.changed_files:
+        lines.append("")
+        lines.append("Changed files:")
+        lines.extend(f"  - {path}" for path in result.changed_files[:25])
+        if len(result.changed_files) > 25:
+            lines.append(f"  - ... {len(result.changed_files) - 25} more")
+    if result.changed_surfaces:
+        lines.append("")
+        lines.append("Changed surfaces:")
+        lines.extend(f"  - {surface}" for surface in result.changed_surfaces)
+    if result.restart_required:
+        lines.append("")
+        lines.append("Restart obligations:")
+        for component in PLUGIN_RESTART_COMPONENTS:
+            info = result.restart_required.get(component) or {}
+            required = "required" if info.get("required") else "not required"
+            suffix = f" - {info.get('reason')}" if info.get("reason") else ""
+            lines.append(f"  - {component}: {required}{suffix}")
+    if result.plugin_state_path:
+        lines.append("")
+        lines.append(f"Plugin state: {result.plugin_state_path}")
+    if result.next_steps:
+        lines.append("")
+        lines.append("Next steps:")
+        lines.extend(f"  {step}" for step in result.next_steps)
     return "\n".join(lines)
 
 

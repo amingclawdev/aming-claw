@@ -1,6 +1,7 @@
 """Tests for Git URL plugin bootstrap helpers."""
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,18 +15,22 @@ from agent.plugin_installer import (
     _check_claude_marketplace,
     _load_toml_text,
     _upsert_toml_table,
+    classify_plugin_changed_surfaces,
     configure_codex_plugin,
     default_plugin_update_state_path,
     doctor_plugin,
     format_plugin_update_state_status,
+    format_plugin_update_result,
     format_result,
     format_doctor_result,
     install_codex_marketplace,
     install_codex_plugin_cache,
     install_from_git,
+    plugin_restart_required_for_surfaces,
     plugin_update_state_status,
     plugin_root_for,
     slug_from_repo_url,
+    update_plugin_from_git,
     validate_plugin_root,
     write_plugin_update_state,
 )
@@ -92,6 +97,45 @@ def _write_plugin_fixture(root: Path) -> None:
     server_path = root / "agent" / "mcp" / "server.py"
     server_path.parent.mkdir(parents=True, exist_ok=True)
     server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _git_commit_all(repo: Path, message: str) -> str:
+    _git(["add", "."], repo)
+    _git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", message], repo)
+    return _git(["rev-parse", "HEAD"], repo)
+
+
+def _make_remote_plugin_repo(tmp_path: Path) -> tuple[Path, Path]:
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    _git(["init", "--bare", str(remote)], tmp_path)
+    source.mkdir()
+    _git(["init"], source)
+    _git(["checkout", "-b", "main"], source)
+    _write_plugin_fixture(source)
+    _git_commit_all(source, "initial plugin")
+    _git(["remote", "add", "origin", str(remote)], source)
+    _git(["push", "-u", "origin", "main"], source)
+    return remote, source
+
+
+def _clone_plugin_repo(remote: Path, install_root: Path) -> Path:
+    plugin_root = plugin_root_for(str(remote), install_root)
+    plugin_root.parent.mkdir(parents=True, exist_ok=True)
+    _git(["clone", str(remote), str(plugin_root)], install_root)
+    _git(["checkout", "main"], plugin_root)
+    return plugin_root
 
 
 def test_slug_from_repo_url_handles_https_and_git_suffix():
@@ -178,6 +222,126 @@ def test_write_plugin_update_state_records_current_install(tmp_path):
     assert result["ok"] is True
     assert result["status"] == "pass"
     assert result["state"]["installed_version"] == "0.1.0"
+
+
+def test_plugin_changed_surface_classification_maps_restart_obligations():
+    surfaces = classify_plugin_changed_surfaces([
+        "skills/aming-claw/SKILL.md",
+        "agent/governance/server.py",
+        "agent/manager_http_server.py",
+        "docs/governance/manual-fix-sop.md",
+    ])
+    restart = plugin_restart_required_for_surfaces(surfaces)
+
+    assert surfaces == ["mcp", "governance", "service_manager"]
+    assert restart["mcp"]["required"] is True
+    assert "reload Codex" in restart["mcp"]["satisfied_by"]
+    assert restart["governance"]["required"] is True
+    assert restart["service_manager"]["required"] is True
+
+
+def test_plugin_update_check_reports_current_checkout(tmp_path):
+    remote, _source = _make_remote_plugin_repo(tmp_path)
+    install_root = tmp_path / "install"
+    _clone_plugin_repo(remote, install_root)
+    state_path = tmp_path / "state.json"
+
+    result = update_plugin_from_git(
+        str(remote),
+        install_root=install_root,
+        install_package=False,
+        install_codex_plugin=False,
+        state_path=state_path,
+    )
+
+    assert result.ok is True
+    assert result.status == "current"
+    assert result.update_available is False
+    assert result.remote_commit == result.installed_commit
+    state = plugin_update_state_status(state_path=state_path)
+    assert state["status"] == "pass"
+    assert state["state"]["update_status"] == "current"
+
+
+def test_plugin_update_check_reports_available_and_writes_state(tmp_path):
+    remote, source = _make_remote_plugin_repo(tmp_path)
+    install_root = tmp_path / "install"
+    _clone_plugin_repo(remote, install_root)
+    skill = source / "skills" / "aming-claw" / "SKILL.md"
+    skill.write_text("---\nname: test\n---\nupdated\n", encoding="utf-8")
+    remote_commit = _git_commit_all(source, "update skill")
+    _git(["push", "origin", "main"], source)
+    state_path = tmp_path / "state.json"
+
+    result = update_plugin_from_git(
+        str(remote),
+        install_root=install_root,
+        install_package=False,
+        install_codex_plugin=False,
+        state_path=state_path,
+    )
+
+    assert result.status == "available"
+    assert result.update_available is True
+    assert result.remote_commit == remote_commit
+    assert "skills/aming-claw/SKILL.md" in result.changed_files
+    assert result.changed_surfaces == ["mcp"]
+    state = plugin_update_state_status(state_path=state_path)
+    assert state["ok"] is True
+    assert state["status"] == "warn"
+    assert state["state"]["update_status"] == "available"
+    assert state["state"]["remote_commit"] == remote_commit
+
+
+def test_plugin_update_apply_fast_forwards_and_blocks_until_restart(tmp_path):
+    remote, source = _make_remote_plugin_repo(tmp_path)
+    install_root = tmp_path / "install"
+    plugin_root = _clone_plugin_repo(remote, install_root)
+    governance_file = source / "agent" / "governance" / "server.py"
+    governance_file.parent.mkdir(parents=True, exist_ok=True)
+    governance_file.write_text("# governance update\n", encoding="utf-8")
+    remote_commit = _git_commit_all(source, "update governance")
+    _git(["push", "origin", "main"], source)
+    state_path = tmp_path / "state.json"
+
+    result = update_plugin_from_git(
+        str(remote),
+        install_root=install_root,
+        apply_update=True,
+        install_package=False,
+        install_codex_plugin=False,
+        state_path=state_path,
+    )
+
+    assert result.ok is True
+    assert result.applied is True
+    assert result.status == "applied_pending_restart"
+    assert _git(["rev-parse", "HEAD"], plugin_root) == remote_commit
+    assert result.changed_surfaces == ["governance"]
+    state = plugin_update_state_status(state_path=state_path)
+    assert state["ok"] is False
+    assert "governance" in state["blockers"][0]
+    assert "applied_pending_restart" in format_plugin_update_result(result)
+
+
+def test_plugin_update_failure_writes_failed_state(tmp_path):
+    state_path = tmp_path / "state.json"
+
+    result = update_plugin_from_git(
+        "https://example.com/aming-claw.git",
+        install_root=tmp_path / "missing-install",
+        install_package=False,
+        install_codex_plugin=False,
+        state_path=state_path,
+    )
+
+    assert result.ok is False
+    assert result.status == "failed"
+    assert "plugin checkout not found" in result.error
+    state = plugin_update_state_status(state_path=state_path)
+    assert state["ok"] is False
+    assert state["state"]["update_status"] == "failed"
+    assert "plugin checkout not found" in state["state"]["last_error"]
 
 
 def test_install_from_git_dry_run_plans_fresh_clone_without_writing(tmp_path):

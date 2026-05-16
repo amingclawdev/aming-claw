@@ -5,6 +5,7 @@ Usage:
     aming-claw bootstrap       - bootstrap an external project
     aming-claw status          - show governance status
     aming-claw plugin install  - install/update plugin assets from Git
+    aming-claw plugin update   - check/apply plugin updates from Git
     aming-claw start           - start governance in the foreground
     aming-claw open            - open the dashboard URL
     aming-claw launcher        - write a local launcher HTML artifact
@@ -302,6 +303,53 @@ def plugin_install(repo_url, install_root, ref, python_executable, no_pip, no_co
         click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
         click.echo(format_result(result))
+
+
+@plugin.command("update")
+@click.argument("repo_url", required=False)
+@click.option("--check", "check_only", is_flag=True, help="Check for updates and refresh local state without applying.")
+@click.option("--apply", "apply_update", is_flag=True, help="Apply a fast-forward update to the local plugin checkout.")
+@click.option("--install-root", default="", help="User-local plugin cache root.")
+@click.option("--ref", default="", help="Optional branch, tag, or commit to compare/apply.")
+@click.option("--python", "python_executable", default=sys.executable, help="Python executable for pip/cache commands.")
+@click.option("--no-pip", is_flag=True, help="Do not pip install after applying.")
+@click.option("--no-codex-install", is_flag=True, help="Do not refresh Codex plugin cache/config after applying.")
+@click.option("--codex-home", default="", help="Override Codex home for plugin cache checks.")
+@click.option("--codex-config", default="", help="Override Codex config.toml path.")
+@click.option("--codex-marketplace-root", default="", help="Override generated Codex marketplace root.")
+@click.option("--plugin-state", default="", help="Optional plugin update state JSON path.")
+@click.option("--dry-run", is_flag=True, help="Print planned update commands without changing state.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def plugin_update(repo_url, check_only, apply_update, install_root, ref, python_executable, no_pip, no_codex_install, codex_home, codex_config, codex_marketplace_root, plugin_state, dry_run, json_output):
+    """Check or apply updates for a Git-backed local plugin checkout."""
+    if check_only and apply_update:
+        raise click.ClickException("Use either --check or --apply, not both.")
+    from agent.plugin_installer import (
+        DEFAULT_REPO_URL,
+        format_plugin_update_result,
+        update_plugin_from_git,
+    )
+
+    result = update_plugin_from_git(
+        repo_url or DEFAULT_REPO_URL,
+        install_root=install_root or None,
+        ref=ref,
+        apply_update=apply_update,
+        python_executable=python_executable,
+        install_package=not no_pip,
+        install_codex_plugin=not no_codex_install,
+        codex_home=codex_home or None,
+        codex_config=codex_config or None,
+        codex_marketplace_root=codex_marketplace_root or None,
+        state_path=plugin_state or None,
+        dry_run=dry_run,
+    )
+    if json_output:
+        click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(format_plugin_update_result(result))
+    if not result.ok:
+        raise click.exceptions.Exit(1)
 
 
 @plugin.command("doctor")
