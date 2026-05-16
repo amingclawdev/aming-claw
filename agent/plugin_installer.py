@@ -15,7 +15,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Union
+from typing import Any, Iterable, Optional, Sequence, Union
 
 
 DEFAULT_REPO_URL = "https://github.com/amingclawdev/aming-claw"
@@ -38,6 +38,15 @@ CODEX_PLUGIN_PAYLOAD = (
     ".mcp.json",
     "README.md",
 )
+PLUGIN_STATE_SCHEMA_VERSION = 1
+PLUGIN_UPDATE_STATUSES = {
+    "current",
+    "available",
+    "applied_pending_restart",
+    "failed",
+    "unknown",
+}
+PLUGIN_RESTART_COMPONENTS = ("mcp", "governance", "service_manager")
 AI_CLI_REQUIREMENTS = {
     "openai": {
         "runtime": "Codex CLI",
@@ -72,6 +81,7 @@ class InstallResult:
     codex_cache_path: str = ""
     codex_marketplace_root: str = ""
     codex_config_path: str = ""
+    plugin_state_path: str = ""
     validated_files: list[str] = field(default_factory=list)
     commands: list[CommandRecord] = field(default_factory=list)
     next_steps: list[str] = field(default_factory=list)
@@ -88,6 +98,7 @@ class InstallResult:
             "codex_cache_path": self.codex_cache_path,
             "codex_marketplace_root": self.codex_marketplace_root,
             "codex_config_path": self.codex_config_path,
+            "plugin_state_path": self.plugin_state_path,
             "started": self.started,
             "validated_files": list(self.validated_files),
             "commands": [
@@ -140,6 +151,17 @@ def default_install_root() -> Path:
     return Path.home() / ".aming-claw" / "plugins"
 
 
+def default_plugin_state_home() -> Path:
+    raw = os.environ.get("AMING_CLAW_PLUGIN_STATE_HOME", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".aming-claw" / "plugin-state"
+
+
+def default_plugin_update_state_path() -> Path:
+    return default_plugin_state_home() / CODEX_MARKETPLACE_NAME / f"{CODEX_PLUGIN_NAME}.json"
+
+
 def slug_from_repo_url(repo_url: str) -> str:
     cleaned = repo_url.rstrip("/").rstrip()
     tail = cleaned.rsplit("/", 1)[-1] or "aming-claw"
@@ -179,6 +201,25 @@ def _run(
         raise PluginInstallError(
             f"command failed ({exc.returncode}): {_command_text(record.args)}"
         ) from exc
+
+
+def _git_commit(plugin_root: Path, *, short: bool = False) -> str:
+    args = ["git", "rev-parse"]
+    if short:
+        args.append("--short")
+    args.append("HEAD")
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=str(plugin_root.expanduser().resolve()),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def _spawn_long_running(
@@ -510,6 +551,184 @@ def _doctor_check(name: str, status: str, detail: str = "") -> DoctorCheck:
 
 def _read_json_file(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _restart_required_template() -> dict[str, dict[str, Any]]:
+    return {
+        component: {
+            "required": False,
+            "reason": "",
+            "satisfied_by": "",
+            "satisfied": False,
+        }
+        for component in PLUGIN_RESTART_COMPONENTS
+    }
+
+
+def _normalize_restart_required(value: Any) -> dict[str, dict[str, Any]]:
+    normalized = _restart_required_template()
+    if not isinstance(value, dict):
+        return normalized
+    for component in PLUGIN_RESTART_COMPONENTS:
+        raw = value.get(component)
+        if not isinstance(raw, dict):
+            continue
+        normalized[component] = {
+            "required": bool(raw.get("required")),
+            "reason": str(raw.get("reason") or ""),
+            "satisfied_by": str(raw.get("satisfied_by") or ""),
+            "satisfied": bool(raw.get("satisfied")),
+        }
+    return normalized
+
+
+def normalize_plugin_update_state(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    status = str(raw.get("update_status") or "unknown").strip() or "unknown"
+    if status not in PLUGIN_UPDATE_STATUSES:
+        status = "unknown"
+    try:
+        schema_version = int(raw.get("schema_version") or PLUGIN_STATE_SCHEMA_VERSION)
+    except (TypeError, ValueError):
+        schema_version = PLUGIN_STATE_SCHEMA_VERSION
+    return {
+        "schema_version": schema_version,
+        "plugin_id": str(raw.get("plugin_id") or CODEX_PLUGIN_ID),
+        "repo_url": str(raw.get("repo_url") or DEFAULT_REPO_URL),
+        "ref": str(raw.get("ref") or ""),
+        "installed_commit": str(raw.get("installed_commit") or ""),
+        "installed_version": str(raw.get("installed_version") or ""),
+        "remote_commit": str(raw.get("remote_commit") or ""),
+        "update_status": status,
+        "last_checked_at": str(raw.get("last_checked_at") or ""),
+        "last_applied_at": str(raw.get("last_applied_at") or ""),
+        "changed_surfaces": [
+            str(item)
+            for item in raw.get("changed_surfaces", [])
+            if str(item).strip()
+        ] if isinstance(raw.get("changed_surfaces"), list) else [],
+        "restart_required": _normalize_restart_required(raw.get("restart_required")),
+    }
+
+
+def write_plugin_update_state(
+    *,
+    plugin_root: Union[Path, str],
+    repo_url: str = DEFAULT_REPO_URL,
+    ref: str = "",
+    update_status: str = "current",
+    remote_commit: str = "",
+    changed_surfaces: Optional[list[str]] = None,
+    restart_required: Optional[dict[str, Any]] = None,
+    state_path: Optional[Union[Path, str]] = None,
+    dry_run: bool = False,
+) -> Path:
+    """Write the local plugin update state file used by MF/preflight checks."""
+
+    path = Path(state_path).expanduser() if state_path else default_plugin_update_state_path()
+    root = Path(plugin_root).expanduser().resolve()
+    now = _utc_now()
+    payload = normalize_plugin_update_state(
+        {
+            "schema_version": PLUGIN_STATE_SCHEMA_VERSION,
+            "plugin_id": CODEX_PLUGIN_ID,
+            "repo_url": repo_url,
+            "ref": ref,
+            "installed_commit": _git_commit(root),
+            "installed_version": _read_codex_manifest_version(root),
+            "remote_commit": remote_commit,
+            "update_status": update_status,
+            "last_checked_at": now if remote_commit else "",
+            "last_applied_at": now if update_status in {"current", "applied_pending_restart"} else "",
+            "changed_surfaces": changed_surfaces or [],
+            "restart_required": restart_required or _restart_required_template(),
+        }
+    )
+    if dry_run:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+    return path
+
+
+def plugin_update_state_status(
+    *,
+    state_path: Optional[Union[Path, str]] = None,
+) -> dict[str, Any]:
+    """Return read-only plugin update/restart obligation status.
+
+    This is intentionally local-only: it never contacts the remote Git source.
+    `plugin update --check` / `plugin doctor` can refresh remote commit data
+    explicitly, while preflight can safely call this on every MF run.
+    """
+
+    path = Path(state_path).expanduser() if state_path else default_plugin_update_state_path()
+    if not path.is_file():
+        return {
+            "ok": True,
+            "status": "warn",
+            "state_exists": False,
+            "state_path": str(path),
+            "update_status": "unknown",
+            "blockers": [],
+            "warnings": ["plugin update state file not found"],
+            "state": normalize_plugin_update_state({}),
+        }
+
+    try:
+        payload = _read_json_file(path)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "fail",
+            "state_exists": True,
+            "state_path": str(path),
+            "update_status": "unknown",
+            "blockers": [f"cannot read plugin update state: {exc}"],
+            "warnings": [],
+            "state": normalize_plugin_update_state({}),
+        }
+
+    state = normalize_plugin_update_state(payload)
+    blockers: list[str] = []
+    warnings: list[str] = []
+    update_status = state["update_status"]
+
+    if update_status == "available":
+        warnings.append("plugin update available")
+    elif update_status == "unknown":
+        warnings.append("plugin update state unknown")
+    elif update_status == "failed":
+        blockers.append("plugin update failed")
+
+    pending_components = []
+    for component, restart in state["restart_required"].items():
+        if restart.get("required") and not restart.get("satisfied"):
+            pending_components.append(component)
+    if pending_components:
+        blockers.append(
+            "restart/reload required for " + ", ".join(sorted(pending_components))
+        )
+    elif update_status == "applied_pending_restart":
+        blockers.append("plugin update applied but restart/reload satisfaction is unknown")
+
+    status = "fail" if blockers else ("warn" if warnings else "pass")
+    return {
+        "ok": not blockers,
+        "status": status,
+        "state_exists": True,
+        "state_path": str(path),
+        "update_status": update_status,
+        "blockers": blockers,
+        "warnings": warnings,
+        "state": state,
+    }
 
 
 def _parse_python_version(text: str) -> Optional[tuple[int, int, int]]:
@@ -1125,6 +1344,38 @@ def build_next_steps(plugin_root: Path, python_executable: str) -> list[str]:
     ]
 
 
+def format_plugin_update_state_status(result: dict[str, Any]) -> str:
+    lines = [
+        "Aming Claw plugin update state",
+        f"  state path:    {result.get('state_path', '')}",
+        f"  overall:       {result.get('status', 'unknown')}",
+        f"  update status: {result.get('update_status', 'unknown')}",
+    ]
+    blockers = result.get("blockers") or []
+    warnings = result.get("warnings") or []
+    if blockers:
+        lines.append("")
+        lines.append("Blockers:")
+        lines.extend(f"  - {item}" for item in blockers)
+    if warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        lines.extend(f"  - {item}" for item in warnings)
+    state = result.get("state") if isinstance(result.get("state"), dict) else {}
+    restart_required = state.get("restart_required") if isinstance(state, dict) else {}
+    if restart_required:
+        lines.append("")
+        lines.append("Restart obligations:")
+        for component in PLUGIN_RESTART_COMPONENTS:
+            info = restart_required.get(component) or {}
+            required = "required" if info.get("required") else "not required"
+            satisfied = "satisfied" if info.get("satisfied") else "unsatisfied"
+            suffix = f", {satisfied}" if info.get("required") else ""
+            reason = f" - {info.get('reason')}" if info.get("reason") else ""
+            lines.append(f"  - {component}: {required}{suffix}{reason}")
+    return "\n".join(lines)
+
+
 def install_from_git(
     repo_url: str = DEFAULT_REPO_URL,
     *,
@@ -1209,6 +1460,17 @@ def install_from_git(
         )
         started = not dry_run
 
+    plugin_state_path = ""
+    if not validate_only:
+        state_target = write_plugin_update_state(
+            plugin_root=plugin_root,
+            repo_url=repo_url,
+            ref=ref,
+            update_status="current",
+            dry_run=dry_run,
+        )
+        plugin_state_path = str(state_target)
+
     return InstallResult(
         repo_url=repo_url,
         install_root=str(root.expanduser().resolve()),
@@ -1220,6 +1482,7 @@ def install_from_git(
         codex_cache_path=codex_cache_path,
         codex_marketplace_root=codex_marketplace_path,
         codex_config_path=codex_config_path,
+        plugin_state_path=plugin_state_path,
         started=started,
         validated_files=validated,
         commands=commands,
@@ -1254,6 +1517,9 @@ def format_result(result: InstallResult) -> str:
             lines.append(f"  marketplace: {result.codex_marketplace_root}")
         if result.codex_config_path:
             lines.append(f"  config:      {result.codex_config_path}")
+    if result.plugin_state_path:
+        lines.append("")
+        lines.append(f"Plugin state: {result.plugin_state_path}")
     lines.append("")
     lines.append("Next steps:")
     lines.extend(f"  {step}" for step in result.next_steps)

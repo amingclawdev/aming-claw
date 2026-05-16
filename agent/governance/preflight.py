@@ -458,6 +458,36 @@ def check_bootstrap(conn, project_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 8. Plugin update state check — local state only, no network
+# ---------------------------------------------------------------------------
+
+def check_plugin_update_state(state_path: str | None = None) -> dict:
+    """Check local plugin update/restart obligations without contacting Git remotes."""
+    try:
+        try:
+            from agent.plugin_installer import plugin_update_state_status
+        except ImportError:
+            from plugin_installer import plugin_update_state_status  # type: ignore
+
+        status = plugin_update_state_status(state_path=state_path)
+        details = {
+            "state_path": status.get("state_path", ""),
+            "state_exists": status.get("state_exists", False),
+            "update_status": status.get("update_status", "unknown"),
+            "blockers": status.get("blockers", []),
+            "warnings": status.get("warnings", []),
+            "state": status.get("state", {}),
+        }
+        if status.get("status") == "fail":
+            return _fail(details)
+        if status.get("status") == "warn":
+            return _warn(details)
+        return _pass(details)
+    except Exception as e:
+        return _warn({"error": str(e), "update_status": "unknown"})
+
+
+# ---------------------------------------------------------------------------
 # Auto-fix actions
 # ---------------------------------------------------------------------------
 
@@ -535,6 +565,7 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
     checks["coverage"] = check_coverage(project_id)
     checks["queue"] = check_queue(conn, project_id)
     checks["batch_worktrees"] = check_batch_worktrees(conn, project_id)
+    checks["plugin_update_state"] = check_plugin_update_state()
 
     # Collect warnings and blockers
     for name, result in checks.items():
@@ -553,6 +584,11 @@ def run_preflight(conn, project_id: str, auto_fix: bool = False) -> dict:
                     warnings.append(f"version sync stale ({details['sync_stale_seconds']}s)")
                 if details.get("dirty_files"):
                     warnings.append(f"{len(details['dirty_files'])} dirty file(s)")
+            elif name == "plugin_update_state":
+                warnings.extend(
+                    f"plugin update state: {item}"
+                    for item in details.get("warnings", [])
+                )
             else:
                 warnings.append(f"{name}: {result['status']}")
         elif result["status"] == "fail":

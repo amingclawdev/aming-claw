@@ -14,7 +14,7 @@ if _agent_dir not in sys.path:
 
 from governance.preflight import (
     check_system, check_version, check_graph,
-    check_coverage, check_queue, run_preflight,
+    check_coverage, check_queue, check_plugin_update_state, run_preflight,
 )
 
 
@@ -224,6 +224,38 @@ class TestCheckQueue(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
 
 
+class TestCheckPluginUpdateState(unittest.TestCase):
+    def test_warn_when_state_missing(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            result = check_plugin_update_state(str(Path(td) / "missing.json"))
+
+        self.assertEqual(result["status"], "warn")
+        self.assertEqual(result["details"]["update_status"], "unknown")
+
+    def test_fail_when_restart_pending(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "state.json"
+            path.write_text(json.dumps({
+                "schema_version": 1,
+                "plugin_id": "aming-claw@aming-claw-local",
+                "update_status": "applied_pending_restart",
+                "restart_required": {
+                    "governance": {"required": True, "reason": "governance changed"}
+                },
+            }), encoding="utf-8")
+
+            result = check_plugin_update_state(str(path))
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("governance", result["details"]["blockers"][0])
+
+
 class TestRunPreflight(unittest.TestCase):
     def setUp(self):
         self.conn = _create_test_db()
@@ -241,7 +273,7 @@ class TestRunPreflight(unittest.TestCase):
         self.assertIn("blockers", report)
         self.assertIn("warnings", report)
         self.assertIn("auto_fixed", report)
-        for category in ("system", "version", "graph", "coverage", "queue"):
+        for category in ("system", "version", "graph", "coverage", "queue", "plugin_update_state"):
             self.assertIn(category, report["checks"])
 
     def test_ok_true_when_all_pass(self):

@@ -119,13 +119,13 @@ def test_ac5_commit_message_template_has_fenced_block(doc_text: str):
     )
 
 
-# --- AC6: Status banner on line 3 mentions v6 + trailer ---
+# --- AC6: Status banner on line 3 mentions current SOP version + trailer ---
 
-def test_ac6_status_banner_v6_trailer(doc_lines: list):
+def test_ac6_status_banner_current_version_trailer(doc_lines: list):
     assert len(doc_lines) >= 3, "Doc must have at least 3 lines for the banner"
     banner = doc_lines[2]
-    assert "v6" in banner, (
-        f"Line 3 status banner must mention 'v6'; got: {banner!r}"
+    assert "v7" in banner, (
+        f"Line 3 status banner must mention 'v7'; got: {banner!r}"
     )
     assert "trailer" in banner.lower(), (
         f"Line 3 status banner must mention 'trailer'; got: {banner!r}"

@@ -307,7 +307,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "preflight_check",
-        "description": "Run pre-flight self-check: system, version, graph, coverage, queue health.",
+        "description": "Run pre-flight self-check: system, version, graph, coverage, queue, and plugin update state.",
         "inputSchema": {
             "type": "object",
             "properties": {

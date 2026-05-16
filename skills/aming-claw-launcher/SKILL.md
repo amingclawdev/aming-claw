@@ -147,6 +147,7 @@ claims are available.
 | `aming-claw open --governance-url <url>` | Open the dashboard in the default browser. |
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
 | `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, install Codex cache/config, and print next steps. |
+| `aming-claw mf precommit-check [--plugin-state <json>]` | Run local manual-fix pre-commit guards, including plugin update/restart state blockers. |
 | `aming-claw run-executor` | Start an executor worker directly. Normally ServiceManager owns this — only use for explicit debugging. |
 
 ## Project-Local Plugin Contract

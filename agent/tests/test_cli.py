@@ -26,7 +26,7 @@ class TestCliHelp:
         runner = CliRunner()
         result = runner.invoke(main, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor", "plugin"):
+        for cmd in ("init", "bootstrap", "scan", "status", "start", "open", "launcher", "run-executor", "plugin", "mf"):
             assert cmd in result.output
 
 
@@ -133,8 +133,25 @@ class TestCliPlugin:
                     }
                 ],
             },
-            ".claude-plugin/plugin.json": {"name": "aming-claw"},
-            ".claude-plugin/marketplace.json": {"name": "aming-claw-local", "plugins": []},
+            ".claude-plugin/plugin.json": {
+                "name": "aming-claw",
+                "version": "0.1.0",
+                "description": "Test plugin.",
+                "mcpServers": {
+                    "aming-claw": {
+                        "command": "python",
+                        "args": ["-m", "agent.mcp.server"],
+                    }
+                },
+            },
+            ".claude-plugin/marketplace.json": {
+                "name": "aming-claw-local",
+                "metadata": {"description": "Test marketplace."},
+                "owner": {"name": "Aming Claw"},
+                "plugins": [
+                    {"name": "aming-claw", "source": "./", "version": "0.1.0"}
+                ],
+            },
             ".mcp.json": {"mcpServers": {"aming-claw": {"command": "python"}}},
         }.items():
             path = tmp_path / rel
@@ -144,6 +161,9 @@ class TestCliPlugin:
             path = tmp_path / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("---\nname: test\n---\n", encoding="utf-8")
+        server_path = tmp_path / "agent" / "mcp" / "server.py"
+        server_path.parent.mkdir(parents=True, exist_ok=True)
+        server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
 
         codex_home = tmp_path / "codex-home"
         marketplace_root = install_codex_marketplace(tmp_path, marketplace_root=tmp_path / "marketplace-root")
@@ -170,3 +190,44 @@ class TestCliPlugin:
         assert "Restart/reload Codex" in result.output
         assert "dashboard_static_assets" in result.output
         assert "ai_cli_openai" in result.output
+
+
+class TestCliMf:
+    def test_mf_precommit_check_passes_on_missing_state_warning(self, tmp_path):
+        runner = CliRunner()
+
+        result = runner.invoke(main, [
+            "mf",
+            "precommit-check",
+            "--plugin-state",
+            str(tmp_path / "missing.json"),
+        ])
+
+        assert result.exit_code == 0
+        assert "Aming Claw MF precommit check" in result.output
+        assert "plugin update state file not found" in result.output
+
+    def test_mf_precommit_check_fails_on_restart_blocker(self, tmp_path):
+        runner = CliRunner()
+        state_path = tmp_path / "state.json"
+        state_path.write_text(json.dumps({
+            "schema_version": 1,
+            "plugin_id": "aming-claw@aming-claw-local",
+            "update_status": "applied_pending_restart",
+            "restart_required": {
+                "mcp": {"required": True, "reason": "skills changed"}
+            },
+        }), encoding="utf-8")
+
+        result = runner.invoke(main, [
+            "mf",
+            "precommit-check",
+            "--plugin-state",
+            str(state_path),
+            "--json-output",
+        ])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["checks"]["plugin_update_state"]["status"] == "fail"

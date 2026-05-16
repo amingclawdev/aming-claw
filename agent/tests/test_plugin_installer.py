@@ -15,15 +15,19 @@ from agent.plugin_installer import (
     _load_toml_text,
     _upsert_toml_table,
     configure_codex_plugin,
+    default_plugin_update_state_path,
     doctor_plugin,
+    format_plugin_update_state_status,
     format_result,
     format_doctor_result,
     install_codex_marketplace,
     install_codex_plugin_cache,
     install_from_git,
+    plugin_update_state_status,
     plugin_root_for,
     slug_from_repo_url,
     validate_plugin_root,
+    write_plugin_update_state,
 )
 
 
@@ -104,6 +108,76 @@ def test_validate_plugin_root_requires_expected_assets(tmp_path):
     validated = validate_plugin_root(tmp_path)
     assert ".codex-plugin/plugin.json" in validated
     assert "skills/aming-claw/SKILL.md" in validated
+
+
+def test_default_plugin_update_state_path_uses_user_state_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMING_CLAW_PLUGIN_STATE_HOME", str(tmp_path / "state-home"))
+
+    path = default_plugin_update_state_path()
+
+    assert path == tmp_path / "state-home" / "aming-claw-local" / "aming-claw.json"
+
+
+def test_plugin_update_state_status_warns_when_missing(tmp_path):
+    result = plugin_update_state_status(state_path=tmp_path / "missing.json")
+
+    assert result["ok"] is True
+    assert result["status"] == "warn"
+    assert result["update_status"] == "unknown"
+    assert "not found" in result["warnings"][0]
+
+
+def test_plugin_update_state_status_blocks_pending_restart(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "schema_version": 1,
+        "plugin_id": "aming-claw@aming-claw-local",
+        "update_status": "applied_pending_restart",
+        "restart_required": {
+            "mcp": {
+                "required": True,
+                "reason": "skills changed",
+                "satisfied_by": "open a new session",
+            }
+        },
+    }), encoding="utf-8")
+
+    result = plugin_update_state_status(state_path=state_path)
+
+    assert result["ok"] is False
+    assert result["status"] == "fail"
+    assert "mcp" in result["blockers"][0]
+    assert "required" in format_plugin_update_state_status(result)
+
+
+def test_plugin_update_state_status_blocks_failed_update(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "schema_version": 1,
+        "plugin_id": "aming-claw@aming-claw-local",
+        "update_status": "failed",
+    }), encoding="utf-8")
+
+    result = plugin_update_state_status(state_path=state_path)
+
+    assert result["ok"] is False
+    assert result["status"] == "fail"
+    assert "failed" in result["blockers"][0]
+
+
+def test_write_plugin_update_state_records_current_install(tmp_path):
+    _write_plugin_fixture(tmp_path)
+    state_path = write_plugin_update_state(
+        plugin_root=tmp_path,
+        repo_url="https://github.com/amingclawdev/aming-claw.git",
+        state_path=tmp_path / "state" / "plugin.json",
+    )
+
+    result = plugin_update_state_status(state_path=state_path)
+
+    assert result["ok"] is True
+    assert result["status"] == "pass"
+    assert result["state"]["installed_version"] == "0.1.0"
 
 
 def test_install_from_git_dry_run_plans_fresh_clone_without_writing(tmp_path):

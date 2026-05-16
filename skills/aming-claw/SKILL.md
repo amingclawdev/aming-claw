@@ -159,6 +159,8 @@ Before editing:
    project has an imported workflow acceptance graph; if `wf_*` returns
    `needs_import_graph=true`, record that precondition instead of treating
    `total_nodes=0` as healthy.
+   Treat `preflight_check.checks.plugin_update_state` blockers as MF blockers;
+   `update_available` or missing plugin state is a warning to record.
 5. Run graph-first discovery and record the owning nodes or why the file is not
    graph-mapped.
 6. Record the E2E decision: run it, defer it with a follow-up backlog row, or
@@ -359,9 +361,11 @@ Before closing a row:
 3. Commit explicit files only.
 4. Restart/redeploy governance or ServiceManager when runtime code changed.
 5. Re-run `version_check` and confirm runtime matches HEAD.
-6. Check graph status and operations queue; if graph is stale, run direct Update graph/scope reconcile before claiming dashboard state is current. Explicit pending-scope queueing is legacy/debug only.
-7. Confirm E2E impact is current, deferred with a backlog row, or explicitly not applicable.
-8. Close the backlog row with commit evidence.
+6. Re-run `preflight_check` or `aming-claw mf precommit-check` and confirm
+   `plugin_update_state` has no blockers.
+7. Check graph status and operations queue; if graph is stale, run direct Update graph/scope reconcile before claiming dashboard state is current. Explicit pending-scope queueing is legacy/debug only.
+8. Confirm E2E impact is current, deferred with a backlog row, or explicitly not applicable.
+9. Close the backlog row with commit evidence.
 
 ## References
 

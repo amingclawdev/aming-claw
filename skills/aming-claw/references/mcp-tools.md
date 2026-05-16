@@ -8,7 +8,8 @@ Prefer MCP tools over raw SQLite or hand-rolled HTTP calls when the tool exists.
 - `version_check`: HEAD, chain version, dirty files, and runtime match.
 - `runtime_status`: combined governance, ServiceManager, and version state.
   Pass `project_id`, for example `runtime_status(project_id="aming-claw")`.
-- `preflight_check`: system, version, graph, coverage, and queue baseline.
+- `preflight_check`: system, version, graph, coverage, queue, and plugin update
+  state baseline.
 
 Use these at session start, after commits, and before closing a backlog row.
 ServiceManager or executor offline means runtime is degraded for chain/executor

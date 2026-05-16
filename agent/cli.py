@@ -9,6 +9,7 @@ Usage:
     aming-claw open            - open the dashboard URL
     aming-claw launcher        - write a local launcher HTML artifact
     aming-claw run-executor    - start executor worker
+    aming-claw mf precommit-check - run MF pre-commit guards
 """
 
 import os
@@ -328,6 +329,39 @@ def plugin_doctor(plugin_root, governance_url, codex_config, codex_home, python_
     else:
         click.echo(format_doctor_result(result))
     if not result.ok:
+        raise click.exceptions.Exit(1)
+
+
+@main.group()
+def mf():
+    """Manual-fix workflow checks."""
+    pass
+
+
+@mf.command("precommit-check")
+@click.option("--plugin-state", default="", help="Optional plugin update state JSON path.")
+@click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
+def mf_precommit_check(plugin_state, json_output):
+    """Run local MF pre-commit guards that do not mutate governance state."""
+    from agent.plugin_installer import (
+        format_plugin_update_state_status,
+        plugin_update_state_status,
+    )
+
+    plugin_status = plugin_update_state_status(state_path=plugin_state or None)
+    result = {
+        "ok": bool(plugin_status.get("ok")),
+        "checks": {
+            "plugin_update_state": plugin_status,
+        },
+    }
+    if json_output:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        click.echo("Aming Claw MF precommit check")
+        click.echo("")
+        click.echo(format_plugin_update_state_status(plugin_status))
+    if not result["ok"]:
         raise click.exceptions.Exit(1)
 
 

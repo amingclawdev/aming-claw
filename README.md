@@ -461,6 +461,10 @@ Run `aming-claw plugin doctor` after install. If the cache or generated
 marketplace is missing/inconsistent, doctor reports `fail` (not just `ok`).
 A passing doctor verifies the on-disk install and generated config; still open
 or reload a Codex/Claude session and confirm the skill/MCP tools are visible.
+Starting governance is a separate long-running service command; keep it in its
+own terminal instead of expecting plugin install to start it. On Windows use a
+separate shell such as `Start-Process powershell`; on macOS/Linux a detached
+smoke command can use `nohup python3 -m agent.cli start`.
 
 ### Post-Install Verification
 
@@ -518,6 +522,7 @@ aming-claw plugin install  # clone/update local plugin assets from Git
 aming-claw start           # start governance locally
 aming-claw open            # open the dashboard
 aming-claw status          # check governance health
+aming-claw mf precommit-check # run manual-fix plugin update guards
 aming-claw bootstrap       # register a project workspace
 aming-claw scan            # scan an external project
 ```
