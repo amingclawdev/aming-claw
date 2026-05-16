@@ -1,0 +1,203 @@
+# Parallel Agent Multibranch Test Scenarios
+
+> Status: P0 design contract
+> Backlog: `ARCH-PARALLEL-AGENT-TEST-SCENARIO-MATRIX`
+> Scope: dry-run scenario matrix for parallel branch governance runtime
+
+## Purpose
+
+Parallel branch development touches task runtime state, branch/worktree identity,
+merge ordering, graph snapshots, semantic projections, pending scope reconcile,
+rollback, and dashboard/MCP read models. The test design has to lead the
+implementation so schema and API choices remain testable.
+
+This document is the contract for that work. Runtime implementation may start
+with dry-run or pending tests, but every affected state transition must be
+represented here before it is encoded in production code.
+
+## PR Gate
+
+Any PR that changes parallel branch runtime schema, merge queue behavior, graph
+ref activation, semantic projection activation, pending scope keys, rollback
+state, Chain integration, or dashboard/MCP read models must do one of these:
+
+1. Implement or update a test mapped to the affected scenario.
+2. Mark the scenario `pending` with an explicit infrastructure blocker.
+3. Update this matrix when the behavior intentionally changes.
+
+The dry-run oracle must not mutate the production git checkout or production
+governance DB. Tests should use an isolated temporary repository and an
+ephemeral SQLite database.
+
+## Runtime Surfaces
+
+| Surface | Responsibility |
+| --- | --- |
+| `BranchTaskRuntimeContext` | Durable branch/task state, lease/fence token, checkpoint, attempt, replay source, and recovery decision. |
+| `MergeQueueRuntime` | Ordered merge queue, dependency blockers, revalidation, stale target handling, and merge result recording. |
+| `BatchMergeRuntime` | Batch-level branch retention, rollback_required state, ordered replay, and cleanup authorization. |
+| `GraphRefRuntime` | Active graph snapshot/projection refs for each branch, target ref, merge epoch, rollback epoch, and replay epoch. |
+| `SemanticProjectionRuntime` | Projection activation and invalidation for branch snapshots, merge epochs, rollback epochs, and semantic job carry-forward. |
+| `PendingScopeRuntime` | Branch/ref/batch-aware pending scope reconcile rows and materialization decisions. |
+| `Dashboard/MCP read model` | Compact operator views for branch lanes, queue blockers, rollback timeline, graph epoch, and recovery actions. |
+| `Chain adapter` | Optional Chain identity fields while MF/observer remains the first client. |
+
+## Oracle Shape
+
+Each scenario must define these dimensions:
+
+| Dimension | Required content |
+| --- | --- |
+| `scenario_id` | Stable ID such as `PB-001`. |
+| `mode` | `dry_run`, `unit`, `integration`, or `e2e`. |
+| `preconditions` | Git refs, task states, leases, queue rows, graph refs, semantic projections, pending scope rows, and dashboard state before the trigger. |
+| `events` | Ordered events such as restart, claim, merge attempt, branch rebase, graph activation, rollback request, or stale agent callback. |
+| `expected.task_runtime` | Task state, attempt, lease owner, fence token, checkpoint, replay source, and terminal/blocked state. |
+| `expected.merge_queue` | Queue position, dependency status, merge gate decision, stale/rebase flags, and operator actions. |
+| `expected.git` | Branch head, target head, retained worktree, merge commit, revert/reset marker, and cleanup permission. |
+| `expected.graph` | Active snapshot ref, branch snapshot ref, merge epoch, rollback epoch, replay epoch, and stale/materialized flags. |
+| `expected.semantic` | Projection ID, projection status, semantic job status, event watermark, and carry-forward/rebuild decision. |
+| `expected.pending_scope` | Branch/ref/batch scoped pending row state and materialization outcome. |
+| `expected.dashboard_mcp` | Compact rows and action affordances visible to the operator without loading full backlog or graph payloads. |
+| `blocked_by` | Infrastructure flags that prevent a real test today. Empty means the test should be implemented immediately. |
+
+Example dry-run oracle:
+
+```json
+{
+  "scenario_id": "PB-001",
+  "mode": "dry_run",
+  "events": ["service_restart", "observer_recovery_scan"],
+  "expected": {
+    "task_runtime": ["T3 lease expired", "T5 lease expired"],
+    "merge_queue": ["T4 dependency_blocked by T2"],
+    "git": ["retain all batch branches"],
+    "graph": ["active target ref remains at T1 merge epoch"],
+    "semantic": ["no projection activation for failed or unfinished branches"],
+    "pending_scope": ["no cross-branch row reuse"],
+    "dashboard_mcp": ["show recovery actions for T2/T3/T5"]
+  },
+  "blocked_by": ["I1", "I2", "I3", "I5", "I7"]
+}
+```
+
+## Infrastructure Flags
+
+| Flag | Meaning |
+| --- | --- |
+| I0 | Documentation-only guard is available. |
+| I1 | Durable `BranchTaskRuntimeContext` store exists. |
+| I2 | Durable `MergeQueueRuntime` store exists. |
+| I3 | Branch/ref-aware graph snapshot refs exist. |
+| I4 | Semantic projection activation and rollback epochs exist. |
+| I5 | Branch/ref/batch-aware `pending_scope_reconcile` keys exist. |
+| I6 | Governance Hint add/remove/change deltas are invertible. |
+| I7 | Dashboard/MCP compact read model exists. |
+| I8 | Chain adapter identity fields exist without requiring Chain execution. |
+| I9 | Batch branch/worktree retention and cleanup policy exists. |
+
+## Fixture Topology
+
+The canonical fixture is a five-task batch against a temporary target repo.
+
+| Fixture item | Value |
+| --- | --- |
+| Project | `fixture-parallel-project` |
+| Base target | `main@B0` |
+| Batch | `batch-parallel-001` |
+| Target branch | `main` |
+| Worktree root | Temporary directory created by the test harness |
+| DB | Ephemeral SQLite database |
+| Graph baseline | `snapshot-main-B0` with `projection-main-B0` |
+| Branch naming | `codex/PB001-T<task>-<slug>` |
+
+Task fixture:
+
+| Task | Branch | Dependency | Runtime state at restart fixture | Intent |
+| --- | --- | --- | --- | --- |
+| T1 | `codex/PB001-T1-scope-reconcile` | none | `merged` | Foundation scope reconcile and graph baseline update. |
+| T2 | `codex/PB001-T2-branch-graph-refs` | T1 | `merge_failed` | Branch/ref graph snapshot support. |
+| T3 | `codex/PB001-T3-task-runtime` | T1 | `running` with expired lease | Branch task runtime and replay support. |
+| T4 | `codex/PB001-T4-dashboard-read-model` | T2 | `queued_for_merge` | Operator read model; complete but blocked by T2. |
+| T5 | `codex/PB001-T5-chain-adapter` | T3 | `running` with expired lease | Chain compatibility hook. |
+
+## Scenario Matrix
+
+| ID | Family | Trigger | Expected decision | Blocked by | Future tests |
+| --- | --- | --- | --- | --- | --- |
+| PB-001 | Machine restart recovery | Service restarts with T1 merged, T2 merge_failed, T4 queued_for_merge, T3/T5 unfinished. | Keep T1 merged; keep T2 merge_failed for observer action; mark T4 dependency_blocked; expire T3/T5 leases; retain all batch branches; activate no unfinished graph/semantic projections. | I1, I2, I3, I5, I7, I9 | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py` |
+| PB-002 | Merge dependency ordering | Downstream branch requests merge before upstream foundation branch. | Reject merge with `waiting_dependency` or `dependency_blocked`; no target branch mutation; no graph ref activation. | I2, I3, I7 | `test_merge_queue_runtime.py` |
+| PB-003 | Target branch moves | Upstream branch merges after downstream branch was validated. | Mark downstream `stale_after_dependency_merge`; require rebase/sync, scope reconcile, semantic projection check, and merge preview. | I2, I3, I4, I5 | `test_merge_queue_runtime.py`, `test_graph_rollback_epoch.py` |
+| PB-004 | Wrong merge order rollback/replay | Batch detects severe integration issue after an invalid merge order. | Enter `rollback_required`; retain all batch branches/worktrees; rollback target ref and graph ref; replay retained branch heads in corrected queue order. | I2, I3, I4, I9 | `test_batch_merge_rollback.py` |
+| PB-005 | DB rollback consistency | Code rollback is requested after graph/semantic/pending rows changed. | Move graph snapshot refs and semantic projection refs to rollback epoch; mark superseded branch projections inactive; requeue or abandon semantic jobs by epoch; scope rows are isolated by branch/ref/batch. | I3, I4, I5 | `test_graph_rollback_epoch.py` |
+| PB-006 | Governance Hint rollback | A hint is added, changed, then removed across branch commits. | Incremental reconcile emits add/change/remove deltas; removed hint cannot leave stale graph binding; rollback restores prior binding state. | I3, I5, I6 | `test_governance_hint_rollback.py` |
+| PB-007 | Chain compatibility | A Chain stage records branch runtime identity while MF remains the active client. | Accept optional `chain_id`, `root_task_id`, `stage_task_id`, `stage_type`, and `retry_round`; runtime semantics do not require Chain execution. | I1, I8 | `test_parallel_branch_runtime.py` |
+| PB-008 | Old agent resurrection | A stale agent callback tries to complete or merge after lease recovery by another agent. | Reject stale fence token; record ignored callback; do not change task state, queue state, branch head, graph ref, or semantic projection. | I1, I2, I7 | `test_parallel_branch_runtime.py` |
+| PB-009 | Cleanup retention | Batch has unresolved merge_failed or rollback_required state. | Block branch/worktree cleanup; cleanup allowed only after batch accepted, abandoned, or explicitly archived with rollback evidence. | I1, I2, I9 | `test_batch_merge_rollback.py` |
+| PB-010 | Dashboard/MCP compact read model | Operator opens dashboard or calls MCP after mixed parallel state. | Return bounded payload: branch lanes, task states, dependency blockers, rollback epoch, graph epoch, and action affordances without full backlog/graph expansion. | I7 | `frontend/dashboard/scripts/e2e-parallel-branches.mjs` |
+| PB-011 | Branch graph artifact isolation | Branch-local graph artifacts are produced before merge. | Store branch artifacts separately; do not mutate active target graph refs until merge queue accepts the branch. | I3, I4 | `test_graph_rollback_epoch.py` |
+| PB-012 | Multi-project and batch isolation | Two projects or batches reuse task IDs and branch slugs. | Runtime keys include project, batch, branch/ref, and attempt identity; no task, queue, pending scope, graph, or semantic row crosses boundaries. | I1, I2, I3, I4, I5 | `test_parallel_branch_runtime.py` |
+
+## Immediate Test Slice
+
+The first slice is documentation-backed and can run before runtime facilities
+exist:
+
+| Test | Purpose | Status |
+| --- | --- | --- |
+| `agent/tests/test_parallel_branch_test_scenarios.py` | Verifies this contract exists, includes required scenario IDs, includes every oracle dimension, preserves the five-task restart fixture, and states the PR gate. | Implement immediately |
+
+The next slice should create dry-run data structures without production code:
+
+| Test | Purpose | Blockers |
+| --- | --- | --- |
+| `agent/tests/test_parallel_branch_runtime.py` | Pure-state `BranchTaskRuntimeContext` fixture for PB-001, PB-007, PB-008, PB-012. | I1 |
+| `agent/tests/test_merge_queue_runtime.py` | Pure-state merge dependency and stale target decisions for PB-001, PB-002, PB-003. | I2 |
+| `agent/tests/test_batch_merge_rollback.py` | Batch retention, rollback_required, and ordered replay decisions for PB-004 and PB-009. | I2, I9 |
+| `agent/tests/test_graph_rollback_epoch.py` | Graph snapshot/projection activation, rollback, and branch artifact isolation for PB-003, PB-004, PB-005, PB-011. | I3, I4 |
+| `agent/tests/test_governance_hint_rollback.py` | Hint add/change/remove inverse delta behavior for PB-006. | I6 |
+| `frontend/dashboard/scripts/e2e-parallel-branches.mjs` | Operator read model for PB-010. | I7 |
+
+## Observer Recovery Dry Run
+
+For PB-001, an observer recovery scan after machine restart should compute:
+
+| Task | Observed state | Recovery decision |
+| --- | --- | --- |
+| T1 | `merged` | Leave merged; target and graph refs remain anchored at T1 merge epoch. |
+| T2 | `merge_failed` | Keep failed; require observer decision: fix/rebase, abandon, or rollback batch. |
+| T3 | `running`, lease expired | Mark reclaimable; replay from last checkpoint on retained branch. |
+| T4 | `queued_for_merge`, depends on T2 | Move to `dependency_blocked`; do not merge until T2 is resolved and T4 is revalidated. |
+| T5 | `running`, lease expired, depends on T3 | Mark reclaimable but blocked by T3 recovery. |
+
+No cleanup is allowed while T2, T3, or T5 are unresolved. No semantic projection
+from T2, T3, T4, or T5 may become active on the target ref during recovery.
+
+## Rollback Dry Run
+
+Rollback scenarios must treat code and DB state as one recoverable unit.
+
+Required rollback assertions:
+
+| Area | Assertion |
+| --- | --- |
+| Git | Target ref is reset or reverted to the selected rollback point; retained branch heads are still available for replay. |
+| Graph refs | Active target graph ref points to a snapshot/projection compatible with the rollback target. |
+| Graph events | Rollback epoch records which merge epoch was abandoned and why. |
+| Semantic nodes/edges/jobs | Rows tied to abandoned epochs are inactive, stale, cancelled, or rebuild-required; they are not silently treated as current. |
+| Pending scope | Rows are keyed by project, branch/ref, batch, and epoch so rollback does not reuse wrong materialization state. |
+| Governance Hint | Hint remove/change emits inverse graph deltas; rollback restores prior binding state. |
+| Dashboard/MCP | Operator can see rollback_required, rollback epoch, retained branches, and replay order. |
+
+## Design Notes
+
+- Chain remains serial inside a single chain, but the branch runtime must be
+  capable of running multiple Chain or MF clients in parallel.
+- MF/observer is the first client. Chain identity is optional metadata until
+  Chain execution is ready to use the runtime directly.
+- Branch/worktree cleanup is not a background garbage-collection concern until
+  batch acceptance, abandonment, or explicit archive has happened.
+- Active graph and semantic projections are target-ref facts. Branch-local
+  artifacts are candidates until accepted by the merge queue.
+- Backlog and dashboard queries must stay compact by default; detailed state
+  should be fetched by ID.
