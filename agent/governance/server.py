@@ -7563,6 +7563,38 @@ def handle_graph_governance_snapshot_semantic_events_backfill(ctx: RequestContex
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/seed/import")
+def handle_graph_governance_snapshot_seed_semantic_import(ctx: RequestContext):
+    """Import packaged seed graph context into local semantic state."""
+    project_id = ctx.get_project_id()
+    snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import seed_graph_semantics
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.seed.import")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
+        with sqlite_write_lock():
+            try:
+                result = seed_graph_semantics.import_seed_graph_semantics(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    seed_path=body.get("seed_path") or None,
+                    actor=str(body.get("actor") or body.get("created_by") or "observer"),
+                    projection_id=str(body.get("projection_id") or ""),
+                    dry_run=bool(body.get("dry_run")),
+                )
+            except (FileNotFoundError, KeyError, ValueError) as exc:
+                _raise_graph_api_validation(exc)
+            conn.commit()
+        return {"ok": True, **result}
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/projection")
 def handle_graph_governance_snapshot_semantic_projection_build(ctx: RequestContext):
     """Build a hash-aware semantic projection snapshot from structure + graph_events."""

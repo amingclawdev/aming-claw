@@ -17,6 +17,7 @@ dashboard action documents the HTTP contract.
 | `POST /api/projects/{project_id}/ai-config` | Update project AI routing without overwriting unrelated config. |
 | `GET /api/graph-governance/{project_id}/status` | Active snapshot, stale state, semantic drift. |
 | `POST /api/graph-governance/{project_id}/reconcile/pending-scope` | V1 Update Graph path for a clean HEAD. |
+| `POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/seed/import` | Import packaged seed graph context into local semantic state and rebuild projection. |
 | `POST /api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs` | Queue targeted node/edge AI Enrich jobs. |
 | `GET /api/graph-governance/{project_id}/operations/queue` | Operations Queue rows for dashboard/MCP. |
 | `GET/POST /api/backlog/{project_id}` | Backlog list/upsert surfaces. |
