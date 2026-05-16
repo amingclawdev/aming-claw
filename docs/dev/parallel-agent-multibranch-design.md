@@ -1,0 +1,386 @@
+# Parallel Agent Multibranch Runtime Design
+
+> Status: P0 design contract
+> Backlog: `ARCH-PARALLEL-AGENT-MULTIBRANCH-DESIGN-DOC`
+> Parent: `ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION`
+> Test oracle: `docs/dev/parallel-agent-multibranch-test-scenarios.md`
+
+## Purpose
+
+Aming Claw needs parallel branch execution without losing the serial quality
+properties of Chain and governance. The runtime must let multiple agents work
+in isolated branches or worktrees while merges remain ordered, auditable,
+rollbackable, and graph-aware.
+
+The governing test contract is
+`docs/dev/parallel-agent-multibranch-test-scenarios.md`. Runtime schema and API
+work must either implement the mapped scenario tests or update the scenario
+matrix with explicit pending infrastructure flags.
+
+## Non-Goals
+
+- Do not increase executor parallelism before one branch can safely allocate,
+  checkpoint, queue, merge, reconcile, and clean up.
+- Do not encode MF-only assumptions. MF/observer is the first client, but Chain
+  must be able to use the same runtime later.
+- Do not treat branch-local graph or semantic evidence as active target-ref
+  truth until the merge queue accepts the branch.
+- Do not rely on a shared dirty checkout for concurrent work.
+
+## Scenario Coverage
+
+| Scenario | Runtime pressure |
+| --- | --- |
+| PB-001 | Restart recovery for five mixed-state tasks. |
+| PB-002 | Merge dependency ordering. |
+| PB-003 | Target branch moves and downstream stale handling. |
+| PB-004 | Batch rollback and replay after wrong merge order. |
+| PB-005 | DB rollback for graph, semantic, jobs, and pending scope rows. |
+| PB-006 | Governance Hint add/change/remove rollback. |
+| PB-007 | Chain compatibility without requiring Chain in MVP. |
+| PB-008 | Stale agent resurrection and fence enforcement. |
+| PB-009 | Cleanup retention while batch is unresolved. |
+| PB-010 | Compact dashboard/MCP read model. |
+| PB-011 | Branch graph artifact isolation before merge. |
+| PB-012 | Multi-project and batch isolation. |
+
+## Runtime Surfaces
+
+| Surface | Owns | Does not own |
+| --- | --- | --- |
+| `BranchTaskRuntimeContext` | Branch/task state, lease/fence token, checkpoint, attempt, replay source, current agent, and recovery decision. | Merge ordering or target-ref mutation. |
+| `MergeQueueRuntime` | Dependency ordering, merge preview, merge gate state, target branch freshness, conflict state, and merge result. | Long-lived agent execution. |
+| `BatchMergeRuntime` | Batch grouping, retained branches/worktrees, rollback_required state, rollback target, replay order, and cleanup authorization. | Per-task implementation details. |
+| `GraphRefRuntime` | Active target graph refs, branch candidate graph refs, merge epoch, rollback epoch, and replay epoch. | Semantic payload trust decisions. |
+| `SemanticProjectionRuntime` | Projection activation, semantic job carry-forward, stale/cancelled state, and epoch-bound rebuild decisions. | Structural graph snapshot creation. |
+| `PendingScopeRuntime` | Branch/ref/batch/epoch-aware scope reconcile rows and materialization decisions. | Merge queue policy. |
+| `Dashboard/MCP read model` | Bounded operator views, blockers, recovery actions, queue status, graph epoch, rollback timeline. | Full backlog or graph expansion by default. |
+| `Chain adapter` | Optional Chain identity fields and event mapping. | A separate parallel runtime. |
+
+## Canonical Identity
+
+Every durable runtime row or event that can survive restart must carry enough
+identity to prevent cross-project, cross-branch, cross-batch, and stale-attempt
+mutation.
+
+Required identity fields:
+
+| Field | Meaning |
+| --- | --- |
+| `project_id` | Governance project identity. |
+| `batch_id` | Optional batch that groups related branches and merge/rollback lifecycle. |
+| `backlog_id` | Backlog row that requested the work. |
+| `task_id` | Governance task row when present. |
+| `chain_id` | Optional Chain run identity. |
+| `root_task_id` | Optional Chain root task identity. |
+| `stage_task_id` | Optional Chain stage task identity. |
+| `stage_type` | Optional Chain stage, such as `dev`, `test`, `qa`, or `merge`. |
+| `agent_id` | Logical agent identity. |
+| `worker_id` | Executor or external worker identity. |
+| `attempt` | Monotonic attempt number for replay and stale callback rejection. |
+| `lease_id` | Current claim lease. |
+| `fence_token` | Token required for mutating callbacks. |
+| `branch_ref` | Full branch ref, for example `refs/heads/codex/PB001-T3-task-runtime`. |
+| `ref_name` | Target ref being merged into, normally `main`. |
+| `worktree_id` | Durable worktree identity. |
+| `worktree_path` | Local path, stored as runtime state and not as portable project identity. |
+| `base_commit` | Target commit used when branch work began. |
+| `head_commit` | Current branch head. |
+| `target_head_commit` | Current target ref head at validation/merge time. |
+| `snapshot_id` | Branch or target structural graph snapshot. |
+| `projection_id` | Branch or target semantic projection. |
+| `merge_queue_id` | Queue row identity. |
+| `merge_preview_id` | Git/graph/test preview identity for a merge attempt. |
+| `rollback_epoch` | Epoch used to isolate rollback and replay state. |
+| `replay_epoch` | Epoch used when replaying retained branch heads. |
+
+Rows may omit optional Chain fields only when Chain is not the client. The
+schema must still reserve them.
+
+## Event Envelope
+
+Durable events should use this shape:
+
+```json
+{
+  "event_id": "evt-...",
+  "event_type": "branch_task.checkpointed",
+  "project_id": "aming-claw",
+  "batch_id": "batch-parallel-001",
+  "backlog_id": "ARCH-...",
+  "task_id": "task-...",
+  "chain_id": "",
+  "stage_task_id": "",
+  "branch_ref": "refs/heads/codex/PB001-T3-task-runtime",
+  "worktree_id": "wt-...",
+  "attempt": 2,
+  "lease_id": "lease-...",
+  "fence_token": "fence-...",
+  "base_commit": "B0",
+  "head_commit": "B3",
+  "snapshot_id": "snapshot-branch-B3",
+  "projection_id": "semproj-branch-B3",
+  "merge_queue_id": "mq-...",
+  "rollback_epoch": "",
+  "replay_epoch": "",
+  "payload": {},
+  "created_at": "2026-05-16T00:00:00Z",
+  "actor": "agent-or-observer"
+}
+```
+
+State rebuild after restart must derive from durable rows plus events, not from
+in-memory worker state.
+
+## BranchTaskRuntimeContext
+
+State machine:
+
+```text
+allocated
+  -> running
+  -> checkpointed
+  -> scope_ready
+  -> review_ready
+  -> merge_queued
+  -> merged
+  -> batch_retained
+  -> cleaned
+```
+
+Exceptional states:
+
+```text
+running -> lease_expired -> reclaimable -> running
+running -> failed -> replay_pending -> running
+running -> abandoned
+checkpointed -> base_stale -> replay_pending
+review_ready -> dependency_blocked
+merge_queued -> merge_blocked
+merge_queued -> rollback_required
+```
+
+Rules:
+
+- Only the current `fence_token` may checkpoint, complete, abandon, or request
+  merge for an active attempt.
+- A stale callback from an old agent must be recorded and ignored.
+- If the target branch moves, a branch that was validated against the old
+  target enters `base_stale` or `stale_after_dependency_merge`.
+- Replay starts from the retained branch head plus the last durable checkpoint.
+- Crash recovery scans expired leases and classifies tasks as `reclaimable`,
+  `dependency_blocked`, `merge_failed`, or `rollback_required`.
+
+## MergeQueueRuntime
+
+Dependency types:
+
+| Type | Meaning |
+| --- | --- |
+| `hard_depends_on` | Upstream must merge successfully first. |
+| `serializes_after` | Upstream should merge first to keep graph/runtime order deterministic. |
+| `conflicts_with` | Branches touch mutually exclusive surfaces and require operator ordering. |
+| `same_node_or_file_conflict` | Graph or file overlap detected. |
+| `requires_graph_epoch` | Branch requires a specific graph/projection epoch before merge. |
+
+Queue states:
+
+```text
+waiting_dependency
+dependency_blocked
+queued_for_merge
+validating
+stale_after_dependency_merge
+rebase_required
+merge_blocked
+merge_ready
+merging
+merged
+merge_failed
+abandoned
+```
+
+Merge gate inputs:
+
+| Input | Required decision |
+| --- | --- |
+| Dependency status | All hard dependencies merged or explicitly waived. |
+| Git conflict check | Merge preview must be clean or explicitly blocked. |
+| Dirty worktree check | Candidate worktree must not contain unrelated dirty files. |
+| Test evidence | Required tests from backlog or Chain stage pass. |
+| Graph currentness | Branch graph evidence is current for branch head. |
+| Scope reconcile | Scope result exists for branch head or fallback is explicitly labeled. |
+| Semantic projection | Projection state is current, stale, or intentionally deferred. |
+| Backlog acceptance | Acceptance criteria are satisfied or blocked with reason. |
+| Batch rollback state | Batch must not be `rollback_required`. |
+| Chain state | If Chain is client, stage state must permit merge. |
+
+After any upstream merge, downstream queued branches must be revalidated. A
+branch that was previously clean can become `stale_after_dependency_merge`.
+
+## BatchMergeRuntime
+
+Batch states:
+
+```text
+open
+merge_in_progress
+rollback_required
+rollback_in_progress
+replay_pending
+replay_in_progress
+accepted
+abandoned
+cleaned
+```
+
+Rules:
+
+- Branches and worktrees remain retained until the batch is `accepted`,
+  `abandoned`, or explicitly archived with rollback evidence.
+- Cleanup is blocked while any branch is `merge_failed`,
+  `dependency_blocked`, `rollback_required`, or `replay_pending`.
+- A severe merge-order error moves the batch to `rollback_required`.
+- Rollback records `rollback_epoch`, target rollback commit, abandoned merge
+  epoch, affected graph refs, affected semantic projections, and replay order.
+- Replay uses retained branch heads through the merge queue. It does not replay
+  shell history.
+
+## Graph And Semantic Ref Rules
+
+Target-ref facts:
+
+- Active graph snapshot refs.
+- Active semantic projection refs.
+- Merge epochs.
+- Rollback epochs.
+- Replay epochs after acceptance.
+
+Branch-local candidate facts:
+
+- Branch graph artifact.
+- Branch semantic projection.
+- Scope reconcile result for branch head.
+- Merge preview graph result.
+
+Branch-local facts must not become active target-ref facts until the merge
+queue accepts the branch and target ref is updated.
+
+DB rollback requirements:
+
+| Table area | Required rollback behavior |
+| --- | --- |
+| `graph_snapshot_refs` | Preserve ref activation history and point active target ref to rollback-compatible snapshot. |
+| `graph_semantic_projections` | Deactivate or supersede abandoned epoch projections. |
+| `graph_semantic_nodes` / `graph_semantic_edges` | Treat abandoned epoch rows as stale or inactive, not current. |
+| `graph_semantic_jobs` | Cancel, requeue, or rebuild jobs by epoch and branch/ref. |
+| `pending_scope_reconcile` | Key rows by project, branch/ref, batch, and epoch before parallel rollout. |
+| `graph_events` | Record merge, rollback, abandoned epoch, replay, and hint inverse events. |
+| Governance Hint state | Hint add/change/remove must be invertible under incremental reconcile. |
+
+## PendingScopeRuntime
+
+Current pending scope rows are keyed too narrowly for parallel branch work. The
+parallel runtime requires keys that include:
+
+```text
+project_id
+branch_ref or ref_name
+commit_sha
+batch_id
+merge_queue_id
+rollback_epoch
+replay_epoch
+```
+
+Until those keys exist, true parallel rollout must treat scope materialization
+as pending infrastructure. Full rebuild fallback is allowed only when labeled
+as a fallback in test evidence and dashboard/MCP state.
+
+## Dashboard And MCP Read Model
+
+Default reads must stay compact. The operator should see:
+
+- Batch lanes and branch lanes.
+- Task state, owner, attempt, lease status, and stale-fence warnings.
+- Dependency blockers and queue position.
+- Base/head commits and target head at validation.
+- Graph snapshot/projection state.
+- Scope reconcile state.
+- Merge gate blockers.
+- Rollback epoch, retained branches, and replay order.
+- Available actions: reclaim, rebase, revalidate, queue merge, block merge,
+  abandon, rollback batch, replay batch, and cleanup when allowed.
+
+Detailed payloads should be fetched by ID.
+
+## Chain Compatibility
+
+Chain remains serial inside one Chain run. Parallel branch runtime allows many
+Chain or MF clients to exist at once.
+
+Rules:
+
+- MF/observer-hotfix is the first client.
+- Chain identity fields are optional but reserved from the first schema slice.
+- Chain stages use the same branch allocation, checkpoint, merge queue, and
+  rollback APIs.
+- Chain events and branch runtime events must be replayable after restart.
+- No API should require Chain to be running for MF clients.
+- No API should assume all future clients are MF clients.
+
+## MVP Implementation Order
+
+1. Scenario matrix and doc guards. Done by `ARCH-PARALLEL-AGENT-TEST-SCENARIO-MATRIX`.
+2. This design contract and doc guard.
+3. Branch/ref graph and semantic rollback contract.
+4. Branch/ref-aware graph snapshot refs and semantic projection refs.
+5. Durable `BranchTaskRuntimeContext`.
+6. Durable `MergeQueueRuntime`.
+7. Durable `BatchMergeRuntime`.
+8. Branch/ref/batch-aware `pending_scope_reconcile`.
+9. MF adapter MVP for one isolated branch through merge queue.
+10. Dashboard/MCP compact read model.
+11. Chain adapter hook tests and later Chain integration.
+
+The smallest runtime slice is one backlog row in one isolated worktree:
+
+```text
+allocate branch/worktree
+-> run implementation
+-> checkpoint
+-> branch-local scope/graph evidence
+-> queue merge
+-> merge gate
+-> merge to target
+-> target scope reconcile
+-> retain then cleanup
+```
+
+Only after this loop is stable should normal executor worker parallelism be
+raised above the current conservative mode.
+
+## Pending Infrastructure
+
+| Flag | Runtime blocker |
+| --- | --- |
+| I1 | Durable branch task runtime store. |
+| I2 | Durable merge queue runtime store. |
+| I3 | Branch/ref-aware graph snapshot refs. |
+| I4 | Semantic projection rollback epochs. |
+| I5 | Branch/ref/batch-aware pending scope keys. |
+| I6 | Invertible Governance Hint deltas. |
+| I7 | Compact dashboard/MCP parallel read model. |
+| I8 | Chain adapter event identity. |
+| I9 | Batch branch/worktree retention and cleanup policy. |
+
+## Acceptance Bar
+
+A runtime PR is not complete unless it answers:
+
+- Which PB scenarios changed?
+- Which identity fields are persisted?
+- Which stale callback or restart path was tested?
+- Which graph/semantic/pending-scope ownership rule changed?
+- Which dashboard/MCP compact field exposes the new state?
+- Which cleanup or rollback path prevents data loss?
