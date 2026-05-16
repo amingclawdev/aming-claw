@@ -67,6 +67,14 @@ STATE_RUNNING = "running"
 STATE_RECLAIMABLE = "reclaimable"
 STATE_DEPENDENCY_BLOCKED = "dependency_blocked"
 STATE_WAITING_DEPENDENCY = "waiting_dependency"
+STATE_VALIDATED = "validated"
+STATE_VALIDATING = "validating"
+STATE_STALE_AFTER_DEPENDENCY_MERGE = "stale_after_dependency_merge"
+STATE_REBASE_REQUIRED = "rebase_required"
+STATE_MERGE_READY = "merge_ready"
+STATE_MERGE_BLOCKED = "merge_blocked"
+STATE_MERGING = "merging"
+STATE_ABANDONED = "abandoned"
 
 ACTION_LEAVE_MERGED = "leave_merged"
 ACTION_OBSERVER_DECISION_REQUIRED = "observer_decision_required"
@@ -74,8 +82,19 @@ ACTION_RECLAIM_FROM_CHECKPOINT = "reclaim_from_checkpoint"
 ACTION_RECLAIM_AFTER_DEPENDENCY = "reclaim_after_dependency"
 ACTION_WAIT_FOR_DEPENDENCY = "wait_for_dependency"
 ACTION_NOOP = "noop"
+ACTION_BLOCKED_BY_DEPENDENCY = "blocked_by_dependency"
+ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE = "revalidate_after_dependency_merge"
+ACTION_ALLOW_MERGE = "allow_merge"
+ACTION_MERGE_IN_PROGRESS = "merge_in_progress"
 
 TERMINAL_NON_BLOCKING_STATES = {"merged", "abandoned", "cleaned"}
+MERGE_DONE_STATES = {STATE_MERGED}
+MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, "rollback_required"}
+MERGE_READY_INPUT_STATES = {
+    STATE_QUEUED_FOR_MERGE,
+    STATE_VALIDATED,
+    STATE_MERGE_READY,
+}
 
 
 class BranchRuntimeFenceError(ValueError):
@@ -187,6 +206,76 @@ class RecoveryPlan:
     retained_branch_refs: tuple[str, ...]
     target_graph_activation_blocked_for: tuple[str, ...]
     target_semantic_activation_blocked_for: tuple[str, ...]
+    dashboard_rows: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class MergeQueueItem:
+    project_id: str
+    merge_queue_id: str
+    queue_item_id: str
+    task_id: str
+    branch_ref: str
+    queue_index: int
+    status: str
+    depends_on: tuple[str, ...] = ()
+    target_ref: str = "refs/heads/main"
+    base_commit: str = ""
+    branch_head: str = ""
+    validated_target_head: str = ""
+    current_target_head: str = ""
+    validation_attempt: int = 0
+    merge_preview_id: str = ""
+    snapshot_id: str = ""
+    projection_id: str = ""
+
+
+@dataclass(frozen=True)
+class MergeQueueDecision:
+    queue_item_id: str
+    task_id: str
+    branch_ref: str
+    observed_status: str
+    queue_state: str
+    action: str
+    dependency_blockers: tuple[str, ...] = ()
+    stale_target_head: bool = False
+    next_actions: tuple[str, ...] = ()
+    merge_allowed: bool = False
+    target_branch_mutation_allowed: bool = False
+    target_graph_activation_allowed: bool = False
+    target_semantic_activation_allowed: bool = False
+    validation_attempt: int = 0
+    merge_preview_id: str = ""
+
+    def to_dashboard_row(self) -> dict[str, Any]:
+        return {
+            "queue_item_id": self.queue_item_id,
+            "task_id": self.task_id,
+            "branch_ref": self.branch_ref,
+            "observed_status": self.observed_status,
+            "queue_state": self.queue_state,
+            "action": self.action,
+            "dependency_blockers": list(self.dependency_blockers),
+            "stale_target_head": self.stale_target_head,
+            "next_actions": list(self.next_actions),
+            "merge_allowed": self.merge_allowed,
+            "target_branch_mutation_allowed": self.target_branch_mutation_allowed,
+            "target_graph_activation_allowed": self.target_graph_activation_allowed,
+            "target_semantic_activation_allowed": self.target_semantic_activation_allowed,
+            "validation_attempt": self.validation_attempt,
+            "merge_preview_id": self.merge_preview_id,
+        }
+
+
+@dataclass(frozen=True)
+class MergeQueuePlan:
+    scenario_id: str
+    decisions: tuple[MergeQueueDecision, ...]
+    mergeable_task_ids: tuple[str, ...]
+    blocked_task_ids: tuple[str, ...]
+    stale_task_ids: tuple[str, ...]
+    target_mutation_blocked_for: tuple[str, ...]
     dashboard_rows: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
 
@@ -492,6 +581,177 @@ def runtime_tasks_from_contexts(
     now_iso: str = "",
 ) -> list[BranchRuntimeTask]:
     return [context.to_runtime_task(now_iso=now_iso) for context in contexts]
+
+
+def _merge_items_by_task(items: list[MergeQueueItem]) -> dict[str, MergeQueueItem]:
+    return {item.task_id: item for item in items}
+
+
+def _merge_dependency_blockers(
+    item: MergeQueueItem,
+    *,
+    items_by_task: dict[str, MergeQueueItem],
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    for dep in item.depends_on:
+        dep_item = items_by_task.get(dep)
+        if dep_item is None or dep_item.status not in MERGE_DONE_STATES:
+            blockers.append(dep)
+    return tuple(blockers)
+
+
+def _has_terminal_dependency_blocker(
+    blockers: tuple[str, ...],
+    *,
+    items_by_task: dict[str, MergeQueueItem],
+) -> bool:
+    for dep in blockers:
+        dep_item = items_by_task.get(dep)
+        if dep_item is None or dep_item.status in MERGE_BLOCKING_STATES:
+            return True
+    return False
+
+
+def _target_head_moved_after_validation(item: MergeQueueItem) -> bool:
+    return bool(
+        item.validated_target_head
+        and item.current_target_head
+        and item.validated_target_head != item.current_target_head
+    )
+
+
+def _merge_queue_actions_for(action: str) -> tuple[str, ...]:
+    if action == ACTION_WAIT_FOR_DEPENDENCY:
+        return ("wait_for_dependency", "do_not_merge")
+    if action == ACTION_BLOCKED_BY_DEPENDENCY:
+        return ("resolve_dependency", "do_not_merge")
+    if action == ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE:
+        return (
+            "rebase_or_sync",
+            "run_scope_reconcile",
+            "verify_semantic_projection",
+            "refresh_merge_preview",
+        )
+    if action == ACTION_ALLOW_MERGE:
+        return ("merge",)
+    if action == ACTION_OBSERVER_DECISION_REQUIRED:
+        return ("fix_or_rebase", "abandon", "rollback_batch")
+    return ()
+
+
+def decide_merge_queue(
+    items: list[MergeQueueItem],
+    *,
+    scenario_id: str = "PB-002",
+) -> MergeQueuePlan:
+    """Compute ordered merge queue decisions without mutating refs or state."""
+    ordered_items = sorted(items, key=lambda item: (item.queue_index, item.queue_item_id))
+    items_by_task = _merge_items_by_task(ordered_items)
+    decisions: list[MergeQueueDecision] = []
+
+    for item in ordered_items:
+        blockers = _merge_dependency_blockers(item, items_by_task=items_by_task)
+        terminal_blocker = _has_terminal_dependency_blocker(
+            blockers,
+            items_by_task=items_by_task,
+        )
+        stale_target_head = False
+
+        if item.status == STATE_MERGED:
+            queue_state = STATE_MERGED
+            action = ACTION_LEAVE_MERGED
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = True
+            semantic_allowed = True
+        elif item.status == STATE_MERGE_FAILED:
+            queue_state = STATE_MERGE_BLOCKED
+            action = ACTION_OBSERVER_DECISION_REQUIRED
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
+        elif blockers:
+            queue_state = STATE_DEPENDENCY_BLOCKED if terminal_blocker else STATE_WAITING_DEPENDENCY
+            action = ACTION_BLOCKED_BY_DEPENDENCY if terminal_blocker else ACTION_WAIT_FOR_DEPENDENCY
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
+        elif item.status in MERGE_READY_INPUT_STATES and _target_head_moved_after_validation(item):
+            queue_state = STATE_STALE_AFTER_DEPENDENCY_MERGE
+            action = ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE
+            stale_target_head = True
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
+        elif item.status in MERGE_READY_INPUT_STATES:
+            queue_state = STATE_MERGE_READY
+            action = ACTION_ALLOW_MERGE
+            merge_allowed = True
+            target_mutation_allowed = True
+            graph_allowed = False
+            semantic_allowed = False
+        elif item.status == STATE_MERGING:
+            queue_state = STATE_MERGING
+            action = ACTION_MERGE_IN_PROGRESS
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
+        else:
+            queue_state = item.status or STATE_WAITING_DEPENDENCY
+            action = ACTION_NOOP
+            merge_allowed = False
+            target_mutation_allowed = False
+            graph_allowed = False
+            semantic_allowed = False
+
+        decisions.append(
+            MergeQueueDecision(
+                queue_item_id=item.queue_item_id,
+                task_id=item.task_id,
+                branch_ref=item.branch_ref,
+                observed_status=item.status,
+                queue_state=queue_state,
+                action=action,
+                dependency_blockers=blockers,
+                stale_target_head=stale_target_head,
+                next_actions=_merge_queue_actions_for(action),
+                merge_allowed=merge_allowed,
+                target_branch_mutation_allowed=target_mutation_allowed,
+                target_graph_activation_allowed=graph_allowed,
+                target_semantic_activation_allowed=semantic_allowed,
+                validation_attempt=item.validation_attempt,
+                merge_preview_id=item.merge_preview_id,
+            )
+        )
+
+    mergeable = tuple(decision.task_id for decision in decisions if decision.merge_allowed)
+    blocked = tuple(
+        decision.task_id
+        for decision in decisions
+        if decision.queue_state in {STATE_WAITING_DEPENDENCY, STATE_DEPENDENCY_BLOCKED, STATE_MERGE_BLOCKED}
+    )
+    stale = tuple(
+        decision.task_id
+        for decision in decisions
+        if decision.queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE
+    )
+    target_mutation_blocked = tuple(
+        decision.task_id for decision in decisions if not decision.target_branch_mutation_allowed
+    )
+
+    return MergeQueuePlan(
+        scenario_id=scenario_id,
+        decisions=tuple(decisions),
+        mergeable_task_ids=mergeable,
+        blocked_task_ids=blocked,
+        stale_task_ids=stale,
+        target_mutation_blocked_for=target_mutation_blocked,
+        dashboard_rows=tuple(decision.to_dashboard_row() for decision in decisions),
+    )
 
 
 def _merged_dependency_ids(tasks_by_id: dict[str, BranchRuntimeTask]) -> set[str]:
