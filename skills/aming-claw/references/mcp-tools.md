@@ -64,7 +64,10 @@ as the default operator path.
 
 ## Backlog
 
-- `backlog_list`: find open rows by status/priority.
+- `backlog_list`: find rows by status/priority/search. Defaults to compact
+  `OPEN` rows with `limit=50` to avoid oversized MCP context. Use `offset` for
+  pagination, `include_closed=true` for all statuses, `view=full` only for a
+  deliberately small page, and `backlog_get` for full detail of one row.
 - `backlog_get`: inspect the selected row.
 - `backlog_upsert`: create/update a row before code or doc mutations.
 - `backlog_close`: close with commit evidence.
@@ -83,6 +86,10 @@ the client did not hot-load MCP yet, reload/open a new session or use
 governance HTTP routes directly:
 
 - `GET  /api/backlog/{project_id}` — list (returns `{bugs: [...], count}`).
+  Legacy no-query calls return all full rows. Optimized query params:
+  `view=compact|full`, `limit` (max 200), `offset`, `q`, `status`,
+  `priority`, `include_closed=false`. Optimized responses include
+  `total_count`, `filtered_count`, `has_more`, `next_offset`, and `summary`.
 - `GET  /api/backlog/{project_id}/{bug_id}` — fetch one row.
 - `POST /api/backlog/{project_id}/{bug_id}` — upsert. Body fields: `title`,
   `status` (`OPEN`/`FIXED`/`CLOSED`/...), `priority` (`P0..P3`),

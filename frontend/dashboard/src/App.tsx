@@ -143,7 +143,16 @@ function shouldFallbackToProjects(error: unknown): boolean {
   return error.status === 400 || error.status === 404;
 }
 
-const CLOSED_BACKLOG_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
+const CLOSED_BACKLOG_STATUSES = new Set([
+  "FIXED",
+  "CLOSED",
+  "DONE",
+  "RESOLVED",
+  "CANCELLED",
+  "MERGED",
+  "SUPERSEDED",
+  "VOID",
+]);
 
 function emptyOperationsQueue(projectId: string, snapshotId: string): OperationsQueueResponse {
   return {
@@ -1151,6 +1160,7 @@ export default function App() {
 }
 
 function countOpenBacklog(backlog?: BacklogResponse): number {
+  if (typeof backlog?.summary?.open === "number") return backlog.summary.open;
   return (
     backlog?.bugs?.filter((bug) => {
       const status = String(bug.status || "OPEN").toUpperCase();

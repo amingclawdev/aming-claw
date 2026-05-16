@@ -12807,41 +12807,234 @@ def handle_baseline_gc(ctx: RequestContext):
 # Backlog Endpoints (OPT-DB-BACKLOG)
 # ---------------------------------------------------------------------------
 
+_BACKLOG_CLOSED_STATUSES = {
+    "FIXED",
+    "CLOSED",
+    "DONE",
+    "RESOLVED",
+    "CANCELLED",
+    "MERGED",
+    "SUPERSEDED",
+    "VOID",
+}
+_BACKLOG_DEFAULT_LIST_LIMIT = 100
+_BACKLOG_HARD_LIST_LIMIT = 200
+_BACKLOG_COMPACT_PREVIEW_CHARS = 280
+
+
+def _first_query_value(query: dict, key: str, default: str = "") -> str:
+    value = query.get(key, default)
+    if isinstance(value, list):
+        value = value[0] if value else default
+    return str(value or "")
+
+
+def _query_has_key(query: dict, key: str) -> bool:
+    return key in query and query.get(key) is not None
+
+
+def _json_list_field(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+            if parsed in (None, ""):
+                return []
+            return [parsed]
+        except (json.JSONDecodeError, TypeError):
+            return [value] if value.strip() else []
+    return [value]
+
+
+def _string_list_field(value: Any, *, limit: int | None = None) -> list[str]:
+    values = [str(item) for item in _json_list_field(value) if str(item).strip()]
+    return values[:limit] if limit is not None else values
+
+
+def _compact_preview(value: Any, limit: int = _BACKLOG_COMPACT_PREVIEW_CHARS) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _backlog_full_bug(row: sqlite3.Row | dict) -> dict:
+    bug = dict(row)
+    for key in ("required_docs", "provenance_paths"):
+        try:
+            bug[key] = json.loads(bug.get(key, "[]"))
+        except (json.JSONDecodeError, TypeError):
+            bug[key] = []
+    bug["bypass_policy"] = backlog_runtime.parse_json_object(bug.get("bypass_policy_json", "{}"))
+    bug["takeover"] = backlog_runtime.parse_json_object(bug.get("takeover_json", "{}"))
+    return bug
+
+
+def _backlog_compact_bug(row: sqlite3.Row | dict) -> dict:
+    raw = dict(row)
+    target_files = _string_list_field(raw.get("target_files"), limit=3)
+    test_files = _string_list_field(raw.get("test_files"), limit=3)
+    acceptance = _string_list_field(raw.get("acceptance_criteria"), limit=2)
+    required_docs = _string_list_field(raw.get("required_docs"), limit=3)
+    provenance_paths = _string_list_field(raw.get("provenance_paths"), limit=3)
+    return {
+        "bug_id": raw.get("bug_id", ""),
+        "title": raw.get("title", ""),
+        "status": raw.get("status", ""),
+        "priority": raw.get("priority", ""),
+        "target_files": target_files,
+        "test_files": test_files,
+        "acceptance_criteria": acceptance,
+        "details_md": _compact_preview(raw.get("details_md", "")),
+        "details_preview": _compact_preview(raw.get("details_md", "")),
+        "commit": raw.get("commit", ""),
+        "created_at": raw.get("created_at", ""),
+        "updated_at": raw.get("updated_at", ""),
+        "fixed_at": raw.get("fixed_at", ""),
+        "chain_task_id": raw.get("chain_task_id", ""),
+        "chain_stage": raw.get("chain_stage", ""),
+        "runtime_state": raw.get("runtime_state", ""),
+        "current_task_id": raw.get("current_task_id", ""),
+        "root_task_id": raw.get("root_task_id", ""),
+        "worktree_path": raw.get("worktree_path", ""),
+        "worktree_branch": raw.get("worktree_branch", ""),
+        "mf_type": raw.get("mf_type", ""),
+        "target_file_count": len(_json_list_field(raw.get("target_files"))),
+        "test_file_count": len(_json_list_field(raw.get("test_files"))),
+        "acceptance_count": len(_json_list_field(raw.get("acceptance_criteria"))),
+        "required_doc_count": len(_json_list_field(raw.get("required_docs"))),
+        "provenance_count": len(_json_list_field(raw.get("provenance_paths"))),
+        "required_docs": required_docs,
+        "provenance_paths": provenance_paths,
+        "compact": True,
+    }
+
+
+def _backlog_summary(conn) -> dict:
+    by_status = {
+        str(row["status"] or "OPEN"): int(row["count"] or 0)
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM backlog_bugs GROUP BY status"
+        ).fetchall()
+    }
+    by_priority = {
+        str(row["priority"] or "P3"): int(row["count"] or 0)
+        for row in conn.execute(
+            "SELECT priority, COUNT(*) AS count FROM backlog_bugs GROUP BY priority"
+        ).fetchall()
+    }
+    open_count = sum(
+        count for status, count in by_status.items()
+        if status.upper() not in _BACKLOG_CLOSED_STATUSES
+    )
+    urgent_open_count = int(conn.execute(
+        "SELECT COUNT(*) AS count FROM backlog_bugs "
+        "WHERE UPPER(status) NOT IN (%s) AND priority IN ('P0', 'P1')"
+        % ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES),
+        [status for status in _BACKLOG_CLOSED_STATUSES],
+    ).fetchone()["count"] or 0)
+    return {
+        "total": sum(by_status.values()),
+        "open": open_count,
+        "fixed": by_status.get("FIXED", 0),
+        "urgent_open": urgent_open_count,
+        "by_status": by_status,
+        "by_priority": by_priority,
+    }
+
+
+def _append_backlog_filters(sql: str, params: list[Any], ctx: RequestContext) -> tuple[str, list[Any]]:
+    status_filter = _first_query_value(ctx.query, "status")
+    priority_filter = _first_query_value(ctx.query, "priority")
+    search = _first_query_value(ctx.query, "q").strip()
+    if status_filter:
+        sql += " AND status = ?"
+        params.append(status_filter)
+    if priority_filter:
+        sql += " AND priority = ?"
+        params.append(priority_filter)
+    if _query_has_key(ctx.query, "include_closed") and not _query_bool(ctx.query, "include_closed", True):
+        placeholders = ",".join("?" for _ in _BACKLOG_CLOSED_STATUSES)
+        sql += f" AND UPPER(status) NOT IN ({placeholders})"
+        params.extend(_BACKLOG_CLOSED_STATUSES)
+    if search:
+        needle = f"%{search.lower()}%"
+        columns = (
+            "bug_id",
+            "title",
+            "status",
+            "priority",
+            "details_md",
+            "target_files",
+            "test_files",
+            "acceptance_criteria",
+            "required_docs",
+            "provenance_paths",
+        )
+        sql += " AND (" + " OR ".join(f"LOWER({col}) LIKE ?" for col in columns) + ")"
+        params.extend([needle] * len(columns))
+    return sql, params
+
+
 @route("GET", "/api/backlog/{project_id}")
 def handle_backlog_list(ctx: RequestContext):
-    """List backlog bugs, optionally filtered by ?status= and ?priority=."""
+    """List backlog bugs.
+
+    Legacy no-query calls still return all full rows. Supplying view, limit,
+    offset, q, or include_closed enables the optimized list path with compact
+    rows and pagination metadata.
+    """
     pid = ctx.path_params["project_id"]
-    status_filter = ctx.query.get("status", "")
-    priority_filter = ctx.query.get("priority", "")
+    query = ctx.query or {}
+    optimized = any(
+        _query_has_key(query, key)
+        for key in ("view", "limit", "offset", "q", "include_closed")
+    )
+    view = _first_query_value(query, "view", "full").strip().lower() or "full"
+    if view not in {"full", "compact"}:
+        raise GovernanceError("invalid_backlog_view", "view must be 'full' or 'compact'", 400)
+    raw_limit = _query_int(query, "limit", _BACKLOG_DEFAULT_LIST_LIMIT)
+    limit = max(1, min(raw_limit, _BACKLOG_HARD_LIST_LIMIT)) if optimized else None
+    offset = max(0, _query_int(query, "offset", 0)) if optimized else 0
     conn = get_connection(pid)
     try:
         sql = "SELECT * FROM backlog_bugs WHERE 1=1"
-        params = []
-        if status_filter:
-            sql += " AND status = ?"
-            params.append(status_filter)
-        if priority_filter:
-            sql += " AND priority = ?"
-            params.append(priority_filter)
+        params: list[Any] = []
+        sql, params = _append_backlog_filters(sql, params, ctx)
+        count_sql = sql.replace("SELECT *", "SELECT COUNT(*) AS count", 1)
+        filtered_count = int(conn.execute(count_sql, params).fetchone()["count"] or 0)
         sql += " ORDER BY created_at DESC"
-        rows = conn.execute(sql, params).fetchall()
-        bugs = []
-        for r in rows:
-            bug = dict(r)
-            # Parse required_docs from JSON string to list
-            try:
-                bug["required_docs"] = json.loads(bug.get("required_docs", "[]"))
-            except (json.JSONDecodeError, TypeError):
-                bug["required_docs"] = []
-            # Parse provenance_paths from JSON string to list
-            try:
-                bug["provenance_paths"] = json.loads(bug.get("provenance_paths", "[]"))
-            except (json.JSONDecodeError, TypeError):
-                bug["provenance_paths"] = []
-            bug["bypass_policy"] = backlog_runtime.parse_json_object(bug.get("bypass_policy_json", "{}"))
-            bug["takeover"] = backlog_runtime.parse_json_object(bug.get("takeover_json", "{}"))
-            bugs.append(bug)
-        return {"bugs": bugs, "count": len(bugs)}
+        page_params = list(params)
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            page_params.extend([limit, offset])
+        rows = conn.execute(sql, page_params).fetchall()
+        bugs = [
+            _backlog_compact_bug(r) if view == "compact" else _backlog_full_bug(r)
+            for r in rows
+        ]
+        total_count = int(conn.execute("SELECT COUNT(*) AS count FROM backlog_bugs").fetchone()["count"] or 0)
+        next_offset = offset + len(bugs)
+        has_more = limit is not None and next_offset < filtered_count
+        result = {
+            "bugs": bugs,
+            "count": len(bugs),
+            "total_count": total_count,
+            "filtered_count": filtered_count,
+            "view": view,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+            "next_offset": next_offset if has_more else None,
+            "truncated": has_more,
+            "summary": _backlog_summary(conn),
+        }
+        return result
     finally:
         conn.close()
 

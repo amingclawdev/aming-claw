@@ -40,14 +40,22 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
   const [attachResults, setAttachResults] = useState<Record<string, AttachResult>>({});
 
   const stats = useMemo(() => {
+    if (backlog.summary) {
+      return {
+        total: backlog.summary.total,
+        open: backlog.summary.open,
+        fixed: backlog.summary.fixed,
+        urgent: backlog.summary.urgent_open,
+      };
+    }
     const open = bugs.filter(isOpenBug);
     return {
-      total: bugs.length,
+      total: backlog.total_count ?? bugs.length,
       open: open.length,
       fixed: bugs.filter((b) => normalizeStatus(b.status) === "FIXED").length,
       urgent: open.filter((b) => ["P0", "P1"].includes(normalizePriority(b.priority))).length,
     };
-  }, [bugs]);
+  }, [backlog.summary, backlog.total_count, bugs]);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -97,6 +105,9 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
       }),
     [files],
   );
+
+  const filteredCount = backlog.filtered_count ?? stats.total;
+  const pageNote = backlog.has_more ? ` · next offset ${backlog.next_offset ?? rows.length}` : "";
 
   useEffect(() => {
     if (!snapshotId) return;
@@ -173,7 +184,7 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
         <h2 className="view-title">Backlog</h2>
         <span className="view-subtitle">
           source <span className="mono">/api/backlog/{projectId}</span> ·{" "}
-          {rows.length} shown · {stats.total} total
+          {rows.length} shown · {filteredCount} filtered · {stats.total} total{pageNote}
         </span>
       </div>
 

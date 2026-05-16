@@ -321,6 +321,93 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         for bug in result["bugs"]:
             self.assertEqual(bug["status"], "OPEN")
 
+    def test_list_compact_paginates_and_summarizes(self):
+        from governance.server import handle_backlog_upsert, handle_backlog_list
+
+        for bug_id in ["BP1", "BP2", "BP3"]:
+            ctx = self._make_ctx(
+                {"project_id": "test-project", "bug_id": bug_id},
+                body={
+                    "title": "Paged bug %s" % bug_id,
+                    "status": "OPEN",
+                    "priority": "P1",
+                    "details_md": "long details " * 80,
+                    "target_files": ["a.py", "b.py", "c.py", "d.py"],
+                    "test_files": ["test_a.py", "test_b.py"],
+                    "acceptance_criteria": ["one", "two", "three"],
+                    "force_admit": True,
+                },
+            )
+            handle_backlog_upsert(ctx)
+
+        ctx2 = self._make_ctx(
+            {"project_id": "test-project"},
+            query={"view": "compact", "limit": "2", "offset": "0", "status": "OPEN"},
+        )
+        result = handle_backlog_list(ctx2)
+
+        self.assertEqual(result["view"], "compact")
+        self.assertEqual(result["limit"], 2)
+        self.assertEqual(result["offset"], 0)
+        self.assertEqual(result["count"], 2)
+        self.assertGreaterEqual(result["filtered_count"], 3)
+        self.assertTrue(result["has_more"])
+        self.assertIsNotNone(result["next_offset"])
+        self.assertGreaterEqual(result["summary"]["open"], 3)
+        bug = result["bugs"][0]
+        self.assertTrue(bug["compact"])
+        self.assertLessEqual(len(bug["details_md"]), 283)
+        self.assertEqual(bug["target_file_count"], 4)
+        self.assertEqual(bug["acceptance_count"], 3)
+        self.assertEqual(bug["target_files"], ["a.py", "b.py", "c.py"])
+
+    def test_list_search_and_exclude_closed(self):
+        from governance.server import handle_backlog_upsert, handle_backlog_list
+
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": "BS1"},
+                body={
+                    "title": "Needle open row",
+                    "status": "OPEN",
+                    "details_md": "alpha needle-token beta " * 20,
+                    "target_files": ["needle.py"],
+                    "force_admit": True,
+                },
+            )
+        )
+        handle_backlog_upsert(
+            self._make_ctx(
+                {"project_id": "test-project", "bug_id": "BS2"},
+                body={
+                    "title": "Needle fixed row",
+                    "status": "FIXED",
+                    "details_md": "needle-token",
+                    "force_admit": True,
+                },
+            )
+        )
+
+        search_ctx = self._make_ctx(
+            {"project_id": "test-project"},
+            query={"view": "compact", "limit": "10", "q": "needle-token"},
+        )
+        search_result = handle_backlog_list(search_ctx)
+        self.assertGreaterEqual(search_result["filtered_count"], 2)
+        self.assertIn("BS1", {bug["bug_id"] for bug in search_result["bugs"]})
+
+        open_ctx = self._make_ctx(
+            {"project_id": "test-project"},
+            query={
+                "view": "compact",
+                "limit": "10",
+                "q": "Needle fixed row",
+                "include_closed": "false",
+            },
+        )
+        open_result = handle_backlog_list(open_ctx)
+        self.assertEqual(open_result["filtered_count"], 0)
+
 
 class TestETLParsing(unittest.TestCase):
     """AC6: ETL dry-run vs apply parity."""
@@ -394,7 +481,10 @@ class TestMCPToolDefinitions(unittest.TestCase):
             mock_http.assert_called_once()
             call_args = mock_http.call_args
             self.assertEqual(call_args[0][0], "GET")
-            self.assertIn("/api/backlog/test", call_args[0][1])
+            self.assertEqual(
+                call_args[0][1],
+                "/api/backlog/test?view=compact&limit=50&offset=0&status=OPEN",
+            )
 
     def test_dispatch_backlog_get(self):
         from governance.mcp_server import _dispatch_tool

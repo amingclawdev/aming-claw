@@ -36,6 +36,15 @@ function pidFor(projectId: string): string {
   return encodeURIComponent(projectId.trim() || DEFAULT_PROJECT_ID);
 }
 
+function backlogListQuery(): string {
+  return new URLSearchParams({
+    view: "compact",
+    limit: "200",
+    offset: "0",
+    include_closed: "true",
+  }).toString();
+}
+
 function base(): string {
   return DIRECT ? BACKEND : "";
 }
@@ -204,10 +213,10 @@ export const api = {
     );
   },
   backlog(signal?: AbortSignal) {
-    return getJSON<BacklogResponse>(`/api/backlog/${pid()}`, signal);
+    return getJSON<BacklogResponse>(`/api/backlog/${pid()}?${backlogListQuery()}`, signal);
   },
   backlogFor(projectId: string, signal?: AbortSignal) {
-    return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}`, signal);
+    return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}?${backlogListQuery()}`, signal);
   },
   snapshotFiles(
     snapshotId: string,

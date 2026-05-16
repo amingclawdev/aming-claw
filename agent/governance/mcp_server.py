@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -41,6 +42,33 @@ if _agent_dir not in sys.path:
     sys.path.insert(0, _agent_dir)
 
 log = logging.getLogger(__name__)
+
+
+def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(args.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _backlog_list_query(args: dict) -> dict:
+    query: dict[str, Any] = {
+        "view": str(args.get("view") or "compact"),
+        "limit": _int_arg(args, "limit", 50, minimum=1, maximum=100),
+        "offset": _int_arg(args, "offset", 0, minimum=0, maximum=1_000_000),
+    }
+    if args.get("priority"):
+        query["priority"] = args["priority"]
+    if args.get("q"):
+        query["q"] = args["q"]
+    if args.get("status"):
+        query["status"] = args["status"]
+    elif "include_closed" in args:
+        query["include_closed"] = "true" if args.get("include_closed") else "false"
+    else:
+        query["status"] = "OPEN"
+    return query
 
 # ---------------------------------------------------------------------------
 # MCP protocol constants
@@ -116,13 +144,18 @@ TOOLS: list[dict] = [
     # --- Backlog tools (OPT-DB-BACKLOG) ---
     {
         "name": "backlog_list",
-        "description": "List backlog bugs for a project, optionally filtered by status and priority.",
+        "description": "List backlog bugs for a project. Defaults to compact OPEN rows to avoid oversized MCP context; use backlog_get for full detail.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string", "description": "Project identifier."},
                 "status": {"type": "string", "description": "Filter by status (e.g. OPEN, FIXED)."},
                 "priority": {"type": "string", "description": "Filter by priority (e.g. P1, P2, P3)."},
+                "limit": {"type": "integer", "description": "Maximum rows to return, default 50, max 100."},
+                "offset": {"type": "integer", "description": "Pagination offset."},
+                "q": {"type": "string", "description": "Case-insensitive search across id, title, details, and file fields."},
+                "view": {"type": "string", "enum": ["compact", "full"], "description": "Row shape; compact is the default."},
+                "include_closed": {"type": "boolean", "description": "When true and no status is supplied, include closed statuses."},
             },
             "required": ["project_id"],
         },
@@ -242,14 +275,8 @@ def _dispatch_tool(name: str, args: dict) -> Any:
     # --- Backlog tools (OPT-DB-BACKLOG) ---
     if name == "backlog_list":
         pid = args["project_id"]
-        qs = ""
-        parts = []
-        if args.get("status"):
-            parts.append(f"status={args['status']}")
-        if args.get("priority"):
-            parts.append(f"priority={args['priority']}")
-        if parts:
-            qs = "?" + "&".join(parts)
+        query = _backlog_list_query(args)
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
         return _http("GET", f"/api/backlog/{pid}{qs}")
 
     if name == "backlog_get":

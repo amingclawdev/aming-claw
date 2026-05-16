@@ -385,7 +385,25 @@ export interface FeedbackQueueSummary {
 export interface BacklogResponse {
   bugs: BacklogBug[];
   count: number;
+  total_count?: number;
+  filtered_count?: number;
+  view?: "compact" | "full" | string;
+  limit?: number | null;
+  offset?: number;
+  has_more?: boolean;
+  next_offset?: number | null;
+  truncated?: boolean;
+  summary?: BacklogSummary;
   request_id?: string;
+}
+
+export interface BacklogSummary {
+  total: number;
+  open: number;
+  fixed: number;
+  urgent_open: number;
+  by_status: Record<string, number>;
+  by_priority: Record<string, number>;
 }
 
 export interface BacklogBug {
@@ -397,6 +415,7 @@ export interface BacklogBug {
   test_files?: string[] | string;
   acceptance_criteria?: string[] | string;
   details_md?: string;
+  details_preview?: string;
   commit?: string;
   created_at?: string;
   updated_at?: string;
@@ -410,6 +429,12 @@ export interface BacklogBug {
   worktree_branch?: string;
   worktree_path?: string;
   mf_type?: string;
+  target_file_count?: number;
+  test_file_count?: number;
+  acceptance_count?: number;
+  required_doc_count?: number;
+  provenance_count?: number;
+  compact?: boolean;
 }
 
 export interface FileInventoryRow {

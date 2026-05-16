@@ -521,6 +521,13 @@ machine are not overwritten. Use `--dry-run` to preview the insert/update/skip
 counts, or `--on-conflict overwrite` when the export should replace target
 rows.
 
+Backlog list queries are compact by default through MCP (`backlog_list` returns
+`OPEN` rows with `limit=50`). For large imported backlogs, page through results
+with `limit`/`offset`, search with `q`, and use `backlog_get` when a single row
+needs full details. The HTTP list endpoint keeps its legacy full response for
+no-query calls, but supports `view=compact`, `limit`, `offset`,
+`include_closed`, `status`, and `priority`.
+
 Project bootstrap is explicit. Do not silently register a workspace just
 because `/api/projects` is empty. Bootstrap writes Aming Claw registry/DB state,
 scans the workspace, and builds a commit-bound graph snapshot through

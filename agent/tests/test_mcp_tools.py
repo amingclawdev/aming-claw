@@ -159,6 +159,46 @@ def test_mcp_backlog_tools_route_to_governance_api():
     )
 
 
+def test_mcp_backlog_list_defaults_to_compact_open_page():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch("backlog_list", {"project_id": "aming-claw"})
+
+    assert recorder.calls == [
+        (
+            "GET",
+            "/api/backlog/aming-claw?view=compact&limit=50&offset=0&status=OPEN",
+            None,
+        )
+    ]
+
+
+def test_mcp_backlog_list_supports_search_and_closed_page():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch(
+        "backlog_list",
+        {
+            "project_id": "aming-claw",
+            "q": "portable import",
+            "limit": 500,
+            "offset": 3,
+            "include_closed": True,
+            "view": "full",
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "GET",
+            "/api/backlog/aming-claw?view=full&limit=100&offset=3&q=portable+import&include_closed=true",
+            None,
+        )
+    ]
+
+
 def test_mcp_graph_tools_route_to_governance_api():
     recorder = _Recorder()
     dispatcher = _dispatcher(recorder)

@@ -18,6 +18,34 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+
+def _int_arg(args: dict, key: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(args.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _backlog_list_query(args: dict) -> dict:
+    query: dict[str, Any] = {
+        "view": str(args.get("view") or "compact"),
+        "limit": _int_arg(args, "limit", 50, minimum=1, maximum=100),
+        "offset": _int_arg(args, "offset", 0, minimum=0, maximum=1_000_000),
+    }
+    if args.get("priority"):
+        query["priority"] = args["priority"]
+    if args.get("q"):
+        query["q"] = args["q"]
+    if args.get("status"):
+        query["status"] = args["status"]
+    elif "include_closed" in args:
+        query["include_closed"] = "true" if args.get("include_closed") else "false"
+    else:
+        query["status"] = "OPEN"
+    return query
+
+
 # ---------------------------------------------------------------------------
 # Tool schema definitions (per MCP spec)
 # ---------------------------------------------------------------------------
@@ -167,13 +195,18 @@ TOOLS: list[dict] = [
     # --- Backlog ---
     {
         "name": "backlog_list",
-        "description": "List backlog bugs for a project, optionally filtered by status and priority.",
+        "description": "List backlog bugs for a project. Defaults to compact OPEN rows to avoid oversized MCP context; use backlog_get for full detail.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "status": {"type": "string", "description": "Optional status filter, e.g. OPEN or FIXED"},
                 "priority": {"type": "string", "description": "Optional priority filter, e.g. P1"},
+                "limit": {"type": "integer", "description": "Maximum rows to return, default 50, max 100"},
+                "offset": {"type": "integer", "description": "Pagination offset"},
+                "q": {"type": "string", "description": "Case-insensitive search across id, title, details, and file fields"},
+                "view": {"type": "string", "enum": ["compact", "full"], "description": "Row shape; compact is the default"},
+                "include_closed": {"type": "boolean", "description": "When true and no status is supplied, include closed statuses"},
             },
             "required": ["project_id"],
         },
@@ -620,11 +653,7 @@ class ToolDispatcher:
         # --- Backlog tools ---
         if name == "backlog_list":
             pid = args["project_id"]
-            query = {
-                key: args[key]
-                for key in ("status", "priority")
-                if args.get(key)
-            }
+            query = _backlog_list_query(args)
             qs = f"?{urllib.parse.urlencode(query)}" if query else ""
             return self._api("GET", f"/api/backlog/{pid}{qs}")
 
