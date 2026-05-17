@@ -132,7 +132,7 @@ Task fixture:
 | PB-005 | DB rollback consistency | Code rollback is requested after graph/semantic/pending rows changed. | Move graph snapshot refs and semantic projection refs to rollback epoch; mark superseded branch projections inactive; requeue or abandon semantic jobs by epoch; scope rows are isolated by branch/ref/batch. | Graph/projection/pending-scope read model implemented; abandoned merge semantic jobs are exposed and cancellable by rollback epoch. | `test_graph_rollback_epoch.py` |
 | PB-006 | Governance Hint rollback | A hint is added, changed, then removed across branch commits. | Incremental reconcile emits add/change/remove deltas; removed hint cannot leave stale graph binding; rollback restores prior binding state. | Implemented as invertible delta oracle; reconcile integration remains pending. | `test_governance_hint_rollback.py` |
 | PB-007 | Chain compatibility | A Chain stage records branch runtime identity while MF remains the active client. | Accept optional `chain_id`, `root_task_id`, `stage_task_id`, `stage_type`, and `retry_round`; runtime semantics do not require Chain execution. | Implemented for runtime identity and no-execution Chain payload adapter; full Chain parallel execution remains future work. | `test_parallel_branch_runtime.py`, `test_chain_parallel_branch_adapter.py` |
-| PB-008 | Old agent resurrection | A stale agent callback tries to complete or merge after lease recovery by another agent. | Reject stale fence token; record ignored callback; do not change task state, queue state, branch head, graph ref, or semantic projection. | Implemented for checkpoint/recovery API; merge callback fencing remains part of live merge execution. | `test_parallel_branch_runtime.py`, `test_graph_governance_api.py` |
+| PB-008 | Old agent resurrection | A stale agent callback tries to complete or merge after lease recovery by another agent. | Reject stale fence token; record ignored callback; do not change task state, queue state, branch head, graph ref, or semantic projection. | Implemented for checkpoint/recovery API and merge-result recording; live merge execution remains gated. | `test_parallel_branch_runtime.py`, `test_graph_governance_api.py` |
 | PB-009 | Cleanup retention | Batch has unresolved merge_failed or rollback_required state. | Block branch/worktree cleanup; cleanup allowed only after batch accepted, abandoned, or explicitly archived with rollback evidence. | Implemented with pure decision oracle and durable SQLite batch replay; live cleanup execution remains gated. | `test_batch_merge_rollback.py` |
 | PB-010 | Dashboard/MCP compact read model | Operator opens dashboard or calls MCP after mixed parallel state. | Return bounded payload: branch lanes, task states, dependency blockers, rollback epoch, graph epoch, and action affordances without full backlog/graph expansion. | Implemented as pure-state read model and read-only governance API over durable stores; dashboard UI wiring remains future work. | `agent/tests/test_parallel_branch_read_model.py`, `agent/tests/test_graph_governance_api.py`, `frontend/dashboard/scripts/e2e-parallel-branches.mjs` |
 | PB-011 | Branch graph artifact isolation | Branch-local graph artifacts are produced before merge. | Store branch artifacts separately; do not mutate active target graph refs until merge queue accepts the branch. | Implemented for graph ref/projection candidate read model. | `test_graph_rollback_epoch.py` |
@@ -178,6 +178,11 @@ The merge-gate planning API slice is covered by
 operator can ask whether one queued branch is mergeable after queue dependency,
 target freshness, rollback state, and required evidence checks, while default
 dry-run mode still prevents target ref mutation.
+
+The merge-result recording API slice is covered by
+`test_parallel_branch_merge_result_route_records_with_fence`. It proves an
+externally performed merge can be recorded into durable queue/context state,
+and that stale fence tokens cannot rewrite the result after recovery.
 
 The batch rollback planning API slice is covered by
 `test_parallel_branch_batch_runtime_route_returns_rollback_plan`. It proves an

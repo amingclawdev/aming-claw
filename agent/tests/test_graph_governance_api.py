@@ -525,6 +525,89 @@ def test_parallel_branch_merge_gate_route_blocks_batch_rollback(conn):
     assert result["plan"]["target_branch_mutation_allowed"] is False
 
 
+def test_parallel_branch_merge_result_route_records_with_fence(conn):
+    queue_id = "mergeq-api-result"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-result",
+            task_id="result-task",
+            branch_ref="refs/heads/codex/result-task",
+            status="merge_ready",
+            fence_token="fence-result-current",
+            target_head_commit="target-before",
+            merge_queue_id=queue_id,
+            merge_preview_id="preview-result",
+        ),
+        now_iso="2026-05-17T08:25:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-result-task",
+                task_id="result-task",
+                branch_ref="refs/heads/codex/result-task",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head="head-result",
+                validated_target_head="target-before",
+                current_target_head="target-before",
+                merge_preview_id="preview-result",
+                snapshot_id="scope-result",
+                projection_id="semproj-result",
+            )
+        ],
+        now_iso="2026-05-17T08:25:00Z",
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_merge_result(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "merge_queue_id": queue_id,
+                    "task_id": "result-task",
+                    "status": "merged",
+                    "merge_commit": "merge-result",
+                    "target_head_after_merge": "target-after",
+                    "fence_token": "fence-stale",
+                },
+            )
+        )
+
+    result = server.handle_graph_governance_parallel_branch_merge_result(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": queue_id,
+                "task_id": "result-task",
+                "status": "merged",
+                "merge_commit": "merge-result",
+                "target_head_before_merge": "target-before",
+                "target_head_after_merge": "target-after",
+                "fence_token": "fence-result-current",
+                "now_iso": "2026-05-17T08:26:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["queue_item"]["status"] == "merged"
+    assert result["queue_item"]["merge_commit"] == "merge-result"
+    assert result["context"]["status"] == "merged"
+    assert result["context"]["target_head_commit"] == "target-after"
+    row = result["decision"]["rows"][0]
+    assert row["queue_state"] == "merged"
+    assert row["target_graph_activation_allowed"] is True
+
+
 def test_parallel_branch_batch_runtime_route_returns_rollback_plan(conn):
     batch_id = "PB-api-batch"
     upsert_branch_context(

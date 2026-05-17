@@ -13,6 +13,8 @@ from agent.governance.parallel_branch_runtime import (
     ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE,
     ACTION_WAIT_FOR_DEPENDENCY,
     BATCH_STATE_ROLLBACK_REQUIRED,
+    BranchRuntimeFenceError,
+    BranchTaskRuntimeContext,
     MERGE_GATE_REQUIRED_EVIDENCE,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_READY,
@@ -25,8 +27,11 @@ from agent.governance.parallel_branch_runtime import (
     decide_merge_queue,
     decide_persisted_merge_gate,
     decide_persisted_merge_queue,
+    get_branch_context,
     list_merge_queue_items,
     merge_gate_plan_to_dict,
+    record_merge_queue_result,
+    upsert_branch_context,
     upsert_merge_queue_items,
 )
 
@@ -614,6 +619,96 @@ def test_persisted_merge_gate_replays_after_restart(tmp_path) -> None:
     )
     assert plan.merge_preview_id == "preview-T1"
     assert plan.snapshot_id == "scope-T1"
+
+
+def test_merge_result_recording_updates_queue_and_context_with_fence() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id="PB-014",
+            task_id="T1",
+            branch_ref="refs/heads/codex/PB014-T1-ready",
+            status=STATE_MERGE_READY,
+            fence_token="fence-merge-current",
+            target_head_commit="target-before",
+            merge_queue_id="mergeq-result",
+            merge_preview_id="preview-result",
+        ),
+        now_iso="2026-05-17T08:20:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-result",
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB014-T1-ready",
+                queue_index=1,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+                branch_head="head-T1",
+                validated_target_head="target-before",
+                current_target_head="target-before",
+                merge_preview_id="preview-result",
+                snapshot_id="scope-T1",
+                projection_id="semproj-T1",
+            ),
+        ],
+        now_iso="2026-05-17T08:20:00Z",
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        record_merge_queue_result(
+            conn,
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-result",
+            task_id="T1",
+            status=STATE_MERGED,
+            merge_commit="merge-T1",
+            target_head_after_merge="target-after",
+            fence_token="fence-stale",
+            now_iso="2026-05-17T08:21:00Z",
+        )
+
+    recorded = record_merge_queue_result(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-result",
+        task_id="T1",
+        status=STATE_MERGED,
+        merge_commit="merge-T1",
+        target_head_before_merge="target-before",
+        target_head_after_merge="target-after",
+        fence_token="fence-merge-current",
+        now_iso="2026-05-17T08:22:00Z",
+    )
+
+    assert recorded["queue_item"]["status"] == STATE_MERGED
+    assert recorded["queue_item"]["merge_commit"] == "merge-T1"
+    assert recorded["queue_item"]["target_head_before_merge"] == "target-before"
+    assert recorded["queue_item"]["target_head_after_merge"] == "target-after"
+    assert recorded["queue_item"]["completed_at"] == "2026-05-17T08:22:00Z"
+    assert recorded["context"]["status"] == STATE_MERGED
+    assert recorded["context"]["target_head_commit"] == "target-after"
+
+    context = get_branch_context(conn, PROJECT_ID, "T1")
+    assert context is not None
+    assert context.status == STATE_MERGED
+    assert context.target_head_commit == "target-after"
+
+    plan = decide_persisted_merge_queue(
+        conn,
+        PROJECT_ID,
+        "mergeq-result",
+        target_ref=TARGET_REF,
+        scenario_id="PB-014",
+    )
+    assert plan.decisions[0].target_graph_activation_allowed is True
+    assert plan.decisions[0].target_semantic_activation_allowed is True
 
 
 def test_pb012_merge_queue_rejects_mixed_project_queue_or_target_scope() -> None:

@@ -202,6 +202,12 @@ slice may use the same plan with explicit operator approval, but dependencies,
 stale target heads, rollback-required batches, and missing or failed evidence
 must block target mutation.
 
+Implemented result slice: the merge-result API records an externally performed
+merge outcome into the durable queue and branch context. It accepts `merged` or
+`merge_failed`, stores merge commit or failure evidence, updates target-head
+evidence, and enforces the branch fence token when the context has one. It does
+not run git merge or activate graph refs by itself.
+
 Queue states:
 
 ```text

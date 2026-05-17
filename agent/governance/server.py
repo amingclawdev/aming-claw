@@ -3347,6 +3347,74 @@ def handle_graph_governance_parallel_branch_merge_gate(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-result")
+def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
+    """Record an externally executed merge result in branch runtime state."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import (
+        decide_persisted_merge_queue,
+        record_merge_queue_result,
+    )
+
+    merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
+    if not merge_queue_id:
+        raise ValidationError("merge_queue_id is required")
+    status = str(ctx.body.get("status") or "").strip()
+    if not status:
+        raise ValidationError("status is required")
+
+    target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.merge-result",
+        )
+        with sqlite_write_lock():
+            recorded = record_merge_queue_result(
+                conn,
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+                task_id=str(ctx.body.get("task_id") or ""),
+                target_ref=target_ref,
+                status=status,
+                merge_commit=str(ctx.body.get("merge_commit") or ""),
+                target_head_before_merge=str(ctx.body.get("target_head_before_merge") or ""),
+                target_head_after_merge=str(ctx.body.get("target_head_after_merge") or ""),
+                failure_reason=str(ctx.body.get("failure_reason") or ""),
+                snapshot_id=str(ctx.body.get("snapshot_id") or ""),
+                projection_id=str(ctx.body.get("projection_id") or ""),
+                fence_token=str(ctx.body.get("fence_token") or ""),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            decision = decide_persisted_merge_queue(
+                conn,
+                project_id,
+                merge_queue_id,
+                target_ref=target_ref,
+                scenario_id=str(ctx.body.get("scenario_id") or "PB-014"),
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            **recorded,
+            "decision": {
+                "scenario_id": decision.scenario_id,
+                "mergeable_task_ids": list(decision.mergeable_task_ids),
+                "blocked_task_ids": list(decision.blocked_task_ids),
+                "stale_task_ids": list(decision.stale_task_ids),
+                "target_mutation_blocked_for": list(decision.target_mutation_blocked_for),
+                "rows": list(decision.dashboard_rows),
+            },
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/batch-runtime")
 def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
     """Persist batch runtime state and return rollback/replay planning."""

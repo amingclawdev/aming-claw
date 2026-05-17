@@ -84,6 +84,11 @@ CREATE TABLE IF NOT EXISTS parallel_branch_merge_queue_items (
     merge_preview_id  TEXT NOT NULL DEFAULT '',
     snapshot_id       TEXT NOT NULL DEFAULT '',
     projection_id     TEXT NOT NULL DEFAULT '',
+    merge_commit      TEXT NOT NULL DEFAULT '',
+    target_head_before_merge TEXT NOT NULL DEFAULT '',
+    target_head_after_merge TEXT NOT NULL DEFAULT '',
+    completed_at      TEXT NOT NULL DEFAULT '',
+    failure_reason    TEXT NOT NULL DEFAULT '',
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     PRIMARY KEY (project_id, merge_queue_id, queue_item_id)
@@ -378,6 +383,11 @@ class MergeQueueItem:
     merge_preview_id: str = ""
     snapshot_id: str = ""
     projection_id: str = ""
+    merge_commit: str = ""
+    target_head_before_merge: str = ""
+    target_head_after_merge: str = ""
+    completed_at: str = ""
+    failure_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -559,6 +569,7 @@ def utc_now() -> str:
 def ensure_branch_runtime_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL)
     _ensure_branch_runtime_context_columns(conn)
+    _ensure_branch_merge_queue_columns(conn)
 
 
 def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
@@ -569,6 +580,40 @@ def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
             "ALTER TABLE parallel_branch_runtime_contexts "
             "ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _ensure_branch_merge_queue_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(parallel_branch_merge_queue_items)").fetchall()
+    columns = {str(row["name"] if hasattr(row, "keys") else row[1]) for row in rows}
+    for column, ddl in (
+        (
+            "merge_commit",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN merge_commit TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "target_head_before_merge",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN target_head_before_merge TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "target_head_after_merge",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN target_head_after_merge TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "completed_at",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "failure_reason",
+            "ALTER TABLE parallel_branch_merge_queue_items "
+            "ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''",
+        ),
+    ):
+        if column not in columns:
+            conn.execute(ddl)
 
 
 def _json_array(values: tuple[str, ...] | list[str]) -> str:
@@ -856,6 +901,11 @@ def _merge_queue_item_from_row(row: sqlite3.Row) -> MergeQueueItem:
         merge_preview_id=row["merge_preview_id"] or "",
         snapshot_id=row["snapshot_id"] or "",
         projection_id=row["projection_id"] or "",
+        merge_commit=row["merge_commit"] or "",
+        target_head_before_merge=row["target_head_before_merge"] or "",
+        target_head_after_merge=row["target_head_after_merge"] or "",
+        completed_at=row["completed_at"] or "",
+        failure_reason=row["failure_reason"] or "",
     )
 
 
@@ -876,9 +926,10 @@ def upsert_merge_queue_item(
             same_node_or_file_conflicts_json, requires_graph_epoch_json,
             target_ref, base_commit, branch_head, validated_target_head,
             current_target_head, validation_attempt, merge_preview_id,
-            snapshot_id, projection_id, created_at, updated_at
+            snapshot_id, projection_id, merge_commit, target_head_before_merge,
+            target_head_after_merge, completed_at, failure_reason, created_at, updated_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, merge_queue_id, queue_item_id) DO UPDATE SET
             task_id = excluded.task_id,
@@ -900,6 +951,11 @@ def upsert_merge_queue_item(
             merge_preview_id = excluded.merge_preview_id,
             snapshot_id = excluded.snapshot_id,
             projection_id = excluded.projection_id,
+            merge_commit = excluded.merge_commit,
+            target_head_before_merge = excluded.target_head_before_merge,
+            target_head_after_merge = excluded.target_head_after_merge,
+            completed_at = excluded.completed_at,
+            failure_reason = excluded.failure_reason,
             updated_at = excluded.updated_at
         """,
         (
@@ -925,6 +981,11 @@ def upsert_merge_queue_item(
             item.merge_preview_id,
             item.snapshot_id,
             item.projection_id,
+            item.merge_commit,
+            item.target_head_before_merge,
+            item.target_head_after_merge,
+            item.completed_at,
+            item.failure_reason,
             now,
             now,
         ),
@@ -1061,6 +1122,95 @@ def decide_persisted_merge_gate(
         dry_run=dry_run,
         scenario_id=scenario_id,
     )
+
+
+def record_merge_queue_result(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str = "",
+    task_id: str = "",
+    status: str = "",
+    target_ref: str = "",
+    merge_commit: str = "",
+    target_head_before_merge: str = "",
+    target_head_after_merge: str = "",
+    failure_reason: str = "",
+    snapshot_id: str = "",
+    projection_id: str = "",
+    fence_token: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Record an externally performed merge attempt without running git."""
+    ensure_branch_runtime_schema(conn)
+    result_status = str(status or "").strip()
+    if result_status not in {STATE_MERGED, STATE_MERGE_FAILED}:
+        raise ValueError("merge result status must be merged or merge_failed")
+    if result_status == STATE_MERGED and not str(merge_commit or "").strip():
+        raise ValueError("merge_commit is required when recording a merged result")
+    if result_status == STATE_MERGE_FAILED and not str(failure_reason or "").strip():
+        raise ValueError("failure_reason is required when recording merge_failed")
+
+    selected = _select_merge_gate_item(
+        list_merge_queue_items(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        ),
+        queue_item_id=queue_item_id,
+        task_id=task_id,
+    )
+    context = get_branch_context(conn, project_id, selected.task_id)
+    if context is not None and (context.fence_token or fence_token):
+        _require_current_fence(context, fence_token)
+
+    now = now_iso or utc_now()
+    before = (
+        target_head_before_merge
+        or selected.target_head_before_merge
+        or selected.current_target_head
+    )
+    after = (
+        target_head_after_merge
+        or selected.target_head_after_merge
+        or selected.current_target_head
+    )
+    updated_item = replace(
+        selected,
+        status=result_status,
+        current_target_head=after or selected.current_target_head,
+        snapshot_id=snapshot_id or selected.snapshot_id,
+        projection_id=projection_id or selected.projection_id,
+        merge_commit=merge_commit if result_status == STATE_MERGED else selected.merge_commit,
+        target_head_before_merge=before,
+        target_head_after_merge=after,
+        completed_at=now,
+        failure_reason=failure_reason if result_status == STATE_MERGE_FAILED else "",
+    )
+    saved_item = upsert_merge_queue_item(conn, updated_item, now_iso=now)
+
+    saved_context: BranchTaskRuntimeContext | None = None
+    if context is not None:
+        saved_context = upsert_branch_context(
+            conn,
+            replace(
+                context,
+                status=result_status,
+                target_head_commit=after or context.target_head_commit,
+                snapshot_id=snapshot_id or context.snapshot_id,
+                projection_id=projection_id or context.projection_id,
+                merge_queue_id=saved_item.merge_queue_id,
+                merge_preview_id=saved_item.merge_preview_id,
+            ),
+            now_iso=now,
+        )
+
+    return {
+        "queue_item": merge_queue_item_to_dict(saved_item),
+        "context": branch_context_to_dict(saved_context) if saved_context is not None else None,
+    }
 
 
 def _batch_merge_item_from_row(row: sqlite3.Row) -> BatchMergeItem:
