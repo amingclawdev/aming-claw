@@ -482,3 +482,107 @@ def test_scope_reconcile_test_fanin_ignores_unrelated_inventory_status_churn(con
         conn,
         "full-test-fanin-head-churn",
     )
+
+
+@pytest.mark.parametrize("operation", ["add", "remove"])
+def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(conn, tmp_path, operation):
+    project = tmp_path / "project"
+    _write_project(project)
+    if operation == "remove":
+        _write(
+            project / "agent" / "tests" / "test_integration.py",
+            "from agent.service import service_entry\n\n"
+            "def test_integration():\n"
+            "    assert service_entry() == 'ok'\n",
+        )
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id=f"full-test-fanin-{operation}-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id=f"full-test-fanin-{operation}-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    if operation == "add":
+        _write(
+            project / "agent" / "tests" / "test_integration.py",
+            "from agent.service import service_entry\n\n"
+            "def test_integration():\n"
+            "    assert service_entry() == 'ok'\n",
+        )
+        _git(project, "add", "agent/tests/test_integration.py")
+        _git(project, "commit", "-m", "add integration test fanin")
+    else:
+        _git(project, "rm", "agent/tests/test_integration.py")
+        _git(project, "commit", "-m", "remove integration test fanin")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope_snapshot_id = f"scope-test-fanin-{operation}-head-consistency"
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id=scope_snapshot_id,
+        snapshot_id=scope_snapshot_id,
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_file_delta"]["graph_delta_mode"] == "test_fanin_file_set"
+    changed_key = "added_files" if operation == "add" else "removed_files"
+    assert scope["scope_file_delta"][changed_key] == ["agent/tests/test_integration.py"]
+    assert scope["scope_graph_delta"]["mode"] == "test_fanin_file_set"
+    assert scope["scope_graph_delta"]["added_nodes"] == []
+    assert scope["scope_graph_delta"]["removed_nodes"] == []
+    assert scope["scope_graph_delta"]["added_edges"] == []
+    assert scope["scope_graph_delta"]["removed_edges"] == []
+
+    full_snapshot_id = f"full-test-fanin-{operation}-head-consistency"
+    full = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id=full_snapshot_id,
+        commit_sha=head_commit,
+        snapshot_id=full_snapshot_id,
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert full["ok"] is True
+
+    assert _normalized_snapshot(conn, scope_snapshot_id) == _normalized_snapshot(
+        conn,
+        full_snapshot_id,
+    )
+
+    service = _nodes_by_module(_read_snapshot_graph(PID, scope_snapshot_id))["agent.service"]
+    service_tests = set(service["test"])
+    service_fanin_paths = {
+        entry["path"]
+        for entry in (service.get("metadata") or {}).get("test_consumer_fanin", [])
+    }
+    if operation == "add":
+        assert "agent/tests/test_integration.py" in service_tests
+        assert "agent/tests/test_integration.py" in service_fanin_paths
+    else:
+        assert "agent/tests/test_integration.py" not in service_tests
+        assert "agent/tests/test_integration.py" not in service_fanin_paths

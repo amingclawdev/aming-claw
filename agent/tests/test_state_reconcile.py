@@ -796,6 +796,182 @@ def test_pending_scope_materializer_incrementally_moves_test_fanin_bindings(conn
     } in by_type["test_binding_added"]
 
 
+def test_pending_scope_materializer_incrementally_adds_test_fanin_file(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-test-fanin-add",
+        commit_sha=base_commit,
+        snapshot_id="full-base-test-fanin-add",
+        created_by="test",
+        activate=True,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.service import service_entry\n\n"
+        "def test_integration():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _git(project, "add", "agent/tests/test_integration.py")
+    _git(project, "commit", "-m", "add integration test")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-fanin-add",
+        snapshot_id="scope-test-fanin-add",
+        semantic_use_ai=True,
+        semantic_ai_call=lambda _stage, payload: {"feature_name": payload["feature"]["node_id"]},
+    )
+
+    assert result["ok"] is True
+    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "test_fanin_file_set"
+    assert result["scope_file_delta"]["added_files"] == ["agent/tests/test_integration.py"]
+    assert result["scope_graph_delta"]["mode"] == "test_fanin_file_set"
+    assert result["semantic_enrichment"]["ai_selected_count"] == 0
+
+    graph = state_reconcile._read_snapshot_graph(PID, "scope-test-fanin-add")
+    nodes_by_module = {
+        (node.get("metadata") or {}).get("module"): node
+        for node in state_reconcile._deps_graph_nodes(graph)
+        if (node.get("metadata") or {}).get("module")
+    }
+    service = nodes_by_module["agent.service"]
+    service_id = state_reconcile._node_id(service)
+    assert "agent/tests/test_integration.py" in service["test"]
+    assert {
+        entry["path"]
+        for entry in (service.get("metadata") or {}).get("test_consumer_fanin", [])
+    } == {"agent/tests/test_integration.py", "agent/tests/test_service.py"}
+    assert service_id in result["scope_graph_delta"]["updated_nodes"]
+    assert service_id in result["scope_graph_delta"]["semantic_stale_node_ids"]
+
+    binding_events = graph_events.list_events(
+        conn,
+        PID,
+        "scope-test-fanin-add",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["test_binding_added", "test_binding_removed"],
+    )
+    by_type = {}
+    for event in binding_events:
+        by_type.setdefault(event["event_type"], []).append(event["payload"])
+    assert {
+        "node_id": service_id,
+        "path": "agent/tests/test_integration.py",
+        "binding": "test",
+    } in by_type["test_binding_added"]
+    assert "test_binding_removed" not in by_type
+
+
+def test_pending_scope_materializer_incrementally_removes_test_fanin_file(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.service import service_entry\n\n"
+        "def test_integration():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-test-fanin-remove",
+        commit_sha=base_commit,
+        snapshot_id="full-base-test-fanin-remove",
+        created_by="test",
+        activate=True,
+    )
+    assert base["ok"] is True
+
+    _git(project, "rm", "agent/tests/test_integration.py")
+    _git(project, "commit", "-m", "remove integration test")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-fanin-remove",
+        snapshot_id="scope-test-fanin-remove",
+        semantic_use_ai=True,
+        semantic_ai_call=lambda _stage, payload: {"feature_name": payload["feature"]["node_id"]},
+    )
+
+    assert result["ok"] is True
+    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "test_fanin_file_set"
+    assert result["scope_file_delta"]["removed_files"] == ["agent/tests/test_integration.py"]
+    assert result["scope_graph_delta"]["mode"] == "test_fanin_file_set"
+    assert result["semantic_enrichment"]["ai_selected_count"] == 0
+
+    graph = state_reconcile._read_snapshot_graph(PID, "scope-test-fanin-remove")
+    nodes_by_module = {
+        (node.get("metadata") or {}).get("module"): node
+        for node in state_reconcile._deps_graph_nodes(graph)
+        if (node.get("metadata") or {}).get("module")
+    }
+    service = nodes_by_module["agent.service"]
+    service_id = state_reconcile._node_id(service)
+    assert "agent/tests/test_integration.py" not in service["test"]
+    assert {
+        entry["path"]
+        for entry in (service.get("metadata") or {}).get("test_consumer_fanin", [])
+    } == {"agent/tests/test_service.py"}
+    assert service_id in result["scope_graph_delta"]["updated_nodes"]
+    assert service_id in result["scope_graph_delta"]["semantic_stale_node_ids"]
+
+    binding_events = graph_events.list_events(
+        conn,
+        PID,
+        "scope-test-fanin-remove",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["test_binding_added", "test_binding_removed"],
+    )
+    by_type = {}
+    for event in binding_events:
+        by_type.setdefault(event["event_type"], []).append(event["payload"])
+    assert {
+        "node_id": service_id,
+        "path": "agent/tests/test_integration.py",
+        "binding": "test",
+    } in by_type["test_binding_removed"]
+    assert "test_binding_added" not in by_type
+
+
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(
     conn,
     tmp_path,

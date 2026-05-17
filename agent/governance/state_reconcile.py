@@ -716,13 +716,21 @@ def _incremental_metadata_scope_eligibility(
     old_rows: list[dict[str, Any]],
     new_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if scope_file_delta.get("added_files"):
-        return {"supported": False, "reason": "added_files_require_full_rebuild"}
-    if scope_file_delta.get("removed_files"):
-        return {"supported": False, "reason": "removed_files_require_full_rebuild"}
     if scope_file_delta.get("status_changed_files"):
         return {"supported": False, "reason": "inventory_status_change_requires_full_rebuild"}
 
+    old_by_path = _rows_by_path(old_rows)
+    new_by_path = _rows_by_path(new_rows)
+    added = {
+        str(path or "").replace("\\", "/").strip("/")
+        for path in scope_file_delta.get("added_files", [])
+        if str(path or "").strip()
+    }
+    removed = {
+        str(path or "").replace("\\", "/").strip("/")
+        for path in scope_file_delta.get("removed_files", [])
+        if str(path or "").strip()
+    }
     hash_changed = {
         str(path or "").replace("\\", "/").strip("/")
         for path in scope_file_delta.get("hash_changed_files", [])
@@ -735,21 +743,49 @@ def _incremental_metadata_scope_eligibility(
     }
     if not impacted:
         return {"supported": False, "reason": "no_impacted_files"}
-    if impacted - hash_changed:
+
+    def _is_non_primary_test(path: str) -> bool:
+        old_row = old_by_path.get(path) or {}
+        new_row = new_by_path.get(path) or {}
+        kind = str(new_row.get("file_kind") or old_row.get("file_kind") or "")
+        role = str(new_row.get("attachment_role") or old_row.get("attachment_role") or "")
+        return kind == "test" and role != "primary"
+
+    added_test_paths = sorted(path for path in added if _is_non_primary_test(path))
+    removed_test_paths = sorted(path for path in removed if _is_non_primary_test(path))
+    unsupported_added = sorted(added - set(added_test_paths))
+    if unsupported_added:
+        return {
+            "supported": False,
+            "reason": "added_files_require_full_rebuild",
+            "paths": unsupported_added,
+        }
+    unsupported_removed = sorted(removed - set(removed_test_paths))
+    if unsupported_removed:
+        return {
+            "supported": False,
+            "reason": "removed_files_require_full_rebuild",
+            "paths": unsupported_removed,
+        }
+
+    test_file_set_paths = set(added_test_paths) | set(removed_test_paths)
+    non_hash_impacted = impacted - hash_changed - test_file_set_paths
+    if non_hash_impacted:
         return {
             "supported": False,
             "reason": "non_hash_impacted_files_require_full_rebuild",
-            "paths": sorted(impacted - hash_changed),
+            "paths": sorted(non_hash_impacted),
         }
 
-    old_by_path = _rows_by_path(old_rows)
-    new_by_path = _rows_by_path(new_rows)
     unsupported: list[dict[str, str]] = []
     source_checks: list[dict[str, Any]] = []
     source_paths: list[str] = []
     metadata_paths: list[str] = []
     test_paths: list[str] = []
     for path in sorted(impacted):
+        if path in test_file_set_paths:
+            test_paths.append(path)
+            continue
         old_row = old_by_path.get(path) or {}
         new_row = new_by_path.get(path) or {}
         kind = str(new_row.get("file_kind") or old_row.get("file_kind") or "")
@@ -798,18 +834,20 @@ def _incremental_metadata_scope_eligibility(
         }
     mode = "metadata_only"
     if test_paths:
-        mode = "test_fanin_hash_only"
+        mode = "test_fanin_file_set" if test_file_set_paths else "test_fanin_hash_only"
     elif source_paths and metadata_paths:
         mode = "mixed_hash_only"
     elif source_paths:
         mode = "source_hash_only"
     return {
         "supported": True,
-        "reason": "hash_only_structure_stable",
+        "reason": "test_fanin_file_set_structure_stable" if test_file_set_paths else "hash_only_structure_stable",
         "mode": mode,
         "source_paths": source_paths,
         "metadata_paths": metadata_paths,
         "test_paths": test_paths,
+        "added_test_paths": added_test_paths,
+        "removed_test_paths": removed_test_paths,
         "source_checks": source_checks,
     }
 
@@ -835,13 +873,20 @@ def _apply_incremental_test_fanin_bindings(
     candidate_graph: dict[str, Any],
     *,
     changed_test_paths: list[str],
+    removed_test_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     changed = {
         _norm_repo_path(path)
         for path in changed_test_paths
         if _norm_repo_path(path)
     }
-    if not changed:
+    removed = {
+        _norm_repo_path(path)
+        for path in (removed_test_paths or [])
+        if _norm_repo_path(path)
+    }
+    affected = changed | removed
+    if not affected:
         return {"ok": True, "changed_test_paths": [], "updated_node_ids": []}
 
     from agent.governance.project_profile import discover_project_profile
@@ -876,16 +921,18 @@ def _apply_incremental_test_fanin_bindings(
         old_changed_paths = {
             _norm_repo_path(entry.get("path"))
             for entry in old_fanin
-            if _norm_repo_path(entry.get("path")) in changed
+            if _norm_repo_path(entry.get("path")) in affected
         }
         new_changed_fanin = new_fanin_by_module.get(module_name, [])
-        if not old_changed_paths and not new_changed_fanin:
+        old_tests = sorted(_path_values(node, "test"))
+        old_affected_tests = {path for path in old_tests if path in affected}
+        if not old_changed_paths and not new_changed_fanin and not old_affected_tests:
             continue
 
         kept_fanin = [
             _graph_fanin_entry(entry)
             for entry in old_fanin
-            if _norm_repo_path(entry.get("path")) not in changed
+            if _norm_repo_path(entry.get("path")) not in affected
         ]
         merged_fanin = sorted(
             kept_fanin + new_changed_fanin,
@@ -897,8 +944,8 @@ def _apply_incremental_test_fanin_bindings(
             if _norm_repo_path(entry.get("path"))
         }
         direct_tests = {
-            path for path in _path_values(node, "test")
-            if path not in old_fanin_paths
+            path for path in old_tests
+            if path not in old_fanin_paths and path not in removed
         }
         fanin_paths = {
             _norm_repo_path(entry.get("path"))
@@ -906,7 +953,6 @@ def _apply_incremental_test_fanin_bindings(
             if _norm_repo_path(entry.get("path"))
         }
         new_tests = sorted(direct_tests | fanin_paths)
-        old_tests = sorted(_path_values(node, "test"))
         old_normalized_fanin = sorted(
             [_graph_fanin_entry(entry) for entry in old_fanin],
             key=lambda item: (str(item.get("path") or ""), ",".join(item.get("imports") or [])),
@@ -924,6 +970,7 @@ def _apply_incremental_test_fanin_bindings(
     return {
         "ok": True,
         "changed_test_paths": sorted(changed),
+        "removed_test_paths": sorted(removed),
         "updated_node_ids": sorted(set(updated_node_ids)),
         "updated_modules": sorted(set(updated_modules)),
     }
@@ -2002,15 +2049,22 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         metadata["incremental_scope_reconcile"] = incremental_metadata
         candidate_graph["metadata"] = metadata
     test_fanin_update: dict[str, Any] = {}
-    if graph_delta_mode == "test_fanin_hash_only":
+    if graph_delta_mode in {"test_fanin_hash_only", "test_fanin_file_set"}:
+        removed_test_paths = [
+            str(path)
+            for path in eligibility.get("removed_test_paths", []) or []
+            if str(path).strip()
+        ]
+        removed_test_path_set = set(removed_test_paths)
         test_fanin_update = _apply_incremental_test_fanin_bindings(
             root,
             candidate_graph,
             changed_test_paths=[
                 str(path)
                 for path in eligibility.get("test_paths", []) or []
-                if str(path).strip()
+                if str(path).strip() and str(path) not in removed_test_path_set
             ],
+            removed_test_paths=removed_test_paths,
         )
         governance_index = build_governance_index(
             conn,
