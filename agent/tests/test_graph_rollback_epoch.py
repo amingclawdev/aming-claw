@@ -8,6 +8,7 @@ import pytest
 
 from agent.governance import graph_events
 from agent.governance import graph_snapshot_store as store
+from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance.db import _ensure_schema
 
 PID = "graph-rollback-test"
@@ -52,6 +53,44 @@ def _projection(
         branch_ref=branch_ref,
         actor="pb-rollback-test",
         backfill_existing=False,
+    )
+
+
+def _semantic_job(
+    conn: sqlite3.Connection,
+    snapshot_id: str,
+    node_id: str,
+    *,
+    status: str,
+    branch_ref: str = "",
+    worker_id: str = "",
+    claim_id: str = "",
+) -> None:
+    semantic_enrichment._ensure_semantic_state_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO graph_semantic_jobs (
+            project_id, snapshot_id, node_id, status, feature_hash,
+            file_hashes_json, branch_ref, operation_type, feedback_round,
+            batch_index, attempt_count, worker_id, claim_id, claimed_at,
+            lease_expires_at, claimed_by, last_error, updated_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, '{}', ?, 'ai_enrich', 0, NULL, 0, ?, ?, ?, ?, ?, '', ?, ?)
+        """,
+        (
+            PID,
+            snapshot_id,
+            node_id,
+            status,
+            f"hash-{node_id}",
+            branch_ref,
+            worker_id,
+            claim_id,
+            "2026-05-17T07:00:00Z" if claim_id else "",
+            "2026-05-17T07:30:00Z" if claim_id else "",
+            worker_id,
+            "2026-05-17T07:00:00Z",
+            "2026-05-17T07:00:00Z",
+        ),
     )
 
 
@@ -135,6 +174,28 @@ def test_pb005_rollback_epoch_labels_abandoned_merge_and_isolated_pending_scope(
         branch_ref=BRANCH_REF,
     )
     _projection(conn, rollback["snapshot_id"], "semproj-rollback-B0")
+    _semantic_job(
+        conn,
+        merged["snapshot_id"],
+        "L7.merge-job",
+        status="running",
+        branch_ref=BRANCH_REF,
+        worker_id="semantic-worker",
+        claim_id="claim-merge",
+    )
+    _semantic_job(
+        conn,
+        rollback["snapshot_id"],
+        "L7.rollback-job",
+        status="pending_ai",
+    )
+    _semantic_job(
+        conn,
+        branch["snapshot_id"],
+        "L7.branch-job",
+        status="pending_ai",
+        branch_ref=BRANCH_REF,
+    )
 
     store.activate_graph_snapshot(
         conn,
@@ -220,3 +281,142 @@ def test_pb005_rollback_epoch_labels_abandoned_merge_and_isolated_pending_scope(
     assert pending_by_ref["active"]["evidence"]["rollback_epoch"] == "rollback-001"
     assert pending_by_ref[BRANCH_REF]["branch_ref"] == BRANCH_REF
     assert pending_by_ref[BRANCH_REF]["worktree_id"] == "wt-PB005-branch"
+
+    jobs = {(row["snapshot_id"], row["node_id"]): row for row in state["semantic_jobs"]}
+    assert jobs[(merged["snapshot_id"], "L7.merge-job")]["rollback_disposition"] == "abandoned"
+    assert jobs[(rollback["snapshot_id"], "L7.rollback-job")]["rollback_disposition"] == "current"
+    assert jobs[(branch["snapshot_id"], "L7.branch-job")]["rollback_disposition"] == "candidate"
+
+
+def test_pb005_rollback_invalidates_open_semantic_jobs_for_abandoned_merge(conn):
+    _ensure_schema(conn)
+    base = _snapshot(conn, "scope-main-B0", "B0")
+    merged = _snapshot(conn, "scope-main-M1", "M1")
+    rollback = _snapshot(conn, "scope-main-R1", "B0")
+    branch = _snapshot(
+        conn,
+        "scope-branch-H1",
+        "H1",
+        ref_name=BRANCH_REF,
+        branch_ref=BRANCH_REF,
+    )
+    _projection(conn, base["snapshot_id"], "semproj-main-B0")
+    _projection(
+        conn,
+        merged["snapshot_id"],
+        "semproj-merge-M1",
+        ref_name="active",
+        branch_ref=BRANCH_REF,
+    )
+    _projection(conn, rollback["snapshot_id"], "semproj-rollback-B0")
+    _projection(
+        conn,
+        branch["snapshot_id"],
+        "semproj-branch-H1",
+        ref_name=BRANCH_REF,
+        branch_ref=BRANCH_REF,
+    )
+    _semantic_job(
+        conn,
+        merged["snapshot_id"],
+        "L7.merge-job",
+        status="running",
+        branch_ref=BRANCH_REF,
+        worker_id="semantic-worker",
+        claim_id="claim-merge",
+    )
+    _semantic_job(conn, rollback["snapshot_id"], "L7.rollback-job", status="pending_ai")
+    _semantic_job(
+        conn,
+        branch["snapshot_id"],
+        "L7.branch-job",
+        status="pending_ai",
+        branch_ref=BRANCH_REF,
+    )
+
+    store.activate_graph_snapshot(conn, PID, base["snapshot_id"], auto_rebuild_projection=False)
+    merge_activation = store.activate_graph_snapshot(
+        conn,
+        PID,
+        merged["snapshot_id"],
+        operation_type="merge",
+        branch_ref=BRANCH_REF,
+        batch_id="batch-PB005",
+        merge_queue_id="mergeq-PB005",
+        merge_epoch="merge-001",
+        auto_rebuild_projection=False,
+    )
+    store.activate_graph_snapshot(
+        conn,
+        PID,
+        rollback["snapshot_id"],
+        operation_type="rollback",
+        batch_id="batch-PB005",
+        rollback_epoch="rollback-001",
+        source_event_id=merge_activation["graph_ref_event_id"],
+        evidence={"reason": "wrong merge order"},
+        auto_rebuild_projection=False,
+    )
+    store.activate_graph_snapshot(
+        conn,
+        PID,
+        branch["snapshot_id"],
+        ref_name=BRANCH_REF,
+        branch_ref=BRANCH_REF,
+        operation_type="activate",
+        batch_id="batch-PB005",
+        merge_queue_id="mergeq-PB005",
+        auto_rebuild_projection=False,
+    )
+
+    invalidated = store.invalidate_semantic_jobs_for_rollback_epoch(
+        conn,
+        PID,
+        rollback_epoch="rollback-001",
+        actor="observer-test",
+        now="2026-05-17T07:40:00Z",
+    )
+
+    assert invalidated["matched_count"] == 1
+    assert invalidated["invalidated_count"] == 1
+    row = conn.execute(
+        """
+        SELECT status, operation_type, worker_id, claim_id, lease_expires_at, last_error
+        FROM graph_semantic_jobs
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, merged["snapshot_id"], "L7.merge-job"),
+    ).fetchone()
+    assert row["status"] == "cancelled"
+    assert row["operation_type"] == "rollback_invalidated"
+    assert row["worker_id"] == ""
+    assert row["claim_id"] == ""
+    assert row["lease_expires_at"] == ""
+    assert "rollback-001" in row["last_error"]
+
+    untouched = {
+        row["node_id"]: row["status"]
+        for row in conn.execute(
+            """
+            SELECT node_id, status FROM graph_semantic_jobs
+            WHERE project_id=? AND snapshot_id IN (?, ?)
+            """,
+            (PID, rollback["snapshot_id"], branch["snapshot_id"]),
+        ).fetchall()
+    }
+    assert untouched == {
+        "L7.rollback-job": "pending_ai",
+        "L7.branch-job": "pending_ai",
+    }
+
+    state = store.build_graph_rollback_epoch_state(
+        conn,
+        PID,
+        ref_name="active",
+        rollback_epoch="rollback-001",
+    )
+    jobs = {(row["snapshot_id"], row["node_id"]): row for row in state["semantic_jobs"]}
+    assert (
+        jobs[(merged["snapshot_id"], "L7.merge-job")]["rollback_disposition"]
+        == "cancelled_by_rollback"
+    )

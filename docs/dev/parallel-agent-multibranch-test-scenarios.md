@@ -129,7 +129,7 @@ Task fixture:
 | PB-002 | Merge dependency ordering | Downstream branch requests merge before upstream foundation branch. | Reject merge with `waiting_dependency` or `dependency_blocked`; no target branch mutation; no graph ref activation. | Implemented with pure decision oracle, durable SQLite queue replay, and fenced governance enqueue API; live merge execution remains gated. | `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
 | PB-003 | Target branch moves | Upstream branch merges after downstream branch was validated. | Mark downstream `stale_after_dependency_merge`; require rebase/sync, scope reconcile, semantic projection check, and merge preview. | Implemented with pure decision oracle and durable SQLite queue replay; scope/materialization integration remains separate. | `test_merge_queue_runtime.py`, `test_graph_rollback_epoch.py` |
 | PB-004 | Wrong merge order rollback/replay | Batch detects severe integration issue after an invalid merge order. | Enter `rollback_required`; retain all batch branches/worktrees; rollback target ref and graph ref; replay retained branch heads in corrected queue order. | Implemented with pure decision oracle, durable SQLite batch replay, and governance rollback-planning API; live rollback execution remains gated. | `test_batch_merge_rollback.py`, `test_graph_governance_api.py` |
-| PB-005 | DB rollback consistency | Code rollback is requested after graph/semantic/pending rows changed. | Move graph snapshot refs and semantic projection refs to rollback epoch; mark superseded branch projections inactive; requeue or abandon semantic jobs by epoch; scope rows are isolated by branch/ref/batch. | Graph/projection/pending-scope read model implemented; semantic job invalidation remains pending. | `test_graph_rollback_epoch.py` |
+| PB-005 | DB rollback consistency | Code rollback is requested after graph/semantic/pending rows changed. | Move graph snapshot refs and semantic projection refs to rollback epoch; mark superseded branch projections inactive; requeue or abandon semantic jobs by epoch; scope rows are isolated by branch/ref/batch. | Graph/projection/pending-scope read model implemented; abandoned merge semantic jobs are exposed and cancellable by rollback epoch. | `test_graph_rollback_epoch.py` |
 | PB-006 | Governance Hint rollback | A hint is added, changed, then removed across branch commits. | Incremental reconcile emits add/change/remove deltas; removed hint cannot leave stale graph binding; rollback restores prior binding state. | Implemented as invertible delta oracle; reconcile integration remains pending. | `test_governance_hint_rollback.py` |
 | PB-007 | Chain compatibility | A Chain stage records branch runtime identity while MF remains the active client. | Accept optional `chain_id`, `root_task_id`, `stage_task_id`, `stage_type`, and `retry_round`; runtime semantics do not require Chain execution. | Implemented for runtime identity and no-execution Chain payload adapter; full Chain parallel execution remains future work. | `test_parallel_branch_runtime.py`, `test_chain_parallel_branch_adapter.py` |
 | PB-008 | Old agent resurrection | A stale agent callback tries to complete or merge after lease recovery by another agent. | Reject stale fence token; record ignored callback; do not change task state, queue state, branch head, graph ref, or semantic projection. | Implemented for checkpoint/recovery API; merge callback fencing remains part of live merge execution. | `test_parallel_branch_runtime.py`, `test_graph_governance_api.py` |
@@ -178,6 +178,12 @@ The batch rollback planning API slice is covered by
 operator can persist batch runtime state from branch contexts, mark the batch
 `rollback_required`, see retained branch/worktree evidence and cleanup blockers,
 and fetch the same rollback plan through the compact read model.
+
+The DB rollback consistency slice is covered by
+`test_pb005_rollback_invalidates_open_semantic_jobs_for_abandoned_merge`. It
+proves rollback epoch state surfaces semantic jobs by disposition and cancels
+open jobs tied to abandoned merge snapshots without touching the rollback target
+or retained branch candidate jobs.
 
 ## Observer Recovery Dry Run
 

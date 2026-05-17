@@ -729,6 +729,45 @@ def _projection_rows_by_id(
     return {str(row["projection_id"]): dict(row) for row in rows}
 
 
+def _semantic_job_rows_for_snapshots(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not snapshot_ids or not _table_exists(conn, "graph_semantic_jobs"):
+        return []
+    ids = sorted(snapshot_ids)
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id IN ({placeholders})
+        ORDER BY snapshot_id, node_id
+        """,
+        (project_id, *ids),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _semantic_job_rollback_disposition(
+    row: dict[str, Any],
+    *,
+    active_snapshot_id: str,
+    abandoned_snapshot_ids: set[str],
+    branch_candidate_snapshot_ids: set[str],
+) -> str:
+    snapshot_id = str(row.get("snapshot_id") or "")
+    status = str(row.get("status") or "").strip().lower()
+    if snapshot_id in abandoned_snapshot_ids:
+        return "cancelled_by_rollback" if status in {"cancelled", "canceled"} else "abandoned"
+    if snapshot_id == active_snapshot_id:
+        return "current"
+    if snapshot_id in branch_candidate_snapshot_ids or row.get("branch_ref"):
+        return "candidate"
+    return "historical"
+
+
 def build_graph_rollback_epoch_state(
     conn: sqlite3.Connection,
     project_id: str,
@@ -789,8 +828,22 @@ def build_graph_rollback_epoch_state(
         event for event in all_events
         if str(event.get("ref_name") or "") != ref
     ]
+    abandoned_snapshot_ids = {
+        str(event.get("new_snapshot_id") or "")
+        for event in abandoned_merge_events
+        if event.get("new_snapshot_id")
+    }
+    branch_candidate_snapshot_ids = {
+        str(event.get("new_snapshot_id") or "")
+        for event in branch_candidate_events
+        if event.get("new_snapshot_id")
+    }
     projection_ids: set[str] = set()
+    event_snapshot_ids: set[str] = {active_snapshot_id} if active_snapshot_id else set()
     for event in all_events:
+        snapshot_id = str(event.get("new_snapshot_id") or "").strip()
+        if snapshot_id:
+            event_snapshot_ids.add(snapshot_id)
         for key in ("old_projection_id", "new_projection_id"):
             value = str(event.get(key) or "").strip()
             if value:
@@ -833,6 +886,28 @@ def build_graph_rollback_epoch_state(
         _compact_pending_scope_row(row)
         for row in all_pending_scope_rows
     ][:bounded_limit]
+    semantic_jobs = []
+    for row in _semantic_job_rows_for_snapshots(conn, project_id, event_snapshot_ids):
+        semantic_jobs.append({
+            "snapshot_id": str(row.get("snapshot_id") or ""),
+            "node_id": str(row.get("node_id") or ""),
+            "status": str(row.get("status") or ""),
+            "branch_ref": str(row.get("branch_ref") or ""),
+            "operation_type": str(row.get("operation_type") or ""),
+            "feature_hash": str(row.get("feature_hash") or ""),
+            "attempt_count": int(row.get("attempt_count") or 0),
+            "worker_id": str(row.get("worker_id") or ""),
+            "claim_id": str(row.get("claim_id") or ""),
+            "lease_expires_at": str(row.get("lease_expires_at") or ""),
+            "last_error": str(row.get("last_error") or ""),
+            "updated_at": str(row.get("updated_at") or ""),
+            "rollback_disposition": _semantic_job_rollback_disposition(
+                row,
+                active_snapshot_id=active_snapshot_id,
+                abandoned_snapshot_ids=abandoned_snapshot_ids,
+                branch_candidate_snapshot_ids=branch_candidate_snapshot_ids,
+            ),
+        })
     return {
         "ok": True,
         "project_id": project_id,
@@ -851,12 +926,14 @@ def build_graph_rollback_epoch_state(
         "branch_candidates": branch_candidate_events[:bounded_limit],
         "projection_states": projection_states[:bounded_limit],
         "pending_scope": pending_rows,
+        "semantic_jobs": semantic_jobs[:bounded_limit],
         "total_counts": {
             "ref_events": len(all_events),
             "abandoned_merge_events": len(abandoned_merge_events),
             "branch_candidates": len(branch_candidate_events),
             "projection_states": len(projection_states),
             "pending_scope": len(all_pending_scope_rows),
+            "semantic_jobs": len(semantic_jobs),
         },
         "truncated": {
             "ref_events": len(all_events) >= bounded_limit,
@@ -864,7 +941,95 @@ def build_graph_rollback_epoch_state(
             "branch_candidates": len(branch_candidate_events) > bounded_limit,
             "projection_states": len(projection_states) > bounded_limit,
             "pending_scope": len(all_pending_scope_rows) > bounded_limit,
+            "semantic_jobs": len(semantic_jobs) > bounded_limit,
         },
+    }
+
+
+def invalidate_semantic_jobs_for_rollback_epoch(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    ref_name: str = "active",
+    rollback_epoch: str,
+    actor: str = "observer",
+    now: str = "",
+) -> dict[str, Any]:
+    """Cancel open semantic jobs tied to merge snapshots abandoned by rollback."""
+    ensure_schema(conn)
+    if not _table_exists(conn, "graph_semantic_jobs"):
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "rollback_epoch": rollback_epoch,
+            "matched_count": 0,
+            "invalidated_count": 0,
+            "semantic_jobs": [],
+        }
+    state = build_graph_rollback_epoch_state(
+        conn,
+        project_id,
+        ref_name=ref_name,
+        rollback_epoch=rollback_epoch,
+        limit=500,
+    )
+    abandoned_snapshot_ids = {
+        str(event.get("new_snapshot_id") or "")
+        for event in state.get("abandoned_merge_events", [])
+        if event.get("new_snapshot_id")
+    }
+    if not abandoned_snapshot_ids:
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "rollback_epoch": rollback_epoch,
+            "matched_count": 0,
+            "invalidated_count": 0,
+            "semantic_jobs": [],
+        }
+    rows = _semantic_job_rows_for_snapshots(conn, project_id, abandoned_snapshot_ids)
+    terminal = {
+        "cancelled",
+        "canceled",
+        "failed",
+        "ai_complete",
+        "complete",
+        "rule_complete",
+    }
+    open_rows = [
+        row for row in rows
+        if str(row.get("status") or "").strip().lower() not in terminal
+    ]
+    stamp = now or utc_now()
+    if open_rows:
+        placeholders = ",".join("(?, ?, ?)" for _ in open_rows)
+        params: list[Any] = []
+        for row in open_rows:
+            params.extend([project_id, row["snapshot_id"], row["node_id"]])
+        reason = f"invalidated by rollback_epoch {rollback_epoch} ({actor})"
+        conn.execute(
+            f"""
+            UPDATE graph_semantic_jobs
+            SET status = 'cancelled',
+                operation_type = 'rollback_invalidated',
+                worker_id = '',
+                claim_id = '',
+                claimed_at = '',
+                lease_expires_at = '',
+                claimed_by = '',
+                last_error = ?,
+                updated_at = ?
+            WHERE (project_id, snapshot_id, node_id) IN ({placeholders})
+            """,
+            (reason, stamp, *params),
+        )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "rollback_epoch": rollback_epoch,
+        "matched_count": len(rows),
+        "invalidated_count": len(open_rows),
+        "semantic_jobs": _semantic_job_rows_for_snapshots(conn, project_id, abandoned_snapshot_ids),
     }
 
 
@@ -3708,6 +3873,7 @@ __all__ = [
     "normalize_pending_scope_identity",
     "graph_payload_stats",
     "import_existing_graph_snapshot",
+    "invalidate_semantic_jobs_for_rollback_epoch",
     "abandon_graph_snapshot",
     "list_pending_scope_reconcile",
     "mark_pending_scope_reconcile_failed",
