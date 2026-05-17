@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from agent.governance.parallel_branch_runtime import (
     BATCH_STATE_OPEN,
     BranchTaskRuntimeContext,
@@ -9,10 +11,14 @@ from agent.governance.parallel_branch_runtime import (
     BatchMergeRuntime,
     MergeQueueItem,
     build_parallel_branch_read_model,
+    build_parallel_branch_read_model_from_db,
     decide_batch_rollback_replay,
     decide_merge_queue,
     decide_restart_recovery,
     runtime_tasks_from_contexts,
+    upsert_batch_merge_runtime,
+    upsert_branch_context,
+    upsert_merge_queue_items,
 )
 
 PROJECT_ID = "fixture-parallel-project"
@@ -20,6 +26,12 @@ BATCH_ID = "PB-010"
 TARGET_REF = "refs/heads/main"
 NOW = "2026-05-16T12:00:00Z"
 EXPIRED = "2026-05-16T11:50:00Z"
+
+
+def _runtime_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _contexts() -> list[BranchTaskRuntimeContext]:
@@ -270,3 +282,102 @@ def test_pb010_read_model_is_bounded_and_marks_truncation() -> None:
         "rollback_rows": False,
     }
     assert payload["summary"]["truncated"] is True
+
+
+def test_pb010_read_model_loads_from_durable_runtime_stores() -> None:
+    conn = _runtime_conn()
+    for context in _contexts():
+        upsert_branch_context(conn, context, now_iso=NOW)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB010",
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB010-T1-foundation",
+                queue_index=1,
+                status="running",
+                target_ref=TARGET_REF,
+            ),
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB010",
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB010-T2-feature",
+                queue_index=2,
+                status="merge_ready",
+                target_ref=TARGET_REF,
+                hard_depends_on=("T1",),
+                requires_graph_epoch=("T1",),
+            ),
+        ],
+        now_iso=NOW,
+    )
+    upsert_batch_merge_runtime(
+        conn,
+        BatchMergeRuntime(
+            project_id=PROJECT_ID,
+            batch_id=BATCH_ID,
+            target_ref=TARGET_REF,
+            batch_base_commit="B0",
+            current_target_head="merge-T2",
+            batch_status=BATCH_STATE_OPEN,
+            rollback_snapshot_id="snapshot-main-B0",
+            rollback_projection_id="semproj-main-B0",
+            items=(
+                BatchMergeItem(
+                    task_id="T2",
+                    branch_ref="refs/heads/codex/PB010-T2-feature",
+                    worktree_path="/tmp/worktrees/PB010-T2",
+                    queue_index=2,
+                    status="merged",
+                    branch_head="H2",
+                    base_commit="B0",
+                    merge_commit="merge-T2",
+                    snapshot_id="scope-T2",
+                    projection_id="semproj-T2",
+                    retained=True,
+                ),
+                BatchMergeItem(
+                    task_id="T1",
+                    branch_ref="refs/heads/codex/PB010-T1-foundation",
+                    worktree_path="/tmp/worktrees/PB010-T1",
+                    queue_index=1,
+                    status="merge_ready",
+                    branch_head="H1",
+                    base_commit="B0",
+                    snapshot_id="scope-T1",
+                    projection_id="semproj-T1",
+                    retained=True,
+                ),
+            ),
+        ),
+        now_iso=NOW,
+    )
+
+    model = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=BATCH_ID,
+        merge_queue_id="mergeq-PB010",
+        target_ref=TARGET_REF,
+        now_iso=NOW,
+        severe_integration_failure=True,
+        corrected_replay_order=("T1", "T2"),
+        limit=10,
+    )
+    payload = model.to_dict()
+
+    assert payload["summary"]["lane_count"] == 4
+    assert payload["summary"]["blocked_count"] == 1
+    assert payload["summary"]["rollback_required"] is True
+    assert payload["merge_queue"]["blocked_task_ids"] == ["T2"]
+    assert payload["rollback"]["replay_task_ids"] == ["T1", "T2"]
+    assert payload["truncated"] == {
+        "branch_lanes": False,
+        "merge_queue_rows": False,
+        "rollback_rows": False,
+    }

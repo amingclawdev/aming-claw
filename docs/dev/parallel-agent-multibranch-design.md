@@ -344,6 +344,12 @@ truncation flags without expanding backlog rows, graph nodes, or semantic
 payloads. MCP and dashboard routes can consume this as the stable read-model
 shape when their durable stores are wired.
 
+Implemented API slice: `build_parallel_branch_read_model_from_db` composes the
+same payload from durable branch context, merge queue, and batch runtime rows.
+The governance endpoint `GET /api/graph-governance/{project_id}/parallel-branches`
+exposes this compact read model for dashboard/MCP clients without expanding
+full backlog rows or graph payloads.
+
 ## Chain Compatibility
 
 Chain remains serial inside one Chain run. Parallel branch runtime allows many
@@ -382,8 +388,8 @@ Serial Chain stages with no `branch_ref` remain unchanged.
 8. Branch/ref/batch-aware `pending_scope_reconcile`.
 9. MF adapter MVP for one isolated branch through merge queue.
 10. Dashboard/MCP compact read model. First pure-state read model is implemented
-   by `agent/tests/test_parallel_branch_read_model.py`; live MCP/dashboard
-   wiring still depends on durable batch stores and API routing.
+   by `agent/tests/test_parallel_branch_read_model.py`; first governance API
+   read model is implemented by `agent/tests/test_graph_governance_api.py`.
 11. Chain adapter hook tests and later Chain integration. First no-execution
     adapter is implemented by `agent/tests/test_chain_parallel_branch_adapter.py`.
 

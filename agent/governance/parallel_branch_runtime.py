@@ -2077,3 +2077,63 @@ def build_parallel_branch_read_model(
         total_counts=total_counts,
         truncated=truncated,
     )
+
+
+def build_parallel_branch_read_model_from_db(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    batch_id: str = "",
+    merge_queue_id: str = "",
+    target_ref: str = "",
+    now_iso: str = "",
+    limit: int = 50,
+    scenario_id: str = "PB-010",
+    severe_integration_failure: bool = False,
+    corrected_replay_order: tuple[str, ...] = (),
+) -> ParallelBranchReadModel:
+    """Build PB-010 read model from durable branch, queue, and batch rows."""
+    contexts = list_branch_contexts(conn, project_id, batch_id=batch_id)
+    recovery_plan = (
+        decide_restart_recovery(
+            runtime_tasks_from_contexts(contexts, now_iso=now_iso),
+            scenario_id=scenario_id,
+        )
+        if contexts
+        else None
+    )
+
+    queue_plan: MergeQueuePlan | None = None
+    queue_id = str(merge_queue_id or "").strip()
+    if not queue_id:
+        queue_ids = sorted({ctx.merge_queue_id for ctx in contexts if ctx.merge_queue_id})
+        queue_id = queue_ids[0] if len(queue_ids) == 1 else ""
+    if queue_id:
+        queue_items = list_merge_queue_items(
+            conn,
+            project_id,
+            queue_id,
+            target_ref=target_ref,
+        )
+        queue_plan = decide_merge_queue(queue_items, scenario_id=scenario_id) if queue_items else None
+
+    batch_plan: BatchRollbackPlan | None = None
+    if batch_id:
+        batch_runtime = get_batch_merge_runtime(conn, project_id, batch_id)
+        if batch_runtime is not None:
+            batch_plan = decide_batch_rollback_replay(
+                batch_runtime,
+                severe_integration_failure=severe_integration_failure,
+                corrected_replay_order=corrected_replay_order,
+                scenario_id=scenario_id,
+            )
+
+    return build_parallel_branch_read_model(
+        project_id=project_id,
+        batch_id=batch_id,
+        contexts=contexts,
+        recovery_plan=recovery_plan,
+        merge_queue_plan=queue_plan,
+        batch_plan=batch_plan,
+        limit=limit,
+    )

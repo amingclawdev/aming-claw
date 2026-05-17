@@ -3090,6 +3090,35 @@ def handle_graph_governance_status(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/parallel-branches")
+def handle_graph_governance_parallel_branches(ctx: RequestContext):
+    """Return compact parallel branch lanes, queue, and rollback state."""
+    project_id = ctx.get_project_id()
+    from .parallel_branch_runtime import build_parallel_branch_read_model_from_db
+
+    conn = get_connection(project_id)
+    try:
+        model = build_parallel_branch_read_model_from_db(
+            conn,
+            project_id=project_id,
+            batch_id=str(ctx.query.get("batch_id") or ""),
+            merge_queue_id=str(ctx.query.get("merge_queue_id") or ""),
+            target_ref=str(ctx.query.get("target_ref") or ""),
+            now_iso=str(ctx.query.get("now_iso") or ""),
+            limit=_query_int(ctx.query, "limit", 50),
+            scenario_id=str(ctx.query.get("scenario_id") or "PB-010"),
+            severe_integration_failure=_query_bool(
+                ctx.query,
+                "severe_integration_failure",
+                False,
+            ),
+            corrected_replay_order=tuple(_query_statuses(ctx.query, "corrected_replay_order")),
+        )
+        return {"ok": True, "read_model": model.to_dict()}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/dashboard")
 def handle_graph_governance_dashboard(ctx: RequestContext):
     """Return a compact dashboard projection over graph, drift, and file state."""

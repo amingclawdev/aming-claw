@@ -16,6 +16,16 @@ from agent.governance import server
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
+from agent.governance.parallel_branch_runtime import (
+    BATCH_STATE_OPEN,
+    BranchTaskRuntimeContext,
+    BatchMergeItem,
+    BatchMergeRuntime,
+    MergeQueueItem,
+    upsert_batch_merge_runtime,
+    upsert_branch_context,
+    upsert_merge_queue_items,
+)
 
 
 PID = "graph-api-test"
@@ -126,6 +136,97 @@ def _graph_with_dependency() -> dict:
         }
     )
     return graph
+
+
+def test_parallel_branch_read_model_route_returns_durable_runtime_state(conn):
+    batch_id = "PB-010-api"
+    queue_id = "mergeq-PB010-api"
+    target_ref = "refs/heads/main"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=batch_id,
+            task_id="T1",
+            backlog_id="OPT-PB010-API",
+            branch_ref="refs/heads/codex/PB010-api-T1",
+            status="running",
+            merge_queue_id=queue_id,
+            checkpoint_id="checkpoint-T1",
+            snapshot_id="scope-T1",
+            projection_id="semproj-T1",
+        ),
+        now_iso="2026-05-17T06:20:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB010-api-T1",
+                queue_index=1,
+                status="merge_ready",
+                target_ref=target_ref,
+                merge_preview_id="preview-T1",
+            )
+        ],
+        now_iso="2026-05-17T06:20:00Z",
+    )
+    upsert_batch_merge_runtime(
+        conn,
+        BatchMergeRuntime(
+            project_id=PID,
+            batch_id=batch_id,
+            target_ref=target_ref,
+            batch_base_commit="B0",
+            current_target_head="B0",
+            batch_status=BATCH_STATE_OPEN,
+            items=(
+                BatchMergeItem(
+                    task_id="T1",
+                    branch_ref="refs/heads/codex/PB010-api-T1",
+                    worktree_path="/tmp/worktrees/PB010-api-T1",
+                    queue_index=1,
+                    status="merge_ready",
+                    branch_head="H1",
+                    base_commit="B0",
+                    snapshot_id="scope-T1",
+                    projection_id="semproj-T1",
+                ),
+            ),
+        ),
+        now_iso="2026-05-17T06:20:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": batch_id,
+                "merge_queue_id": queue_id,
+                "target_ref": target_ref,
+                "limit": "5",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    payload = result["read_model"]
+    assert payload["project_id"] == PID
+    assert payload["batch_id"] == batch_id
+    assert payload["summary"]["lane_count"] == 1
+    assert payload["summary"]["mergeable_count"] == 1
+    assert payload["branch_lanes"][0]["task_id"] == "T1"
+    assert payload["merge_queue"]["rows"][0]["merge_preview_id"] == "preview-T1"
+    assert payload["rollback"]["cleanup_allowed"] is False
+    assert payload["truncated"] == {
+        "branch_lanes": False,
+        "merge_queue_rows": False,
+        "rollback_rows": False,
+    }
 
 
 def test_governance_handler_json_response_includes_dev_cors_headers():
