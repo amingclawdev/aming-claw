@@ -600,6 +600,135 @@ def test_parallel_branch_merge_preview_route_builds_gate_evidence(conn, tmp_path
     assert result["gate_plan"]["target_branch_mutation_allowed"] is False
 
 
+def test_parallel_branch_merge_execute_route_dry_run_then_live_merge(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "feature-live"], cwd=repo, check=True)
+    (repo / "live.txt").write_text("live\n", encoding="utf-8")
+    subprocess.run(["git", "add", "live.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "live branch"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    queue_id = "mergeq-api-execute"
+    evidence = {
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-execute",
+            task_id="execute-task",
+            branch_ref="feature-live",
+            status="merge_ready",
+            fence_token="fence-execute-current",
+            target_head_commit=main_head,
+            merge_queue_id=queue_id,
+        ),
+        now_iso="2026-05-17T08:28:00Z",
+    )
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-execute-task",
+                task_id="execute-task",
+                branch_ref="feature-live",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head="feature-live",
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                snapshot_id="scope-execute",
+                projection_id="semproj-execute",
+            )
+        ],
+        now_iso="2026-05-17T08:28:00Z",
+    )
+
+    dry_run = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "task_id": "execute-task",
+                "evidence": evidence,
+                "dry_run": True,
+            },
+        )
+    )
+
+    assert dry_run["ok"] is True
+    assert dry_run["executed"] is False
+    assert dry_run["gate_plan"]["merge_gate_passed"] is True
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == main_head
+
+    live = server.handle_graph_governance_parallel_branch_merge_execute(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "task_id": "execute-task",
+                "evidence": evidence,
+                "dry_run": False,
+                "allow_target_ref_mutation": True,
+                "fence_token": "fence-execute-current",
+                "message": "merge feature-live",
+                "bug_id": "ARCH-PARALLEL-AGENT-MULTIBRANCH-EXECUTION",
+                "now_iso": "2026-05-17T08:29:00Z",
+            },
+        )
+    )
+
+    assert live["ok"] is True
+    assert live["executed"] is True
+    assert live["merge_commit"]
+    assert live["recorded"]["queue_item"]["status"] == "merged"
+    assert live["recorded"]["context"]["status"] == "merged"
+    assert live["decision"]["rows"][0]["queue_state"] == "merged"
+    assert live["decision"]["rows"][0]["target_graph_activation_allowed"] is True
+    assert (repo / "live.txt").read_text(encoding="utf-8") == "live\n"
+    assert subprocess.run(
+        ["git", "log", "-1", "--format=%B"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.find("Chain-Source-Stage: merge") != -1
+
+
 def test_parallel_branch_merge_result_route_records_with_fence(conn):
     queue_id = "mergeq-api-result"
     upsert_branch_context(

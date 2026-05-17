@@ -3509,6 +3509,85 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-execute")
+def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
+    """Dry-run or explicitly execute one gated queue merge."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import (
+        decide_persisted_merge_queue,
+        execute_merge_queue_item,
+    )
+
+    merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
+    if not merge_queue_id:
+        raise ValidationError("merge_queue_id is required")
+    evidence = ctx.body.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        raise ValidationError("evidence must be an object when provided")
+    repo_root = str(
+        ctx.body.get("repo_root_path")
+        or ctx.body.get("workspace_root")
+        or os.getcwd()
+    )
+    target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.merge-execute",
+        )
+        with sqlite_write_lock():
+            result = execute_merge_queue_item(
+                conn,
+                project_id=project_id,
+                merge_queue_id=merge_queue_id,
+                repo_root_path=repo_root,
+                queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+                task_id=str(ctx.body.get("task_id") or ""),
+                target_ref=target_ref,
+                evidence=evidence,
+                batch_status=str(ctx.body.get("batch_status") or ""),
+                dry_run=_query_bool(ctx.body, "dry_run", True),
+                allow_target_ref_mutation=_query_bool(
+                    ctx.body,
+                    "allow_target_ref_mutation",
+                    False,
+                ),
+                message=str(ctx.body.get("message") or ""),
+                bug_id=str(ctx.body.get("bug_id") or ""),
+                fence_token=str(ctx.body.get("fence_token") or ""),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+                timeout_seconds=_query_int(ctx.body, "timeout_seconds", 30),
+                scenario_id=str(ctx.body.get("scenario_id") or "PB-016"),
+            )
+            decision = decide_persisted_merge_queue(
+                conn,
+                project_id,
+                merge_queue_id,
+                target_ref=target_ref,
+                scenario_id=str(ctx.body.get("scenario_id") or "PB-016"),
+            )
+            conn.commit()
+        return {
+            "ok": bool(result.get("ok")),
+            "project_id": project_id,
+            **result,
+            "decision": {
+                "scenario_id": decision.scenario_id,
+                "mergeable_task_ids": list(decision.mergeable_task_ids),
+                "blocked_task_ids": list(decision.blocked_task_ids),
+                "stale_task_ids": list(decision.stale_task_ids),
+                "target_mutation_blocked_for": list(decision.target_mutation_blocked_for),
+                "rows": list(decision.dashboard_rows),
+            },
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/batch-runtime")
 def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
     """Persist batch runtime state and return rollback/replay planning."""

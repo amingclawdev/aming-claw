@@ -2436,6 +2436,206 @@ def git_merge_preview_evidence(
     }
 
 
+def _git_worktree_dirty_files(repo_root: Path, *, timeout_seconds: int) -> list[str]:
+    proc = _git_preview_command(
+        repo_root,
+        ["status", "--porcelain"],
+        timeout_seconds=timeout_seconds,
+    )
+    if proc.returncode != 0:
+        return ["<git-status-error>"]
+    return [line[3:] if len(line) > 3 else line for line in proc.stdout.splitlines() if line]
+
+
+def execute_merge_queue_item(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    merge_queue_id: str,
+    repo_root_path: str | Path,
+    queue_item_id: str = "",
+    task_id: str = "",
+    target_ref: str = "",
+    evidence: dict[str, Any] | None = None,
+    batch_status: str = "",
+    dry_run: bool = True,
+    allow_target_ref_mutation: bool = False,
+    message: str = "",
+    bug_id: str = "",
+    fence_token: str = "",
+    now_iso: str = "",
+    timeout_seconds: int = 30,
+    scenario_id: str = "PB-016",
+) -> dict[str, Any]:
+    """Execute one gated merge queue item, or return a dry-run plan.
+
+    The live path is deliberately explicit: callers must set dry_run=false and
+    allow_target_ref_mutation=true, and the merge gate must pass first.
+    """
+    ensure_branch_runtime_schema(conn)
+    items = list_merge_queue_items(
+        conn,
+        project_id,
+        merge_queue_id,
+        target_ref=target_ref,
+    )
+    item = select_merge_queue_item(items, queue_item_id=queue_item_id, task_id=task_id)
+    repo_root = Path(repo_root_path).resolve()
+    preview = git_merge_preview_evidence(
+        repo_root_path=repo_root,
+        target_ref=target_ref or item.target_ref,
+        branch_ref=item.branch_ref,
+        expected_target_head=item.current_target_head or item.validated_target_head,
+        timeout_seconds=timeout_seconds,
+    )
+    gate_evidence = dict(evidence or {})
+    gate_evidence["git_conflict_check"] = preview
+    gate_plan = decide_merge_gate(
+        items,
+        queue_item_id=item.queue_item_id,
+        evidence=gate_evidence,
+        batch_status=batch_status,
+        dry_run=dry_run or not allow_target_ref_mutation,
+        scenario_id=scenario_id,
+    )
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "executed": False,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+    if not allow_target_ref_mutation:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "target_ref_mutation_not_allowed",
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+    if not gate_plan.merge_gate_passed:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "merge_gate_blocked",
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
+    dirty_files = _git_worktree_dirty_files(repo_root, timeout_seconds=timeout_seconds)
+    if dirty_files:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "dirty_worktree",
+            "dirty_files": dirty_files,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
+    target_branch = _branch_name_from_ref(target_ref or item.target_ref)
+    branch_name = _branch_name_from_ref(item.branch_ref)
+    checkout = _git_preview_command(
+        repo_root,
+        ["checkout", target_branch],
+        timeout_seconds=timeout_seconds,
+    )
+    if checkout.returncode != 0:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "checkout_failed",
+            "stderr": _bounded_command_text(checkout.stderr or checkout.stdout),
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
+    before_commit, before_error = _git_preview_commit(
+        repo_root,
+        "HEAD",
+        timeout_seconds=timeout_seconds,
+    )
+    if before_error:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": False,
+            "error": "target_head_unresolved",
+            "stderr": before_error,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": None,
+        }
+
+    from .chain_trailer import write_merge_with_trailer
+
+    ok, merge_commit, error = write_merge_with_trailer(
+        message or f"parallel branch merge: {item.task_id}",
+        branch=branch_name,
+        cwd=str(repo_root),
+        task_id=item.task_id,
+        parent_chain_sha=before_commit,
+        bug_id=bug_id or item.task_id,
+    )
+    if not ok:
+        recorded = record_merge_queue_result(
+            conn,
+            project_id=project_id,
+            merge_queue_id=merge_queue_id,
+            queue_item_id=item.queue_item_id,
+            target_ref=target_ref,
+            status=STATE_MERGE_FAILED,
+            failure_reason=error,
+            target_head_before_merge=before_commit,
+            target_head_after_merge=before_commit,
+            fence_token=fence_token,
+            now_iso=now_iso,
+        )
+        return {
+            "ok": False,
+            "dry_run": False,
+            "executed": True,
+            "error": "merge_failed",
+            "message": error,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan),
+            "recorded": recorded,
+        }
+
+    recorded = record_merge_queue_result(
+        conn,
+        project_id=project_id,
+        merge_queue_id=merge_queue_id,
+        queue_item_id=item.queue_item_id,
+        target_ref=target_ref,
+        status=STATE_MERGED,
+        merge_commit=merge_commit,
+        target_head_before_merge=before_commit,
+        target_head_after_merge=merge_commit,
+        fence_token=fence_token,
+        now_iso=now_iso,
+    )
+    return {
+        "ok": True,
+        "dry_run": False,
+        "executed": True,
+        "merge_commit": merge_commit,
+        "preview": preview,
+        "gate_plan": merge_gate_plan_to_dict(gate_plan),
+        "recorded": recorded,
+    }
+
+
 def _short_identity(value: str, fallback: str) -> str:
     text = str(value or "").strip()
     return text[:12] if text else fallback

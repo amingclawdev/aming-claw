@@ -214,6 +214,12 @@ verifies the expected target head, runs `git merge-tree --write-tree`, and
 returns clean/conflict/stale/error evidence without checkout, merge, commit,
 reset, or ref mutation.
 
+Implemented execution slice: the merge-execute API defaults to dry-run and
+requires explicit `allow_target_ref_mutation=true` before it can checkout the
+target branch and merge. It generates merge preview evidence, evaluates the
+merge gate, checks for a clean worktree, performs the merge with Chain trailers,
+and records `merged` or `merge_failed` back into durable queue/context state.
+
 Queue states:
 
 ```text

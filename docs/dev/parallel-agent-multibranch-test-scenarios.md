@@ -185,6 +185,12 @@ conflict evidence can be produced by read-only `rev-parse`, `merge-base`, and
 `merge-tree` commands, then fed directly into the merge gate plan without
 mutating the target worktree or refs.
 
+The gated live merge execution slice is covered by
+`test_parallel_branch_merge_execute_route_dry_run_then_live_merge`. It proves
+the API defaults to dry-run with no target mutation, and only executes a merge
+in a temporary repository when the caller explicitly allows target-ref mutation
+and the merge gate passes.
+
 The merge-result recording API slice is covered by
 `test_parallel_branch_merge_result_route_records_with_fence`. It proves an
 externally performed merge can be recorded into durable queue/context state,
