@@ -34,6 +34,7 @@ def test_schema_migration_is_idempotent(conn):
     assert {
         "graph_snapshots",
         "graph_snapshot_refs",
+        "graph_ref_events",
         "graph_nodes_index",
         "graph_edges_index",
         "graph_drift_ledger",
@@ -94,10 +95,19 @@ def test_create_index_and_activate_snapshot(conn, tmp_path):
 
     activation = store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
     assert activation["previous_snapshot_id"] == ""
+    assert activation["graph_ref_event_id"]
 
     active = store.get_active_graph_snapshot(conn, PID)
     assert active["snapshot_id"] == snapshot["snapshot_id"]
     assert active["commit_sha"] == "abc1234deadbeef"
+
+    ref_events = store.list_graph_ref_events(conn, PID, ref_name="active")
+    assert len(ref_events) == 1
+    assert ref_events[0]["operation_type"] == "activate"
+    assert ref_events[0]["old_snapshot_id"] == ""
+    assert ref_events[0]["new_snapshot_id"] == snapshot["snapshot_id"]
+    assert ref_events[0]["new_commit"] == "abc1234deadbeef"
+    assert ref_events[0]["evidence"]["projection_status"] in {"rebuilt", "already_present", "skipped"}
 
     node = conn.execute(
         "SELECT * FROM graph_nodes_index WHERE project_id=? AND snapshot_id=? AND node_id=?",
@@ -148,6 +158,111 @@ def test_activate_snapshot_compare_and_swap_rejects_stale_writer(conn):
         (PID, first["snapshot_id"]),
     ).fetchone()
     assert first_row["status"] == store.SNAPSHOT_STATUS_SUPERSEDED
+
+    ref_events = store.list_graph_ref_events(conn, PID, ref_name="active")
+    by_new = {event["new_snapshot_id"]: event for event in ref_events}
+    assert set(by_new) == {first["snapshot_id"], second["snapshot_id"]}
+    assert by_new[second["snapshot_id"]]["old_snapshot_id"] == first["snapshot_id"]
+    assert by_new[second["snapshot_id"]]["old_commit"] == "a111111"
+    assert by_new[second["snapshot_id"]]["new_commit"] == "b222222"
+
+
+def test_graph_ref_events_record_rollback_epoch_and_branch_ref_isolation(conn):
+    _ensure_schema(conn)
+    base = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-base-rollback",
+        commit_sha="base",
+        snapshot_kind="full",
+    )
+    branch = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-branch-candidate",
+        commit_sha="branch-head",
+        snapshot_kind="scope",
+    )
+    rollback = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-base-rollback",
+        commit_sha="base",
+        snapshot_kind="scope",
+    )
+
+    store.activate_graph_snapshot(conn, PID, base["snapshot_id"], auto_rebuild_projection=False)
+    store.activate_graph_snapshot(
+        conn,
+        PID,
+        branch["snapshot_id"],
+        ref_name="refs/heads/codex/feature",
+        operation_type="merge",
+        branch_ref="refs/heads/codex/feature",
+        batch_id="batch-rollback",
+        merge_queue_id="mergeq-rollback",
+        merge_epoch="merge-001",
+        auto_rebuild_projection=False,
+    )
+    active = store.get_active_graph_snapshot(conn, PID, ref_name="active")
+    assert active["snapshot_id"] == base["snapshot_id"]
+
+    result = store.activate_graph_snapshot(
+        conn,
+        PID,
+        rollback["snapshot_id"],
+        operation_type="rollback",
+        batch_id="batch-rollback",
+        rollback_epoch="rollback-001",
+        source_event_id="merge-001",
+        evidence={"reason": "wrong merge order"},
+        auto_rebuild_projection=False,
+    )
+
+    assert result["previous_snapshot_id"] == base["snapshot_id"]
+    active_events = store.list_graph_ref_events(conn, PID, ref_name="active")
+    branch_events = store.list_graph_ref_events(conn, PID, ref_name="refs/heads/codex/feature")
+    active_by_op = {event["operation_type"]: event for event in active_events}
+    assert set(active_by_op) == {"activate", "rollback"}
+    rollback_event = active_by_op["rollback"]
+    assert rollback_event["rollback_epoch"] == "rollback-001"
+    assert rollback_event["source_event_id"] == "merge-001"
+    assert rollback_event["evidence"]["reason"] == "wrong merge order"
+    assert branch_events[0]["operation_type"] == "merge"
+    assert branch_events[0]["branch_ref"] == "refs/heads/codex/feature"
+    assert branch_events[0]["merge_epoch"] == "merge-001"
+
+
+def test_activate_snapshot_rejects_invalid_ref_operation_without_moving_active(conn):
+    _ensure_schema(conn)
+    active = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-valid-active",
+        commit_sha="valid",
+        snapshot_kind="full",
+    )
+    candidate = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-invalid-op",
+        commit_sha="candidate",
+        snapshot_kind="scope",
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"], auto_rebuild_projection=False)
+
+    with pytest.raises(ValueError, match="invalid graph ref operation_type"):
+        store.activate_graph_snapshot(
+            conn,
+            PID,
+            candidate["snapshot_id"],
+            operation_type="unsafe_direct_write",
+            auto_rebuild_projection=False,
+        )
+
+    current = store.get_active_graph_snapshot(conn, PID)
+    assert current["snapshot_id"] == active["snapshot_id"]
+    assert store.list_graph_ref_events(conn, PID, operation_type="unsafe_direct_write") == []
 
 
 def test_drift_ledger_allows_multiple_target_symbols(conn):

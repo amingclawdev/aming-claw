@@ -58,6 +58,12 @@ an equivalent table, but it must preserve these fields:
 `graph_snapshot_refs` may be rebuilt from the latest valid ref event. The event
 log is the audit source.
 
+Implemented runtime slice: `activate_graph_snapshot` now writes append-only
+`graph_ref_events` rows for ref movements, including branch, batch, queue, epoch,
+old/new snapshot, old/new commit, old/new projection, actor, and bounded
+evidence. Projection currentness, job invalidation, and synthetic backfill remain
+separate rollout steps.
+
 ## Operation Types
 
 | Operation | Allowed source | Required effect |

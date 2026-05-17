@@ -47,6 +47,36 @@ CREATE TABLE IF NOT EXISTS graph_snapshot_refs (
   PRIMARY KEY(project_id, ref_name)
 );
 
+CREATE TABLE IF NOT EXISTS graph_ref_events (
+  project_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  ref_name TEXT NOT NULL,
+  branch_ref TEXT NOT NULL DEFAULT '',
+  batch_id TEXT NOT NULL DEFAULT '',
+  merge_queue_id TEXT NOT NULL DEFAULT '',
+  operation_type TEXT NOT NULL,
+  old_snapshot_id TEXT NOT NULL DEFAULT '',
+  new_snapshot_id TEXT NOT NULL DEFAULT '',
+  old_commit TEXT NOT NULL DEFAULT '',
+  new_commit TEXT NOT NULL DEFAULT '',
+  old_projection_id TEXT NOT NULL DEFAULT '',
+  new_projection_id TEXT NOT NULL DEFAULT '',
+  merge_epoch TEXT NOT NULL DEFAULT '',
+  rollback_epoch TEXT NOT NULL DEFAULT '',
+  replay_epoch TEXT NOT NULL DEFAULT '',
+  source_event_id TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(project_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_ref_events_ref
+  ON graph_ref_events(project_id, ref_name, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_graph_ref_events_operation
+  ON graph_ref_events(project_id, operation_type, created_at);
+
 CREATE TABLE IF NOT EXISTS graph_nodes_index (
   project_id TEXT NOT NULL,
   snapshot_id TEXT NOT NULL,
@@ -167,6 +197,14 @@ ALLOWED_PENDING_STATUSES = {
     PENDING_STATUS_MATERIALIZED,
     PENDING_STATUS_FAILED,
     PENDING_STATUS_WAIVED,
+}
+GRAPH_REF_OPERATION_TYPES = {
+    "activate",
+    "merge",
+    "rollback",
+    "revert",
+    "replay",
+    "backfill_escape",
 }
 
 
@@ -316,6 +354,120 @@ def normalize_pending_scope_identity(
 
 def _json(data: Any) -> str:
     return json.dumps(data if data is not None else {}, sort_keys=True, ensure_ascii=False)
+
+
+def _latest_projection_id(conn: sqlite3.Connection, project_id: str, snapshot_id: str) -> str:
+    if not snapshot_id:
+        return ""
+    try:
+        from . import graph_events
+
+        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id)
+    except Exception:
+        return ""
+    return str((projection or {}).get("projection_id") or "")
+
+
+def record_graph_ref_event(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    ref_name: str,
+    operation_type: str,
+    old_snapshot_id: str = "",
+    new_snapshot_id: str = "",
+    old_commit: str = "",
+    new_commit: str = "",
+    old_projection_id: str = "",
+    new_projection_id: str = "",
+    branch_ref: str = "",
+    batch_id: str = "",
+    merge_queue_id: str = "",
+    merge_epoch: str = "",
+    rollback_epoch: str = "",
+    replay_epoch: str = "",
+    source_event_id: str = "",
+    actor: str = "",
+    evidence: dict[str, Any] | None = None,
+    event_id: str = "",
+    created_at: str = "",
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    op = str(operation_type or "").strip()
+    if op not in GRAPH_REF_OPERATION_TYPES:
+        raise ValueError(f"invalid graph ref operation_type: {operation_type}")
+    event = event_id or f"gref-{uuid.uuid4().hex[:16]}"
+    now = created_at or utc_now()
+    row = {
+        "project_id": project_id,
+        "event_id": event,
+        "ref_name": str(ref_name or "active"),
+        "branch_ref": str(branch_ref or ""),
+        "batch_id": str(batch_id or ""),
+        "merge_queue_id": str(merge_queue_id or ""),
+        "operation_type": op,
+        "old_snapshot_id": str(old_snapshot_id or ""),
+        "new_snapshot_id": str(new_snapshot_id or ""),
+        "old_commit": str(old_commit or ""),
+        "new_commit": str(new_commit or ""),
+        "old_projection_id": str(old_projection_id or ""),
+        "new_projection_id": str(new_projection_id or ""),
+        "merge_epoch": str(merge_epoch or ""),
+        "rollback_epoch": str(rollback_epoch or ""),
+        "replay_epoch": str(replay_epoch or ""),
+        "source_event_id": str(source_event_id or ""),
+        "actor": str(actor or ""),
+        "evidence_json": _json(evidence or {}),
+        "created_at": now,
+    }
+    conn.execute(
+        """
+        INSERT INTO graph_ref_events (
+          project_id, event_id, ref_name, branch_ref, batch_id, merge_queue_id,
+          operation_type, old_snapshot_id, new_snapshot_id, old_commit, new_commit,
+          old_projection_id, new_projection_id, merge_epoch, rollback_epoch,
+          replay_epoch, source_event_id, actor, evidence_json, created_at
+        )
+        VALUES (
+          :project_id, :event_id, :ref_name, :branch_ref, :batch_id, :merge_queue_id,
+          :operation_type, :old_snapshot_id, :new_snapshot_id, :old_commit, :new_commit,
+          :old_projection_id, :new_projection_id, :merge_epoch, :rollback_epoch,
+          :replay_epoch, :source_event_id, :actor, :evidence_json, :created_at
+        )
+        """,
+        row,
+    )
+    out = dict(row)
+    out["evidence"] = evidence or {}
+    return out
+
+
+def list_graph_ref_events(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    ref_name: str = "",
+    operation_type: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id]
+    sql = "SELECT * FROM graph_ref_events WHERE project_id = ?"
+    if ref_name:
+        sql += " AND ref_name = ?"
+        params.append(ref_name)
+    if operation_type:
+        sql += " AND operation_type = ?"
+        params.append(operation_type)
+    sql += " ORDER BY created_at DESC, event_id DESC LIMIT ?"
+    params.append(max(1, min(500, int(limit or 50))))
+    rows = conn.execute(sql, params).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["evidence"] = _decode_json(item.get("evidence_json"), {})
+        out.append(item)
+    return out
 
 
 def _json_list(data: Any) -> str:
@@ -841,11 +993,23 @@ def activate_graph_snapshot(
     *,
     expected_old_snapshot_id: str | None = None,
     ref_name: str = "active",
+    operation_type: str = "activate",
+    branch_ref: str = "",
+    batch_id: str = "",
+    merge_queue_id: str = "",
+    merge_epoch: str = "",
+    rollback_epoch: str = "",
+    replay_epoch: str = "",
+    source_event_id: str = "",
+    evidence: dict[str, Any] | None = None,
     actor: str = "activate_hook",
     auto_rebuild_projection: bool = True,
 ) -> dict[str, Any]:
     ensure_schema(conn)
     ref_name = normalize_pending_scope_identity(ref_name=ref_name)["ref_name"]
+    op = str(operation_type or "").strip()
+    if op not in GRAPH_REF_OPERATION_TYPES:
+        raise ValueError(f"invalid graph ref operation_type: {operation_type}")
     row = conn.execute(
         "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
         (project_id, snapshot_id),
@@ -854,14 +1018,16 @@ def activate_graph_snapshot(
         raise KeyError(f"graph snapshot not found: {project_id}/{snapshot_id}")
     snapshot = dict(row)
     old = conn.execute(
-        "SELECT snapshot_id FROM graph_snapshot_refs WHERE project_id = ? AND ref_name = ?",
+        "SELECT snapshot_id, commit_sha FROM graph_snapshot_refs WHERE project_id = ? AND ref_name = ?",
         (project_id, ref_name),
     ).fetchone()
     old_id = old["snapshot_id"] if old else ""
+    old_commit = old["commit_sha"] if old else ""
     if expected_old_snapshot_id is not None and old_id != expected_old_snapshot_id:
         raise GraphSnapshotConflictError(
             f"active snapshot changed: expected {expected_old_snapshot_id!r}, got {old_id!r}"
         )
+    old_projection_id = _latest_projection_id(conn, project_id, old_id)
 
     now = utc_now()
     conn.execute(
@@ -914,6 +1080,38 @@ def activate_graph_snapshot(
         except Exception as exc:  # noqa: BLE001 - advisory; activation already committed
             projection_status = f"rebuild_failed: {exc}"
     result["projection_status"] = projection_status
+    new_projection_id = _latest_projection_id(conn, project_id, snapshot_id)
+    try:
+        ref_event = record_graph_ref_event(
+            conn,
+            project_id,
+            ref_name=ref_name,
+            operation_type=op,
+            old_snapshot_id=old_id,
+            new_snapshot_id=snapshot_id,
+            old_commit=old_commit,
+            new_commit=str(snapshot["commit_sha"] or ""),
+            old_projection_id=old_projection_id,
+            new_projection_id=new_projection_id,
+            branch_ref=branch_ref,
+            batch_id=batch_id,
+            merge_queue_id=merge_queue_id,
+            merge_epoch=merge_epoch,
+            rollback_epoch=rollback_epoch,
+            replay_epoch=replay_epoch,
+            source_event_id=source_event_id,
+            actor=actor,
+            evidence={
+                "source": "activate_graph_snapshot",
+                "projection_status": projection_status,
+                **(evidence or {}),
+            },
+        )
+        result["graph_ref_event_id"] = ref_event["event_id"]
+        result["old_projection_id"] = old_projection_id
+        result["new_projection_id"] = new_projection_id
+    except ValueError:
+        raise
     # MF 2026-05-11: snapshot activation is an in-process hook (no HTTP),
     # so _emit_dashboard_changed never fires for it. Publish here so the
     # dashboard's SSE subscribers refetch when a new snapshot becomes
@@ -927,6 +1125,7 @@ def activate_graph_snapshot(
             "commit_sha": snapshot["commit_sha"],
             "ref_name": ref_name,
             "projection_status": projection_status,
+            "graph_ref_event_id": result.get("graph_ref_event_id", ""),
             "source": "activate_graph_snapshot",
         })
         event_bus.publish("dashboard.changed", {
@@ -3226,6 +3425,7 @@ __all__ = [
     "list_graph_snapshot_files",
     "list_graph_snapshot_nodes",
     "list_graph_snapshots",
+    "list_graph_ref_events",
     "list_graph_drift",
     "normalize_pending_scope_identity",
     "graph_payload_stats",
@@ -3235,6 +3435,7 @@ __all__ = [
     "mark_pending_scope_reconcile_failed",
     "queue_pending_scope_reconcile",
     "record_reconcile_run_metric",
+    "record_graph_ref_event",
     "recover_stale_pending_scope_reconcile",
     "record_drift",
     "select_existing_graph_source",
