@@ -3119,6 +3119,154 @@ def handle_graph_governance_parallel_branches(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/allocate")
+def handle_graph_governance_parallel_branch_allocate(ctx: RequestContext):
+    """Allocate and optionally materialize one parallel branch runtime context."""
+    project_id = ctx.get_project_id()
+    from . import batch_jobs
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import (
+        branch_context_to_dict,
+        materialize_branch_worktree,
+        plan_branch_runtime_context,
+        upsert_branch_context,
+    )
+
+    task_id = str(ctx.body.get("task_id") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+
+    workspace_root = str(
+        ctx.body.get("workspace_root")
+        or ctx.body.get("repo_root_path")
+        or os.getcwd()
+    )
+    base_commit = str(ctx.body.get("base_commit") or "").strip()
+    target_head_commit = str(ctx.body.get("target_head_commit") or "").strip()
+    if _query_bool(ctx.body, "create_worktree", False) and not base_commit:
+        base_commit = batch_jobs.git_commit(workspace_root)
+    if not target_head_commit:
+        target_head_commit = base_commit
+
+    context = plan_branch_runtime_context(
+        project_id=project_id,
+        task_id=task_id,
+        workspace_root=workspace_root,
+        batch_id=str(ctx.body.get("batch_id") or ""),
+        backlog_id=str(ctx.body.get("backlog_id") or ""),
+        agent_id=str(ctx.body.get("agent_id") or ctx.body.get("actor") or ""),
+        worker_id=str(ctx.body.get("worker_id") or ""),
+        attempt=_query_int(ctx.body, "attempt", 1),
+        branch_prefix=str(ctx.body.get("branch_prefix") or "codex"),
+        worktree_root=str(ctx.body.get("worktree_root") or ".worktrees"),
+        ref_name=str(ctx.body.get("ref_name") or ctx.body.get("target_branch") or "main"),
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        merge_queue_id=str(ctx.body.get("merge_queue_id") or ""),
+    )
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.allocate")
+        with sqlite_write_lock():
+            saved = upsert_branch_context(
+                conn,
+                context,
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            conn.commit()
+
+        worktree_result: dict[str, Any] | None = None
+        if _query_bool(ctx.body, "create_worktree", False):
+            worktree_result = materialize_branch_worktree(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                repo_root_path=workspace_root,
+                fence_token=str(ctx.body.get("fence_token") or ""),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            conn.commit()
+            saved = saved.__class__(**worktree_result["context"])
+
+        return 201, {
+            "ok": True,
+            "project_id": project_id,
+            "context": branch_context_to_dict(saved),
+            "worktree": worktree_result["worktree"] if worktree_result else None,
+            "branch_strategy": worktree_result["branch_strategy"] if worktree_result else None,
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/checkpoint")
+def handle_graph_governance_parallel_branch_checkpoint(ctx: RequestContext):
+    """Record a checkpoint for a branch runtime context with fence protection."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import branch_context_to_dict, record_branch_checkpoint
+
+    task_id = str(ctx.body.get("task_id") or "").strip()
+    checkpoint_id = str(ctx.body.get("checkpoint_id") or "").strip()
+    fence_token = str(ctx.body.get("fence_token") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+    if not checkpoint_id:
+        raise ValidationError("checkpoint_id is required")
+    if not fence_token:
+        raise ValidationError("fence_token is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.checkpoint")
+        with sqlite_write_lock():
+            context = record_branch_checkpoint(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                checkpoint_id=checkpoint_id,
+                fence_token=fence_token,
+                replay_source=str(ctx.body.get("replay_source") or "checkpoint"),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            conn.commit()
+        return {"ok": True, "project_id": project_id, "context": branch_context_to_dict(context)}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/recover-expired")
+def handle_graph_governance_parallel_branch_recover_expired(ctx: RequestContext):
+    """Recover expired running branch contexts after an agent/session restart."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import (
+        branch_context_to_dict,
+        recover_expired_branch_contexts,
+    )
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.recover-expired")
+        with sqlite_write_lock():
+            recovered = recover_expired_branch_contexts(
+                conn,
+                project_id,
+                now_iso=str(ctx.body.get("now_iso") or ""),
+                actor=str(ctx.body.get("actor") or "observer_recovery"),
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "recovered_count": len(recovered),
+            "contexts": [branch_context_to_dict(context) for context in recovered],
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/dashboard")
 def handle_graph_governance_dashboard(ctx: RequestContext):
     """Return a compact dashboard projection over graph, drift, and file state."""

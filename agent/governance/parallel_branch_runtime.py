@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -162,6 +162,7 @@ STATE_MERGING = "merging"
 STATE_ABANDONED = "abandoned"
 STATE_ROLLBACK_REQUIRED = "rollback_required"
 STATE_ALLOCATED = "allocated"
+STATE_WORKTREE_READY = "worktree_ready"
 
 BATCH_STATE_OPEN = "open"
 BATCH_STATE_MERGE_IN_PROGRESS = "merge_in_progress"
@@ -572,6 +573,12 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
         created_at=row["created_at"] or "",
         updated_at=row["updated_at"] or "",
     )
+
+
+def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
+    payload = asdict(context)
+    payload["depends_on"] = list(context.depends_on)
+    return payload
 
 
 def upsert_branch_context(
@@ -1316,6 +1323,104 @@ def plan_branch_runtime_context(
     )
 
 
+def _branch_name_from_ref(branch_ref: str) -> str:
+    text = str(branch_ref or "").strip()
+    prefix = "refs/heads/"
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def _resolve_repo_worktree_path(repo_root_path: str | Path, worktree_path: str) -> Path:
+    root = Path(repo_root_path).resolve()
+    candidate = Path(str(worktree_path or ""))
+    return candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+
+
+def _worktree_relpath(repo_root_path: str | Path, worktree_path: Path) -> str:
+    root = Path(repo_root_path).resolve()
+    try:
+        return str(worktree_path.resolve().relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return ""
+
+
+def branch_strategy_from_runtime_context(
+    context: BranchTaskRuntimeContext,
+    *,
+    repo_root_path: str | Path,
+) -> Any:
+    """Build a batch_jobs BranchStrategy from branch runtime identity."""
+    from . import batch_jobs
+
+    root = batch_jobs.repo_root(repo_root_path)
+    work_branch = _branch_name_from_ref(context.branch_ref)
+    if not work_branch:
+        raise ValueError("branch_ref is required to materialize a worktree")
+    worktree_path = _resolve_repo_worktree_path(root, context.worktree_path)
+    base_commit = context.base_commit or context.target_head_commit or batch_jobs.git_commit(root)
+    return batch_jobs.BranchStrategy(
+        job_type=batch_jobs.JOB_FEATURE_WORK,
+        target_branch=context.ref_name or "main",
+        base_commit=base_commit,
+        work_branch=work_branch,
+        worktree_path=str(worktree_path),
+        worktree_relpath=_worktree_relpath(root, worktree_path),
+        direct=False,
+        merge_policy="merge_queue",
+        project_id=context.project_id,
+    )
+
+
+def materialize_branch_worktree(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    repo_root_path: str | Path,
+    fence_token: str = "",
+    status: str = STATE_WORKTREE_READY,
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Create the planned worktree and persist the updated runtime context.
+
+    Git side effects are limited to branch/worktree creation under `.worktrees`
+    using the existing batch job worktree helper. Merge execution remains outside
+    this helper.
+    """
+    from . import batch_jobs
+
+    ensure_branch_runtime_schema(conn)
+    context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+    if context.fence_token or fence_token:
+        _require_current_fence(context, fence_token)
+
+    strategy = branch_strategy_from_runtime_context(context, repo_root_path=repo_root_path)
+    worktree = batch_jobs.create_worktree(strategy, repo_root_path=repo_root_path)
+    head_commit = ""
+    try:
+        head_commit = batch_jobs.git_commit(strategy.worktree_path)
+    except batch_jobs.BatchJobError:
+        head_commit = context.head_commit
+
+    updated = replace(
+        context,
+        status=status,
+        branch_ref=f"refs/heads/{strategy.work_branch}",
+        ref_name=strategy.target_branch,
+        worktree_path=strategy.worktree_path,
+        base_commit=context.base_commit or strategy.base_commit,
+        target_head_commit=context.target_head_commit or strategy.base_commit,
+        head_commit=head_commit or context.head_commit,
+    )
+    saved = upsert_branch_context(conn, updated, now_iso=now_iso)
+    return {
+        "context": branch_context_to_dict(saved),
+        "branch_strategy": strategy.to_metadata(),
+        "worktree": worktree,
+    }
+
+
 def branch_context_from_chain_stage(
     *,
     project_id: str,
@@ -1999,6 +2104,7 @@ def _compact_branch_lane(
         "branch_ref": context.branch_ref,
         "ref_name": context.ref_name,
         "worktree_id": context.worktree_id,
+        "worktree_path": context.worktree_path,
         "status": recovery_state,
         "observed_status": context.status,
         "attempt": context.attempt,

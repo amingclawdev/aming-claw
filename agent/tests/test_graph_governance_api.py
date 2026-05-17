@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from agent.governance.errors import ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
 from agent.governance.parallel_branch_runtime import (
     BATCH_STATE_OPEN,
+    BranchRuntimeFenceError,
     BranchTaskRuntimeContext,
     BatchMergeItem,
     BatchMergeRuntime,
@@ -70,6 +72,19 @@ def _bare_handler():
     handler.send_header = lambda key, value: handler.sent_headers.append((key, value))
     handler.end_headers = lambda: None
     return handler
+
+
+def _git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "README.md").write_text("# test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    return repo
 
 
 @pytest.fixture()
@@ -227,6 +242,118 @@ def test_parallel_branch_read_model_route_returns_durable_runtime_state(conn):
         "merge_queue_rows": False,
         "rollback_rows": False,
     }
+
+
+def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_model(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+
+    status, created = server.handle_graph_governance_parallel_branch_allocate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "API Branch Task",
+                "batch_id": "PB-api-alloc",
+                "backlog_id": "ARCH-PB-ALLOC",
+                "workspace_root": str(repo),
+                "worker_id": "worker api",
+                "merge_queue_id": "mergeq-api-alloc",
+                "create_worktree": True,
+                "now_iso": "2026-05-17T07:10:00Z",
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["ok"] is True
+    context = created["context"]
+    assert context["status"] == "worktree_ready"
+    assert context["branch_ref"] == "refs/heads/codex/api-branch-task"
+    assert context["worktree_path"] == str(repo / ".worktrees" / "worker-api" / "api-branch-task")
+    assert created["worktree"]["created"] is True
+    assert created["worktree"]["branch_graph"]["status"] == "ready"
+
+    read = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": "PB-api-alloc",
+                "merge_queue_id": "mergeq-api-alloc",
+                "limit": "5",
+            },
+        )
+    )
+    lanes = read["read_model"]["branch_lanes"]
+    assert len(lanes) == 1
+    assert lanes[0]["task_id"] == "API Branch Task"
+    assert lanes[0]["status"] == "worktree_ready"
+    assert lanes[0]["worktree_path"] == context["worktree_path"]
+    assert lanes[0]["graph_epoch"]["base_commit"]
+
+
+def test_parallel_branch_recover_and_checkpoint_routes_enforce_fence(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-recover",
+            task_id="recover-task",
+            branch_ref="refs/heads/codex/recover-task",
+            status="running",
+            lease_id="lease-old",
+            lease_expires_at="2026-05-17T07:00:00Z",
+            fence_token="fence-old",
+            checkpoint_id="checkpoint-old",
+            replay_source="checkpoint",
+        ),
+        now_iso="2026-05-17T07:00:00Z",
+    )
+
+    recovered = server.handle_graph_governance_parallel_branch_recover_expired(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "now_iso": "2026-05-17T07:10:00Z",
+                "actor": "observer-test",
+            },
+        )
+    )
+
+    assert recovered["recovered_count"] == 1
+    context = recovered["contexts"][0]
+    assert context["status"] == "reclaimable"
+    assert context["attempt"] == 2
+    assert context["fence_token"] != "fence-old"
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_checkpoint(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "recover-task",
+                    "checkpoint_id": "checkpoint-stale",
+                    "fence_token": "fence-old",
+                },
+            )
+        )
+
+    checkpointed = server.handle_graph_governance_parallel_branch_checkpoint(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "recover-task",
+                "checkpoint_id": "checkpoint-after-reclaim",
+                "fence_token": context["fence_token"],
+                "now_iso": "2026-05-17T07:11:00Z",
+            },
+        )
+    )
+
+    assert checkpointed["ok"] is True
+    assert checkpointed["context"]["checkpoint_id"] == "checkpoint-after-reclaim"
 
 
 def test_governance_handler_json_response_includes_dev_cors_headers():

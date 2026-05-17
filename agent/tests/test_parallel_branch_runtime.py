@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -19,6 +20,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_RECLAIMABLE,
     STATE_RUNNING,
     STATE_ALLOCATED,
+    STATE_WORKTREE_READY,
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
@@ -27,6 +29,7 @@ from agent.governance.parallel_branch_runtime import (
     ensure_branch_runtime_schema,
     get_branch_context,
     list_branch_contexts,
+    materialize_branch_worktree,
     plan_branch_runtime_context,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
@@ -88,6 +91,19 @@ def _runtime_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     ensure_branch_runtime_schema(conn)
     return conn
+
+
+def _git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "README.md").write_text("# test\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    return repo
 
 
 def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
@@ -402,6 +418,50 @@ def test_mf_branch_allocation_planner_sanitizes_worker_attempt_and_persists() ->
     assert reloaded is not None
     assert reloaded.worker_id == "worker 0/../../x"
     assert reloaded.merge_queue_id == "mergeq-PB009"
+
+
+def test_mf_branch_worktree_materialization_uses_planned_identity(tmp_path) -> None:
+    repo = _git_repo(tmp_path)
+    base = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    conn = _runtime_conn()
+    planned = plan_branch_runtime_context(
+        project_id=PROJECT_ID,
+        task_id="MF Branch API",
+        batch_id="PB-001",
+        backlog_id="ARCH-PB-WORKTREE",
+        worker_id="worker one",
+        workspace_root=str(repo),
+        base_commit=base,
+        target_head_commit=base,
+        merge_queue_id="mergeq-worktree",
+    )
+    upsert_branch_context(conn, planned, now_iso=NOW)
+
+    result = materialize_branch_worktree(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="MF Branch API",
+        repo_root_path=repo,
+        now_iso=NOW,
+    )
+
+    context = get_branch_context(conn, PROJECT_ID, "MF Branch API")
+    assert context is not None
+    assert context.status == STATE_WORKTREE_READY
+    assert context.branch_ref == "refs/heads/codex/mf-branch-api"
+    assert context.worktree_path == str(repo / ".worktrees" / "worker-one" / "mf-branch-api")
+    assert context.head_commit == base
+    assert result["worktree"]["created"] is True
+    assert result["branch_strategy"]["work_branch"] == "codex/mf-branch-api"
+    assert result["branch_strategy"]["merge_policy"] == "merge_queue"
+    assert (repo / ".worktrees" / "worker-one" / "mf-branch-api" / ".git").exists()
+    assert result["worktree"]["branch_graph"]["status"] == "ready"
 
 
 def test_pb012_branch_contexts_are_isolated_by_project_and_batch() -> None:

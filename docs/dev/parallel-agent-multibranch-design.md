@@ -417,6 +417,16 @@ identity. It sanitizes branch/worktree names and persists through the existing
 branch runtime table; actual `git worktree` creation remains delegated to the
 executor/MF client.
 
+Implemented MF adapter API slice: governance exposes
+`POST /api/graph-governance/{project_id}/parallel-branches/allocate` to persist
+the planned runtime context and, when explicitly requested, materialize the
+isolated git worktree under `.worktrees` through the existing branch graph
+artifact initializer. `POST .../checkpoint` records replay checkpoints with
+fence-token enforcement, and `POST .../recover-expired` rotates expired running
+contexts into `reclaimable` after restart. These APIs create the execution
+front door for MF/executor clients, while live merge and rollback execution
+remain gated by the merge queue and graph checks.
+
 Only after this loop is stable should normal executor worker parallelism be
 raised above the current conservative mode.
 
