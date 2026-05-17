@@ -578,12 +578,10 @@ def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, t
 
     assert result["ok"] is True
     assert result["scope_file_delta"]["changed_files"] == ["agent/tests/test_service.py"]
-    assert result["scope_file_delta"]["strategy"] == "full_rebuild_fallback"
-    assert result["scope_file_delta"]["graph_delta_mode"] == "full_rebuild"
-    assert result["scope_file_delta"]["fallback_reason"] == "test_consumer_fanin_requires_full_rebuild"
-    assert result["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
-    assert result["scope_graph_delta"]["mode"] == "full_rebuild"
-    assert result["scope_graph_delta"]["fallback_reason"] == "test_consumer_fanin_requires_full_rebuild"
+    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "test_fanin_hash_only"
+    assert result["scope_graph_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_graph_delta"]["mode"] == "test_fanin_hash_only"
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/tests/test_service.py"]
@@ -601,6 +599,117 @@ def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, t
     assert len(events) == 1
     assert events[0]["payload"]["files"] == ["agent/tests/test_service.py"]
     assert events[0]["payload"]["file_role"] == "test"
+
+
+def test_pending_scope_materializer_incrementally_moves_test_fanin_bindings(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _write(
+        project / "agent" / "other.py",
+        "def other_entry():\n"
+        "    return 'ok'\n",
+    )
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.service import service_entry\n\n"
+        "def test_integration():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-test-fanin-move",
+        commit_sha=base_commit,
+        snapshot_id="full-base-test-fanin-move",
+        created_by="test",
+        activate=True,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.other import other_entry\n\n"
+        "def test_integration():\n"
+        "    assert other_entry() == 'ok'\n",
+    )
+    _git(project, "add", "agent/tests/test_integration.py")
+    _git(project, "commit", "-m", "move integration test import")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-fanin-move",
+        snapshot_id="scope-test-fanin-move",
+        semantic_use_ai=True,
+        semantic_ai_call=lambda _stage, payload: {"feature_name": payload["feature"]["node_id"]},
+    )
+
+    assert result["ok"] is True
+    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "test_fanin_hash_only"
+    assert result["scope_graph_delta"]["mode"] == "test_fanin_hash_only"
+    assert result["semantic_enrichment"]["ai_selected_count"] == 0
+
+    graph = state_reconcile._read_snapshot_graph(PID, "scope-test-fanin-move")
+    nodes_by_module = {
+        (node.get("metadata") or {}).get("module"): node
+        for node in state_reconcile._deps_graph_nodes(graph)
+        if (node.get("metadata") or {}).get("module")
+    }
+    service = nodes_by_module["agent.service"]
+    other = nodes_by_module["agent.other"]
+    service_id = state_reconcile._node_id(service)
+    other_id = state_reconcile._node_id(other)
+    assert "agent/tests/test_integration.py" not in service["test"]
+    assert "agent/tests/test_integration.py" in other["test"]
+    assert {
+        entry["path"]
+        for entry in (service.get("metadata") or {}).get("test_consumer_fanin", [])
+    } == {"agent/tests/test_service.py"}
+    assert {
+        entry["path"]
+        for entry in (other.get("metadata") or {}).get("test_consumer_fanin", [])
+    } == {"agent/tests/test_integration.py"}
+    assert service_id in result["scope_graph_delta"]["updated_nodes"]
+    assert other_id in result["scope_graph_delta"]["updated_nodes"]
+    assert service_id in result["scope_graph_delta"]["semantic_stale_node_ids"]
+    assert other_id in result["scope_graph_delta"]["semantic_stale_node_ids"]
+
+    binding_events = graph_events.list_events(
+        conn,
+        PID,
+        "scope-test-fanin-move",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["test_binding_added", "test_binding_removed"],
+    )
+    by_type = {}
+    for event in binding_events:
+        by_type.setdefault(event["event_type"], []).append(event["payload"])
+    assert {
+        "node_id": service_id,
+        "path": "agent/tests/test_integration.py",
+        "binding": "test",
+    } in by_type["test_binding_removed"]
+    assert {
+        "node_id": other_id,
+        "path": "agent/tests/test_integration.py",
+        "binding": "test",
+    } in by_type["test_binding_added"]
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(

@@ -63,9 +63,11 @@ from agent.governance.reconcile_file_inventory import (
     git_tracked_paths,
 )
 from agent.governance.reconcile_phases.phase_z_v2 import (
+    build_test_consumer_fanin_index,
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
     extract_typed_relations,
+    parse_production_modules,
     parse_production_module_file,
 )
 
@@ -529,6 +531,10 @@ def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
 _INCREMENTAL_METADATA_FILE_KINDS = {"config", "doc", "index_doc"}
 
 
+def _norm_repo_path(path: Any) -> str:
+    return str(path or "").replace("\\", "/").strip("/")
+
+
 def _json_clone(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
@@ -727,18 +733,14 @@ def _incremental_metadata_scope_eligibility(
     source_checks: list[dict[str, Any]] = []
     source_paths: list[str] = []
     metadata_paths: list[str] = []
+    test_paths: list[str] = []
     for path in sorted(impacted):
         old_row = old_by_path.get(path) or {}
         new_row = new_by_path.get(path) or {}
         kind = str(new_row.get("file_kind") or old_row.get("file_kind") or "")
         role = str(new_row.get("attachment_role") or old_row.get("attachment_role") or "")
         if kind == "test" and role != "primary":
-            unsupported.append({
-                "path": path,
-                "file_kind": kind,
-                "attachment_role": role,
-                "reason": "test_consumer_fanin_requires_full_rebuild",
-            })
+            test_paths.append(path)
             continue
         if kind in _INCREMENTAL_METADATA_FILE_KINDS and role != "primary":
             metadata_paths.append(path)
@@ -770,8 +772,19 @@ def _incremental_metadata_scope_eligibility(
             "unsupported": unsupported,
             "source_checks": source_checks,
         }
+    if test_paths and (source_paths or metadata_paths):
+        return {
+            "supported": False,
+            "reason": "test_fanin_mixed_changes_require_full_rebuild",
+            "test_paths": test_paths,
+            "source_paths": source_paths,
+            "metadata_paths": metadata_paths,
+            "source_checks": source_checks,
+        }
     mode = "metadata_only"
-    if source_paths and metadata_paths:
+    if test_paths:
+        mode = "test_fanin_hash_only"
+    elif source_paths and metadata_paths:
         mode = "mixed_hash_only"
     elif source_paths:
         mode = "source_hash_only"
@@ -781,7 +794,123 @@ def _incremental_metadata_scope_eligibility(
         "mode": mode,
         "source_paths": source_paths,
         "metadata_paths": metadata_paths,
+        "test_paths": test_paths,
         "source_checks": source_checks,
+    }
+
+
+def _fanin_entry_path(entry: dict[str, Any]) -> str:
+    return _norm_repo_path(entry.get("rel_path") or entry.get("path"))
+
+
+def _graph_fanin_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": _fanin_entry_path(entry),
+        "evidence": str(entry.get("evidence") or "test_import_fanin"),
+        "imports": sorted({
+            str(token or "").strip()
+            for token in entry.get("imports", []) or []
+            if str(token or "").strip()
+        }),
+    }
+
+
+def _apply_incremental_test_fanin_bindings(
+    project_root: str | Path,
+    candidate_graph: dict[str, Any],
+    *,
+    changed_test_paths: list[str],
+) -> dict[str, Any]:
+    changed = {
+        _norm_repo_path(path)
+        for path in changed_test_paths
+        if _norm_repo_path(path)
+    }
+    if not changed:
+        return {"ok": True, "changed_test_paths": [], "updated_node_ids": []}
+
+    from agent.governance.project_profile import discover_project_profile
+
+    root = Path(project_root).resolve()
+    profile = discover_project_profile(str(root))
+    modules = parse_production_modules(str(root), profile=profile)
+    fanin_index = build_test_consumer_fanin_index(str(root), modules, profile=profile)
+    new_fanin_by_module: dict[str, list[dict[str, Any]]] = {}
+    for module_name, entries in fanin_index.items():
+        kept = [
+            _graph_fanin_entry(entry)
+            for entry in entries or []
+            if _fanin_entry_path(entry) in changed
+        ]
+        if kept:
+            new_fanin_by_module[str(module_name)] = kept
+
+    updated_node_ids: list[str] = []
+    updated_modules: list[str] = []
+    for node in _deps_graph_nodes(candidate_graph):
+        node_id = _node_id(node)
+        metadata = _node_metadata(node)
+        module_name = str(metadata.get("module") or node.get("module") or "")
+        if not module_name:
+            continue
+        old_fanin = [
+            dict(entry)
+            for entry in metadata.get("test_consumer_fanin", []) or []
+            if isinstance(entry, dict)
+        ]
+        old_changed_paths = {
+            _norm_repo_path(entry.get("path"))
+            for entry in old_fanin
+            if _norm_repo_path(entry.get("path")) in changed
+        }
+        new_changed_fanin = new_fanin_by_module.get(module_name, [])
+        if not old_changed_paths and not new_changed_fanin:
+            continue
+
+        kept_fanin = [
+            _graph_fanin_entry(entry)
+            for entry in old_fanin
+            if _norm_repo_path(entry.get("path")) not in changed
+        ]
+        merged_fanin = sorted(
+            kept_fanin + new_changed_fanin,
+            key=lambda item: (str(item.get("path") or ""), ",".join(item.get("imports") or [])),
+        )
+        old_fanin_paths = {
+            _norm_repo_path(entry.get("path"))
+            for entry in old_fanin
+            if _norm_repo_path(entry.get("path"))
+        }
+        direct_tests = {
+            path for path in _path_values(node, "test")
+            if path not in old_fanin_paths
+        }
+        fanin_paths = {
+            _norm_repo_path(entry.get("path"))
+            for entry in merged_fanin
+            if _norm_repo_path(entry.get("path"))
+        }
+        new_tests = sorted(direct_tests | fanin_paths)
+        old_tests = sorted(_path_values(node, "test"))
+        old_normalized_fanin = sorted(
+            [_graph_fanin_entry(entry) for entry in old_fanin],
+            key=lambda item: (str(item.get("path") or ""), ",".join(item.get("imports") or [])),
+        )
+        if new_tests == old_tests and merged_fanin == old_normalized_fanin:
+            continue
+        node["test"] = new_tests
+        node["test_coverage"] = "direct" if new_tests else "none"
+        metadata["test_consumer_fanin"] = merged_fanin
+        node["metadata"] = metadata
+        if node_id:
+            updated_node_ids.append(node_id)
+        updated_modules.append(module_name)
+
+    return {
+        "ok": True,
+        "changed_test_paths": sorted(changed),
+        "updated_node_ids": sorted(set(updated_node_ids)),
+        "updated_modules": sorted(set(updated_modules)),
     }
 
 
@@ -816,7 +945,10 @@ def _build_scope_graph_delta(
         )
         if str(path or "").strip()
     }
-    changed_node_ids = _node_ids_for_paths(new_graph_json, changed_paths)
+    changed_node_ids = sorted(
+        set(_node_ids_for_paths(old_graph_json, changed_paths))
+        | set(_node_ids_for_paths(new_graph_json, changed_paths))
+    )
     return {
         "strategy": strategy,
         "mode": mode,
@@ -1854,6 +1986,59 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         incremental_metadata["mode"] = graph_delta_mode
         metadata["incremental_scope_reconcile"] = incremental_metadata
         candidate_graph["metadata"] = metadata
+    test_fanin_update: dict[str, Any] = {}
+    if graph_delta_mode == "test_fanin_hash_only":
+        test_fanin_update = _apply_incremental_test_fanin_bindings(
+            root,
+            candidate_graph,
+            changed_test_paths=[
+                str(path)
+                for path in eligibility.get("test_paths", []) or []
+                if str(path).strip()
+            ],
+        )
+        governance_index = build_governance_index(
+            conn,
+            project_id,
+            root,
+            run_id=rid,
+            commit_sha=target,
+            candidate_graph=candidate_graph,
+            snapshot_id=sid,
+            snapshot_kind="scope",
+        )
+        file_inventory = _normalize_inventory_commit(
+            [
+                row for row in (governance_index.get("file_inventory") or [])
+                if isinstance(row, dict)
+            ],
+            commit_sha=target,
+        )
+        scope_file_delta = _build_scope_file_delta(
+            project_root=root,
+            old_rows=active_inventory,
+            new_rows=file_inventory,
+            changed_files=changed_files,
+        )
+        final_eligibility = _incremental_metadata_scope_eligibility(
+            scope_file_delta,
+            project_root=root,
+            active_graph_json=active_graph_json,
+            old_rows=active_inventory,
+            new_rows=file_inventory,
+        )
+        if not final_eligibility.get("supported"):
+            return {
+                "ok": False,
+                "fallback_reason": str(final_eligibility.get("reason") or "incremental_test_fanin_unsupported"),
+                "incremental_eligibility": final_eligibility,
+                "test_fanin_update": test_fanin_update,
+            }
+        graph_delta_mode = str(final_eligibility.get("mode") or graph_delta_mode)
+        eligibility = {
+            **final_eligibility,
+            "test_fanin_update": test_fanin_update,
+        }
 
     state_dir = _governance_state_dir(project_id, rid)
     scratch_dir = state_dir / "scratch"
@@ -1898,6 +2083,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         output_payload={
             "graph_stats": graph_payload_stats(candidate_graph),
             "eligibility": eligibility,
+            "test_fanin_update": test_fanin_update,
         },
     )
     hash_metadata_merge = merge_feature_hashes_into_graph_nodes(candidate_graph, governance_index)
