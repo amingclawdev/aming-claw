@@ -6,10 +6,13 @@ import pytest
 
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
+    ACTION_BLOCKED_BY_DEPENDENCY,
     ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE,
     ACTION_WAIT_FOR_DEPENDENCY,
+    STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_READY,
     STATE_MERGED,
+    STATE_RUNNING,
     STATE_STALE_AFTER_DEPENDENCY_MERGE,
     STATE_WAITING_DEPENDENCY,
     MergeQueueItem,
@@ -79,6 +82,7 @@ def test_pb002_downstream_merge_waits_for_unmerged_foundation_dependency() -> No
     assert decisions["T2"].queue_state == STATE_WAITING_DEPENDENCY
     assert decisions["T2"].action == ACTION_WAIT_FOR_DEPENDENCY
     assert decisions["T2"].dependency_blockers == ("T1",)
+    assert decisions["T2"].dependency_blocker_types == {"T1": ("hard_depends_on",)}
     assert decisions["T2"].next_actions == ("wait_for_dependency", "do_not_merge")
     assert decisions["T2"].merge_allowed is False
     assert decisions["T2"].target_branch_mutation_allowed is False
@@ -187,6 +191,7 @@ def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:
         "queue_state": STATE_WAITING_DEPENDENCY,
         "action": ACTION_WAIT_FOR_DEPENDENCY,
         "dependency_blockers": ["T1"],
+        "dependency_blocker_types": {"T1": ["hard_depends_on"]},
         "stale_target_head": False,
         "next_actions": ["wait_for_dependency", "do_not_merge"],
         "merge_allowed": False,
@@ -196,6 +201,96 @@ def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:
         "validation_attempt": 0,
         "merge_preview_id": "",
     }
+
+
+def test_typed_dependency_blockers_are_compact_and_merge_blocking() -> None:
+    items = [
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=QUEUE_ID,
+            queue_item_id="item-T1",
+            task_id="T1",
+            branch_ref="refs/heads/codex/PB002-T1-foundation",
+            queue_index=1,
+            status=STATE_RUNNING,
+            target_ref=TARGET_REF,
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=QUEUE_ID,
+            queue_item_id="item-T2",
+            task_id="T2",
+            branch_ref="refs/heads/codex/PB002-T2-feature",
+            queue_index=2,
+            status=STATE_MERGE_READY,
+            target_ref=TARGET_REF,
+            hard_depends_on=("T1",),
+            serializes_after=("T1",),
+            requires_graph_epoch=("T1",),
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=QUEUE_ID,
+            queue_item_id="item-T3",
+            task_id="T3",
+            branch_ref="refs/heads/codex/PB002-T3-independent",
+            queue_index=3,
+            status=STATE_MERGE_READY,
+            target_ref=TARGET_REF,
+        ),
+    ]
+
+    plan = decide_merge_queue(items, scenario_id="PB-002")
+    decisions = _by_task(plan)
+
+    assert decisions["T2"].queue_state == STATE_DEPENDENCY_BLOCKED
+    assert decisions["T2"].action == ACTION_BLOCKED_BY_DEPENDENCY
+    assert decisions["T2"].dependency_blockers == ("T1",)
+    assert decisions["T2"].dependency_blocker_types == {
+        "T1": ("hard_depends_on", "requires_graph_epoch", "serializes_after")
+    }
+    assert decisions["T2"].merge_allowed is False
+    assert decisions["T3"].queue_state == STATE_MERGE_READY
+    assert decisions["T3"].merge_allowed is True
+    assert plan.mergeable_task_ids == ("T3",)
+
+
+def test_conflict_dependencies_require_operator_resolution() -> None:
+    items = [
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=QUEUE_ID,
+            queue_item_id="item-T1",
+            task_id="T1",
+            branch_ref="refs/heads/codex/PB002-T1-node-change",
+            queue_index=1,
+            status=STATE_MERGE_READY,
+            target_ref=TARGET_REF,
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id=QUEUE_ID,
+            queue_item_id="item-T2",
+            task_id="T2",
+            branch_ref="refs/heads/codex/PB002-T2-conflicting-node-change",
+            queue_index=2,
+            status=STATE_MERGE_READY,
+            target_ref=TARGET_REF,
+            conflicts_with=("T1",),
+            same_node_or_file_conflicts=("T1",),
+        ),
+    ]
+
+    plan = decide_merge_queue(items, scenario_id="PB-002")
+    decisions = _by_task(plan)
+
+    assert decisions["T1"].merge_allowed is True
+    assert decisions["T2"].queue_state == STATE_DEPENDENCY_BLOCKED
+    assert decisions["T2"].action == ACTION_BLOCKED_BY_DEPENDENCY
+    assert decisions["T2"].dependency_blocker_types == {
+        "T1": ("conflicts_with", "same_node_or_file_conflict")
+    }
+    assert decisions["T2"].next_actions == ("resolve_dependency", "do_not_merge")
 
 
 def test_pb012_merge_queue_rejects_mixed_project_queue_or_target_scope() -> None:

@@ -107,6 +107,14 @@ ACTION_CLEANUP_RETAINED_BRANCH = "cleanup_retained_branch"
 TERMINAL_NON_BLOCKING_STATES = {"merged", "abandoned", "cleaned"}
 MERGE_DONE_STATES = {STATE_MERGED}
 MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
+MERGE_REVALIDATION_BLOCKING_STATES = {
+    STATE_RUNNING,
+    STATE_DEPENDENCY_BLOCKED,
+    STATE_VALIDATING,
+    STATE_STALE_AFTER_DEPENDENCY_MERGE,
+    STATE_REBASE_REQUIRED,
+    STATE_MERGE_BLOCKED,
+}
 MERGE_READY_INPUT_STATES = {
     STATE_QUEUED_FOR_MERGE,
     STATE_VALIDATED,
@@ -248,6 +256,11 @@ class MergeQueueItem:
     queue_index: int
     status: str
     depends_on: tuple[str, ...] = ()
+    hard_depends_on: tuple[str, ...] = ()
+    serializes_after: tuple[str, ...] = ()
+    conflicts_with: tuple[str, ...] = ()
+    same_node_or_file_conflicts: tuple[str, ...] = ()
+    requires_graph_epoch: tuple[str, ...] = ()
     target_ref: str = "refs/heads/main"
     base_commit: str = ""
     branch_head: str = ""
@@ -268,6 +281,7 @@ class MergeQueueDecision:
     queue_state: str
     action: str
     dependency_blockers: tuple[str, ...] = ()
+    dependency_blocker_types: dict[str, tuple[str, ...]] = field(default_factory=dict)
     stale_target_head: bool = False
     next_actions: tuple[str, ...] = ()
     merge_allowed: bool = False
@@ -286,6 +300,10 @@ class MergeQueueDecision:
             "queue_state": self.queue_state,
             "action": self.action,
             "dependency_blockers": list(self.dependency_blockers),
+            "dependency_blocker_types": {
+                key: list(values)
+                for key, values in sorted(self.dependency_blocker_types.items())
+            },
             "stale_target_head": self.stale_target_head,
             "next_actions": list(self.next_actions),
             "merge_allowed": self.merge_allowed,
@@ -786,13 +804,44 @@ def _merge_dependency_blockers(
     item: MergeQueueItem,
     *,
     items_by_task: dict[str, MergeQueueItem],
-) -> tuple[str, ...]:
-    blockers: list[str] = []
-    for dep in item.depends_on:
-        dep_item = items_by_task.get(dep)
-        if dep_item is None or dep_item.status not in MERGE_DONE_STATES:
-            blockers.append(dep)
-    return tuple(blockers)
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    blocker_types: dict[str, set[str]] = {}
+
+    def add(dep: str, blocker_type: str) -> None:
+        dep_id = str(dep or "").strip()
+        if not dep_id:
+            return
+        blocker_types.setdefault(dep_id, set()).add(blocker_type)
+
+    dependency_groups = (
+        ("hard_depends_on", tuple(item.depends_on) + tuple(item.hard_depends_on)),
+        ("serializes_after", tuple(item.serializes_after)),
+        ("requires_graph_epoch", tuple(item.requires_graph_epoch)),
+    )
+    for blocker_type, deps in dependency_groups:
+        for dep in deps:
+            dep_item = items_by_task.get(dep)
+            if dep_item is None or dep_item.status not in MERGE_DONE_STATES:
+                add(dep, blocker_type)
+                continue
+            if blocker_type == "requires_graph_epoch" and not (
+                dep_item.snapshot_id and dep_item.projection_id
+            ):
+                add(dep, blocker_type)
+
+    for blocker_type, deps in (
+        ("conflicts_with", item.conflicts_with),
+        ("same_node_or_file_conflict", item.same_node_or_file_conflicts),
+    ):
+        for dep in deps:
+            dep_item = items_by_task.get(dep)
+            if dep_item is None or dep_item.status not in TERMINAL_NON_BLOCKING_STATES:
+                add(dep, blocker_type)
+
+    ordered = tuple(dep for dep in items_by_task if dep in blocker_types)
+    extras = tuple(sorted(dep for dep in blocker_types if dep not in items_by_task))
+    blockers = ordered + extras
+    return blockers, {dep: tuple(sorted(blocker_types[dep])) for dep in blockers}
 
 
 def _has_terminal_dependency_blocker(
@@ -802,9 +851,17 @@ def _has_terminal_dependency_blocker(
 ) -> bool:
     for dep in blockers:
         dep_item = items_by_task.get(dep)
-        if dep_item is None or dep_item.status in MERGE_BLOCKING_STATES:
+        blocking_states = MERGE_BLOCKING_STATES | MERGE_REVALIDATION_BLOCKING_STATES
+        if dep_item is None or dep_item.status in blocking_states:
             return True
     return False
+
+
+def _has_conflict_dependency_blocker(blocker_types: dict[str, tuple[str, ...]]) -> bool:
+    return any(
+        "conflicts_with" in values or "same_node_or_file_conflict" in values
+        for values in blocker_types.values()
+    )
 
 
 def _target_head_moved_after_validation(item: MergeQueueItem) -> bool:
@@ -846,11 +903,12 @@ def decide_merge_queue(
     decisions: list[MergeQueueDecision] = []
 
     for item in ordered_items:
-        blockers = _merge_dependency_blockers(item, items_by_task=items_by_task)
+        blockers, blocker_types = _merge_dependency_blockers(item, items_by_task=items_by_task)
         terminal_blocker = _has_terminal_dependency_blocker(
             blockers,
             items_by_task=items_by_task,
         )
+        conflict_blocker = _has_conflict_dependency_blocker(blocker_types)
         stale_target_head = False
 
         if item.status == STATE_MERGED:
@@ -868,8 +926,9 @@ def decide_merge_queue(
             graph_allowed = False
             semantic_allowed = False
         elif blockers:
-            queue_state = STATE_DEPENDENCY_BLOCKED if terminal_blocker else STATE_WAITING_DEPENDENCY
-            action = ACTION_BLOCKED_BY_DEPENDENCY if terminal_blocker else ACTION_WAIT_FOR_DEPENDENCY
+            hard_blocked = terminal_blocker or conflict_blocker
+            queue_state = STATE_DEPENDENCY_BLOCKED if hard_blocked else STATE_WAITING_DEPENDENCY
+            action = ACTION_BLOCKED_BY_DEPENDENCY if hard_blocked else ACTION_WAIT_FOR_DEPENDENCY
             merge_allowed = False
             target_mutation_allowed = False
             graph_allowed = False
@@ -913,6 +972,7 @@ def decide_merge_queue(
                 queue_state=queue_state,
                 action=action,
                 dependency_blockers=blockers,
+                dependency_blocker_types=blocker_types,
                 stale_target_head=stale_target_head,
                 next_actions=_merge_queue_actions_for(action),
                 merge_allowed=merge_allowed,

@@ -183,6 +183,12 @@ Dependency types:
 | `same_node_or_file_conflict` | Graph or file overlap detected. |
 | `requires_graph_epoch` | Branch requires a specific graph/projection epoch before merge. |
 
+Implemented runtime slice: `decide_merge_queue` carries compact typed blocker
+evidence for all dependency types above. Failed, abandoned, stale,
+rebase-required, running, validating, or merge-blocked upstream items move the
+downstream item to `dependency_blocked`; unrelated branches remain mergeable
+when they do not share blockers.
+
 Queue states:
 
 ```text
