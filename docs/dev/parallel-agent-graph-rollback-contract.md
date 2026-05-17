@@ -64,6 +64,13 @@ old/new snapshot, old/new commit, old/new projection, actor, and bounded
 evidence. Projection currentness, job invalidation, and synthetic backfill remain
 separate rollout steps.
 
+Implemented read-model slice: `build_graph_rollback_epoch_state` now returns a
+compact PB-005/PB-011 state view from `graph_ref_events`, `graph_snapshot_refs`,
+`graph_semantic_projections`, and `pending_scope_reconcile`. It labels active
+target state, branch-local candidates, abandoned merge epochs, current versus
+abandoned/candidate projections, and pending scope rows without mutating graph
+state.
+
 ## Operation Types
 
 | Operation | Allowed source | Required effect |
@@ -197,7 +204,8 @@ pagination.
 3. Backfill synthetic active ref event for existing active snapshots.
 4. Move snapshot activation through ref event writer.
 5. Add projection currentness rules based on ref event and projection rule
-   version.
+   version. First compact rollback-state labels are implemented; semantic job
+   invalidation remains a later rollout step.
 6. Add rollback/revert/replay operations without dashboard write actions.
 7. Add branch/ref/batch/epoch keys to pending scope and semantic jobs.
 8. Add dashboard/MCP compact read model.

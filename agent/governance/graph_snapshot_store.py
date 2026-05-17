@@ -672,6 +672,202 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _compact_pending_scope_row(row: dict[str, Any]) -> dict[str, Any]:
+    evidence = _decode_json(row.get("evidence_json"), {})
+    return {
+        "ref_name": str(row.get("ref_name") or ""),
+        "branch_ref": str(row.get("branch_ref") or ""),
+        "worktree_id": str(row.get("worktree_id") or ""),
+        "commit_sha": str(row.get("commit_sha") or ""),
+        "status": str(row.get("status") or ""),
+        "snapshot_id": str(row.get("snapshot_id") or ""),
+        "evidence": evidence,
+    }
+
+
+def _source_matches_ref_event(source: str, event: dict[str, Any]) -> bool:
+    source_value = str(source or "").strip()
+    if not source_value:
+        return False
+    return source_value in {
+        str(event.get("event_id") or ""),
+        str(event.get("merge_epoch") or ""),
+        str(event.get("new_snapshot_id") or ""),
+        str(event.get("new_commit") or ""),
+    }
+
+
+def _rollback_source_values(event: dict[str, Any]) -> set[str]:
+    evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+    sources = {str(event.get("source_event_id") or "").strip()}
+    for key in ("abandoned_event_ids", "abandoned_merge_epochs", "abandoned_snapshot_ids"):
+        values = evidence.get(key)
+        if isinstance(values, list):
+            sources.update(str(value or "").strip() for value in values)
+        elif values:
+            sources.add(str(values).strip())
+    return {source for source in sources if source}
+
+
+def _projection_rows_by_id(
+    conn: sqlite3.Connection,
+    project_id: str,
+    projection_ids: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    ids = sorted({str(pid or "").strip() for pid in projection_ids if str(pid or "").strip()})
+    if not ids or not _table_exists(conn, "graph_semantic_projections"):
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM graph_semantic_projections
+        WHERE project_id = ? AND projection_id IN ({placeholders})
+        """,
+        (project_id, *ids),
+    ).fetchall()
+    return {str(row["projection_id"]): dict(row) for row in rows}
+
+
+def build_graph_rollback_epoch_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    ref_name: str = "active",
+    rollback_epoch: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return compact PB-005/PB-011 graph rollback state for operators/tests."""
+    ensure_schema(conn)
+    bounded_limit = max(1, min(500, int(limit or 50)))
+    ref = normalize_pending_scope_identity(ref_name=ref_name)["ref_name"]
+    ref_row = conn.execute(
+        """
+        SELECT snapshot_id, commit_sha
+        FROM graph_snapshot_refs
+        WHERE project_id = ? AND ref_name = ?
+        """,
+        (project_id, ref),
+    ).fetchone()
+    all_events = list_graph_ref_events(conn, project_id, limit=bounded_limit)
+    active_snapshot_id = str(ref_row["snapshot_id"] if ref_row else "")
+    target_events = [event for event in all_events if str(event.get("ref_name") or "") == ref]
+    rollback_events = [
+        event for event in target_events
+        if event.get("operation_type") == "rollback"
+        and (not rollback_epoch or event.get("rollback_epoch") == rollback_epoch)
+    ]
+    active_event = next(
+        (
+            event for event in target_events
+            if str(event.get("new_snapshot_id") or "") == active_snapshot_id
+        ),
+        target_events[0] if target_events else {},
+    )
+    rollback_event = rollback_events[0] if rollback_events else {}
+    abandoned_sources = _rollback_source_values(rollback_event)
+    abandoned_merge_events: list[dict[str, Any]] = []
+    for event in target_events:
+        if event.get("operation_type") != "merge":
+            continue
+        explicit_match = any(_source_matches_ref_event(source, event) for source in abandoned_sources)
+        same_batch = (
+            rollback_event
+            and event.get("batch_id")
+            and event.get("batch_id") == rollback_event.get("batch_id")
+        )
+        if explicit_match or (not abandoned_sources and same_batch):
+            abandoned_merge_events.append(event)
+
+    abandoned_event_ids = {str(event.get("event_id") or "") for event in abandoned_merge_events}
+    abandoned_merge_epochs = {
+        str(event.get("merge_epoch") or "")
+        for event in abandoned_merge_events
+        if event.get("merge_epoch")
+    }
+    branch_candidate_events = [
+        event for event in all_events
+        if str(event.get("ref_name") or "") != ref
+    ]
+    projection_ids: set[str] = set()
+    for event in all_events:
+        for key in ("old_projection_id", "new_projection_id"):
+            value = str(event.get(key) or "").strip()
+            if value:
+                projection_ids.add(value)
+    projection_rows = _projection_rows_by_id(conn, project_id, projection_ids)
+    projection_states: list[dict[str, Any]] = []
+    seen_projection_ids: set[str] = set()
+    for event in all_events:
+        projection_id = str(event.get("new_projection_id") or "").strip()
+        if not projection_id or projection_id in seen_projection_ids:
+            continue
+        seen_projection_ids.add(projection_id)
+        projection_row = projection_rows.get(projection_id, {})
+        event_id = str(event.get("event_id") or "")
+        event_ref = str(event.get("ref_name") or "")
+        event_branch = str(event.get("branch_ref") or "")
+        if event_id in abandoned_event_ids or str(event.get("merge_epoch") or "") in abandoned_merge_epochs:
+            status = "abandoned"
+        elif event_id == str(active_event.get("event_id") or "") and event_ref == ref:
+            status = "current"
+        elif event_ref != ref or event_branch:
+            status = "candidate"
+        else:
+            status = "historical"
+        projection_states.append({
+            "projection_id": projection_id,
+            "snapshot_id": str(event.get("new_snapshot_id") or ""),
+            "ref_name": event_ref,
+            "branch_ref": event_branch,
+            "operation_type": str(event.get("operation_type") or ""),
+            "event_id": event_id,
+            "merge_epoch": str(event.get("merge_epoch") or ""),
+            "rollback_epoch": str(event.get("rollback_epoch") or ""),
+            "status": status,
+            "base_commit": str(projection_row.get("base_commit") or event.get("new_commit") or ""),
+        })
+
+    all_pending_scope_rows = list_pending_scope_reconcile(conn, project_id)
+    pending_rows = [
+        _compact_pending_scope_row(row)
+        for row in all_pending_scope_rows
+    ][:bounded_limit]
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "ref_name": ref,
+        "rollback_epoch": rollback_epoch or str(rollback_event.get("rollback_epoch") or ""),
+        "active": {
+            "snapshot_id": active_snapshot_id,
+            "commit_sha": str(ref_row["commit_sha"] if ref_row else ""),
+            "event_id": str(active_event.get("event_id") or ""),
+            "operation_type": str(active_event.get("operation_type") or ""),
+            "projection_id": str(active_event.get("new_projection_id") or ""),
+        },
+        "rollback_event": rollback_event,
+        "abandoned_merge_epochs": sorted(abandoned_merge_epochs),
+        "abandoned_merge_events": abandoned_merge_events[:bounded_limit],
+        "branch_candidates": branch_candidate_events[:bounded_limit],
+        "projection_states": projection_states[:bounded_limit],
+        "pending_scope": pending_rows,
+        "total_counts": {
+            "ref_events": len(all_events),
+            "abandoned_merge_events": len(abandoned_merge_events),
+            "branch_candidates": len(branch_candidate_events),
+            "projection_states": len(projection_states),
+            "pending_scope": len(all_pending_scope_rows),
+        },
+        "truncated": {
+            "ref_events": len(all_events) >= bounded_limit,
+            "abandoned_merge_events": len(abandoned_merge_events) > bounded_limit,
+            "branch_candidates": len(branch_candidate_events) > bounded_limit,
+            "projection_states": len(projection_states) > bounded_limit,
+            "pending_scope": len(all_pending_scope_rows) > bounded_limit,
+        },
+    }
+
+
 def _semantic_hash_state(status: str, feature_hash: str, payload: dict[str, Any]) -> str:
     status_norm = str(status or "").strip().lower()
     validation = payload.get("semantic_state_validation")
@@ -3490,6 +3686,7 @@ __all__ = [
     "GraphSnapshotConflictError",
     "activate_graph_snapshot",
     "backfill_reconcile_run_metrics_from_snapshots",
+    "build_graph_rollback_epoch_state",
     "create_graph_snapshot",
     "ensure_schema",
     "export_graph_snapshot_cache",
