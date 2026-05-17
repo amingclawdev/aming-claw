@@ -168,6 +168,12 @@ Hint delta operations:
 Rollback must not leave a stale binding when a hint was removed, changed, or
 rolled back.
 
+Implemented oracle slice: `diff_governance_hint_bindings` emits invertible
+`hint_added`, `hint_changed`, `hint_removed`, and `hint_rollback_restored`
+deltas with previous/current binding payloads, inverse actions, commits, and
+rollback epoch. Incremental reconcile can consume these deltas later instead of
+guessing from the final source state.
+
 ## Migration Strategy
 
 Existing data has active-only refs and many empty `branch_ref` values. The

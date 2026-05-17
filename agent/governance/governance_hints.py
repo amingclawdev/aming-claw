@@ -46,6 +46,75 @@ class BindingHint:
     target_title: str = ""
 
 
+def binding_hint_to_dict(hint: BindingHint) -> dict[str, str]:
+    return {
+        "source_path": hint.source_path,
+        "path": hint.path,
+        "field": hint.field,
+        "target_node_id": hint.target_node_id,
+        "target_module": hint.target_module,
+        "target_title": hint.target_title,
+    }
+
+
+def diff_governance_hint_bindings(
+    previous: Iterable[BindingHint],
+    current: Iterable[BindingHint],
+    *,
+    rollback_epoch: str = "",
+    source_commit: str = "",
+    target_commit: str = "",
+) -> dict[str, Any]:
+    """Return invertible add/change/remove deltas for incremental reconcile."""
+    previous_by_key = _binding_hints_by_key(previous)
+    current_by_key = _binding_hints_by_key(current)
+    deltas: list[dict[str, Any]] = []
+
+    for key in sorted(set(previous_by_key) | set(current_by_key)):
+        old = previous_by_key.get(key)
+        new = current_by_key.get(key)
+        if old and new and _binding_hint_signature(old) == _binding_hint_signature(new):
+            continue
+        if old is None and new is not None:
+            delta_type = "hint_rollback_restored" if rollback_epoch else "hint_added"
+            inverse_action = "remove_restored_binding" if rollback_epoch else "remove_binding"
+        elif old is not None and new is None:
+            delta_type = "hint_removed"
+            inverse_action = "restore_binding"
+        elif rollback_epoch:
+            delta_type = "hint_rollback_restored"
+            inverse_action = "restore_previous_binding"
+        else:
+            delta_type = "hint_changed"
+            inverse_action = "restore_previous_binding"
+        delta = {
+            "delta_type": delta_type,
+            "path": key[1],
+            "source_path": key[0],
+            "field": (new or old).field if (new or old) else "",
+            "previous": binding_hint_to_dict(old) if old else None,
+            "current": binding_hint_to_dict(new) if new else None,
+            "inverse_action": inverse_action,
+            "rollback_epoch": rollback_epoch,
+            "source_commit": source_commit,
+            "target_commit": target_commit,
+        }
+        deltas.append(delta)
+
+    by_type: dict[str, int] = {}
+    for delta in deltas:
+        dtype = str(delta.get("delta_type") or "")
+        by_type[dtype] = by_type.get(dtype, 0) + 1
+    return {
+        "delta_count": len(deltas),
+        "by_type": by_type,
+        "deltas": deltas,
+        "rollback_epoch": rollback_epoch,
+        "source_commit": source_commit,
+        "target_commit": target_commit,
+    }
+
+
 def normalize_relpath(project_root: str | Path, path: str) -> str:
     raw = str(path or "").replace("\\", "/").strip()
     if not raw:
@@ -212,6 +281,26 @@ def apply_binding_hints_to_graph_nodes(
         "applied": applied,
         "skipped": skipped[:50],
     }
+
+
+def _binding_hint_key(hint: BindingHint) -> tuple[str, str]:
+    return (
+        normalize_relpath("", hint.source_path or hint.path),
+        normalize_relpath("", hint.path or hint.source_path),
+    )
+
+
+def _binding_hint_signature(hint: BindingHint) -> tuple[str, str, str, str]:
+    return (
+        hint.field,
+        hint.target_node_id,
+        hint.target_module,
+        hint.target_title,
+    )
+
+
+def _binding_hints_by_key(hints: Iterable[BindingHint]) -> dict[tuple[str, str], BindingHint]:
+    return {_binding_hint_key(hint): hint for hint in hints}
 
 
 def _bindings_from_payload(payload: Any, *, source_path: str) -> list[BindingHint]:
