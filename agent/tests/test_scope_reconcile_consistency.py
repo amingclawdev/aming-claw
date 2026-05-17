@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -115,6 +116,22 @@ def _nodes_by_module(graph: dict) -> dict[str, dict]:
         if module:
             out[module] = node
     return out
+
+
+def _rewrite_inventory_status(snapshot_id: str, path: str, *, scan_status: str, graph_status: str) -> None:
+    inventory_path = store.snapshot_companion_dir(PID, snapshot_id) / "file_inventory.json"
+    rows = json.loads(inventory_path.read_text(encoding="utf-8"))
+    for row in rows:
+        if isinstance(row, dict) and row.get("path") == path:
+            row["scan_status"] = scan_status
+            row["graph_status"] = graph_status
+            break
+    else:
+        raise AssertionError(f"inventory path not found: {path}")
+    inventory_path.write_text(
+        json.dumps(rows, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def test_scope_reconcile_output_matches_full_rebuild_for_same_final_state(conn, tmp_path):
@@ -374,3 +391,94 @@ def test_scope_reconcile_test_fanin_incremental_matches_full_rebuild(conn, tmp_p
     assert other_fanin[0]["evidence"] == "test_import_fanin"
     assert "agent.service.service_entry" in service_fanin[0]["imports"]
     assert "agent.other.other_entry" in other_fanin[0]["imports"]
+
+
+def test_scope_reconcile_test_fanin_ignores_unrelated_inventory_status_churn(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _write(
+        project / "agent" / "other.py",
+        "def other_entry():\n"
+        "    return 'ok'\n",
+    )
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.service import service_entry\n\n"
+        "def test_integration():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-test-fanin-base-churn",
+        commit_sha=base_commit,
+        snapshot_id="full-test-fanin-base-churn",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+    _rewrite_inventory_status(
+        "full-test-fanin-base-churn",
+        "README.md",
+        scan_status="stale_fixture_status",
+        graph_status="stale_fixture_graph_status",
+    )
+
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.other import other_entry\n\n"
+        "def test_integration():\n"
+        "    assert other_entry() == 'ok'\n",
+    )
+    _git(project, "add", "agent/tests/test_integration.py")
+    _git(project, "commit", "-m", "move integration test fanin")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-fanin-head-churn",
+        snapshot_id="scope-test-fanin-head-churn",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_file_delta"]["graph_delta_mode"] == "test_fanin_hash_only"
+    assert scope["scope_file_delta"]["changed_files"] == ["agent/tests/test_integration.py"]
+    assert scope["scope_file_delta"]["status_changed_files"] == []
+    assert scope["scope_file_delta"]["ignored_status_changed_files"] == ["README.md"]
+    assert scope["scope_graph_delta"]["mode"] == "test_fanin_hash_only"
+
+    full = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-test-fanin-head-churn",
+        commit_sha=head_commit,
+        snapshot_id="full-test-fanin-head-churn",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert full["ok"] is True
+
+    assert _normalized_snapshot(conn, "scope-test-fanin-head-churn") == _normalized_snapshot(
+        conn,
+        "full-test-fanin-head-churn",
+    )
