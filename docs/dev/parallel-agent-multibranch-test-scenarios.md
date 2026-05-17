@@ -105,7 +105,9 @@ The canonical fixture is a five-task batch against a temporary target repo.
 Generated git-backed target repos are created through
 `agent/tests/fixtures/parallel_project.py` so branch/worktree and merge-preview
 tests share the same isolated project shape instead of relying on the Aming
-Claw source checkout.
+Claw source checkout. PB-001 uses `create_pb001_restart_fixture_project` to
+materialize T1-T5 as real git branches and commits before replaying durable
+runtime recovery and compact read-model assertions.
 
 | Fixture item | Value |
 | --- | --- |
@@ -132,7 +134,7 @@ Task fixture:
 
 | ID | Family | Trigger | Expected decision | Blocked by | Future tests |
 | --- | --- | --- | --- | --- | --- |
-| PB-001 | Machine restart recovery | Service restarts with T1 merged, T2 merge_failed, T4 queued_for_merge, T3/T5 unfinished. | Keep T1 merged; keep T2 merge_failed for observer action; mark T4 dependency_blocked; expire T3/T5 leases; retain all batch branches; activate no unfinished graph/semantic projections. | Runtime store, recovery API, and checkpoint fence are implemented; live executor replay remains gated. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
+| PB-001 | Machine restart recovery | Service restarts with T1 merged, T2 merge_failed, T4 queued_for_merge, T3/T5 unfinished. | Keep T1 merged; keep T2 merge_failed for observer action; mark T4 dependency_blocked; expire T3/T5 leases; retain all batch branches; activate no unfinished graph/semantic projections. | Runtime store, recovery API, checkpoint fence, generated git branch topology, and compact read-model assertions are implemented; live executor replay remains gated. | `test_parallel_branch_runtime.py`, `test_parallel_branch_read_model.py`, `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
 | PB-002 | Merge dependency ordering | Downstream branch requests merge before upstream foundation branch. | Reject merge with `waiting_dependency` or `dependency_blocked`; no target branch mutation; no graph ref activation. | Implemented with pure decision oracle, durable SQLite queue replay, fenced governance enqueue API, dry-run merge-gate planning, and read-only merge preview evidence; live merge execution remains gated. | `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
 | PB-003 | Target branch moves | Upstream branch merges after downstream branch was validated. | Mark downstream `stale_after_dependency_merge`; require rebase/sync, scope reconcile, semantic projection check, and merge preview. | Implemented with pure decision oracle, durable SQLite queue replay, dry-run merge-gate planning, and stale target-head merge preview evidence; scope/materialization integration remains separate. | `test_merge_queue_runtime.py`, `test_graph_rollback_epoch.py` |
 | PB-004 | Wrong merge order rollback/replay | Batch detects severe integration issue after an invalid merge order. | Enter `rollback_required`; retain all batch branches/worktrees; rollback target ref and graph ref; replay retained branch heads in corrected queue order. | Implemented with pure decision oracle, durable SQLite batch replay, and governance rollback-planning API; live rollback execution remains gated. | `test_batch_merge_rollback.py`, `test_graph_governance_api.py` |

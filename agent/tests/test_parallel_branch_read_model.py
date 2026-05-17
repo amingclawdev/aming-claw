@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 
+from agent.tests.fixtures.parallel_project import (
+    PB001RestartFixtureProject,
+    create_pb001_restart_fixture_project,
+)
 from agent.governance.parallel_branch_runtime import (
     BATCH_STATE_OPEN,
     BranchTaskRuntimeContext,
@@ -15,6 +19,7 @@ from agent.governance.parallel_branch_runtime import (
     decide_batch_rollback_replay,
     decide_merge_queue,
     decide_restart_recovery,
+    recover_expired_branch_contexts,
     runtime_tasks_from_contexts,
     upsert_batch_merge_runtime,
     upsert_branch_context,
@@ -23,9 +28,11 @@ from agent.governance.parallel_branch_runtime import (
 
 PROJECT_ID = "fixture-parallel-project"
 BATCH_ID = "PB-010"
+PB001_BATCH_ID = "PB-001"
 TARGET_REF = "refs/heads/main"
 NOW = "2026-05-16T12:00:00Z"
 EXPIRED = "2026-05-16T11:50:00Z"
+PB001_TASK_IDS = ("T1", "T2", "T3", "T4", "T5")
 
 
 def _runtime_conn() -> sqlite3.Connection:
@@ -104,6 +111,104 @@ def _contexts() -> list[BranchTaskRuntimeContext]:
             checkpoint_id="checkpoint-T4",
             base_commit="B0",
             head_commit="H4",
+        ),
+    ]
+
+
+def _pb001_contexts(fixture: PB001RestartFixtureProject) -> list[BranchTaskRuntimeContext]:
+    branches = fixture.task_branches
+    target_head = fixture.target_head_after_t1
+    return [
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=PB001_BATCH_ID,
+            task_id="T1",
+            backlog_id="OPT-PB001-T1",
+            branch_ref=branches["T1"].branch_ref,
+            ref_name="main",
+            status="merged",
+            base_commit=branches["T1"].base_commit,
+            head_commit=branches["T1"].head_commit,
+            target_head_commit=target_head,
+            snapshot_id="scope-T1",
+            projection_id="semproj-T1",
+            merge_queue_id="mergeq-PB001",
+            fence_token="fence-T1",
+        ),
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=PB001_BATCH_ID,
+            task_id="T2",
+            backlog_id="OPT-PB001-T2",
+            branch_ref=branches["T2"].branch_ref,
+            ref_name="main",
+            status="merge_failed",
+            depends_on=("T1",),
+            base_commit=branches["T2"].base_commit,
+            head_commit=branches["T2"].head_commit,
+            target_head_commit=target_head,
+            snapshot_id="scope-T2",
+            projection_id="semproj-T2",
+            merge_queue_id="mergeq-PB001",
+            fence_token="fence-T2",
+        ),
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=PB001_BATCH_ID,
+            task_id="T3",
+            backlog_id="OPT-PB001-T3",
+            branch_ref=branches["T3"].branch_ref,
+            ref_name="main",
+            status="running",
+            attempt=1,
+            lease_id="lease-T3",
+            lease_expires_at=EXPIRED,
+            depends_on=("T1",),
+            checkpoint_id="checkpoint-T3",
+            replay_source="checkpoint",
+            base_commit=branches["T3"].base_commit,
+            head_commit=branches["T3"].head_commit,
+            target_head_commit=target_head,
+            snapshot_id="scope-T3",
+            projection_id="semproj-T3",
+            fence_token="fence-old-T3",
+        ),
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=PB001_BATCH_ID,
+            task_id="T4",
+            backlog_id="OPT-PB001-T4",
+            branch_ref=branches["T4"].branch_ref,
+            ref_name="main",
+            status="queued_for_merge",
+            depends_on=("T2",),
+            checkpoint_id="checkpoint-T4",
+            base_commit=branches["T4"].base_commit,
+            head_commit=branches["T4"].head_commit,
+            target_head_commit=target_head,
+            merge_queue_id="mergeq-PB001",
+            fence_token="fence-T4",
+        ),
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            batch_id=PB001_BATCH_ID,
+            task_id="T5",
+            backlog_id="OPT-PB001-T5",
+            branch_ref=branches["T5"].branch_ref,
+            ref_name="main",
+            status="running",
+            attempt=2,
+            lease_id="lease-T5",
+            lease_expires_at=EXPIRED,
+            depends_on=("T3",),
+            checkpoint_id="checkpoint-T5",
+            replay_source="checkpoint",
+            base_commit=branches["T5"].base_commit,
+            head_commit=branches["T5"].head_commit,
+            target_head_commit=target_head,
+            snapshot_id="scope-T5",
+            projection_id="semproj-T5",
+            fence_token="fence-old-T5",
         ),
     ]
 
@@ -381,6 +486,50 @@ def test_pb010_read_model_loads_from_durable_runtime_stores() -> None:
         "merge_queue_rows": False,
         "rollback_rows": False,
     }
+
+
+def test_pb001_read_model_uses_generated_project_restart_topology(tmp_path) -> None:
+    fixture = create_pb001_restart_fixture_project(tmp_path)
+    conn = _runtime_conn()
+    for context in _pb001_contexts(fixture):
+        upsert_branch_context(conn, context, now_iso=NOW)
+
+    recovered = recover_expired_branch_contexts(conn, PROJECT_ID, now_iso=NOW)
+    assert [context.task_id for context in recovered] == ["T3", "T5"]
+
+    model = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        batch_id=PB001_BATCH_ID,
+        now_iso=NOW,
+        scenario_id="PB-001",
+        limit=10,
+    )
+    payload = model.to_dict()
+    lanes = {row["task_id"]: row for row in payload["branch_lanes"]}
+
+    assert payload["summary"]["lane_count"] == 5
+    assert payload["summary"]["status_counts"] == {
+        "dependency_blocked": 1,
+        "merge_failed": 1,
+        "merged": 1,
+        "reclaimable": 2,
+    }
+    assert [lanes[task_id]["branch_ref"] for task_id in PB001_TASK_IDS] == [
+        fixture.task_branches[task_id].branch_ref for task_id in PB001_TASK_IDS
+    ]
+    assert lanes["T1"]["graph_epoch"]["head_commit"] == fixture.task_branches["T1"].head_commit
+    assert lanes["T1"]["graph_epoch"]["target_head_commit"] == fixture.target_head_after_t1
+    assert lanes["T3"]["observed_status"] == "reclaimable"
+    assert lanes["T3"]["graph_epoch"]["head_commit"] == fixture.task_branches["T3"].head_commit
+    assert lanes["T3"]["recovery_actions"] == ["reclaim", "replay_from_checkpoint"]
+    assert lanes["T4"]["status"] == "dependency_blocked"
+    assert lanes["T4"]["dependency_blockers"] == ["T2"]
+    assert lanes["T5"]["recovery_actions"] == [
+        "wait_for_dependency",
+        "reclaim",
+        "replay_from_checkpoint",
+    ]
 
 
 def test_pb010_read_model_marks_queue_stale_against_latest_target_head() -> None:

@@ -7,7 +7,11 @@ import subprocess
 
 import pytest
 
-from agent.tests.fixtures.parallel_project import create_parallel_fixture_project
+from agent.tests.fixtures.parallel_project import (
+    PB001RestartFixtureProject,
+    create_parallel_fixture_project,
+    create_pb001_restart_fixture_project,
+)
 from agent.governance.db import SCHEMA_VERSION, _ensure_schema
 from agent.governance.parallel_branch_runtime import (
     ACTION_LEAVE_MERGED,
@@ -43,25 +47,66 @@ PROJECT_ID = "fixture-parallel-project"
 BATCH_ID = "PB-001"
 NOW = "2026-05-16T12:00:00Z"
 EXPIRED = "2026-05-16T11:50:00Z"
+PB001_TASK_IDS = ("T1", "T2", "T3", "T4", "T5")
+PB001_BRANCH_NAMES = {
+    "T1": "codex/PB001-T1-scope-reconcile",
+    "T2": "codex/PB001-T2-branch-graph-refs",
+    "T3": "codex/PB001-T3-task-runtime",
+    "T4": "codex/PB001-T4-dashboard-read-model",
+    "T5": "codex/PB001-T5-chain-adapter",
+}
 
 
-def _pb001_tasks() -> list[BranchRuntimeTask]:
+def _pb001_branch_ref(
+    task_id: str,
+    fixture: PB001RestartFixtureProject | None = None,
+) -> str:
+    if fixture is not None:
+        return fixture.task_branches[task_id].branch_ref
+    return f"refs/heads/{PB001_BRANCH_NAMES[task_id]}"
+
+
+def _pb001_base_commit(
+    task_id: str,
+    fixture: PB001RestartFixtureProject | None = None,
+) -> str:
+    if fixture is not None:
+        return fixture.task_branches[task_id].base_commit
+    return "base-001"
+
+
+def _pb001_head_commit(
+    task_id: str,
+    fixture: PB001RestartFixtureProject | None = None,
+) -> str:
+    if fixture is not None:
+        return fixture.task_branches[task_id].head_commit
+    return f"head-{task_id}"
+
+
+def _pb001_target_head(fixture: PB001RestartFixtureProject | None = None) -> str:
+    if fixture is not None:
+        return fixture.target_head_after_t1
+    return "head-T1"
+
+
+def _pb001_tasks(fixture: PB001RestartFixtureProject | None = None) -> list[BranchRuntimeTask]:
     return [
         BranchRuntimeTask(
             task_id="T1",
-            branch_ref="refs/heads/codex/PB001-T1-scope-reconcile",
+            branch_ref=_pb001_branch_ref("T1", fixture),
             status="merged",
             merge_epoch="merge-001",
         ),
         BranchRuntimeTask(
             task_id="T2",
-            branch_ref="refs/heads/codex/PB001-T2-branch-graph-refs",
+            branch_ref=_pb001_branch_ref("T2", fixture),
             status="merge_failed",
             depends_on=("T1",),
         ),
         BranchRuntimeTask(
             task_id="T3",
-            branch_ref="refs/heads/codex/PB001-T3-task-runtime",
+            branch_ref=_pb001_branch_ref("T3", fixture),
             status="running",
             depends_on=("T1",),
             lease_expired=True,
@@ -69,13 +114,13 @@ def _pb001_tasks() -> list[BranchRuntimeTask]:
         ),
         BranchRuntimeTask(
             task_id="T4",
-            branch_ref="refs/heads/codex/PB001-T4-dashboard-read-model",
+            branch_ref=_pb001_branch_ref("T4", fixture),
             status="queued_for_merge",
             depends_on=("T2",),
         ),
         BranchRuntimeTask(
             task_id="T5",
-            branch_ref="refs/heads/codex/PB001-T5-chain-adapter",
+            branch_ref=_pb001_branch_ref("T5", fixture),
             status="running",
             depends_on=("T3",),
             lease_expired=True,
@@ -95,18 +140,21 @@ def _runtime_conn() -> sqlite3.Connection:
     return conn
 
 
-def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
+def _pb001_contexts(
+    fixture: PB001RestartFixtureProject | None = None,
+) -> list[BranchTaskRuntimeContext]:
     return [
         BranchTaskRuntimeContext(
             project_id=PROJECT_ID,
             task_id="T1",
             batch_id=BATCH_ID,
             backlog_id="OPT-PB001-T1",
-            branch_ref="refs/heads/codex/PB001-T1-scope-reconcile",
+            branch_ref=_pb001_branch_ref("T1", fixture),
             status=STATE_MERGED,
             merge_queue_id="merge-001",
-            base_commit="base-001",
-            head_commit="head-T1",
+            base_commit=_pb001_base_commit("T1", fixture),
+            head_commit=_pb001_head_commit("T1", fixture),
+            target_head_commit=_pb001_target_head(fixture),
             snapshot_id="scope-base",
             projection_id="semproj-base",
             fence_token="fence-T1",
@@ -116,11 +164,12 @@ def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
             task_id="T2",
             batch_id=BATCH_ID,
             backlog_id="OPT-PB001-T2",
-            branch_ref="refs/heads/codex/PB001-T2-branch-graph-refs",
+            branch_ref=_pb001_branch_ref("T2", fixture),
             status=STATE_MERGE_FAILED,
             depends_on=("T1",),
-            base_commit="base-001",
-            head_commit="head-T2",
+            base_commit=_pb001_base_commit("T2", fixture),
+            head_commit=_pb001_head_commit("T2", fixture),
+            target_head_commit=_pb001_target_head(fixture),
             fence_token="fence-T2",
         ),
         BranchTaskRuntimeContext(
@@ -128,7 +177,7 @@ def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
             task_id="T3",
             batch_id=BATCH_ID,
             backlog_id="OPT-PB001-T3",
-            branch_ref="refs/heads/codex/PB001-T3-task-runtime",
+            branch_ref=_pb001_branch_ref("T3", fixture),
             status="running",
             depends_on=("T1",),
             attempt=1,
@@ -137,8 +186,9 @@ def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
             fence_token="fence-old-T3",
             checkpoint_id="checkpoint-T3",
             replay_source="checkpoint",
-            base_commit="base-001",
-            head_commit="head-T3",
+            base_commit=_pb001_base_commit("T3", fixture),
+            head_commit=_pb001_head_commit("T3", fixture),
+            target_head_commit=_pb001_target_head(fixture),
             snapshot_id="scope-T3",
             projection_id="semproj-T3",
         ),
@@ -147,12 +197,13 @@ def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
             task_id="T4",
             batch_id=BATCH_ID,
             backlog_id="OPT-PB001-T4",
-            branch_ref="refs/heads/codex/PB001-T4-dashboard-read-model",
+            branch_ref=_pb001_branch_ref("T4", fixture),
             status="queued_for_merge",
             depends_on=("T2",),
             merge_queue_id="merge-004",
-            base_commit="base-001",
-            head_commit="head-T4",
+            base_commit=_pb001_base_commit("T4", fixture),
+            head_commit=_pb001_head_commit("T4", fixture),
+            target_head_commit=_pb001_target_head(fixture),
             fence_token="fence-T4",
         ),
         BranchTaskRuntimeContext(
@@ -160,7 +211,7 @@ def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
             task_id="T5",
             batch_id=BATCH_ID,
             backlog_id="OPT-PB001-T5",
-            branch_ref="refs/heads/codex/PB001-T5-chain-adapter",
+            branch_ref=_pb001_branch_ref("T5", fixture),
             status="running",
             depends_on=("T3",),
             attempt=2,
@@ -169,16 +220,20 @@ def _pb001_contexts() -> list[BranchTaskRuntimeContext]:
             fence_token="fence-old-T5",
             checkpoint_id="checkpoint-T5",
             replay_source="checkpoint",
-            base_commit="base-001",
-            head_commit="head-T5",
+            base_commit=_pb001_base_commit("T5", fixture),
+            head_commit=_pb001_head_commit("T5", fixture),
+            target_head_commit=_pb001_target_head(fixture),
             snapshot_id="scope-T5",
             projection_id="semproj-T5",
         ),
     ]
 
 
-def _persist_pb001_contexts(conn: sqlite3.Connection) -> None:
-    for context in _pb001_contexts():
+def _persist_pb001_contexts(
+    conn: sqlite3.Connection,
+    fixture: PB001RestartFixtureProject | None = None,
+) -> None:
+    for context in _pb001_contexts(fixture):
         upsert_branch_context(conn, context, now_iso=NOW)
 
 
@@ -266,9 +321,23 @@ def test_branch_runtime_schema_is_in_governance_migration() -> None:
     }
 
 
-def test_pb001_recovery_rehydrates_replay_ready_contexts_from_db() -> None:
+def test_pb001_recovery_rehydrates_replay_ready_contexts_from_generated_project(
+    tmp_path,
+) -> None:
+    fixture = create_pb001_restart_fixture_project(tmp_path)
+    for task_id in PB001_TASK_IDS:
+        branch = fixture.task_branches[task_id]
+        actual = subprocess.run(
+            ["git", "rev-parse", "--verify", branch.branch_ref],
+            cwd=fixture.root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert actual == branch.head_commit
+
     conn = _runtime_conn()
-    _persist_pb001_contexts(conn)
+    _persist_pb001_contexts(conn, fixture)
 
     recovered = recover_expired_branch_contexts(conn, PROJECT_ID, now_iso=NOW)
     assert [context.task_id for context in recovered] == ["T3", "T5"]
@@ -285,12 +354,21 @@ def test_pb001_recovery_rehydrates_replay_ready_contexts_from_db() -> None:
     assert t5_context.checkpoint_id == "checkpoint-T5"
     assert t3_context.fence_token != "fence-old-T3"
     assert t5_context.fence_token != "fence-old-T5"
+    assert t3_context.head_commit == fixture.task_branches["T3"].head_commit
+    assert t5_context.head_commit == fixture.task_branches["T5"].head_commit
+    t4_context = get_branch_context(conn, PROJECT_ID, "T4")
+    assert t4_context is not None
+    assert t4_context.base_commit == fixture.task_branches["T4"].base_commit
+    assert t4_context.head_commit == fixture.task_branches["T4"].head_commit
 
     contexts_after_restart = list_branch_contexts(conn, PROJECT_ID, batch_id=BATCH_ID)
     runtime_tasks = runtime_tasks_from_contexts(contexts_after_restart, now_iso=NOW)
     plan = decide_restart_recovery(runtime_tasks)
     decisions = _by_task(plan)
 
+    assert plan.retained_branch_refs == tuple(
+        fixture.task_branches[task_id].branch_ref for task_id in PB001_TASK_IDS
+    )
     assert decisions["T3"].action == ACTION_RECLAIM_FROM_CHECKPOINT
     assert decisions["T3"].checkpoint_id == "checkpoint-T3"
     assert decisions["T3"].replay_source == "checkpoint"
