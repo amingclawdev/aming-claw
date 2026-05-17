@@ -3300,6 +3300,17 @@ def _operation_unit_progress(status: str) -> dict[str, int]:
     return {"done": 1 if normalized in {"complete", "cancelled", "failed"} else 0, "total": 1}
 
 
+def _json_loads(raw: Any, default: Any) -> Any:
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+    return default
+
+
 def _git_head_commit(project_root: Path) -> str:
     try:
         result = subprocess.run(
@@ -3380,6 +3391,26 @@ def _git_changed_paths_between(project_root: Path, base_commit: str, target_comm
     if limit is None:
         return paths
     return paths[: max(0, int(limit))]
+
+
+def _git_commit_range(project_root: Path, base_commit: str, target_commit: str) -> list[str]:
+    base_commit = str(base_commit or "").strip()
+    target_commit = str(target_commit or "").strip()
+    if not base_commit or not target_commit or base_commit == target_commit:
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--reverse", f"{base_commit}..{target_commit}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=project_root,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def _graph_stale_scope_operation(
@@ -3655,6 +3686,23 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         for row in pending_scope_rows:
             op_status = _normalize_operation_status(row.get("status", "queued"))
             commit = str(row.get("commit_sha") or row.get("target_commit") or "")
+            evidence = _json_loads(row.get("evidence_json"), {})
+            evidence_summary = evidence if isinstance(evidence, dict) else {}
+            last_error = str(
+                row.get("last_error")
+                or evidence_summary.get("error")
+                or evidence_summary.get("reason")
+                or ""
+            )
+            last_result = str(
+                row.get("result_json")
+                or evidence_summary.get("recovery_action")
+                or evidence_summary.get("source")
+                or ""
+            )
+            supported_actions = ["observer_takeover", "view_trace"]
+            if op_status in {"failed", "running", "queued"}:
+                supported_actions.insert(0, "retry_scope_reconcile")
             operations.append({
                 "operation_id": f"scope-reconcile:{commit or len(operations)}",
                 "operation_type": "scope_reconcile",
@@ -3668,10 +3716,11 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "claimed_by": row.get("claimed_by", ""),
                 "worker_id": row.get("worker_id", ""),
                 "lease_expires_at": row.get("lease_expires_at", ""),
-                "last_error": row.get("last_error", ""),
-                "last_result": row.get("result_json", ""),
+                "last_error": last_error,
+                "last_result": last_result,
+                "evidence": evidence_summary,
                 # MF-2026-05-10-011: cancel removed from scope_reconcile actions.
-                "supported_actions": ["observer_takeover", "view_trace"],
+                "supported_actions": supported_actions,
             })
 
         if stale_operation:
@@ -3827,6 +3876,11 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             snapshot_summary=snapshot_summary,
         )
         current_state["graph_stale"] = graph_stale_summary
+        reconcile_metrics = store.summarize_reconcile_run_metrics(
+            conn,
+            project_id,
+            limit=_query_int(ctx.query, "reconcile_metric_limit", 100),
+        )
         operations.sort(key=lambda item: (str(item.get("updated_at") or item.get("created_at") or ""), str(item.get("operation_id") or "")), reverse=True)
         return {
             "ok": True,
@@ -3863,12 +3917,74 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 },
                 "feedback_queue": feedback_summary,
                 "graph_correction_patches": patch_summary,
+                "reconcile_metrics": reconcile_metrics,
                 "graph_stale": graph_stale_summary,
                 "semantic_snapshot": current_state["semantic_snapshot"],
                 "semantic_drift": current_state["semantic_drift"],
                 "current_state": current_state,
             },
         }
+    finally:
+        conn.close()
+
+
+@route("GET", "/api/graph-governance/{project_id}/reconcile/metrics")
+def handle_graph_governance_reconcile_metrics(ctx: RequestContext):
+    """Return persisted scope/full reconcile timing metrics."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.metrics")
+        if _query_bool(ctx.query, "backfill", True):
+            backfill = store.backfill_reconcile_run_metrics_from_snapshots(
+                conn,
+                project_id,
+                limit=_query_int(ctx.query, "backfill_limit", 100),
+            )
+            conn.commit()
+        else:
+            backfill = {"project_id": project_id, "scanned": 0, "imported": 0}
+        limit = _query_int(ctx.query, "limit", 50)
+        strategy = str(ctx.query.get("strategy") or "")
+        rows = store.list_reconcile_run_metrics(
+            conn,
+            project_id,
+            limit=limit,
+            strategy=strategy,
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "backfill": backfill,
+            "summary": store.summarize_reconcile_run_metrics(conn, project_id, limit=max(limit, 100)),
+            "metrics": rows,
+            "count": len(rows),
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope/recover-stale")
+def handle_graph_governance_pending_scope_recover_stale(ctx: RequestContext):
+    """Fail stale running pending-scope rows so they can be force-requeued."""
+    project_id = ctx.get_project_id()
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope.recover-stale")
+        with sqlite_write_lock():
+            result = store.recover_stale_pending_scope_reconcile(
+                conn,
+                project_id,
+                max_running_seconds=_query_int(ctx.body, "max_running_seconds", 1800),
+                actor=str(ctx.body.get("actor") or "observer"),
+            )
+            conn.commit()
+        return 200, {"ok": True, **result}
     finally:
         conn.close()
 
@@ -5356,7 +5472,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope")
         target_commit = str(body.get("target_commit_sha") or "").strip()
-        direct_pending_created = False
+        target_pending_for_failure = False
         if target_commit and bool(body.get("ensure_pending_scope", True)):
             pending = store.list_pending_scope_reconcile(
                 conn,
@@ -5368,7 +5484,29 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                     store.PENDING_STATUS_FAILED,
                 ],
             )
-            if not pending:
+            if pending:
+                target_pending_for_failure = True
+                if bool(body.get("force_requeue", False)):
+                    active = store.get_active_graph_snapshot(conn, project_id) or {}
+                    parent_commit = str(
+                        body.get("parent_commit_sha") or active.get("commit_sha") or ""
+                    )
+                    with sqlite_write_lock():
+                        store.queue_pending_scope_reconcile(
+                            conn,
+                            project_id,
+                            commit_sha=target_commit,
+                            parent_commit_sha=parent_commit,
+                            status=store.PENDING_STATUS_RUNNING,
+                            evidence={
+                                "source": "direct_update_graph_force_requeue",
+                                "actor": body.get("actor", "api"),
+                                "parent_commit_sha": parent_commit,
+                            },
+                            force_requeue=True,
+                        )
+                        conn.commit()
+            else:
                 active = store.get_active_graph_snapshot(conn, project_id) or {}
                 if str(active.get("commit_sha") or "").strip() == target_commit:
                     return 200, {
@@ -5397,11 +5535,8 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                             "parent_commit_sha": parent_commit,
                         },
                     )
-                    direct_pending_created = (
-                        row.get("status") == store.PENDING_STATUS_RUNNING
-                        if isinstance(row, dict)
-                        else False
-                    )
+                    _ = row
+                    target_pending_for_failure = True
                     conn.commit()
         try:
             result = run_pending_scope_reconcile_candidate(
@@ -5465,59 +5600,164 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         "pending_count": 0,
                     }
         except (KeyError, ValueError) as exc:
-            if direct_pending_created:
+            if target_pending_for_failure:
                 with sqlite_write_lock():
-                    conn.execute(
-                        """
-                        UPDATE pending_scope_reconcile
-                        SET status = ?, evidence_json = ?
-                        WHERE project_id = ? AND commit_sha = ?
-                        """,
-                        (
-                            store.PENDING_STATUS_FAILED,
-                            json.dumps(
-                                {
-                                    "source": "direct_update_graph",
-                                    "error": str(exc),
-                                    "target_commit_sha": target_commit,
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                            project_id,
-                            target_commit,
-                        ),
+                    store.mark_pending_scope_reconcile_failed(
+                        conn,
+                        project_id,
+                        commit_sha=target_commit,
+                        actor=str(body.get("actor") or "api"),
+                        reason=str(exc),
+                        evidence={"source": "direct_update_graph", "error": str(exc)},
                     )
                     conn.commit()
             _raise_graph_api_validation(exc)
         except Exception as exc:
-            if direct_pending_created:
+            if target_pending_for_failure:
                 with sqlite_write_lock():
-                    conn.execute(
-                        """
-                        UPDATE pending_scope_reconcile
-                        SET status = ?, evidence_json = ?
-                        WHERE project_id = ? AND commit_sha = ?
-                        """,
-                        (
-                            store.PENDING_STATUS_FAILED,
-                            json.dumps(
-                                {
-                                    "source": "direct_update_graph",
-                                    "error": str(exc),
-                                    "target_commit_sha": target_commit,
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                            project_id,
-                            target_commit,
-                        ),
+                    store.mark_pending_scope_reconcile_failed(
+                        conn,
+                        project_id,
+                        commit_sha=target_commit,
+                        actor=str(body.get("actor") or "api"),
+                        reason=str(exc),
+                        evidence={"source": "direct_update_graph", "error": str(exc)},
                     )
                     conn.commit()
             raise
         conn.commit()
         return 201, result
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/reconcile/pending-scope/catch-up")
+def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
+    """Queue active..HEAD commits and materialize them through scope reconcile."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    root = _graph_governance_project_root(project_id, body)
+    from .state_reconcile import run_pending_scope_reconcile_candidate
+    from . import graph_snapshot_store as store
+    from .db import sqlite_write_lock
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope.catch-up")
+        active = store.get_active_graph_snapshot(conn, project_id) or {}
+        base_commit = str(body.get("base_commit_sha") or active.get("commit_sha") or "").strip()
+        target_commit = str(body.get("target_commit_sha") or _git_head_commit(root) or "").strip()
+        explicit_commits = [
+            str(item or "").strip()
+            for item in (body.get("commit_shas") or [])
+            if str(item or "").strip()
+        ]
+        commit_shas = explicit_commits or _git_commit_range(root, base_commit, target_commit)
+        if target_commit and commit_shas and commit_shas[-1] != target_commit:
+            commit_shas.append(target_commit)
+        if not commit_shas:
+            return 200, {
+                "ok": True,
+                "project_id": project_id,
+                "status": "already_current",
+                "base_commit_sha": base_commit,
+                "target_commit_sha": target_commit,
+                "commit_count": 0,
+                "commits": [],
+            }
+        if target_commit != _git_head_commit(root):
+            return 400, {
+                "ok": False,
+                "error": "target_not_head",
+                "message": "pending-scope catch-up materializes the current worktree; target_commit_sha must equal HEAD",
+                "target_commit_sha": target_commit,
+                "head_commit": _git_head_commit(root),
+            }
+        if bool(body.get("dry_run", False)):
+            return 200, {
+                "ok": True,
+                "project_id": project_id,
+                "dry_run": True,
+                "base_commit_sha": base_commit,
+                "target_commit_sha": target_commit,
+                "commit_count": len(commit_shas),
+                "commits": commit_shas,
+                "progress": {"done": 0, "total": len(commit_shas)},
+            }
+
+        queued_rows: list[dict[str, Any]] = []
+        parent = base_commit
+        with sqlite_write_lock():
+            for index, commit in enumerate(commit_shas, start=1):
+                row = store.queue_pending_scope_reconcile(
+                    conn,
+                    project_id,
+                    commit_sha=commit,
+                    parent_commit_sha=parent,
+                    status=store.PENDING_STATUS_QUEUED,
+                    evidence={
+                        "source": "pending_scope_catch_up",
+                        "actor": body.get("actor", "api"),
+                        "index": index,
+                        "total": len(commit_shas),
+                        "base_commit_sha": base_commit,
+                        "target_commit_sha": target_commit,
+                    },
+                    force_requeue=bool(body.get("force_requeue", False)),
+                )
+                queued_rows.append(row)
+                parent = commit
+            conn.commit()
+
+        try:
+            result = run_pending_scope_reconcile_candidate(
+                conn,
+                project_id,
+                root,
+                target_commit_sha=target_commit,
+                run_id=str(body.get("run_id") or f"scope-catch-up-{target_commit[:7]}"),
+                snapshot_id=body.get("snapshot_id"),
+                created_by=str(body.get("actor") or "observer"),
+                activate=bool(body.get("activate", True)),
+                semantic_enrich=bool(body.get("semantic_enrich", True)),
+                semantic_use_ai=_semantic_use_ai_from_body(body),
+                semantic_ai_call=_semantic_ai_call_from_body(project_id, root, body),
+                semantic_enqueue_stale=bool(body.get("enqueue_stale", False)),
+            )
+        except Exception as exc:
+            with sqlite_write_lock():
+                store.mark_pending_scope_reconcile_failed(
+                    conn,
+                    project_id,
+                    commit_sha=target_commit,
+                    actor=str(body.get("actor") or "api"),
+                    reason=str(exc),
+                    evidence={"source": "pending_scope_catch_up", "error": str(exc)},
+                )
+                conn.commit()
+            raise
+
+        return 201, {
+            "ok": bool(result.get("ok")),
+            "project_id": project_id,
+            "base_commit_sha": base_commit,
+            "target_commit_sha": target_commit,
+            "commit_count": len(commit_shas),
+            "commits": [
+                {
+                    "index": index,
+                    "commit_sha": commit,
+                    "queued_status": queued_rows[index - 1].get("status", "") if index - 1 < len(queued_rows) else "",
+                    "covered": commit in set(result.get("covered_commit_shas") or []),
+                }
+                for index, commit in enumerate(commit_shas, start=1)
+            ],
+            "progress": {
+                "done": len(result.get("covered_commit_shas") or []),
+                "total": len(commit_shas),
+            },
+            "materialize": result,
+        }
     finally:
         conn.close()
 

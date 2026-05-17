@@ -38,6 +38,7 @@ def test_schema_migration_is_idempotent(conn):
         "graph_edges_index",
         "graph_drift_ledger",
         "pending_scope_reconcile",
+        "reconcile_run_metrics",
     }.issubset(table_names)
 
     version = conn.execute(
@@ -256,6 +257,145 @@ def test_pending_scope_reconcile_queue_is_idempotent(conn):
         (PID, "d444444"),
     ).fetchone()["count"]
     assert count == 1
+
+
+def test_reconcile_run_metrics_record_and_summarize(conn):
+    _ensure_schema(conn)
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="scope-fast",
+        snapshot_id="scope-fast",
+        commit_sha="fast",
+        snapshot_kind="scope",
+        strategy="incremental_graph_delta",
+        graph_delta_mode="test_fanin_hash_only",
+        status="ok",
+        changed_file_count=2,
+        event_count=12,
+        elapsed_ms=4700,
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="scope-full",
+        snapshot_id="scope-full",
+        commit_sha="full",
+        snapshot_kind="scope",
+        strategy="full_rebuild_fallback",
+        graph_delta_mode="full_rebuild",
+        status="ok",
+        changed_file_count=3,
+        event_count=13,
+        elapsed_ms=36000,
+    )
+
+    rows = store.list_reconcile_run_metrics(conn, PID)
+    assert {row["run_id"] for row in rows} == {"scope-fast", "scope-full"}
+    summary = store.summarize_reconcile_run_metrics(conn, PID)
+    assert summary["by_strategy"]["incremental_graph_delta"]["avg_elapsed_ms"] == 4700
+    assert summary["by_strategy"]["full_rebuild_fallback"]["avg_elapsed_ms"] == 36000
+    assert summary["speedup"]["speedup_x"] == pytest.approx(7.66, rel=0.01)
+    assert summary["speedup"]["elapsed_reduction_pct"] == pytest.approx(86.9, rel=0.01)
+
+
+def test_reconcile_run_metrics_backfills_from_snapshot_notes(conn, tmp_path):
+    _ensure_schema(conn)
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    trace_summary = trace_dir / "summary.json"
+    trace_summary.write_text(
+        json.dumps({"status": "ok", "elapsed_ms": 1234}),
+        encoding="utf-8",
+    )
+    notes = {
+        "run_id": "scope-reconcile-head",
+        "scope_reconcile_strategy": "incremental_graph_delta",
+        "scope_graph_delta_mode": "metadata_only",
+        "scope_file_delta": {"changed_file_count": 1, "impacted_file_count": 1},
+        "pending_scope_reconcile": {
+            "active_graph_commit": "base",
+            "scope_graph_events": {"event_count": 2},
+        },
+        "trace": {"summary_path": str(trace_summary)},
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-head",
+        commit_sha="head",
+        snapshot_kind="scope",
+        graph_json={"deps_graph": {"nodes": [{"id": "L7.1"}], "edges": []}},
+        notes=json.dumps(notes),
+    )
+
+    result = store.backfill_reconcile_run_metrics_from_snapshots(conn, PID)
+    assert result["imported"] == 1
+    row = store.list_reconcile_run_metrics(conn, PID)[0]
+    assert row["run_id"] == "scope-reconcile-head"
+    assert row["elapsed_ms"] == 1234
+    assert row["event_count"] == 2
+
+
+def test_mark_pending_scope_failed_preserves_recovery_evidence(conn):
+    _ensure_schema(conn)
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        parent_commit_sha="base",
+        status=store.PENDING_STATUS_RUNNING,
+        evidence={"source": "direct_update_graph"},
+    )
+
+    result = store.mark_pending_scope_reconcile_failed(
+        conn,
+        PID,
+        commit_sha="head",
+        actor="test",
+        reason="client disconnected",
+    )
+
+    assert result["updated_count"] == 1
+    row = store.list_pending_scope_reconcile(conn, PID, commit_shas=["head"])[0]
+    assert row["status"] == store.PENDING_STATUS_FAILED
+    evidence = json.loads(row["evidence_json"])
+    assert evidence["recoverable"] is True
+    assert evidence["recovery_action"] == "force_requeue_pending_scope"
+
+
+def test_recover_stale_pending_scope_marks_old_running_failed(conn):
+    _ensure_schema(conn)
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="old-running",
+        parent_commit_sha="base",
+        status=store.PENDING_STATUS_RUNNING,
+        evidence={"source": "direct_update_graph"},
+    )
+    conn.execute(
+        """
+        UPDATE pending_scope_reconcile
+        SET queued_at='2026-01-01T00:00:00Z'
+        WHERE project_id=? AND commit_sha=?
+        """,
+        (PID, "old-running"),
+    )
+
+    result = store.recover_stale_pending_scope_reconcile(
+        conn,
+        PID,
+        max_running_seconds=1,
+        actor="test",
+    )
+
+    assert result["recovered_count"] == 1
+    row = store.list_pending_scope_reconcile(conn, PID, commit_shas=["old-running"])[0]
+    assert row["status"] == store.PENDING_STATUS_FAILED
+    evidence = json.loads(row["evidence_json"])
+    assert evidence["source"] == "pending_scope_stale_running_recovery"
+    assert evidence["recoverable"] is True
 
 
 def test_waive_pending_scope_reconcile_preserves_materialized_rows(conn):

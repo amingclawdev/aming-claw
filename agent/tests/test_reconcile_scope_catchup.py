@@ -12,6 +12,7 @@ from agent.governance.reconcile_scope_catchup import (
     _load_committed_doc_debt_waiver_paths,
     _summarize_materialization_backlog,
     ensure_catchup_worktree,
+    resolve_commit_range,
     run_scope_catchup,
 )
 
@@ -66,6 +67,20 @@ def test_ensure_catchup_worktree_creates_and_fast_forwards(tmp_path):
 
     assert updated["action"] == "fast_forwarded"
     assert updated["worktree_head"] == second
+
+
+def test_resolve_commit_range_returns_base_to_head_exclusive_in_order(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test User")
+    base = _commit(repo, "a.txt", "one")
+    second = _commit(repo, "b.txt", "two")
+    third = _commit(repo, "c.txt", "three")
+
+    assert resolve_commit_range(repo, base_commit=base, target_commit=third) == [second, third]
+    assert resolve_commit_range(repo, base_commit=third, target_commit=third) == []
 
 
 def test_run_scope_catchup_writes_output_and_marks_scan_only(tmp_path):

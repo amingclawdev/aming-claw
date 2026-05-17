@@ -77,6 +77,26 @@ def _rev_parse(repo_root: Path, ref: str, short: bool = False) -> str:
     return _git(args, repo_root).stdout.strip()
 
 
+def resolve_commit_range(
+    repo_root: str | Path,
+    *,
+    base_commit: str,
+    target_commit: str = "HEAD",
+) -> List[str]:
+    """Return commits in base..target order for scope catch-up planning."""
+    root = Path(repo_root).resolve()
+    base = str(base_commit or "").strip()
+    target = str(target_commit or "").strip() or "HEAD"
+    if not base:
+        return []
+    base_resolved = _rev_parse(root, base)
+    target_resolved = _rev_parse(root, target)
+    if base_resolved == target_resolved:
+        return []
+    proc = _git(["rev-list", "--reverse", f"{base_resolved}..{target_resolved}"], root)
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
 def _branch_exists(repo_root: Path, branch: str) -> bool:
     proc = _git(["rev-parse", "--verify", "--quiet", "refs/heads/" + branch], repo_root, check=False)
     return proc.returncode == 0

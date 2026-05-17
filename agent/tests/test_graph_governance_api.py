@@ -3302,6 +3302,183 @@ def test_pending_scope_materialize_already_current_is_idempotent(conn, tmp_path,
     assert store.list_pending_scope_reconcile(conn, PID, commit_shas=["head"]) == []
 
 
+def test_pending_scope_materialize_existing_running_failure_becomes_recoverable(conn, tmp_path, monkeypatch):
+    from agent.governance import state_reconcile
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+        status=store.PENDING_STATUS_RUNNING,
+        evidence={"source": "previous_direct_update"},
+    )
+    conn.commit()
+
+    def fail_materialize(*_args, **_kwargs):
+        raise RuntimeError("client disconnected during materialize")
+
+    monkeypatch.setattr(state_reconcile, "run_pending_scope_reconcile_candidate", fail_materialize)
+
+    with pytest.raises(RuntimeError):
+        server.handle_graph_governance_pending_scope_materialize(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "target_commit_sha": "head",
+                    "parent_commit_sha": "old",
+                    "actor": "dashboard",
+                    "activate": True,
+                },
+            )
+        )
+
+    row = store.list_pending_scope_reconcile(conn, PID, commit_shas=["head"])[0]
+    assert row["status"] == store.PENDING_STATUS_FAILED
+    evidence = json.loads(row["evidence_json"])
+    assert evidence["recoverable"] is True
+    assert evidence["recovery_action"] == "force_requeue_pending_scope"
+    assert "client disconnected" in evidence["reason"]
+
+
+def test_pending_scope_catch_up_queues_range_and_materializes_head(conn, tmp_path, monkeypatch):
+    from agent.governance import state_reconcile
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    monkeypatch.setattr(server, "_graph_governance_project_root", lambda _project_id, _body: project_root)
+    monkeypatch.setattr(server, "_git_head_commit", lambda _root: "c3")
+    monkeypatch.setattr(server, "_git_commit_range", lambda _root, _base, _target: ["c1", "c2", "c3"])
+    active = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-base",
+        commit_sha="base",
+        snapshot_kind="scope",
+        graph_json=_graph("L7.1"),
+    )
+    store.activate_graph_snapshot(conn, PID, active["snapshot_id"])
+    conn.commit()
+
+    captured = {}
+
+    def fake_materialize(conn_arg, project_id, root, **kwargs):
+        rows = store.list_pending_scope_reconcile(conn_arg, project_id)
+        captured["rows"] = rows
+        captured["kwargs"] = kwargs
+        for row in rows:
+            conn_arg.execute(
+                """
+                UPDATE pending_scope_reconcile
+                SET status=?, snapshot_id=?
+                WHERE project_id=? AND commit_sha=?
+                """,
+                (store.PENDING_STATUS_MATERIALIZED, "scope-c3", project_id, row["commit_sha"]),
+            )
+        return {
+            "ok": True,
+            "snapshot_id": "scope-c3",
+            "covered_commit_shas": ["c1", "c2", "c3"],
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_pending_scope_reconcile_candidate", fake_materialize)
+
+    code, result = server.handle_graph_governance_pending_scope_catch_up(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"target_commit_sha": "c3", "activate": True, "actor": "dashboard"},
+        )
+    )
+
+    assert code == 201
+    assert result["commit_count"] == 3
+    assert result["progress"] == {"done": 3, "total": 3}
+    assert captured["kwargs"]["target_commit_sha"] == "c3"
+    assert [row["commit_sha"] for row in captured["rows"]] == ["c1", "c2", "c3"]
+    assert [item["covered"] for item in result["commits"]] == [True, True, True]
+
+
+def test_reconcile_metrics_endpoint_reports_speedup(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="fast",
+        snapshot_id="scope-fast",
+        strategy="incremental_graph_delta",
+        graph_delta_mode="metadata_only",
+        status="ok",
+        elapsed_ms=5000,
+    )
+    store.record_reconcile_run_metric(
+        conn,
+        PID,
+        run_id="full",
+        snapshot_id="scope-full",
+        strategy="full_rebuild_fallback",
+        graph_delta_mode="full_rebuild",
+        status="ok",
+        elapsed_ms=40000,
+    )
+    conn.commit()
+
+    result = server.handle_graph_governance_reconcile_metrics(
+        _ctx({"project_id": PID}, query={"backfill": "false"})
+    )
+
+    assert result["ok"] is True
+    assert result["summary"]["speedup"]["speedup_x"] == 8
+    assert result["summary"]["speedup"]["elapsed_reduction_pct"] == 87.5
+    assert {row["run_id"] for row in result["metrics"]} == {"fast", "full"}
+
+
+def test_pending_scope_recover_stale_endpoint_marks_running_failed(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="old-running",
+        parent_commit_sha="base",
+        status=store.PENDING_STATUS_RUNNING,
+        evidence={"source": "direct_update_graph"},
+    )
+    conn.execute(
+        """
+        UPDATE pending_scope_reconcile
+        SET queued_at='2026-01-01T00:00:00Z'
+        WHERE project_id=? AND commit_sha=?
+        """,
+        (PID, "old-running"),
+    )
+    conn.commit()
+
+    code, result = server.handle_graph_governance_pending_scope_recover_stale(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={"max_running_seconds": 1, "actor": "dashboard"},
+        )
+    )
+
+    assert code == 200
+    assert result["recovered_count"] == 1
+    row = store.list_pending_scope_reconcile(conn, PID, commit_shas=["old-running"])[0]
+    assert row["status"] == store.PENDING_STATUS_FAILED
+
+
 def test_graph_governance_semantic_feedback_and_enrich_api(conn, tmp_path):
     project = tmp_path / "project"
     primary = project / "agent" / "governance" / "server.py"
@@ -4970,6 +5147,39 @@ def test_operations_queue_includes_pending_scope_reconcile(conn, monkeypatch):
     row = next(item for item in queue["operations"] if item["operation_type"] == "scope_reconcile")
     assert row["target_id"] == "head"
     assert row["status"] == "queued"
+
+
+def test_operations_queue_surfaces_pending_scope_recovery_evidence(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+        status=store.PENDING_STATUS_RUNNING,
+        evidence={"source": "direct_update_graph"},
+    )
+    store.mark_pending_scope_reconcile_failed(
+        conn,
+        PID,
+        commit_sha="head",
+        actor="test",
+        reason="timeout",
+    )
+    conn.commit()
+
+    queue = server.handle_graph_governance_operations_queue(_ctx({"project_id": PID}))
+
+    row = next(item for item in queue["operations"] if item["operation_id"] == "scope-reconcile:head")
+    assert row["status"] == "failed"
+    assert row["last_error"] == "timeout"
+    assert row["last_result"] == "force_requeue_pending_scope"
+    assert row["evidence"]["recoverable"] is True
+    assert "retry_scope_reconcile" in row["supported_actions"]
 
 
 def test_operations_queue_synthesizes_stale_scope_reconcile(conn, monkeypatch, tmp_path):

@@ -32,6 +32,7 @@ from agent.governance.graph_snapshot_store import (
     index_graph_snapshot,
     list_graph_snapshot_files,
     list_pending_scope_reconcile,
+    record_reconcile_run_metric,
     snapshot_companion_dir,
     snapshot_graph_path,
     snapshot_id_for,
@@ -2437,6 +2438,35 @@ def _finalize_scope_reconcile_candidate(
                 "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
                 (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
             )
+        trace_info = result.get("trace") if isinstance(result.get("trace"), dict) else {}
+        graph_stats = result.get("graph_stats") if isinstance(result.get("graph_stats"), dict) else {}
+        notes_trace = notes.get("trace") if isinstance(notes.get("trace"), dict) else {}
+        record_reconcile_run_metric(
+            conn,
+            project_id,
+            run_id=rid,
+            snapshot_id=sid,
+            commit_sha=target,
+            parent_commit_sha=str(active.get("commit_sha") or ""),
+            snapshot_kind="scope",
+            strategy=strategy,
+            graph_delta_mode=graph_delta_mode,
+            status=str(trace_info.get("status") or ("ok" if result.get("ok") else "failed")),
+            changed_file_count=int(scope_file_delta.get("changed_file_count") or 0),
+            impacted_file_count=int(scope_file_delta.get("impacted_file_count") or 0),
+            event_count=int(scope_event_summary.get("event_count") or 0),
+            node_count=int(graph_stats.get("nodes") or 0),
+            edge_count=int(graph_stats.get("edges") or 0),
+            elapsed_ms=int(trace_info.get("elapsed_ms") or 0),
+            trace_summary_path=str(notes_trace.get("summary_path") or trace_info.get("summary_path") or ""),
+            fallback_reason=fallback_reason,
+            evidence={
+                "source": "pending_scope_materializer",
+                "covered_commit_shas": covered_commit_shas,
+                "pending_rows_bound": updated,
+                "semantic_enqueue_stale": bool(semantic_enqueue_stale),
+            },
+        )
         conn.commit()
     return {
         **result,

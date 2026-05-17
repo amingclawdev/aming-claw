@@ -109,6 +109,35 @@ CREATE TABLE IF NOT EXISTS pending_scope_reconcile (
 
 CREATE INDEX IF NOT EXISTS idx_pending_scope_status
   ON pending_scope_reconcile(project_id, status, queued_at);
+
+CREATE TABLE IF NOT EXISTS reconcile_run_metrics (
+  project_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  commit_sha TEXT NOT NULL DEFAULT '',
+  parent_commit_sha TEXT NOT NULL DEFAULT '',
+  snapshot_kind TEXT NOT NULL DEFAULT '',
+  strategy TEXT NOT NULL DEFAULT '',
+  graph_delta_mode TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  changed_file_count INTEGER NOT NULL DEFAULT 0,
+  impacted_file_count INTEGER NOT NULL DEFAULT 0,
+  event_count INTEGER NOT NULL DEFAULT 0,
+  node_count INTEGER NOT NULL DEFAULT 0,
+  edge_count INTEGER NOT NULL DEFAULT 0,
+  elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  trace_summary_path TEXT NOT NULL DEFAULT '',
+  fallback_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY(project_id, run_id, snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_project_created
+  ON reconcile_run_metrics(project_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reconcile_run_metrics_strategy
+  ON reconcile_run_metrics(project_id, strategy, graph_delta_mode);
 """
 
 SNAPSHOT_STATUS_CANDIDATE = "candidate"
@@ -2111,6 +2140,290 @@ def graph_governance_status(conn: sqlite3.Connection, project_id: str) -> dict[s
     }
 
 
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def record_reconcile_run_metric(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    run_id: str,
+    snapshot_id: str,
+    commit_sha: str = "",
+    parent_commit_sha: str = "",
+    snapshot_kind: str = "",
+    strategy: str = "",
+    graph_delta_mode: str = "",
+    status: str = "",
+    changed_file_count: int = 0,
+    impacted_file_count: int = 0,
+    event_count: int = 0,
+    node_count: int = 0,
+    edge_count: int = 0,
+    elapsed_ms: int = 0,
+    trace_summary_path: str = "",
+    fallback_reason: str = "",
+    evidence: dict[str, Any] | None = None,
+    created_at: str = "",
+) -> dict[str, Any]:
+    """Persist one reconcile timing row.
+
+    The primary key is run_id + snapshot_id so fallback metadata can be
+    upserted after graph events are emitted.
+    """
+    ensure_schema(conn)
+    rid = str(run_id or snapshot_id or commit_sha or "").strip()
+    sid = str(snapshot_id or "").strip()
+    if not rid or not sid:
+        raise ValueError("reconcile metric requires run_id and snapshot_id")
+    now = created_at or utc_now()
+    payload = _json(evidence or {})
+    conn.execute(
+        """
+        INSERT INTO reconcile_run_metrics
+          (project_id, run_id, snapshot_id, commit_sha, parent_commit_sha,
+           snapshot_kind, strategy, graph_delta_mode, status,
+           changed_file_count, impacted_file_count, event_count,
+           node_count, edge_count, elapsed_ms, trace_summary_path,
+           fallback_reason, created_at, evidence_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, run_id, snapshot_id) DO UPDATE SET
+          commit_sha = excluded.commit_sha,
+          parent_commit_sha = excluded.parent_commit_sha,
+          snapshot_kind = excluded.snapshot_kind,
+          strategy = excluded.strategy,
+          graph_delta_mode = excluded.graph_delta_mode,
+          status = excluded.status,
+          changed_file_count = excluded.changed_file_count,
+          impacted_file_count = excluded.impacted_file_count,
+          event_count = excluded.event_count,
+          node_count = excluded.node_count,
+          edge_count = excluded.edge_count,
+          elapsed_ms = excluded.elapsed_ms,
+          trace_summary_path = excluded.trace_summary_path,
+          fallback_reason = excluded.fallback_reason,
+          evidence_json = excluded.evidence_json
+        """,
+        (
+            project_id,
+            rid,
+            sid,
+            str(commit_sha or ""),
+            str(parent_commit_sha or ""),
+            str(snapshot_kind or ""),
+            str(strategy or ""),
+            str(graph_delta_mode or ""),
+            str(status or ""),
+            int(changed_file_count or 0),
+            int(impacted_file_count or 0),
+            int(event_count or 0),
+            int(node_count or 0),
+            int(edge_count or 0),
+            int(elapsed_ms or 0),
+            str(trace_summary_path or ""),
+            str(fallback_reason or ""),
+            now,
+            payload,
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT * FROM reconcile_run_metrics
+        WHERE project_id=? AND run_id=? AND snapshot_id=?
+        """,
+        (project_id, rid, sid),
+    ).fetchone()
+    return dict(row)
+
+
+def _metric_from_snapshot_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    snapshot = dict(row)
+    notes = _decode_json(snapshot.get("notes"), {})
+    if not isinstance(notes, dict):
+        return None
+    scope_delta = notes.get("scope_file_delta")
+    if not isinstance(scope_delta, dict):
+        pending = notes.get("pending_scope_reconcile")
+        scope_delta = pending.get("scope_file_delta") if isinstance(pending, dict) else {}
+    if not isinstance(scope_delta, dict):
+        scope_delta = {}
+    pending_notes = notes.get("pending_scope_reconcile") if isinstance(notes.get("pending_scope_reconcile"), dict) else {}
+    event_summary = pending_notes.get("scope_graph_events") if isinstance(pending_notes, dict) else {}
+    if not isinstance(event_summary, dict):
+        event_summary = {}
+    graph_stats: dict[str, Any] = {}
+    graph_path = snapshot_graph_path(str(snapshot.get("project_id") or ""), str(snapshot.get("snapshot_id") or ""))
+    if graph_path.exists():
+        try:
+            graph_stats = graph_payload_stats(json.loads(graph_path.read_text(encoding="utf-8")))
+        except Exception:
+            graph_stats = {}
+    trace_ref = notes.get("trace") if isinstance(notes.get("trace"), dict) else {}
+    trace_summary_path = str(trace_ref.get("summary_path") or "")
+    trace_summary: dict[str, Any] = {}
+    if trace_summary_path:
+        try:
+            trace_summary = json.loads(Path(trace_summary_path).read_text(encoding="utf-8"))
+        except Exception:
+            trace_summary = {}
+    strategy = str(
+        notes.get("scope_reconcile_strategy")
+        or scope_delta.get("strategy")
+        or ("legacy_full_like" if snapshot.get("snapshot_kind") == "scope" else snapshot.get("snapshot_kind") or "")
+    )
+    mode = str(
+        notes.get("scope_graph_delta_mode")
+        or scope_delta.get("graph_delta_mode")
+        or ("full_rebuild" if strategy == "legacy_full_like" else "")
+    )
+    fallback_reason = str(scope_delta.get("fallback_reason") or "")
+    return {
+        "run_id": str(notes.get("run_id") or snapshot.get("snapshot_id") or ""),
+        "snapshot_id": str(snapshot.get("snapshot_id") or ""),
+        "commit_sha": str(snapshot.get("commit_sha") or ""),
+        "parent_commit_sha": str(pending_notes.get("active_graph_commit") or ""),
+        "snapshot_kind": str(snapshot.get("snapshot_kind") or ""),
+        "strategy": strategy,
+        "graph_delta_mode": mode,
+        "status": str(trace_summary.get("status") or snapshot.get("status") or ""),
+        "changed_file_count": _int_value(scope_delta.get("changed_file_count")),
+        "impacted_file_count": _int_value(scope_delta.get("impacted_file_count")),
+        "event_count": _int_value(event_summary.get("event_count")),
+        "node_count": _int_value(graph_stats.get("nodes")),
+        "edge_count": _int_value(graph_stats.get("edges")),
+        "elapsed_ms": _int_value(trace_summary.get("elapsed_ms")),
+        "trace_summary_path": trace_summary_path,
+        "fallback_reason": fallback_reason,
+        "created_at": str(snapshot.get("created_at") or ""),
+        "evidence": {
+            "source": "graph_snapshot_notes_backfill",
+            "snapshot_status": snapshot.get("status") or "",
+        },
+    }
+
+
+def backfill_reconcile_run_metrics_from_snapshots(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Best-effort import of historical trace timings into metrics table."""
+    ensure_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT * FROM graph_snapshots
+        WHERE project_id=? AND snapshot_kind IN ('scope', 'full')
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (project_id, int(limit or 100)),
+    ).fetchall()
+    imported = 0
+    for row in rows:
+        metric = _metric_from_snapshot_row(row)
+        if not metric:
+            continue
+        try:
+            record_reconcile_run_metric(
+                conn,
+                project_id,
+                run_id=metric["run_id"],
+                snapshot_id=metric["snapshot_id"],
+                commit_sha=metric["commit_sha"],
+                parent_commit_sha=metric["parent_commit_sha"],
+                snapshot_kind=metric["snapshot_kind"],
+                strategy=metric["strategy"],
+                graph_delta_mode=metric["graph_delta_mode"],
+                status=metric["status"],
+                changed_file_count=metric["changed_file_count"],
+                impacted_file_count=metric["impacted_file_count"],
+                event_count=metric["event_count"],
+                node_count=metric["node_count"],
+                edge_count=metric["edge_count"],
+                elapsed_ms=metric["elapsed_ms"],
+                trace_summary_path=metric["trace_summary_path"],
+                fallback_reason=metric["fallback_reason"],
+                evidence=metric["evidence"],
+                created_at=metric["created_at"],
+            )
+            imported += 1
+        except Exception:
+            continue
+    return {"project_id": project_id, "scanned": len(rows), "imported": imported}
+
+
+def list_reconcile_run_metrics(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 50,
+    strategy: str = "",
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    params: list[Any] = [project_id]
+    sql = "SELECT * FROM reconcile_run_metrics WHERE project_id=?"
+    if strategy:
+        sql += " AND strategy=?"
+        params.append(strategy)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(int(limit or 50))
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def summarize_reconcile_run_metrics(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 100,
+) -> dict[str, Any]:
+    rows = list_reconcile_run_metrics(conn, project_id, limit=limit)
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        strategy = str(row.get("strategy") or "unknown")
+        bucket = buckets.setdefault(
+            strategy,
+            {"count": 0, "total_elapsed_ms": 0, "min_elapsed_ms": 0, "max_elapsed_ms": 0},
+        )
+        elapsed = int(row.get("elapsed_ms") or 0)
+        bucket["count"] += 1
+        bucket["total_elapsed_ms"] += elapsed
+        bucket["min_elapsed_ms"] = elapsed if not bucket["min_elapsed_ms"] else min(bucket["min_elapsed_ms"], elapsed)
+        bucket["max_elapsed_ms"] = max(bucket["max_elapsed_ms"], elapsed)
+    for bucket in buckets.values():
+        count = int(bucket.get("count") or 0)
+        bucket["avg_elapsed_ms"] = round(float(bucket["total_elapsed_ms"]) / count, 2) if count else 0
+
+    incremental = buckets.get("incremental_graph_delta") or {}
+    full_candidates = [
+        bucket for name, bucket in buckets.items()
+        if name in {"full_rebuild_fallback", "legacy_full_like", "full"}
+    ]
+    full_count = sum(int(bucket.get("count") or 0) for bucket in full_candidates)
+    full_total = sum(int(bucket.get("total_elapsed_ms") or 0) for bucket in full_candidates)
+    incremental_avg = float(incremental.get("avg_elapsed_ms") or 0)
+    full_avg = (float(full_total) / full_count) if full_count else 0.0
+    speedup = round(full_avg / incremental_avg, 2) if full_avg and incremental_avg else 0
+    reduction_pct = round((1 - (incremental_avg / full_avg)) * 100, 1) if full_avg and incremental_avg else 0
+    return {
+        "project_id": project_id,
+        "sample_count": len(rows),
+        "by_strategy": buckets,
+        "speedup": {
+            "incremental_avg_ms": round(incremental_avg, 2),
+            "full_avg_ms": round(full_avg, 2),
+            "speedup_x": speedup,
+            "elapsed_reduction_pct": reduction_pct,
+            "full_sample_count": full_count,
+            "incremental_sample_count": int(incremental.get("count") or 0),
+        },
+    }
+
+
 def strict_graph_ready(
     conn: sqlite3.Connection,
     project_id: str,
@@ -2527,12 +2840,122 @@ def waive_pending_scope_reconcile(
     }
 
 
+def mark_pending_scope_reconcile_failed(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    commit_sha: str,
+    actor: str = "observer",
+    reason: str = "",
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Move a queued/running pending-scope row to failed with recovery evidence."""
+    ensure_schema(conn)
+    commit = str(commit_sha or "").strip()
+    if not commit:
+        return {"project_id": project_id, "updated_count": 0, "commit_sha": ""}
+    row = conn.execute(
+        "SELECT * FROM pending_scope_reconcile WHERE project_id=? AND commit_sha=?",
+        (project_id, commit),
+    ).fetchone()
+    previous = dict(row) if row else {}
+    failure_evidence = {
+        "source": "pending_scope_failure",
+        "actor": actor,
+        "reason": reason,
+        "commit_sha": commit,
+        "previous_status": previous.get("status", ""),
+        "previous_evidence": _decode_json(previous.get("evidence_json"), {}),
+        "recoverable": True,
+        "recovery_action": "force_requeue_pending_scope",
+        **(evidence or {}),
+    }
+    cur = conn.execute(
+        """
+        UPDATE pending_scope_reconcile
+        SET status=?, evidence_json=?
+        WHERE project_id=? AND commit_sha=? AND status IN (?, ?, ?)
+        """,
+        (
+            PENDING_STATUS_FAILED,
+            _json(failure_evidence),
+            project_id,
+            commit,
+            PENDING_STATUS_QUEUED,
+            PENDING_STATUS_RUNNING,
+            PENDING_STATUS_FAILED,
+        ),
+    )
+    return {
+        "project_id": project_id,
+        "updated_count": int(cur.rowcount or 0),
+        "commit_sha": commit,
+        "status": PENDING_STATUS_FAILED,
+        "evidence": failure_evidence,
+    }
+
+
+def recover_stale_pending_scope_reconcile(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    max_running_seconds: int = 1800,
+    actor: str = "observer",
+) -> dict[str, Any]:
+    """Fail old running rows so dashboard Update Graph can requeue them."""
+    ensure_schema(conn)
+    cutoff_seconds = max(0, int(max_running_seconds or 0))
+    now_text = utc_now()
+    rows = conn.execute(
+        """
+        SELECT * FROM pending_scope_reconcile
+        WHERE project_id=? AND status=?
+        ORDER BY queued_at, commit_sha
+        """,
+        (project_id, PENDING_STATUS_RUNNING),
+    ).fetchall()
+    recovered: list[str] = []
+    now_dt = datetime.now(timezone.utc)
+    for row in rows:
+        queued_at = str(row["queued_at"] or "")
+        try:
+            queued_dt = datetime.strptime(queued_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            age_seconds = int((now_dt - queued_dt).total_seconds())
+        except Exception:
+            age_seconds = cutoff_seconds + 1
+        if age_seconds < cutoff_seconds:
+            continue
+        commit = str(row["commit_sha"] or "")
+        mark_pending_scope_reconcile_failed(
+            conn,
+            project_id,
+            commit_sha=commit,
+            actor=actor,
+            reason="stale running pending-scope row exceeded recovery threshold",
+            evidence={
+                "source": "pending_scope_stale_running_recovery",
+                "queued_at": queued_at,
+                "recovered_at": now_text,
+                "age_seconds": age_seconds,
+                "max_running_seconds": cutoff_seconds,
+            },
+        )
+        recovered.append(commit)
+    return {
+        "project_id": project_id,
+        "recovered_count": len(recovered),
+        "commit_shas": recovered,
+        "max_running_seconds": cutoff_seconds,
+    }
+
+
 __all__ = [
     "ALLOWED_PENDING_STATUSES",
     "ALLOWED_SNAPSHOT_STATUSES",
     "GRAPH_SNAPSHOT_SCHEMA_SQL",
     "GraphSnapshotConflictError",
     "activate_graph_snapshot",
+    "backfill_reconcile_run_metrics_from_snapshots",
     "create_graph_snapshot",
     "ensure_schema",
     "export_graph_snapshot_cache",
@@ -2544,6 +2967,7 @@ __all__ = [
     "graph_governance_status",
     "graph_payload_edges",
     "index_graph_snapshot",
+    "list_reconcile_run_metrics",
     "list_graph_snapshot_edges",
     "list_graph_snapshot_files",
     "list_graph_snapshot_nodes",
@@ -2553,7 +2977,10 @@ __all__ = [
     "import_existing_graph_snapshot",
     "abandon_graph_snapshot",
     "list_pending_scope_reconcile",
+    "mark_pending_scope_reconcile_failed",
     "queue_pending_scope_reconcile",
+    "record_reconcile_run_metric",
+    "recover_stale_pending_scope_reconcile",
     "record_drift",
     "select_existing_graph_source",
     "snapshot_materialization_provenance",
@@ -2561,6 +2988,7 @@ __all__ = [
     "snapshot_graph_path",
     "snapshot_id_for",
     "strict_graph_ready",
+    "summarize_reconcile_run_metrics",
     "summarize_file_inventory_rows",
     "update_graph_drift_status",
     "waive_pending_scope_reconcile",
