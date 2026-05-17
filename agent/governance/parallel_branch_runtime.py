@@ -390,6 +390,30 @@ class BatchRollbackPlan:
     dashboard_rows: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class ParallelBranchReadModel:
+    project_id: str
+    batch_id: str
+    summary: dict[str, Any]
+    branch_lanes: tuple[dict[str, Any], ...]
+    merge_queue: dict[str, Any]
+    rollback: dict[str, Any]
+    total_counts: dict[str, int]
+    truncated: dict[str, bool]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "batch_id": self.batch_id,
+            "summary": self.summary,
+            "branch_lanes": list(self.branch_lanes),
+            "merge_queue": self.merge_queue,
+            "rollback": self.rollback,
+            "total_counts": self.total_counts,
+            "truncated": self.truncated,
+        }
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1340,4 +1364,207 @@ def decide_restart_recovery(
         target_graph_activation_blocked_for=target_graph_blocked,
         target_semantic_activation_blocked_for=target_semantic_blocked,
         dashboard_rows=tuple(decision.to_dashboard_row() for decision in decisions),
+    )
+
+
+def _limit_compact_rows(rows: list[dict[str, Any]], limit: int) -> tuple[tuple[dict[str, Any], ...], bool]:
+    bounded_limit = max(0, int(limit))
+    return tuple(rows[:bounded_limit]), len(rows) > bounded_limit
+
+
+def _recovery_decisions_by_task(
+    recovery_plan: RecoveryPlan | None,
+) -> dict[str, RecoveryDecision]:
+    if recovery_plan is None:
+        return {}
+    return {decision.task_id: decision for decision in recovery_plan.decisions}
+
+
+def _branch_lane_graph_epoch(context: BranchTaskRuntimeContext) -> dict[str, str]:
+    return {
+        "snapshot_id": context.snapshot_id,
+        "projection_id": context.projection_id,
+        "base_commit": context.base_commit,
+        "head_commit": context.head_commit,
+        "target_head_commit": context.target_head_commit,
+        "rollback_epoch": context.rollback_epoch,
+        "replay_epoch": context.replay_epoch,
+    }
+
+
+def _compact_branch_lane(
+    context: BranchTaskRuntimeContext,
+    *,
+    recovery_decision: RecoveryDecision | None,
+) -> dict[str, Any]:
+    recovery_actions = (
+        recovery_decision.recovery_actions
+        if recovery_decision is not None
+        else ((context.last_recovery_action,) if context.last_recovery_action else ())
+    )
+    recovery_state = recovery_decision.recovery_state if recovery_decision else context.status
+    dependency_blockers = recovery_decision.dependency_blockers if recovery_decision else context.depends_on
+    return {
+        "project_id": context.project_id,
+        "batch_id": context.batch_id,
+        "task_id": context.task_id,
+        "backlog_id": context.backlog_id,
+        "chain_id": context.chain_id,
+        "stage_task_id": context.stage_task_id,
+        "stage_type": context.stage_type,
+        "branch_ref": context.branch_ref,
+        "ref_name": context.ref_name,
+        "worktree_id": context.worktree_id,
+        "status": recovery_state,
+        "observed_status": context.status,
+        "attempt": context.attempt,
+        "lease_id": context.lease_id,
+        "checkpoint_id": context.checkpoint_id,
+        "replay_source": context.replay_source,
+        "dependency_blockers": list(dependency_blockers),
+        "recovery_actions": list(recovery_actions),
+        "graph_epoch": _branch_lane_graph_epoch(context),
+        "merge_queue_id": context.merge_queue_id,
+        "merge_preview_id": context.merge_preview_id,
+    }
+
+
+def _compact_merge_queue(
+    merge_queue_plan: MergeQueuePlan | None,
+    *,
+    limit: int,
+) -> tuple[dict[str, Any], int, bool]:
+    if merge_queue_plan is None:
+        return {
+            "scenario_id": "",
+            "mergeable_task_ids": [],
+            "blocked_task_ids": [],
+            "stale_task_ids": [],
+            "target_mutation_blocked_for": [],
+            "rows": [],
+        }, 0, False
+    rows, truncated = _limit_compact_rows(list(merge_queue_plan.dashboard_rows), limit)
+    return {
+        "scenario_id": merge_queue_plan.scenario_id,
+        "mergeable_task_ids": list(merge_queue_plan.mergeable_task_ids),
+        "blocked_task_ids": list(merge_queue_plan.blocked_task_ids),
+        "stale_task_ids": list(merge_queue_plan.stale_task_ids),
+        "target_mutation_blocked_for": list(merge_queue_plan.target_mutation_blocked_for),
+        "rows": list(rows),
+    }, len(merge_queue_plan.dashboard_rows), truncated
+
+
+def _compact_rollback(
+    batch_plan: BatchRollbackPlan | None,
+    *,
+    limit: int,
+) -> tuple[dict[str, Any], int, bool]:
+    if batch_plan is None:
+        return {
+            "scenario_id": "",
+            "batch_status": "",
+            "rollback_required": False,
+            "rollback_epoch": "",
+            "replay_epoch": "",
+            "retained_branch_refs": [],
+            "cleanup_allowed": True,
+            "cleanup_blockers": [],
+            "operator_actions": [],
+            "rows": [],
+        }, 0, False
+    rows, rows_truncated = _limit_compact_rows(list(batch_plan.dashboard_rows), limit)
+    retained, retained_truncated = _limit_compact_rows(
+        [{"branch_ref": branch_ref} for branch_ref in batch_plan.retained_branch_refs],
+        limit,
+    )
+    rollback = {
+        "scenario_id": batch_plan.scenario_id,
+        "target_ref": batch_plan.target_ref,
+        "batch_status": batch_plan.batch_status,
+        "rollback_required": batch_plan.rollback_required,
+        "rollback_epoch": batch_plan.rollback_epoch,
+        "replay_epoch": batch_plan.replay_epoch,
+        "rollback_target_commit": batch_plan.rollback_target_commit,
+        "rollback_snapshot_id": batch_plan.rollback_snapshot_id,
+        "rollback_projection_id": batch_plan.rollback_projection_id,
+        "retained_branch_refs": [row["branch_ref"] for row in retained],
+        "replay_task_ids": list(batch_plan.replay_task_ids),
+        "cleanup_allowed": batch_plan.cleanup_allowed,
+        "cleanup_blockers": list(batch_plan.cleanup_blockers),
+        "operator_actions": list(batch_plan.operator_actions),
+        "rows": list(rows),
+    }
+    return rollback, len(batch_plan.dashboard_rows), rows_truncated or retained_truncated
+
+
+def build_parallel_branch_read_model(
+    *,
+    project_id: str,
+    batch_id: str,
+    contexts: list[BranchTaskRuntimeContext],
+    recovery_plan: RecoveryPlan | None = None,
+    merge_queue_plan: MergeQueuePlan | None = None,
+    batch_plan: BatchRollbackPlan | None = None,
+    limit: int = 50,
+) -> ParallelBranchReadModel:
+    """Build the bounded PB-010 operator view for dashboard and MCP clients.
+
+    This function composes existing runtime decisions into a compact payload and
+    deliberately avoids expanding backlog rows, graph nodes, or semantic payloads.
+    """
+    decisions_by_task = _recovery_decisions_by_task(recovery_plan)
+    ordered_contexts = sorted(contexts, key=lambda ctx: (ctx.batch_id, ctx.task_id))
+    lanes = [
+        _compact_branch_lane(
+            context,
+            recovery_decision=decisions_by_task.get(context.task_id),
+        )
+        for context in ordered_contexts
+        if context.project_id == project_id and (not batch_id or context.batch_id == batch_id)
+    ]
+    branch_lanes, lanes_truncated = _limit_compact_rows(lanes, limit)
+    merge_queue, merge_queue_total, merge_queue_truncated = _compact_merge_queue(
+        merge_queue_plan,
+        limit=limit,
+    )
+    rollback, rollback_total, rollback_truncated = _compact_rollback(
+        batch_plan,
+        limit=limit,
+    )
+
+    status_counts: dict[str, int] = {}
+    for lane in lanes:
+        status = str(lane.get("status") or "")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    truncated = {
+        "branch_lanes": lanes_truncated,
+        "merge_queue_rows": merge_queue_truncated,
+        "rollback_rows": rollback_truncated,
+    }
+    total_counts = {
+        "branch_lanes": len(lanes),
+        "merge_queue_rows": merge_queue_total,
+        "rollback_rows": rollback_total,
+    }
+    summary = {
+        "lane_count": len(lanes),
+        "status_counts": status_counts,
+        "mergeable_count": len(merge_queue.get("mergeable_task_ids", [])),
+        "blocked_count": len(merge_queue.get("blocked_task_ids", [])),
+        "stale_count": len(merge_queue.get("stale_task_ids", [])),
+        "rollback_required": bool(rollback.get("rollback_required")),
+        "cleanup_allowed": bool(rollback.get("cleanup_allowed", True)),
+        "truncated": any(truncated.values()),
+    }
+
+    return ParallelBranchReadModel(
+        project_id=project_id,
+        batch_id=batch_id,
+        summary=summary,
+        branch_lanes=branch_lanes,
+        merge_queue=merge_queue,
+        rollback=rollback,
+        total_counts=total_counts,
+        truncated=truncated,
     )

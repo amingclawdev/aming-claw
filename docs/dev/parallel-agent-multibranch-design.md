@@ -324,6 +324,14 @@ Default reads must stay compact. The operator should see:
 
 Detailed payloads should be fetched by ID.
 
+Implemented runtime slice: `build_parallel_branch_read_model` composes branch
+runtime contexts, recovery decisions, merge queue decisions, and batch rollback
+plans into a bounded payload for PB-010. It exposes branch lanes, compact queue
+blockers, rollback epochs, graph epochs, action affordances, total counts, and
+truncation flags without expanding backlog rows, graph nodes, or semantic
+payloads. MCP and dashboard routes can consume this as the stable read-model
+shape when their durable stores are wired.
+
 ## Chain Compatibility
 
 Chain remains serial inside one Chain run. Parallel branch runtime allows many
@@ -350,7 +358,9 @@ Rules:
 7. Durable `BatchMergeRuntime`.
 8. Branch/ref/batch-aware `pending_scope_reconcile`.
 9. MF adapter MVP for one isolated branch through merge queue.
-10. Dashboard/MCP compact read model.
+10. Dashboard/MCP compact read model. First pure-state read model is implemented
+   by `agent/tests/test_parallel_branch_read_model.py`; live MCP/dashboard
+   wiring still depends on durable queue/batch stores.
 11. Chain adapter hook tests and later Chain integration.
 
 The smallest runtime slice is one backlog row in one isolated worktree:
