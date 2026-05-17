@@ -117,6 +117,25 @@ def test_scope_file_delta_keeps_real_deletions_but_ignores_old_untracked_artifac
     assert ".codex/config.toml" not in delta["impacted_files"]
 
 
+def test_git_changed_files_preserves_both_sides_of_renames(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git(project)
+    _write(project / "agent" / "tests" / "test_integration.py", "def test_old():\n    assert True\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "initial")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    _git(project, "mv", "agent/tests/test_integration.py", "agent/tests/test_integration_renamed.py")
+    _git(project, "commit", "-m", "rename test")
+    head_commit = _git(project, "rev-parse", "HEAD")
+
+    assert state_reconcile._git_changed_files(project, base_commit, head_commit) == [
+        "agent/tests/test_integration.py",
+        "agent/tests/test_integration_renamed.py",
+    ]
+
+
 def test_scope_file_delta_ignores_unchanged_inventory_status_churn(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
@@ -970,6 +989,100 @@ def test_pending_scope_materializer_incrementally_removes_test_fanin_file(conn, 
         "binding": "test",
     } in by_type["test_binding_removed"]
     assert "test_binding_added" not in by_type
+
+
+def test_pending_scope_materializer_incrementally_renames_test_fanin_file(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.service import service_entry\n\n"
+        "def test_integration():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-test-fanin-rename",
+        commit_sha=base_commit,
+        snapshot_id="full-base-test-fanin-rename",
+        created_by="test",
+        activate=True,
+    )
+    assert base["ok"] is True
+
+    _git(project, "mv", "agent/tests/test_integration.py", "agent/tests/test_integration_renamed.py")
+    _git(project, "commit", "-m", "rename integration test")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    result = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-fanin-rename",
+        snapshot_id="scope-test-fanin-rename",
+        semantic_use_ai=True,
+        semantic_ai_call=lambda _stage, payload: {"feature_name": payload["feature"]["node_id"]},
+    )
+
+    assert result["ok"] is True
+    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "test_fanin_file_set"
+    assert result["scope_file_delta"]["added_files"] == ["agent/tests/test_integration_renamed.py"]
+    assert result["scope_file_delta"]["removed_files"] == ["agent/tests/test_integration.py"]
+    assert result["scope_graph_delta"]["mode"] == "test_fanin_file_set"
+    assert result["semantic_enrichment"]["ai_selected_count"] == 0
+
+    graph = state_reconcile._read_snapshot_graph(PID, "scope-test-fanin-rename")
+    nodes_by_module = {
+        (node.get("metadata") or {}).get("module"): node
+        for node in state_reconcile._deps_graph_nodes(graph)
+        if (node.get("metadata") or {}).get("module")
+    }
+    service = nodes_by_module["agent.service"]
+    service_id = state_reconcile._node_id(service)
+    assert "agent/tests/test_integration.py" not in service["test"]
+    assert "agent/tests/test_integration_renamed.py" in service["test"]
+    assert {
+        entry["path"]
+        for entry in (service.get("metadata") or {}).get("test_consumer_fanin", [])
+    } == {"agent/tests/test_integration_renamed.py", "agent/tests/test_service.py"}
+    assert service_id in result["scope_graph_delta"]["updated_nodes"]
+    assert service_id in result["scope_graph_delta"]["semantic_stale_node_ids"]
+
+    binding_events = graph_events.list_events(
+        conn,
+        PID,
+        "scope-test-fanin-rename",
+        statuses=[graph_events.EVENT_STATUS_OBSERVED],
+        event_types=["test_binding_added", "test_binding_removed"],
+    )
+    by_type = {}
+    for event in binding_events:
+        by_type.setdefault(event["event_type"], []).append(event["payload"])
+    assert {
+        "node_id": service_id,
+        "path": "agent/tests/test_integration.py",
+        "binding": "test",
+    } in by_type["test_binding_removed"]
+    assert {
+        "node_id": service_id,
+        "path": "agent/tests/test_integration_renamed.py",
+        "binding": "test",
+    } in by_type["test_binding_added"]
 
 
 def test_backfill_escape_hatch_activates_full_snapshot_and_waives_pending(

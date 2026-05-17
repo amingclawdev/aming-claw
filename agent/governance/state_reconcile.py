@@ -106,7 +106,7 @@ def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str)
     root = Path(project_root).resolve()
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "diff", "--name-only", f"{base}..{target}"],
+            ["git", "-C", str(root), "diff", "--name-status", "--no-renames", f"{base}..{target}"],
             check=True,
             capture_output=True,
             text=True,
@@ -115,9 +115,10 @@ def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str)
     except Exception:
         return []
     return sorted({
-        line.replace("\\", "/").strip("/")
+        path.replace("\\", "/").strip("/")
         for line in (result.stdout or "").splitlines()
-        if line.strip()
+        for path in line.split("\t")[1:]
+        if path.strip()
     })
 
 

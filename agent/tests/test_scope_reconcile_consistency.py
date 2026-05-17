@@ -484,11 +484,11 @@ def test_scope_reconcile_test_fanin_ignores_unrelated_inventory_status_churn(con
     )
 
 
-@pytest.mark.parametrize("operation", ["add", "remove"])
+@pytest.mark.parametrize("operation", ["add", "remove", "rename"])
 def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(conn, tmp_path, operation):
     project = tmp_path / "project"
     _write_project(project)
-    if operation == "remove":
+    if operation in {"remove", "rename"}:
         _write(
             project / "agent" / "tests" / "test_integration.py",
             "from agent.service import service_entry\n\n"
@@ -523,8 +523,12 @@ def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(co
         _git(project, "add", "agent/tests/test_integration.py")
         _git(project, "commit", "-m", "add integration test fanin")
     else:
-        _git(project, "rm", "agent/tests/test_integration.py")
-        _git(project, "commit", "-m", "remove integration test fanin")
+        if operation == "remove":
+            _git(project, "rm", "agent/tests/test_integration.py")
+            _git(project, "commit", "-m", "remove integration test fanin")
+        else:
+            _git(project, "mv", "agent/tests/test_integration.py", "agent/tests/test_integration_renamed.py")
+            _git(project, "commit", "-m", "rename integration test fanin")
     head_commit = _git(project, "rev-parse", "HEAD")
     store.queue_pending_scope_reconcile(
         conn,
@@ -548,8 +552,15 @@ def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(co
     assert scope["ok"] is True
     assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
     assert scope["scope_file_delta"]["graph_delta_mode"] == "test_fanin_file_set"
-    changed_key = "added_files" if operation == "add" else "removed_files"
-    assert scope["scope_file_delta"][changed_key] == ["agent/tests/test_integration.py"]
+    if operation == "add":
+        assert scope["scope_file_delta"]["added_files"] == ["agent/tests/test_integration.py"]
+        assert scope["scope_file_delta"]["removed_files"] == []
+    elif operation == "remove":
+        assert scope["scope_file_delta"]["added_files"] == []
+        assert scope["scope_file_delta"]["removed_files"] == ["agent/tests/test_integration.py"]
+    else:
+        assert scope["scope_file_delta"]["added_files"] == ["agent/tests/test_integration_renamed.py"]
+        assert scope["scope_file_delta"]["removed_files"] == ["agent/tests/test_integration.py"]
     assert scope["scope_graph_delta"]["mode"] == "test_fanin_file_set"
     assert scope["scope_graph_delta"]["added_nodes"] == []
     assert scope["scope_graph_delta"]["removed_nodes"] == []
@@ -583,6 +594,11 @@ def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(co
     if operation == "add":
         assert "agent/tests/test_integration.py" in service_tests
         assert "agent/tests/test_integration.py" in service_fanin_paths
+    elif operation == "remove":
+        assert "agent/tests/test_integration.py" not in service_tests
+        assert "agent/tests/test_integration.py" not in service_fanin_paths
     else:
         assert "agent/tests/test_integration.py" not in service_tests
         assert "agent/tests/test_integration.py" not in service_fanin_paths
+        assert "agent/tests/test_integration_renamed.py" in service_tests
+        assert "agent/tests/test_integration_renamed.py" in service_fanin_paths
