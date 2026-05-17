@@ -526,7 +526,7 @@ def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
-_INCREMENTAL_METADATA_FILE_KINDS = {"config", "doc", "index_doc", "test"}
+_INCREMENTAL_METADATA_FILE_KINDS = {"config", "doc", "index_doc"}
 
 
 def _json_clone(value: Any) -> Any:
@@ -732,6 +732,14 @@ def _incremental_metadata_scope_eligibility(
         new_row = new_by_path.get(path) or {}
         kind = str(new_row.get("file_kind") or old_row.get("file_kind") or "")
         role = str(new_row.get("attachment_role") or old_row.get("attachment_role") or "")
+        if kind == "test" and role != "primary":
+            unsupported.append({
+                "path": path,
+                "file_kind": kind,
+                "attachment_role": role,
+                "reason": "test_consumer_fanin_requires_full_rebuild",
+            })
+            continue
         if kind in _INCREMENTAL_METADATA_FILE_KINDS and role != "primary":
             metadata_paths.append(path)
             continue

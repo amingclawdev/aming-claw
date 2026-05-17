@@ -578,10 +578,12 @@ def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, t
 
     assert result["ok"] is True
     assert result["scope_file_delta"]["changed_files"] == ["agent/tests/test_service.py"]
-    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
-    assert result["scope_file_delta"]["graph_delta_mode"] == "metadata_only"
-    assert result["scope_graph_delta"]["strategy"] == "incremental_graph_delta"
-    assert result["scope_graph_delta"]["mode"] == "metadata_only"
+    assert result["scope_file_delta"]["strategy"] == "full_rebuild_fallback"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "full_rebuild"
+    assert result["scope_file_delta"]["fallback_reason"] == "test_consumer_fanin_requires_full_rebuild"
+    assert result["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
+    assert result["scope_graph_delta"]["mode"] == "full_rebuild"
+    assert result["scope_graph_delta"]["fallback_reason"] == "test_consumer_fanin_requires_full_rebuild"
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/tests/test_service.py"]
