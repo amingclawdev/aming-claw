@@ -104,6 +104,19 @@ def _node_ids_by_primary_file(graph: dict) -> dict[str, str]:
     return mapping
 
 
+def _nodes_by_module(graph: dict) -> dict[str, dict]:
+    nodes = ((graph.get("deps_graph") or {}).get("nodes") or [])
+    out: dict[str, dict] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        module = str(metadata.get("module") or "")
+        if module:
+            out[module] = node
+    return out
+
+
 def test_scope_reconcile_output_matches_full_rebuild_for_same_final_state(conn, tmp_path):
     project = tmp_path / "project"
     _write_project(project)
@@ -260,3 +273,104 @@ def test_scope_reconcile_source_hash_only_matches_full_rebuild_for_same_final_st
     base_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "full-source-base-consistency"))
     scope_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "scope-source-head-consistency"))
     assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]
+
+
+def test_scope_reconcile_test_fanin_incremental_matches_full_rebuild(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _write(
+        project / "agent" / "other.py",
+        "def other_entry():\n"
+        "    return 'ok'\n",
+    )
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.service import service_entry\n\n"
+        "def test_integration():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-test-fanin-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id="full-test-fanin-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "agent" / "tests" / "test_integration.py",
+        "from agent.other import other_entry\n\n"
+        "def test_integration():\n"
+        "    assert other_entry() == 'ok'\n",
+    )
+    _git(project, "add", "agent/tests/test_integration.py")
+    _git(project, "commit", "-m", "move integration test fanin")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-test-fanin-head-consistency",
+        snapshot_id="scope-test-fanin-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_file_delta"]["graph_delta_mode"] == "test_fanin_hash_only"
+    assert scope["scope_file_delta"]["changed_files"] == ["agent/tests/test_integration.py"]
+    assert scope["scope_graph_delta"]["mode"] == "test_fanin_hash_only"
+    assert scope["scope_graph_delta"]["added_nodes"] == []
+    assert scope["scope_graph_delta"]["removed_nodes"] == []
+    assert scope["scope_graph_delta"]["added_edges"] == []
+    assert scope["scope_graph_delta"]["removed_edges"] == []
+
+    full = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-test-fanin-head-consistency",
+        commit_sha=head_commit,
+        snapshot_id="full-test-fanin-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert full["ok"] is True
+
+    assert _normalized_snapshot(conn, "scope-test-fanin-head-consistency") == _normalized_snapshot(
+        conn,
+        "full-test-fanin-head-consistency",
+    )
+
+    scope_nodes = _nodes_by_module(_read_snapshot_graph(PID, "scope-test-fanin-head-consistency"))
+    service = scope_nodes["agent.service"]
+    other = scope_nodes["agent.other"]
+    assert "agent/tests/test_integration.py" not in service["test"]
+    assert "agent/tests/test_integration.py" in other["test"]
+    service_fanin = (service.get("metadata") or {}).get("test_consumer_fanin") or []
+    other_fanin = (other.get("metadata") or {}).get("test_consumer_fanin") or []
+    assert {entry["path"] for entry in service_fanin} == {"agent/tests/test_service.py"}
+    assert {entry["path"] for entry in other_fanin} == {"agent/tests/test_integration.py"}
+    assert service_fanin[0]["evidence"] == "test_import_fanin"
+    assert other_fanin[0]["evidence"] == "test_import_fanin"
+    assert "agent.service.service_entry" in service_fanin[0]["imports"]
+    assert "agent.other.other_entry" in other_fanin[0]["imports"]
