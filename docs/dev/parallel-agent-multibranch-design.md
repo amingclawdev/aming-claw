@@ -189,6 +189,12 @@ rebase-required, running, validating, or merge-blocked upstream items move the
 downstream item to `dependency_blocked`; unrelated branches remain mergeable
 when they do not share blockers.
 
+Implemented durability slice: `parallel_branch_merge_queue_items` persists
+`MergeQueueItem` rows with typed dependencies, target refs, validation heads,
+merge preview ids, and graph/projection ids. `decide_persisted_merge_queue`
+replays PB-002/PB-003 queue decisions from SQLite after restart without
+performing git merge side effects.
+
 Queue states:
 
 ```text
@@ -361,13 +367,15 @@ Serial Chain stages with no `branch_ref` remain unchanged.
 3. Branch/ref graph and semantic rollback contract.
 4. Branch/ref-aware graph snapshot refs and semantic projection refs.
 5. Durable `BranchTaskRuntimeContext`.
-6. Durable `MergeQueueRuntime`.
+6. Durable `MergeQueueRuntime`. First SQLite-backed queue item store is
+   implemented by `agent/tests/test_merge_queue_runtime.py`; live merge
+   execution remains gated.
 7. Durable `BatchMergeRuntime`.
 8. Branch/ref/batch-aware `pending_scope_reconcile`.
 9. MF adapter MVP for one isolated branch through merge queue.
 10. Dashboard/MCP compact read model. First pure-state read model is implemented
    by `agent/tests/test_parallel_branch_read_model.py`; live MCP/dashboard
-   wiring still depends on durable queue/batch stores.
+   wiring still depends on durable batch stores and API routing.
 11. Chain adapter hook tests and later Chain integration. First no-execution
     adapter is implemented by `agent/tests/test_chain_parallel_branch_adapter.py`.
 

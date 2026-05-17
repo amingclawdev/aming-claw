@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from agent.governance.parallel_branch_runtime import (
@@ -17,6 +19,9 @@ from agent.governance.parallel_branch_runtime import (
     STATE_WAITING_DEPENDENCY,
     MergeQueueItem,
     decide_merge_queue,
+    decide_persisted_merge_queue,
+    list_merge_queue_items,
+    upsert_merge_queue_items,
 )
 
 PROJECT_ID = "fixture-parallel-project"
@@ -26,6 +31,12 @@ TARGET_REF = "refs/heads/main"
 
 def _by_task(plan):
     return {decision.task_id: decision for decision in plan.decisions}
+
+
+def _runtime_conn(path: str = ":memory:") -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def test_pb002_downstream_merge_waits_for_unmerged_foundation_dependency() -> None:
@@ -88,6 +99,79 @@ def test_pb002_downstream_merge_waits_for_unmerged_foundation_dependency() -> No
     assert decisions["T2"].target_branch_mutation_allowed is False
     assert decisions["T2"].target_graph_activation_allowed is False
     assert decisions["T2"].target_semantic_activation_allowed is False
+
+
+def test_pb002_persisted_merge_queue_replays_dependency_blockers_after_restart(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime.db")
+    conn = _runtime_conn(db_path)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB002-T2-dashboard-read-model",
+                queue_index=2,
+                status=STATE_MERGE_READY,
+                hard_depends_on=("T1",),
+                serializes_after=("T1",),
+                requires_graph_epoch=("T1",),
+                target_ref=TARGET_REF,
+                base_commit="target-base",
+                branch_head="head-T2",
+                validated_target_head="target-base",
+                current_target_head="target-base",
+                validation_attempt=1,
+                merge_preview_id="preview-T2",
+                snapshot_id="scope-T2",
+                projection_id="semproj-T2",
+            ),
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB002-T1-scope-reconcile-foundation",
+                queue_index=1,
+                status=STATE_RUNNING,
+                target_ref=TARGET_REF,
+                base_commit="target-base",
+                branch_head="head-T1",
+            ),
+        ],
+        now_iso="2026-05-17T06:00:00Z",
+    )
+    conn.commit()
+    conn.close()
+
+    restarted = _runtime_conn(db_path)
+    persisted = list_merge_queue_items(restarted, PROJECT_ID, QUEUE_ID, target_ref=TARGET_REF)
+    assert [item.task_id for item in persisted] == ["T1", "T2"]
+    assert persisted[1].hard_depends_on == ("T1",)
+    assert persisted[1].serializes_after == ("T1",)
+    assert persisted[1].requires_graph_epoch == ("T1",)
+    assert persisted[1].merge_preview_id == "preview-T2"
+    assert persisted[1].snapshot_id == "scope-T2"
+    assert persisted[1].projection_id == "semproj-T2"
+
+    plan = decide_persisted_merge_queue(
+        restarted,
+        PROJECT_ID,
+        QUEUE_ID,
+        target_ref=TARGET_REF,
+        scenario_id="PB-002",
+    )
+    decisions = _by_task(plan)
+
+    assert plan.mergeable_task_ids == ()
+    assert plan.blocked_task_ids == ("T2",)
+    assert decisions["T2"].queue_state == STATE_DEPENDENCY_BLOCKED
+    assert decisions["T2"].dependency_blocker_types == {
+        "T1": ("hard_depends_on", "requires_graph_epoch", "serializes_after")
+    }
+    assert decisions["T2"].target_branch_mutation_allowed is False
 
 
 def test_pb003_downstream_validated_branch_goes_stale_after_dependency_merge() -> None:
@@ -153,6 +237,76 @@ def test_pb003_downstream_validated_branch_goes_stale_after_dependency_merge() -
     assert decisions["T2"].target_branch_mutation_allowed is False
     assert decisions["T2"].target_graph_activation_allowed is False
     assert decisions["T2"].target_semantic_activation_allowed is False
+
+
+def test_pb003_persisted_merge_queue_rehydrates_stale_validation_after_restart(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime.db")
+    conn = _runtime_conn(db_path)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB003",
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB003-T1-scope-reconcile-foundation",
+                queue_index=1,
+                status=STATE_MERGED,
+                target_ref=TARGET_REF,
+                base_commit="target-base",
+                branch_head="head-T1",
+                current_target_head="target-after-T1",
+                snapshot_id="scope-T1",
+                projection_id="semproj-T1",
+            ),
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB003",
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB003-T2-dashboard-read-model",
+                queue_index=2,
+                status=STATE_MERGE_READY,
+                depends_on=("T1",),
+                target_ref=TARGET_REF,
+                base_commit="target-base",
+                branch_head="head-T2",
+                validated_target_head="target-base",
+                current_target_head="target-after-T1",
+                validation_attempt=1,
+                merge_preview_id="preview-T2-before-T1",
+                snapshot_id="scope-T2-before-T1",
+                projection_id="semproj-T2-before-T1",
+            ),
+        ],
+        now_iso="2026-05-17T06:05:00Z",
+    )
+    conn.commit()
+    conn.close()
+
+    restarted = _runtime_conn(db_path)
+    plan = decide_persisted_merge_queue(
+        restarted,
+        PROJECT_ID,
+        "mergeq-PB003",
+        target_ref=TARGET_REF,
+        scenario_id="PB-003",
+    )
+    decisions = _by_task(plan)
+
+    assert plan.stale_task_ids == ("T2",)
+    assert decisions["T1"].target_graph_activation_allowed is True
+    assert decisions["T1"].target_semantic_activation_allowed is True
+    assert decisions["T2"].queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE
+    assert decisions["T2"].stale_target_head is True
+    assert decisions["T2"].merge_preview_id == "preview-T2-before-T1"
+    assert decisions["T2"].next_actions == (
+        "rebase_or_sync",
+        "run_scope_reconcile",
+        "verify_semantic_projection",
+        "refresh_merge_preview",
+    )
 
 
 def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:

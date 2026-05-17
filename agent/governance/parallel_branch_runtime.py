@@ -59,6 +59,40 @@ CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_batch
   ON parallel_branch_runtime_contexts(project_id, batch_id, status);
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_runtime_project_branch
   ON parallel_branch_runtime_contexts(project_id, branch_ref);
+
+CREATE TABLE IF NOT EXISTS parallel_branch_merge_queue_items (
+    project_id        TEXT NOT NULL,
+    merge_queue_id    TEXT NOT NULL,
+    queue_item_id     TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    branch_ref        TEXT NOT NULL DEFAULT '',
+    queue_index       INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT '',
+    depends_on_json   TEXT NOT NULL DEFAULT '[]',
+    hard_depends_on_json TEXT NOT NULL DEFAULT '[]',
+    serializes_after_json TEXT NOT NULL DEFAULT '[]',
+    conflicts_with_json TEXT NOT NULL DEFAULT '[]',
+    same_node_or_file_conflicts_json TEXT NOT NULL DEFAULT '[]',
+    requires_graph_epoch_json TEXT NOT NULL DEFAULT '[]',
+    target_ref        TEXT NOT NULL DEFAULT '',
+    base_commit       TEXT NOT NULL DEFAULT '',
+    branch_head       TEXT NOT NULL DEFAULT '',
+    validated_target_head TEXT NOT NULL DEFAULT '',
+    current_target_head TEXT NOT NULL DEFAULT '',
+    validation_attempt INTEGER NOT NULL DEFAULT 0,
+    merge_preview_id  TEXT NOT NULL DEFAULT '',
+    snapshot_id       TEXT NOT NULL DEFAULT '',
+    projection_id     TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, merge_queue_id, queue_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_merge_queue_project_queue
+  ON parallel_branch_merge_queue_items(project_id, merge_queue_id, queue_index, queue_item_id);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_merge_queue_project_task
+  ON parallel_branch_merge_queue_items(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_merge_queue_project_target
+  ON parallel_branch_merge_queue_items(project_id, target_ref, merge_queue_id);
 """
 
 STATE_MERGED = "merged"
@@ -632,6 +666,201 @@ def list_branch_contexts(
             (project_id,),
         ).fetchall()
     return [_context_from_row(row) for row in rows]
+
+
+def _merge_queue_item_from_row(row: sqlite3.Row) -> MergeQueueItem:
+    return MergeQueueItem(
+        project_id=row["project_id"],
+        merge_queue_id=row["merge_queue_id"],
+        queue_item_id=row["queue_item_id"],
+        task_id=row["task_id"],
+        branch_ref=row["branch_ref"] or "",
+        queue_index=int(row["queue_index"] or 0),
+        status=row["status"] or "",
+        depends_on=_parse_json_array(row["depends_on_json"]),
+        hard_depends_on=_parse_json_array(row["hard_depends_on_json"]),
+        serializes_after=_parse_json_array(row["serializes_after_json"]),
+        conflicts_with=_parse_json_array(row["conflicts_with_json"]),
+        same_node_or_file_conflicts=_parse_json_array(row["same_node_or_file_conflicts_json"]),
+        requires_graph_epoch=_parse_json_array(row["requires_graph_epoch_json"]),
+        target_ref=row["target_ref"] or "",
+        base_commit=row["base_commit"] or "",
+        branch_head=row["branch_head"] or "",
+        validated_target_head=row["validated_target_head"] or "",
+        current_target_head=row["current_target_head"] or "",
+        validation_attempt=int(row["validation_attempt"] or 0),
+        merge_preview_id=row["merge_preview_id"] or "",
+        snapshot_id=row["snapshot_id"] or "",
+        projection_id=row["projection_id"] or "",
+    )
+
+
+def upsert_merge_queue_item(
+    conn: sqlite3.Connection,
+    item: MergeQueueItem,
+    *,
+    now_iso: str = "",
+) -> MergeQueueItem:
+    ensure_branch_runtime_schema(conn)
+    now = now_iso or utc_now()
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_merge_queue_items (
+            project_id, merge_queue_id, queue_item_id, task_id, branch_ref,
+            queue_index, status, depends_on_json, hard_depends_on_json,
+            serializes_after_json, conflicts_with_json,
+            same_node_or_file_conflicts_json, requires_graph_epoch_json,
+            target_ref, base_commit, branch_head, validated_target_head,
+            current_target_head, validation_attempt, merge_preview_id,
+            snapshot_id, projection_id, created_at, updated_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(project_id, merge_queue_id, queue_item_id) DO UPDATE SET
+            task_id = excluded.task_id,
+            branch_ref = excluded.branch_ref,
+            queue_index = excluded.queue_index,
+            status = excluded.status,
+            depends_on_json = excluded.depends_on_json,
+            hard_depends_on_json = excluded.hard_depends_on_json,
+            serializes_after_json = excluded.serializes_after_json,
+            conflicts_with_json = excluded.conflicts_with_json,
+            same_node_or_file_conflicts_json = excluded.same_node_or_file_conflicts_json,
+            requires_graph_epoch_json = excluded.requires_graph_epoch_json,
+            target_ref = excluded.target_ref,
+            base_commit = excluded.base_commit,
+            branch_head = excluded.branch_head,
+            validated_target_head = excluded.validated_target_head,
+            current_target_head = excluded.current_target_head,
+            validation_attempt = excluded.validation_attempt,
+            merge_preview_id = excluded.merge_preview_id,
+            snapshot_id = excluded.snapshot_id,
+            projection_id = excluded.projection_id,
+            updated_at = excluded.updated_at
+        """,
+        (
+            item.project_id,
+            item.merge_queue_id,
+            item.queue_item_id,
+            item.task_id,
+            item.branch_ref,
+            item.queue_index,
+            item.status,
+            _json_array(item.depends_on),
+            _json_array(item.hard_depends_on),
+            _json_array(item.serializes_after),
+            _json_array(item.conflicts_with),
+            _json_array(item.same_node_or_file_conflicts),
+            _json_array(item.requires_graph_epoch),
+            item.target_ref,
+            item.base_commit,
+            item.branch_head,
+            item.validated_target_head,
+            item.current_target_head,
+            item.validation_attempt,
+            item.merge_preview_id,
+            item.snapshot_id,
+            item.projection_id,
+            now,
+            now,
+        ),
+    )
+    found = get_merge_queue_item(
+        conn,
+        item.project_id,
+        item.merge_queue_id,
+        item.queue_item_id,
+    )
+    if found is None:
+        raise RuntimeError(f"merge queue item was not persisted: {item.queue_item_id}")
+    return found
+
+
+def upsert_merge_queue_items(
+    conn: sqlite3.Connection,
+    items: list[MergeQueueItem],
+    *,
+    now_iso: str = "",
+) -> list[MergeQueueItem]:
+    ensure_branch_runtime_schema(conn)
+    if not items:
+        return []
+    _require_single_merge_queue_scope(items)
+    for item in items:
+        upsert_merge_queue_item(conn, item, now_iso=now_iso)
+    first = items[0]
+    return list_merge_queue_items(
+        conn,
+        first.project_id,
+        first.merge_queue_id,
+        target_ref=first.target_ref,
+    )
+
+
+def get_merge_queue_item(
+    conn: sqlite3.Connection,
+    project_id: str,
+    merge_queue_id: str,
+    queue_item_id: str,
+) -> MergeQueueItem | None:
+    ensure_branch_runtime_schema(conn)
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_merge_queue_items
+        WHERE project_id = ? AND merge_queue_id = ? AND queue_item_id = ?
+        """,
+        (project_id, merge_queue_id, queue_item_id),
+    ).fetchone()
+    return _merge_queue_item_from_row(row) if row else None
+
+
+def list_merge_queue_items(
+    conn: sqlite3.Connection,
+    project_id: str,
+    merge_queue_id: str,
+    *,
+    target_ref: str = "",
+) -> list[MergeQueueItem]:
+    ensure_branch_runtime_schema(conn)
+    if target_ref:
+        rows = conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ? AND target_ref = ?
+            ORDER BY queue_index, queue_item_id
+            """,
+            (project_id, merge_queue_id, target_ref),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM parallel_branch_merge_queue_items
+            WHERE project_id = ? AND merge_queue_id = ?
+            ORDER BY queue_index, queue_item_id
+            """,
+            (project_id, merge_queue_id),
+        ).fetchall()
+    return [_merge_queue_item_from_row(row) for row in rows]
+
+
+def decide_persisted_merge_queue(
+    conn: sqlite3.Connection,
+    project_id: str,
+    merge_queue_id: str,
+    *,
+    target_ref: str = "",
+    scenario_id: str = "PB-002",
+) -> MergeQueuePlan:
+    """Replay merge queue decisions from durable queue rows."""
+    return decide_merge_queue(
+        list_merge_queue_items(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        ),
+        scenario_id=scenario_id,
+    )
 
 
 def _require_current_fence(context: BranchTaskRuntimeContext, fence_token: str) -> None:

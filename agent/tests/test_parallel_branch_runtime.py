@@ -241,12 +241,15 @@ def test_branch_runtime_schema_is_in_governance_migration() -> None:
 
     _ensure_schema(conn)
 
-    assert SCHEMA_VERSION >= 36
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        ("parallel_branch_runtime_contexts",),
-    ).fetchone()
-    assert row is not None
+    assert SCHEMA_VERSION >= 37
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+        ("parallel_branch_runtime_contexts", "parallel_branch_merge_queue_items"),
+    ).fetchall()
+    assert {row["name"] for row in rows} == {
+        "parallel_branch_runtime_contexts",
+        "parallel_branch_merge_queue_items",
+    }
 
 
 def test_pb001_recovery_rehydrates_replay_ready_contexts_from_db() -> None:
