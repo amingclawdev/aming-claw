@@ -427,6 +427,14 @@ contexts into `reclaimable` after restart. These APIs create the execution
 front door for MF/executor clients, while live merge and rollback execution
 remain gated by the merge queue and graph checks.
 
+Implemented fenced merge-queue API slice:
+`POST /api/graph-governance/{project_id}/parallel-branches/merge-queue` lets a
+branch runtime context enter the durable merge queue without direct client DB
+writes. The route enforces the current branch fence token, writes dependency
+and graph/projection evidence into `parallel_branch_merge_queue_items`, updates
+the branch context status and `merge_queue_id`, and returns the replayed merge
+queue decision plan. It still performs no target-branch mutation.
+
 Only after this loop is stable should normal executor worker parallelism be
 raised above the current conservative mode.
 

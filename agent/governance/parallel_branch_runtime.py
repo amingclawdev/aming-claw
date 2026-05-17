@@ -581,6 +581,20 @@ def branch_context_to_dict(context: BranchTaskRuntimeContext) -> dict[str, Any]:
     return payload
 
 
+def merge_queue_item_to_dict(item: MergeQueueItem) -> dict[str, Any]:
+    payload = asdict(item)
+    for key in (
+        "depends_on",
+        "hard_depends_on",
+        "serializes_after",
+        "conflicts_with",
+        "same_node_or_file_conflicts",
+        "requires_graph_epoch",
+    ):
+        payload[key] = list(getattr(item, key))
+    return payload
+
+
 def upsert_branch_context(
     conn: sqlite3.Connection,
     context: BranchTaskRuntimeContext,
@@ -1418,6 +1432,79 @@ def materialize_branch_worktree(
         "context": branch_context_to_dict(saved),
         "branch_strategy": strategy.to_metadata(),
         "worktree": worktree,
+    }
+
+
+def queue_merge_item_for_branch_context(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    merge_queue_id: str,
+    queue_item_id: str = "",
+    queue_index: int = 0,
+    status: str = STATE_QUEUED_FOR_MERGE,
+    fence_token: str = "",
+    depends_on: tuple[str, ...] = (),
+    hard_depends_on: tuple[str, ...] = (),
+    serializes_after: tuple[str, ...] = (),
+    conflicts_with: tuple[str, ...] = (),
+    same_node_or_file_conflicts: tuple[str, ...] = (),
+    requires_graph_epoch: tuple[str, ...] = (),
+    target_ref: str = "refs/heads/main",
+    current_target_head: str = "",
+    validated_target_head: str = "",
+    validation_attempt: int = 0,
+    merge_preview_id: str = "",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Persist a fenced merge queue request for one branch runtime context."""
+    ensure_branch_runtime_schema(conn)
+    queue_id = str(merge_queue_id or "").strip()
+    if not queue_id:
+        raise ValueError("merge_queue_id is required")
+    context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+    if context.fence_token or fence_token:
+        _require_current_fence(context, fence_token)
+
+    item = MergeQueueItem(
+        project_id=project_id,
+        merge_queue_id=queue_id,
+        queue_item_id=queue_item_id or f"{queue_id}:{task_id}",
+        task_id=task_id,
+        branch_ref=context.branch_ref,
+        queue_index=queue_index,
+        status=status or STATE_QUEUED_FOR_MERGE,
+        depends_on=tuple(depends_on or context.depends_on),
+        hard_depends_on=tuple(hard_depends_on),
+        serializes_after=tuple(serializes_after),
+        conflicts_with=tuple(conflicts_with),
+        same_node_or_file_conflicts=tuple(same_node_or_file_conflicts),
+        requires_graph_epoch=tuple(requires_graph_epoch),
+        target_ref=target_ref or context.ref_name or "refs/heads/main",
+        base_commit=context.base_commit,
+        branch_head=context.head_commit,
+        validated_target_head=validated_target_head,
+        current_target_head=current_target_head or context.target_head_commit,
+        validation_attempt=validation_attempt,
+        merge_preview_id=merge_preview_id or context.merge_preview_id,
+        snapshot_id=context.snapshot_id,
+        projection_id=context.projection_id,
+    )
+    saved_item = upsert_merge_queue_item(conn, item, now_iso=now_iso)
+    updated_context = replace(
+        context,
+        status=saved_item.status,
+        merge_queue_id=saved_item.merge_queue_id,
+        merge_preview_id=saved_item.merge_preview_id,
+        target_head_commit=saved_item.current_target_head or context.target_head_commit,
+    )
+    saved_context = upsert_branch_context(conn, updated_context, now_iso=now_iso)
+    return {
+        "context": branch_context_to_dict(saved_context),
+        "queue_item": merge_queue_item_to_dict(saved_item),
     }
 
 

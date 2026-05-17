@@ -3236,6 +3236,76 @@ def handle_graph_governance_parallel_branch_checkpoint(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
+def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
+    """Enter one branch runtime context into the durable merge queue."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import (
+        decide_persisted_merge_queue,
+        queue_merge_item_for_branch_context,
+    )
+
+    task_id = str(ctx.body.get("task_id") or "").strip()
+    merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+    if not merge_queue_id:
+        raise ValidationError("merge_queue_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.merge-queue")
+        with sqlite_write_lock():
+            queued = queue_merge_item_for_branch_context(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                merge_queue_id=merge_queue_id,
+                queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+                queue_index=_query_int(ctx.body, "queue_index", 0),
+                status=str(ctx.body.get("status") or "queued_for_merge"),
+                fence_token=str(ctx.body.get("fence_token") or ""),
+                depends_on=tuple(_query_statuses(ctx.body, "depends_on")),
+                hard_depends_on=tuple(_query_statuses(ctx.body, "hard_depends_on")),
+                serializes_after=tuple(_query_statuses(ctx.body, "serializes_after")),
+                conflicts_with=tuple(_query_statuses(ctx.body, "conflicts_with")),
+                same_node_or_file_conflicts=tuple(
+                    _query_statuses(ctx.body, "same_node_or_file_conflicts")
+                ),
+                requires_graph_epoch=tuple(_query_statuses(ctx.body, "requires_graph_epoch")),
+                target_ref=str(ctx.body.get("target_ref") or "refs/heads/main"),
+                current_target_head=str(ctx.body.get("current_target_head") or ""),
+                validated_target_head=str(ctx.body.get("validated_target_head") or ""),
+                validation_attempt=_query_int(ctx.body, "validation_attempt", 0),
+                merge_preview_id=str(ctx.body.get("merge_preview_id") or ""),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            decision = decide_persisted_merge_queue(
+                conn,
+                project_id,
+                merge_queue_id,
+                target_ref=str(ctx.body.get("target_ref") or "refs/heads/main"),
+                scenario_id=str(ctx.body.get("scenario_id") or "PB-002"),
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            **queued,
+            "decision": {
+                "scenario_id": decision.scenario_id,
+                "mergeable_task_ids": list(decision.mergeable_task_ids),
+                "blocked_task_ids": list(decision.blocked_task_ids),
+                "stale_task_ids": list(decision.stale_task_ids),
+                "target_mutation_blocked_for": list(decision.target_mutation_blocked_for),
+                "rows": list(decision.dashboard_rows),
+            },
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/recover-expired")
 def handle_graph_governance_parallel_branch_recover_expired(ctx: RequestContext):
     """Recover expired running branch contexts after an agent/session restart."""

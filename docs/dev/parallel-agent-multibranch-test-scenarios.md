@@ -126,7 +126,7 @@ Task fixture:
 | ID | Family | Trigger | Expected decision | Blocked by | Future tests |
 | --- | --- | --- | --- | --- | --- |
 | PB-001 | Machine restart recovery | Service restarts with T1 merged, T2 merge_failed, T4 queued_for_merge, T3/T5 unfinished. | Keep T1 merged; keep T2 merge_failed for observer action; mark T4 dependency_blocked; expire T3/T5 leases; retain all batch branches; activate no unfinished graph/semantic projections. | Runtime store, recovery API, and checkpoint fence are implemented; live executor replay remains gated. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
-| PB-002 | Merge dependency ordering | Downstream branch requests merge before upstream foundation branch. | Reject merge with `waiting_dependency` or `dependency_blocked`; no target branch mutation; no graph ref activation. | Implemented with pure decision oracle and durable SQLite queue replay; live merge execution remains gated. | `test_merge_queue_runtime.py` |
+| PB-002 | Merge dependency ordering | Downstream branch requests merge before upstream foundation branch. | Reject merge with `waiting_dependency` or `dependency_blocked`; no target branch mutation; no graph ref activation. | Implemented with pure decision oracle, durable SQLite queue replay, and fenced governance enqueue API; live merge execution remains gated. | `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
 | PB-003 | Target branch moves | Upstream branch merges after downstream branch was validated. | Mark downstream `stale_after_dependency_merge`; require rebase/sync, scope reconcile, semantic projection check, and merge preview. | Implemented with pure decision oracle and durable SQLite queue replay; scope/materialization integration remains separate. | `test_merge_queue_runtime.py`, `test_graph_rollback_epoch.py` |
 | PB-004 | Wrong merge order rollback/replay | Batch detects severe integration issue after an invalid merge order. | Enter `rollback_required`; retain all batch branches/worktrees; rollback target ref and graph ref; replay retained branch heads in corrected queue order. | Implemented with pure decision oracle and durable SQLite batch replay; live rollback execution remains gated. | `test_batch_merge_rollback.py` |
 | PB-005 | DB rollback consistency | Code rollback is requested after graph/semantic/pending rows changed. | Move graph snapshot refs and semantic projection refs to rollback epoch; mark superseded branch projections inactive; requeue or abandon semantic jobs by epoch; scope rows are isolated by branch/ref/batch. | Graph/projection/pending-scope read model implemented; semantic job invalidation remains pending. | `test_graph_rollback_epoch.py` |
@@ -166,6 +166,12 @@ tests prove a governance client can allocate a deterministic branch runtime,
 materialize an isolated worktree with branch-local graph artifacts, recover
 expired leases, reject stale fence tokens, and see the result through the
 compact read model.
+
+The merge-queue API slice is covered by
+`test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision`.
+It proves a stale agent cannot enqueue a branch after fence recovery, and that
+successful enqueue returns the same dependency-blocker oracle used by durable
+queue replay and the compact read model.
 
 ## Observer Recovery Dry Run
 

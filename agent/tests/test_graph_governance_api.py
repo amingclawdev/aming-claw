@@ -356,6 +356,77 @@ def test_parallel_branch_recover_and_checkpoint_routes_enforce_fence(conn):
     assert checkpointed["context"]["checkpoint_id"] == "checkpoint-after-reclaim"
 
 
+def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(conn):
+    queue_id = "mergeq-api-fenced"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-queue",
+            task_id="queue-task",
+            branch_ref="refs/heads/codex/queue-task",
+            status="worktree_ready",
+            fence_token="fence-queue-current",
+            base_commit="base-queue",
+            head_commit="head-queue",
+            target_head_commit="target-queue",
+            snapshot_id="scope-queue",
+            projection_id="semproj-queue",
+        ),
+        now_iso="2026-05-17T07:20:00Z",
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "queue-task",
+                    "merge_queue_id": queue_id,
+                    "fence_token": "fence-stale",
+                },
+            )
+        )
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "queue-task",
+                "merge_queue_id": queue_id,
+                "queue_index": 1,
+                "fence_token": "fence-queue-current",
+                "hard_depends_on": ["foundation-task"],
+                "merge_preview_id": "preview-queue",
+                "now_iso": "2026-05-17T07:21:00Z",
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["queue_item"]["merge_preview_id"] == "preview-queue"
+    assert queued["decision"]["blocked_task_ids"] == ["queue-task"]
+    row = queued["decision"]["rows"][0]
+    assert row["dependency_blockers"] == ["foundation-task"]
+    assert row["dependency_blocker_types"] == {"foundation-task": ["hard_depends_on"]}
+
+    read = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": "PB-api-queue",
+                "merge_queue_id": queue_id,
+                "limit": "5",
+            },
+        )
+    )
+    assert read["read_model"]["merge_queue"]["blocked_task_ids"] == ["queue-task"]
+    assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
+
+
 def test_governance_handler_json_response_includes_dev_cors_headers():
     handler = _bare_handler()
 

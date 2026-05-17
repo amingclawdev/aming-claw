@@ -31,6 +31,7 @@ from agent.governance.parallel_branch_runtime import (
     list_branch_contexts,
     materialize_branch_worktree,
     plan_branch_runtime_context,
+    queue_merge_item_for_branch_context,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
     runtime_tasks_from_contexts,
@@ -462,6 +463,58 @@ def test_mf_branch_worktree_materialization_uses_planned_identity(tmp_path) -> N
     assert result["branch_strategy"]["merge_policy"] == "merge_queue"
     assert (repo / ".worktrees" / "worker-one" / "mf-branch-api" / ".git").exists()
     assert result["worktree"]["branch_graph"]["status"] == "ready"
+
+
+def test_merge_queue_enqueue_uses_current_fence_and_updates_context() -> None:
+    conn = _runtime_conn()
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PROJECT_ID,
+            task_id="T-merge",
+            batch_id="PB-002",
+            branch_ref="refs/heads/codex/t-merge",
+            status=STATE_WORKTREE_READY,
+            fence_token="fence-current",
+            base_commit="base-merge",
+            head_commit="head-merge",
+            target_head_commit="target-merge",
+            snapshot_id="scope-merge",
+            projection_id="semproj-merge",
+        ),
+        now_iso=NOW,
+    )
+
+    with pytest.raises(BranchRuntimeFenceError):
+        queue_merge_item_for_branch_context(
+            conn,
+            project_id=PROJECT_ID,
+            task_id="T-merge",
+            merge_queue_id="mergeq-PB002",
+            fence_token="fence-stale",
+            now_iso=NOW,
+        )
+
+    queued = queue_merge_item_for_branch_context(
+        conn,
+        project_id=PROJECT_ID,
+        task_id="T-merge",
+        merge_queue_id="mergeq-PB002",
+        queue_index=2,
+        fence_token="fence-current",
+        hard_depends_on=("T-foundation",),
+        merge_preview_id="preview-merge",
+        now_iso=NOW,
+    )
+
+    context = get_branch_context(conn, PROJECT_ID, "T-merge")
+    assert context is not None
+    assert context.status == "queued_for_merge"
+    assert context.merge_queue_id == "mergeq-PB002"
+    assert context.merge_preview_id == "preview-merge"
+    assert queued["queue_item"]["branch_ref"] == "refs/heads/codex/t-merge"
+    assert queued["queue_item"]["hard_depends_on"] == ["T-foundation"]
+    assert queued["queue_item"]["snapshot_id"] == "scope-merge"
 
 
 def test_pb012_branch_contexts_are_isolated_by_project_and_batch() -> None:
