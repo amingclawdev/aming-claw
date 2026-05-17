@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import sqlite3
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from agent.governance import graph_snapshot_store as store
+from agent.governance.db import _ensure_schema
+from agent.governance.state_reconcile import (
+    _read_snapshot_graph,
+    _snapshot_inventory_rows,
+    normalize_reconcile_snapshot_for_comparison,
+    run_pending_scope_reconcile_candidate,
+    run_state_only_full_reconcile,
+)
+
+
+PID = "scope-consistency-test"
+
+
+@pytest.fixture()
+def conn(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    _ensure_schema(c)
+    yield c
+    c.close()
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return (result.stdout or "").strip()
+
+
+def _init_git(repo: Path) -> None:
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test User")
+
+
+def _write_project(root: Path) -> None:
+    _write(
+        root / "agent" / "service.py",
+        "def service_entry():\n"
+        "    return helper()\n\n"
+        "def helper():\n"
+        "    return 'ok'\n",
+    )
+    _write(
+        root / "agent" / "tests" / "test_service.py",
+        "from agent.service import service_entry\n\n"
+        "def test_service_entry():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _write(root / "README.md", "# Service\n\nScope consistency fixture.\n")
+
+
+def _normalized_snapshot(conn: sqlite3.Connection, snapshot_id: str) -> dict:
+    graph = _read_snapshot_graph(PID, snapshot_id)
+    inventory = _snapshot_inventory_rows(conn, PID, snapshot_id)
+    return normalize_reconcile_snapshot_for_comparison(graph, file_inventory=inventory)
+
+
+def _node_ids_by_primary_file(graph: dict) -> dict[str, str]:
+    nodes = ((graph.get("deps_graph") or {}).get("nodes") or [])
+    mapping: dict[str, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or node.get("node_id") or "")
+        primary_files = list(node.get("primary") or []) + list(node.get("primary_files") or [])
+        for path in primary_files:
+            if node_id and path:
+                mapping[str(path).replace("\\", "/").strip("/")] = node_id
+    return mapping
+
+
+def test_scope_reconcile_output_matches_full_rebuild_for_same_final_state(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id="full-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "README.md",
+        "# Service\n\nScope consistency fixture with a documentation update.\n",
+    )
+    _git(project, "add", "README.md")
+    _git(project, "commit", "-m", "change docs")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-head-consistency",
+        snapshot_id="scope-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
+    assert scope["scope_file_delta"]["changed_files"] == ["README.md"]
+
+    full = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-head-consistency",
+        commit_sha=head_commit,
+        snapshot_id="full-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert full["ok"] is True
+
+    assert _normalized_snapshot(conn, "scope-head-consistency") == _normalized_snapshot(
+        conn,
+        "full-head-consistency",
+    )
+
+    base_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "full-base-consistency"))
+    scope_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "scope-head-consistency"))
+    assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]

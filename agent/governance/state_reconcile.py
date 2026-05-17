@@ -284,6 +284,71 @@ def _read_snapshot_companion(project_id: str, snapshot_id: str, filename: str, d
     return payload
 
 
+_RECONCILE_COMPARISON_VOLATILE_KEYS = {
+    "artifact_path",
+    "created_at",
+    "drift_sha256",
+    "generated_at",
+    "graph_sha256",
+    "inventory_sha256",
+    "phase_report_path",
+    "project_root",
+    "review_report_path",
+    "run_id",
+    "scratch_dir",
+    "semantic_index_path",
+    "snapshot_artifact",
+    "snapshot_id",
+    "snapshot_path",
+    "state_dir",
+    "summary_path",
+    "trace",
+    "trace_dir",
+    "updated_at",
+    "version",
+}
+
+
+def _stable_json_key(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_for_reconcile_comparison(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_for_reconcile_comparison(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _RECONCILE_COMPARISON_VOLATILE_KEYS
+        }
+    if isinstance(value, list):
+        normalized = [_normalize_for_reconcile_comparison(item) for item in value]
+        return sorted(normalized, key=_stable_json_key)
+    return value
+
+
+def normalize_reconcile_snapshot_for_comparison(
+    graph_json: dict[str, Any],
+    *,
+    file_inventory: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return a stable structural view for full-vs-scope reconcile comparison.
+
+    The helper deliberately strips run-specific metadata, artifact paths,
+    timestamps, and snapshot ids while preserving node ids, graph structure,
+    file bindings, file hashes, function metadata, and inventory state. It is
+    intended for regression tests that compare full rebuild output with scope
+    reconcile output for the same final project state.
+    """
+    nodes = _deps_graph_nodes(graph_json)
+    edges = _deps_graph_edges(graph_json)
+    inventory = file_inventory or []
+    return {
+        "nodes": _normalize_for_reconcile_comparison(nodes),
+        "edges": _normalize_for_reconcile_comparison(edges),
+        "file_inventory": _normalize_for_reconcile_comparison(inventory),
+    }
+
+
 def repair_snapshot_feature_hash_metadata(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1638,6 +1703,7 @@ def run_backfill_escape_hatch(
 
 
 __all__ = [
+    "normalize_reconcile_snapshot_for_comparison",
     "repair_snapshot_feature_hash_metadata",
     "run_backfill_escape_hatch",
     "run_pending_scope_reconcile_candidate",
