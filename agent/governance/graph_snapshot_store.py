@@ -97,6 +97,10 @@ CREATE INDEX IF NOT EXISTS idx_graph_drift_status
 
 CREATE TABLE IF NOT EXISTS pending_scope_reconcile (
   project_id TEXT NOT NULL,
+  ref_name TEXT NOT NULL DEFAULT 'active',
+  branch_ref TEXT NOT NULL DEFAULT '',
+  worktree_id TEXT NOT NULL DEFAULT '',
+  worktree_path TEXT NOT NULL DEFAULT '',
   commit_sha TEXT NOT NULL,
   parent_commit_sha TEXT NOT NULL DEFAULT '',
   queued_at TEXT NOT NULL,
@@ -104,11 +108,8 @@ CREATE TABLE IF NOT EXISTS pending_scope_reconcile (
   retry_count INTEGER NOT NULL DEFAULT 0,
   snapshot_id TEXT NOT NULL DEFAULT '',
   evidence_json TEXT NOT NULL DEFAULT '{}',
-  PRIMARY KEY(project_id, commit_sha)
+  PRIMARY KEY(project_id, ref_name, worktree_id, commit_sha)
 );
-
-CREATE INDEX IF NOT EXISTS idx_pending_scope_status
-  ON pending_scope_reconcile(project_id, status, queued_at);
 
 CREATE TABLE IF NOT EXISTS reconcile_run_metrics (
   project_id TEXT NOT NULL,
@@ -179,6 +180,138 @@ def utc_now() -> str:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
+    _migrate_pending_scope_reconcile_branch_identity(conn)
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row["name"] if hasattr(row, "keys") else row[1]) for row in rows}
+
+
+def _table_pk_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    items: list[tuple[int, str]] = []
+    for row in rows:
+        pk = int(row["pk"] if hasattr(row, "keys") else row[5])
+        if pk:
+            items.append((pk, str(row["name"] if hasattr(row, "keys") else row[1])))
+    return [name for _pk, name in sorted(items)]
+
+
+def _migrate_pending_scope_reconcile_branch_identity(conn: sqlite3.Connection) -> None:
+    """Upgrade pending scope rows from commit-only identity to ref/worktree identity."""
+    if not _table_exists(conn, "pending_scope_reconcile"):
+        return
+    columns = _table_columns(conn, "pending_scope_reconcile")
+    expected_columns = {"ref_name", "branch_ref", "worktree_id", "worktree_path"}
+    expected_pk = ["project_id", "ref_name", "worktree_id", "commit_sha"]
+    if expected_columns.issubset(columns) and _table_pk_columns(conn, "pending_scope_reconcile") == expected_pk:
+        _ensure_pending_scope_reconcile_indexes(conn)
+        return
+
+    legacy_name = "pending_scope_reconcile_legacy_branch_identity"
+    conn.execute("DROP TABLE IF EXISTS pending_scope_reconcile_migrated")
+    conn.execute(f"DROP TABLE IF EXISTS {legacy_name}")
+    conn.execute("DROP INDEX IF EXISTS idx_pending_scope_status")
+    conn.execute("DROP INDEX IF EXISTS idx_pending_scope_branch")
+    conn.execute(f"ALTER TABLE pending_scope_reconcile RENAME TO {legacy_name}")
+    conn.execute(
+        """
+        CREATE TABLE pending_scope_reconcile (
+          project_id TEXT NOT NULL,
+          ref_name TEXT NOT NULL DEFAULT 'active',
+          branch_ref TEXT NOT NULL DEFAULT '',
+          worktree_id TEXT NOT NULL DEFAULT '',
+          worktree_path TEXT NOT NULL DEFAULT '',
+          commit_sha TEXT NOT NULL,
+          parent_commit_sha TEXT NOT NULL DEFAULT '',
+          queued_at TEXT NOT NULL,
+          status TEXT NOT NULL,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          snapshot_id TEXT NOT NULL DEFAULT '',
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          PRIMARY KEY(project_id, ref_name, worktree_id, commit_sha)
+        )
+        """
+    )
+    legacy_columns = _table_columns(conn, legacy_name)
+
+    def expr(column: str, default: str) -> str:
+        if column in legacy_columns:
+            return f"COALESCE({column}, {default})"
+        return default
+
+    conn.execute(
+        f"""
+        INSERT OR REPLACE INTO pending_scope_reconcile
+          (project_id, ref_name, branch_ref, worktree_id, worktree_path,
+           commit_sha, parent_commit_sha, queued_at, status, retry_count,
+           snapshot_id, evidence_json)
+        SELECT
+          project_id,
+          {expr('ref_name', "'active'")},
+          {expr('branch_ref', "''")},
+          {expr('worktree_id', "''")},
+          {expr('worktree_path', "''")},
+          commit_sha,
+          parent_commit_sha,
+          queued_at,
+          status,
+          retry_count,
+          snapshot_id,
+          evidence_json
+        FROM {legacy_name}
+        """
+    )
+    conn.execute(f"DROP TABLE {legacy_name}")
+    _ensure_pending_scope_reconcile_indexes(conn)
+
+
+def _ensure_pending_scope_reconcile_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_scope_status "
+        "ON pending_scope_reconcile(project_id, status, ref_name, queued_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_scope_branch "
+        "ON pending_scope_reconcile(project_id, branch_ref, worktree_id, commit_sha)"
+    )
+
+
+def normalize_pending_scope_identity(
+    *,
+    ref_name: str = "",
+    branch_ref: str = "",
+    worktree_id: str = "",
+    worktree_path: str = "",
+) -> dict[str, str]:
+    branch = str(branch_ref or "").strip()
+    raw_path = str(worktree_path or "").strip()
+    normalized_path = ""
+    if raw_path:
+        try:
+            normalized_path = str(Path(raw_path).expanduser().resolve()).replace("\\", "/")
+        except Exception:
+            normalized_path = str(Path(raw_path).expanduser()).replace("\\", "/")
+    wid = str(worktree_id or "").strip()
+    if not wid and normalized_path:
+        digest = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[:12]
+        wid = f"worktree:{digest}"
+    ref = str(ref_name or "").strip()
+    if not ref:
+        ref = branch or wid or "active"
+    return {
+        "ref_name": ref,
+        "branch_ref": branch,
+        "worktree_id": wid,
+        "worktree_path": normalized_path,
+    }
 
 
 def _json(data: Any) -> str:
@@ -712,6 +845,7 @@ def activate_graph_snapshot(
     auto_rebuild_projection: bool = True,
 ) -> dict[str, Any]:
     ensure_schema(conn)
+    ref_name = normalize_pending_scope_identity(ref_name=ref_name)["ref_name"]
     row = conn.execute(
         "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
         (project_id, snapshot_id),
@@ -814,6 +948,9 @@ def finalize_graph_snapshot(
     target_commit_sha: str = "",
     expected_old_snapshot_id: str | None = None,
     ref_name: str = "active",
+    branch_ref: str = "",
+    worktree_id: str = "",
+    worktree_path: str = "",
     actor: str = "observer",
     materialize_pending: bool = True,
     covered_commit_shas: Iterable[str] | None = None,
@@ -856,6 +993,12 @@ def finalize_graph_snapshot(
     )
     materialized_count = 0
     if materialize_pending:
+        identity = normalize_pending_scope_identity(
+            ref_name=ref_name,
+            branch_ref=branch_ref,
+            worktree_id=worktree_id,
+            worktree_path=worktree_path,
+        )
         commit_targets = sorted({
             str(item or "").strip()
             for item in (covered_commit_shas or [commit_sha])
@@ -867,7 +1010,10 @@ def finalize_graph_snapshot(
             "source": "graph_snapshot_finalizer",
             "actor": actor,
             "snapshot_id": snapshot_id,
-            "ref_name": ref_name,
+            "ref_name": identity["ref_name"],
+            "branch_ref": identity["branch_ref"],
+            "worktree_id": identity["worktree_id"],
+            "worktree_path": identity["worktree_path"],
             "covered_commit_shas": commit_targets,
             **(evidence or {}),
         }
@@ -879,6 +1025,8 @@ def finalize_graph_snapshot(
                 snapshot_id = ?,
                 evidence_json = ?
             WHERE project_id = ?
+              AND ref_name = ?
+              AND worktree_id = ?
               AND commit_sha IN ({placeholders})
               AND status IN (?, ?, ?)
             """,
@@ -887,6 +1035,8 @@ def finalize_graph_snapshot(
                 snapshot_id,
                 _json(pending_evidence),
                 project_id,
+                identity["ref_name"],
+                identity["worktree_id"],
                 *commit_targets,
                 PENDING_STATUS_QUEUED,
                 PENDING_STATUS_RUNNING,
@@ -1848,6 +1998,7 @@ def _pending_by_commit(conn: sqlite3.Connection, project_id: str) -> dict[str, d
         conn,
         project_id,
         statuses=[PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED],
+        ref_name="active",
     )
     return {str(row.get("commit_sha") or ""): row for row in pending}
 
@@ -1914,7 +2065,7 @@ def resolve_commit_graph_state(
     active = get_active_graph_snapshot(conn, project_id)
     active_snapshot_id = str(active.get("snapshot_id") or "") if active else ""
     exact = get_graph_snapshot_for_commit(conn, project_id, commit_sha)
-    pending_rows = list_pending_scope_reconcile(conn, project_id, commit_shas=[commit_sha])
+    pending_rows = list_pending_scope_reconcile(conn, project_id, commit_shas=[commit_sha], ref_name="active")
     pending_active = [
         row for row in pending_rows
         if row.get("status") in {PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED}
@@ -2094,6 +2245,10 @@ def list_pending_scope_reconcile(
     *,
     statuses: Iterable[str] | None = None,
     commit_shas: Iterable[str] | None = None,
+    ref_name: str | None = None,
+    branch_ref: str | None = None,
+    worktree_id: str | None = None,
+    worktree_path: str | None = None,
 ) -> list[dict[str, Any]]:
     ensure_schema(conn)
     params: list[Any] = [project_id]
@@ -2108,7 +2263,19 @@ def list_pending_scope_reconcile(
         placeholders = ",".join("?" for _ in commit_values)
         sql += f" AND commit_sha IN ({placeholders})"
         params.extend(commit_values)
-    sql += " ORDER BY queued_at, commit_sha"
+    if any(value is not None for value in (ref_name, branch_ref, worktree_id, worktree_path)):
+        identity = normalize_pending_scope_identity(
+            ref_name=str(ref_name or ""),
+            branch_ref=str(branch_ref or ""),
+            worktree_id=str(worktree_id or ""),
+            worktree_path=str(worktree_path or ""),
+        )
+        sql += " AND ref_name = ? AND worktree_id = ?"
+        params.extend([identity["ref_name"], identity["worktree_id"]])
+        if branch_ref is not None:
+            sql += " AND branch_ref = ?"
+            params.append(identity["branch_ref"])
+    sql += " ORDER BY queued_at, ref_name, worktree_id, commit_sha"
     rows = conn.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
 
@@ -2696,6 +2863,10 @@ def queue_pending_scope_reconcile(
     *,
     commit_sha: str,
     parent_commit_sha: str = "",
+    ref_name: str = "",
+    branch_ref: str = "",
+    worktree_id: str = "",
+    worktree_path: str = "",
     status: str = PENDING_STATUS_QUEUED,
     snapshot_id: str = "",
     evidence: dict[str, Any] | None = None,
@@ -2706,17 +2877,26 @@ def queue_pending_scope_reconcile(
         raise ValueError(f"invalid pending scope reconcile status: {status}")
     now = utc_now()
     force_flag = 1 if force_requeue else 0
+    identity = normalize_pending_scope_identity(
+        ref_name=ref_name,
+        branch_ref=branch_ref,
+        worktree_id=worktree_id,
+        worktree_path=worktree_path,
+    )
     conn.execute(
         """
         INSERT INTO pending_scope_reconcile
-          (project_id, commit_sha, parent_commit_sha, queued_at, status,
-           retry_count, snapshot_id, evidence_json)
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-        ON CONFLICT(project_id, commit_sha) DO UPDATE SET
+          (project_id, ref_name, branch_ref, worktree_id, worktree_path,
+           commit_sha, parent_commit_sha, queued_at, status, retry_count,
+           snapshot_id, evidence_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(project_id, ref_name, worktree_id, commit_sha) DO UPDATE SET
           queued_at = CASE
             WHEN ? = 1 THEN excluded.queued_at
             ELSE pending_scope_reconcile.queued_at
           END,
+          branch_ref = excluded.branch_ref,
+          worktree_path = excluded.worktree_path,
           parent_commit_sha = CASE
             WHEN pending_scope_reconcile.parent_commit_sha = '' THEN excluded.parent_commit_sha
             ELSE pending_scope_reconcile.parent_commit_sha
@@ -2740,12 +2920,20 @@ def queue_pending_scope_reconcile(
         """,
         (
             project_id,
+            identity["ref_name"],
+            identity["branch_ref"],
+            identity["worktree_id"],
+            identity["worktree_path"],
             commit_sha,
             parent_commit_sha,
             now,
             status,
             snapshot_id,
             _json({
+                "ref_name": identity["ref_name"],
+                "branch_ref": identity["branch_ref"],
+                "worktree_id": identity["worktree_id"],
+                "worktree_path": identity["worktree_path"],
                 **(evidence or {}),
                 **({"force_requeue": True, "forced_at": now} if force_requeue else {}),
             }),
@@ -2756,8 +2944,11 @@ def queue_pending_scope_reconcile(
         ),
     )
     row = conn.execute(
-        "SELECT * FROM pending_scope_reconcile WHERE project_id = ? AND commit_sha = ?",
-        (project_id, commit_sha),
+        """
+        SELECT * FROM pending_scope_reconcile
+        WHERE project_id = ? AND ref_name = ? AND worktree_id = ? AND commit_sha = ?
+        """,
+        (project_id, identity["ref_name"], identity["worktree_id"], commit_sha),
     ).fetchone()
     return dict(row)
 
@@ -2767,6 +2958,10 @@ def waive_pending_scope_reconcile(
     project_id: str,
     *,
     commit_shas: Iterable[str] | None = None,
+    ref_name: str | None = None,
+    branch_ref: str | None = None,
+    worktree_id: str | None = None,
+    worktree_path: str | None = None,
     snapshot_id: str = "",
     actor: str = "observer",
     reason: str = "",
@@ -2790,6 +2985,19 @@ def waive_pending_scope_reconcile(
         placeholders = ",".join("?" for _ in selected)
         sql += f" AND commit_sha IN ({placeholders})"
         params.extend(selected)
+    identity: dict[str, str] | None = None
+    if any(value is not None for value in (ref_name, branch_ref, worktree_id, worktree_path)):
+        identity = normalize_pending_scope_identity(
+            ref_name=str(ref_name or ""),
+            branch_ref=str(branch_ref or ""),
+            worktree_id=str(worktree_id or ""),
+            worktree_path=str(worktree_path or ""),
+        )
+        sql += " AND ref_name = ? AND worktree_id = ?"
+        params.extend([identity["ref_name"], identity["worktree_id"]])
+        if branch_ref is not None:
+            sql += " AND branch_ref = ?"
+            params.append(identity["branch_ref"])
     sql += " ORDER BY queued_at, commit_sha"
     rows = conn.execute(sql, params).fetchall()
     targets = [row["commit_sha"] for row in rows]
@@ -2807,9 +3015,15 @@ def waive_pending_scope_reconcile(
         "reason": reason,
         "snapshot_id": snapshot_id,
         "commit_shas": targets,
+        **(identity or {}),
         **(evidence or {}),
     }
     placeholders = ",".join("?" for _ in targets)
+    update_filters = ""
+    update_filter_values: list[Any] = []
+    if identity is not None:
+        update_filters += " AND ref_name = ? AND worktree_id = ?"
+        update_filter_values.extend([identity["ref_name"], identity["worktree_id"]])
     cur = conn.execute(
         f"""
         UPDATE pending_scope_reconcile
@@ -2818,6 +3032,7 @@ def waive_pending_scope_reconcile(
             evidence_json = ?
         WHERE project_id = ?
           AND commit_sha IN ({placeholders})
+          {update_filters}
           AND status IN (?, ?, ?)
         """,
         (
@@ -2827,6 +3042,7 @@ def waive_pending_scope_reconcile(
             _json(waiver_evidence),
             project_id,
             *targets,
+            *update_filter_values,
             PENDING_STATUS_QUEUED,
             PENDING_STATUS_RUNNING,
             PENDING_STATUS_FAILED,
@@ -2837,6 +3053,7 @@ def waive_pending_scope_reconcile(
         "waived_count": int(cur.rowcount or 0),
         "commit_shas": targets,
         "snapshot_id": snapshot_id,
+        **(identity or {}),
     }
 
 
@@ -2845,6 +3062,10 @@ def mark_pending_scope_reconcile_failed(
     project_id: str,
     *,
     commit_sha: str,
+    ref_name: str | None = None,
+    branch_ref: str | None = None,
+    worktree_id: str | None = None,
+    worktree_path: str | None = None,
     actor: str = "observer",
     reason: str = "",
     evidence: dict[str, Any] | None = None,
@@ -2854,33 +3075,52 @@ def mark_pending_scope_reconcile_failed(
     commit = str(commit_sha or "").strip()
     if not commit:
         return {"project_id": project_id, "updated_count": 0, "commit_sha": ""}
-    row = conn.execute(
-        "SELECT * FROM pending_scope_reconcile WHERE project_id=? AND commit_sha=?",
-        (project_id, commit),
-    ).fetchone()
+    identity: dict[str, str] | None = None
+    select_sql = "SELECT * FROM pending_scope_reconcile WHERE project_id=? AND commit_sha=?"
+    select_params: list[Any] = [project_id, commit]
+    if any(value is not None for value in (ref_name, branch_ref, worktree_id, worktree_path)):
+        identity = normalize_pending_scope_identity(
+            ref_name=str(ref_name or ""),
+            branch_ref=str(branch_ref or ""),
+            worktree_id=str(worktree_id or ""),
+            worktree_path=str(worktree_path or ""),
+        )
+        select_sql += " AND ref_name=? AND worktree_id=?"
+        select_params.extend([identity["ref_name"], identity["worktree_id"]])
+        if branch_ref is not None:
+            select_sql += " AND branch_ref=?"
+            select_params.append(identity["branch_ref"])
+    row = conn.execute(select_sql, select_params).fetchone()
     previous = dict(row) if row else {}
     failure_evidence = {
         "source": "pending_scope_failure",
         "actor": actor,
         "reason": reason,
         "commit_sha": commit,
+        **(identity or {}),
         "previous_status": previous.get("status", ""),
         "previous_evidence": _decode_json(previous.get("evidence_json"), {}),
         "recoverable": True,
         "recovery_action": "force_requeue_pending_scope",
         **(evidence or {}),
     }
+    update_filters = ""
+    update_filter_values: list[Any] = []
+    if identity is not None:
+        update_filters += " AND ref_name=? AND worktree_id=?"
+        update_filter_values.extend([identity["ref_name"], identity["worktree_id"]])
     cur = conn.execute(
-        """
+        f"""
         UPDATE pending_scope_reconcile
         SET status=?, evidence_json=?
-        WHERE project_id=? AND commit_sha=? AND status IN (?, ?, ?)
+        WHERE project_id=? AND commit_sha=? {update_filters} AND status IN (?, ?, ?)
         """,
         (
             PENDING_STATUS_FAILED,
             _json(failure_evidence),
             project_id,
             commit,
+            *update_filter_values,
             PENDING_STATUS_QUEUED,
             PENDING_STATUS_RUNNING,
             PENDING_STATUS_FAILED,
@@ -2892,6 +3132,7 @@ def mark_pending_scope_reconcile_failed(
         "commit_sha": commit,
         "status": PENDING_STATUS_FAILED,
         "evidence": failure_evidence,
+        **(identity or {}),
     }
 
 
@@ -2910,11 +3151,12 @@ def recover_stale_pending_scope_reconcile(
         """
         SELECT * FROM pending_scope_reconcile
         WHERE project_id=? AND status=?
-        ORDER BY queued_at, commit_sha
+        ORDER BY queued_at, ref_name, worktree_id, commit_sha
         """,
         (project_id, PENDING_STATUS_RUNNING),
     ).fetchall()
     recovered: list[str] = []
+    recovered_rows: list[dict[str, str]] = []
     now_dt = datetime.now(timezone.utc)
     for row in rows:
         queued_at = str(row["queued_at"] or "")
@@ -2930,6 +3172,10 @@ def recover_stale_pending_scope_reconcile(
             conn,
             project_id,
             commit_sha=commit,
+            ref_name=str(row["ref_name"] or ""),
+            branch_ref=str(row["branch_ref"] or ""),
+            worktree_id=str(row["worktree_id"] or ""),
+            worktree_path=str(row["worktree_path"] or ""),
             actor=actor,
             reason="stale running pending-scope row exceeded recovery threshold",
             evidence={
@@ -2941,10 +3187,18 @@ def recover_stale_pending_scope_reconcile(
             },
         )
         recovered.append(commit)
+        recovered_rows.append({
+            "commit_sha": commit,
+            "ref_name": str(row["ref_name"] or ""),
+            "branch_ref": str(row["branch_ref"] or ""),
+            "worktree_id": str(row["worktree_id"] or ""),
+            "worktree_path": str(row["worktree_path"] or ""),
+        })
     return {
         "project_id": project_id,
         "recovered_count": len(recovered),
         "commit_shas": recovered,
+        "recovered_rows": recovered_rows,
         "max_running_seconds": cutoff_seconds,
     }
 
@@ -2973,6 +3227,7 @@ __all__ = [
     "list_graph_snapshot_nodes",
     "list_graph_snapshots",
     "list_graph_drift",
+    "normalize_pending_scope_identity",
     "graph_payload_stats",
     "import_existing_graph_snapshot",
     "abandon_graph_snapshot",

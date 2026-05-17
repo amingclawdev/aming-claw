@@ -32,6 +32,7 @@ from agent.governance.graph_snapshot_store import (
     index_graph_snapshot,
     list_graph_snapshot_files,
     list_pending_scope_reconcile,
+    normalize_pending_scope_identity,
     record_reconcile_run_metric,
     snapshot_companion_dir,
     snapshot_graph_path,
@@ -1937,6 +1938,7 @@ def run_state_only_full_reconcile(
     created_by: str = "observer",
     activate: bool = False,
     expected_old_snapshot_id: str | None = None,
+    ref_name: str = "active",
     notes_extra: dict[str, Any] | None = None,
     semantic_enrich: bool = True,
     semantic_use_ai: bool | None = None,
@@ -1987,6 +1989,7 @@ def run_state_only_full_reconcile(
         project_id=project_id,
         commit_sha=commit,
     )
+    activation_ref_name = str(ref_name or "active").strip() or "active"
     state_dir = _governance_state_dir(project_id, rid)
     scratch_dir = state_dir / "scratch"
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -2008,6 +2011,7 @@ def run_state_only_full_reconcile(
             "snapshot_kind": snapshot_kind,
             "commit_sha": commit,
             "created_by": created_by,
+            "ref_name": activation_ref_name,
         },
         output_payload={
             "state_dir": str(state_dir),
@@ -2368,6 +2372,7 @@ def run_state_only_full_reconcile(
                 project_id,
                 sid,
                 expected_old_snapshot_id=expected_old_snapshot_id,
+                ref_name=activation_ref_name,
             )
             conn.commit()
         trace.step(
@@ -2375,6 +2380,7 @@ def run_state_only_full_reconcile(
             input_payload={
                 "snapshot_id": sid,
                 "expected_old_snapshot_id": expected_old_snapshot_id,
+                "ref_name": activation_ref_name,
             },
             output_payload={"activation": activation},
         )
@@ -2431,6 +2437,10 @@ def _update_pending_scope_candidate(
     target_commit_sha: str,
     run_id: str,
     activated: bool = False,
+    ref_name: str = "active",
+    branch_ref: str = "",
+    worktree_id: str = "",
+    worktree_path: str = "",
 ) -> int:
     """Mark pending_scope_reconcile rows bound to the just-built candidate.
 
@@ -2445,6 +2455,12 @@ def _update_pending_scope_candidate(
         return 0
     placeholders = ",".join("?" for _ in commits)
     final_status = PENDING_STATUS_MATERIALIZED if activated else PENDING_STATUS_RUNNING
+    identity = normalize_pending_scope_identity(
+        ref_name=ref_name,
+        branch_ref=branch_ref,
+        worktree_id=worktree_id,
+        worktree_path=worktree_path,
+    )
     evidence = {
         "source": "pending_scope_materializer",
         "snapshot_id": snapshot_id,
@@ -2453,6 +2469,7 @@ def _update_pending_scope_candidate(
         "covered_commit_shas": commits,
         "activated": bool(activated),
         "final_status": final_status,
+        **identity,
     }
     cur = conn.execute(
         f"""
@@ -2461,6 +2478,8 @@ def _update_pending_scope_candidate(
             snapshot_id = ?,
             evidence_json = ?
         WHERE project_id = ?
+          AND ref_name = ?
+          AND worktree_id = ?
           AND commit_sha IN ({placeholders})
           AND status IN (?, ?, ?)
         """,
@@ -2469,6 +2488,8 @@ def _update_pending_scope_candidate(
             snapshot_id,
             json.dumps(evidence, ensure_ascii=False, sort_keys=True),
             project_id,
+            identity["ref_name"],
+            identity["worktree_id"],
             *commits,
             PENDING_STATUS_QUEUED,
             PENDING_STATUS_RUNNING,
@@ -2613,6 +2634,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
     checkout_provenance: dict[str, Any],
     created_by: str,
     activate: bool,
+    ref_name: str,
+    expected_old_snapshot_id: str,
     semantic_options: dict[str, Any],
 ) -> dict[str, Any]:
     active_snapshot_id = str(active.get("snapshot_id") or "")
@@ -2632,6 +2655,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             "active_snapshot_id": active_snapshot_id,
             "active_graph_commit": active_commit,
             "target_commit": target,
+            "ref_name": ref_name,
         }
         candidate_graph["metadata"] = metadata
 
@@ -2990,14 +3014,16 @@ def _run_incremental_metadata_scope_reconcile_candidate(
                 conn,
                 project_id,
                 sid,
-                expected_old_snapshot_id=active_snapshot_id,
+                expected_old_snapshot_id=expected_old_snapshot_id or None,
+                ref_name=ref_name,
             )
             conn.commit()
         trace.step(
             "activate-snapshot",
             input_payload={
                 "snapshot_id": sid,
-                "expected_old_snapshot_id": active_snapshot_id,
+                "expected_old_snapshot_id": expected_old_snapshot_id,
+                "ref_name": ref_name,
             },
             output_payload={"activation": activation},
         )
@@ -3053,11 +3079,21 @@ def _finalize_scope_reconcile_candidate(
     rid: str,
     sid: str,
     created_by: str,
+    ref_name: str,
+    branch_ref: str,
+    worktree_id: str,
+    worktree_path: str,
     semantic_enqueue_stale: bool,
     strategy: str,
     graph_delta_mode: str,
     fallback_reason: str = "",
 ) -> dict[str, Any]:
+    identity = normalize_pending_scope_identity(
+        ref_name=ref_name,
+        branch_ref=branch_ref,
+        worktree_id=worktree_id,
+        worktree_path=worktree_path,
+    )
     scope_file_delta = _build_scope_file_delta(
         project_root=root,
         old_rows=active_inventory,
@@ -3086,6 +3122,7 @@ def _finalize_scope_reconcile_candidate(
         "covered_commit_count": len(covered_commit_shas),
         "active_snapshot_id": active.get("snapshot_id", ""),
         "active_graph_commit": active.get("commit_sha", ""),
+        **identity,
         "scope_file_delta": scope_file_delta,
         "scope_graph_delta": scope_graph_delta,
         "semantic_enqueue_stale": bool(semantic_enqueue_stale),
@@ -3117,6 +3154,10 @@ def _finalize_scope_reconcile_candidate(
             target_commit_sha=target,
             run_id=rid,
             activated=activation_succeeded,
+            ref_name=identity["ref_name"],
+            branch_ref=identity["branch_ref"],
+            worktree_id=identity["worktree_id"],
+            worktree_path=identity["worktree_path"],
         )
         if row:
             try:
@@ -3157,6 +3198,7 @@ def _finalize_scope_reconcile_candidate(
                 "covered_commit_shas": covered_commit_shas,
                 "pending_rows_bound": updated,
                 "semantic_enqueue_stale": bool(semantic_enqueue_stale),
+                **identity,
             },
         )
         conn.commit()
@@ -3171,6 +3213,10 @@ def _finalize_scope_reconcile_candidate(
         "scope_graph_events": scope_event_summary,
         "active_snapshot_id": active.get("snapshot_id", ""),
         "active_graph_commit": active.get("commit_sha", ""),
+        "ref_name": identity["ref_name"],
+        "branch_ref": identity["branch_ref"],
+        "worktree_id": identity["worktree_id"],
+        "worktree_path": identity["worktree_path"],
     }
 
 
@@ -3184,6 +3230,10 @@ def run_pending_scope_reconcile_candidate(
     snapshot_id: str | None = None,
     created_by: str = "observer",
     activate: bool = False,
+    ref_name: str = "active",
+    branch_ref: str = "",
+    worktree_id: str = "",
+    worktree_path: str = "",
     semantic_enrich: bool = True,
     semantic_use_ai: bool | None = None,
     semantic_feedback_items: list[dict[str, Any]] | dict[str, Any] | None = None,
@@ -3233,6 +3283,12 @@ def run_pending_scope_reconcile_candidate(
     """
     ensure_graph_snapshot_schema(conn)
     root = Path(project_root).resolve()
+    identity = normalize_pending_scope_identity(
+        ref_name=ref_name,
+        branch_ref=branch_ref,
+        worktree_id=worktree_id,
+        worktree_path=worktree_path,
+    )
     head = _git_commit(root) or "unknown"
     target = target_commit_sha or head
     if head != "unknown" and target != head:
@@ -3244,6 +3300,10 @@ def run_pending_scope_reconcile_candidate(
         conn,
         project_id,
         statuses=[PENDING_STATUS_QUEUED, PENDING_STATUS_RUNNING, PENDING_STATUS_FAILED],
+        ref_name=identity["ref_name"],
+        branch_ref=identity["branch_ref"],
+        worktree_id=identity["worktree_id"],
+        worktree_path=identity["worktree_path"],
     )
     if not pending:
         return {
@@ -3251,6 +3311,7 @@ def run_pending_scope_reconcile_candidate(
             "project_id": project_id,
             "reason": "no_pending_scope_reconcile",
             "target_commit_sha": target,
+            **identity,
             "pending_count": 0,
         }
     covered = _pending_commits_through_target(pending, target)
@@ -3260,6 +3321,7 @@ def run_pending_scope_reconcile_candidate(
             "project_id": project_id,
             "reason": "no_pending_commits_selected",
             "target_commit_sha": target,
+            **identity,
             "pending_count": len(pending),
         }
     dirty_files = _git_dirty_files(root)
@@ -3271,7 +3333,11 @@ def run_pending_scope_reconcile_candidate(
             f"uncommitted files: {preview}{suffix}"
         )
 
-    active = get_active_graph_snapshot(conn, project_id) or {}
+    ref_active = get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"]) or {}
+    active = ref_active or get_active_graph_snapshot(conn, project_id) or {}
+    expected_old_snapshot_id = str(ref_active.get("snapshot_id") or "")
+    if identity["ref_name"] == "active" and not expected_old_snapshot_id:
+        expected_old_snapshot_id = str(active.get("snapshot_id") or "")
     active_inventory = _snapshot_inventory_rows(conn, project_id, active.get("snapshot_id", ""))
     changed_files = _git_changed_files(
         root,
@@ -3350,6 +3416,8 @@ def run_pending_scope_reconcile_candidate(
         checkout_provenance=checkout_provenance,
         created_by=created_by,
         activate=activate,
+        ref_name=identity["ref_name"],
+        expected_old_snapshot_id=expected_old_snapshot_id,
         semantic_options=semantic_options,
     )
     if incremental_result.get("ok"):
@@ -3371,6 +3439,10 @@ def run_pending_scope_reconcile_candidate(
             rid=rid,
             sid=sid,
             created_by=created_by,
+            ref_name=identity["ref_name"],
+            branch_ref=identity["branch_ref"],
+            worktree_id=identity["worktree_id"],
+            worktree_path=identity["worktree_path"],
             semantic_enqueue_stale=semantic_enqueue_stale,
             strategy="incremental_graph_delta",
             graph_delta_mode=incremental_mode,
@@ -3393,6 +3465,8 @@ def run_pending_scope_reconcile_candidate(
         # the active snapshot in one HTTP round-trip. MF-012's hook then
         # auto-rebuilds the projection on activation.
         activate=activate,
+        ref_name=identity["ref_name"],
+        expected_old_snapshot_id=expected_old_snapshot_id or None,
         semantic_enrich=semantic_enrich,
         semantic_use_ai=semantic_use_ai,
         semantic_feedback_items=semantic_feedback_items,
@@ -3432,6 +3506,7 @@ def run_pending_scope_reconcile_candidate(
                 "covered_commit_count": len(covered),
                 "active_snapshot_id": active.get("snapshot_id", ""),
                 "active_graph_commit": active.get("commit_sha", ""),
+                **identity,
                 "semantic_selector_defaulted_to_changed_files": bool(
                     changed_files and not has_semantic_selector_override
                 ),
@@ -3459,6 +3534,10 @@ def run_pending_scope_reconcile_candidate(
         rid=rid,
         sid=sid,
         created_by=created_by,
+        ref_name=identity["ref_name"],
+        branch_ref=identity["branch_ref"],
+        worktree_id=identity["worktree_id"],
+        worktree_path=identity["worktree_path"],
         semantic_enqueue_stale=semantic_enqueue_stale,
         strategy="full_rebuild_fallback",
         graph_delta_mode="full_rebuild",

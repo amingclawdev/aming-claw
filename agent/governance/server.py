@@ -2663,6 +2663,7 @@ def handle_reconcile_file_inventory_list(ctx: RequestContext):
 def _graph_governance_project_root(project_id: str, body: dict) -> Path:
     raw = (
         body.get("project_root")
+        or body.get("worktree_path")
         or body.get("workspace_path")
         or body.get("repo_root")
         or ""
@@ -2676,6 +2677,17 @@ def _graph_governance_project_root(project_id: str, body: dict) -> Path:
         return Path(__file__).resolve().parents[2]
     from .errors import ValidationError
     raise ValidationError("project_root or workspace_path is required")
+
+
+def _pending_scope_identity_from_body(body: dict) -> dict[str, str]:
+    from . import graph_snapshot_store as store
+
+    return store.normalize_pending_scope_identity(
+        ref_name=str(body.get("ref_name") or ""),
+        branch_ref=str(body.get("branch_ref") or body.get("worktree_branch") or ""),
+        worktree_id=str(body.get("worktree_id") or ""),
+        worktree_path=str(body.get("worktree_path") or ""),
+    )
 
 
 def _semantic_use_ai_from_body(body: dict) -> bool | None:
@@ -3476,6 +3488,8 @@ def _graph_stale_scope_operation(
     })
     pending_for_head = any(
         str(row.get("commit_sha") or row.get("target_commit") or "") == head_commit
+        and str(row.get("ref_name") or "active") == "active"
+        and not str(row.get("worktree_id") or "")
         for row in pending_rows
         if _normalize_operation_status(str(row.get("status") or "")) in {"queued", "running", "failed"}
     )
@@ -3686,6 +3700,20 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
         for row in pending_scope_rows:
             op_status = _normalize_operation_status(row.get("status", "queued"))
             commit = str(row.get("commit_sha") or row.get("target_commit") or "")
+            ref_name = str(row.get("ref_name") or "active")
+            branch_ref = str(row.get("branch_ref") or "")
+            worktree_id = str(row.get("worktree_id") or "")
+            worktree_path = str(row.get("worktree_path") or "")
+            scope_key = commit
+            if ref_name != "active" or worktree_id:
+                key_parts = [ref_name or "active"]
+                if worktree_id:
+                    key_parts.append(worktree_id)
+                key_parts.append(commit or str(len(operations)))
+                scope_key = ":".join(key_parts)
+            target_label = commit[:12]
+            if ref_name != "active":
+                target_label = f"{target_label} @ {ref_name}" if target_label else ref_name
             evidence = _json_loads(row.get("evidence_json"), {})
             evidence_summary = evidence if isinstance(evidence, dict) else {}
             last_error = str(
@@ -3704,11 +3732,11 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             if op_status in {"failed", "running", "queued"}:
                 supported_actions.insert(0, "retry_scope_reconcile")
             operations.append({
-                "operation_id": f"scope-reconcile:{commit or len(operations)}",
+                "operation_id": f"scope-reconcile:{scope_key or len(operations)}",
                 "operation_type": "scope_reconcile",
                 "target_scope": "snapshot",
                 "target_id": commit,
-                "target_label": commit[:12],
+                "target_label": target_label,
                 "status": op_status,
                 "progress": _operation_unit_progress(op_status),
                 "created_at": row.get("queued_at", ""),
@@ -3719,6 +3747,10 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "last_error": last_error,
                 "last_result": last_result,
                 "evidence": evidence_summary,
+                "ref_name": ref_name,
+                "branch_ref": branch_ref,
+                "worktree_id": worktree_id,
+                "worktree_path": worktree_path,
                 # MF-2026-05-10-011: cancel removed from scope_reconcile actions.
                 "supported_actions": supported_actions,
             })
@@ -5295,6 +5327,7 @@ def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
         raise ValidationError("commit_sha is required")
     from . import graph_snapshot_store as store
     from .db import sqlite_write_lock
+    identity = _pending_scope_identity_from_body(body)
 
     conn = get_connection(project_id)
     try:
@@ -5306,11 +5339,16 @@ def handle_graph_governance_pending_scope_queue(ctx: RequestContext):
                     project_id,
                     commit_sha=commit_sha,
                     parent_commit_sha=str(body.get("parent_commit_sha") or ""),
+                    ref_name=identity["ref_name"],
+                    branch_ref=identity["branch_ref"],
+                    worktree_id=identity["worktree_id"],
+                    worktree_path=identity["worktree_path"],
                     status=str(body.get("status") or store.PENDING_STATUS_QUEUED),
                     snapshot_id=str(body.get("snapshot_id") or ""),
                     evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {
                         "source": "graph_governance_api",
                         "actor": body.get("actor", "api"),
+                        **identity,
                     },
                     force_requeue=_query_bool(body, "force_requeue", False),
                 )
@@ -5467,6 +5505,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
     from .db import sqlite_write_lock
     semantic_use_ai = _semantic_use_ai_from_body(body)
     semantic_ai_call = _semantic_ai_call_from_body(project_id, root, body)
+    identity = _pending_scope_identity_from_body(body)
 
     conn = get_connection(project_id)
     try:
@@ -5478,6 +5517,10 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 conn,
                 project_id,
                 commit_shas=[target_commit],
+                ref_name=identity["ref_name"],
+                branch_ref=identity["branch_ref"],
+                worktree_id=identity["worktree_id"],
+                worktree_path=identity["worktree_path"],
                 statuses=[
                     store.PENDING_STATUS_QUEUED,
                     store.PENDING_STATUS_RUNNING,
@@ -5487,7 +5530,11 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
             if pending:
                 target_pending_for_failure = True
                 if bool(body.get("force_requeue", False)):
-                    active = store.get_active_graph_snapshot(conn, project_id) or {}
+                    active = (
+                        store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"])
+                        or store.get_active_graph_snapshot(conn, project_id)
+                        or {}
+                    )
                     parent_commit = str(
                         body.get("parent_commit_sha") or active.get("commit_sha") or ""
                     )
@@ -5497,17 +5544,22 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                             project_id,
                             commit_sha=target_commit,
                             parent_commit_sha=parent_commit,
+                            ref_name=identity["ref_name"],
+                            branch_ref=identity["branch_ref"],
+                            worktree_id=identity["worktree_id"],
+                            worktree_path=identity["worktree_path"],
                             status=store.PENDING_STATUS_RUNNING,
                             evidence={
                                 "source": "direct_update_graph_force_requeue",
                                 "actor": body.get("actor", "api"),
                                 "parent_commit_sha": parent_commit,
+                                **identity,
                             },
                             force_requeue=True,
                         )
                         conn.commit()
             else:
-                active = store.get_active_graph_snapshot(conn, project_id) or {}
+                active = store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"]) or {}
                 if str(active.get("commit_sha") or "").strip() == target_commit:
                     return 200, {
                         "ok": True,
@@ -5515,12 +5567,14 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         "status": "already_current",
                         "reason": "already_current",
                         "target_commit_sha": target_commit,
+                        **identity,
                         "snapshot_id": active.get("snapshot_id") or "",
                         "active_snapshot_id": active.get("snapshot_id") or "",
                         "pending_count": 0,
                     }
+                parent_active = active or store.get_active_graph_snapshot(conn, project_id) or {}
                 parent_commit = str(
-                    body.get("parent_commit_sha") or active.get("commit_sha") or ""
+                    body.get("parent_commit_sha") or parent_active.get("commit_sha") or ""
                 )
                 with sqlite_write_lock():
                     row = store.queue_pending_scope_reconcile(
@@ -5528,11 +5582,16 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         project_id,
                         commit_sha=target_commit,
                         parent_commit_sha=parent_commit,
+                        ref_name=identity["ref_name"],
+                        branch_ref=identity["branch_ref"],
+                        worktree_id=identity["worktree_id"],
+                        worktree_path=identity["worktree_path"],
                         status=store.PENDING_STATUS_RUNNING,
                         evidence={
                             "source": "direct_update_graph",
                             "actor": body.get("actor", "api"),
                             "parent_commit_sha": parent_commit,
+                            **identity,
                         },
                     )
                     _ = row
@@ -5547,6 +5606,10 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 run_id=str(body.get("run_id") or ""),
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
+                ref_name=identity["ref_name"],
+                branch_ref=identity["branch_ref"],
+                worktree_id=identity["worktree_id"],
+                worktree_path=identity["worktree_path"],
                 # MF-2026-05-10-014: dashboard-driven incremental catchup
                 # passes activate=true so the materialized snapshot becomes
                 # active in one round-trip; MF-012 hook then auto-builds
@@ -5587,7 +5650,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                 and result.get("reason") == "no_pending_scope_reconcile"
                 and target_commit
             ):
-                active = store.get_active_graph_snapshot(conn, project_id) or {}
+                active = store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"]) or {}
                 if str(active.get("commit_sha") or "").strip() == target_commit:
                     result = {
                         "ok": True,
@@ -5595,6 +5658,7 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         "status": "already_current",
                         "reason": "already_current",
                         "target_commit_sha": target_commit,
+                        **identity,
                         "snapshot_id": active.get("snapshot_id") or "",
                         "active_snapshot_id": active.get("snapshot_id") or "",
                         "pending_count": 0,
@@ -5606,9 +5670,13 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         conn,
                         project_id,
                         commit_sha=target_commit,
+                        ref_name=identity["ref_name"],
+                        branch_ref=identity["branch_ref"],
+                        worktree_id=identity["worktree_id"],
+                        worktree_path=identity["worktree_path"],
                         actor=str(body.get("actor") or "api"),
                         reason=str(exc),
-                        evidence={"source": "direct_update_graph", "error": str(exc)},
+                        evidence={"source": "direct_update_graph", "error": str(exc), **identity},
                     )
                     conn.commit()
             _raise_graph_api_validation(exc)
@@ -5619,9 +5687,13 @@ def handle_graph_governance_pending_scope_materialize(ctx: RequestContext):
                         conn,
                         project_id,
                         commit_sha=target_commit,
+                        ref_name=identity["ref_name"],
+                        branch_ref=identity["branch_ref"],
+                        worktree_id=identity["worktree_id"],
+                        worktree_path=identity["worktree_path"],
                         actor=str(body.get("actor") or "api"),
                         reason=str(exc),
-                        evidence={"source": "direct_update_graph", "error": str(exc)},
+                        evidence={"source": "direct_update_graph", "error": str(exc), **identity},
                     )
                     conn.commit()
             raise
@@ -5640,11 +5712,16 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
     from .state_reconcile import run_pending_scope_reconcile_candidate
     from . import graph_snapshot_store as store
     from .db import sqlite_write_lock
+    identity = _pending_scope_identity_from_body(body)
 
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.reconcile.pending-scope.catch-up")
-        active = store.get_active_graph_snapshot(conn, project_id) or {}
+        active = (
+            store.get_active_graph_snapshot(conn, project_id, ref_name=identity["ref_name"])
+            or store.get_active_graph_snapshot(conn, project_id)
+            or {}
+        )
         base_commit = str(body.get("base_commit_sha") or active.get("commit_sha") or "").strip()
         target_commit = str(body.get("target_commit_sha") or _git_head_commit(root) or "").strip()
         explicit_commits = [
@@ -5662,6 +5739,7 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
                 "status": "already_current",
                 "base_commit_sha": base_commit,
                 "target_commit_sha": target_commit,
+                **identity,
                 "commit_count": 0,
                 "commits": [],
             }
@@ -5680,6 +5758,7 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
                 "dry_run": True,
                 "base_commit_sha": base_commit,
                 "target_commit_sha": target_commit,
+                **identity,
                 "commit_count": len(commit_shas),
                 "commits": commit_shas,
                 "progress": {"done": 0, "total": len(commit_shas)},
@@ -5694,6 +5773,10 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
                     project_id,
                     commit_sha=commit,
                     parent_commit_sha=parent,
+                    ref_name=identity["ref_name"],
+                    branch_ref=identity["branch_ref"],
+                    worktree_id=identity["worktree_id"],
+                    worktree_path=identity["worktree_path"],
                     status=store.PENDING_STATUS_QUEUED,
                     evidence={
                         "source": "pending_scope_catch_up",
@@ -5702,6 +5785,7 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
                         "total": len(commit_shas),
                         "base_commit_sha": base_commit,
                         "target_commit_sha": target_commit,
+                        **identity,
                     },
                     force_requeue=bool(body.get("force_requeue", False)),
                 )
@@ -5718,6 +5802,10 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
                 run_id=str(body.get("run_id") or f"scope-catch-up-{target_commit[:7]}"),
                 snapshot_id=body.get("snapshot_id"),
                 created_by=str(body.get("actor") or "observer"),
+                ref_name=identity["ref_name"],
+                branch_ref=identity["branch_ref"],
+                worktree_id=identity["worktree_id"],
+                worktree_path=identity["worktree_path"],
                 activate=bool(body.get("activate", True)),
                 semantic_enrich=bool(body.get("semantic_enrich", True)),
                 semantic_use_ai=_semantic_use_ai_from_body(body),
@@ -5730,9 +5818,13 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
                     conn,
                     project_id,
                     commit_sha=target_commit,
+                    ref_name=identity["ref_name"],
+                    branch_ref=identity["branch_ref"],
+                    worktree_id=identity["worktree_id"],
+                    worktree_path=identity["worktree_path"],
                     actor=str(body.get("actor") or "api"),
                     reason=str(exc),
-                    evidence={"source": "pending_scope_catch_up", "error": str(exc)},
+                    evidence={"source": "pending_scope_catch_up", "error": str(exc), **identity},
                 )
                 conn.commit()
             raise
@@ -5742,6 +5834,7 @@ def handle_graph_governance_pending_scope_catch_up(ctx: RequestContext):
             "project_id": project_id,
             "base_commit_sha": base_commit,
             "target_commit_sha": target_commit,
+            **identity,
             "commit_count": len(commit_shas),
             "commits": [
                 {
@@ -5801,6 +5894,7 @@ def handle_graph_governance_snapshot_finalize(ctx: RequestContext):
     body = ctx.body
     from . import graph_snapshot_store as store
     from .db import sqlite_write_lock
+    identity = _pending_scope_identity_from_body(body)
 
     conn = get_connection(project_id)
     try:
@@ -5813,7 +5907,10 @@ def handle_graph_governance_snapshot_finalize(ctx: RequestContext):
                     snapshot_id,
                     target_commit_sha=str(body.get("target_commit_sha") or ""),
                     expected_old_snapshot_id=body.get("expected_old_snapshot_id"),
-                    ref_name=str(body.get("ref_name") or "active"),
+                    ref_name=identity["ref_name"],
+                    branch_ref=identity["branch_ref"],
+                    worktree_id=identity["worktree_id"],
+                    worktree_path=identity["worktree_path"],
                     actor=str(body.get("actor") or "observer"),
                     materialize_pending=bool(body.get("materialize_pending", True)),
                     covered_commit_shas=body.get("covered_commit_shas") or None,

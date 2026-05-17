@@ -3254,6 +3254,198 @@ def test_pending_scope_materialize_auto_creates_running_row(conn, tmp_path, monk
     assert final_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
 
 
+def test_pending_scope_queue_allows_same_commit_on_different_refs(conn):
+    code_main, main = server.handle_graph_governance_pending_scope_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "commit_sha": "same-head",
+                "parent_commit_sha": "base",
+                "branch_ref": "refs/heads/main",
+            },
+        )
+    )
+    code_feature, feature = server.handle_graph_governance_pending_scope_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "commit_sha": "same-head",
+                "parent_commit_sha": "base",
+                "branch_ref": "refs/heads/feature",
+            },
+        )
+    )
+
+    assert code_main == 201
+    assert code_feature == 201
+    assert main["pending_scope_reconcile"]["ref_name"] == "refs/heads/main"
+    assert feature["pending_scope_reconcile"]["ref_name"] == "refs/heads/feature"
+
+    rows = store.list_pending_scope_reconcile(conn, PID, commit_shas=["same-head"])
+    assert {row["ref_name"] for row in rows} == {"refs/heads/main", "refs/heads/feature"}
+
+    feature_rows = store.list_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_shas=["same-head"],
+        branch_ref="refs/heads/feature",
+    )
+    assert len(feature_rows) == 1
+    assert feature_rows[0]["ref_name"] == "refs/heads/feature"
+
+
+def test_pending_scope_schema_migrates_commit_only_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.governance.db._governance_root", lambda: tmp_path / "state")
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    c.execute(
+        """
+        CREATE TABLE pending_scope_reconcile (
+          project_id TEXT NOT NULL,
+          commit_sha TEXT NOT NULL,
+          parent_commit_sha TEXT NOT NULL DEFAULT '',
+          queued_at TEXT NOT NULL,
+          status TEXT NOT NULL,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          snapshot_id TEXT NOT NULL DEFAULT '',
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          PRIMARY KEY(project_id, commit_sha)
+        )
+        """
+    )
+    c.execute(
+        """
+        INSERT INTO pending_scope_reconcile
+          (project_id, commit_sha, parent_commit_sha, queued_at, status)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (PID, "same-head", "base", "2026-05-17T00:00:00Z", store.PENDING_STATUS_QUEUED),
+    )
+
+    store.ensure_schema(c)
+    store.queue_pending_scope_reconcile(
+        c,
+        PID,
+        commit_sha="same-head",
+        parent_commit_sha="base",
+        branch_ref="refs/heads/feature",
+    )
+
+    rows = store.list_pending_scope_reconcile(c, PID, commit_shas=["same-head"])
+    assert {row["ref_name"] for row in rows} == {"active", "refs/heads/feature"}
+    c.close()
+
+
+def test_pending_scope_materialize_selects_branch_worktree_identity(conn, tmp_path, monkeypatch):
+    from agent.governance import state_reconcile
+
+    worktree = tmp_path / "feature-worktree"
+    worktree.mkdir()
+    active_identity = store.normalize_pending_scope_identity()
+    feature_identity = store.normalize_pending_scope_identity(
+        branch_ref="codex/feature",
+        worktree_path=str(worktree),
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="same-head",
+        parent_commit_sha="base",
+        ref_name=active_identity["ref_name"],
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="same-head",
+        parent_commit_sha="base",
+        branch_ref=feature_identity["branch_ref"],
+        worktree_id=feature_identity["worktree_id"],
+        worktree_path=feature_identity["worktree_path"],
+    )
+    conn.commit()
+
+    captured = {}
+
+    def fake_run_pending_scope(conn_arg, project_id, root, **kwargs):
+        captured["root"] = Path(root)
+        captured["kwargs"] = kwargs
+        rows = store.list_pending_scope_reconcile(
+            conn_arg,
+            project_id,
+            commit_shas=["same-head"],
+            ref_name=kwargs["ref_name"],
+            branch_ref=kwargs["branch_ref"],
+            worktree_id=kwargs["worktree_id"],
+            worktree_path=kwargs["worktree_path"],
+            statuses=[store.PENDING_STATUS_QUEUED],
+        )
+        assert len(rows) == 1
+        assert rows[0]["ref_name"] == "codex/feature"
+        conn_arg.execute(
+            """
+            UPDATE pending_scope_reconcile
+            SET status = ?, snapshot_id = ?
+            WHERE project_id = ? AND ref_name = ? AND worktree_id = ? AND commit_sha = ?
+            """,
+            (
+                store.PENDING_STATUS_MATERIALIZED,
+                "scope-feature",
+                project_id,
+                kwargs["ref_name"],
+                kwargs["worktree_id"],
+                "same-head",
+            ),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": "scope-feature",
+            "covered_pending_count": 1,
+            "pending_rows_bound": 1,
+            "ref_name": kwargs["ref_name"],
+            "worktree_id": kwargs["worktree_id"],
+        }
+
+    monkeypatch.setattr(state_reconcile, "run_pending_scope_reconcile_candidate", fake_run_pending_scope)
+
+    code, result = server.handle_graph_governance_pending_scope_materialize(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "worktree_path": str(worktree),
+                "target_commit_sha": "same-head",
+                "branch_ref": "codex/feature",
+                "actor": "dashboard",
+            },
+        )
+    )
+
+    assert code == 201
+    assert result["ok"] is True
+    assert captured["root"] == worktree.resolve()
+    assert captured["kwargs"]["ref_name"] == "codex/feature"
+    assert captured["kwargs"]["worktree_id"] == feature_identity["worktree_id"]
+
+    active_rows = store.list_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_shas=["same-head"],
+        ref_name=active_identity["ref_name"],
+    )
+    feature_rows = store.list_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_shas=["same-head"],
+        ref_name=feature_identity["ref_name"],
+        worktree_id=feature_identity["worktree_id"],
+    )
+    assert active_rows[0]["status"] == store.PENDING_STATUS_QUEUED
+    assert feature_rows[0]["status"] == store.PENDING_STATUS_MATERIALIZED
+
+
 def test_pending_scope_materialize_already_current_is_idempotent(conn, tmp_path, monkeypatch):
     """Direct Update graph should treat an active target commit as a no-op success."""
     from agent.governance import state_reconcile
@@ -5147,6 +5339,56 @@ def test_operations_queue_includes_pending_scope_reconcile(conn, monkeypatch):
     row = next(item for item in queue["operations"] if item["operation_type"] == "scope_reconcile")
     assert row["target_id"] == "head"
     assert row["status"] == "queued"
+
+
+def test_operations_queue_reports_pending_scope_branch_identity(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda *_args, **_kwargs: {"role": "observer"},
+    )
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="scope-active",
+        commit_sha="old",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    worktree = tmp_path / "feature-worktree"
+    worktree.mkdir()
+    identity = store.normalize_pending_scope_identity(
+        branch_ref="codex/feature",
+        worktree_path=str(worktree),
+    )
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha="head",
+        parent_commit_sha="old",
+        branch_ref=identity["branch_ref"],
+        worktree_id=identity["worktree_id"],
+        worktree_path=identity["worktree_path"],
+    )
+    conn.commit()
+
+    queue = server.handle_graph_governance_operations_queue(_ctx({"project_id": PID}))
+
+    row = next(item for item in queue["operations"] if item["operation_type"] == "scope_reconcile")
+    assert row["target_id"] == "head"
+    assert row["ref_name"] == "codex/feature"
+    assert row["branch_ref"] == "codex/feature"
+    assert row["worktree_id"] == identity["worktree_id"]
+    assert row["worktree_path"] == identity["worktree_path"]
+    assert row["target_label"] == "head @ codex/feature"
 
 
 def test_operations_queue_surfaces_pending_scope_recovery_evidence(conn, monkeypatch):
