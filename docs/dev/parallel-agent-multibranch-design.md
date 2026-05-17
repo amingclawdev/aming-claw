@@ -347,6 +347,13 @@ Rules:
 - No API should require Chain to be running for MF clients.
 - No API should assume all future clients are MF clients.
 
+Implemented adapter slice: `build_parallel_branch_context_from_chain_payload`
+maps Chain task payload metadata into `BranchTaskRuntimeContext` without
+starting Chain execution. `parallel_branch_event_payload_from_context` emits a
+compact branch runtime event envelope carrying Chain identity, retry/attempt,
+branch/worktree, graph/projection, merge queue, and rollback/replay fields.
+Serial Chain stages with no `branch_ref` remain unchanged.
+
 ## MVP Implementation Order
 
 1. Scenario matrix and doc guards. Done by `ARCH-PARALLEL-AGENT-TEST-SCENARIO-MATRIX`.
@@ -361,7 +368,8 @@ Rules:
 10. Dashboard/MCP compact read model. First pure-state read model is implemented
    by `agent/tests/test_parallel_branch_read_model.py`; live MCP/dashboard
    wiring still depends on durable queue/batch stores.
-11. Chain adapter hook tests and later Chain integration.
+11. Chain adapter hook tests and later Chain integration. First no-execution
+    adapter is implemented by `agent/tests/test_chain_parallel_branch_adapter.py`.
 
 The smallest runtime slice is one backlog row in one isolated worktree:
 

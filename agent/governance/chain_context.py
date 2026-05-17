@@ -24,6 +24,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,138 @@ CHAIN_STATES = {
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _int_metadata(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _chain_parallel_branch_meta(metadata: dict[str, Any]) -> dict[str, Any]:
+    nested = metadata.get("parallel_branch") or metadata.get("parallel_branch_runtime")
+    if isinstance(nested, dict):
+        return {**metadata, **nested}
+    return metadata
+
+
+def build_parallel_branch_context_from_chain_payload(payload: dict[str, Any]):
+    """Map a Chain task payload into BranchTaskRuntimeContext without running Chain."""
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    branch_meta = _chain_parallel_branch_meta(metadata)
+    branch_ref = str(branch_meta.get("branch_ref") or branch_meta.get("worktree_branch") or "").strip()
+    if not branch_ref:
+        return None
+
+    from .parallel_branch_runtime import branch_context_from_chain_stage
+
+    task_id = str(payload.get("task_id") or metadata.get("task_id") or "").strip()
+    stage_task_id = str(branch_meta.get("stage_task_id") or task_id).strip()
+    chain_id = str(
+        branch_meta.get("chain_id")
+        or metadata.get("chain_id")
+        or branch_meta.get("root_task_id")
+        or metadata.get("root_task_id")
+        or payload.get("parent_task_id")
+        or task_id
+    ).strip()
+    root_task_id = str(
+        branch_meta.get("root_task_id")
+        or metadata.get("root_task_id")
+        or chain_id
+        or task_id
+    ).strip()
+    retry_round = _int_metadata(branch_meta.get("retry_round", metadata.get("retry_round", 0)), 0)
+    attempt_value = branch_meta.get("attempt")
+    attempt = _int_metadata(attempt_value, retry_round + 1) if attempt_value is not None else None
+    depends_on = branch_meta.get("depends_on") or branch_meta.get("hard_depends_on") or ()
+    if isinstance(depends_on, str):
+        depends_on = (depends_on,)
+    elif isinstance(depends_on, list):
+        depends_on = tuple(str(item) for item in depends_on if str(item or "").strip())
+    elif not isinstance(depends_on, tuple):
+        depends_on = ()
+
+    return branch_context_from_chain_stage(
+        project_id=str(payload.get("project_id") or branch_meta.get("project_id") or "").strip(),
+        chain_id=chain_id,
+        root_task_id=root_task_id,
+        stage_task_id=stage_task_id,
+        stage_type=str(branch_meta.get("stage_type") or payload.get("type") or "").strip(),
+        retry_round=retry_round,
+        task_id=task_id,
+        batch_id=str(branch_meta.get("batch_id") or "").strip(),
+        backlog_id=str(branch_meta.get("backlog_id") or metadata.get("bug_id") or "").strip(),
+        agent_id=str(branch_meta.get("agent_id") or "").strip(),
+        worker_id=str(branch_meta.get("worker_id") or "").strip(),
+        status=str(branch_meta.get("status") or "running").strip(),
+        ref_name=str(branch_meta.get("ref_name") or "main").strip(),
+        branch_ref=branch_ref,
+        worktree_id=str(branch_meta.get("worktree_id") or "").strip(),
+        worktree_path=str(branch_meta.get("worktree_path") or "").strip(),
+        base_commit=str(branch_meta.get("base_commit") or "").strip(),
+        head_commit=str(branch_meta.get("head_commit") or "").strip(),
+        target_head_commit=str(branch_meta.get("target_head_commit") or "").strip(),
+        snapshot_id=str(branch_meta.get("snapshot_id") or "").strip(),
+        projection_id=str(branch_meta.get("projection_id") or "").strip(),
+        merge_queue_id=str(branch_meta.get("merge_queue_id") or "").strip(),
+        merge_preview_id=str(branch_meta.get("merge_preview_id") or "").strip(),
+        rollback_epoch=str(branch_meta.get("rollback_epoch") or "").strip(),
+        replay_epoch=str(branch_meta.get("replay_epoch") or "").strip(),
+        depends_on=depends_on,
+        checkpoint_id=str(branch_meta.get("checkpoint_id") or "").strip(),
+        replay_source=str(branch_meta.get("replay_source") or "").strip(),
+        lease_id=str(branch_meta.get("lease_id") or "").strip(),
+        lease_expires_at=str(branch_meta.get("lease_expires_at") or "").strip(),
+        fence_token=str(branch_meta.get("fence_token") or "").strip(),
+        attempt=attempt,
+    )
+
+
+def parallel_branch_event_payload_from_context(
+    context,
+    *,
+    event_type: str,
+    actor: str = "chain_adapter",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a compact event envelope shared by Chain and branch runtime."""
+    return {
+        "event_type": event_type,
+        "project_id": context.project_id,
+        "batch_id": context.batch_id,
+        "backlog_id": context.backlog_id,
+        "task_id": context.task_id,
+        "chain_id": context.chain_id,
+        "root_task_id": context.root_task_id,
+        "stage_task_id": context.stage_task_id,
+        "stage_type": context.stage_type,
+        "retry_round": context.retry_round,
+        "attempt": context.attempt,
+        "branch_ref": context.branch_ref,
+        "ref_name": context.ref_name,
+        "worktree_id": context.worktree_id,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "head_commit": context.head_commit,
+        "target_head_commit": context.target_head_commit,
+        "snapshot_id": context.snapshot_id,
+        "projection_id": context.projection_id,
+        "merge_queue_id": context.merge_queue_id,
+        "merge_preview_id": context.merge_preview_id,
+        "rollback_epoch": context.rollback_epoch,
+        "replay_epoch": context.replay_epoch,
+        "depends_on": list(context.depends_on),
+        "checkpoint_id": context.checkpoint_id,
+        "replay_source": context.replay_source,
+        "lease_id": context.lease_id,
+        "lease_expires_at": context.lease_expires_at,
+        "fence_token": context.fence_token,
+        "actor": actor,
+        "payload": payload or {},
+        "created_at": _utc_iso(),
+    }
 
 
 def _extract_core(result: dict) -> dict:
