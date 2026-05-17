@@ -386,7 +386,10 @@ Serial Chain stages with no `branch_ref` remain unchanged.
    implemented by `agent/tests/test_batch_merge_rollback.py`; live rollback
    execution remains gated.
 8. Branch/ref/batch-aware `pending_scope_reconcile`.
-9. MF adapter MVP for one isolated branch through merge queue.
+9. MF adapter MVP for one isolated branch through merge queue. First
+   side-effect-free branch allocation planner is implemented by
+   `agent/tests/test_parallel_branch_runtime.py`; actual git worktree execution
+   remains delegated/gated.
 10. Dashboard/MCP compact read model. First pure-state read model is implemented
    by `agent/tests/test_parallel_branch_read_model.py`; first governance API
    read model is implemented by `agent/tests/test_graph_governance_api.py`.
@@ -406,6 +409,13 @@ allocate branch/worktree
 -> target scope reconcile
 -> retain then cleanup
 ```
+
+Implemented allocation slice: `plan_branch_runtime_context` derives a
+side-effect-free `BranchTaskRuntimeContext` with deterministic `branch_ref`,
+`worktree_id`, and `worktree_path` from task, worker, batch, and attempt
+identity. It sanitizes branch/worktree names and persists through the existing
+branch runtime table; actual `git worktree` creation remains delegated to the
+executor/MF client.
 
 Only after this loop is stable should normal executor worker parallelism be
 raised above the current conservative mode.

@@ -11,6 +11,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -160,6 +161,7 @@ STATE_MERGE_BLOCKED = "merge_blocked"
 STATE_MERGING = "merging"
 STATE_ABANDONED = "abandoned"
 STATE_ROLLBACK_REQUIRED = "rollback_required"
+STATE_ALLOCATED = "allocated"
 
 BATCH_STATE_OPEN = "open"
 BATCH_STATE_MERGE_IN_PROGRESS = "merge_in_progress"
@@ -1239,6 +1241,79 @@ def runtime_tasks_from_contexts(
     now_iso: str = "",
 ) -> list[BranchRuntimeTask]:
     return [context.to_runtime_task(now_iso=now_iso) for context in contexts]
+
+
+def _safe_slug(value: str, fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    out: list[str] = []
+    last_dash = False
+    for char in text:
+        if char.isascii() and char.isalnum():
+            out.append(char)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    slug = "".join(out).strip("-")
+    return slug or fallback
+
+
+def _attempt_suffix(attempt: int) -> str:
+    try:
+        attempt_num = max(1, int(attempt or 1))
+    except (TypeError, ValueError):
+        attempt_num = 1
+    return f"-attempt-{attempt_num}" if attempt_num > 1 else ""
+
+
+def plan_branch_runtime_context(
+    *,
+    project_id: str,
+    task_id: str,
+    workspace_root: str = "",
+    batch_id: str = "",
+    backlog_id: str = "",
+    agent_id: str = "",
+    worker_id: str = "",
+    attempt: int = 1,
+    branch_prefix: str = "codex",
+    worktree_root: str = ".worktrees",
+    ref_name: str = "main",
+    base_commit: str = "",
+    target_head_commit: str = "",
+    merge_queue_id: str = "",
+    status: str = STATE_ALLOCATED,
+) -> BranchTaskRuntimeContext:
+    """Plan deterministic branch/worktree identity without invoking git."""
+    task_slug = _safe_slug(task_id, "task")
+    worker_slug = _safe_slug(worker_id, "") if worker_id else ""
+    prefix = _safe_slug(branch_prefix, "codex")
+    try:
+        attempt_num = max(1, int(attempt or 1))
+    except (TypeError, ValueError):
+        attempt_num = 1
+    suffix = _attempt_suffix(attempt)
+    branch_ref = f"refs/heads/{prefix}/{task_slug}{suffix}"
+    worktree_id = f"wt-{task_slug}{suffix}"
+    worktree_parts = [part for part in (worktree_root, worker_slug, f"{task_slug}{suffix}") if part]
+    worktree_path = str(Path(workspace_root, *worktree_parts)) if workspace_root else str(Path(*worktree_parts))
+    return BranchTaskRuntimeContext(
+        project_id=project_id,
+        task_id=task_id,
+        batch_id=batch_id,
+        backlog_id=backlog_id,
+        agent_id=agent_id,
+        worker_id=worker_id,
+        attempt=attempt_num,
+        branch_ref=branch_ref,
+        ref_name=ref_name,
+        worktree_id=worktree_id,
+        worktree_path=worktree_path,
+        base_commit=base_commit,
+        target_head_commit=target_head_commit,
+        merge_queue_id=merge_queue_id,
+        status=status,
+    )
 
 
 def branch_context_from_chain_stage(

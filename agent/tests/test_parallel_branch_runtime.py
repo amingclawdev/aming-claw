@@ -18,6 +18,7 @@ from agent.governance.parallel_branch_runtime import (
     STATE_MERGED,
     STATE_RECLAIMABLE,
     STATE_RUNNING,
+    STATE_ALLOCATED,
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
@@ -26,6 +27,7 @@ from agent.governance.parallel_branch_runtime import (
     ensure_branch_runtime_schema,
     get_branch_context,
     list_branch_contexts,
+    plan_branch_runtime_context,
     recover_expired_branch_contexts,
     record_branch_checkpoint,
     runtime_tasks_from_contexts,
@@ -368,6 +370,38 @@ def test_pb007_chain_stage_identity_round_trips_without_running_chain() -> None:
     assert reloaded.chain_id == "chain-root-1"
     assert reloaded.retry_round == 2
     assert reloaded.to_runtime_task(now_iso=NOW).checkpoint_id == "checkpoint-PB007"
+
+
+def test_mf_branch_allocation_planner_sanitizes_worker_attempt_and_persists() -> None:
+    conn = _runtime_conn()
+    context = plan_branch_runtime_context(
+        project_id=PROJECT_ID,
+        task_id="../Task 123",
+        batch_id="PB-009",
+        backlog_id="ARCH-PB009",
+        agent_id="observer",
+        worker_id="worker 0/../../x",
+        workspace_root="/repo",
+        attempt=2,
+        base_commit="B0",
+        target_head_commit="M0",
+        merge_queue_id="mergeq-PB009",
+    )
+
+    assert context.status == STATE_ALLOCATED
+    assert context.branch_ref == "refs/heads/codex/task-123-attempt-2"
+    assert context.worktree_id == "wt-task-123-attempt-2"
+    assert context.worktree_path == "/repo/.worktrees/worker-0-x/task-123-attempt-2"
+    assert ".." not in context.branch_ref
+    assert ".." not in context.worktree_path
+
+    saved = upsert_branch_context(conn, context, now_iso=NOW)
+    reloaded = get_branch_context(conn, PROJECT_ID, "../Task 123")
+
+    assert saved == reloaded
+    assert reloaded is not None
+    assert reloaded.worker_id == "worker 0/../../x"
+    assert reloaded.merge_queue_id == "mergeq-PB009"
 
 
 def test_pb012_branch_contexts_are_isolated_by_project_and_batch() -> None:
