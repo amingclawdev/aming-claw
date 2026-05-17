@@ -139,7 +139,170 @@ def test_active_ref_alias_is_not_treated_as_a_branch(conn):
     )
 
     assert projection["branch_ref"] == ""
+    assert projection["ref_name"] == "active"
     assert projection["projection"]["branch_ref"] == ""
+    assert projection["projection"]["ref_name"] == "active"
+
+
+def test_projection_builder_records_explicit_ref_identity_for_same_commit_branch_views(conn):
+    graph = _graph()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="same-commit-branch-views",
+        commit_sha="same-commit",
+        snapshot_kind="scope",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    node = graph["deps_graph"]["nodes"][0]
+    stable_key = graph_events.stable_node_key_for_node(node)
+    feature_hash = graph_events.feature_hash_for_node(node)
+
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_id="same-commit-main",
+        event_type="semantic_node_enriched",
+        event_kind="semantic_job",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        branch_ref=MAIN_REF,
+        operation_type="accept",
+        stable_node_key=stable_key,
+        feature_hash=feature_hash,
+        payload={"semantic_payload": {"feature_name": "Main branch meaning"}},
+        created_by="test",
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_id="same-commit-feature",
+        event_type="semantic_node_enriched",
+        event_kind="semantic_job",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        branch_ref=FEATURE_REF,
+        operation_type="accept",
+        stable_node_key=stable_key,
+        feature_hash=feature_hash,
+        payload={"semantic_payload": {"feature_name": "Feature branch meaning"}},
+        created_by="test",
+    )
+
+    main_projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        projection_id="same-commit-main-projection",
+        ref_name=MAIN_REF,
+        branch_ref=MAIN_REF,
+        backfill_existing=False,
+    )
+    feature_projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        projection_id="same-commit-feature-projection",
+        ref_name=FEATURE_REF,
+        branch_ref=FEATURE_REF,
+        backfill_existing=False,
+    )
+
+    assert main_projection["ref_name"] == MAIN_REF
+    assert main_projection["branch_ref"] == MAIN_REF
+    assert feature_projection["ref_name"] == FEATURE_REF
+    assert feature_projection["branch_ref"] == FEATURE_REF
+    assert (
+        main_projection["projection"]["node_semantics"]["L7.1"]["semantic"]["feature_name"]
+        == "Main branch meaning"
+    )
+    assert (
+        feature_projection["projection"]["node_semantics"]["L7.1"]["semantic"]["feature_name"]
+        == "Feature branch meaning"
+    )
+
+    fetched_main = graph_events.get_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        ref_name=MAIN_REF,
+        branch_ref=MAIN_REF,
+    )
+    fetched_feature = graph_events.get_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        ref_name=FEATURE_REF,
+        branch_ref=FEATURE_REF,
+    )
+    assert fetched_main["projection_id"] == "same-commit-main-projection"
+    assert fetched_feature["projection_id"] == "same-commit-feature-projection"
+    assert fetched_main["projection"]["node_semantics"]["L7.1"]["source_event"]["branch_ref"] == MAIN_REF
+    assert fetched_feature["projection"]["node_semantics"]["L7.1"]["source_event"]["branch_ref"] == FEATURE_REF
+
+
+def test_snapshot_ref_identity_drives_projection_default_branch(conn):
+    graph = _graph()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="feature-owned-snapshot",
+        commit_sha="feature-commit",
+        snapshot_kind="scope",
+        ref_name=FEATURE_REF,
+        branch_ref=FEATURE_REF,
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    node = graph["deps_graph"]["nodes"][0]
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_id="feature-owned-semantic",
+        event_type="semantic_node_enriched",
+        event_kind="semantic_job",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        operation_type="accept",
+        stable_node_key=graph_events.stable_node_key_for_node(node),
+        feature_hash=graph_events.feature_hash_for_node(node),
+        payload={"semantic_payload": {"feature_name": "Feature default"}},
+        created_by="test",
+    )
+
+    stored = store.get_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+    projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        projection_id="feature-owned-projection",
+        backfill_existing=False,
+    )
+
+    assert stored["ref_name"] == FEATURE_REF
+    assert stored["branch_ref"] == FEATURE_REF
+    assert projection["ref_name"] == FEATURE_REF
+    assert projection["branch_ref"] == FEATURE_REF
+    assert projection["projection"]["node_semantics"]["L7.1"]["semantic"]["feature_name"] == "Feature default"
 
 
 def test_node_projection_ignores_other_branch_until_main_event_is_accepted(conn):

@@ -120,6 +120,11 @@ def test_activate_non_active_ref_name_skips_rebuild(conn):
     )
     conn.commit()
     assert result["projection_status"] == "skipped"
+    stored = store.get_graph_snapshot(conn, PID, sid)
+    assert stored["ref_name"] == "candidate"
+    assert stored["branch_ref"] == "candidate"
+    ref_event = store.list_graph_ref_events(conn, PID, ref_name="candidate")[0]
+    assert ref_event["branch_ref"] == "candidate"
 
 
 def test_pending_scope_activate_param_is_plumbed_through():

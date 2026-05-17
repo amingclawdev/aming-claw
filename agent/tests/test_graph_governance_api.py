@@ -1671,6 +1671,76 @@ def test_graph_governance_semantic_events_backfill_and_projection_are_hash_aware
     assert changed_projected["health"]["semantic_stale_count"] == 1
 
 
+def test_projection_api_builds_and_fetches_branch_ref_specific_projection(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    graph = _graph()
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="api-branch-projection",
+        commit_sha="commit-api-branch",
+        snapshot_kind="scope",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    branch_ref = "refs/heads/codex/api-branch"
+    node = graph["deps_graph"]["nodes"][0]
+    graph_events.create_event(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        event_id="api-branch-semantic",
+        event_type="semantic_node_enriched",
+        event_kind="semantic_job",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        branch_ref=branch_ref,
+        operation_type="accept",
+        stable_node_key=graph_events.stable_node_key_for_node(node),
+        feature_hash=graph_events.feature_hash_for_node(node),
+        payload={"semantic_payload": {"feature_name": "API branch semantic"}},
+        created_by="test",
+    )
+
+    projected = server.handle_graph_governance_snapshot_semantic_projection_build(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "actor": "observer",
+                "projection_id": "semproj-api-branch",
+                "ref_name": branch_ref,
+                "branch_ref": branch_ref,
+                "backfill_existing": False,
+            },
+        )
+    )
+    fetched = server.handle_graph_governance_snapshot_semantic_projection_get(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            query={"ref_name": branch_ref, "branch_ref": branch_ref},
+        )
+    )
+
+    assert projected["ref_name"] == branch_ref
+    assert projected["branch_ref"] == branch_ref
+    assert fetched["projection_id"] == "semproj-api-branch"
+    assert fetched["ref_name"] == branch_ref
+    assert fetched["branch_ref"] == branch_ref
+    assert fetched["projection"]["node_semantics"]["L7.1"]["semantic"]["feature_name"] == "API branch semantic"
+
+
 def test_semantic_projection_rejects_target_id_fallback_when_lid_is_reused(conn, monkeypatch):
     monkeypatch.setattr(
         server,

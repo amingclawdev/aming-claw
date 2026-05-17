@@ -7953,6 +7953,8 @@ def handle_graph_governance_snapshot_semantic_projection_build(ctx: RequestConte
                     snapshot_id,
                     actor=str(body.get("actor") or body.get("created_by") or "observer"),
                     projection_id=str(body.get("projection_id") or "") or None,
+                    ref_name=str(body.get("ref_name") or ""),
+                    branch_ref=str(body.get("branch_ref") or body.get("worktree_branch") or ""),
                     backfill_existing=bool(body.get("backfill_existing", True)),
                 )
             except (KeyError, ValueError) as exc:
@@ -7969,13 +7971,22 @@ def handle_graph_governance_snapshot_semantic_projection_get(ctx: RequestContext
     project_id = ctx.get_project_id()
     snapshot_id = ctx.path_params["snapshot_id"]
     projection_id = str(ctx.query.get("projection_id") or "")
+    ref_name = str(ctx.query.get("ref_name") or "")
+    branch_ref = str(ctx.query.get("branch_ref") or "")
     from . import graph_events
 
     conn = get_connection(project_id)
     try:
         _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.projection.get")
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
-        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id, projection_id)
+        projection = graph_events.get_semantic_projection(
+            conn,
+            project_id,
+            snapshot_id,
+            projection_id,
+            ref_name=ref_name,
+            branch_ref=branch_ref if "branch_ref" in ctx.query else None,
+        )
         if not projection:
             return {
                 "ok": True,
@@ -7993,6 +8004,8 @@ def handle_graph_governance_snapshot_semantic_projection_get(ctx: RequestContext
             "projection": projection.get("projection") or {},
             "health": projection.get("health") or {},
             "status": projection.get("status") or "current",
+            "ref_name": projection.get("ref_name", ""),
+            "branch_ref": projection.get("branch_ref", ""),
             "event_watermark": projection.get("event_watermark", 0),
             "base_commit": projection.get("base_commit", ""),
             "created_at": projection.get("created_at", ""),

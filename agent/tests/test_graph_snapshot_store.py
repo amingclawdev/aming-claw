@@ -41,6 +41,10 @@ def test_schema_migration_is_idempotent(conn):
         "pending_scope_reconcile",
         "reconcile_run_metrics",
     }.issubset(table_names)
+    snapshot_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(graph_snapshots)").fetchall()
+    }
+    assert {"ref_name", "branch_ref"}.issubset(snapshot_columns)
 
     version = conn.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"

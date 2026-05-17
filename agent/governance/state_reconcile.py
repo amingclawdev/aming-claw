@@ -1939,6 +1939,7 @@ def run_state_only_full_reconcile(
     activate: bool = False,
     expected_old_snapshot_id: str | None = None,
     ref_name: str = "active",
+    branch_ref: str = "",
     notes_extra: dict[str, Any] | None = None,
     semantic_enrich: bool = True,
     semantic_use_ai: bool | None = None,
@@ -1989,7 +1990,9 @@ def run_state_only_full_reconcile(
         project_id=project_id,
         commit_sha=commit,
     )
-    activation_ref_name = str(ref_name or "active").strip() or "active"
+    identity = normalize_pending_scope_identity(ref_name=ref_name, branch_ref=branch_ref)
+    activation_ref_name = identity["ref_name"]
+    activation_branch_ref = identity["branch_ref"]
     state_dir = _governance_state_dir(project_id, rid)
     scratch_dir = state_dir / "scratch"
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -2012,6 +2015,7 @@ def run_state_only_full_reconcile(
             "commit_sha": commit,
             "created_by": created_by,
             "ref_name": activation_ref_name,
+            "branch_ref": activation_branch_ref,
         },
         output_payload={
             "state_dir": str(state_dir),
@@ -2189,6 +2193,8 @@ def run_state_only_full_reconcile(
             snapshot_id=sid,
             commit_sha=commit,
             snapshot_kind=snapshot_kind,
+            ref_name=activation_ref_name,
+            branch_ref=activation_branch_ref,
             graph_json=candidate_graph,
             file_inventory=file_inventory,
             drift_ledger=[],
@@ -2373,6 +2379,7 @@ def run_state_only_full_reconcile(
                 sid,
                 expected_old_snapshot_id=expected_old_snapshot_id,
                 ref_name=activation_ref_name,
+                branch_ref=activation_branch_ref,
             )
             conn.commit()
         trace.step(
@@ -2381,6 +2388,7 @@ def run_state_only_full_reconcile(
                 "snapshot_id": sid,
                 "expected_old_snapshot_id": expected_old_snapshot_id,
                 "ref_name": activation_ref_name,
+                "branch_ref": activation_branch_ref,
             },
             output_payload={"activation": activation},
         )
@@ -2635,9 +2643,11 @@ def _run_incremental_metadata_scope_reconcile_candidate(
     created_by: str,
     activate: bool,
     ref_name: str,
+    branch_ref: str,
     expected_old_snapshot_id: str,
     semantic_options: dict[str, Any],
 ) -> dict[str, Any]:
+    identity = normalize_pending_scope_identity(ref_name=ref_name, branch_ref=branch_ref)
     active_snapshot_id = str(active.get("snapshot_id") or "")
     active_commit = str(active.get("commit_sha") or "")
     active_graph_json = _read_snapshot_graph(project_id, active_snapshot_id)
@@ -2655,7 +2665,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             "active_snapshot_id": active_snapshot_id,
             "active_graph_commit": active_commit,
             "target_commit": target,
-            "ref_name": ref_name,
+            "ref_name": identity["ref_name"],
+            "branch_ref": identity["branch_ref"],
         }
         candidate_graph["metadata"] = metadata
 
@@ -2932,6 +2943,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             commit_sha=target,
             parent_snapshot_id=active_snapshot_id,
             snapshot_kind="scope",
+            ref_name=identity["ref_name"],
+            branch_ref=identity["branch_ref"],
             graph_json=candidate_graph,
             file_inventory=file_inventory,
             drift_ledger=[],
@@ -3015,7 +3028,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
                 project_id,
                 sid,
                 expected_old_snapshot_id=expected_old_snapshot_id or None,
-                ref_name=ref_name,
+                ref_name=identity["ref_name"],
+                branch_ref=identity["branch_ref"],
             )
             conn.commit()
         trace.step(
@@ -3023,7 +3037,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             input_payload={
                 "snapshot_id": sid,
                 "expected_old_snapshot_id": expected_old_snapshot_id,
-                "ref_name": ref_name,
+                "ref_name": identity["ref_name"],
+                "branch_ref": identity["branch_ref"],
             },
             output_payload={"activation": activation},
         )
@@ -3417,6 +3432,7 @@ def run_pending_scope_reconcile_candidate(
         created_by=created_by,
         activate=activate,
         ref_name=identity["ref_name"],
+        branch_ref=identity["branch_ref"],
         expected_old_snapshot_id=expected_old_snapshot_id,
         semantic_options=semantic_options,
     )
@@ -3466,6 +3482,7 @@ def run_pending_scope_reconcile_candidate(
         # auto-rebuilds the projection on activation.
         activate=activate,
         ref_name=identity["ref_name"],
+        branch_ref=identity["branch_ref"],
         expected_old_snapshot_id=expected_old_snapshot_id or None,
         semantic_enrich=semantic_enrich,
         semantic_use_ai=semantic_use_ai,

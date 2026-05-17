@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS graph_semantic_projections (
   snapshot_id TEXT NOT NULL,
   projection_id TEXT NOT NULL,
   base_commit TEXT NOT NULL DEFAULT '',
+  ref_name TEXT NOT NULL DEFAULT '',
   branch_ref TEXT NOT NULL DEFAULT '',
   projection_rule_version TEXT NOT NULL DEFAULT '',
   event_watermark INTEGER NOT NULL DEFAULT 0,
@@ -209,6 +210,7 @@ def _ensure_graph_event_columns(conn: sqlite3.Connection) -> None:
 
 def _ensure_semantic_projection_columns(conn: sqlite3.Connection) -> None:
     _ensure_columns(conn, "graph_semantic_projections", {
+        "ref_name": "TEXT NOT NULL DEFAULT ''",
         "branch_ref": "TEXT NOT NULL DEFAULT ''",
         "projection_rule_version": "TEXT NOT NULL DEFAULT ''",
     })
@@ -375,6 +377,23 @@ def _snapshot_branch_ref(conn: sqlite3.Connection, project_id: str, snapshot_id:
     generic `active` ref, so this function is intentionally conservative.
     """
     try:
+        row = conn.execute(
+            """
+            SELECT ref_name, branch_ref FROM graph_snapshots
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, snapshot_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row:
+        branch = str(_row_get(row, "branch_ref") or "").strip()
+        if branch:
+            return branch
+        ref = str(_row_get(row, "ref_name") or "").strip()
+        if ref and ref != "active":
+            return ref
+    try:
         rows = conn.execute(
             """
             SELECT ref_name FROM graph_snapshot_refs
@@ -390,6 +409,30 @@ def _snapshot_branch_ref(conn: sqlite3.Connection, project_id: str, snapshot_id:
         if ref and ref != "active":
             return ref
     return ""
+
+
+def _projection_ref_identity(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    ref_name: str = "",
+    branch_ref: str = "",
+) -> dict[str, str]:
+    ref = str(ref_name or "").strip()
+    branch = str(branch_ref or "").strip()
+    snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+    if not ref:
+        ref = str(snapshot.get("ref_name") or "").strip()
+    if not branch:
+        branch = str(snapshot.get("branch_ref") or "").strip()
+    if not branch and ref and ref != "active":
+        branch = ref
+    if not branch:
+        branch = _snapshot_branch_ref(conn, project_id, snapshot_id)
+    if not ref:
+        ref = branch or "active"
+    return {"ref_name": ref, "branch_ref": branch}
 
 
 def _semantic_operation_type(
@@ -2415,6 +2458,8 @@ def build_semantic_projection(
     *,
     actor: str = "semantic_projection_builder",
     projection_id: str | None = None,
+    ref_name: str = "",
+    branch_ref: str = "",
     backfill_existing: bool = True,
 ) -> dict[str, Any]:
     """Materialize a query-friendly semantic view from structure + events."""
@@ -2425,7 +2470,15 @@ def build_semantic_projection(
     if backfill_existing:
         backfill_existing_semantic_events(conn, project_id, snapshot_id, actor=actor)
     commit_sha = str(snapshot.get("commit_sha") or "")
-    branch_ref = _snapshot_branch_ref(conn, project_id, snapshot_id)
+    identity = _projection_ref_identity(
+        conn,
+        project_id,
+        snapshot_id,
+        ref_name=ref_name,
+        branch_ref=branch_ref,
+    )
+    ref_name = identity["ref_name"]
+    branch_ref = identity["branch_ref"]
     nodes = store.list_graph_snapshot_nodes(
         conn,
         project_id,
@@ -2528,6 +2581,7 @@ def build_semantic_projection(
         "projection_rule_version": SEMANTIC_PROJECTION_RULE_VERSION,
         "project_id": project_id,
         "snapshot_id": snapshot_id,
+        "ref_name": ref_name,
         "branch_ref": branch_ref,
         "commit_sha": commit_sha,
         "event_watermark": event_watermark,
@@ -2540,12 +2594,13 @@ def build_semantic_projection(
     conn.execute(
         """
         INSERT INTO graph_semantic_projections
-          (project_id, snapshot_id, projection_id, base_commit, branch_ref,
+          (project_id, snapshot_id, projection_id, base_commit, ref_name, branch_ref,
            projection_rule_version, event_watermark,
            status, projection_json, health_json, created_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project_id, snapshot_id, projection_id) DO UPDATE SET
           base_commit = excluded.base_commit,
+          ref_name = excluded.ref_name,
           branch_ref = excluded.branch_ref,
           projection_rule_version = excluded.projection_rule_version,
           event_watermark = excluded.event_watermark,
@@ -2559,6 +2614,7 @@ def build_semantic_projection(
             snapshot_id,
             pid,
             commit_sha,
+            ref_name,
             branch_ref,
             SEMANTIC_PROJECTION_RULE_VERSION,
             event_watermark,
@@ -2582,8 +2638,10 @@ def build_semantic_projection(
         status=EVENT_STATUS_OBSERVED,
         baseline_commit=commit_sha,
         target_commit=commit_sha,
+        branch_ref=branch_ref,
         payload={
             "projection_id": pid,
+            "ref_name": ref_name,
             "branch_ref": branch_ref,
             "projection_rule_version": SEMANTIC_PROJECTION_RULE_VERSION,
             "event_watermark": event_watermark,
@@ -2597,6 +2655,7 @@ def build_semantic_projection(
         "snapshot_id": snapshot_id,
         "projection_id": pid,
         "base_commit": commit_sha,
+        "ref_name": ref_name,
         "branch_ref": branch_ref,
         "projection_rule_version": SEMANTIC_PROJECTION_RULE_VERSION,
         "event_watermark": event_watermark,
@@ -2610,6 +2669,9 @@ def get_semantic_projection(
     project_id: str,
     snapshot_id: str,
     projection_id: str = "",
+    *,
+    ref_name: str = "",
+    branch_ref: str | None = None,
 ) -> dict[str, Any] | None:
     ensure_schema(conn)
     if projection_id:
@@ -2621,13 +2683,27 @@ def get_semantic_projection(
             (project_id, snapshot_id, projection_id),
         ).fetchone()
     else:
+        filters: list[str] = []
+        params: list[Any] = [project_id, snapshot_id]
+        if ref_name:
+            if str(ref_name or "") == "active":
+                filters.append("(ref_name = ? OR ref_name = '')")
+                params.append("active")
+            else:
+                filters.append("ref_name = ?")
+                params.append(str(ref_name or ""))
+        if branch_ref is not None:
+            filters.append("branch_ref = ?")
+            params.append(str(branch_ref or ""))
+        where_extra = (" AND " + " AND ".join(filters)) if filters else ""
         row = conn.execute(
-            """
+            f"""
             SELECT * FROM graph_semantic_projections
             WHERE project_id = ? AND snapshot_id = ?
+            {where_extra}
             ORDER BY event_watermark DESC, created_at DESC LIMIT 1
             """,
-            (project_id, snapshot_id),
+            params,
         ).fetchone()
     if not row:
         return None

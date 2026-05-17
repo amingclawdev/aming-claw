@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS graph_snapshots (
   commit_sha TEXT NOT NULL,
   parent_snapshot_id TEXT NOT NULL DEFAULT '',
   snapshot_kind TEXT NOT NULL,
+  ref_name TEXT NOT NULL DEFAULT '',
+  branch_ref TEXT NOT NULL DEFAULT '',
   graph_sha256 TEXT NOT NULL DEFAULT '',
   inventory_sha256 TEXT NOT NULL DEFAULT '',
   drift_sha256 TEXT NOT NULL DEFAULT '',
@@ -218,6 +220,7 @@ def utc_now() -> str:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(GRAPH_SNAPSHOT_SCHEMA_SQL)
+    _ensure_graph_snapshot_ref_columns(conn)
     _migrate_pending_scope_reconcile_branch_identity(conn)
 
 
@@ -240,6 +243,16 @@ def _table_pk_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
         if pk:
             items.append((pk, str(row["name"] if hasattr(row, "keys") else row[1])))
     return [name for _pk, name in sorted(items)]
+
+
+def _ensure_graph_snapshot_ref_columns(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "graph_snapshots"):
+        return
+    columns = _table_columns(conn, "graph_snapshots")
+    if "ref_name" not in columns:
+        conn.execute("ALTER TABLE graph_snapshots ADD COLUMN ref_name TEXT NOT NULL DEFAULT ''")
+    if "branch_ref" not in columns:
+        conn.execute("ALTER TABLE graph_snapshots ADD COLUMN branch_ref TEXT NOT NULL DEFAULT ''")
 
 
 def _migrate_pending_scope_reconcile_branch_identity(conn: sqlite3.Connection) -> None:
@@ -356,13 +369,26 @@ def _json(data: Any) -> str:
     return json.dumps(data if data is not None else {}, sort_keys=True, ensure_ascii=False)
 
 
-def _latest_projection_id(conn: sqlite3.Connection, project_id: str, snapshot_id: str) -> str:
+def _latest_projection_id(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    ref_name: str = "",
+    branch_ref: str = "",
+) -> str:
     if not snapshot_id:
         return ""
     try:
         from . import graph_events
 
-        projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id)
+        projection = graph_events.get_semantic_projection(
+            conn,
+            project_id,
+            snapshot_id,
+            ref_name=ref_name,
+            branch_ref=branch_ref,
+        )
     except Exception:
         return ""
     return str((projection or {}).get("projection_id") or "")
@@ -867,6 +893,8 @@ def create_graph_snapshot(
     snapshot_kind: str,
     snapshot_id: str | None = None,
     parent_snapshot_id: str = "",
+    ref_name: str = "",
+    branch_ref: str = "",
     graph_json: dict[str, Any] | None = None,
     file_inventory: list[dict[str, Any]] | None = None,
     drift_ledger: list[dict[str, Any]] | None = None,
@@ -878,6 +906,12 @@ def create_graph_snapshot(
     if status not in ALLOWED_SNAPSHOT_STATUSES:
         raise ValueError(f"invalid graph snapshot status: {status}")
     sid = snapshot_id or snapshot_id_for(snapshot_kind, commit_sha)
+    ref_value = str(ref_name or "").strip()
+    branch_value = str(branch_ref or "").strip()
+    if not ref_value and branch_value:
+        ref_value = branch_value
+    if ref_value == "active" and not branch_value:
+        ref_value = ""
     shas = write_companion_files(
         project_id,
         sid,
@@ -890,9 +924,9 @@ def create_graph_snapshot(
         """
         INSERT INTO graph_snapshots
           (project_id, snapshot_id, commit_sha, parent_snapshot_id, snapshot_kind,
-           graph_sha256, inventory_sha256, drift_sha256, status, created_at,
+           ref_name, branch_ref, graph_sha256, inventory_sha256, drift_sha256, status, created_at,
            created_by, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             project_id,
@@ -900,6 +934,8 @@ def create_graph_snapshot(
             commit_sha,
             parent_snapshot_id,
             snapshot_kind,
+            ref_value,
+            branch_value,
             shas["graph_sha256"],
             shas["inventory_sha256"],
             shas["drift_sha256"],
@@ -914,6 +950,8 @@ def create_graph_snapshot(
         "snapshot_id": sid,
         "commit_sha": commit_sha,
         "snapshot_kind": snapshot_kind,
+        "ref_name": ref_value,
+        "branch_ref": branch_value,
         "status": status,
         "path": shas["path"],
         "graph_sha256": shas["graph_sha256"],
@@ -1010,6 +1048,9 @@ def activate_graph_snapshot(
     op = str(operation_type or "").strip()
     if op not in GRAPH_REF_OPERATION_TYPES:
         raise ValueError(f"invalid graph ref operation_type: {operation_type}")
+    activation_branch_ref = str(branch_ref or "").strip()
+    if not activation_branch_ref and ref_name != "active":
+        activation_branch_ref = ref_name
     row = conn.execute(
         "SELECT * FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
         (project_id, snapshot_id),
@@ -1027,7 +1068,13 @@ def activate_graph_snapshot(
         raise GraphSnapshotConflictError(
             f"active snapshot changed: expected {expected_old_snapshot_id!r}, got {old_id!r}"
         )
-    old_projection_id = _latest_projection_id(conn, project_id, old_id)
+    old_projection_id = _latest_projection_id(
+        conn,
+        project_id,
+        old_id,
+        ref_name=ref_name,
+        branch_ref=activation_branch_ref,
+    )
 
     now = utc_now()
     conn.execute(
@@ -1041,6 +1088,21 @@ def activate_graph_snapshot(
         """,
         (project_id, ref_name, snapshot_id, snapshot["commit_sha"], now),
     )
+    if ref_name != "active" or activation_branch_ref:
+        conn.execute(
+            """
+            UPDATE graph_snapshots
+            SET ref_name = CASE WHEN ref_name = '' THEN ? ELSE ref_name END,
+                branch_ref = CASE WHEN branch_ref = '' THEN ? ELSE branch_ref END
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (
+                "" if ref_name == "active" and not activation_branch_ref else ref_name,
+                activation_branch_ref,
+                project_id,
+                snapshot_id,
+            ),
+        )
     conn.execute(
         "UPDATE graph_snapshots SET status = ? WHERE project_id = ? AND snapshot_id = ?",
         (SNAPSHOT_STATUS_ACTIVE, project_id, snapshot_id),
@@ -1070,17 +1132,36 @@ def activate_graph_snapshot(
         try:
             from . import graph_events  # local import to avoid module cycle
 
-            existing = graph_events.get_semantic_projection(conn, project_id, snapshot_id)
+            existing = graph_events.get_semantic_projection(
+                conn,
+                project_id,
+                snapshot_id,
+                ref_name=ref_name,
+                branch_ref=activation_branch_ref,
+            )
             if not existing or existing.get("status") in (None, "", "missing"):
                 graph_events.materialize_events(conn, project_id, snapshot_id, actor=actor)
-                graph_events.build_semantic_projection(conn, project_id, snapshot_id, actor=actor)
+                graph_events.build_semantic_projection(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    actor=actor,
+                    ref_name=ref_name,
+                    branch_ref=activation_branch_ref,
+                )
                 projection_status = "rebuilt"
             else:
                 projection_status = "already_present"
         except Exception as exc:  # noqa: BLE001 - advisory; activation already committed
             projection_status = f"rebuild_failed: {exc}"
     result["projection_status"] = projection_status
-    new_projection_id = _latest_projection_id(conn, project_id, snapshot_id)
+    new_projection_id = _latest_projection_id(
+        conn,
+        project_id,
+        snapshot_id,
+        ref_name=ref_name,
+        branch_ref=activation_branch_ref,
+    )
     try:
         ref_event = record_graph_ref_event(
             conn,
@@ -1093,7 +1174,7 @@ def activate_graph_snapshot(
             new_commit=str(snapshot["commit_sha"] or ""),
             old_projection_id=old_projection_id,
             new_projection_id=new_projection_id,
-            branch_ref=branch_ref,
+            branch_ref=activation_branch_ref,
             batch_id=batch_id,
             merge_queue_id=merge_queue_id,
             merge_epoch=merge_epoch,
