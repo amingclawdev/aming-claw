@@ -261,6 +261,12 @@ Rules:
   `agent/tests/test_batch_merge_rollback.py`: it produces rollback/replay
   decisions, retained branch/worktree evidence, compact dashboard rows, and
   replay `MergeQueueItem` entries without mutating git or the production DB.
+- The first durability slice is the SQLite-backed batch/item store in
+  `parallel_branch_batch_runtimes` and `parallel_branch_batch_items`. It
+  persists retained branch/worktree evidence, abandoned merge commits, rollback
+  graph/projection refs, replay epochs, and cleanup status so
+  `decide_persisted_batch_rollback_replay` can replay PB-004/PB-009 decisions
+  after restart without mutating git.
 
 ## Graph And Semantic Ref Rules
 
@@ -370,7 +376,9 @@ Serial Chain stages with no `branch_ref` remain unchanged.
 6. Durable `MergeQueueRuntime`. First SQLite-backed queue item store is
    implemented by `agent/tests/test_merge_queue_runtime.py`; live merge
    execution remains gated.
-7. Durable `BatchMergeRuntime`.
+7. Durable `BatchMergeRuntime`. First SQLite-backed batch/item store is
+   implemented by `agent/tests/test_batch_merge_rollback.py`; live rollback
+   execution remains gated.
 8. Branch/ref/batch-aware `pending_scope_reconcile`.
 9. MF adapter MVP for one isolated branch through merge queue.
 10. Dashboard/MCP compact read model. First pure-state read model is implemented

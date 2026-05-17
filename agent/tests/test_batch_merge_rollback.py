@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from agent.governance.parallel_branch_runtime import (
     ACTION_CLEANUP_RETAINED_BRANCH,
     ACTION_REPLAY_THROUGH_MERGE_QUEUE,
@@ -16,11 +18,20 @@ from agent.governance.parallel_branch_runtime import (
     BatchMergeItem,
     BatchMergeRuntime,
     decide_batch_rollback_replay,
+    decide_persisted_batch_rollback_replay,
+    get_batch_merge_runtime,
+    upsert_batch_merge_runtime,
 )
 
 PROJECT_ID = "fixture-parallel-project"
 BATCH_ID = "PB-004"
 TARGET_REF = "refs/heads/main"
+
+
+def _runtime_conn(path: str = ":memory:") -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _pb004_runtime(*, batch_status: str = BATCH_STATE_OPEN) -> BatchMergeRuntime:
@@ -124,6 +135,49 @@ def test_pb004_wrong_merge_order_enters_rollback_required_and_retains_branches()
     )
 
 
+def test_pb004_persisted_batch_replays_rollback_after_restart(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime.db")
+    conn = _runtime_conn(db_path)
+    upsert_batch_merge_runtime(
+        conn,
+        _pb004_runtime(),
+        now_iso="2026-05-17T06:10:00Z",
+    )
+    conn.commit()
+    conn.close()
+
+    restarted = _runtime_conn(db_path)
+    runtime = get_batch_merge_runtime(restarted, PROJECT_ID, BATCH_ID)
+    assert runtime is not None
+    assert runtime.failure_reason == "wrong merge order caused severe integration failure"
+    assert [item.task_id for item in runtime.items] == ["T1", "T2", "T3"]
+    assert [item.worktree_path for item in runtime.items] == [
+        "/tmp/worktrees/PB004-T1",
+        "/tmp/worktrees/PB004-T2",
+        "/tmp/worktrees/PB004-T3",
+    ]
+    assert runtime.items[1].merge_commit == "merge-T2"
+    assert runtime.items[1].depends_on == ("T1",)
+
+    plan = decide_persisted_batch_rollback_replay(
+        restarted,
+        PROJECT_ID,
+        BATCH_ID,
+        severe_integration_failure=True,
+        corrected_replay_order=("T1", "T2", "T3"),
+    )
+
+    assert plan.rollback_required is True
+    assert plan.abandoned_merge_commits == ("merge-T2",)
+    assert plan.replay_task_ids == ("T1", "T2", "T3")
+    assert plan.retained_worktree_paths == (
+        "/tmp/worktrees/PB004-T1",
+        "/tmp/worktrees/PB004-T2",
+        "/tmp/worktrees/PB004-T3",
+    )
+    assert plan.cleanup_allowed is False
+
+
 def test_pb004_replays_retained_branch_heads_through_merge_queue_in_corrected_order() -> None:
     plan = decide_batch_rollback_replay(
         _pb004_runtime(),
@@ -193,3 +247,29 @@ def test_pb009_cleanup_allowed_only_after_batch_acceptance() -> None:
     assert {row["action"] for row in accepted_plan.dashboard_rows} == {
         ACTION_CLEANUP_RETAINED_BRANCH
     }
+
+
+def test_pb009_persisted_accepted_batch_allows_cleanup_after_restart(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime.db")
+    conn = _runtime_conn(db_path)
+    upsert_batch_merge_runtime(
+        conn,
+        _pb004_runtime(batch_status=BATCH_STATE_ACCEPTED),
+        now_iso="2026-05-17T06:15:00Z",
+    )
+    conn.commit()
+    conn.close()
+
+    restarted = _runtime_conn(db_path)
+    plan = decide_persisted_batch_rollback_replay(
+        restarted,
+        PROJECT_ID,
+        BATCH_ID,
+        severe_integration_failure=False,
+        scenario_id="PB-009",
+    )
+
+    assert plan.rollback_required is False
+    assert plan.cleanup_allowed is True
+    assert plan.cleanup_blockers == ()
+    assert plan.operator_actions == (ACTION_CLEANUP_RETAINED_BRANCH,)

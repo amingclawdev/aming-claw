@@ -93,6 +93,55 @@ CREATE INDEX IF NOT EXISTS idx_parallel_branch_merge_queue_project_task
   ON parallel_branch_merge_queue_items(project_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_parallel_branch_merge_queue_project_target
   ON parallel_branch_merge_queue_items(project_id, target_ref, merge_queue_id);
+
+CREATE TABLE IF NOT EXISTS parallel_branch_batch_runtimes (
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    target_ref        TEXT NOT NULL DEFAULT '',
+    batch_base_commit TEXT NOT NULL DEFAULT '',
+    current_target_head TEXT NOT NULL DEFAULT '',
+    batch_status      TEXT NOT NULL DEFAULT '',
+    rollback_epoch    TEXT NOT NULL DEFAULT '',
+    replay_epoch      TEXT NOT NULL DEFAULT '',
+    rollback_target_commit TEXT NOT NULL DEFAULT '',
+    rollback_snapshot_id TEXT NOT NULL DEFAULT '',
+    rollback_projection_id TEXT NOT NULL DEFAULT '',
+    failure_reason    TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_batch_project_status
+  ON parallel_branch_batch_runtimes(project_id, batch_status, updated_at);
+
+CREATE TABLE IF NOT EXISTS parallel_branch_batch_items (
+    project_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    branch_ref        TEXT NOT NULL DEFAULT '',
+    worktree_path     TEXT NOT NULL DEFAULT '',
+    queue_index       INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT '',
+    branch_head       TEXT NOT NULL DEFAULT '',
+    base_commit       TEXT NOT NULL DEFAULT '',
+    checkpoint_id     TEXT NOT NULL DEFAULT '',
+    merge_commit      TEXT NOT NULL DEFAULT '',
+    target_head_before_merge TEXT NOT NULL DEFAULT '',
+    target_head_after_merge TEXT NOT NULL DEFAULT '',
+    snapshot_id       TEXT NOT NULL DEFAULT '',
+    projection_id     TEXT NOT NULL DEFAULT '',
+    merge_queue_id    TEXT NOT NULL DEFAULT '',
+    merge_preview_id  TEXT NOT NULL DEFAULT '',
+    depends_on_json   TEXT NOT NULL DEFAULT '[]',
+    retained          INTEGER NOT NULL DEFAULT 1,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, batch_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_batch_items_project_batch
+  ON parallel_branch_batch_items(project_id, batch_id, queue_index, task_id);
+CREATE INDEX IF NOT EXISTS idx_parallel_branch_batch_items_project_branch
+  ON parallel_branch_batch_items(project_id, branch_ref);
 """
 
 STATE_MERGED = "merged"
@@ -859,6 +908,237 @@ def decide_persisted_merge_queue(
             merge_queue_id,
             target_ref=target_ref,
         ),
+        scenario_id=scenario_id,
+    )
+
+
+def _batch_merge_item_from_row(row: sqlite3.Row) -> BatchMergeItem:
+    return BatchMergeItem(
+        task_id=row["task_id"],
+        branch_ref=row["branch_ref"] or "",
+        worktree_path=row["worktree_path"] or "",
+        queue_index=int(row["queue_index"] or 0),
+        status=row["status"] or "",
+        branch_head=row["branch_head"] or "",
+        base_commit=row["base_commit"] or "",
+        checkpoint_id=row["checkpoint_id"] or "",
+        merge_commit=row["merge_commit"] or "",
+        target_head_before_merge=row["target_head_before_merge"] or "",
+        target_head_after_merge=row["target_head_after_merge"] or "",
+        snapshot_id=row["snapshot_id"] or "",
+        projection_id=row["projection_id"] or "",
+        merge_queue_id=row["merge_queue_id"] or "",
+        merge_preview_id=row["merge_preview_id"] or "",
+        depends_on=_parse_json_array(row["depends_on_json"]),
+        retained=bool(int(row["retained"] or 0)),
+    )
+
+
+def _batch_runtime_from_row(
+    row: sqlite3.Row,
+    items: list[BatchMergeItem],
+) -> BatchMergeRuntime:
+    return BatchMergeRuntime(
+        project_id=row["project_id"],
+        batch_id=row["batch_id"],
+        target_ref=row["target_ref"] or "",
+        batch_base_commit=row["batch_base_commit"] or "",
+        current_target_head=row["current_target_head"] or "",
+        items=tuple(items),
+        batch_status=row["batch_status"] or "",
+        rollback_epoch=row["rollback_epoch"] or "",
+        replay_epoch=row["replay_epoch"] or "",
+        rollback_target_commit=row["rollback_target_commit"] or "",
+        rollback_snapshot_id=row["rollback_snapshot_id"] or "",
+        rollback_projection_id=row["rollback_projection_id"] or "",
+        failure_reason=row["failure_reason"] or "",
+    )
+
+
+def upsert_batch_merge_runtime(
+    conn: sqlite3.Connection,
+    runtime: BatchMergeRuntime,
+    *,
+    now_iso: str = "",
+) -> BatchMergeRuntime:
+    ensure_branch_runtime_schema(conn)
+    now = now_iso or utc_now()
+    conn.execute(
+        """
+        INSERT INTO parallel_branch_batch_runtimes (
+            project_id, batch_id, target_ref, batch_base_commit,
+            current_target_head, batch_status, rollback_epoch, replay_epoch,
+            rollback_target_commit, rollback_snapshot_id, rollback_projection_id,
+            failure_reason, created_at, updated_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(project_id, batch_id) DO UPDATE SET
+            target_ref = excluded.target_ref,
+            batch_base_commit = excluded.batch_base_commit,
+            current_target_head = excluded.current_target_head,
+            batch_status = excluded.batch_status,
+            rollback_epoch = excluded.rollback_epoch,
+            replay_epoch = excluded.replay_epoch,
+            rollback_target_commit = excluded.rollback_target_commit,
+            rollback_snapshot_id = excluded.rollback_snapshot_id,
+            rollback_projection_id = excluded.rollback_projection_id,
+            failure_reason = excluded.failure_reason,
+            updated_at = excluded.updated_at
+        """,
+        (
+            runtime.project_id,
+            runtime.batch_id,
+            runtime.target_ref,
+            runtime.batch_base_commit,
+            runtime.current_target_head,
+            runtime.batch_status,
+            runtime.rollback_epoch,
+            runtime.replay_epoch,
+            runtime.rollback_target_commit,
+            runtime.rollback_snapshot_id,
+            runtime.rollback_projection_id,
+            runtime.failure_reason,
+            now,
+            now,
+        ),
+    )
+    for item in runtime.items:
+        conn.execute(
+            """
+            INSERT INTO parallel_branch_batch_items (
+                project_id, batch_id, task_id, branch_ref, worktree_path,
+                queue_index, status, branch_head, base_commit, checkpoint_id,
+                merge_commit, target_head_before_merge, target_head_after_merge,
+                snapshot_id, projection_id, merge_queue_id, merge_preview_id,
+                depends_on_json, retained, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            ON CONFLICT(project_id, batch_id, task_id) DO UPDATE SET
+                branch_ref = excluded.branch_ref,
+                worktree_path = excluded.worktree_path,
+                queue_index = excluded.queue_index,
+                status = excluded.status,
+                branch_head = excluded.branch_head,
+                base_commit = excluded.base_commit,
+                checkpoint_id = excluded.checkpoint_id,
+                merge_commit = excluded.merge_commit,
+                target_head_before_merge = excluded.target_head_before_merge,
+                target_head_after_merge = excluded.target_head_after_merge,
+                snapshot_id = excluded.snapshot_id,
+                projection_id = excluded.projection_id,
+                merge_queue_id = excluded.merge_queue_id,
+                merge_preview_id = excluded.merge_preview_id,
+                depends_on_json = excluded.depends_on_json,
+                retained = excluded.retained,
+                updated_at = excluded.updated_at
+            """,
+            (
+                runtime.project_id,
+                runtime.batch_id,
+                item.task_id,
+                item.branch_ref,
+                item.worktree_path,
+                item.queue_index,
+                item.status,
+                item.branch_head,
+                item.base_commit,
+                item.checkpoint_id,
+                item.merge_commit,
+                item.target_head_before_merge,
+                item.target_head_after_merge,
+                item.snapshot_id,
+                item.projection_id,
+                item.merge_queue_id,
+                item.merge_preview_id,
+                _json_array(item.depends_on),
+                1 if item.retained else 0,
+                now,
+                now,
+            ),
+        )
+
+    task_ids = [item.task_id for item in runtime.items]
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        conn.execute(
+            f"""
+            DELETE FROM parallel_branch_batch_items
+            WHERE project_id = ? AND batch_id = ? AND task_id NOT IN ({placeholders})
+            """,
+            (runtime.project_id, runtime.batch_id, *task_ids),
+        )
+    else:
+        conn.execute(
+            """
+            DELETE FROM parallel_branch_batch_items
+            WHERE project_id = ? AND batch_id = ?
+            """,
+            (runtime.project_id, runtime.batch_id),
+        )
+
+    found = get_batch_merge_runtime(conn, runtime.project_id, runtime.batch_id)
+    if found is None:
+        raise RuntimeError(f"batch runtime was not persisted: {runtime.batch_id}")
+    return found
+
+
+def list_batch_merge_items(
+    conn: sqlite3.Connection,
+    project_id: str,
+    batch_id: str,
+) -> list[BatchMergeItem]:
+    ensure_branch_runtime_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT * FROM parallel_branch_batch_items
+        WHERE project_id = ? AND batch_id = ?
+        ORDER BY queue_index, task_id
+        """,
+        (project_id, batch_id),
+    ).fetchall()
+    return [_batch_merge_item_from_row(row) for row in rows]
+
+
+def get_batch_merge_runtime(
+    conn: sqlite3.Connection,
+    project_id: str,
+    batch_id: str,
+) -> BatchMergeRuntime | None:
+    ensure_branch_runtime_schema(conn)
+    row = conn.execute(
+        """
+        SELECT * FROM parallel_branch_batch_runtimes
+        WHERE project_id = ? AND batch_id = ?
+        """,
+        (project_id, batch_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return _batch_runtime_from_row(
+        row,
+        list_batch_merge_items(conn, project_id, batch_id),
+    )
+
+
+def decide_persisted_batch_rollback_replay(
+    conn: sqlite3.Connection,
+    project_id: str,
+    batch_id: str,
+    *,
+    severe_integration_failure: bool = False,
+    corrected_replay_order: tuple[str, ...] = (),
+    scenario_id: str = "PB-004",
+) -> BatchRollbackPlan:
+    """Replay batch rollback decisions from durable batch rows."""
+    runtime = get_batch_merge_runtime(conn, project_id, batch_id)
+    if runtime is None:
+        raise KeyError(f"batch runtime not found: {project_id}/{batch_id}")
+    return decide_batch_rollback_replay(
+        runtime,
+        severe_integration_failure=severe_integration_failure,
+        corrected_replay_order=corrected_replay_order,
         scenario_id=scenario_id,
     )
 
