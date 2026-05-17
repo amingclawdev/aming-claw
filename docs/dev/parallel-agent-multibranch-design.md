@@ -245,6 +245,10 @@ Rules:
   epoch, affected graph refs, affected semantic projections, and replay order.
 - Replay uses retained branch heads through the merge queue. It does not replay
   shell history.
+- The first executable slice is the PB-004/PB-009 dry-run oracle in
+  `agent/tests/test_batch_merge_rollback.py`: it produces rollback/replay
+  decisions, retained branch/worktree evidence, compact dashboard rows, and
+  replay `MergeQueueItem` entries without mutating git or the production DB.
 
 ## Graph And Semantic Ref Rules
 

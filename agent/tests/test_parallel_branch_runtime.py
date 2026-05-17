@@ -17,9 +17,11 @@ from agent.governance.parallel_branch_runtime import (
     STATE_MERGE_FAILED,
     STATE_MERGED,
     STATE_RECLAIMABLE,
+    STATE_RUNNING,
     BranchRuntimeFenceError,
     BranchRuntimeTask,
     BranchTaskRuntimeContext,
+    branch_context_from_chain_stage,
     decide_restart_recovery,
     ensure_branch_runtime_schema,
     get_branch_context,
@@ -311,3 +313,87 @@ def test_branch_runtime_rejects_stale_fence_after_reclaim() -> None:
 
     assert updated.checkpoint_id == "checkpoint-T3-after-reclaim"
     assert updated.replay_source == "checkpoint"
+
+
+def test_pb007_chain_stage_identity_round_trips_without_running_chain() -> None:
+    conn = _runtime_conn()
+    context = branch_context_from_chain_stage(
+        project_id=PROJECT_ID,
+        chain_id="chain-root-1",
+        root_task_id="chain-root-1",
+        stage_task_id="chain-dev-2",
+        stage_type="dev",
+        retry_round=2,
+        batch_id="PB-007",
+        backlog_id="OPT-PB007",
+        branch_ref="refs/heads/codex/PB007-chain-dev",
+        worktree_id="worktree-PB007",
+        worktree_path="/tmp/worktrees/PB007-chain-dev",
+        base_commit="base-PB007",
+        head_commit="head-PB007",
+        target_head_commit="target-PB007",
+        snapshot_id="scope-PB007",
+        projection_id="semproj-PB007",
+        merge_queue_id="mergeq-PB007",
+        merge_preview_id="preview-PB007",
+        checkpoint_id="checkpoint-PB007",
+        replay_source="checkpoint",
+        fence_token="fence-PB007",
+    )
+
+    saved = upsert_branch_context(conn, context, now_iso=NOW)
+
+    assert saved.task_id == "chain-dev-2"
+    assert saved.chain_id == "chain-root-1"
+    assert saved.root_task_id == "chain-root-1"
+    assert saved.stage_task_id == "chain-dev-2"
+    assert saved.stage_type == "dev"
+    assert saved.retry_round == 2
+    assert saved.attempt == 3
+    assert saved.branch_ref == "refs/heads/codex/PB007-chain-dev"
+    assert saved.merge_queue_id == "mergeq-PB007"
+
+    reloaded = get_branch_context(conn, PROJECT_ID, "chain-dev-2")
+    assert reloaded is not None
+    assert reloaded.chain_id == "chain-root-1"
+    assert reloaded.retry_round == 2
+    assert reloaded.to_runtime_task(now_iso=NOW).checkpoint_id == "checkpoint-PB007"
+
+
+def test_pb012_branch_contexts_are_isolated_by_project_and_batch() -> None:
+    conn = _runtime_conn()
+    shared_task_id = "shared-task"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id="project-a",
+            task_id=shared_task_id,
+            batch_id="batch-a",
+            branch_ref="refs/heads/codex/project-a-shared-task",
+            status=STATE_RUNNING,
+            fence_token="fence-a",
+        ),
+        now_iso=NOW,
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id="project-b",
+            task_id=shared_task_id,
+            batch_id="batch-b",
+            branch_ref="refs/heads/codex/project-b-shared-task",
+            status=STATE_MERGED,
+            fence_token="fence-b",
+        ),
+        now_iso=NOW,
+    )
+
+    project_a = get_branch_context(conn, "project-a", shared_task_id)
+    project_b = get_branch_context(conn, "project-b", shared_task_id)
+
+    assert project_a is not None
+    assert project_b is not None
+    assert project_a.branch_ref == "refs/heads/codex/project-a-shared-task"
+    assert project_b.branch_ref == "refs/heads/codex/project-b-shared-task"
+    assert list_branch_contexts(conn, "project-a", batch_id="batch-a") == [project_a]
+    assert list_branch_contexts(conn, "project-a", batch_id="batch-b") == []

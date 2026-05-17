@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
     ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE,
@@ -194,3 +196,61 @@ def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:
         "validation_attempt": 0,
         "merge_preview_id": "",
     }
+
+
+def test_pb012_merge_queue_rejects_mixed_project_queue_or_target_scope() -> None:
+    base = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id=QUEUE_ID,
+        queue_item_id="item-T1",
+        task_id="T1",
+        branch_ref="refs/heads/codex/PB012-T1",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+    )
+
+    with pytest.raises(ValueError, match="project_id"):
+        decide_merge_queue([
+            base,
+            MergeQueueItem(
+                project_id="other-project",
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB012-T2",
+                queue_index=2,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+            ),
+        ], scenario_id="PB-012")
+
+    with pytest.raises(ValueError, match="merge_queue_id"):
+        decide_merge_queue([
+            base,
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="other-queue",
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB012-T2",
+                queue_index=2,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+            ),
+        ], scenario_id="PB-012")
+
+    with pytest.raises(ValueError, match="target_ref"):
+        decide_merge_queue([
+            base,
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id=QUEUE_ID,
+                queue_item_id="item-T2",
+                task_id="T2",
+                branch_ref="refs/heads/codex/PB012-T2",
+                queue_index=2,
+                status=STATE_MERGE_READY,
+                target_ref="refs/heads/release",
+            ),
+        ], scenario_id="PB-012")

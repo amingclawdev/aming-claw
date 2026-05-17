@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS parallel_branch_runtime_contexts (
     root_task_id      TEXT NOT NULL DEFAULT '',
     stage_task_id     TEXT NOT NULL DEFAULT '',
     stage_type        TEXT NOT NULL DEFAULT '',
+    retry_round       INTEGER NOT NULL DEFAULT 0,
     agent_id          TEXT NOT NULL DEFAULT '',
     worker_id         TEXT NOT NULL DEFAULT '',
     attempt           INTEGER NOT NULL DEFAULT 1,
@@ -75,6 +76,17 @@ STATE_MERGE_READY = "merge_ready"
 STATE_MERGE_BLOCKED = "merge_blocked"
 STATE_MERGING = "merging"
 STATE_ABANDONED = "abandoned"
+STATE_ROLLBACK_REQUIRED = "rollback_required"
+
+BATCH_STATE_OPEN = "open"
+BATCH_STATE_MERGE_IN_PROGRESS = "merge_in_progress"
+BATCH_STATE_ROLLBACK_REQUIRED = "rollback_required"
+BATCH_STATE_ROLLBACK_IN_PROGRESS = "rollback_in_progress"
+BATCH_STATE_REPLAY_PENDING = "replay_pending"
+BATCH_STATE_REPLAY_IN_PROGRESS = "replay_in_progress"
+BATCH_STATE_ACCEPTED = "accepted"
+BATCH_STATE_ABANDONED = "abandoned"
+BATCH_STATE_CLEANED = "cleaned"
 
 ACTION_LEAVE_MERGED = "leave_merged"
 ACTION_OBSERVER_DECISION_REQUIRED = "observer_decision_required"
@@ -86,14 +98,30 @@ ACTION_BLOCKED_BY_DEPENDENCY = "blocked_by_dependency"
 ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE = "revalidate_after_dependency_merge"
 ACTION_ALLOW_MERGE = "allow_merge"
 ACTION_MERGE_IN_PROGRESS = "merge_in_progress"
+ACTION_ROLLBACK_BATCH = "rollback_batch"
+ACTION_REPLAY_THROUGH_MERGE_QUEUE = "replay_through_merge_queue"
+ACTION_RETAIN_FOR_REPLAY = "retain_for_replay"
+ACTION_RETAIN_FOR_AUDIT = "retain_for_audit"
+ACTION_CLEANUP_RETAINED_BRANCH = "cleanup_retained_branch"
 
 TERMINAL_NON_BLOCKING_STATES = {"merged", "abandoned", "cleaned"}
 MERGE_DONE_STATES = {STATE_MERGED}
-MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, "rollback_required"}
+MERGE_BLOCKING_STATES = {STATE_MERGE_FAILED, STATE_ABANDONED, STATE_ROLLBACK_REQUIRED}
 MERGE_READY_INPUT_STATES = {
     STATE_QUEUED_FOR_MERGE,
     STATE_VALIDATED,
     STATE_MERGE_READY,
+}
+BATCH_CLEANUP_ALLOWED_STATES = {
+    BATCH_STATE_ACCEPTED,
+    BATCH_STATE_ABANDONED,
+    BATCH_STATE_CLEANED,
+}
+BATCH_ROLLBACK_STATES = {
+    BATCH_STATE_ROLLBACK_REQUIRED,
+    BATCH_STATE_ROLLBACK_IN_PROGRESS,
+    BATCH_STATE_REPLAY_PENDING,
+    BATCH_STATE_REPLAY_IN_PROGRESS,
 }
 
 
@@ -125,6 +153,7 @@ class BranchTaskRuntimeContext:
     root_task_id: str = ""
     stage_task_id: str = ""
     stage_type: str = ""
+    retry_round: int = 0
     agent_id: str = ""
     worker_id: str = ""
     attempt: int = 1
@@ -279,12 +308,87 @@ class MergeQueuePlan:
     dashboard_rows: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class BatchMergeItem:
+    task_id: str
+    branch_ref: str
+    worktree_path: str
+    queue_index: int
+    status: str
+    branch_head: str
+    base_commit: str = ""
+    checkpoint_id: str = ""
+    merge_commit: str = ""
+    target_head_before_merge: str = ""
+    target_head_after_merge: str = ""
+    snapshot_id: str = ""
+    projection_id: str = ""
+    merge_queue_id: str = ""
+    merge_preview_id: str = ""
+    depends_on: tuple[str, ...] = ()
+    retained: bool = True
+
+
+@dataclass(frozen=True)
+class BatchMergeRuntime:
+    project_id: str
+    batch_id: str
+    target_ref: str
+    batch_base_commit: str
+    current_target_head: str
+    items: tuple[BatchMergeItem, ...]
+    batch_status: str = BATCH_STATE_OPEN
+    rollback_epoch: str = ""
+    replay_epoch: str = ""
+    rollback_target_commit: str = ""
+    rollback_snapshot_id: str = ""
+    rollback_projection_id: str = ""
+    failure_reason: str = ""
+
+
+@dataclass(frozen=True)
+class BatchRollbackPlan:
+    scenario_id: str
+    project_id: str
+    batch_id: str
+    target_ref: str
+    batch_status: str
+    rollback_required: bool
+    rollback_epoch: str
+    replay_epoch: str
+    rollback_target_commit: str
+    rollback_snapshot_id: str
+    rollback_projection_id: str
+    abandoned_merge_commits: tuple[str, ...]
+    abandoned_snapshot_ids: tuple[str, ...]
+    abandoned_projection_ids: tuple[str, ...]
+    retained_branch_refs: tuple[str, ...]
+    retained_worktree_paths: tuple[str, ...]
+    replay_task_ids: tuple[str, ...]
+    replay_merge_queue_items: tuple[MergeQueueItem, ...]
+    cleanup_allowed: bool
+    cleanup_blockers: tuple[str, ...]
+    operator_actions: tuple[str, ...]
+    dashboard_rows: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def ensure_branch_runtime_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(PARALLEL_BRANCH_RUNTIME_SCHEMA_SQL)
+    _ensure_branch_runtime_context_columns(conn)
+
+
+def _ensure_branch_runtime_context_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(parallel_branch_runtime_contexts)").fetchall()
+    columns = {str(row["name"] if hasattr(row, "keys") else row[1]) for row in rows}
+    if "retry_round" not in columns:
+        conn.execute(
+            "ALTER TABLE parallel_branch_runtime_contexts "
+            "ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _json_array(values: tuple[str, ...] | list[str]) -> str:
@@ -313,6 +417,7 @@ def _context_from_row(row: sqlite3.Row) -> BranchTaskRuntimeContext:
         root_task_id=row["root_task_id"] or "",
         stage_task_id=row["stage_task_id"] or "",
         stage_type=row["stage_type"] or "",
+        retry_round=int(row["retry_round"] or 0),
         agent_id=row["agent_id"] or "",
         worker_id=row["worker_id"] or "",
         attempt=int(row["attempt"] or 1),
@@ -354,7 +459,7 @@ def upsert_branch_context(
         """
         INSERT INTO parallel_branch_runtime_contexts (
             project_id, task_id, batch_id, backlog_id, chain_id, root_task_id,
-            stage_task_id, stage_type, agent_id, worker_id, attempt, lease_id,
+            stage_task_id, stage_type, retry_round, agent_id, worker_id, attempt, lease_id,
             lease_expires_at, fence_token, branch_ref, ref_name, worktree_id,
             worktree_path, base_commit, head_commit, target_head_commit,
             snapshot_id, projection_id, merge_queue_id, merge_preview_id,
@@ -363,7 +468,7 @@ def upsert_branch_context(
             created_at, updated_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(project_id, task_id) DO UPDATE SET
             batch_id = excluded.batch_id,
@@ -372,6 +477,7 @@ def upsert_branch_context(
             root_task_id = excluded.root_task_id,
             stage_task_id = excluded.stage_task_id,
             stage_type = excluded.stage_type,
+            retry_round = excluded.retry_round,
             agent_id = excluded.agent_id,
             worker_id = excluded.worker_id,
             attempt = excluded.attempt,
@@ -407,6 +513,7 @@ def upsert_branch_context(
             context.root_task_id,
             context.stage_task_id,
             context.stage_type,
+            context.retry_round,
             context.agent_id,
             context.worker_id,
             context.attempt,
@@ -583,8 +690,96 @@ def runtime_tasks_from_contexts(
     return [context.to_runtime_task(now_iso=now_iso) for context in contexts]
 
 
+def branch_context_from_chain_stage(
+    *,
+    project_id: str,
+    chain_id: str,
+    root_task_id: str,
+    stage_task_id: str,
+    stage_type: str,
+    retry_round: int = 0,
+    branch_ref: str,
+    task_id: str = "",
+    batch_id: str = "",
+    backlog_id: str = "",
+    agent_id: str = "",
+    worker_id: str = "",
+    status: str = STATE_RUNNING,
+    ref_name: str = "main",
+    worktree_id: str = "",
+    worktree_path: str = "",
+    base_commit: str = "",
+    head_commit: str = "",
+    target_head_commit: str = "",
+    snapshot_id: str = "",
+    projection_id: str = "",
+    merge_queue_id: str = "",
+    merge_preview_id: str = "",
+    rollback_epoch: str = "",
+    replay_epoch: str = "",
+    depends_on: tuple[str, ...] = (),
+    checkpoint_id: str = "",
+    replay_source: str = "",
+    lease_id: str = "",
+    lease_expires_at: str = "",
+    fence_token: str = "",
+    attempt: int | None = None,
+) -> BranchTaskRuntimeContext:
+    """Create a branch runtime context for a Chain stage without running Chain."""
+    stage_task = str(stage_task_id or task_id or "").strip()
+    if not stage_task:
+        raise ValueError("stage_task_id or task_id is required")
+    round_num = max(0, int(retry_round or 0))
+    return BranchTaskRuntimeContext(
+        project_id=project_id,
+        task_id=task_id or stage_task,
+        batch_id=batch_id,
+        backlog_id=backlog_id,
+        chain_id=chain_id or root_task_id,
+        root_task_id=root_task_id or chain_id,
+        stage_task_id=stage_task,
+        stage_type=stage_type,
+        retry_round=round_num,
+        agent_id=agent_id,
+        worker_id=worker_id,
+        attempt=attempt if attempt is not None else round_num + 1,
+        lease_id=lease_id,
+        lease_expires_at=lease_expires_at,
+        fence_token=fence_token,
+        branch_ref=branch_ref,
+        ref_name=ref_name,
+        worktree_id=worktree_id,
+        worktree_path=worktree_path,
+        base_commit=base_commit,
+        head_commit=head_commit,
+        target_head_commit=target_head_commit,
+        snapshot_id=snapshot_id,
+        projection_id=projection_id,
+        merge_queue_id=merge_queue_id,
+        merge_preview_id=merge_preview_id,
+        rollback_epoch=rollback_epoch,
+        replay_epoch=replay_epoch,
+        status=status,
+        depends_on=depends_on,
+        checkpoint_id=checkpoint_id,
+        replay_source=replay_source,
+    )
+
+
 def _merge_items_by_task(items: list[MergeQueueItem]) -> dict[str, MergeQueueItem]:
     return {item.task_id: item for item in items}
+
+
+def _require_single_merge_queue_scope(items: list[MergeQueueItem]) -> None:
+    project_ids = {item.project_id for item in items}
+    queue_ids = {item.merge_queue_id for item in items}
+    target_refs = {item.target_ref for item in items}
+    if len(project_ids) > 1:
+        raise ValueError("merge queue decisions must not mix project_id values")
+    if len(queue_ids) > 1:
+        raise ValueError("merge queue decisions must not mix merge_queue_id values")
+    if len(target_refs) > 1:
+        raise ValueError("merge queue decisions must not mix target_ref values")
 
 
 def _merge_dependency_blockers(
@@ -645,6 +840,7 @@ def decide_merge_queue(
     scenario_id: str = "PB-002",
 ) -> MergeQueuePlan:
     """Compute ordered merge queue decisions without mutating refs or state."""
+    _require_single_merge_queue_scope(items)
     ordered_items = sorted(items, key=lambda item: (item.queue_index, item.queue_item_id))
     items_by_task = _merge_items_by_task(ordered_items)
     decisions: list[MergeQueueDecision] = []
@@ -751,6 +947,212 @@ def decide_merge_queue(
         stale_task_ids=stale,
         target_mutation_blocked_for=target_mutation_blocked,
         dashboard_rows=tuple(decision.to_dashboard_row() for decision in decisions),
+    )
+
+
+def _short_identity(value: str, fallback: str) -> str:
+    text = str(value or "").strip()
+    return text[:12] if text else fallback
+
+
+def _batch_epoch(prefix: str, runtime: BatchMergeRuntime, commit: str) -> str:
+    batch = runtime.batch_id or "batch"
+    return f"{prefix}-{batch}-{_short_identity(commit, 'unknown')}"
+
+
+def _batch_items_by_task(items: tuple[BatchMergeItem, ...]) -> dict[str, BatchMergeItem]:
+    return {item.task_id: item for item in items}
+
+
+def _ordered_replay_items(
+    runtime: BatchMergeRuntime,
+    *,
+    corrected_replay_order: tuple[str, ...],
+) -> tuple[BatchMergeItem, ...]:
+    items_by_task = _batch_items_by_task(runtime.items)
+    ordered: list[BatchMergeItem] = []
+    seen: set[str] = set()
+    for task_id in corrected_replay_order:
+        item = items_by_task.get(task_id)
+        if item and item.retained and item.status != STATE_ABANDONED:
+            ordered.append(item)
+            seen.add(task_id)
+    for item in sorted(runtime.items, key=lambda it: (it.queue_index, it.task_id)):
+        if item.task_id not in seen and item.retained and item.status != STATE_ABANDONED:
+            ordered.append(item)
+    return tuple(ordered)
+
+
+def _batch_replay_merge_queue_items(
+    runtime: BatchMergeRuntime,
+    *,
+    replay_items: tuple[BatchMergeItem, ...],
+    replay_epoch: str,
+    rollback_target_commit: str,
+) -> tuple[MergeQueueItem, ...]:
+    queue_id = f"replay:{runtime.batch_id}:{replay_epoch}"
+    return tuple(
+        MergeQueueItem(
+            project_id=runtime.project_id,
+            merge_queue_id=queue_id,
+            queue_item_id=f"{runtime.batch_id}:{replay_epoch}:{index}:{item.task_id}",
+            task_id=item.task_id,
+            branch_ref=item.branch_ref,
+            queue_index=index,
+            status=STATE_QUEUED_FOR_MERGE,
+            depends_on=item.depends_on,
+            target_ref=runtime.target_ref,
+            base_commit=rollback_target_commit,
+            branch_head=item.branch_head,
+            current_target_head=rollback_target_commit,
+            merge_preview_id="",
+            snapshot_id=item.snapshot_id,
+            projection_id=item.projection_id,
+        )
+        for index, item in enumerate(replay_items, start=1)
+    )
+
+
+def _batch_dashboard_rows(
+    runtime: BatchMergeRuntime,
+    *,
+    rollback_required: bool,
+    rollback_epoch: str,
+    replay_epoch: str,
+    replay_task_ids: tuple[str, ...],
+    cleanup_allowed: bool,
+) -> tuple[dict[str, Any], ...]:
+    replay_set = set(replay_task_ids)
+    rows: list[dict[str, Any]] = []
+    for item in sorted(runtime.items, key=lambda it: (it.queue_index, it.task_id)):
+        if cleanup_allowed:
+            action = ACTION_CLEANUP_RETAINED_BRANCH if item.retained else ACTION_NOOP
+            actions = ("cleanup_retained_branch",) if item.retained else ()
+        elif rollback_required and item.task_id in replay_set:
+            action = ACTION_RETAIN_FOR_REPLAY
+            actions = ("retain_branch", "replay_through_merge_queue", "block_cleanup")
+        elif rollback_required and item.retained:
+            action = ACTION_RETAIN_FOR_AUDIT
+            actions = ("retain_branch", "block_cleanup")
+        else:
+            action = ACTION_NOOP
+            actions = ("block_cleanup",) if item.retained else ()
+        rows.append({
+            "batch_id": runtime.batch_id,
+            "task_id": item.task_id,
+            "branch_ref": item.branch_ref,
+            "worktree_path": item.worktree_path,
+            "status": item.status,
+            "retained": item.retained,
+            "queue_index": item.queue_index,
+            "branch_head": item.branch_head,
+            "merge_commit": item.merge_commit,
+            "snapshot_id": item.snapshot_id,
+            "projection_id": item.projection_id,
+            "rollback_epoch": rollback_epoch,
+            "replay_epoch": replay_epoch,
+            "cleanup_allowed": cleanup_allowed,
+            "action": action,
+            "operator_actions": list(actions),
+        })
+    return tuple(rows)
+
+
+def decide_batch_rollback_replay(
+    runtime: BatchMergeRuntime,
+    *,
+    severe_integration_failure: bool = False,
+    corrected_replay_order: tuple[str, ...] = (),
+    scenario_id: str = "PB-004",
+) -> BatchRollbackPlan:
+    """Plan batch rollback/replay without mutating git, graph, semantic, or DB state."""
+    rollback_target = runtime.rollback_target_commit or runtime.batch_base_commit
+    rollback_required = bool(
+        severe_integration_failure
+        or runtime.batch_status in BATCH_ROLLBACK_STATES
+        or any(item.status in {STATE_MERGE_FAILED, STATE_ROLLBACK_REQUIRED} for item in runtime.items)
+    )
+    rollback_epoch = runtime.rollback_epoch or (
+        _batch_epoch("rollback", runtime, rollback_target) if rollback_required else ""
+    )
+    replay_epoch = runtime.replay_epoch or (
+        _batch_epoch("replay", runtime, runtime.current_target_head or rollback_target)
+        if rollback_required
+        else ""
+    )
+    batch_status = BATCH_STATE_ROLLBACK_REQUIRED if rollback_required else runtime.batch_status
+
+    retained_items = tuple(item for item in runtime.items if item.retained and item.status != STATE_ABANDONED)
+    replay_items = (
+        _ordered_replay_items(runtime, corrected_replay_order=corrected_replay_order)
+        if rollback_required
+        else ()
+    )
+    replay_task_ids = tuple(item.task_id for item in replay_items)
+    replay_queue_items = _batch_replay_merge_queue_items(
+        runtime,
+        replay_items=replay_items,
+        replay_epoch=replay_epoch,
+        rollback_target_commit=rollback_target,
+    ) if rollback_required else ()
+
+    abandoned_merge_commits = tuple(
+        item.merge_commit for item in runtime.items if item.merge_commit
+    )
+    abandoned_snapshot_ids = tuple(
+        item.snapshot_id for item in runtime.items if item.snapshot_id and item.status == STATE_MERGED
+    )
+    abandoned_projection_ids = tuple(
+        item.projection_id for item in runtime.items if item.projection_id and item.status == STATE_MERGED
+    )
+    cleanup_allowed = (
+        not rollback_required
+        and runtime.batch_status in BATCH_CLEANUP_ALLOWED_STATES
+    )
+    cleanup_blockers = () if cleanup_allowed else tuple(item.task_id for item in retained_items)
+    operator_actions = (
+        (ACTION_ROLLBACK_BATCH, ACTION_REPLAY_THROUGH_MERGE_QUEUE, "approve_cleanup_after_replay")
+        if rollback_required
+        else ((ACTION_CLEANUP_RETAINED_BRANCH,) if cleanup_allowed else ("wait_for_batch_resolution",))
+    )
+
+    rollback_snapshot_id = runtime.rollback_snapshot_id or (
+        f"snapshot-{_short_identity(rollback_target, 'rollback-target')}" if rollback_target else ""
+    )
+    rollback_projection_id = runtime.rollback_projection_id or (
+        f"projection-{_short_identity(rollback_target, 'rollback-target')}" if rollback_target else ""
+    )
+
+    return BatchRollbackPlan(
+        scenario_id=scenario_id,
+        project_id=runtime.project_id,
+        batch_id=runtime.batch_id,
+        target_ref=runtime.target_ref,
+        batch_status=batch_status,
+        rollback_required=rollback_required,
+        rollback_epoch=rollback_epoch,
+        replay_epoch=replay_epoch,
+        rollback_target_commit=rollback_target,
+        rollback_snapshot_id=rollback_snapshot_id,
+        rollback_projection_id=rollback_projection_id,
+        abandoned_merge_commits=abandoned_merge_commits,
+        abandoned_snapshot_ids=abandoned_snapshot_ids,
+        abandoned_projection_ids=abandoned_projection_ids,
+        retained_branch_refs=tuple(item.branch_ref for item in retained_items if item.branch_ref),
+        retained_worktree_paths=tuple(item.worktree_path for item in retained_items if item.worktree_path),
+        replay_task_ids=replay_task_ids,
+        replay_merge_queue_items=replay_queue_items,
+        cleanup_allowed=cleanup_allowed,
+        cleanup_blockers=cleanup_blockers,
+        operator_actions=operator_actions,
+        dashboard_rows=_batch_dashboard_rows(
+            runtime,
+            rollback_required=rollback_required,
+            rollback_epoch=rollback_epoch,
+            replay_epoch=replay_epoch,
+            replay_task_ids=replay_task_ids,
+            cleanup_allowed=cleanup_allowed,
+        ),
     )
 
 
