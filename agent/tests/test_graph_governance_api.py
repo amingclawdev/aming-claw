@@ -529,6 +529,82 @@ def test_parallel_branch_finish_gate_rejects_stale_fence(conn):
         )
 
 
+def test_parallel_branch_finish_gate_validates_worktree_changed_files(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    base = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "README.md").write_text("# changed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "worker change"], cwd=repo, check=True, capture_output=True, text=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-finish-diff",
+            task_id="finish-diff-task",
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/finish-diff-task",
+            status="worktree_ready",
+            fence_token="fence-finish-diff",
+            worktree_path=str(repo),
+            base_commit=base,
+            head_commit=base,
+            target_head_commit=base,
+        ),
+        now_iso="2026-05-17T07:33:00Z",
+    )
+
+    with pytest.raises(ValidationError, match="changed_files do not match assigned worktree diff"):
+        server.handle_graph_governance_parallel_branch_finish_gate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "finish-diff-task",
+                    "status": "succeeded",
+                    "changed_files": ["agent/governance/server.py"],
+                    "test_results": {"status": "passed"},
+                    "checkpoint_id": "ckpt-finish-diff-bad",
+                    "fence_token": "fence-finish-diff",
+                    "head_commit": head,
+                },
+            )
+        )
+
+    finished = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "finish-diff-task",
+                "status": "succeeded",
+                "changed_files": ["README.md"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-finish-diff",
+                "fence_token": "fence-finish-diff",
+                "head_commit": head,
+            },
+        )
+    )
+
+    assert finished["ok"] is True
+    assert finished["gate"]["validated_changed_files"] == ["README.md"]
+    assert finished["context"]["head_commit"] == head
+
+
 def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
     queue_id = "mergeq-api-finish-required"
     upsert_branch_context(

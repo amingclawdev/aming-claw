@@ -182,7 +182,11 @@ only through the `mf_sub` contract. An `mf_sub` worker may patch code, run
 tests, inspect diffs, checkpoint, and report blockers inside its assigned
 worktree. It must not merge, push, activate graph refs, release gates, create
 tasks, delete worktrees, or modify merge queues; those remain observer,
-governance, or merge-queue operations.
+governance, or merge-queue operations. Natural-language cwd instructions are
+not enough: the worker result must pass the finish gate, which validates the
+current fence and, when the assigned worktree exists, recomputes the
+`base_commit..HEAD` changed-file set from that worktree before checkpoint or
+merge-queue entry.
 
 Before editing:
 

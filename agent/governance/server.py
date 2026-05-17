@@ -3324,6 +3324,28 @@ def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
             if actual_head and claimed_head and actual_head != claimed_head:
                 raise ValidationError("head_commit does not match assigned worktree HEAD")
             validated_head = actual_head or claimed_head or context.head_commit
+            actual_changed_files: list[str] = []
+            if worktree_path and os.path.exists(worktree_path) and context.base_commit:
+                try:
+                    actual_changed_files = batch_jobs.git_changed_files(
+                        worktree_path,
+                        base_ref=context.base_commit,
+                        head_ref=validated_head or "HEAD",
+                    )
+                except batch_jobs.BatchJobError:
+                    actual_changed_files = []
+            if actual_changed_files:
+                claimed_changed = set(gate.get("changed_files") or [])
+                claimed_changed.update(gate.get("new_files") or [])
+                actual_changed = set(actual_changed_files)
+                if claimed_changed != actual_changed:
+                    missing = sorted(actual_changed - claimed_changed)
+                    extra = sorted(claimed_changed - actual_changed)
+                    raise ValidationError(
+                        "changed_files do not match assigned worktree diff"
+                        f"; missing={missing}; extra={extra}"
+                    )
+                gate["validated_changed_files"] = sorted(actual_changed)
 
             saved = record_branch_finish_gate(
                 conn,

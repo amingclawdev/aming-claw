@@ -559,9 +559,13 @@ Implemented MF subagent finish gate: `POST
 trusted exit for `mf_sub` worker claims. The worker fills a structured result,
 but governance treats it as a claim, validates it against the current branch
 runtime context, fence token, identity fields, and assigned worktree HEAD when
-available, then records a `mf_sub_finish_gate` checkpoint. Merge queue requests
-with `worker_role=mf_sub` or `require_finish_gate=true` must reference that
-validated checkpoint before they can enter the durable queue.
+available. When the assigned worktree exists, governance also recomputes the
+actual `base_commit..HEAD` changed-file set from that worktree and rejects
+subagent `changed_files` claims that do not match. Natural-language cwd
+instructions are not a runtime boundary; this diff validation is required
+before recording a `mf_sub_finish_gate` checkpoint. Merge queue requests with
+`worker_role=mf_sub` or `require_finish_gate=true` must reference that validated
+checkpoint before they can enter the durable queue.
 
 Implemented fenced merge-queue API slice:
 `POST /api/graph-governance/{project_id}/parallel-branches/merge-queue` lets a

@@ -158,6 +158,23 @@ def git_commit(path: str | Path | None = None, ref: str = "HEAD", *, short: bool
     return _git_output(args, cwd=root)
 
 
+def git_changed_files(
+    path: str | Path | None = None,
+    *,
+    base_ref: str,
+    head_ref: str = "HEAD",
+) -> list[str]:
+    """Return files changed between two refs in a repository/worktree."""
+
+    base = str(base_ref or "").strip()
+    head = str(head_ref or "HEAD").strip()
+    if not base:
+        raise BatchJobError("base_ref is required")
+    root = repo_root(path)
+    output = _git_output(["diff", "--name-only", f"{base}..{head}"], cwd=root)
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
 def infer_job_type(task_type: str = "task", metadata: dict[str, Any] | None = None) -> str:
     """Infer job_type without changing task/stage routing."""
     metadata = metadata or {}
