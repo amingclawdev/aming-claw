@@ -6524,3 +6524,83 @@ def test_managed_ref_api_records_merge_then_archives_ref_context(conn, monkeypat
         )
     )
     assert retained["refs"][0]["status"] == "archived"
+
+
+def test_managed_ref_bootstrap_api_dry_run_discovers_git_branches(conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "release/1.x"], cwd=repo, check=True, capture_output=True, text=True)
+    (repo / "release.txt").write_text("release\n", encoding="utf-8")
+    subprocess.run(["git", "add", "release.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "release work"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "-b", "codex/task-1"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True, text=True)
+
+    result = server.handle_graph_governance_managed_ref_bootstrap_dry_run(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "project_root": str(repo),
+                "target_ref": "refs/heads/main",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["discovery"]["source"] == "git_for_each_ref"
+    by_ref = {candidate["ref_name"]: candidate for candidate in result["candidates"]}
+    assert by_ref["refs/heads/main"]["classification"] == "target_ref"
+    assert by_ref["refs/heads/codex/task-1"]["classification"] == "short_lived_agent_ref"
+    release = by_ref["refs/heads/release/1.x"]
+    assert release["classification"] == "managed_ref"
+    assert release["action"] == "import"
+    assert release["ahead_count"] == 1
+    assert release["behind_count"] == 0
+    listed = server.handle_graph_governance_managed_refs(_ctx({"project_id": PID}))
+    assert listed["refs"] == []
+
+
+def test_managed_ref_bootstrap_api_applies_supplied_refs(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+
+    status, payload = server.handle_graph_governance_managed_ref_bootstrap(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "target_ref": "refs/heads/main",
+                "target_head_commit": "M0",
+                "refs": [
+                    {"ref_name": "refs/heads/main", "ref_head_commit": "M0"},
+                    {
+                        "ref_name": "refs/heads/release/1.x",
+                        "ref_head_commit": "R1",
+                        "target_head_commit": "M0",
+                        "merge_base_commit": "B0",
+                    },
+                    {"ref_name": "refs/heads/codex/task-1", "ref_head_commit": "C1"},
+                ],
+                "evidence": {"source": "operator_dry_run_accept"},
+                "now_iso": "2026-05-17T11:20:00Z",
+            },
+        )
+    )
+
+    assert status == 201
+    assert payload["applied_count"] == 1
+    assert payload["skipped_count"] == 2
+    assert payload["refs"][0]["ref_name"] == "refs/heads/release/1.x"
+    listed = server.handle_graph_governance_managed_refs(_ctx({"project_id": PID}))
+    assert listed["refs"][0]["ref_name"] == "refs/heads/release/1.x"
+    assert listed["refs"][0]["evidence"]["source"] == "operator_dry_run_accept"
+    assert listed["decisions"][0]["action"] == "materialize_ref_graph"

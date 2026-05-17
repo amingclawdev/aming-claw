@@ -8,6 +8,7 @@ project identity; they are not modeled as separate projects.
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import sqlite3
 from dataclasses import asdict, dataclass, field
@@ -95,6 +96,56 @@ ACTION_ROLLBACK_REF_MERGE = "rollback_ref_merge"
 ACTION_ARCHIVE_REF_CONTEXT = "archive_ref_context"
 ACTION_NOOP = "noop"
 
+BOOTSTRAP_CLASS_TARGET = "target_ref"
+BOOTSTRAP_CLASS_AGENT = "short_lived_agent_ref"
+BOOTSTRAP_CLASS_MANAGED = "managed_ref"
+BOOTSTRAP_CLASS_IGNORED = "ignored_ref"
+BOOTSTRAP_CLASS_UNMANAGED = "unmanaged_ref"
+BOOTSTRAP_CLASS_BLOCKED = "blocked_ref"
+
+BOOTSTRAP_ACTION_IMPORT = "import"
+BOOTSTRAP_ACTION_REFRESH = "refresh"
+BOOTSTRAP_ACTION_NOOP = "noop"
+BOOTSTRAP_ACTION_SKIP = "skip"
+BOOTSTRAP_ACTION_BLOCKED = "blocked"
+BOOTSTRAP_APPLY_ACTIONS = {BOOTSTRAP_ACTION_IMPORT, BOOTSTRAP_ACTION_REFRESH}
+
+DEFAULT_MANAGED_REF_PATTERNS = (
+    "release/*",
+    "maintenance/*",
+    "hotfix/*",
+    "feature/*",
+    "refs/heads/release/*",
+    "refs/heads/maintenance/*",
+    "refs/heads/hotfix/*",
+    "refs/heads/feature/*",
+    "refs/remotes/*/release/*",
+    "refs/remotes/*/maintenance/*",
+    "refs/remotes/*/hotfix/*",
+    "refs/remotes/*/feature/*",
+)
+DEFAULT_AGENT_REF_PATTERNS = (
+    "codex/*",
+    "agent/*",
+    "refs/heads/codex/*",
+    "refs/heads/agent/*",
+    "refs/remotes/*/codex/*",
+    "refs/remotes/*/agent/*",
+)
+DEFAULT_IGNORED_REF_PATTERNS = (
+    "tmp/*",
+    "wip/*",
+    "scratch/*",
+    "refs/tags/*",
+    "refs/heads/tmp/*",
+    "refs/heads/wip/*",
+    "refs/heads/scratch/*",
+    "refs/remotes/*/HEAD",
+    "refs/remotes/*/tmp/*",
+    "refs/remotes/*/wip/*",
+    "refs/remotes/*/scratch/*",
+)
+
 
 @dataclass(frozen=True)
 class ManagedRefContext:
@@ -141,8 +192,71 @@ class ManagedRefDecision:
         return payload
 
 
+@dataclass(frozen=True)
+class ManagedRefBootstrapCandidate:
+    project_id: str
+    ref_name: str
+    target_ref: str
+    classification: str
+    action: str
+    reason: str
+    raw_ref_name: str = ""
+    ref_head_commit: str = ""
+    target_head_commit: str = ""
+    merge_base_commit: str = ""
+    ahead_count: int = 0
+    behind_count: int = 0
+    existing_status: str = ""
+    blockers: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["blockers"] = list(self.blockers)
+        payload["warnings"] = list(self.warnings)
+        return payload
+
+
+@dataclass(frozen=True)
+class ManagedRefBootstrapPlan:
+    project_id: str
+    target_ref: str
+    target_head_commit: str
+    candidates: tuple[ManagedRefBootstrapCandidate, ...]
+    manage_unmatched_refs: bool = False
+    dry_run: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        candidates = [candidate.to_dict() for candidate in self.candidates]
+        return {
+            "ok": True,
+            "project_id": self.project_id,
+            "target_ref": self.target_ref,
+            "target_head_commit": self.target_head_commit,
+            "dry_run": self.dry_run,
+            "manage_unmatched_refs": self.manage_unmatched_refs,
+            "summary": _bootstrap_summary(self.candidates),
+            "candidates": candidates,
+        }
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_managed_ref_name(ref_name: str) -> str:
+    raw = str(ref_name or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("refs/"):
+        return raw
+    if raw.startswith("heads/") or raw.startswith("remotes/") or raw.startswith("tags/"):
+        return f"refs/{raw}"
+    first = raw.split("/", 1)[0]
+    if first in {"origin", "upstream"}:
+        return f"refs/remotes/{raw}"
+    return f"refs/heads/{raw}"
 
 
 def ensure_managed_ref_schema(conn: sqlite3.Connection) -> None:
@@ -397,6 +511,428 @@ def archive_managed_ref(
     )
 
 
+def build_managed_ref_bootstrap_plan(
+    conn: sqlite3.Connection,
+    project_id: str,
+    refs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    target_ref: str = "refs/heads/main",
+    target_head_commit: str = "",
+    managed_patterns: list[str] | tuple[str, ...] | None = None,
+    agent_patterns: list[str] | tuple[str, ...] | None = None,
+    ignored_patterns: list[str] | tuple[str, ...] | None = None,
+    manage_unmatched_refs: bool = False,
+    evidence: dict[str, Any] | None = None,
+) -> ManagedRefBootstrapPlan:
+    """Plan same-project managed-ref imports for existing branch refs."""
+    ensure_managed_ref_schema(conn)
+    normalized_target = normalize_managed_ref_name(target_ref) or "refs/heads/main"
+    rows = list(refs or [])
+    target_head = str(target_head_commit or "").strip() or _target_head_from_refs(rows, normalized_target)
+    managed = tuple(managed_patterns) if managed_patterns is not None else DEFAULT_MANAGED_REF_PATTERNS
+    agent = tuple(agent_patterns) if agent_patterns is not None else DEFAULT_AGENT_REF_PATTERNS
+    ignored = tuple(ignored_patterns) if ignored_patterns is not None else DEFAULT_IGNORED_REF_PATTERNS
+    shared_evidence = dict(evidence or {})
+    candidates: list[ManagedRefBootstrapCandidate] = []
+    seen: set[str] = set()
+
+    for row in rows:
+        ref_row = row if isinstance(row, dict) else {"ref_name": str(row)}
+        raw_ref = str(ref_row.get("ref_name") or ref_row.get("name") or ref_row.get("branch") or "").strip()
+        ref_name = normalize_managed_ref_name(raw_ref)
+        row_target_ref = normalize_managed_ref_name(str(ref_row.get("target_ref") or normalized_target))
+        ref_head = str(
+            ref_row.get("ref_head_commit")
+            or ref_row.get("head_commit")
+            or ref_row.get("commit")
+            or ref_row.get("sha")
+            or ""
+        ).strip()
+        row_target_head = str(ref_row.get("target_head_commit") or target_head or "").strip()
+        merge_base = str(ref_row.get("merge_base_commit") or "").strip()
+        ahead_count = _int_value(ref_row.get("ahead_count"))
+        behind_count = _int_value(ref_row.get("behind_count"))
+        row_evidence = ref_row.get("evidence") if isinstance(ref_row.get("evidence"), dict) else {}
+        candidate_evidence = {
+            **shared_evidence,
+            **dict(row_evidence),
+            "managed_ref_bootstrap": {
+                "raw_ref_name": raw_ref,
+                "normalized_ref_name": ref_name,
+                "target_ref": row_target_ref,
+            },
+        }
+        blockers: list[str] = []
+        warnings: list[str] = []
+
+        if not ref_name:
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name="",
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                classification=BOOTSTRAP_CLASS_BLOCKED,
+                action=BOOTSTRAP_ACTION_BLOCKED,
+                reason="ref_name_missing",
+                blockers=("ref_name_missing",),
+                evidence=candidate_evidence,
+            ))
+            continue
+        if ref_name in seen:
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name=ref_name,
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                ref_head_commit=ref_head,
+                target_head_commit=row_target_head,
+                merge_base_commit=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                classification=BOOTSTRAP_CLASS_IGNORED,
+                action=BOOTSTRAP_ACTION_SKIP,
+                reason="duplicate_ref",
+                warnings=("duplicate_ref",),
+                evidence=candidate_evidence,
+            ))
+            continue
+        seen.add(ref_name)
+
+        if _same_ref(ref_name, row_target_ref):
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name=ref_name,
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                ref_head_commit=ref_head,
+                target_head_commit=row_target_head,
+                merge_base_commit=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                classification=BOOTSTRAP_CLASS_TARGET,
+                action=BOOTSTRAP_ACTION_SKIP,
+                reason="target_ref",
+                evidence=candidate_evidence,
+            ))
+            continue
+        if _matches_patterns(ref_name, ignored):
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name=ref_name,
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                ref_head_commit=ref_head,
+                target_head_commit=row_target_head,
+                merge_base_commit=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                classification=BOOTSTRAP_CLASS_IGNORED,
+                action=BOOTSTRAP_ACTION_SKIP,
+                reason="ignored_pattern",
+                evidence=candidate_evidence,
+            ))
+            continue
+        if _matches_patterns(ref_name, agent):
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name=ref_name,
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                ref_head_commit=ref_head,
+                target_head_commit=row_target_head,
+                merge_base_commit=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                classification=BOOTSTRAP_CLASS_AGENT,
+                action=BOOTSTRAP_ACTION_SKIP,
+                reason="short_lived_agent_ref",
+                evidence=candidate_evidence,
+            ))
+            continue
+
+        should_manage = manage_unmatched_refs or _matches_patterns(ref_name, managed)
+        if not should_manage:
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name=ref_name,
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                ref_head_commit=ref_head,
+                target_head_commit=row_target_head,
+                merge_base_commit=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                classification=BOOTSTRAP_CLASS_UNMANAGED,
+                action=BOOTSTRAP_ACTION_SKIP,
+                reason="no_managed_pattern_match",
+                evidence=candidate_evidence,
+            ))
+            continue
+
+        if not ref_head:
+            blockers.append("ref_head_missing")
+        if not row_target_head:
+            blockers.append("target_head_missing")
+        if not merge_base:
+            warnings.append("merge_base_unknown")
+
+        existing = get_managed_ref(conn, project_id, ref_name)
+        existing_status = existing.status if existing else ""
+        if existing and existing.status in TERMINAL_STATES:
+            blockers.append("existing_ref_context_terminal")
+        if blockers:
+            candidates.append(_bootstrap_candidate(
+                project_id,
+                ref_name=ref_name,
+                target_ref=row_target_ref,
+                raw_ref_name=raw_ref,
+                ref_head_commit=ref_head,
+                target_head_commit=row_target_head,
+                merge_base_commit=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                existing_status=existing_status,
+                classification=BOOTSTRAP_CLASS_BLOCKED,
+                action=BOOTSTRAP_ACTION_BLOCKED,
+                reason=";".join(blockers),
+                blockers=tuple(blockers),
+                warnings=tuple(warnings),
+                evidence=candidate_evidence,
+            ))
+            continue
+
+        action = BOOTSTRAP_ACTION_IMPORT
+        reason = "new_managed_ref"
+        if existing:
+            if (
+                existing.target_ref == row_target_ref
+                and existing.ref_head_commit == ref_head
+                and existing.target_head_commit == row_target_head
+                and existing.merge_base_commit == merge_base
+            ):
+                action = BOOTSTRAP_ACTION_NOOP
+                reason = "managed_ref_current"
+            else:
+                action = BOOTSTRAP_ACTION_REFRESH
+                reason = "managed_ref_changed"
+
+        candidates.append(_bootstrap_candidate(
+            project_id,
+            ref_name=ref_name,
+            target_ref=row_target_ref,
+            raw_ref_name=raw_ref,
+            ref_head_commit=ref_head,
+            target_head_commit=row_target_head,
+            merge_base_commit=merge_base,
+            ahead_count=ahead_count,
+            behind_count=behind_count,
+            existing_status=existing_status,
+            classification=BOOTSTRAP_CLASS_MANAGED,
+            action=action,
+            reason=reason,
+            warnings=tuple(warnings),
+            evidence=candidate_evidence,
+        ))
+
+    return ManagedRefBootstrapPlan(
+        project_id=project_id,
+        target_ref=normalized_target,
+        target_head_commit=target_head,
+        candidates=tuple(candidates),
+        manage_unmatched_refs=manage_unmatched_refs,
+        dry_run=True,
+    )
+
+
+def apply_managed_ref_bootstrap_plan(
+    conn: sqlite3.Connection,
+    plan: ManagedRefBootstrapPlan,
+    *,
+    actor: str = "observer",
+    now_iso: str = "",
+) -> dict[str, Any]:
+    """Persist import/refresh candidates from a managed-ref bootstrap plan."""
+    ensure_managed_ref_schema(conn)
+    applied: list[ManagedRefContext] = []
+    skipped: list[dict[str, Any]] = []
+    for candidate in plan.candidates:
+        if candidate.action not in BOOTSTRAP_APPLY_ACTIONS:
+            skipped.append(candidate.to_dict())
+            continue
+
+        existing = get_managed_ref(conn, plan.project_id, candidate.ref_name)
+        previous = managed_ref_to_dict(existing) if existing else {}
+        status = STATE_IMPORTED if candidate.action == BOOTSTRAP_ACTION_IMPORT else STATE_STALE
+        evidence = dict(existing.evidence) if existing else {}
+        evidence.update(candidate.evidence)
+        evidence["managed_ref_bootstrap"] = {
+            **dict(evidence.get("managed_ref_bootstrap") or {}),
+            "action": candidate.action,
+            "reason": candidate.reason,
+            "ahead_count": candidate.ahead_count,
+            "behind_count": candidate.behind_count,
+        }
+        if previous:
+            evidence["managed_ref_bootstrap"]["previous_ref_head_commit"] = previous.get("ref_head_commit", "")
+            evidence["managed_ref_bootstrap"]["previous_target_head_commit"] = previous.get("target_head_commit", "")
+
+        base = previous if previous else {
+            "project_id": plan.project_id,
+            "ref_name": candidate.ref_name,
+            "target_ref": candidate.target_ref,
+        }
+        saved = upsert_managed_ref(
+            conn,
+            ManagedRefContext(
+                **{
+                    **base,
+                    "target_ref": candidate.target_ref,
+                    "ref_type": "long_lived",
+                    "merge_base_commit": candidate.merge_base_commit,
+                    "ref_head_commit": candidate.ref_head_commit,
+                    "target_head_commit": candidate.target_head_commit,
+                    "validated_target_head": candidate.target_head_commit,
+                    "snapshot_id": "" if candidate.action == BOOTSTRAP_ACTION_REFRESH else base.get("snapshot_id", ""),
+                    "projection_id": "" if candidate.action == BOOTSTRAP_ACTION_REFRESH else base.get("projection_id", ""),
+                    "merge_preview_id": "",
+                    "merge_queue_id": "",
+                    "merge_commit": "",
+                    "status": status,
+                    "evidence": evidence,
+                }
+            ),
+            actor=actor,
+            operation_type=f"bootstrap_{candidate.action}",
+            now_iso=now_iso,
+        )
+        applied.append(saved)
+
+    return {
+        "ok": True,
+        "project_id": plan.project_id,
+        "target_ref": plan.target_ref,
+        "target_head_commit": plan.target_head_commit,
+        "applied_count": len(applied),
+        "skipped_count": len(skipped),
+        "refs": [managed_ref_to_dict(ref) for ref in applied],
+        "skipped": skipped,
+        "plan": {
+            **plan.to_dict(),
+            "dry_run": False,
+        },
+    }
+
+
+def _bootstrap_candidate(
+    project_id: str,
+    *,
+    ref_name: str,
+    target_ref: str,
+    raw_ref_name: str,
+    classification: str,
+    action: str,
+    reason: str,
+    ref_head_commit: str = "",
+    target_head_commit: str = "",
+    merge_base_commit: str = "",
+    ahead_count: int = 0,
+    behind_count: int = 0,
+    existing_status: str = "",
+    blockers: tuple[str, ...] = (),
+    warnings: tuple[str, ...] = (),
+    evidence: dict[str, Any] | None = None,
+) -> ManagedRefBootstrapCandidate:
+    return ManagedRefBootstrapCandidate(
+        project_id=project_id,
+        ref_name=ref_name,
+        target_ref=target_ref,
+        classification=classification,
+        action=action,
+        reason=reason,
+        raw_ref_name=raw_ref_name,
+        ref_head_commit=ref_head_commit,
+        target_head_commit=target_head_commit,
+        merge_base_commit=merge_base_commit,
+        ahead_count=ahead_count,
+        behind_count=behind_count,
+        existing_status=existing_status,
+        blockers=blockers,
+        warnings=warnings,
+        evidence=dict(evidence or {}),
+    )
+
+
+def _bootstrap_summary(candidates: tuple[ManagedRefBootstrapCandidate, ...]) -> dict[str, Any]:
+    by_action: dict[str, int] = {}
+    by_classification: dict[str, int] = {}
+    for candidate in candidates:
+        by_action[candidate.action] = by_action.get(candidate.action, 0) + 1
+        by_classification[candidate.classification] = by_classification.get(candidate.classification, 0) + 1
+    return {
+        "candidate_count": len(candidates),
+        "by_action": by_action,
+        "by_classification": by_classification,
+        "apply_count": sum(1 for candidate in candidates if candidate.action in BOOTSTRAP_APPLY_ACTIONS),
+        "blocked_count": sum(1 for candidate in candidates if candidate.action == BOOTSTRAP_ACTION_BLOCKED),
+    }
+
+
+def _target_head_from_refs(refs: list[dict[str, Any]], target_ref: str) -> str:
+    for row in refs:
+        if not isinstance(row, dict):
+            continue
+        ref_name = normalize_managed_ref_name(
+            str(row.get("ref_name") or row.get("name") or row.get("branch") or "")
+        )
+        if _same_ref(ref_name, target_ref):
+            return str(
+                row.get("ref_head_commit")
+                or row.get("head_commit")
+                or row.get("target_head_commit")
+                or row.get("commit")
+                or row.get("sha")
+                or ""
+            ).strip()
+    return ""
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _same_ref(left: str, right: str) -> bool:
+    left_aliases = _ref_aliases(left)
+    right_aliases = _ref_aliases(right)
+    return bool(left_aliases & right_aliases)
+
+
+def _matches_patterns(ref_name: str, patterns: tuple[str, ...]) -> bool:
+    aliases = _ref_aliases(ref_name)
+    return any(
+        fnmatch.fnmatchcase(alias, pattern)
+        for alias in aliases
+        for pattern in patterns
+    )
+
+
+def _ref_aliases(ref_name: str) -> set[str]:
+    normalized = normalize_managed_ref_name(ref_name)
+    aliases = {normalized} if normalized else set()
+    if normalized.startswith("refs/heads/"):
+        aliases.add(normalized.removeprefix("refs/heads/"))
+    elif normalized.startswith("refs/remotes/"):
+        rest = normalized.removeprefix("refs/remotes/")
+        aliases.add(rest)
+        if "/" in rest:
+            aliases.add(rest.split("/", 1)[1])
+    elif normalized.startswith("refs/tags/"):
+        aliases.add(normalized.removeprefix("refs/tags/"))
+    return {alias for alias in aliases if alias}
+
+
 def decide_managed_ref(
     context: ManagedRefContext,
     *,
@@ -424,6 +960,10 @@ def decide_managed_ref(
     elif target_moved:
         decision_state = STATE_STALE
         blockers.append("target_ref_moved")
+        next_actions.append("recompute_ref_graph_against_target")
+        action = ACTION_RECOMPUTE_REF_CONTEXT
+    elif observed_status == STATE_STALE:
+        blockers.append("stale_ref_context")
         next_actions.append("recompute_ref_graph_against_target")
         action = ACTION_RECOMPUTE_REF_CONTEXT
     elif observed_status == STATE_IMPORTED or not context.snapshot_id:

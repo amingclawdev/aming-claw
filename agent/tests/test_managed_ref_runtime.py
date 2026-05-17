@@ -19,7 +19,9 @@ from agent.governance.managed_ref_runtime import (
     STATE_STALE,
     STATE_TRACKED,
     ManagedRefContext,
+    apply_managed_ref_bootstrap_plan,
     archive_managed_ref,
+    build_managed_ref_bootstrap_plan,
     decide_managed_ref,
     decide_project_deletion_guard,
     ensure_managed_ref_schema,
@@ -228,3 +230,187 @@ def test_archive_rejects_unmerged_tracked_ref() -> None:
 
     with pytest.raises(ValueError, match="cannot be archived"):
         archive_managed_ref(conn, PID, saved.ref_name)
+
+
+def test_managed_ref_bootstrap_dry_run_classifies_existing_branches() -> None:
+    conn = _conn()
+
+    plan = build_managed_ref_bootstrap_plan(
+        conn,
+        PID,
+        [
+            {"ref_name": "refs/heads/main", "ref_head_commit": "M0"},
+            {"ref_name": "refs/heads/codex/task-1", "ref_head_commit": "C1"},
+            {
+                "ref_name": "refs/heads/release/1.x",
+                "ref_head_commit": "R1",
+                "target_head_commit": "M0",
+                "merge_base_commit": "B0",
+                "ahead_count": 2,
+                "behind_count": 1,
+            },
+            {
+                "ref_name": "refs/heads/feature/large-refactor",
+                "ref_head_commit": "F1",
+                "target_head_commit": "M0",
+                "merge_base_commit": "B0",
+            },
+            {"ref_name": "refs/tags/v1.0.0", "ref_head_commit": "T1"},
+            {"ref_name": "refs/heads/topic/random", "ref_head_commit": "X1"},
+            {"ref_name": "refs/heads/release/no-head", "target_head_commit": "M0"},
+        ],
+        target_ref="refs/heads/main",
+        target_head_commit="M0",
+    )
+
+    by_ref = {candidate.ref_name: candidate for candidate in plan.candidates}
+    assert by_ref["refs/heads/main"].classification == "target_ref"
+    assert by_ref["refs/heads/main"].action == "skip"
+    assert by_ref["refs/heads/codex/task-1"].classification == "short_lived_agent_ref"
+    assert by_ref["refs/heads/release/1.x"].classification == "managed_ref"
+    assert by_ref["refs/heads/release/1.x"].action == "import"
+    assert by_ref["refs/heads/release/1.x"].ahead_count == 2
+    assert by_ref["refs/heads/feature/large-refactor"].action == "import"
+    assert by_ref["refs/tags/v1.0.0"].classification == "ignored_ref"
+    assert by_ref["refs/heads/topic/random"].classification == "unmanaged_ref"
+    assert by_ref["refs/heads/release/no-head"].action == "blocked"
+    assert by_ref["refs/heads/release/no-head"].blockers == ("ref_head_missing",)
+    assert plan.to_dict()["summary"]["apply_count"] == 2
+
+
+def test_managed_ref_bootstrap_apply_persists_imports_only() -> None:
+    conn = _conn()
+    plan = build_managed_ref_bootstrap_plan(
+        conn,
+        PID,
+        [
+            {"ref_name": "refs/heads/main", "ref_head_commit": "M0"},
+            {
+                "ref_name": "refs/heads/release/1.x",
+                "ref_head_commit": "R1",
+                "target_head_commit": "M0",
+                "merge_base_commit": "B0",
+                "ahead_count": 3,
+            },
+            {"ref_name": "refs/heads/codex/task-1", "ref_head_commit": "C1"},
+        ],
+        target_ref="refs/heads/main",
+        target_head_commit="M0",
+        evidence={"source": "project_import"},
+    )
+
+    result = apply_managed_ref_bootstrap_plan(
+        conn,
+        plan,
+        actor="test",
+        now_iso="2026-05-17T11:00:00Z",
+    )
+
+    assert result["applied_count"] == 1
+    assert result["skipped_count"] == 2
+    saved = get_managed_ref(conn, PID, "refs/heads/release/1.x")
+    assert saved is not None
+    assert saved.status == STATE_IMPORTED
+    assert saved.project_id == PID
+    assert saved.ref_head_commit == "R1"
+    assert saved.target_head_commit == "M0"
+    assert saved.evidence["source"] == "project_import"
+    assert saved.evidence["managed_ref_bootstrap"]["action"] == "import"
+    assert get_managed_ref(conn, PID, "refs/heads/codex/task-1") is None
+
+
+def test_managed_ref_bootstrap_refresh_marks_existing_context_stale() -> None:
+    conn = _conn()
+    upsert_managed_ref(
+        conn,
+        ManagedRefContext(
+            project_id=PID,
+            ref_name="refs/heads/release/1.x",
+            target_ref="refs/heads/main",
+            merge_base_commit="B0",
+            ref_head_commit="R1",
+            target_head_commit="M0",
+            validated_target_head="M0",
+            snapshot_id="scope-release-old",
+            projection_id="semproj-release-old",
+            status=STATE_TRACKED,
+        ),
+        now_iso=NOW,
+    )
+
+    plan = build_managed_ref_bootstrap_plan(
+        conn,
+        PID,
+        [
+            {
+                "ref_name": "refs/heads/release/1.x",
+                "ref_head_commit": "R2",
+                "target_head_commit": "M1",
+                "merge_base_commit": "B1",
+            }
+        ],
+        target_ref="refs/heads/main",
+        target_head_commit="M1",
+    )
+
+    candidate = plan.candidates[0]
+    assert candidate.action == "refresh"
+    assert candidate.existing_status == STATE_TRACKED
+
+    result = apply_managed_ref_bootstrap_plan(
+        conn,
+        plan,
+        now_iso="2026-05-17T11:10:00Z",
+    )
+
+    assert result["applied_count"] == 1
+    saved = get_managed_ref(conn, PID, "refs/heads/release/1.x")
+    assert saved is not None
+    assert saved.status == STATE_STALE
+    assert saved.ref_head_commit == "R2"
+    assert saved.target_head_commit == "M1"
+    assert saved.snapshot_id == ""
+    assert saved.projection_id == ""
+    assert saved.evidence["managed_ref_bootstrap"]["action"] == "refresh"
+    assert saved.evidence["managed_ref_bootstrap"]["previous_ref_head_commit"] == "R1"
+    decision = decide_managed_ref(saved, current_target_head="M1")
+    assert decision.action == ACTION_RECOMPUTE_REF_CONTEXT
+    assert decision.blockers == ("stale_ref_context",)
+
+
+def test_managed_ref_bootstrap_noops_current_existing_context() -> None:
+    conn = _conn()
+    upsert_managed_ref(
+        conn,
+        ManagedRefContext(
+            project_id=PID,
+            ref_name="refs/heads/feature/large-refactor",
+            target_ref="refs/heads/main",
+            merge_base_commit="B0",
+            ref_head_commit="F1",
+            target_head_commit="M0",
+            status=STATE_IMPORTED,
+        ),
+        now_iso=NOW,
+    )
+
+    plan = build_managed_ref_bootstrap_plan(
+        conn,
+        PID,
+        [
+            {
+                "ref_name": "feature/large-refactor",
+                "ref_head_commit": "F1",
+                "target_head_commit": "M0",
+                "merge_base_commit": "B0",
+            }
+        ],
+        target_ref="main",
+        target_head_commit="M0",
+    )
+
+    assert plan.candidates[0].ref_name == "refs/heads/feature/large-refactor"
+    assert plan.candidates[0].action == "noop"
+    result = apply_managed_ref_bootstrap_plan(conn, plan)
+    assert result["applied_count"] == 0
+    assert result["skipped_count"] == 1

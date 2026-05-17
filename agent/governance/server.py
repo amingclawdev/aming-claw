@@ -2905,6 +2905,52 @@ def _query_statuses(query: dict, key: str = "status") -> list[str]:
     return [str(value).strip() for value in values if str(value).strip()]
 
 
+def _body_bool(body: dict, key: str, default: bool = False) -> bool:
+    value = body.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _body_string_list(body: dict, key: str) -> list[str] | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(part).strip() for part in value if str(part).strip()]
+    raise ValidationError(f"{key} must be a list or comma-separated string")
+
+
+def _managed_ref_bootstrap_refs_from_body(project_id: str, body: dict) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    refs = body.get("refs")
+    target_ref = str(body.get("target_ref") or "refs/heads/main")
+    if refs is not None:
+        if not isinstance(refs, list):
+            raise ValidationError("refs must be a list when provided")
+        rows = [row if isinstance(row, dict) else {"ref_name": str(row)} for row in refs]
+        return rows, {
+            "source": "request_body",
+            "ref_count": len(rows),
+            "target_ref": target_ref,
+            "target_head_commit": str(body.get("target_head_commit") or ""),
+        }
+
+    root = _graph_governance_project_root(project_id, body)
+    include_remotes = _body_bool(body, "include_remotes", False)
+    target_head_commit = str(body.get("target_head_commit") or "").strip()
+    rows, discovery = _git_managed_ref_bootstrap_rows(
+        root,
+        target_ref=target_ref,
+        target_head_commit=target_head_commit,
+        include_remotes=include_remotes,
+    )
+    return rows, discovery
+
+
 def _require_graph_governance_operator(ctx: RequestContext, conn, action: str) -> dict:
     session = ctx.require_auth(conn)
     role = session.get("role", "")
@@ -3768,6 +3814,80 @@ def handle_graph_governance_managed_refs(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/managed-refs/bootstrap/dry-run")
+def handle_graph_governance_managed_ref_bootstrap_dry_run(ctx: RequestContext):
+    """Dry-run same-project managed-ref bootstrap for existing branch refs."""
+    project_id = ctx.get_project_id()
+    from .managed_ref_runtime import build_managed_ref_bootstrap_plan
+
+    body = ctx.body
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.managed-refs.bootstrap.dry-run")
+        refs, discovery = _managed_ref_bootstrap_refs_from_body(project_id, body)
+        plan = build_managed_ref_bootstrap_plan(
+            conn,
+            project_id,
+            refs,
+            target_ref=str(body.get("target_ref") or "refs/heads/main"),
+            target_head_commit=str(body.get("target_head_commit") or discovery.get("target_head_commit") or ""),
+            managed_patterns=_body_string_list(body, "managed_patterns"),
+            agent_patterns=_body_string_list(body, "agent_patterns"),
+            ignored_patterns=_body_string_list(body, "ignored_patterns"),
+            manage_unmatched_refs=_body_bool(body, "manage_unmatched_refs", False),
+            evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+        )
+        return {
+            **plan.to_dict(),
+            "discovery": discovery,
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/managed-refs/bootstrap")
+def handle_graph_governance_managed_ref_bootstrap(ctx: RequestContext):
+    """Persist managed-ref bootstrap import/refresh actions."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .managed_ref_runtime import (
+        apply_managed_ref_bootstrap_plan,
+        build_managed_ref_bootstrap_plan,
+    )
+
+    body = ctx.body
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.managed-refs.bootstrap")
+        refs, discovery = _managed_ref_bootstrap_refs_from_body(project_id, body)
+        plan = build_managed_ref_bootstrap_plan(
+            conn,
+            project_id,
+            refs,
+            target_ref=str(body.get("target_ref") or "refs/heads/main"),
+            target_head_commit=str(body.get("target_head_commit") or discovery.get("target_head_commit") or ""),
+            managed_patterns=_body_string_list(body, "managed_patterns"),
+            agent_patterns=_body_string_list(body, "agent_patterns"),
+            ignored_patterns=_body_string_list(body, "ignored_patterns"),
+            manage_unmatched_refs=_body_bool(body, "manage_unmatched_refs", False),
+            evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+        )
+        with sqlite_write_lock():
+            result = apply_managed_ref_bootstrap_plan(
+                conn,
+                plan,
+                actor=str(body.get("actor") or "api"),
+                now_iso=str(body.get("now_iso") or ""),
+            )
+            conn.commit()
+        return 201, {
+            **result,
+            "discovery": discovery,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/managed-refs")
 def handle_graph_governance_managed_ref_upsert(ctx: RequestContext):
     """Create or update a same-project managed ref context."""
@@ -4210,6 +4330,84 @@ def _git_refs_for_root(project_root: Path) -> dict[str, Any]:
         "tags": tags,
         "is_git_repo": bool(head_commit),
     }
+
+
+def _git_managed_ref_bootstrap_rows(
+    project_root: Path,
+    *,
+    target_ref: str,
+    target_head_commit: str = "",
+    include_remotes: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Discover branch refs and code-distance evidence for managed-ref bootstrap."""
+    from .managed_ref_runtime import normalize_managed_ref_name
+
+    normalized_target = normalize_managed_ref_name(target_ref) or "refs/heads/main"
+    target_head = target_head_commit or _git_output(
+        project_root,
+        ["rev-parse", "--verify", f"{normalized_target}^{{commit}}"],
+    )
+    namespaces = ["refs/heads"]
+    if include_remotes:
+        namespaces.append("refs/remotes")
+    raw = _git_output(
+        project_root,
+        ["for-each-ref", "--format=%(refname)%00%(objectname)", *namespaces],
+        timeout=10,
+    )
+    rows: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip() or "\x00" not in line:
+            continue
+        ref_name, ref_head = line.split("\x00", 1)
+        ref_name = ref_name.strip()
+        ref_head = ref_head.strip()
+        if not ref_name or ref_name.endswith("/HEAD"):
+            continue
+        merge_base = ""
+        ahead_count = 0
+        behind_count = 0
+        if target_head:
+            merge_base = _git_output(project_root, ["merge-base", normalized_target, ref_name], timeout=10)
+            counts = _git_output(
+                project_root,
+                ["rev-list", "--left-right", "--count", f"{normalized_target}...{ref_name}"],
+                timeout=10,
+            )
+            behind_count, ahead_count = _parse_git_ahead_behind(counts)
+        rows.append({
+            "ref_name": ref_name,
+            "ref_head_commit": ref_head,
+            "target_ref": normalized_target,
+            "target_head_commit": target_head,
+            "merge_base_commit": merge_base,
+            "ahead_count": ahead_count,
+            "behind_count": behind_count,
+            "evidence": {
+                "source": "git_for_each_ref",
+                "project_root": str(project_root),
+                "include_remotes": include_remotes,
+            },
+        })
+    return rows, {
+        "source": "git_for_each_ref",
+        "project_root": str(project_root),
+        "target_ref": normalized_target,
+        "target_head_commit": target_head,
+        "include_remotes": include_remotes,
+        "ref_count": len(rows),
+        "is_git_repo": bool(raw),
+    }
+
+
+def _parse_git_ahead_behind(raw: str) -> tuple[int, int]:
+    parts = str(raw or "").split()
+    if len(parts) < 2:
+        return 0, 0
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return 0, 0
 
 
 def _git_ref_exists(project_root: Path, ref_name: str) -> bool:

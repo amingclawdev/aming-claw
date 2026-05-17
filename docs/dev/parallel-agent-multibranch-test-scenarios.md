@@ -140,6 +140,7 @@ Task fixture:
 | PB-011 | Branch graph artifact isolation | Branch-local graph artifacts are produced before merge. | Store branch artifacts as one-hop candidate evidence from the target graph; do not chain branch candidates or mutate active target graph refs until target scope reconcile after merge. | Implemented for graph ref/projection candidate read model and one-hop artifact policy. | `test_graph_rollback_epoch.py`, `test_batch_jobs.py` |
 | PB-012 | Multi-project and batch isolation | Two projects or batches reuse task IDs and branch slugs. | Runtime keys include project, batch, branch/ref, and attempt identity; no task, queue, pending scope, graph, or semantic row crosses boundaries. | Implemented for branch context and merge queue scope; graph/semantic isolation still depends on I3/I4. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py` |
 | PB-013 | Existing long-lived ref governance | A project import discovers release and feature branches that already have many commits. | Keep one project identity; create managed ref contexts; detect target movement as stale; merge code through target reconcile; archive source ref context instead of deleting a project. | Implemented as SQLite managed-ref runtime, decision oracle, and governance API; dashboard wiring remains pending. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
+| PB-014 | Managed ref bootstrap/import | Operator imports an already-branched repository. | Dry-run classifies target, short-lived agent, managed, ignored, unmanaged, and blocked refs; apply only creates/refreshes managed ref contexts in the same project and never activates branch-local graph truth. | Implemented for supplied refs and git branch discovery through governance API. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
 
 ## Immediate Test Slice
 
@@ -259,5 +260,9 @@ Required rollback assertions:
   can carry ref-local snapshot/projection pointers, but merge still updates code
   first and then reconciles the target ref; project deletion is blocked until
   unresolved managed refs are archived or abandoned.
+- Existing branch import must go through managed-ref bootstrap dry-run before
+  apply. Dry-run classifications are part of the operator evidence, and refresh
+  clears stale graph/preview pointers rather than treating old branch graph
+  state as target truth.
 - Backlog and dashboard queries must stay compact by default; detailed state
   should be fetched by ID.

@@ -99,6 +99,10 @@ Keep one project identity and use a managed ref context for each governed ref.
 Managed refs may carry ref-local snapshot/projection pointers, but merges still
 update code first and then reconcile the target ref. After merge, archive the
 source ref context; do not delete the project as a substitute for ref cleanup.
+When importing an already-branched project, run managed-ref bootstrap dry-run
+first, review the target/agent/managed/ignored/unmanaged/blocked classification,
+then apply only the accepted managed refs. Refreshing an existing managed ref
+marks it stale and requires recomputation against target graph truth.
 
 ## Current Workspace Not Registered
 

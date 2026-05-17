@@ -224,6 +224,12 @@ project_id = repo/workspace identity
 
 Rules:
 
+- Import existing branches through managed-ref bootstrap dry-run first. The
+  dry-run classifies refs as target, short-lived agent, managed, ignored,
+  unmanaged, or blocked before anything is written.
+- Applying a managed-ref bootstrap creates or refreshes `managed_ref_contexts`
+  only. It must not create new project identities and must not activate a
+  branch-local graph snapshot as target graph truth.
 - Short-lived agent branches use one-hop candidate evidence.
 - Existing long-lived refs may have ref-local current graph/projection pointers,
   but those pointers are scoped to the ref context and are not target graph
@@ -242,6 +248,11 @@ Rules:
 The minimum durable state for a managed ref is source ref, target ref, merge
 base, source head, target head, source snapshot/projection pointers, merge
 preview, merge queue id, rollback epoch, archive policy, status, and evidence.
+
+Managed-ref bootstrap records source/target heads, merge base, ahead/behind
+counts, classification reason, and operator evidence. Refreshing an existing
+managed ref marks the context stale and clears branch-local graph/preview
+pointers so the next step must recompute against current target graph truth.
 
 ## MergeQueueRuntime
 

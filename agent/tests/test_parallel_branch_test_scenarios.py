@@ -24,6 +24,7 @@ REQUIRED_SCENARIOS = {
     "PB-011": "Branch graph artifact isolation",
     "PB-012": "Multi-project and batch isolation",
     "PB-013": "Existing long-lived ref governance",
+    "PB-014": "Managed ref bootstrap/import",
 }
 
 REQUIRED_ORACLE_DIMENSIONS = [
@@ -105,3 +106,10 @@ def test_existing_long_lived_refs_are_not_modeled_as_new_projects(doc_text: str)
     assert "Keep one project identity" in doc_text
     assert "create managed ref contexts" in normalized
     assert "archive source ref context instead of deleting a project" in normalized
+
+
+def test_managed_ref_bootstrap_requires_dry_run_classification(doc_text: str) -> None:
+    normalized = " ".join(doc_text.split())
+    assert "Managed ref bootstrap/import" in doc_text
+    assert "Dry-run classifies target, short-lived agent, managed, ignored, unmanaged, and blocked refs" in doc_text
+    assert "managed-ref bootstrap dry-run before apply" in normalized
