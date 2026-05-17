@@ -24,6 +24,7 @@ if _repo_root not in sys.path:
 
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
+    build_rebase_candidate_graph,
     find_test_coverage,
     find_doc_coverage,
     diff_against_existing_graph,
@@ -201,6 +202,82 @@ class TestCoverageLookup:
         assert "agent/tests/test_managerhttpserver_spawn.py" in compact_files
         assert "agent/tests/test_unrelated.py" not in import_files
         assert "agent/tests/test_unrelated.py" not in compact_files
+
+    def test_graph_attaches_src_layout_test_consumer_fanin(self):
+        project = _make_temp_project({
+            "src/mypkg/service.py": "def run():\n    return 1\n",
+            "tests/test_core.py": (
+                "from mypkg.service import run\n\n"
+                "def test_run():\n"
+                "    assert run() == 1\n"
+            ),
+        })
+
+        result = build_graph_v2_from_symbols(project, dry_run=True)
+        service_node = next(
+            node for node in result["nodes"]
+            if node["module"] == "src.mypkg.service"
+        )
+        test_files = {
+            os.path.relpath(path, project).replace(os.sep, "/")
+            for path in service_node["test_coverage"]["test_files"]
+        }
+
+        assert "tests/test_core.py" in test_files
+        assert service_node["test_coverage"]["fan_in_evidence"] == [{
+            "path": "tests/test_core.py",
+            "evidence": "test_import_fanin",
+            "imports": ["mypkg.service.run"],
+        }]
+        assert all(node["module"] != "tests.test_core" for node in result["nodes"])
+
+        rows = {row["path"]: row for row in result["file_inventory"]}
+        assert rows["tests/test_core.py"]["file_kind"] == "test"
+        assert rows["tests/test_core.py"]["scan_status"] == "secondary_attached"
+        candidate = build_rebase_candidate_graph(
+            project,
+            result,
+            session_id="test-fanin",
+            run_id=result["run_id"],
+        )
+        graph_node = next(
+            node for node in candidate["deps_graph"]["nodes"]
+            if node["layer"] == "L7" and node["title"] == "src.mypkg.service"
+        )
+        assert graph_node["test"] == ["tests/test_core.py"]
+        assert graph_node["metadata"]["test_consumer_fanin"] == [{
+            "path": "tests/test_core.py",
+            "evidence": "test_import_fanin",
+            "imports": ["mypkg.service.run"],
+        }]
+
+    def test_test_consumer_fanin_skips_ambiguous_source_root_alias(self):
+        project = _make_temp_project({
+            "src/mypkg/service.py": "def run():\n    return 1\n",
+            "lib/mypkg/service.py": "def run():\n    return 2\n",
+            "tests/test_core.py": (
+                "from mypkg.service import run\n\n"
+                "def test_run():\n"
+                "    assert run() in {1, 2}\n"
+            ),
+        })
+
+        result = build_graph_v2_from_symbols(project, dry_run=True)
+        service_nodes = [
+            node for node in result["nodes"]
+            if node["module"] in {"src.mypkg.service", "lib.mypkg.service"}
+        ]
+        assert len(service_nodes) == 2
+        for node in service_nodes:
+            rel_tests = {
+                os.path.relpath(path, project).replace(os.sep, "/")
+                for path in node["test_coverage"]["test_files"]
+            }
+            assert "tests/test_core.py" not in rel_tests
+            assert node["test_coverage"].get("fan_in_evidence") in (None, [])
+
+        rows = {row["path"]: row for row in result["file_inventory"]}
+        assert rows["tests/test_core.py"]["scan_status"] == "orphan"
 
     def test_ac5_find_doc_coverage(self):
         """AC5: find_doc_coverage returns doc_files list + covered_lines int."""

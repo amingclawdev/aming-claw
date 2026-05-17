@@ -1311,6 +1311,199 @@ def _repo_relpath(project_root: str, path: str) -> str:
     return rel.strip("/")
 
 
+def _module_token_from_relpath(rel_path: str) -> str:
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    if not rel:
+        return ""
+    token = DEFAULT_LANGUAGE_POLICY.strip_source_suffix(rel)
+    if token.endswith("/__init__"):
+        token = token[:-9]
+    return token.replace("/", ".").strip(".")
+
+
+def _source_root_aliases(rel_path: str, profile: Any) -> Set[str]:
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    aliases: Set[str] = set()
+    for raw_root in getattr(profile, "source_roots", []) or []:
+        root = str(raw_root or "").replace("\\", "/").strip("/")
+        if root in {"", "."}:
+            continue
+        prefix = f"{root}/"
+        if rel.startswith(prefix):
+            alias = _module_token_from_relpath(rel[len(prefix):])
+            if alias:
+                aliases.add(alias)
+    return aliases
+
+
+def _module_aliases_for_source(
+    project_root: str,
+    module: ModuleInfo,
+    profile: Any,
+) -> Set[str]:
+    rel = _repo_relpath(project_root, module.path)
+    aliases = {
+        str(module.module_name or "").strip("."),
+        _module_token_from_relpath(rel),
+    }
+    aliases.update(_source_root_aliases(rel, profile))
+    return {alias for alias in aliases if alias}
+
+
+def _production_module_alias_index(
+    project_root: str,
+    modules: Dict[str, ModuleInfo],
+    profile: Any,
+) -> Dict[str, Set[str]]:
+    alias_to_modules: Dict[str, Set[str]] = {}
+    for module_name, module in sorted((modules or {}).items()):
+        for alias in _module_aliases_for_source(project_root, module, profile):
+            alias_to_modules.setdefault(alias, set()).add(module_name)
+    return alias_to_modules
+
+
+def _resolve_import_token_to_unique_module(
+    token: str,
+    alias_to_modules: Dict[str, Set[str]],
+) -> str:
+    normalized = str(token or "").replace("\\", "/").strip().strip(".")
+    if not normalized:
+        return ""
+    normalized = DEFAULT_LANGUAGE_POLICY.strip_source_suffix(normalized).replace("/", ".").strip(".")
+    while normalized:
+        module_names = alias_to_modules.get(normalized)
+        if module_names:
+            if len(module_names) == 1:
+                return next(iter(module_names))
+            return ""
+        if "." not in normalized:
+            return ""
+        normalized = normalized.rsplit(".", 1)[0]
+    return ""
+
+
+def _iter_test_source_files(project_root: str, profile: Any) -> List[Tuple[str, str]]:
+    files: List[Tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        kept_dirs = []
+        for dirname in dirnames:
+            rel_dir = _repo_relpath(project_root, os.path.join(dirpath, dirname))
+            if profile.is_excluded_path(rel_dir) or profile.is_doc_path(rel_dir):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+        for fname in filenames:
+            if not DEFAULT_LANGUAGE_POLICY.is_source_path(fname):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            rel = _repo_relpath(project_root, fpath)
+            if profile.is_excluded_path(rel) or profile.is_doc_path(rel):
+                continue
+            if profile.is_test_path(rel):
+                files.append((rel, fpath))
+    return files
+
+
+def _test_import_tokens(project_root: str, test_file: str, source: str) -> Set[str]:
+    adapter = _adapter_for_source_file(test_file)
+    imports = _safe_adapter_imports(adapter, test_file, source)
+    tokens: Set[str] = set()
+    for row in imports:
+        imported = str(row.get("imported") or "").strip()
+        specifier = str(row.get("specifier") or "").strip()
+        if imported:
+            tokens.add(imported)
+        if specifier:
+            tokens.add(specifier)
+            tokens.add(_resolve_source_import(project_root, test_file, specifier))
+    return {token for token in tokens if token}
+
+
+def build_test_consumer_fanin_index(
+    project_root: str,
+    modules: Dict[str, ModuleInfo],
+    profile: Optional[Any] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Map production modules to tests that import them as downstream consumers."""
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    alias_to_modules = _production_module_alias_index(project_root, modules, profile)
+    if not alias_to_modules:
+        return {}
+
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    for rel, fpath in _iter_test_source_files(project_root, profile):
+        try:
+            source = _read_file(fpath)
+        except (UnicodeDecodeError, OSError):
+            continue
+        module_hits: Dict[str, Set[str]] = {}
+        for token in _test_import_tokens(project_root, fpath, source):
+            module_name = _resolve_import_token_to_unique_module(token, alias_to_modules)
+            if module_name:
+                module_hits.setdefault(module_name, set()).add(token)
+        for module_name, tokens in sorted(module_hits.items()):
+            index.setdefault(module_name, []).append({
+                "path": fpath,
+                "rel_path": rel,
+                "evidence": "test_import_fanin",
+                "imports": sorted(tokens),
+                "covered_lines": source.count("\n"),
+            })
+    for entries in index.values():
+        entries.sort(key=lambda item: str(item.get("rel_path") or item.get("path") or ""))
+    return index
+
+
+def _merge_test_consumer_fanin(
+    project_root: str,
+    coverage: Dict[str, Any],
+    entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not entries:
+        return coverage
+    merged = dict(coverage or {})
+    files = list(merged.get("test_files") or [])
+    seen = {_repo_relpath(project_root, path) for path in files}
+    covered_lines = int(merged.get("covered_lines") or 0)
+    fan_in_evidence = list(merged.get("fan_in_evidence") or [])
+    for entry in entries:
+        path = str(entry.get("path") or "")
+        rel = _repo_relpath(project_root, entry.get("rel_path") or path)
+        if path and rel not in seen:
+            files.append(path)
+            seen.add(rel)
+            covered_lines += int(entry.get("covered_lines") or 0)
+        fan_in_evidence.append({
+            "path": rel,
+            "evidence": entry.get("evidence") or "test_import_fanin",
+            "imports": list(entry.get("imports") or []),
+        })
+    merged["test_files"] = files
+    merged["covered_lines"] = covered_lines
+    merged["fan_in_evidence"] = fan_in_evidence
+    return merged
+
+
+def _attach_test_consumer_fanin_to_nodes(
+    project_root: str,
+    nodes: List[Dict[str, Any]],
+    fanin_index: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    if not fanin_index:
+        return
+    for node in nodes:
+        module_name = str(node.get("module") or node.get("node_id") or "")
+        entries = fanin_index.get(module_name) or []
+        if entries:
+            node["test_coverage"] = _merge_test_consumer_fanin(
+                project_root,
+                node.get("test_coverage") or {"test_files": [], "covered_lines": 0},
+                entries,
+            )
+
+
 def _module_from_qname(qname: str) -> str:
     return qname.split("::", 1)[0] if "::" in qname else ""
 
@@ -2884,6 +3077,7 @@ def build_rebase_candidate_graph(
                 "function_called_by_count": node.get("function_called_by_count", 0),
                 "function_weak_call_count": node.get("function_weak_call_count", 0),
                 "config_files": sorted({p for p in config_files if p}),
+                "test_consumer_fanin": (node.get("test_coverage") or {}).get("fan_in_evidence") or [],
                 "architecture_signals": node.get("architecture_signals") or {},
                 "typed_relations": node.get("typed_relations") or [],
             },
@@ -3975,6 +4169,12 @@ def build_graph_v2_from_symbols(
 
     nodes = aggregate_functions_into_nodes(modules, layer_scores)
 
+    test_consumer_fanin = build_test_consumer_fanin_index(
+        project_root,
+        modules,
+        profile=profile,
+    )
+
     # Step 3: PR3 — coverage lookup
     for node in nodes:
         pf = node.get("primary_file", "")
@@ -3982,6 +4182,7 @@ def build_graph_v2_from_symbols(
         doc_cov = find_doc_coverage(project_root, pf, profile=profile)
         node["test_coverage"] = test_cov
         node["doc_coverage"] = doc_cov
+    _attach_test_consumer_fanin_to_nodes(project_root, nodes, test_consumer_fanin)
 
     feature_clusters = synthesize_feature_clusters(
         project_root=project_root,
@@ -3996,6 +4197,7 @@ def build_graph_v2_from_symbols(
     ]
     fallback_nodes = append_filetree_fallback_source_nodes(project_root, nodes, profile=profile)
     all_fallback_nodes = adapter_fallback_nodes + fallback_nodes
+    _attach_test_consumer_fanin_to_nodes(project_root, all_fallback_nodes, test_consumer_fanin)
     if all_fallback_nodes:
         feature_clusters.extend(_fallback_feature_clusters(all_fallback_nodes))
         feature_clusters.sort(key=lambda c: c.get("cluster_fingerprint", ""))
