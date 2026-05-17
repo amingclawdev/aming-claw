@@ -518,7 +518,8 @@ The smallest runtime slice is one backlog row in one isolated worktree:
 ```text
 allocate branch/worktree
 -> run implementation
--> checkpoint
+-> finish gate
+-> validated checkpoint
 -> branch-local scope/graph evidence
 -> queue merge
 -> merge gate
@@ -553,12 +554,22 @@ evidence, blockers, checkpoint, and merge-queue readiness. It cannot merge,
 push, activate graph refs, release gates, create tasks, delete worktrees, or
 modify merge queues.
 
+Implemented MF subagent finish gate: `POST
+/api/graph-governance/{project_id}/parallel-branches/finish-gate` is the only
+trusted exit for `mf_sub` worker claims. The worker fills a structured result,
+but governance treats it as a claim, validates it against the current branch
+runtime context, fence token, identity fields, and assigned worktree HEAD when
+available, then records a `mf_sub_finish_gate` checkpoint. Merge queue requests
+with `worker_role=mf_sub` or `require_finish_gate=true` must reference that
+validated checkpoint before they can enter the durable queue.
+
 Implemented fenced merge-queue API slice:
 `POST /api/graph-governance/{project_id}/parallel-branches/merge-queue` lets a
 branch runtime context enter the durable merge queue without direct client DB
-writes. The route enforces the current branch fence token, writes dependency
-and graph/projection evidence into `parallel_branch_merge_queue_items`, updates
-the branch context status and `merge_queue_id`, and returns the replayed merge
+writes. The route enforces the current branch fence token, requires a validated
+finish-gate checkpoint for `mf_sub` worker entries, writes dependency and
+graph/projection evidence into `parallel_branch_merge_queue_items`, updates the
+branch context status and `merge_queue_id`, and returns the replayed merge
 queue decision plan. It still performs no target-branch mutation.
 
 Implemented batch rollback planning API slice:

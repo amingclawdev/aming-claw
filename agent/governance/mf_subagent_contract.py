@@ -11,6 +11,8 @@ from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 MF_SUB_ROLE = "mf_sub"
 INPUT_SCHEMA_VERSION = "mf_subagent_input.v1"
 RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
+FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
+FINISH_GATE_REPLAY_SOURCE = "mf_sub_finish_gate"
 BACKEND_CONTRACT = "parallel_branch_worker.v1"
 
 MF_SUB_ALLOWED_CAPABILITIES = (
@@ -57,6 +59,15 @@ _FORBIDDEN_RESULT_FLAGS = {
     "task_created": "create_task",
     "worktree_deleted": "delete_worktree",
 }
+_FINISH_IDENTITY_FIELDS = (
+    "project_id",
+    "task_id",
+    "backlog_id",
+    "branch_ref",
+    "worktree_path",
+    "base_commit",
+    "target_head_commit",
+)
 
 
 class MfSubagentContractError(ValueError):
@@ -218,4 +229,64 @@ def normalize_mf_subagent_result(
         "blockers": blockers,
         "summary": str(payload.get("summary") or ""),
         "evidence": _mapping(payload.get("evidence"), field_name="evidence"),
+    }
+
+
+def validate_mf_subagent_finish_gate(
+    payload: Mapping[str, Any],
+    *,
+    context: BranchTaskRuntimeContext,
+) -> dict[str, Any]:
+    """Validate a subagent finish claim against durable branch runtime facts.
+
+    The subagent payload is a claim. This function only returns evidence that
+    matches the current runtime context and is ready to become a checkpoint.
+    """
+
+    _require_context(context)
+    normalized = normalize_mf_subagent_result(
+        payload,
+        expected_fence_token=context.fence_token,
+    )
+    if not normalized["merge_queue_ready"]:
+        raise MfSubagentContractError("MF subagent finish gate is not merge-queue ready")
+
+    identity_mismatches: list[str] = []
+    for field in _FINISH_IDENTITY_FIELDS:
+        claimed = str(payload.get(field) or "")
+        expected = str(getattr(context, field) or "")
+        if claimed and expected and claimed != expected:
+            identity_mismatches.append(field)
+    if identity_mismatches:
+        raise MfSubagentContractError(
+            "MF subagent finish gate identity mismatch: "
+            + ", ".join(sorted(identity_mismatches))
+        )
+
+    claimed_head = str(payload.get("head_commit") or payload.get("branch_head") or "")
+    checkpoint_id = str(normalized.get("checkpoint_id") or "").strip()
+    if not checkpoint_id:
+        raise MfSubagentContractError("checkpoint_id is required")
+
+    return {
+        "schema_version": FINISH_GATE_SCHEMA_VERSION,
+        "role": MF_SUB_ROLE,
+        "project_id": context.project_id,
+        "task_id": context.task_id,
+        "backlog_id": context.backlog_id,
+        "branch_ref": context.branch_ref,
+        "worktree_path": context.worktree_path,
+        "base_commit": context.base_commit,
+        "target_head_commit": context.target_head_commit,
+        "head_commit": claimed_head or context.head_commit,
+        "checkpoint_id": checkpoint_id,
+        "fence_token": context.fence_token,
+        "replay_source": FINISH_GATE_REPLAY_SOURCE,
+        "changed_files": normalized["changed_files"],
+        "new_files": normalized["new_files"],
+        "test_results": normalized["test_results"],
+        "blockers": normalized["blockers"],
+        "summary": normalized["summary"],
+        "evidence": normalized["evidence"],
+        "merge_queue_ready": True,
     }

@@ -3284,6 +3284,82 @@ def handle_graph_governance_parallel_branch_checkpoint(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/finish-gate")
+def handle_graph_governance_parallel_branch_finish_gate(ctx: RequestContext):
+    """Validate an mf_sub worker finish claim and record a checkpoint."""
+    project_id = ctx.get_project_id()
+    from . import batch_jobs
+    from .db import sqlite_write_lock
+    from .mf_subagent_contract import (
+        FINISH_GATE_REPLAY_SOURCE,
+        validate_mf_subagent_finish_gate,
+    )
+    from .parallel_branch_runtime import (
+        branch_context_to_dict,
+        get_branch_context,
+        record_branch_finish_gate,
+    )
+
+    task_id = str(ctx.body.get("task_id") or "").strip()
+    if not task_id:
+        raise ValidationError("task_id is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.finish-gate")
+        with sqlite_write_lock():
+            context = get_branch_context(conn, project_id, task_id)
+            if context is None:
+                raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+
+            gate = validate_mf_subagent_finish_gate(ctx.body, context=context)
+            claimed_head = str(gate.get("head_commit") or "").strip()
+            actual_head = ""
+            worktree_path = str(context.worktree_path or "")
+            if worktree_path and os.path.exists(worktree_path):
+                try:
+                    actual_head = batch_jobs.git_commit(worktree_path)
+                except batch_jobs.BatchJobError:
+                    actual_head = ""
+            if actual_head and claimed_head and actual_head != claimed_head:
+                raise ValidationError("head_commit does not match assigned worktree HEAD")
+            validated_head = actual_head or claimed_head or context.head_commit
+
+            saved = record_branch_finish_gate(
+                conn,
+                project_id=project_id,
+                task_id=task_id,
+                checkpoint_id=str(gate["checkpoint_id"]),
+                fence_token=str(gate["fence_token"]),
+                head_commit=validated_head,
+                replay_source=FINISH_GATE_REPLAY_SOURCE,
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            gate["validated_head_commit"] = saved.head_commit
+            gate["runtime_status"] = saved.status
+            try:
+                audit_service.record(
+                    conn,
+                    project_id,
+                    "mf_subagent.finish_gate_passed",
+                    actor=str(ctx.body.get("agent_id") or ctx.body.get("actor") or "mf_subagent"),
+                    task_id=task_id,
+                    bug_id=saved.backlog_id,
+                    checkpoint_id=saved.checkpoint_id,
+                )
+            except Exception:
+                pass
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "gate": gate,
+            "context": branch_context_to_dict(saved),
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-queue")
 def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
     """Enter one branch runtime context into the durable merge queue."""
@@ -3327,6 +3403,11 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 validated_target_head=str(ctx.body.get("validated_target_head") or ""),
                 validation_attempt=_query_int(ctx.body, "validation_attempt", 0),
                 merge_preview_id=str(ctx.body.get("merge_preview_id") or ""),
+                checkpoint_id=str(ctx.body.get("checkpoint_id") or ""),
+                require_finish_gate=(
+                    _query_bool(ctx.body, "require_finish_gate", False)
+                    or str(ctx.body.get("worker_role") or "") == "mf_sub"
+                ),
                 now_iso=str(ctx.body.get("now_iso") or ""),
             )
             decision = decide_persisted_merge_queue(

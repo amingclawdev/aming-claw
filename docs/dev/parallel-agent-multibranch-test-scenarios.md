@@ -142,7 +142,7 @@ Task fixture:
 | PB-012 | Multi-project and batch isolation | Two projects or batches reuse task IDs and branch slugs. | Runtime keys include project, batch, branch/ref, and attempt identity; no task, queue, pending scope, graph, or semantic row crosses boundaries. | Implemented for branch context and merge queue scope; graph/semantic isolation still depends on I3/I4. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py` |
 | PB-013 | Existing long-lived ref governance | A project import discovers release and feature branches that already have many commits. | Keep one project identity; create managed ref contexts; detect target movement as stale; merge code through target reconcile; archive source ref context instead of deleting a project. | Implemented as SQLite managed-ref runtime, decision oracle, and governance API; dashboard wiring remains pending. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
 | PB-014 | Managed ref bootstrap/import | Operator imports an already-branched repository. | Dry-run classifies target, short-lived agent, managed, ignored, unmanaged, and blocked refs; apply only creates/refreshes managed ref contexts in the same project and never activates branch-local graph truth. | Implemented for supplied refs and git branch discovery through governance API. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
-| PB-015 | MF subagent backend contract | Observer delegates one branch implementation to a Codex subagent while executor remains offline. | Build an `mf_sub` payload from `BranchTaskRuntimeContext`; require backlog, worktree, branch, target head, attempt, and fence identity; normalize only checkpoint/test/change evidence into merge-queue readiness; reject stale fences and merge/push/graph activation attempts. | Implemented as backend-neutral contract helpers and a dedicated role profile; live subagent spawning remains operator-driven. | `test_mf_subagent_contract.py`, `test_role_config.py` |
+| PB-015 | MF subagent backend contract | Observer delegates one branch implementation to a Codex subagent while executor remains offline. | Build an `mf_sub` payload from `BranchTaskRuntimeContext`; require backlog, worktree, branch, target head, attempt, and fence identity; normalize only checkpoint/test/change evidence into merge-queue readiness; reject stale fences and merge/push/graph activation attempts. | Implemented as backend-neutral contract helpers, finish-gate checkpoint validation, and merge-queue checkpoint enforcement; live subagent spawning remains operator-driven. | `test_mf_subagent_contract.py`, `test_graph_governance_api.py`, `test_role_config.py` |
 
 ## Immediate Test Slice
 
@@ -268,8 +268,10 @@ Required rollback assertions:
   clears stale graph/preview pointers rather than treating old branch graph
   state as target truth.
 - MF subagents are branch workers, not merge workers. Their contract can
-  report checkpoint, changed files, tests, blockers, and readiness; merge,
-  push, graph activation, release gates, task creation, and worktree cleanup
-  remain owner-controlled operations.
+  report checkpoint, changed files, tests, blockers, and readiness; those
+  fields are claims until the finish gate validates them and records a
+  `mf_sub_finish_gate` checkpoint. Merge queue requires that checkpoint for
+  `mf_sub` entries. Merge, push, graph activation, release gates, task
+  creation, and worktree cleanup remain owner-controlled operations.
 - Backlog and dashboard queries must stay compact by default; detailed state
   should be fetched by ID.

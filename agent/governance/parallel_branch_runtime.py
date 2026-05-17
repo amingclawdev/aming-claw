@@ -1480,6 +1480,51 @@ def record_branch_checkpoint(
     return found
 
 
+def record_branch_finish_gate(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    checkpoint_id: str,
+    fence_token: str,
+    head_commit: str = "",
+    replay_source: str = "mf_sub_finish_gate",
+    now_iso: str = "",
+) -> BranchTaskRuntimeContext:
+    """Record a validated MF subagent finish-gate checkpoint."""
+    ensure_branch_runtime_schema(conn)
+    context = get_branch_context(conn, project_id, task_id)
+    if context is None:
+        raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
+    _require_current_fence(context, fence_token)
+    now = now_iso or utc_now()
+    next_head = str(head_commit or context.head_commit or "").strip()
+    conn.execute(
+        """
+        UPDATE parallel_branch_runtime_contexts
+        SET checkpoint_id = ?,
+            replay_source = ?,
+            head_commit = ?,
+            status = ?,
+            updated_at = ?
+        WHERE project_id = ? AND task_id = ?
+        """,
+        (
+            checkpoint_id,
+            replay_source,
+            next_head,
+            STATE_VALIDATED,
+            now,
+            project_id,
+            task_id,
+        ),
+    )
+    found = get_branch_context(conn, project_id, task_id)
+    if found is None:
+        raise RuntimeError(f"branch runtime context disappeared: {project_id}/{task_id}")
+    return found
+
+
 def recover_expired_branch_contexts(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1737,6 +1782,8 @@ def queue_merge_item_for_branch_context(
     validated_target_head: str = "",
     validation_attempt: int = 0,
     merge_preview_id: str = "",
+    checkpoint_id: str = "",
+    require_finish_gate: bool = False,
     now_iso: str = "",
 ) -> dict[str, Any]:
     """Persist a fenced merge queue request for one branch runtime context."""
@@ -1749,6 +1796,14 @@ def queue_merge_item_for_branch_context(
         raise KeyError(f"branch runtime context not found: {project_id}/{task_id}")
     if context.fence_token or fence_token:
         _require_current_fence(context, fence_token)
+    if require_finish_gate:
+        expected_checkpoint = str(checkpoint_id or "").strip()
+        if not expected_checkpoint:
+            raise ValueError("checkpoint_id is required when require_finish_gate is true")
+        if context.checkpoint_id != expected_checkpoint:
+            raise ValueError("checkpoint_id does not match the validated finish gate")
+        if context.replay_source != "mf_sub_finish_gate":
+            raise ValueError("validated mf_sub finish gate checkpoint is required")
 
     item = MergeQueueItem(
         project_id=project_id,

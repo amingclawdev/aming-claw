@@ -17,6 +17,7 @@ from agent.governance import server
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
+from agent.governance.mf_subagent_contract import MfSubagentContractError
 from agent.governance.parallel_branch_runtime import (
     BATCH_STATE_OPEN,
     BranchRuntimeFenceError,
@@ -440,6 +441,160 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
     )
     assert read["read_model"]["merge_queue"]["blocked_task_ids"] == ["queue-task"]
     assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
+
+
+def test_parallel_branch_finish_gate_records_validated_checkpoint(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id="PB-api-finish",
+            task_id="finish-task",
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/finish-task",
+            status="worktree_ready",
+            fence_token="fence-finish-current",
+            worktree_path="/tmp/nonexistent-finish-task",
+            base_commit="base-finish",
+            head_commit="base-finish",
+            target_head_commit="target-finish",
+        ),
+        now_iso="2026-05-17T07:30:00Z",
+    )
+
+    finished = server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "project_id": PID,
+                "task_id": "finish-task",
+                "backlog_id": "FEAT-FINISH-GATE",
+                "branch_ref": "refs/heads/codex/finish-task",
+                "worktree_path": "/tmp/nonexistent-finish-task",
+                "base_commit": "base-finish",
+                "target_head_commit": "target-finish",
+                "head_commit": "head-finish",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed", "command": "pytest -q"},
+                "checkpoint_id": "ckpt-finish-gate",
+                "fence_token": "fence-finish-current",
+                "agent_id": "codex-subagent-1",
+                "now_iso": "2026-05-17T07:31:00Z",
+            },
+        )
+    )
+
+    assert finished["ok"] is True
+    assert finished["gate"]["checkpoint_id"] == "ckpt-finish-gate"
+    assert finished["gate"]["validated_head_commit"] == "head-finish"
+    assert finished["context"]["checkpoint_id"] == "ckpt-finish-gate"
+    assert finished["context"]["replay_source"] == "mf_sub_finish_gate"
+    assert finished["context"]["status"] == "validated"
+    assert finished["context"]["head_commit"] == "head-finish"
+
+
+def test_parallel_branch_finish_gate_rejects_stale_fence(conn):
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="finish-stale-task",
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/finish-stale-task",
+            status="worktree_ready",
+            fence_token="fence-current",
+            worktree_path="/tmp/nonexistent-finish-stale-task",
+            base_commit="base",
+            target_head_commit="target",
+        ),
+        now_iso="2026-05-17T07:30:00Z",
+    )
+
+    with pytest.raises(MfSubagentContractError, match="stale"):
+        server.handle_graph_governance_parallel_branch_finish_gate(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "finish-stale-task",
+                    "status": "succeeded",
+                    "changed_files": ["agent/governance/server.py"],
+                    "test_results": {"status": "passed"},
+                    "checkpoint_id": "ckpt-stale",
+                    "fence_token": "fence-old",
+                },
+            )
+        )
+
+
+def test_mf_sub_merge_queue_requires_finish_gate_checkpoint(conn):
+    queue_id = "mergeq-api-finish-required"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            task_id="mf-sub-queue-task",
+            backlog_id="FEAT-FINISH-GATE",
+            branch_ref="refs/heads/codex/mf-sub-queue-task",
+            status="worktree_ready",
+            fence_token="fence-mf-sub",
+            worktree_path="/tmp/nonexistent-mf-sub-queue-task",
+            base_commit="base",
+            head_commit="head",
+            target_head_commit="target",
+        ),
+        now_iso="2026-05-17T07:32:00Z",
+    )
+
+    with pytest.raises(ValueError, match="checkpoint_id is required"):
+        server.handle_graph_governance_parallel_branch_merge_queue(
+            _ctx(
+                {"project_id": PID},
+                method="POST",
+                body={
+                    "task_id": "mf-sub-queue-task",
+                    "merge_queue_id": queue_id,
+                    "worker_role": "mf_sub",
+                    "fence_token": "fence-mf-sub",
+                },
+            )
+        )
+
+    server.handle_graph_governance_parallel_branch_finish_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "mf-sub-queue-task",
+                "status": "succeeded",
+                "changed_files": ["agent/governance/server.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-mf-sub",
+                "fence_token": "fence-mf-sub",
+                "head_commit": "head",
+            },
+        )
+    )
+
+    queued = server.handle_graph_governance_parallel_branch_merge_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "task_id": "mf-sub-queue-task",
+                "merge_queue_id": queue_id,
+                "worker_role": "mf_sub",
+                "checkpoint_id": "ckpt-mf-sub",
+                "fence_token": "fence-mf-sub",
+            },
+        )
+    )
+
+    assert queued["ok"] is True
+    assert queued["context"]["status"] == "queued_for_merge"
+    assert queued["context"]["checkpoint_id"] == "ckpt-mf-sub"
 
 
 def test_parallel_branch_merge_gate_route_returns_dry_run_plan(conn):

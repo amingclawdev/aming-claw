@@ -14,11 +14,14 @@ if str(_repo_root) not in sys.path:
 
 from agent.governance.mf_subagent_contract import (
     BACKEND_CONTRACT,
+    FINISH_GATE_REPLAY_SOURCE,
+    FINISH_GATE_SCHEMA_VERSION,
     MF_SUB_FORBIDDEN_ACTIONS,
     MF_SUB_ROLE,
     MfSubagentContractError,
     build_mf_subagent_input,
     normalize_mf_subagent_result,
+    validate_mf_subagent_finish_gate,
 )
 from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
@@ -158,3 +161,61 @@ def test_normalize_result_blocks_merge_queue_when_tests_fail() -> None:
 
     assert normalized["merge_queue_ready"] is False
     assert normalized["blockers"] == ["test failure"]
+
+
+def test_finish_gate_returns_validated_checkpoint_evidence() -> None:
+    gate = validate_mf_subagent_finish_gate(
+        {
+            "project_id": "aming-claw",
+            "task_id": "task-mf-sub-1",
+            "backlog_id": "ARCH-MF-SUBAGENT-BACKEND",
+            "branch_ref": "refs/heads/codex/task-mf-sub-1",
+            "worktree_path": "/tmp/aming-claw-wt/task-mf-sub-1",
+            "base_commit": "base123",
+            "target_head_commit": "target123",
+            "head_commit": "head456",
+            "status": "succeeded",
+            "changed_files": ["agent/governance/mf_subagent_contract.py"],
+            "test_results": {"status": "passed", "command": "pytest -q"},
+            "checkpoint_id": "ckpt-finish",
+            "fence_token": "fence-2",
+            "summary": "Ready.",
+        },
+        context=_context(),
+    )
+
+    assert gate["schema_version"] == FINISH_GATE_SCHEMA_VERSION
+    assert gate["checkpoint_id"] == "ckpt-finish"
+    assert gate["head_commit"] == "head456"
+    assert gate["replay_source"] == FINISH_GATE_REPLAY_SOURCE
+    assert gate["merge_queue_ready"] is True
+
+
+def test_finish_gate_rejects_identity_mismatch() -> None:
+    with pytest.raises(MfSubagentContractError, match="identity mismatch"):
+        validate_mf_subagent_finish_gate(
+            {
+                "project_id": "other-project",
+                "status": "succeeded",
+                "changed_files": ["x.py"],
+                "test_results": {"status": "passed"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+            },
+            context=_context(),
+        )
+
+
+def test_finish_gate_rejects_not_ready_result() -> None:
+    with pytest.raises(MfSubagentContractError, match="not merge-queue ready"):
+        validate_mf_subagent_finish_gate(
+            {
+                "status": "succeeded",
+                "changed_files": ["x.py"],
+                "test_results": {"status": "failed"},
+                "checkpoint_id": "ckpt-finish",
+                "fence_token": "fence-2",
+                "blockers": ["tests failed"],
+            },
+            context=_context(),
+        )
