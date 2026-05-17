@@ -4359,6 +4359,7 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
                 "feedback_queue": {"items": [], "groups": [], "count": 0},
                 "semantic_jobs": {"jobs": [], "summary": {}},
                 "semantic_projection": {"projection_id": "", "health": {}},
+                "graph_structure_hints": _empty_graph_structure_hint_projection(),
                 "commit_timeline": {"commits": [], "count": 0},
             }
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
@@ -4388,6 +4389,8 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
         )
         projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
         summary = store.summarize_graph_snapshot(conn, project_id, snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+        graph_structure_hints = _graph_structure_hint_projection_from_snapshot(snapshot)
         current_state = _dashboard_current_state(
             conn,
             project_id,
@@ -4446,6 +4449,7 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
                 "base_commit": projection.get("base_commit", ""),
                 "health": projection.get("health", {}),
             },
+            "graph_structure_hints": graph_structure_hints,
             "commit_timeline": {
                 "commits": commits,
                 "count": len(commits),
@@ -4459,6 +4463,7 @@ def handle_graph_governance_dashboard_active_bundle(ctx: RequestContext):
                 "semantic_jobs": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/jobs",
                 "semantic_projection": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/projection",
                 "feedback_queue": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/queue",
+                "graph_structure_hints": f"/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-hints",
             },
         }
     finally:
@@ -5512,6 +5517,81 @@ def handle_graph_governance_snapshot_summary(ctx: RequestContext):
         except KeyError as exc:
             _raise_graph_api_validation(exc)
         return {"ok": True, **summary}
+    finally:
+        conn.close()
+
+
+def _empty_graph_structure_hint_projection() -> dict:
+    return {
+        "status": "ok",
+        "hint_count": 0,
+        "materialized_count": 0,
+        "conflict_count": 0,
+        "hint_states": {},
+        "suppressed_edges": [],
+        "has_projection_notes": False,
+    }
+
+
+def _graph_structure_hint_projection_from_snapshot(snapshot: dict) -> dict:
+    raw_notes = snapshot.get("notes") if isinstance(snapshot, dict) else ""
+    notes = {}
+    if isinstance(raw_notes, str) and raw_notes.strip():
+        try:
+            decoded = json.loads(raw_notes)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = {}
+        if isinstance(decoded, dict):
+            notes = decoded
+    elif isinstance(raw_notes, dict):
+        notes = raw_notes
+    report = notes.get("graph_structure_hint_projection") if isinstance(notes, dict) else {}
+    if not isinstance(report, dict):
+        report = {}
+    out = _empty_graph_structure_hint_projection()
+    out.update({
+        "status": str(report.get("status") or out["status"]),
+        "hint_count": int(report.get("hint_count") or 0),
+        "materialized_count": int(report.get("materialized_count") or 0),
+        "conflict_count": int(report.get("conflict_count") or 0),
+        "hint_states": report.get("hint_states") if isinstance(report.get("hint_states"), dict) else {},
+        "suppressed_edges": report.get("suppressed_edges") if isinstance(report.get("suppressed_edges"), list) else [],
+        "has_projection_notes": "graph_structure_hint_projection" in notes,
+    })
+    return out
+
+
+@route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-hints")
+def handle_graph_governance_snapshot_graph_structure_hints(ctx: RequestContext):
+    """Return source-hint graph projection status recorded on a graph snapshot."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    from . import graph_snapshot_store as store
+    from .errors import ValidationError
+
+    conn = get_connection(project_id)
+    try:
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+        if not snapshot:
+            raise ValidationError(f"graph snapshot not found: {snapshot_id}")
+        projection = _graph_structure_hint_projection_from_snapshot(snapshot)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "commit_sha": snapshot.get("commit_sha", ""),
+            "snapshot_status": snapshot.get("status", ""),
+            "snapshot_kind": snapshot.get("snapshot_kind", ""),
+            "created_at": snapshot.get("created_at", ""),
+            "projection": projection,
+            "status": projection["status"],
+            "hint_count": projection["hint_count"],
+            "materialized_count": projection["materialized_count"],
+            "conflict_count": projection["conflict_count"],
+            "hint_states": projection["hint_states"],
+            "suppressed_edges": projection["suppressed_edges"],
+        }
     finally:
         conn.close()
 

@@ -173,6 +173,88 @@ def _graph_with_dependency() -> dict:
     return graph
 
 
+def test_graph_structure_hint_projection_api_returns_snapshot_notes(conn):
+    notes = {
+        "graph_structure_hint_projection": {
+            "status": "conflict",
+            "hint_count": 2,
+            "materialized_count": 1,
+            "conflict_count": 1,
+            "hint_states": {
+                "hint-ok": {"status": "materialized"},
+                "hint-stale": {"status": "conflict", "last_error": "target_node_missing"},
+            },
+            "suppressed_edges": [
+                {"src": "tests/test_service.py", "dst": "L7.old", "edge_type": "tests"}
+            ],
+        }
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="hint-projection-api",
+        commit_sha="hintcommit",
+        snapshot_kind="scope",
+        graph_json=_graph(),
+        notes=json.dumps(notes, sort_keys=True),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=_graph()["deps_graph"]["nodes"],
+        edges=_graph()["deps_graph"]["edges"],
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+
+    report = server.handle_graph_governance_snapshot_graph_structure_hints(
+        _ctx({"project_id": PID, "snapshot_id": "active"})
+    )
+
+    assert report["ok"] is True
+    assert report["snapshot_id"] == "hint-projection-api"
+    assert report["commit_sha"] == "hintcommit"
+    assert report["status"] == "conflict"
+    assert report["hint_count"] == 2
+    assert report["materialized_count"] == 1
+    assert report["conflict_count"] == 1
+    assert report["hint_states"]["hint-stale"]["last_error"] == "target_node_missing"
+    assert report["suppressed_edges"] == [
+        {"src": "tests/test_service.py", "dst": "L7.old", "edge_type": "tests"}
+    ]
+
+    bundle = server.handle_graph_governance_dashboard_active_bundle(
+        _ctx({"project_id": PID}, query={"snapshot_id": "active"})
+    )
+    assert bundle["graph_structure_hints"]["status"] == "conflict"
+    assert bundle["endpoints"]["graph_structure_hints"].endswith(
+        "/snapshots/hint-projection-api/graph-structure-hints"
+    )
+
+
+def test_graph_structure_hint_projection_api_defaults_when_notes_are_absent(conn):
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="hint-projection-empty",
+        commit_sha="emptycommit",
+        snapshot_kind="full",
+        graph_json=_graph(),
+    )
+    store.activate_graph_snapshot(conn, PID, snapshot["snapshot_id"])
+
+    report = server.handle_graph_governance_snapshot_graph_structure_hints(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+
+    assert report["ok"] is True
+    assert report["status"] == "ok"
+    assert report["hint_count"] == 0
+    assert report["materialized_count"] == 0
+    assert report["conflict_count"] == 0
+    assert report["projection"]["has_projection_notes"] is False
+
+
 def test_parallel_branch_read_model_route_returns_durable_runtime_state(conn):
     batch_id = "PB-010-api"
     queue_id = "mergeq-PB010-api"
