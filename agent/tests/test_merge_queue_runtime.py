@@ -361,6 +361,54 @@ def test_pb003_persisted_merge_queue_rehydrates_stale_validation_after_restart(t
     )
 
 
+def test_persisted_merge_queue_marks_supplied_target_head_drift(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime.db")
+    conn = _runtime_conn(db_path)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-target-drift",
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/T1",
+                queue_index=1,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+                branch_head="head-T1",
+                validated_target_head="target-before",
+                current_target_head="target-before",
+                merge_preview_id="preview-before",
+            )
+        ],
+        now_iso="2026-05-17T09:10:00Z",
+    )
+    conn.commit()
+
+    plan = decide_persisted_merge_queue(
+        conn,
+        PROJECT_ID,
+        "mergeq-target-drift",
+        target_ref=TARGET_REF,
+        current_target_head="target-after",
+        scenario_id="PB-target-drift",
+    )
+    decision = plan.decisions[0]
+
+    assert plan.mergeable_task_ids == ()
+    assert plan.stale_task_ids == ("T1",)
+    assert decision.queue_state == STATE_STALE_AFTER_DEPENDENCY_MERGE
+    assert decision.stale_target_head is True
+    assert decision.merge_allowed is False
+    assert decision.next_actions == (
+        "rebase_or_sync",
+        "run_scope_reconcile",
+        "verify_semantic_projection",
+        "refresh_merge_preview",
+    )
+
+
 def test_merge_queue_dashboard_rows_are_deterministic_and_reviewable() -> None:
     items = [
         MergeQueueItem(

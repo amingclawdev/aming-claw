@@ -3006,6 +3006,28 @@ def _raise_graph_api_conflict(exc: Exception):
     raise GovernanceError("graph_snapshot_conflict", str(exc), 409) from exc
 
 
+def _parallel_branch_current_target_head(
+    project_id: str,
+    source: dict,
+    *,
+    target_ref: str = "",
+) -> str:
+    provided = str(
+        source.get("current_target_head")
+        or source.get("latest_target_head")
+        or ""
+    ).strip()
+    if provided:
+        return provided
+    if not _query_bool(source, "resolve_current_target_head", False):
+        return ""
+    ref = str(target_ref or source.get("target_ref") or "refs/heads/main").strip()
+    if not ref:
+        return ""
+    root = _graph_governance_project_root(project_id, source)
+    return _git_output(root, ["rev-parse", "--verify", ref])
+
+
 def _resolve_graph_snapshot_id(conn, project_id: str, snapshot_id: str) -> str:
     if snapshot_id and snapshot_id != "active":
         return snapshot_id
@@ -3179,6 +3201,7 @@ def handle_graph_governance_parallel_branches(ctx: RequestContext):
     project_id = ctx.get_project_id()
     from .parallel_branch_runtime import build_parallel_branch_read_model_from_db
 
+    target_ref = str(ctx.query.get("target_ref") or "")
     conn = get_connection(project_id)
     try:
         model = build_parallel_branch_read_model_from_db(
@@ -3186,7 +3209,12 @@ def handle_graph_governance_parallel_branches(ctx: RequestContext):
             project_id=project_id,
             batch_id=str(ctx.query.get("batch_id") or ""),
             merge_queue_id=str(ctx.query.get("merge_queue_id") or ""),
-            target_ref=str(ctx.query.get("target_ref") or ""),
+            target_ref=target_ref,
+            current_target_head=_parallel_branch_current_target_head(
+                project_id,
+                ctx.query,
+                target_ref=target_ref,
+            ),
             now_iso=str(ctx.query.get("now_iso") or ""),
             limit=_query_int(ctx.query, "limit", 50),
             scenario_id=str(ctx.query.get("scenario_id") or "PB-010"),
@@ -3435,6 +3463,7 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
         raise ValidationError("task_id is required")
     if not merge_queue_id:
         raise ValidationError("merge_queue_id is required")
+    target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
 
     conn = get_connection(project_id)
     try:
@@ -3457,8 +3486,12 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                     _query_statuses(ctx.body, "same_node_or_file_conflicts")
                 ),
                 requires_graph_epoch=tuple(_query_statuses(ctx.body, "requires_graph_epoch")),
-                target_ref=str(ctx.body.get("target_ref") or "refs/heads/main"),
-                current_target_head=str(ctx.body.get("current_target_head") or ""),
+                target_ref=target_ref,
+                current_target_head=_parallel_branch_current_target_head(
+                    project_id,
+                    ctx.body,
+                    target_ref=target_ref,
+                ),
                 validated_target_head=str(ctx.body.get("validated_target_head") or ""),
                 validation_attempt=_query_int(ctx.body, "validation_attempt", 0),
                 merge_preview_id=str(ctx.body.get("merge_preview_id") or ""),
@@ -3473,7 +3506,12 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
                 conn,
                 project_id,
                 merge_queue_id,
-                target_ref=str(ctx.body.get("target_ref") or "refs/heads/main"),
+                target_ref=target_ref,
+                current_target_head=_parallel_branch_current_target_head(
+                    project_id,
+                    ctx.body,
+                    target_ref=target_ref,
+                ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-002"),
             )
             conn.commit()
@@ -3677,6 +3715,12 @@ def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
                 project_id,
                 merge_queue_id,
                 target_ref=target_ref,
+                current_target_head=str(
+                    ctx.body.get("current_target_head")
+                    or ctx.body.get("latest_target_head")
+                    or ctx.body.get("target_head_after_merge")
+                    or ""
+                ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-014"),
             )
             conn.commit()
@@ -3756,6 +3800,14 @@ def handle_graph_governance_parallel_branch_merge_execute(ctx: RequestContext):
                 project_id,
                 merge_queue_id,
                 target_ref=target_ref,
+                current_target_head=(
+                    str(result.get("target_head_after_merge") or "").strip()
+                    or _parallel_branch_current_target_head(
+                        project_id,
+                        ctx.body,
+                        target_ref=target_ref,
+                    )
+                ),
                 scenario_id=str(ctx.body.get("scenario_id") or "PB-016"),
             )
             conn.commit()

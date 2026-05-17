@@ -264,6 +264,110 @@ def test_parallel_branch_read_model_route_returns_durable_runtime_state(conn):
     }
 
 
+def test_parallel_branch_read_model_route_marks_supplied_target_head_drift(conn):
+    queue_id = "mergeq-api-stale-target"
+    target_ref = "refs/heads/main"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-stale-target",
+                task_id="stale-target-task",
+                branch_ref="refs/heads/codex/stale-target-task",
+                queue_index=1,
+                status="merge_ready",
+                target_ref=target_ref,
+                branch_head="branch-head",
+                validated_target_head="target-before",
+                current_target_head="target-before",
+                merge_preview_id="preview-before",
+            )
+        ],
+        now_iso="2026-05-17T09:10:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "merge_queue_id": queue_id,
+                "target_ref": target_ref,
+                "current_target_head": "target-after",
+                "limit": "5",
+            },
+        )
+    )
+    payload = result["read_model"]
+    row = payload["merge_queue"]["rows"][0]
+
+    assert result["ok"] is True
+    assert payload["summary"]["mergeable_count"] == 0
+    assert payload["summary"]["stale_count"] == 1
+    assert payload["merge_queue"]["stale_task_ids"] == ["stale-target-task"]
+    assert row["stale_target_head"] is True
+    assert row["queue_state"] == "stale_after_dependency_merge"
+
+
+def test_parallel_branch_read_model_route_can_resolve_actual_target_head(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    target_before = subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "target.txt").write_text("target moved\n", encoding="utf-8")
+    subprocess.run(["git", "add", "target.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "move target"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    queue_id = "mergeq-api-resolve-target"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-resolve-target",
+                task_id="resolve-target-task",
+                branch_ref="refs/heads/codex/resolve-target-task",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head="branch-head",
+                validated_target_head=target_before,
+                current_target_head=target_before,
+            )
+        ],
+        now_iso="2026-05-17T09:11:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "workspace_path": str(repo),
+                "resolve_current_target_head": "true",
+                "limit": "5",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["read_model"]["merge_queue"]["stale_task_ids"] == ["resolve-target-task"]
+    assert result["read_model"]["merge_queue"]["rows"][0]["stale_target_head"] is True
+
+
 def test_parallel_branch_allocate_route_materializes_worktree_and_updates_read_model(conn, tmp_path):
     repo = _git_repo(tmp_path)
 

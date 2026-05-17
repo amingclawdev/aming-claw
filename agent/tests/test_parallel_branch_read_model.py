@@ -381,3 +381,50 @@ def test_pb010_read_model_loads_from_durable_runtime_stores() -> None:
         "merge_queue_rows": False,
         "rollback_rows": False,
     }
+
+
+def test_pb010_read_model_marks_queue_stale_against_latest_target_head() -> None:
+    conn = _runtime_conn()
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-PB010-stale-target",
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB010-T1",
+                queue_index=1,
+                status="merge_ready",
+                target_ref=TARGET_REF,
+                validated_target_head="target-before",
+                current_target_head="target-before",
+                merge_preview_id="preview-before",
+            ),
+        ],
+        now_iso=NOW,
+    )
+
+    model = build_parallel_branch_read_model_from_db(
+        conn,
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-PB010-stale-target",
+        target_ref=TARGET_REF,
+        current_target_head="target-after",
+        now_iso=NOW,
+        limit=10,
+    )
+    payload = model.to_dict()
+    row = payload["merge_queue"]["rows"][0]
+
+    assert payload["summary"]["mergeable_count"] == 0
+    assert payload["summary"]["stale_count"] == 1
+    assert payload["merge_queue"]["stale_task_ids"] == ["T1"]
+    assert row["stale_target_head"] is True
+    assert row["queue_state"] == "stale_after_dependency_merge"
+    assert row["next_actions"] == [
+        "rebase_or_sync",
+        "run_scope_reconcile",
+        "verify_semantic_projection",
+        "refresh_merge_preview",
+    ]

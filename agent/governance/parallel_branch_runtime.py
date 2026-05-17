@@ -1075,16 +1075,26 @@ def decide_persisted_merge_queue(
     merge_queue_id: str,
     *,
     target_ref: str = "",
+    current_target_head: str = "",
     scenario_id: str = "PB-002",
 ) -> MergeQueuePlan:
     """Replay merge queue decisions from durable queue rows."""
+    items = list_merge_queue_items(
+        conn,
+        project_id,
+        merge_queue_id,
+        target_ref=target_ref,
+    )
+    latest_target = str(current_target_head or "").strip()
+    if latest_target:
+        items = [
+            replace(item, current_target_head=latest_target)
+            if item.status in MERGE_READY_INPUT_STATES
+            else item
+            for item in items
+        ]
     return decide_merge_queue(
-        list_merge_queue_items(
-            conn,
-            project_id,
-            merge_queue_id,
-            target_ref=target_ref,
-        ),
+        items,
         scenario_id=scenario_id,
     )
 
@@ -3237,6 +3247,7 @@ def build_parallel_branch_read_model_from_db(
     batch_id: str = "",
     merge_queue_id: str = "",
     target_ref: str = "",
+    current_target_head: str = "",
     now_iso: str = "",
     limit: int = 50,
     scenario_id: str = "PB-010",
@@ -3266,6 +3277,14 @@ def build_parallel_branch_read_model_from_db(
             queue_id,
             target_ref=target_ref,
         )
+        latest_target = str(current_target_head or "").strip()
+        if latest_target:
+            queue_items = [
+                replace(item, current_target_head=latest_target)
+                if item.status in MERGE_READY_INPUT_STATES
+                else item
+                for item in queue_items
+            ]
         queue_plan = decide_merge_queue(queue_items, scenario_id=scenario_id) if queue_items else None
 
     batch_plan: BatchRollbackPlan | None = None
