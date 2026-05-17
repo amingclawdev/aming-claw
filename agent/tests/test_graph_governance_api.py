@@ -427,6 +427,94 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
     assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
 
 
+def test_parallel_branch_batch_runtime_route_returns_rollback_plan(conn):
+    batch_id = "PB-api-batch"
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=batch_id,
+            task_id="T1",
+            branch_ref="refs/heads/codex/batch-t1",
+            worktree_path="/repo/.worktrees/batch-t1",
+            status="merged",
+            base_commit="base-batch",
+            head_commit="head-T1",
+            snapshot_id="scope-T1",
+            projection_id="semproj-T1",
+            merge_queue_id="mergeq-batch",
+        ),
+        now_iso="2026-05-17T07:30:00Z",
+    )
+    upsert_branch_context(
+        conn,
+        BranchTaskRuntimeContext(
+            project_id=PID,
+            batch_id=batch_id,
+            task_id="T2",
+            branch_ref="refs/heads/codex/batch-t2",
+            worktree_path="/repo/.worktrees/batch-t2",
+            status="merge_failed",
+            base_commit="base-batch",
+            head_commit="head-T2",
+            snapshot_id="scope-T2",
+            projection_id="semproj-T2",
+            merge_queue_id="mergeq-batch",
+            depends_on=("T1",),
+        ),
+        now_iso="2026-05-17T07:30:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branch_batch_runtime(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "batch_id": batch_id,
+                "target_ref": "refs/heads/main",
+                "batch_base_commit": "base-batch",
+                "current_target_head": "bad-target",
+                "severe_integration_failure": True,
+                "corrected_replay_order": ["T2", "T1"],
+                "failure_reason": "wrong merge order",
+                "items": [
+                    {"task_id": "T1", "queue_index": 1, "merge_commit": "merge-T1"},
+                    {"task_id": "T2", "queue_index": 2},
+                ],
+                "now_iso": "2026-05-17T07:31:00Z",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["runtime"]["batch_status"] == "rollback_required"
+    assert result["plan"]["rollback_required"] is True
+    assert result["plan"]["rollback_target_commit"] == "base-batch"
+    assert result["plan"]["retained_branch_refs"] == [
+        "refs/heads/codex/batch-t1",
+        "refs/heads/codex/batch-t2",
+    ]
+    assert result["plan"]["replay_task_ids"] == ["T2", "T1"]
+    assert result["plan"]["cleanup_allowed"] is False
+    assert result["plan"]["cleanup_blockers"] == ["T1", "T2"]
+
+    read = server.handle_graph_governance_parallel_branches(
+        _ctx(
+            {"project_id": PID},
+            query={
+                "batch_id": batch_id,
+                "merge_queue_id": "mergeq-batch",
+                "corrected_replay_order": "T2,T1",
+                "limit": "5",
+            },
+        )
+    )
+
+    assert read["read_model"]["rollback"]["rollback_required"] is True
+    assert read["read_model"]["rollback"]["replay_task_ids"] == ["T2", "T1"]
+    assert read["read_model"]["rollback"]["cleanup_blockers"] == ["T1", "T2"]
+
+
 def test_governance_handler_json_response_includes_dev_cors_headers():
     handler = _bare_handler()
 

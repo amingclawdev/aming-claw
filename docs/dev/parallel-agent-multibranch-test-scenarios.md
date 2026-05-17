@@ -128,7 +128,7 @@ Task fixture:
 | PB-001 | Machine restart recovery | Service restarts with T1 merged, T2 merge_failed, T4 queued_for_merge, T3/T5 unfinished. | Keep T1 merged; keep T2 merge_failed for observer action; mark T4 dependency_blocked; expire T3/T5 leases; retain all batch branches; activate no unfinished graph/semantic projections. | Runtime store, recovery API, and checkpoint fence are implemented; live executor replay remains gated. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
 | PB-002 | Merge dependency ordering | Downstream branch requests merge before upstream foundation branch. | Reject merge with `waiting_dependency` or `dependency_blocked`; no target branch mutation; no graph ref activation. | Implemented with pure decision oracle, durable SQLite queue replay, and fenced governance enqueue API; live merge execution remains gated. | `test_merge_queue_runtime.py`, `test_graph_governance_api.py` |
 | PB-003 | Target branch moves | Upstream branch merges after downstream branch was validated. | Mark downstream `stale_after_dependency_merge`; require rebase/sync, scope reconcile, semantic projection check, and merge preview. | Implemented with pure decision oracle and durable SQLite queue replay; scope/materialization integration remains separate. | `test_merge_queue_runtime.py`, `test_graph_rollback_epoch.py` |
-| PB-004 | Wrong merge order rollback/replay | Batch detects severe integration issue after an invalid merge order. | Enter `rollback_required`; retain all batch branches/worktrees; rollback target ref and graph ref; replay retained branch heads in corrected queue order. | Implemented with pure decision oracle and durable SQLite batch replay; live rollback execution remains gated. | `test_batch_merge_rollback.py` |
+| PB-004 | Wrong merge order rollback/replay | Batch detects severe integration issue after an invalid merge order. | Enter `rollback_required`; retain all batch branches/worktrees; rollback target ref and graph ref; replay retained branch heads in corrected queue order. | Implemented with pure decision oracle, durable SQLite batch replay, and governance rollback-planning API; live rollback execution remains gated. | `test_batch_merge_rollback.py`, `test_graph_governance_api.py` |
 | PB-005 | DB rollback consistency | Code rollback is requested after graph/semantic/pending rows changed. | Move graph snapshot refs and semantic projection refs to rollback epoch; mark superseded branch projections inactive; requeue or abandon semantic jobs by epoch; scope rows are isolated by branch/ref/batch. | Graph/projection/pending-scope read model implemented; semantic job invalidation remains pending. | `test_graph_rollback_epoch.py` |
 | PB-006 | Governance Hint rollback | A hint is added, changed, then removed across branch commits. | Incremental reconcile emits add/change/remove deltas; removed hint cannot leave stale graph binding; rollback restores prior binding state. | Implemented as invertible delta oracle; reconcile integration remains pending. | `test_governance_hint_rollback.py` |
 | PB-007 | Chain compatibility | A Chain stage records branch runtime identity while MF remains the active client. | Accept optional `chain_id`, `root_task_id`, `stage_task_id`, `stage_type`, and `retry_round`; runtime semantics do not require Chain execution. | Implemented for runtime identity and no-execution Chain payload adapter; full Chain parallel execution remains future work. | `test_parallel_branch_runtime.py`, `test_chain_parallel_branch_adapter.py` |
@@ -172,6 +172,12 @@ The merge-queue API slice is covered by
 It proves a stale agent cannot enqueue a branch after fence recovery, and that
 successful enqueue returns the same dependency-blocker oracle used by durable
 queue replay and the compact read model.
+
+The batch rollback planning API slice is covered by
+`test_parallel_branch_batch_runtime_route_returns_rollback_plan`. It proves an
+operator can persist batch runtime state from branch contexts, mark the batch
+`rollback_required`, see retained branch/worktree evidence and cleanup blockers,
+and fetch the same rollback plan through the compact read model.
 
 ## Observer Recovery Dry Run
 

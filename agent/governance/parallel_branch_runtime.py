@@ -595,6 +595,35 @@ def merge_queue_item_to_dict(item: MergeQueueItem) -> dict[str, Any]:
     return payload
 
 
+def batch_merge_item_to_dict(item: BatchMergeItem) -> dict[str, Any]:
+    payload = asdict(item)
+    payload["depends_on"] = list(item.depends_on)
+    return payload
+
+
+def batch_merge_runtime_to_dict(runtime: BatchMergeRuntime) -> dict[str, Any]:
+    payload = asdict(runtime)
+    payload["items"] = [batch_merge_item_to_dict(item) for item in runtime.items]
+    return payload
+
+
+def batch_rollback_plan_to_dict(plan: BatchRollbackPlan) -> dict[str, Any]:
+    payload = asdict(plan)
+    payload["abandoned_merge_commits"] = list(plan.abandoned_merge_commits)
+    payload["abandoned_snapshot_ids"] = list(plan.abandoned_snapshot_ids)
+    payload["abandoned_projection_ids"] = list(plan.abandoned_projection_ids)
+    payload["retained_branch_refs"] = list(plan.retained_branch_refs)
+    payload["retained_worktree_paths"] = list(plan.retained_worktree_paths)
+    payload["replay_task_ids"] = list(plan.replay_task_ids)
+    payload["replay_merge_queue_items"] = [
+        merge_queue_item_to_dict(item) for item in plan.replay_merge_queue_items
+    ]
+    payload["cleanup_blockers"] = list(plan.cleanup_blockers)
+    payload["operator_actions"] = list(plan.operator_actions)
+    payload["dashboard_rows"] = list(plan.dashboard_rows)
+    return payload
+
+
 def upsert_branch_context(
     conn: sqlite3.Connection,
     context: BranchTaskRuntimeContext,

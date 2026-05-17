@@ -435,6 +435,14 @@ and graph/projection evidence into `parallel_branch_merge_queue_items`, updates
 the branch context status and `merge_queue_id`, and returns the replayed merge
 queue decision plan. It still performs no target-branch mutation.
 
+Implemented batch rollback planning API slice:
+`POST /api/graph-governance/{project_id}/parallel-branches/batch-runtime`
+persists `BatchMergeRuntime` from branch runtime contexts and operator-supplied
+merge evidence, then returns the deterministic rollback/replay plan. The route
+can mark a batch `rollback_required`, retain branch/worktree evidence, expose
+rollback/replay epochs and cleanup blockers, and keep git ref reset/replay
+execution as an explicit later step.
+
 Only after this loop is stable should normal executor worker parallelism be
 raised above the current conservative mode.
 

@@ -3306,6 +3306,121 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/batch-runtime")
+def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
+    """Persist batch runtime state and return rollback/replay planning."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .parallel_branch_runtime import (
+        BATCH_STATE_OPEN,
+        BATCH_STATE_ROLLBACK_REQUIRED,
+        BatchMergeItem,
+        BatchMergeRuntime,
+        batch_merge_runtime_to_dict,
+        batch_rollback_plan_to_dict,
+        decide_persisted_batch_rollback_replay,
+        list_branch_contexts,
+        upsert_batch_merge_runtime,
+    )
+
+    batch_id = str(ctx.body.get("batch_id") or "").strip()
+    if not batch_id:
+        raise ValidationError("batch_id is required")
+
+    explicit_items = ctx.body.get("items") or []
+    if isinstance(explicit_items, dict):
+        explicit_items = list(explicit_items.values())
+    overrides = {
+        str(item.get("task_id") or ""): item
+        for item in explicit_items
+        if isinstance(item, dict) and str(item.get("task_id") or "")
+    }
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.batch-runtime")
+        contexts = list_branch_contexts(conn, project_id, batch_id=batch_id)
+        if not contexts:
+            raise ValidationError(f"no branch runtime contexts found for batch_id: {batch_id}")
+
+        items: list[BatchMergeItem] = []
+        for index, context in enumerate(contexts, start=1):
+            override = overrides.get(context.task_id, {})
+            items.append(
+                BatchMergeItem(
+                    task_id=context.task_id,
+                    branch_ref=str(override.get("branch_ref") or context.branch_ref),
+                    worktree_path=str(override.get("worktree_path") or context.worktree_path),
+                    queue_index=int(override.get("queue_index") or index),
+                    status=str(override.get("status") or context.status),
+                    branch_head=str(override.get("branch_head") or context.head_commit),
+                    base_commit=str(override.get("base_commit") or context.base_commit),
+                    checkpoint_id=str(override.get("checkpoint_id") or context.checkpoint_id),
+                    merge_commit=str(override.get("merge_commit") or ""),
+                    target_head_before_merge=str(override.get("target_head_before_merge") or ""),
+                    target_head_after_merge=str(override.get("target_head_after_merge") or ""),
+                    snapshot_id=str(override.get("snapshot_id") or context.snapshot_id),
+                    projection_id=str(override.get("projection_id") or context.projection_id),
+                    merge_queue_id=str(override.get("merge_queue_id") or context.merge_queue_id),
+                    merge_preview_id=str(override.get("merge_preview_id") or context.merge_preview_id),
+                    depends_on=tuple(override.get("depends_on") or context.depends_on),
+                    retained=not str(override.get("retained") or "").strip().lower() in {
+                        "0",
+                        "false",
+                        "no",
+                        "off",
+                    },
+                )
+            )
+
+        severe = _query_bool(ctx.body, "severe_integration_failure", False)
+        batch_status = str(
+            ctx.body.get("batch_status")
+            or (BATCH_STATE_ROLLBACK_REQUIRED if severe else BATCH_STATE_OPEN)
+        )
+        batch_base_commit = str(ctx.body.get("batch_base_commit") or items[0].base_commit)
+        runtime = BatchMergeRuntime(
+            project_id=project_id,
+            batch_id=batch_id,
+            target_ref=str(ctx.body.get("target_ref") or "refs/heads/main"),
+            batch_base_commit=batch_base_commit,
+            current_target_head=str(ctx.body.get("current_target_head") or batch_base_commit),
+            items=tuple(items),
+            batch_status=batch_status,
+            rollback_epoch=str(ctx.body.get("rollback_epoch") or ""),
+            replay_epoch=str(ctx.body.get("replay_epoch") or ""),
+            rollback_target_commit=str(ctx.body.get("rollback_target_commit") or batch_base_commit),
+            rollback_snapshot_id=str(ctx.body.get("rollback_snapshot_id") or ""),
+            rollback_projection_id=str(ctx.body.get("rollback_projection_id") or ""),
+            failure_reason=str(ctx.body.get("failure_reason") or ""),
+        )
+
+        with sqlite_write_lock():
+            saved = upsert_batch_merge_runtime(
+                conn,
+                runtime,
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            plan = decide_persisted_batch_rollback_replay(
+                conn,
+                project_id,
+                batch_id,
+                severe_integration_failure=severe,
+                corrected_replay_order=tuple(_query_statuses(ctx.body, "corrected_replay_order")),
+                scenario_id=str(ctx.body.get("scenario_id") or "PB-004"),
+            )
+            conn.commit()
+
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "runtime": batch_merge_runtime_to_dict(saved),
+            "plan": batch_rollback_plan_to_dict(plan),
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/recover-expired")
 def handle_graph_governance_parallel_branch_recover_expired(ctx: RequestContext):
     """Recover expired running branch contexts after an agent/session restart."""
