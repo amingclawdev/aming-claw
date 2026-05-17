@@ -25,6 +25,7 @@ REQUIRED_SCENARIOS = {
     "PB-012": "Multi-project and batch isolation",
     "PB-013": "Existing long-lived ref governance",
     "PB-014": "Managed ref bootstrap/import",
+    "PB-015": "MF subagent backend contract",
 }
 
 REQUIRED_ORACLE_DIMENSIONS = [
@@ -38,7 +39,20 @@ REQUIRED_ORACLE_DIMENSIONS = [
     "blocked_by",
 ]
 
-REQUIRED_INFRA_FLAGS = ["I0", "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10"]
+REQUIRED_INFRA_FLAGS = [
+    "I0",
+    "I1",
+    "I2",
+    "I3",
+    "I4",
+    "I5",
+    "I6",
+    "I7",
+    "I8",
+    "I9",
+    "I10",
+    "I11",
+]
 
 
 @pytest.fixture(scope="module")
@@ -113,3 +127,11 @@ def test_managed_ref_bootstrap_requires_dry_run_classification(doc_text: str) ->
     assert "Managed ref bootstrap/import" in doc_text
     assert "Dry-run classifies target, short-lived agent, managed, ignored, unmanaged, and blocked refs" in doc_text
     assert "managed-ref bootstrap dry-run before apply" in normalized
+
+
+def test_mf_subagent_contract_is_bounded_to_branch_worker_actions(doc_text: str) -> None:
+    normalized = " ".join(doc_text.split())
+    assert "MF subagent backend contract" in doc_text
+    assert "Build an `mf_sub` payload from `BranchTaskRuntimeContext`" in doc_text
+    assert "reject stale fences and merge/push/graph activation attempts" in normalized
+    assert "MF subagents are branch workers, not merge workers" in doc_text

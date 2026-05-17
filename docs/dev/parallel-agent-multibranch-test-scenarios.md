@@ -97,6 +97,7 @@ Example dry-run oracle:
 | I8 | Chain adapter identity fields exist without requiring Chain execution. |
 | I9 | Batch branch/worktree retention and cleanup policy exists. |
 | I10 | Managed ref runtime store, decision oracle, and governance API exist for existing long-lived branches. |
+| I11 | MF subagent backend contract and role profile exist. |
 
 ## Fixture Topology
 
@@ -141,6 +142,7 @@ Task fixture:
 | PB-012 | Multi-project and batch isolation | Two projects or batches reuse task IDs and branch slugs. | Runtime keys include project, batch, branch/ref, and attempt identity; no task, queue, pending scope, graph, or semantic row crosses boundaries. | Implemented for branch context and merge queue scope; graph/semantic isolation still depends on I3/I4. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py` |
 | PB-013 | Existing long-lived ref governance | A project import discovers release and feature branches that already have many commits. | Keep one project identity; create managed ref contexts; detect target movement as stale; merge code through target reconcile; archive source ref context instead of deleting a project. | Implemented as SQLite managed-ref runtime, decision oracle, and governance API; dashboard wiring remains pending. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
 | PB-014 | Managed ref bootstrap/import | Operator imports an already-branched repository. | Dry-run classifies target, short-lived agent, managed, ignored, unmanaged, and blocked refs; apply only creates/refreshes managed ref contexts in the same project and never activates branch-local graph truth. | Implemented for supplied refs and git branch discovery through governance API. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
+| PB-015 | MF subagent backend contract | Observer delegates one branch implementation to a Codex subagent while executor remains offline. | Build an `mf_sub` payload from `BranchTaskRuntimeContext`; require backlog, worktree, branch, target head, attempt, and fence identity; normalize only checkpoint/test/change evidence into merge-queue readiness; reject stale fences and merge/push/graph activation attempts. | Implemented as backend-neutral contract helpers and a dedicated role profile; live subagent spawning remains operator-driven. | `test_mf_subagent_contract.py`, `test_role_config.py` |
 
 ## Immediate Test Slice
 
@@ -162,6 +164,7 @@ The next slice should create dry-run data structures without production code:
 | `agent/tests/test_graph_rollback_epoch.py` | Graph snapshot/projection activation, rollback, pending-scope isolation, and branch artifact isolation for PB-005 and PB-011. | Implemented for graph/projection/pending-scope read model; semantic job invalidation remains pending. |
 | `agent/tests/test_governance_hint_rollback.py` | Hint add/change/remove/rollback-restored inverse delta behavior for PB-006. | Implemented as pure delta oracle; incremental reconcile integration remains pending. |
 | `agent/tests/test_managed_ref_runtime.py` | Managed ref import, stale target detection, merge readiness, archive policy, and project deletion guard for PB-013. | Implemented as SQLite state/decision oracle; governance API coverage lives in `test_graph_governance_api.py`; dashboard wiring remains future work. |
+| `agent/tests/test_mf_subagent_contract.py` | Backend-neutral `mf_sub` payload/result contract for PB-015. | Implemented |
 | `frontend/dashboard/scripts/e2e-parallel-branches.mjs` | Operator read model for PB-010. | I7 |
 
 The MF adapter API slice is now covered by
@@ -264,5 +267,9 @@ Required rollback assertions:
   apply. Dry-run classifications are part of the operator evidence, and refresh
   clears stale graph/preview pointers rather than treating old branch graph
   state as target truth.
+- MF subagents are branch workers, not merge workers. Their contract can
+  report checkpoint, changed files, tests, blockers, and readiness; merge,
+  push, graph activation, release gates, task creation, and worktree cleanup
+  remain owner-controlled operations.
 - Backlog and dashboard queries must stay compact by default; detailed state
   should be fetched by ID.

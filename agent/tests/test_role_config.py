@@ -59,10 +59,10 @@ class TestYAMLLoad:
         assert isinstance(config.permissions, RolePermissions)
         assert config.prompt_template  # non-empty
 
-    def test_load_all_six_roles(self):
-        """AC2: All 6 YAML files load (tester archived)."""
+    def test_load_all_known_roles(self):
+        """AC2: All known YAML files load (tester archived)."""
         configs = load_all_role_configs(config_base=_CONFIG_DIR)
-        assert len(configs) == 6
+        assert len(configs) == 7
         for role in KNOWN_ROLES:
             assert role in configs, f"Missing config for role: {role}"
 
@@ -71,6 +71,18 @@ class TestYAMLLoad:
         configs = load_all_role_configs(config_base=_CONFIG_DIR)
         for role, config in configs.items():
             assert config.version, f"Role {role} has empty version"
+
+    def test_load_mf_sub_config(self):
+        """MF subagent role is available but cannot merge or mutate gates."""
+        config = load_role_config("mf_sub", config_base=_CONFIG_DIR)
+        assert config is not None
+        assert config.role == "mf_sub"
+        assert "modify_code" in config.permissions.allowed
+        assert "run_tests" in config.permissions.allowed
+        assert "merge" in config.permissions.denied
+        assert "push" in config.permissions.denied
+        assert "activate_graph" in config.permissions.denied
+        assert "release_gate" in config.permissions.denied
 
 
 # --- Test 2: Override merge ---

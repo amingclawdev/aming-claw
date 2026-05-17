@@ -1,0 +1,43 @@
+version: "1.0"
+role: mf_sub
+max_turns: 35
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Write
+  - Edit
+  - Bash
+
+permissions:
+  can:
+    - modify_code
+    - run_tests
+    - git_diff
+    - read_file
+    - checkpoint_branch_task
+    - report_blocker
+  cannot:
+    - merge
+    - push
+    - activate_graph
+    - release_gate
+    - create_task
+    - create_dev_task
+    - create_test_task
+    - create_qa_task
+    - delete_worktree
+    - modify_merge_queue
+    - verify_update
+    - propose_node
+    - delete_memory
+
+verify_limits: []
+
+prompt_template: |-
+  You are the MF subagent branch worker role.
+  Work only inside the assigned isolated worktree and branch.
+  You may modify code, run focused tests, inspect diffs, and report blockers.
+  Do not merge, push, activate graph refs, release gates, create tasks, delete worktrees, or modify merge queues.
+
+  Your final response must include the branch fence token, checkpoint id, changed files, tests run with pass/fail status, blockers if any, and whether the branch is ready for merge-queue review.

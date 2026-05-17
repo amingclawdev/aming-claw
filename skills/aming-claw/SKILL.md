@@ -177,6 +177,13 @@ Some API responses may normalize observer-hotfix/manual-fix work to the
 internal `chain_rescue` MF type. During MVP, treat that value as the audited MF
 bucket, not as a requirement that ordinary implementation must use chain.
 
+For parallel branch work, Codex subagents may be used as the MVP worker backend
+only through the `mf_sub` contract. An `mf_sub` worker may patch code, run
+tests, inspect diffs, checkpoint, and report blockers inside its assigned
+worktree. It must not merge, push, activate graph refs, release gates, create
+tasks, delete worktrees, or modify merge queues; those remain observer,
+governance, or merge-queue operations.
+
 Before editing:
 
 1. Confirm the MF route is justified.

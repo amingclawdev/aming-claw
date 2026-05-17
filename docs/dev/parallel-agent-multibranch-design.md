@@ -47,6 +47,8 @@ matrix with explicit pending infrastructure flags.
 | PB-011 | Branch graph artifact isolation before merge. |
 | PB-012 | Multi-project and batch isolation. |
 | PB-013 | Existing long-lived ref governance under one project identity. |
+| PB-014 | Managed ref bootstrap/import for existing branched repositories. |
+| PB-015 | MF subagent backend contract for branch-isolated worker execution. |
 
 ## Runtime Surfaces
 
@@ -59,6 +61,7 @@ matrix with explicit pending infrastructure flags.
 | `SemanticProjectionRuntime` | Projection activation, semantic job carry-forward, stale/cancelled state, and epoch-bound rebuild decisions. | Structural graph snapshot creation. |
 | `PendingScopeRuntime` | Branch/ref/batch/epoch-aware scope reconcile rows and materialization decisions. | Merge queue policy. |
 | `ManagedRefRuntime` | Same-project governance state for existing long-lived refs, release branches, and large feature branches. | Treating ordinary refs as separate projects or merging graph truth across refs. |
+| `MF subagent contract` | Backend-neutral branch worker input/result schema, fence identity, checkpoint evidence, and merge-queue readiness. | Merge, push, graph activation, release gates, task creation, or worktree cleanup. |
 | `Dashboard/MCP read model` | Bounded operator views, blockers, recovery actions, queue status, graph epoch, rollback timeline. | Full backlog or graph expansion by default. |
 | `Chain adapter` | Optional Chain identity fields and event mapping. | A separate parallel runtime. |
 
@@ -505,6 +508,10 @@ Serial Chain stages with no `branch_ref` remain unchanged.
     adapter is implemented by `agent/tests/test_chain_parallel_branch_adapter.py`.
 12. Managed ref runtime for existing long-lived branches. First SQLite-backed
     state/decision slice is implemented by `agent/tests/test_managed_ref_runtime.py`.
+13. MF subagent backend contract. First backend-neutral payload/result contract
+    is implemented by `agent/tests/test_mf_subagent_contract.py`; Codex
+    subagents can act as the MVP worker backend, while executor and Chain can
+    later implement the same contract.
 
 The smallest runtime slice is one backlog row in one isolated worktree:
 
@@ -536,6 +543,15 @@ fence-token enforcement, and `POST .../recover-expired` rotates expired running
 contexts into `reclaimable` after restart. These APIs create the execution
 front door for MF/executor clients, while live merge and rollback execution
 remain gated by the merge queue and graph checks.
+
+Implemented MF subagent worker contract: `mf_sub` is a dedicated branch worker
+role for Codex subagents in the MVP and executor/Chain workers later. Its
+input payload carries `BranchTaskRuntimeContext` identity, including backlog,
+branch, worktree, attempt, lease, fence, graph/projection, merge queue, and
+optional Chain fields. Its result payload can only report changed files, test
+evidence, blockers, checkpoint, and merge-queue readiness. It cannot merge,
+push, activate graph refs, release gates, create tasks, delete worktrees, or
+modify merge queues.
 
 Implemented fenced merge-queue API slice:
 `POST /api/graph-governance/{project_id}/parallel-branches/merge-queue` lets a
@@ -570,6 +586,7 @@ raised above the current conservative mode.
 | I8 | Chain adapter event identity. |
 | I9 | Batch branch/worktree retention and cleanup policy. |
 | I10 | Managed ref dashboard wiring for existing long-lived branches. |
+| I11 | MF subagent backend contract and role profile. |
 
 ## Acceptance Bar
 
