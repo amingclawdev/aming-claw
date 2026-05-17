@@ -8,13 +8,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
+
+from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 
 _START_RE = re.compile(r"aming-claw-hint:start\s+(?P<attrs>.*)$")
 _END_RE = re.compile(r"aming-claw-hint:end")
 _ATTR_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*)=(?P<value>\"[^\"]*\"|'[^']*'|\S+)")
 _DEF_RE = re.compile(r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_SCAN_EXTENSIONS = (
+    DEFAULT_LANGUAGE_POLICY.source_extensions
+    | DEFAULT_LANGUAGE_POLICY.script_extensions
+    | DEFAULT_LANGUAGE_POLICY.config_extensions
+    | DEFAULT_LANGUAGE_POLICY.doc_extensions
+)
+_SCAN_FILENAMES = DEFAULT_LANGUAGE_POLICY.config_filenames | DEFAULT_LANGUAGE_POLICY.index_doc_filenames
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,28 @@ def scan_graph_structure_hints(files: Mapping[str, str]) -> dict[str, Any]:
         "hint_count": len(hints),
         "hints": [hint.to_dict() for hint in hints],
     }
+
+
+def load_graph_structure_hints(project_root: str | Path) -> dict[str, Any]:
+    """Scan governed text/source files under a project root for source hint blocks."""
+    root = Path(project_root).resolve()
+    files: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if DEFAULT_LANGUAGE_POLICY.is_excluded_path(rel):
+            continue
+        if path.name not in _SCAN_FILENAMES and path.suffix.lower() not in _SCAN_EXTENSIONS:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if "aming-claw-hint:start" not in text:
+            continue
+        files[rel] = text
+    return scan_graph_structure_hints(files)
 
 
 def _scan_one_file(source_path: str, text: str) -> list[GraphStructureHint]:

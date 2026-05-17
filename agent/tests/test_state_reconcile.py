@@ -308,6 +308,76 @@ def test_state_only_full_reconcile_creates_candidate_snapshot_without_project_mu
     assert notes["semantic_enrichment"]["feature_count"] == result["semantic_enrichment"]["feature_count"]
 
 
+def test_state_only_full_reconcile_materializes_source_graph_hints_in_generated_project(conn, tmp_path):
+    project = tmp_path / "project"
+    files = _write_project(project)
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-hint-base",
+        commit_sha="hintbase",
+        snapshot_id="full-hint-base",
+        created_by="test",
+    )
+    assert base["ok"] is True
+
+    base_graph = state_reconcile._read_snapshot_graph(PID, "full-hint-base")
+    service_node = next(
+        node for node in state_reconcile._deps_graph_nodes(base_graph)
+        if "agent/service.py" in (node.get("primary") or [])
+    )
+    service_id = state_reconcile._node_id(service_node)
+    before = {str(path): _file_sha(path) for path in files}
+
+    _write(
+        project / "agent" / "tests" / "test_service.py",
+        "from agent.service import service_entry\n\n"
+        "def test_service_entry():\n"
+        "    # aming-claw-hint:start id=state-reconcile-test-edge op=add_edge edge=tests "
+        f"target={service_id}\n"
+        "    # reason: generated project test should bind to service node\n"
+        "    # aming-claw-hint:end\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+
+    result = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-hint-projection",
+        commit_sha="hinthead",
+        snapshot_id="full-hint-projection",
+        created_by="test",
+    )
+
+    assert result["ok"] is True
+    graph = state_reconcile._read_snapshot_graph(PID, "full-hint-projection")
+    edges = state_reconcile._deps_graph_edges(graph)
+    assert any(
+        edge.get("src") == "agent/tests/test_service.py"
+        and edge.get("dst") == service_id
+        and edge.get("edge_type") == "tests"
+        and edge.get("direction") == "source_hint"
+        for edge in edges
+    )
+    notes_row = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (PID, "full-hint-projection"),
+    ).fetchone()
+    notes = json.loads(notes_row["notes"])
+    projection = notes["graph_structure_hint_projection"]
+    assert projection["status"] == "ok"
+    assert projection["hint_count"] == 1
+    assert projection["materialized_count"] == 1
+    assert projection["conflict_count"] == 0
+    assert projection["hint_states"]["state-reconcile-test-edge"]["status"] == "materialized"
+    after = {str(path): _file_sha(path) for path in files}
+    assert after[str(project / "agent" / "service.py")] == before[str(project / "agent" / "service.py")]
+    assert after[str(project / "README.md")] == before[str(project / "README.md")]
+
+
 def test_state_only_full_reconcile_can_activate_with_explicit_signoff(conn, tmp_path):
     project = tmp_path / "project"
     _write_project(project)

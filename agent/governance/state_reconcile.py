@@ -49,6 +49,8 @@ from agent.governance.graph_correction_patches import (
     persist_node_migrations,
     record_patch_apply_report,
 )
+from agent.governance.graph_hint_projection import build_hint_projection
+from agent.governance.graph_structure_hints import load_graph_structure_hints
 from agent.governance.db import sqlite_write_lock
 from agent.governance.dirty_worktree import filter_dirty_files, parse_git_porcelain_paths
 from agent.governance.governance_index import (
@@ -104,6 +106,15 @@ def _governance_state_dir(project_id: str, run_id: str) -> Path:
     from .db import _governance_root
 
     return _governance_root() / project_id / "state-reconcile" / run_id
+
+
+def _project_graph_structure_hints(project_root: str | Path, candidate_graph: dict[str, Any]) -> dict[str, Any]:
+    hint_index = load_graph_structure_hints(project_root)
+    projection = build_hint_projection(candidate_graph, hint_index)
+    return {
+        "hint_index": hint_index,
+        "projection": projection,
+    }
 
 
 def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str) -> list[str]:
@@ -2125,6 +2136,31 @@ def run_state_only_full_reconcile(
             "graph_stats": graph_payload_stats(candidate_graph),
         },
     )
+    hint_projection_state = _project_graph_structure_hints(root, candidate_graph)
+    hint_index = hint_projection_state["hint_index"]
+    hint_projection = hint_projection_state["projection"]
+    candidate_graph = hint_projection["graph"]
+    graph_structure_hint_report = {
+        "status": hint_projection.get("status", ""),
+        "hint_count": hint_index.get("hint_count", 0),
+        "materialized_count": hint_projection.get("materialized_count", 0),
+        "conflict_count": hint_projection.get("conflict_count", 0),
+        "hint_states": hint_projection.get("hint_states") or {},
+        "suppressed_edges": hint_projection.get("suppressed_edges") or [],
+    }
+    trace.step(
+        "graph-structure-hints",
+        input_payload={
+            "project_root": str(root),
+            "hint_count": hint_index.get("hint_count", 0),
+            "hints": hint_index.get("hints") or [],
+        },
+        output_payload={
+            "report": graph_structure_hint_report,
+            "graph_stats": graph_payload_stats(candidate_graph),
+        },
+        status="ok" if hint_projection.get("status") == "ok" else "warning",
+    )
     file_inventory = _normalize_inventory_commit(
         [
             row for row in (phase_result.get("file_inventory") or [])
@@ -2156,6 +2192,7 @@ def run_state_only_full_reconcile(
         "file_role_annotation": role_annotation["report"],
         "relationship_metrics": relationship_metrics["report"],
         "graph_correction_patch_report": patch_application["report"],
+        "graph_structure_hint_projection": graph_structure_hint_report,
         "checkout_provenance": checkout_provenance,
         **(notes_extra or {}),
     }

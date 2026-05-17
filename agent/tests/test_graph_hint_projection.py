@@ -96,13 +96,18 @@ def test_projection_materializes_add_edge_hint_as_graph_truth() -> None:
 
     assert projection["status"] == "ok"
     assert projection["materialized_count"] == 1
-    assert {
-        "src": "agent/tests/test_parallel_branch_runtime.py",
-        "dst": "L7.runtime",
-        "edge_type": "tests",
-        "source": "source_hint",
-        "hint_id": "gsh-runtime-tests",
-    } in projection["graph"]["deps_graph"]["edges"]
+    assert any(
+        {
+            "src": "agent/tests/test_parallel_branch_runtime.py",
+            "dst": "L7.runtime",
+            "edge_type": "tests",
+            "direction": "source_hint",
+            "source": "source_hint",
+            "hint_id": "gsh-runtime-tests",
+        }.items()
+        <= edge.items()
+        for edge in projection["graph"]["deps_graph"]["edges"]
+    )
     assert projection["hint_states"]["gsh-runtime-tests"]["status"] == "materialized"
 
 

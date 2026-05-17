@@ -119,7 +119,12 @@ def _nodes(graph: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _edges(graph: dict[str, Any]) -> list[dict[str, Any]]:
     deps_graph = graph.setdefault("deps_graph", {})
-    edges = deps_graph.setdefault("edges", [])
+    edges = deps_graph.get("edges") if isinstance(deps_graph.get("edges"), list) else None
+    if edges is None:
+        edges = deps_graph.get("links") if isinstance(deps_graph.get("links"), list) else None
+    if edges is None:
+        edges = []
+        deps_graph["edges"] = edges
     return edges if isinstance(edges, list) else []
 
 
@@ -138,6 +143,7 @@ def _add_hint_edge(
         "src": source_path,
         "dst": target_node_id,
         "edge_type": edge_type,
+        "direction": "source_hint",
         "source": "source_hint",
         "hint_id": hint_id,
     }
