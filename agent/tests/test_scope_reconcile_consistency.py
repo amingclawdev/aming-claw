@@ -484,11 +484,17 @@ def test_scope_reconcile_test_fanin_ignores_unrelated_inventory_status_churn(con
     )
 
 
-@pytest.mark.parametrize("operation", ["add", "remove", "rename"])
+@pytest.mark.parametrize("operation", ["add", "remove", "rename", "rename_retarget"])
 def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(conn, tmp_path, operation):
     project = tmp_path / "project"
     _write_project(project)
-    if operation in {"remove", "rename"}:
+    if operation == "rename_retarget":
+        _write(
+            project / "agent" / "other.py",
+            "def other_entry():\n"
+            "    return 'ok'\n",
+        )
+    if operation in {"remove", "rename", "rename_retarget"}:
         _write(
             project / "agent" / "tests" / "test_integration.py",
             "from agent.service import service_entry\n\n"
@@ -528,6 +534,14 @@ def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(co
             _git(project, "commit", "-m", "remove integration test fanin")
         else:
             _git(project, "mv", "agent/tests/test_integration.py", "agent/tests/test_integration_renamed.py")
+            if operation == "rename_retarget":
+                _write(
+                    project / "agent" / "tests" / "test_integration_renamed.py",
+                    "from agent.other import other_entry\n\n"
+                    "def test_integration():\n"
+                    "    assert other_entry() == 'ok'\n",
+                )
+                _git(project, "add", "agent/tests/test_integration_renamed.py")
             _git(project, "commit", "-m", "rename integration test fanin")
     head_commit = _git(project, "rev-parse", "HEAD")
     store.queue_pending_scope_reconcile(
@@ -557,6 +571,9 @@ def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(co
         assert scope["scope_file_delta"]["removed_files"] == []
     elif operation == "remove":
         assert scope["scope_file_delta"]["added_files"] == []
+        assert scope["scope_file_delta"]["removed_files"] == ["agent/tests/test_integration.py"]
+    elif operation == "rename":
+        assert scope["scope_file_delta"]["added_files"] == ["agent/tests/test_integration_renamed.py"]
         assert scope["scope_file_delta"]["removed_files"] == ["agent/tests/test_integration.py"]
     else:
         assert scope["scope_file_delta"]["added_files"] == ["agent/tests/test_integration_renamed.py"]
@@ -597,8 +614,21 @@ def test_scope_reconcile_test_fanin_file_set_incremental_matches_full_rebuild(co
     elif operation == "remove":
         assert "agent/tests/test_integration.py" not in service_tests
         assert "agent/tests/test_integration.py" not in service_fanin_paths
-    else:
+    elif operation == "rename":
         assert "agent/tests/test_integration.py" not in service_tests
         assert "agent/tests/test_integration.py" not in service_fanin_paths
         assert "agent/tests/test_integration_renamed.py" in service_tests
         assert "agent/tests/test_integration_renamed.py" in service_fanin_paths
+    else:
+        other = _nodes_by_module(_read_snapshot_graph(PID, scope_snapshot_id))["agent.other"]
+        other_tests = set(other["test"])
+        other_fanin_paths = {
+            entry["path"]
+            for entry in (other.get("metadata") or {}).get("test_consumer_fanin", [])
+        }
+        assert "agent/tests/test_integration.py" not in service_tests
+        assert "agent/tests/test_integration.py" not in service_fanin_paths
+        assert "agent/tests/test_integration_renamed.py" not in service_tests
+        assert "agent/tests/test_integration_renamed.py" not in service_fanin_paths
+        assert "agent/tests/test_integration_renamed.py" in other_tests
+        assert "agent/tests/test_integration_renamed.py" in other_fanin_paths
