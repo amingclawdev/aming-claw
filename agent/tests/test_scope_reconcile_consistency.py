@@ -69,6 +69,21 @@ def _write_project(root: Path) -> None:
     _write(root / "README.md", "# Service\n\nScope consistency fixture.\n")
 
 
+def _write_call_free_project(root: Path, *, result: str = "ok") -> None:
+    _write(
+        root / "agent" / "service.py",
+        "def service_entry():\n"
+        f"    return {result!r}\n",
+    )
+    _write(
+        root / "agent" / "tests" / "test_service.py",
+        "from agent.service import service_entry\n\n"
+        "def test_service_entry():\n"
+        f"    assert service_entry() == {result!r}\n",
+    )
+    _write(root / "README.md", "# Service\n\nCall-free source consistency fixture.\n")
+
+
 def _normalized_snapshot(conn: sqlite3.Connection, snapshot_id: str) -> dict:
     graph = _read_snapshot_graph(PID, snapshot_id)
     inventory = _snapshot_inventory_rows(conn, PID, snapshot_id)
@@ -165,4 +180,83 @@ def test_scope_reconcile_output_matches_full_rebuild_for_same_final_state(conn, 
 
     base_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "full-base-consistency"))
     scope_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "scope-head-consistency"))
+    assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]
+
+
+def test_scope_reconcile_source_hash_only_matches_full_rebuild_for_same_final_state(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_call_free_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-source-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id="full-source-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    _write(
+        project / "agent" / "service.py",
+        "def service_entry():\n"
+        "    return 'changed'\n",
+    )
+    _git(project, "add", "agent/service.py")
+    _git(project, "commit", "-m", "change source body")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-source-head-consistency",
+        snapshot_id="scope-source-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_file_delta"]["graph_delta_mode"] == "source_hash_only"
+    assert scope["scope_file_delta"]["changed_files"] == ["agent/service.py"]
+    assert scope["scope_graph_delta"]["mode"] == "source_hash_only"
+    assert scope["scope_graph_delta"]["added_nodes"] == []
+    assert scope["scope_graph_delta"]["removed_nodes"] == []
+    assert scope["scope_graph_delta"]["added_edges"] == []
+    assert scope["scope_graph_delta"]["removed_edges"] == []
+
+    full = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-source-head-consistency",
+        commit_sha=head_commit,
+        snapshot_id="full-source-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert full["ok"] is True
+
+    assert _normalized_snapshot(conn, "scope-source-head-consistency") == _normalized_snapshot(
+        conn,
+        "full-source-head-consistency",
+    )
+
+    base_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "full-source-base-consistency"))
+    scope_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "scope-source-head-consistency"))
     assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]

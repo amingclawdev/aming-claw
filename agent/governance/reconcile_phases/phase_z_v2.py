@@ -512,6 +512,53 @@ def parse_production_modules(
     return modules
 
 
+def parse_production_module_file(
+    project_root: str,
+    rel_path: str,
+    profile: Optional[Any] = None,
+) -> Optional[ModuleInfo]:
+    """Parse one production source file through the same adapter path as Phase Z.
+
+    This is intentionally a narrow public helper for scope-reconcile deltas. It
+    does not build call graphs, clusters, or relations for the project; callers
+    must decide whether the resulting module-level facts are sufficient for a
+    safe incremental update or whether to fall back to the full graph builder.
+    """
+    if profile is None:
+        from agent.governance.project_profile import discover_project_profile
+        profile = discover_project_profile(project_root)
+    root = Path(project_root).resolve()
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    if (
+        not rel
+        or profile.is_excluded_path(rel)
+        or profile.is_test_path(rel)
+        or profile.is_doc_path(rel)
+        or not profile.is_production_source_path(rel)
+    ):
+        return None
+    fpath = root / rel
+    if not fpath.is_file():
+        return None
+    try:
+        source = _read_file(str(fpath))
+    except (UnicodeDecodeError, OSError):
+        return None
+
+    mod_name = _path_to_module(str(fpath), project_root)
+    adapter = _adapter_for_source_file(str(fpath))
+    if isinstance(adapter, PythonAdapter):
+        return _parse_python_module(str(fpath), mod_name, source)
+    return _parse_filetree_module(
+        project_root,
+        str(fpath),
+        mod_name,
+        source,
+        adapter,
+        rel,
+    )
+
+
 def _read_file(path: str) -> str:
     """Read file with fallback encoding."""
     try:

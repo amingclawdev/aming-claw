@@ -65,6 +65,8 @@ from agent.governance.reconcile_file_inventory import (
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
+    extract_typed_relations,
+    parse_production_module_file,
 )
 
 
@@ -531,6 +533,119 @@ def _json_clone(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
+def _node_for_primary_path(graph_json: dict[str, Any], path: str) -> dict[str, Any] | None:
+    norm = str(path or "").replace("\\", "/").strip("/")
+    if not norm:
+        return None
+    matches = [
+        node for node in _graph_nodes(graph_json)
+        if norm in set(_path_values(node, "primary"))
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _module_function_signature(module: Any) -> list[dict[str, Any]]:
+    signature: list[dict[str, Any]] = []
+    for func in getattr(module, "functions", []) or []:
+        name = str(getattr(func, "name", "") or "")
+        qualified_name = str(getattr(func, "qualified_name", "") or "")
+        if not name or not qualified_name:
+            continue
+        signature.append({
+            "name": name,
+            "qualified_name": qualified_name,
+            "lineno": int(getattr(func, "lineno", 0) or 0),
+            "end_lineno": int(getattr(func, "end_lineno", 0) or 0),
+        })
+    return sorted(signature, key=lambda item: item["qualified_name"])
+
+
+def _node_function_signature(node: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = _node_metadata(node)
+    raw_functions = metadata.get("functions") if isinstance(metadata.get("functions"), list) else []
+    raw_lines = metadata.get("function_lines") if isinstance(metadata.get("function_lines"), dict) else {}
+    signature: list[dict[str, Any]] = []
+    for raw in raw_functions:
+        qualified_name = str(raw or "")
+        if not qualified_name:
+            continue
+        name = qualified_name.rsplit("::", 1)[-1]
+        lines = raw_lines.get(name) if isinstance(raw_lines.get(name), list) else []
+        signature.append({
+            "name": name,
+            "qualified_name": qualified_name,
+            "lineno": int(lines[0]) if len(lines) >= 1 else 0,
+            "end_lineno": int(lines[1]) if len(lines) >= 2 else int(lines[0]) if lines else 0,
+        })
+    return sorted(signature, key=lambda item: item["qualified_name"])
+
+
+def _source_path_incremental_eligibility(
+    project_root: str | Path,
+    active_graph_json: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    node = _node_for_primary_path(active_graph_json, path)
+    if not node:
+        return {"supported": False, "reason": "source_primary_node_not_unique", "path": path}
+    module = parse_production_module_file(str(Path(project_root).resolve()), path)
+    if module is None:
+        return {"supported": False, "reason": "source_adapter_parse_failed", "path": path}
+    metadata = _node_metadata(node)
+    expected_module = str(metadata.get("module") or "")
+    parsed_module = str(getattr(module, "module_name", "") or "")
+    if expected_module and parsed_module != expected_module:
+        return {
+            "supported": False,
+            "reason": "source_module_identity_changed",
+            "path": path,
+            "expected_module": expected_module,
+            "parsed_module": parsed_module,
+        }
+    if getattr(module, "import_map", None):
+        return {"supported": False, "reason": "source_imports_require_full_rebuild", "path": path}
+    if getattr(module, "adapter_imports", None):
+        return {"supported": False, "reason": "source_adapter_imports_require_full_rebuild", "path": path}
+    if getattr(module, "adapter_relations", None):
+        return {"supported": False, "reason": "source_adapter_relations_require_full_rebuild", "path": path}
+    for func in getattr(module, "functions", []) or []:
+        if getattr(func, "decorators", None):
+            return {"supported": False, "reason": "source_decorators_require_full_rebuild", "path": path}
+        if getattr(func, "calls", None):
+            return {"supported": False, "reason": "source_function_calls_require_full_rebuild", "path": path}
+    try:
+        typed_relations = extract_typed_relations(
+            str(Path(project_root).resolve()),
+            {parsed_module: module},
+        )
+    except Exception:
+        typed_relations = [{"error": "typed_relation_scan_failed"}]
+    if typed_relations:
+        return {
+            "supported": False,
+            "reason": "source_typed_relations_require_full_rebuild",
+            "path": path,
+            "typed_relation_count": len(typed_relations),
+        }
+    parsed_signature = _module_function_signature(module)
+    active_signature = _node_function_signature(node)
+    if parsed_signature != active_signature:
+        return {
+            "supported": False,
+            "reason": "source_function_signature_changed",
+            "path": path,
+            "parsed_signature": parsed_signature,
+            "active_signature": active_signature,
+        }
+    return {
+        "supported": True,
+        "reason": "source_hash_only_structure_stable",
+        "path": path,
+        "node_id": _node_id(node),
+        "module": parsed_module,
+    }
+
+
 def _node_ids_for_paths(graph_json: dict[str, Any], paths: set[str]) -> list[str]:
     if not paths:
         return []
@@ -575,6 +690,8 @@ def _mark_scope_file_delta_strategy(
 def _incremental_metadata_scope_eligibility(
     scope_file_delta: dict[str, Any],
     *,
+    project_root: str | Path,
+    active_graph_json: dict[str, Any],
     old_rows: list[dict[str, Any]],
     new_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -607,20 +724,57 @@ def _incremental_metadata_scope_eligibility(
     old_by_path = _rows_by_path(old_rows)
     new_by_path = _rows_by_path(new_rows)
     unsupported: list[dict[str, str]] = []
+    source_checks: list[dict[str, Any]] = []
+    source_paths: list[str] = []
+    metadata_paths: list[str] = []
     for path in sorted(impacted):
         old_row = old_by_path.get(path) or {}
         new_row = new_by_path.get(path) or {}
         kind = str(new_row.get("file_kind") or old_row.get("file_kind") or "")
         role = str(new_row.get("attachment_role") or old_row.get("attachment_role") or "")
+        if kind in _INCREMENTAL_METADATA_FILE_KINDS and role != "primary":
+            metadata_paths.append(path)
+            continue
+        if kind == "source" and role == "primary":
+            check = _source_path_incremental_eligibility(project_root, active_graph_json, path)
+            source_checks.append(check)
+            if not check.get("supported"):
+                unsupported.append({
+                    "path": path,
+                    "file_kind": kind,
+                    "attachment_role": role,
+                    "reason": str(check.get("reason") or ""),
+                })
+            else:
+                source_paths.append(path)
+            continue
         if kind not in _INCREMENTAL_METADATA_FILE_KINDS or role == "primary":
             unsupported.append({"path": path, "file_kind": kind, "attachment_role": role})
     if unsupported:
+        detailed_reasons = sorted({
+            str(item.get("reason") or "")
+            for item in unsupported
+            if str(item.get("reason") or "")
+        })
         return {
             "supported": False,
-            "reason": "structural_or_unknown_file_requires_full_rebuild",
+            "reason": detailed_reasons[0] if len(detailed_reasons) == 1 else "structural_or_unknown_file_requires_full_rebuild",
             "unsupported": unsupported,
+            "source_checks": source_checks,
         }
-    return {"supported": True, "reason": "metadata_only_hash_change"}
+    mode = "metadata_only"
+    if source_paths and metadata_paths:
+        mode = "mixed_hash_only"
+    elif source_paths:
+        mode = "source_hash_only"
+    return {
+        "supported": True,
+        "reason": "hash_only_structure_stable",
+        "mode": mode,
+        "source_paths": source_paths,
+        "metadata_paths": metadata_paths,
+        "source_checks": source_checks,
+    }
 
 
 def _build_scope_graph_delta(
@@ -1674,6 +1828,8 @@ def _run_incremental_metadata_scope_reconcile_candidate(
     )
     eligibility = _incremental_metadata_scope_eligibility(
         scope_file_delta,
+        project_root=root,
+        active_graph_json=active_graph_json,
         old_rows=active_inventory,
         new_rows=file_inventory,
     )
@@ -1683,6 +1839,13 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             "fallback_reason": str(eligibility.get("reason") or "incremental_metadata_unsupported"),
             "incremental_eligibility": eligibility,
         }
+    graph_delta_mode = str(eligibility.get("mode") or "metadata_only")
+    if isinstance(candidate_graph, dict):
+        metadata = dict(candidate_graph.get("metadata") or {})
+        incremental_metadata = dict(metadata.get("incremental_scope_reconcile") or {})
+        incremental_metadata["mode"] = graph_delta_mode
+        metadata["incremental_scope_reconcile"] = incremental_metadata
+        candidate_graph["metadata"] = metadata
 
     state_dir = _governance_state_dir(project_id, rid)
     scratch_dir = state_dir / "scratch"
@@ -1706,7 +1869,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             "commit_sha": target,
             "created_by": created_by,
             "scope_reconcile_strategy": "incremental_graph_delta",
-            "scope_graph_delta_mode": "metadata_only",
+            "scope_graph_delta_mode": graph_delta_mode,
         },
         output_payload={
             "state_dir": str(state_dir),
@@ -1748,21 +1911,21 @@ def _run_incremental_metadata_scope_reconcile_candidate(
     scope_file_delta = _mark_scope_file_delta_strategy(
         scope_file_delta,
         strategy="incremental_graph_delta",
-        graph_delta_mode="metadata_only",
+        graph_delta_mode=graph_delta_mode,
     )
     scope_graph_delta = _build_scope_graph_delta(
         old_graph_json=active_graph_json,
         new_graph_json=candidate_graph,
         scope_file_delta=scope_file_delta,
         strategy="incremental_graph_delta",
-        mode="metadata_only",
+        mode=graph_delta_mode,
     )
     notes = {
         "state_only": True,
         "run_id": rid,
         "snapshot_kind": "scope",
         "scope_reconcile_strategy": "incremental_graph_delta",
-        "scope_graph_delta_mode": "metadata_only",
+        "scope_graph_delta_mode": graph_delta_mode,
         "incremental_scope_reconcile": {
             "active_snapshot_id": active_snapshot_id,
             "active_graph_commit": active_commit,
@@ -2204,6 +2367,10 @@ def run_pending_scope_reconcile_candidate(
         semantic_options=semantic_options,
     )
     if incremental_result.get("ok"):
+        incremental_mode = str(
+            (incremental_result.get("incremental_eligibility") or {}).get("mode")
+            or "metadata_only"
+        )
         return _finalize_scope_reconcile_candidate(
             conn,
             project_id,
@@ -2220,7 +2387,7 @@ def run_pending_scope_reconcile_candidate(
             created_by=created_by,
             semantic_enqueue_stale=semantic_enqueue_stale,
             strategy="incremental_graph_delta",
-            graph_delta_mode="metadata_only",
+            graph_delta_mode=incremental_mode,
         )
     fallback_reason = str(
         incremental_result.get("fallback_reason")
