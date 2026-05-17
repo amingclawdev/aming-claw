@@ -85,6 +85,32 @@ def _write_call_free_project(root: Path, *, result: str = "ok") -> None:
     _write(root / "README.md", "# Service\n\nCall-free source consistency fixture.\n")
 
 
+def _write_dependency_project(root: Path, *, helper_module: str = "helper_a") -> None:
+    _write(
+        root / "agent" / "service.py",
+        f"from agent.{helper_module} import run_helper\n\n"
+        "def service_entry():\n"
+        "    return run_helper()\n",
+    )
+    _write(
+        root / "agent" / "helper_a.py",
+        "def run_helper():\n"
+        "    return 'a'\n",
+    )
+    _write(
+        root / "agent" / "helper_b.py",
+        "def run_helper():\n"
+        "    return 'b'\n",
+    )
+    _write(
+        root / "agent" / "tests" / "test_service.py",
+        "from agent.service import service_entry\n\n"
+        "def test_service_entry():\n"
+        "    assert service_entry() in {'a', 'b'}\n",
+    )
+    _write(root / "README.md", "# Service\n\nSource dependency consistency fixture.\n")
+
+
 def _normalized_snapshot(conn: sqlite3.Connection, snapshot_id: str) -> dict:
     graph = _read_snapshot_graph(PID, snapshot_id)
     inventory = _snapshot_inventory_rows(conn, PID, snapshot_id)
@@ -290,6 +316,81 @@ def test_scope_reconcile_source_hash_only_matches_full_rebuild_for_same_final_st
     base_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "full-source-base-consistency"))
     scope_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "scope-source-head-consistency"))
     assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]
+
+
+def test_scope_reconcile_source_dependency_delta_matches_full_rebuild(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_dependency_project(project, helper_module="helper_a")
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "base")
+    base_commit = _git(project, "rev-parse", "HEAD")
+
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-source-dep-base-consistency",
+        commit_sha=base_commit,
+        snapshot_id="full-source-dep-base-consistency",
+        created_by="test",
+        activate=True,
+        semantic_enrich=False,
+    )
+    assert base["ok"] is True
+
+    _write_dependency_project(project, helper_module="helper_b")
+    _git(project, "add", "agent/service.py")
+    _git(project, "commit", "-m", "retarget service dependency")
+    head_commit = _git(project, "rev-parse", "HEAD")
+    store.queue_pending_scope_reconcile(
+        conn,
+        PID,
+        commit_sha=head_commit,
+        parent_commit_sha=base_commit,
+        evidence={"source": "test"},
+    )
+
+    scope = run_pending_scope_reconcile_candidate(
+        conn,
+        PID,
+        project,
+        target_commit_sha=head_commit,
+        run_id="scope-source-dep-head-consistency",
+        snapshot_id="scope-source-dep-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert scope["ok"] is True
+    assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_file_delta"]["graph_delta_mode"] == "source_dependency_delta"
+    assert scope["scope_graph_delta"]["mode"] == "source_dependency_delta"
+    assert scope["scope_graph_delta"]["added_nodes"] == []
+    assert scope["scope_graph_delta"]["removed_nodes"] == []
+    assert scope["scope_graph_delta"]["added_edges"]
+    assert scope["scope_graph_delta"]["removed_edges"]
+
+    full = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-source-dep-head-consistency",
+        commit_sha=head_commit,
+        snapshot_id="full-source-dep-head-consistency",
+        created_by="test",
+        semantic_enrich=False,
+    )
+    assert full["ok"] is True
+    assert _normalized_snapshot(conn, "scope-source-dep-head-consistency") == _normalized_snapshot(
+        conn,
+        "full-source-dep-head-consistency",
+    )
+
+    base_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "full-source-dep-base-consistency"))
+    scope_node_ids = _node_ids_by_primary_file(_read_snapshot_graph(PID, "scope-source-dep-head-consistency"))
+    assert scope_node_ids["agent/service.py"] == base_node_ids["agent/service.py"]
+    assert scope_node_ids["agent/helper_a.py"] == base_node_ids["agent/helper_a.py"]
+    assert scope_node_ids["agent/helper_b.py"] == base_node_ids["agent/helper_b.py"]
 
 
 def test_scope_reconcile_test_fanin_incremental_matches_full_rebuild(conn, tmp_path):

@@ -64,9 +64,15 @@ from agent.governance.reconcile_file_inventory import (
     git_tracked_paths,
 )
 from agent.governance.reconcile_phases.phase_z_v2 import (
+    FunctionMeta,
+    ModuleInfo,
+    build_call_graph,
+    build_function_call_facts,
     build_test_consumer_fanin_index,
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
+    build_module_dependency_edges,
+    enrich_nodes_with_architecture_signals,
     extract_typed_relations,
     parse_production_modules,
     parse_production_module_file,
@@ -625,30 +631,18 @@ def _source_path_incremental_eligibility(
             "expected_module": expected_module,
             "parsed_module": parsed_module,
         }
-    if getattr(module, "import_map", None):
-        return {"supported": False, "reason": "source_imports_require_full_rebuild", "path": path}
-    if getattr(module, "adapter_imports", None):
-        return {"supported": False, "reason": "source_adapter_imports_require_full_rebuild", "path": path}
-    if getattr(module, "adapter_relations", None):
-        return {"supported": False, "reason": "source_adapter_relations_require_full_rebuild", "path": path}
-    for func in getattr(module, "functions", []) or []:
-        if getattr(func, "decorators", None):
-            return {"supported": False, "reason": "source_decorators_require_full_rebuild", "path": path}
-        if getattr(func, "calls", None):
-            return {"supported": False, "reason": "source_function_calls_require_full_rebuild", "path": path}
     try:
         typed_relations = extract_typed_relations(
             str(Path(project_root).resolve()),
             {parsed_module: module},
         )
     except Exception:
-        typed_relations = [{"error": "typed_relation_scan_failed"}]
-    if typed_relations:
+        return {"supported": False, "reason": "source_typed_relation_scan_failed", "path": path}
+    if getattr(module, "source_kind", "") == "filetree_fallback":
         return {
             "supported": False,
-            "reason": "source_typed_relations_require_full_rebuild",
+            "reason": "source_filetree_fallback_requires_full_rebuild",
             "path": path,
-            "typed_relation_count": len(typed_relations),
         }
     parsed_signature = _module_function_signature(module)
     active_signature = _node_function_signature(node)
@@ -662,10 +656,28 @@ def _source_path_incremental_eligibility(
         }
     return {
         "supported": True,
-        "reason": "source_hash_only_structure_stable",
+        "reason": "source_dependency_structure_stable"
+        if (
+            getattr(module, "import_map", None)
+            or getattr(module, "adapter_imports", None)
+            or getattr(module, "adapter_relations", None)
+            or typed_relations
+            or any(getattr(func, "calls", None) for func in getattr(module, "functions", []) or [])
+            or any(getattr(func, "decorators", None) for func in getattr(module, "functions", []) or [])
+        )
+        else "source_hash_only_structure_stable",
         "path": path,
         "node_id": _node_id(node),
         "module": parsed_module,
+        "requires_dependency_delta": bool(
+            getattr(module, "import_map", None)
+            or getattr(module, "adapter_imports", None)
+            or getattr(module, "adapter_relations", None)
+            or typed_relations
+            or any(getattr(func, "calls", None) for func in getattr(module, "functions", []) or [])
+            or any(getattr(func, "decorators", None) for func in getattr(module, "functions", []) or [])
+        ),
+        "typed_relation_count": len(typed_relations),
     }
 
 
@@ -834,16 +846,27 @@ def _incremental_metadata_scope_eligibility(
             "metadata_paths": metadata_paths,
             "source_checks": source_checks,
         }
+    source_dependency_delta = any(
+        bool(check.get("requires_dependency_delta"))
+        for check in source_checks
+        if isinstance(check, dict)
+    )
     mode = "metadata_only"
     if test_paths:
         mode = "test_fanin_file_set" if test_file_set_paths else "test_fanin_hash_only"
     elif source_paths and metadata_paths:
-        mode = "mixed_hash_only"
+        mode = "mixed_dependency_delta" if source_dependency_delta else "mixed_hash_only"
     elif source_paths:
-        mode = "source_hash_only"
+        mode = "source_dependency_delta" if source_dependency_delta else "source_hash_only"
     return {
         "supported": True,
-        "reason": "test_fanin_file_set_structure_stable" if test_file_set_paths else "hash_only_structure_stable",
+        "reason": (
+            "test_fanin_file_set_structure_stable"
+            if test_file_set_paths
+            else "source_dependency_structure_stable"
+            if source_dependency_delta
+            else "hash_only_structure_stable"
+        ),
         "mode": mode,
         "source_paths": source_paths,
         "metadata_paths": metadata_paths,
@@ -975,6 +998,611 @@ def _apply_incremental_test_fanin_bindings(
         "removed_test_paths": sorted(removed),
         "updated_node_ids": sorted(set(updated_node_ids)),
         "updated_modules": sorted(set(updated_modules)),
+    }
+
+
+def _module_info_from_graph_node(project_root: str | Path, node: dict[str, Any]) -> ModuleInfo | None:
+    metadata = _node_metadata(node)
+    module_name = str(metadata.get("module") or node.get("module") or "")
+    primary = sorted(_path_values(node, "primary"))
+    if not module_name or not primary:
+        return None
+    function_lines = metadata.get("function_lines") if isinstance(metadata.get("function_lines"), dict) else {}
+    functions: list[FunctionMeta] = []
+    for qualified_name in metadata.get("functions", []) or []:
+        qname = str(qualified_name or "")
+        if not qname:
+            continue
+        name = qname.rsplit("::", 1)[-1]
+        lines = function_lines.get(name) if isinstance(function_lines.get(name), list) else []
+        start = int(lines[0]) if len(lines) >= 1 else 0
+        end = int(lines[1]) if len(lines) >= 2 else start
+        functions.append(
+            FunctionMeta(
+                module=module_name,
+                name=name,
+                qualified_name=qname,
+                lineno=start,
+                end_lineno=end,
+            )
+        )
+    return ModuleInfo(
+        path=str(Path(project_root).resolve() / primary[0]),
+        module_name=module_name,
+        functions=functions,
+    )
+
+
+def _active_module_index(
+    project_root: str | Path,
+    graph_json: dict[str, Any],
+) -> tuple[dict[str, ModuleInfo], dict[str, dict[str, Any]], dict[str, str]]:
+    modules: dict[str, ModuleInfo] = {}
+    nodes_by_module: dict[str, dict[str, Any]] = {}
+    node_ids_by_module: dict[str, str] = {}
+    for node in _deps_graph_nodes(graph_json):
+        module = _module_info_from_graph_node(project_root, node)
+        if module is None:
+            continue
+        node_id = _node_id(node)
+        modules[module.module_name] = module
+        nodes_by_module[module.module_name] = node
+        if node_id:
+            node_ids_by_module[module.module_name] = node_id
+    return modules, nodes_by_module, node_ids_by_module
+
+
+def _asset_identity_for_relation(target_kind: str, target: str) -> tuple[str, bool]:
+    kind = str(target_kind or "")
+    value = str(target or "")
+    lower = value.lower()
+    if kind == "db_table":
+        return f"db_table:{value}", False
+    if kind == "artifact":
+        basename = lower.rsplit("/", 1)[-1]
+        important = (
+            basename.startswith("graph")
+            or basename in {"governance.db", "context_store.db", "manager_signal.json", "manager_status.json"}
+            or lower.endswith((".db", ".sqlite", ".sqlite3"))
+        )
+        return (f"artifact:{value}", False) if important else ("artifact:__artifact_assets", True)
+    if kind == "config":
+        return f"config:{value}", False
+    if kind == "event":
+        return "event:__event_contracts", True
+    if kind == "interface":
+        return (f"interface:{value}", False) if "/api/" in lower else ("interface:__interface_contracts", True)
+    if kind == "task":
+        return "task:__task_contracts", True
+    if kind == "task_metadata":
+        return "task_metadata:__task_metadata_contracts", True
+    return f"{kind}:{value}", False
+
+
+def _asset_ids_by_key(graph_json: dict[str, Any]) -> dict[str, tuple[str, bool]]:
+    out: dict[str, tuple[str, bool]] = {}
+    for node in _deps_graph_nodes(graph_json):
+        if str(node.get("layer") or "") != "L4":
+            continue
+        metadata = _node_metadata(node)
+        key = str(metadata.get("asset_key") or node.get("asset_key") or "")
+        node_id = _node_id(node)
+        if key and node_id:
+            out[key] = (node_id, bool(metadata.get("aggregate_asset") or node.get("aggregate_asset")))
+    return out
+
+
+def _link_kind(link: dict[str, Any]) -> str:
+    metadata = link.get("metadata") if isinstance(link.get("metadata"), dict) else {}
+    return str(metadata.get("edge_kind") or "")
+
+
+def _add_indexed_graph_link(
+    links: list[dict[str, Any]],
+    index: dict[tuple[str, str, str], dict[str, Any]],
+    source: str,
+    target: str,
+    relation_type: str,
+    evidence: str = "",
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not source or not target or source == target:
+        return
+    key = (source, target, relation_type)
+    if key in index:
+        item = index[key]
+        item["evidence_count"] = int(item.get("evidence_count") or 1) + 1
+        if evidence:
+            sample = item.setdefault("evidence_sample", [])
+            if isinstance(sample, list) and evidence not in sample and len(sample) < 5:
+                sample.append(evidence)
+        return
+    item: dict[str, Any] = {"source": source, "target": target, "type": relation_type}
+    if evidence:
+        item["evidence"] = evidence
+        item["evidence_sample"] = [evidence]
+        item["evidence_count"] = 1
+    if metadata:
+        item["metadata"] = dict(metadata)
+    index[key] = item
+    links.append(item)
+
+
+def _dependency_direction_for_relation(source: str, target: str, relation_type: str) -> tuple[str, str]:
+    producer_to_asset = {
+        "owns_state",
+        "writes_state",
+        "writes_artifact",
+        "emits_event",
+    }
+    asset_to_consumer = {
+        "reads_state",
+        "reads_artifact",
+        "consumes_event",
+        "uses_task_metadata",
+        "http_route",
+        "creates_task",
+        "configures_role",
+        "configures_analyzer",
+        "configures_model_routing",
+        "configures_runtime",
+    }
+    if relation_type in producer_to_asset:
+        return source, target
+    if relation_type in asset_to_consumer:
+        return target, source
+    return source, target
+
+
+def _graph_links_have_cycle(links: list[dict[str, Any]]) -> bool:
+    adjacency: dict[str, set[str]] = {}
+    for link in links:
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        if source and target and source != target:
+            adjacency.setdefault(source, set()).add(target)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> bool:
+        if node_id in visiting:
+            return True
+        if node_id in visited:
+            return False
+        visiting.add(node_id)
+        for child in adjacency.get(node_id, set()):
+            if visit(child):
+                return True
+        visiting.remove(node_id)
+        visited.add(node_id)
+        return False
+
+    return any(visit(node_id) for node_id in list(adjacency))
+
+
+def _refresh_candidate_dependency_links(candidate_graph: dict[str, Any]) -> dict[str, Any]:
+    deps_graph = candidate_graph.get("deps_graph") if isinstance(candidate_graph.get("deps_graph"), dict) else {}
+    hierarchy_graph = (
+        candidate_graph.get("hierarchy_graph")
+        if isinstance(candidate_graph.get("hierarchy_graph"), dict)
+        else {}
+    )
+    nodes = [node for node in deps_graph.get("nodes", []) or [] if isinstance(node, dict)]
+    nodes_by_id = {_node_id(node): node for node in nodes if _node_id(node)}
+    links = [dict(link) for link in deps_graph.get("links", []) or [] if isinstance(link, dict)]
+    base_links = [
+        link for link in links
+        if _link_kind(link) not in {
+            "aggregated_l2_dependency",
+            "aggregated_l3_dependency",
+            "shared_asset_dependency",
+        }
+    ]
+    parent: dict[str, str] = {}
+    for link in hierarchy_graph.get("links", []) or []:
+        if not isinstance(link, dict) or str(link.get("type") or "") != "contains":
+            continue
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        if source and target:
+            parent[target] = source
+    for node_id, node in nodes_by_id.items():
+        metadata = _node_metadata(node)
+        parent_id = str(metadata.get("hierarchy_parent") or "")
+        if parent_id and node_id not in parent:
+            parent[node_id] = parent_id
+
+    def node_layer(node_id: str) -> str:
+        return str((nodes_by_id.get(node_id) or {}).get("layer") or "")
+
+    def is_aggregate_asset(node_id: str) -> bool:
+        node = nodes_by_id.get(node_id) or {}
+        metadata = _node_metadata(node)
+        return node.get("layer") == "L4" and bool(metadata.get("aggregate_asset") or node.get("aggregate_asset"))
+
+    def parent_at(node_id: str, layer: str) -> str:
+        current = node_id
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            if node_layer(current) == layer:
+                return current
+            current = parent.get(current, "")
+        return ""
+
+    index = {
+        (
+            str(link.get("source") or ""),
+            str(link.get("target") or ""),
+            str(link.get("type") or ""),
+        ): link
+        for link in base_links
+    }
+    asset_producers: dict[str, set[str]] = {}
+    asset_consumers: dict[str, set[str]] = {}
+    for link in base_links:
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        source_layer = node_layer(source)
+        target_layer = node_layer(target)
+        if source_layer == "L7" and target_layer == "L4":
+            asset_producers.setdefault(target, set()).add(source)
+        elif source_layer == "L4" and target_layer == "L7":
+            asset_consumers.setdefault(source, set()).add(target)
+    for asset_id, producers in sorted(asset_producers.items()):
+        if is_aggregate_asset(asset_id):
+            continue
+        for producer in sorted(producers):
+            for consumer in sorted(asset_consumers.get(asset_id, set())):
+                _add_indexed_graph_link(
+                    base_links,
+                    index,
+                    producer,
+                    consumer,
+                    "depends_on",
+                    f"shared asset {asset_id}",
+                    metadata={"edge_kind": "shared_asset_dependency", "asset": asset_id},
+                )
+
+    l7_links = [
+        link for link in base_links
+        if node_layer(str(link.get("source") or "")) == "L7"
+        and node_layer(str(link.get("target") or "")) == "L7"
+    ]
+    for link in l7_links:
+        source_l7 = str(link.get("source") or "")
+        target_l7 = str(link.get("target") or "")
+        source_l3 = parent_at(source_l7, "L3")
+        target_l3 = parent_at(target_l7, "L3")
+        source_l2 = parent_at(source_l7, "L2")
+        target_l2 = parent_at(target_l7, "L2")
+        if source_l3 and target_l3 and source_l3 != target_l3:
+            _add_indexed_graph_link(
+                base_links,
+                index,
+                source_l3,
+                target_l3,
+                "depends_on",
+                f"aggregated from {source_l7}->{target_l7}",
+                metadata={"edge_kind": "aggregated_l3_dependency"},
+            )
+        if source_l2 and target_l2 and source_l2 != target_l2:
+            _add_indexed_graph_link(
+                base_links,
+                index,
+                source_l2,
+                target_l2,
+                "depends_on",
+                f"aggregated from {source_l7}->{target_l7}",
+                metadata={"edge_kind": "aggregated_l2_dependency"},
+            )
+
+    deps_graph["links"] = sorted(base_links, key=lambda item: (
+        str(item.get("source") or ""),
+        str(item.get("target") or ""),
+        str(item.get("type") or ""),
+    ))
+    deps_by_child: dict[str, set[str]] = {}
+    for link in deps_graph.get("links", []) or []:
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        if source and target:
+            deps_by_child.setdefault(target, set()).add(source)
+    for node in nodes:
+        node["_deps"] = sorted(deps_by_child.get(_node_id(node), set()))
+
+    summary = candidate_graph.setdefault("architecture_summary", {})
+    if isinstance(summary, dict):
+        summary["dependency_link_count"] = len(deps_graph.get("links") or [])
+        summary["link_count"] = (
+            len((candidate_graph.get("hierarchy_graph") or {}).get("links") or [])
+            + len((candidate_graph.get("evidence_graph") or {}).get("links") or [])
+            + len(deps_graph.get("links") or [])
+        )
+    return {"ok": True, "dependency_link_count": len(deps_graph.get("links") or [])}
+
+
+def _refresh_relationship_metrics_in_place(candidate_graph: dict[str, Any]) -> None:
+    nodes = _deps_graph_nodes(candidate_graph)
+    node_map = {_node_id(node): node for node in nodes if _node_id(node)}
+    metrics: dict[str, dict[str, int]] = {
+        node_id: {"fan_in": 0, "fan_out": 0, "hierarchy_in": 0, "hierarchy_out": 0}
+        for node_id in node_map
+    }
+    hierarchy_graph = candidate_graph.get("hierarchy_graph") if isinstance(candidate_graph.get("hierarchy_graph"), dict) else {}
+    for link in hierarchy_graph.get("links", []) or []:
+        if not isinstance(link, dict) or str(link.get("type") or "") != "contains":
+            continue
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        if source in metrics:
+            metrics[source]["hierarchy_out"] += 1
+        if target in metrics:
+            metrics[target]["hierarchy_in"] += 1
+    deps_graph = candidate_graph.get("deps_graph") if isinstance(candidate_graph.get("deps_graph"), dict) else {}
+    for link in deps_graph.get("links", []) or []:
+        if not isinstance(link, dict):
+            continue
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        weight = max(1, int(link.get("evidence_count") or 1))
+        if source in metrics:
+            metrics[source]["fan_out"] += weight
+        if target in metrics:
+            metrics[target]["fan_in"] += weight
+    for node in nodes:
+        metadata = _node_metadata(node)
+        flags = [
+            str(flag)
+            for flag in metadata.get("quality_flags", []) or []
+            if str(flag) != "no_direct_dependency_edges"
+        ]
+        node_id = _node_id(node)
+        node_metrics = metrics.get(node_id, {"fan_in": 0, "fan_out": 0, "hierarchy_in": 0, "hierarchy_out": 0})
+        metadata["graph_metrics"] = node_metrics
+        if (
+            str(node.get("layer") or "").upper() == "L7"
+            and node_metrics["fan_in"] == 0
+            and node_metrics["fan_out"] == 0
+        ):
+            flags.append("no_direct_dependency_edges")
+        metadata["quality_flags"] = sorted(set(flags))
+        node["metadata"] = metadata
+
+
+def _merge_function_facts_for_changed_modules(
+    candidate_graph: dict[str, Any],
+    modules: dict[str, ModuleInfo],
+    changed_modules: set[str],
+) -> None:
+    call_graph = build_call_graph(modules)
+    facts = build_function_call_facts(modules, call_graph)
+    for node in _deps_graph_nodes(candidate_graph):
+        metadata = _node_metadata(node)
+        module_name = str(metadata.get("module") or node.get("module") or "")
+        if not module_name:
+            continue
+        module_facts = facts.get(module_name) or {}
+        old_called_by = [
+            item for item in metadata.get("function_called_by", []) or []
+            if str((item or {}).get("caller_module") or "") not in changed_modules
+        ]
+        new_called_by = [
+            item for item in module_facts.get("called_by", []) or []
+            if str((item or {}).get("caller_module") or "") in changed_modules
+        ]
+        if module_name in changed_modules:
+            metadata["function_calls"] = list(module_facts.get("calls") or [])
+            metadata["function_weak_calls"] = list(module_facts.get("weak_calls") or [])
+            metadata["function_call_count"] = len(metadata["function_calls"])
+            metadata["function_weak_call_count"] = len(metadata["function_weak_calls"])
+        metadata["function_called_by"] = sorted(
+            old_called_by + new_called_by,
+            key=lambda item: (
+                str((item or {}).get("callee") or ""),
+                str((item or {}).get("caller") or ""),
+            ),
+        )
+        metadata["function_called_by_count"] = len(metadata["function_called_by"])
+        node["metadata"] = metadata
+
+
+def _apply_incremental_source_dependency_delta(
+    project_root: str | Path,
+    candidate_graph: dict[str, Any],
+    *,
+    source_paths: list[str],
+) -> dict[str, Any]:
+    source_set = {
+        _norm_repo_path(path)
+        for path in source_paths
+        if _norm_repo_path(path)
+    }
+    if not source_set:
+        return {"ok": True, "source_paths": [], "updated_node_ids": []}
+    modules, _nodes_by_module, node_ids_by_module = _active_module_index(project_root, candidate_graph)
+    changed_modules: set[str] = set()
+    updated_node_ids: set[str] = set()
+    parsed_modules: dict[str, ModuleInfo] = {}
+    typed_relations: list[dict[str, Any]] = []
+    for path in sorted(source_set):
+        node = _node_for_primary_path(candidate_graph, path)
+        if not node:
+            return {"ok": False, "reason": "source_primary_node_not_unique", "path": path}
+        module = parse_production_module_file(str(Path(project_root).resolve()), path)
+        if module is None:
+            return {"ok": False, "reason": "source_adapter_parse_failed", "path": path}
+        metadata = _node_metadata(node)
+        module_name = str(metadata.get("module") or "")
+        if not module_name or module.module_name != module_name:
+            return {
+                "ok": False,
+                "reason": "source_module_identity_changed",
+                "path": path,
+                "expected_module": module_name,
+                "parsed_module": module.module_name,
+            }
+        node_id = _node_id(node)
+        if not node_id:
+            return {"ok": False, "reason": "source_node_id_missing", "path": path}
+        changed_modules.add(module_name)
+        updated_node_ids.add(node_id)
+        parsed_modules[module_name] = module
+        modules[module_name] = module
+        metadata["function_count"] = len(module.functions)
+        metadata["functions"] = sorted(func.qualified_name for func in module.functions)
+        metadata["function_lines"] = {
+            func.name: [int(func.lineno or 0), int(func.end_lineno or func.lineno or 0)]
+            for func in module.functions
+            if func.name
+        }
+        temp_node = {"module": module_name}
+        module_relations = extract_typed_relations(str(Path(project_root).resolve()), {module_name: module})
+        enrich_nodes_with_architecture_signals([temp_node], module_relations)
+        metadata["typed_relations"] = temp_node.get("typed_relations") or []
+        metadata["architecture_signals"] = temp_node.get("architecture_signals") or {}
+        node["metadata"] = metadata
+        typed_relations.extend(metadata["typed_relations"])
+
+    asset_index = _asset_ids_by_key(candidate_graph)
+    evidence_graph = candidate_graph.get("evidence_graph") if isinstance(candidate_graph.get("evidence_graph"), dict) else {}
+    deps_graph = candidate_graph.get("deps_graph") if isinstance(candidate_graph.get("deps_graph"), dict) else {}
+    changed_node_ids = {node_ids_by_module[module] for module in changed_modules if module in node_ids_by_module}
+    if not changed_node_ids:
+        return {"ok": False, "reason": "source_changed_node_missing"}
+
+    evidence_links = [
+        dict(link) for link in evidence_graph.get("links", []) or []
+        if isinstance(link, dict)
+        and not (
+            _link_kind(link) == "module_dependency"
+            and str(link.get("target") or "") in changed_node_ids
+        )
+        and not (
+            _link_kind(link) == "typed_evidence"
+            and str(link.get("source") or "") in changed_node_ids
+        )
+    ]
+    dependency_links = [
+        dict(link) for link in deps_graph.get("links", []) or []
+        if isinstance(link, dict)
+        and not (
+            _link_kind(link) == "module_dependency"
+            and str(link.get("target") or "") in changed_node_ids
+        )
+        and not (
+            _link_kind(link) == "typed_dependency"
+            and (
+                str((link.get("metadata") or {}).get("evidence_source") or "") in changed_node_ids
+                or str((link.get("metadata") or {}).get("evidence_target") or "") in changed_node_ids
+                or str(link.get("source") or "") in changed_node_ids
+                or str(link.get("target") or "") in changed_node_ids
+            )
+        )
+    ]
+    evidence_index = {
+        (
+            str(link.get("source") or ""),
+            str(link.get("target") or ""),
+            str(link.get("type") or ""),
+        ): link
+        for link in evidence_links
+    }
+    dependency_index = {
+        (
+            str(link.get("source") or ""),
+            str(link.get("target") or ""),
+            str(link.get("type") or ""),
+        ): link
+        for link in dependency_links
+    }
+
+    module_edges = [
+        edge for edge in build_module_dependency_edges(modules, build_call_graph(modules))
+        if str(edge.get("target_module") or "") in changed_modules
+    ]
+    for edge in module_edges:
+        source_id = node_ids_by_module.get(str(edge.get("source_module") or ""), "")
+        target_id = node_ids_by_module.get(str(edge.get("target_module") or ""), "")
+        evidence = str(edge.get("evidence") or "")
+        metadata = {
+            "edge_kind": "module_dependency",
+            "relation_type": edge.get("relation_type") or "",
+        }
+        _add_indexed_graph_link(evidence_links, evidence_index, source_id, target_id, "depends_on", evidence, metadata=metadata)
+        _add_indexed_graph_link(dependency_links, dependency_index, source_id, target_id, "depends_on", evidence, metadata=metadata)
+
+    for rel in typed_relations:
+        module_name = str(rel.get("source_module") or "")
+        source_id = node_ids_by_module.get(module_name, "")
+        relation_type = str(rel.get("relation_type") or "")
+        target_kind = str(rel.get("target_kind") or "")
+        target = str(rel.get("target") or "")
+        asset_key, aggregate_asset = _asset_identity_for_relation(target_kind, target)
+        asset_entry = asset_index.get(asset_key)
+        if not asset_entry:
+            return {
+                "ok": False,
+                "reason": "source_typed_relation_asset_unknown",
+                "asset_key": asset_key,
+                "target_kind": target_kind,
+                "target": target,
+            }
+        target_id, active_aggregate_asset = asset_entry
+        aggregate_asset = aggregate_asset or active_aggregate_asset
+        evidence = str(rel.get("evidence") or "")
+        if aggregate_asset and target and asset_key.endswith("__artifact_assets"):
+            evidence = " | ".join(part for part in [evidence, target] if part)
+        _add_indexed_graph_link(
+            evidence_links,
+            evidence_index,
+            source_id,
+            target_id,
+            relation_type,
+            evidence,
+            metadata={"edge_kind": "typed_evidence"},
+        )
+        if aggregate_asset:
+            continue
+        dep_source, dep_target = _dependency_direction_for_relation(source_id, target_id, relation_type)
+        _add_indexed_graph_link(
+            dependency_links,
+            dependency_index,
+            dep_source,
+            dep_target,
+            relation_type,
+            evidence,
+            metadata={
+                "edge_kind": "typed_dependency",
+                "evidence_source": source_id,
+                "evidence_target": target_id,
+            },
+        )
+
+    evidence_graph["links"] = sorted(evidence_links, key=lambda item: (
+        str(item.get("source") or ""),
+        str(item.get("target") or ""),
+        str(item.get("type") or ""),
+    ))
+    deps_graph["links"] = sorted(dependency_links, key=lambda item: (
+        str(item.get("source") or ""),
+        str(item.get("target") or ""),
+        str(item.get("type") or ""),
+    ))
+    _merge_function_facts_for_changed_modules(candidate_graph, modules, changed_modules)
+    _refresh_candidate_dependency_links(candidate_graph)
+    _refresh_relationship_metrics_in_place(candidate_graph)
+    if _graph_links_have_cycle(deps_graph.get("links", []) or []):
+        return {"ok": False, "reason": "source_dependency_delta_cycle_risk"}
+    return {
+        "ok": True,
+        "source_paths": sorted(source_set),
+        "updated_node_ids": sorted(updated_node_ids),
+        "changed_modules": sorted(changed_modules),
+        "module_dependency_edge_count": len(module_edges),
+        "typed_relation_count": len(typed_relations),
     }
 
 
@@ -2051,6 +2679,68 @@ def _run_incremental_metadata_scope_reconcile_candidate(
         metadata["incremental_scope_reconcile"] = incremental_metadata
         candidate_graph["metadata"] = metadata
     test_fanin_update: dict[str, Any] = {}
+    source_dependency_update: dict[str, Any] = {}
+    if graph_delta_mode in {"source_dependency_delta", "mixed_dependency_delta"}:
+        source_dependency_update = _apply_incremental_source_dependency_delta(
+            root,
+            candidate_graph,
+            source_paths=[
+                str(path)
+                for path in eligibility.get("source_paths", []) or []
+                if str(path).strip()
+            ],
+        )
+        if not source_dependency_update.get("ok"):
+            return {
+                "ok": False,
+                "fallback_reason": str(
+                    source_dependency_update.get("reason") or "incremental_source_dependency_unsupported"
+                ),
+                "incremental_eligibility": eligibility,
+                "source_dependency_update": source_dependency_update,
+            }
+        governance_index = build_governance_index(
+            conn,
+            project_id,
+            root,
+            run_id=rid,
+            commit_sha=target,
+            candidate_graph=candidate_graph,
+            snapshot_id=sid,
+            snapshot_kind="scope",
+        )
+        file_inventory = _normalize_inventory_commit(
+            [
+                row for row in (governance_index.get("file_inventory") or [])
+                if isinstance(row, dict)
+            ],
+            commit_sha=target,
+        )
+        scope_file_delta = _build_scope_file_delta(
+            project_root=root,
+            old_rows=active_inventory,
+            new_rows=file_inventory,
+            changed_files=changed_files,
+        )
+        final_eligibility = _incremental_metadata_scope_eligibility(
+            scope_file_delta,
+            project_root=root,
+            active_graph_json=active_graph_json,
+            old_rows=active_inventory,
+            new_rows=file_inventory,
+        )
+        if not final_eligibility.get("supported"):
+            return {
+                "ok": False,
+                "fallback_reason": str(final_eligibility.get("reason") or "incremental_source_dependency_unsupported"),
+                "incremental_eligibility": final_eligibility,
+                "source_dependency_update": source_dependency_update,
+            }
+        graph_delta_mode = str(final_eligibility.get("mode") or graph_delta_mode)
+        eligibility = {
+            **final_eligibility,
+            "source_dependency_update": source_dependency_update,
+        }
     if graph_delta_mode in {"test_fanin_hash_only", "test_fanin_file_set"}:
         removed_test_paths = [
             str(path)
@@ -2155,6 +2845,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             "graph_stats": graph_payload_stats(candidate_graph),
             "eligibility": eligibility,
             "test_fanin_update": test_fanin_update,
+            "source_dependency_update": source_dependency_update,
         },
     )
     hash_metadata_merge = merge_feature_hashes_into_graph_nodes(candidate_graph, governance_index)
@@ -2196,6 +2887,7 @@ def _run_incremental_metadata_scope_reconcile_candidate(
             "active_graph_commit": active_commit,
             "target_commit": target,
             "eligibility": eligibility,
+            "source_dependency_update": source_dependency_update,
         },
         "scope_file_delta": scope_file_delta,
         "scope_graph_delta": scope_graph_delta,

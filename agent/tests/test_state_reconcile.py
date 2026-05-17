@@ -524,13 +524,13 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
 
     assert result["ok"] is True
     delta = result["scope_file_delta"]
-    assert delta["strategy"] == "full_rebuild_fallback"
-    assert delta["fallback_reason"] == "source_function_calls_require_full_rebuild"
+    assert delta["strategy"] == "incremental_graph_delta"
+    assert delta["graph_delta_mode"] == "source_dependency_delta"
     assert delta["changed_files"] == ["agent/service.py"]
     assert "agent/service.py" in delta["hash_changed_files"]
     assert "agent/service.py" in delta["impacted_files"]
-    assert result["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
-    assert result["scope_graph_delta"]["mode"] == "full_rebuild"
+    assert result["scope_graph_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_graph_delta"]["mode"] == "source_dependency_delta"
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/service.py"]
