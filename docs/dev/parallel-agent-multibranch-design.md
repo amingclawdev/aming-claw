@@ -208,6 +208,12 @@ merge outcome into the durable queue and branch context. It accepts `merged` or
 evidence, and enforces the branch fence token when the context has one. It does
 not run git merge or activate graph refs by itself.
 
+Implemented preview slice: the merge-preview API produces `git_conflict_check`
+evidence with read-only git commands. It resolves target and branch commits,
+verifies the expected target head, runs `git merge-tree --write-tree`, and
+returns clean/conflict/stale/error evidence without checkout, merge, commit,
+reset, or ref mutation.
+
 Queue states:
 
 ```text

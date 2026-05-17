@@ -3347,6 +3347,100 @@ def handle_graph_governance_parallel_branch_merge_gate(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-preview")
+def handle_graph_governance_parallel_branch_merge_preview(ctx: RequestContext):
+    """Return side-effect-free git merge preview evidence for a queued branch."""
+    project_id = ctx.get_project_id()
+    from .parallel_branch_runtime import (
+        decide_persisted_merge_gate,
+        git_merge_preview_evidence,
+        list_merge_queue_items,
+        merge_gate_plan_to_dict,
+        select_merge_queue_item,
+    )
+
+    repo_root = str(
+        ctx.body.get("repo_root_path")
+        or ctx.body.get("workspace_root")
+        or os.getcwd()
+    )
+    merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
+    target_ref = str(ctx.body.get("target_ref") or "refs/heads/main")
+    branch_ref = str(ctx.body.get("branch_ref") or "")
+    expected_target_head = str(ctx.body.get("expected_target_head") or "")
+    queue_item_id = str(ctx.body.get("queue_item_id") or "")
+    task_id = str(ctx.body.get("task_id") or "")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(
+            ctx,
+            conn,
+            "graph-governance.parallel-branches.merge-preview",
+        )
+        if merge_queue_id:
+            items = list_merge_queue_items(
+                conn,
+                project_id,
+                merge_queue_id,
+                target_ref=target_ref,
+            )
+            item = select_merge_queue_item(
+                items,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+            )
+            branch_ref = branch_ref or item.branch_ref
+            expected_target_head = (
+                expected_target_head
+                or item.current_target_head
+                or item.validated_target_head
+            )
+            task_id = task_id or item.task_id
+            queue_item_id = queue_item_id or item.queue_item_id
+        if not branch_ref:
+            raise ValidationError("branch_ref is required when merge_queue_id is not provided")
+
+        preview = git_merge_preview_evidence(
+            repo_root_path=repo_root,
+            target_ref=target_ref,
+            branch_ref=branch_ref,
+            expected_target_head=expected_target_head,
+            timeout_seconds=_query_int(ctx.body, "timeout_seconds", 30),
+        )
+        gate_plan = None
+        if merge_queue_id and _query_bool(ctx.body, "include_gate_plan", False):
+            evidence = ctx.body.get("evidence") or {}
+            if not isinstance(evidence, dict):
+                raise ValidationError("evidence must be an object when provided")
+            gate_evidence = dict(evidence)
+            gate_evidence["git_conflict_check"] = preview
+            gate_plan = decide_persisted_merge_gate(
+                conn,
+                project_id,
+                merge_queue_id,
+                target_ref=target_ref,
+                queue_item_id=queue_item_id,
+                task_id=task_id,
+                evidence=gate_evidence,
+                batch_id=str(ctx.body.get("batch_id") or ""),
+                batch_status=str(ctx.body.get("batch_status") or ""),
+                dry_run=_query_bool(ctx.body, "dry_run", True),
+                scenario_id=str(ctx.body.get("scenario_id") or "PB-015"),
+            )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "merge_queue_id": merge_queue_id,
+            "queue_item_id": queue_item_id,
+            "task_id": task_id,
+            "preview": preview,
+            "gate_plan": merge_gate_plan_to_dict(gate_plan) if gate_plan is not None else None,
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-result")
 def handle_graph_governance_parallel_branch_merge_result(ctx: RequestContext):
     """Record an externally executed merge result in branch runtime state."""

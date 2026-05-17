@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -2106,6 +2107,16 @@ def _select_merge_gate_item(
     raise KeyError(f"merge queue item not found: {item_id or task or '<unspecified>'}")
 
 
+def select_merge_queue_item(
+    items: list[MergeQueueItem],
+    *,
+    queue_item_id: str = "",
+    task_id: str = "",
+) -> MergeQueueItem:
+    """Select a single queue item by queue item id or task id."""
+    return _select_merge_gate_item(items, queue_item_id=queue_item_id, task_id=task_id)
+
+
 def _select_merge_gate_decision(
     plan: MergeQueuePlan,
     item: MergeQueueItem,
@@ -2300,6 +2311,129 @@ def decide_merge_gate(
         snapshot_id=selected.snapshot_id,
         projection_id=selected.projection_id,
     )
+
+
+def _bounded_command_text(value: str, limit: int = 4000) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def _git_preview_command(
+    repo_root: Path,
+    args: list[str],
+    *,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo_root),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=max(1, int(timeout_seconds or 30)),
+    )
+
+
+def _git_preview_commit(
+    repo_root: Path,
+    ref: str,
+    *,
+    timeout_seconds: int,
+) -> tuple[str, str]:
+    proc = _git_preview_command(
+        repo_root,
+        ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+        timeout_seconds=timeout_seconds,
+    )
+    if proc.returncode != 0:
+        return "", _bounded_command_text(proc.stderr or proc.stdout)
+    return proc.stdout.strip(), ""
+
+
+def git_merge_preview_evidence(
+    *,
+    repo_root_path: str | Path,
+    target_ref: str,
+    branch_ref: str,
+    expected_target_head: str = "",
+    timeout_seconds: int = 30,
+) -> dict[str, Any]:
+    """Return side-effect-free git merge preview evidence for a queued branch."""
+    repo_root = Path(repo_root_path).resolve()
+    target = str(target_ref or "").strip()
+    branch = str(branch_ref or "").strip()
+    if not target:
+        raise ValueError("target_ref is required")
+    if not branch:
+        raise ValueError("branch_ref is required")
+
+    target_commit, target_error = _git_preview_commit(
+        repo_root,
+        target,
+        timeout_seconds=timeout_seconds,
+    )
+    branch_commit, branch_error = _git_preview_commit(
+        repo_root,
+        branch,
+        timeout_seconds=timeout_seconds,
+    )
+    evidence_id = f"merge-preview:{target_commit[:12] or 'unknown'}:{branch_commit[:12] or 'unknown'}"
+    base_payload = {
+        "key": "git_conflict_check",
+        "evidence_id": evidence_id,
+        "repo_root": str(repo_root),
+        "target_ref": target,
+        "branch_ref": branch,
+        "target_commit": target_commit,
+        "branch_commit": branch_commit,
+        "expected_target_head": str(expected_target_head or ""),
+        "command": "git merge-tree --write-tree <target_commit> <branch_commit>",
+    }
+    if target_error or branch_error:
+        return {
+            **base_payload,
+            "status": "error",
+            "passed": False,
+            "reason": target_error or branch_error,
+        }
+
+    expected = str(expected_target_head or "").strip()
+    if expected and expected != target_commit:
+        return {
+            **base_payload,
+            "status": "stale",
+            "passed": False,
+            "reason": "target head differs from expected_target_head",
+        }
+
+    merge_base_proc = _git_preview_command(
+        repo_root,
+        ["merge-base", target_commit, branch_commit],
+        timeout_seconds=timeout_seconds,
+    )
+    merge_base = merge_base_proc.stdout.strip() if merge_base_proc.returncode == 0 else ""
+    preview_proc = _git_preview_command(
+        repo_root,
+        ["merge-tree", "--write-tree", target_commit, branch_commit],
+        timeout_seconds=timeout_seconds,
+    )
+    stdout = _bounded_command_text(preview_proc.stdout)
+    stderr = _bounded_command_text(preview_proc.stderr)
+    first_line = stdout.splitlines()[0].strip() if stdout.splitlines() else ""
+    clean = preview_proc.returncode == 0
+    return {
+        **base_payload,
+        "status": "pass" if clean else "fail",
+        "passed": clean,
+        "reason": "" if clean else "merge-tree reported conflicts",
+        "merge_base": merge_base,
+        "preview_tree": first_line if clean else "",
+        "returncode": preview_proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
 
 
 def _short_identity(value: str, fallback: str) -> str:

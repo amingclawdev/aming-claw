@@ -525,6 +525,81 @@ def test_parallel_branch_merge_gate_route_blocks_batch_rollback(conn):
     assert result["plan"]["target_branch_mutation_allowed"] is False
 
 
+def test_parallel_branch_merge_preview_route_builds_gate_evidence(conn, tmp_path):
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-b", "feature-preview"], cwd=repo, check=True)
+    (repo / "preview.txt").write_text("preview\n", encoding="utf-8")
+    subprocess.run(["git", "add", "preview.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "preview branch"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    main_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    queue_id = "mergeq-api-preview"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-preview-task",
+                task_id="preview-task",
+                branch_ref="feature-preview",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="main",
+                branch_head="feature-preview",
+                validated_target_head=main_head,
+                current_target_head=main_head,
+                merge_preview_id="preview-route",
+                snapshot_id="scope-preview",
+                projection_id="semproj-preview",
+            )
+        ],
+        now_iso="2026-05-17T08:24:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branch_merge_preview(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "repo_root_path": str(repo),
+                "merge_queue_id": queue_id,
+                "target_ref": "main",
+                "task_id": "preview-task",
+                "include_gate_plan": True,
+                "evidence": {
+                    "dirty_worktree_check": {"status": "pass"},
+                    "test_evidence": {"status": "pass"},
+                    "graph_currentness": {"status": "current"},
+                    "scope_reconcile": {"status": "pass"},
+                    "semantic_projection": {"status": "pass"},
+                    "backlog_acceptance": {"status": "satisfied"},
+                },
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["preview"]["status"] == "pass"
+    assert result["preview"]["target_commit"] == main_head
+    assert result["gate_plan"]["merge_gate_passed"] is True
+    assert result["gate_plan"]["dry_run"] is True
+    assert result["gate_plan"]["target_branch_mutation_allowed"] is False
+
+
 def test_parallel_branch_merge_result_route_records_with_fence(conn):
     queue_id = "mergeq-api-result"
     upsert_branch_context(
