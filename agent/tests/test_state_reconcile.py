@@ -117,6 +117,90 @@ def test_scope_file_delta_keeps_real_deletions_but_ignores_old_untracked_artifac
     assert ".codex/config.toml" not in delta["impacted_files"]
 
 
+def test_scope_file_delta_ignores_unchanged_inventory_status_churn(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git(project)
+    _write(project / "agent" / "service.py", "def run():\n    return 1\n")
+    _write(project / "agent" / "tests" / "test_service.py", "def test_run():\n    assert True\n")
+    _write(project / "docs" / "guide.md", "# Guide\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "initial")
+
+    delta = _build_scope_file_delta(
+        project_root=project,
+        old_rows=[
+            {
+                "path": "agent/tests/test_service.py",
+                "file_hash": "sha256:old-test",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+            },
+            {
+                "path": "docs/guide.md",
+                "file_hash": "sha256:same-doc",
+                "scan_status": "archive",
+                "graph_status": "archive",
+            },
+        ],
+        new_rows=[
+            {
+                "path": "agent/tests/test_service.py",
+                "file_hash": "sha256:new-test",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+            },
+            {
+                "path": "docs/guide.md",
+                "file_hash": "sha256:same-doc",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+            },
+        ],
+        changed_files=["agent/tests/test_service.py"],
+    )
+
+    assert delta["hash_changed_files"] == ["agent/tests/test_service.py"]
+    assert delta["status_changed_files"] == []
+    assert delta["ignored_status_changed_files"] == ["docs/guide.md"]
+    assert delta["impacted_files"] == ["agent/tests/test_service.py"]
+
+
+def test_scope_file_delta_keeps_changed_file_status_changes_blocking(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git(project)
+    _write(project / "agent" / "tests" / "test_service.py", "def test_run():\n    assert True\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "initial")
+
+    delta = _build_scope_file_delta(
+        project_root=project,
+        old_rows=[
+            {
+                "path": "agent/tests/test_service.py",
+                "file_hash": "sha256:old-test",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+            },
+        ],
+        new_rows=[
+            {
+                "path": "agent/tests/test_service.py",
+                "file_hash": "sha256:new-test",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+            },
+        ],
+        changed_files=["agent/tests/test_service.py"],
+    )
+
+    assert delta["hash_changed_files"] == ["agent/tests/test_service.py"]
+    assert delta["status_changed_files"] == ["agent/tests/test_service.py"]
+    assert delta["ignored_status_changed_files"] == []
+    assert delta["impacted_files"] == ["agent/tests/test_service.py"]
+
+
 def _write_project(root: Path) -> list[Path]:
     files = [
         root / "agent" / "service.py",

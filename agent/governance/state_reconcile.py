@@ -244,18 +244,32 @@ def _build_scope_file_delta(
     new_paths = set(new_by_path)
     added = sorted(new_paths - old_paths)
     removed = sorted(old_paths - new_paths)
+    changed = sorted({path.replace("\\", "/").strip("/") for path in changed_files if path})
     hash_changed = sorted(
         path for path in (old_paths & new_paths)
         if _row_file_hash(old_by_path[path]) != _row_file_hash(new_by_path[path])
     )
+    status_candidate_paths = set(changed) | set(hash_changed)
     status_changed = sorted(
         path for path in (old_paths & new_paths)
-        if str(old_by_path[path].get("graph_status") or "")
-        != str(new_by_path[path].get("graph_status") or "")
-        or str(old_by_path[path].get("scan_status") or "")
-        != str(new_by_path[path].get("scan_status") or "")
+        if path in status_candidate_paths
+        and (
+            str(old_by_path[path].get("graph_status") or "")
+            != str(new_by_path[path].get("graph_status") or "")
+            or str(old_by_path[path].get("scan_status") or "")
+            != str(new_by_path[path].get("scan_status") or "")
+        )
     )
-    changed = sorted({path.replace("\\", "/").strip("/") for path in changed_files if path})
+    ignored_status_changed = sorted(
+        path for path in (old_paths & new_paths)
+        if path not in status_candidate_paths
+        and (
+            str(old_by_path[path].get("graph_status") or "")
+            != str(new_by_path[path].get("graph_status") or "")
+            or str(old_by_path[path].get("scan_status") or "")
+            != str(new_by_path[path].get("scan_status") or "")
+        )
+    )
     impacted = sorted(set(changed) | set(added) | set(removed) | set(hash_changed) | set(status_changed))
     return {
         "strategy": "full_scan_with_incremental_file_delta",
@@ -264,6 +278,7 @@ def _build_scope_file_delta(
         "removed_files": removed,
         "hash_changed_files": hash_changed,
         "status_changed_files": status_changed,
+        "ignored_status_changed_files": ignored_status_changed,
         "impacted_files": impacted,
         "changed_file_count": len(changed),
         "impacted_file_count": len(impacted),
