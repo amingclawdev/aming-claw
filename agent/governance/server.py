@@ -3734,6 +3734,200 @@ def handle_graph_governance_parallel_branch_recover_expired(ctx: RequestContext)
         conn.close()
 
 
+@route("GET", "/api/graph-governance/{project_id}/managed-refs")
+def handle_graph_governance_managed_refs(ctx: RequestContext):
+    """List same-project managed refs for existing long-lived branches."""
+    project_id = ctx.get_project_id()
+    from .managed_ref_runtime import (
+        decide_managed_ref,
+        decide_project_deletion_guard,
+        list_managed_refs,
+        managed_ref_to_dict,
+    )
+
+    conn = get_connection(project_id)
+    try:
+        refs = list_managed_refs(
+            conn,
+            project_id,
+            include_archived=_query_bool(ctx.query, "include_archived", False),
+            target_ref=str(ctx.query.get("target_ref") or ""),
+        )
+        current_target_head = str(ctx.query.get("current_target_head") or "")
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "refs": [managed_ref_to_dict(ref) for ref in refs],
+            "decisions": [
+                decide_managed_ref(ref, current_target_head=current_target_head).to_dict()
+                for ref in refs
+            ],
+            "deletion_guard": decide_project_deletion_guard(refs),
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/managed-refs")
+def handle_graph_governance_managed_ref_upsert(ctx: RequestContext):
+    """Create or update a same-project managed ref context."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .managed_ref_runtime import (
+        STATE_IMPORTED,
+        ManagedRefContext,
+        decide_managed_ref,
+        get_managed_ref,
+        managed_ref_to_dict,
+        upsert_managed_ref,
+    )
+
+    ref_name = str(ctx.body.get("ref_name") or "").strip()
+    if not ref_name:
+        raise ValidationError("ref_name is required")
+    evidence = ctx.body.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        raise ValidationError("evidence must be an object when provided")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.managed-refs.upsert")
+        existing = get_managed_ref(conn, project_id, ref_name)
+        base = managed_ref_to_dict(existing) if existing else {
+            "project_id": project_id,
+            "ref_name": ref_name,
+        }
+        for key in (
+            "ref_type",
+            "target_ref",
+            "merge_base_commit",
+            "ref_head_commit",
+            "target_head_commit",
+            "validated_target_head",
+            "snapshot_id",
+            "projection_id",
+            "merge_preview_id",
+            "merge_queue_id",
+            "merge_commit",
+            "rollback_epoch",
+            "archive_policy",
+            "status",
+        ):
+            if key in ctx.body:
+                base[key] = str(ctx.body.get(key) or "")
+        base.setdefault("target_ref", "refs/heads/main")
+        base.setdefault("status", STATE_IMPORTED)
+        base["evidence"] = {**dict(base.get("evidence") or {}), **evidence}
+        context = ManagedRefContext(**base)
+        with sqlite_write_lock():
+            saved = upsert_managed_ref(
+                conn,
+                context,
+                actor=str(ctx.body.get("actor") or "api"),
+                operation_type=str(ctx.body.get("operation_type") or "upsert"),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            conn.commit()
+        return 201, {
+            "ok": True,
+            "project_id": project_id,
+            "ref": managed_ref_to_dict(saved),
+            "decision": decide_managed_ref(
+                saved,
+                current_target_head=str(ctx.body.get("current_target_head") or ""),
+            ).to_dict(),
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/managed-refs/merged")
+def handle_graph_governance_managed_ref_merged(ctx: RequestContext):
+    """Record that a managed source ref merged into its target ref."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .managed_ref_runtime import (
+        decide_managed_ref,
+        managed_ref_to_dict,
+        mark_managed_ref_merged,
+    )
+
+    ref_name = str(ctx.body.get("ref_name") or "").strip()
+    merge_commit = str(ctx.body.get("merge_commit") or "").strip()
+    target_head_commit = str(ctx.body.get("target_head_commit") or merge_commit).strip()
+    if not ref_name:
+        raise ValidationError("ref_name is required")
+    if not merge_commit:
+        raise ValidationError("merge_commit is required")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.managed-refs.merged")
+        with sqlite_write_lock():
+            saved = mark_managed_ref_merged(
+                conn,
+                project_id,
+                ref_name,
+                merge_commit=merge_commit,
+                target_head_commit=target_head_commit,
+                merge_queue_id=str(ctx.body.get("merge_queue_id") or ""),
+                actor=str(ctx.body.get("actor") or "api"),
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "ref": managed_ref_to_dict(saved),
+            "decision": decide_managed_ref(saved).to_dict(),
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/managed-refs/archive")
+def handle_graph_governance_managed_ref_archive(ctx: RequestContext):
+    """Archive a resolved managed ref context without deleting the project."""
+    project_id = ctx.get_project_id()
+    from .db import sqlite_write_lock
+    from .managed_ref_runtime import (
+        archive_managed_ref,
+        decide_project_deletion_guard,
+        list_managed_refs,
+        managed_ref_to_dict,
+    )
+
+    ref_name = str(ctx.body.get("ref_name") or "").strip()
+    if not ref_name:
+        raise ValidationError("ref_name is required")
+    evidence = ctx.body.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        raise ValidationError("evidence must be an object when provided")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.managed-refs.archive")
+        with sqlite_write_lock():
+            saved = archive_managed_ref(
+                conn,
+                project_id,
+                ref_name,
+                actor=str(ctx.body.get("actor") or "api"),
+                evidence=evidence,
+                now_iso=str(ctx.body.get("now_iso") or ""),
+            )
+            refs = list_managed_refs(conn, project_id, include_archived=True)
+            conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "ref": managed_ref_to_dict(saved),
+            "deletion_guard": decide_project_deletion_guard(refs),
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/dashboard")
 def handle_graph_governance_dashboard(ctx: RequestContext):
     """Return a compact dashboard projection over graph, drift, and file state."""

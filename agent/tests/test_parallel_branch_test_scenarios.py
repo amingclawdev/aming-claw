@@ -23,6 +23,7 @@ REQUIRED_SCENARIOS = {
     "PB-010": "Dashboard/MCP compact read model",
     "PB-011": "Branch graph artifact isolation",
     "PB-012": "Multi-project and batch isolation",
+    "PB-013": "Existing long-lived ref governance",
 }
 
 REQUIRED_ORACLE_DIMENSIONS = [
@@ -36,7 +37,7 @@ REQUIRED_ORACLE_DIMENSIONS = [
     "blocked_by",
 ]
 
-REQUIRED_INFRA_FLAGS = ["I0", "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9"]
+REQUIRED_INFRA_FLAGS = ["I0", "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10"]
 
 
 @pytest.fixture(scope="module")
@@ -97,3 +98,10 @@ def test_branch_graph_policy_is_one_hop_candidate_evidence(doc_text: str) -> Non
     assert "one-hop candidate deltas from a target graph" in normalized
     assert "must not chain from prior branch candidates" in normalized
     assert "do not chain branch candidates" in normalized
+
+
+def test_existing_long_lived_refs_are_not_modeled_as_new_projects(doc_text: str) -> None:
+    normalized = " ".join(doc_text.split())
+    assert "Keep one project identity" in doc_text
+    assert "create managed ref contexts" in normalized
+    assert "archive source ref context instead of deleting a project" in normalized

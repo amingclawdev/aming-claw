@@ -46,6 +46,7 @@ matrix with explicit pending infrastructure flags.
 | PB-010 | Compact dashboard/MCP read model. |
 | PB-011 | Branch graph artifact isolation before merge. |
 | PB-012 | Multi-project and batch isolation. |
+| PB-013 | Existing long-lived ref governance under one project identity. |
 
 ## Runtime Surfaces
 
@@ -57,6 +58,7 @@ matrix with explicit pending infrastructure flags.
 | `GraphRefRuntime` | Active target graph refs, branch candidate graph refs, merge epoch, rollback epoch, and replay epoch. | Semantic payload trust decisions. |
 | `SemanticProjectionRuntime` | Projection activation, semantic job carry-forward, stale/cancelled state, and epoch-bound rebuild decisions. | Structural graph snapshot creation. |
 | `PendingScopeRuntime` | Branch/ref/batch/epoch-aware scope reconcile rows and materialization decisions. | Merge queue policy. |
+| `ManagedRefRuntime` | Same-project governance state for existing long-lived refs, release branches, and large feature branches. | Treating ordinary refs as separate projects or merging graph truth across refs. |
 | `Dashboard/MCP read model` | Bounded operator views, blockers, recovery actions, queue status, graph epoch, rollback timeline. | Full backlog or graph expansion by default. |
 | `Chain adapter` | Optional Chain identity fields and event mapping. | A separate parallel runtime. |
 
@@ -205,6 +207,41 @@ Rules:
 
 This keeps parallel development as target graph plus branch delta, not multiple
 branch-local graph universes.
+
+## Existing Long-Lived Branches
+
+Existing projects may already have release branches, maintenance branches, or
+large feature branches with many rounds of work. These are not modeled as
+separate projects by default. Project identity remains the repository/workspace;
+the long-lived branch gets a managed ref context under the same project.
+
+```text
+project_id = repo/workspace identity
+  -> target ref context: refs/heads/main
+  -> managed ref context: refs/heads/release/1.x
+  -> managed ref context: refs/heads/feature/large-refactor
+```
+
+Rules:
+
+- Short-lived agent branches use one-hop candidate evidence.
+- Existing long-lived refs may have ref-local current graph/projection pointers,
+  but those pointers are scoped to the ref context and are not target graph
+  truth.
+- Merge from a managed ref to a target ref is code-first: freeze source/target
+  heads and merge base, run preview/tests/gate, update the target ref, then run
+  target-ref scope reconcile and activate the target snapshot.
+- Do not merge structural graph truth across refs. Recompute target graph truth
+  from the target HEAD after the code merge.
+- After merge, mark the source ref context `merged` then `archived`; do not
+  delete the project just because a source branch merged.
+- Project deletion must be blocked while unresolved managed refs are still
+  imported, tracked, stale, validating, merge-ready, merging, merged but not
+  archived, or rollback-required.
+
+The minimum durable state for a managed ref is source ref, target ref, merge
+base, source head, target head, source snapshot/projection pointers, merge
+preview, merge queue id, rollback epoch, archive policy, status, and evidence.
 
 ## MergeQueueRuntime
 
@@ -455,6 +492,8 @@ Serial Chain stages with no `branch_ref` remain unchanged.
    read model is implemented by `agent/tests/test_graph_governance_api.py`.
 11. Chain adapter hook tests and later Chain integration. First no-execution
     adapter is implemented by `agent/tests/test_chain_parallel_branch_adapter.py`.
+12. Managed ref runtime for existing long-lived branches. First SQLite-backed
+    state/decision slice is implemented by `agent/tests/test_managed_ref_runtime.py`.
 
 The smallest runtime slice is one backlog row in one isolated worktree:
 
@@ -519,6 +558,7 @@ raised above the current conservative mode.
 | I7 | Compact dashboard/MCP parallel read model. |
 | I8 | Chain adapter event identity. |
 | I9 | Batch branch/worktree retention and cleanup policy. |
+| I10 | Managed ref dashboard wiring for existing long-lived branches. |
 
 ## Acceptance Bar
 

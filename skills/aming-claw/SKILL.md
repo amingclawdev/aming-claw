@@ -93,6 +93,13 @@ and activate the target snapshot/projection. Branch refs, worktree ids,
 snapshot ids, and projection ids may be recorded only as bounded candidate
 evidence, merge-gate inputs, rollback/replay provenance, or audit pointers.
 
+For existing projects with long-lived release, maintenance, or large feature
+branches, do not register each ordinary branch as a separate project by default.
+Keep one project identity and use a managed ref context for each governed ref.
+Managed refs may carry ref-local snapshot/projection pointers, but merges still
+update code first and then reconcile the target ref. After merge, archive the
+source ref context; do not delete the project as a substitute for ref cleanup.
+
 ## Current Workspace Not Registered
 
 If governance is running but `GET /api/projects` does not include the active

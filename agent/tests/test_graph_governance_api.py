@@ -6361,3 +6361,166 @@ def test_operations_queue_surfaces_suspect_snapshot_root_warning(conn, monkeypat
     assert row["status"] == "not_queued"
     assert row["warnings"][0]["code"] == "ephemeral_execution_root"
     assert queue["summary"]["graph_stale"]["active_snapshot_warnings"][0]["code"] == "ephemeral_execution_root"
+
+
+def test_managed_ref_api_tracks_existing_long_lived_branch_without_new_project(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+
+    status, created = server.handle_graph_governance_managed_ref_upsert(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "ref_name": "refs/heads/release/1.x",
+                "target_ref": "refs/heads/main",
+                "merge_base_commit": "B0",
+                "ref_head_commit": "R1",
+                "target_head_commit": "M0",
+                "status": "imported",
+                "evidence": {"source": "project_import"},
+                "now_iso": "2026-05-17T10:10:00Z",
+            },
+        )
+    )
+
+    assert status == 201
+    assert created["project_id"] == PID
+    assert created["ref"]["project_id"] == PID
+    assert created["ref"]["ref_name"] == "refs/heads/release/1.x"
+    assert created["decision"]["action"] == "materialize_ref_graph"
+
+    listed = server.handle_graph_governance_managed_refs(
+        _ctx(
+            {"project_id": PID},
+            query={"current_target_head": "M0"},
+        )
+    )
+
+    assert listed["ok"] is True
+    assert listed["refs"][0]["project_id"] == PID
+    assert listed["refs"][0]["evidence"]["source"] == "project_import"
+    assert listed["deletion_guard"]["allowed"] is False
+    assert listed["deletion_guard"]["required_action"] == "archive_or_abandon_managed_refs"
+
+
+def test_managed_ref_api_surfaces_stale_target_movement(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    server.handle_graph_governance_managed_ref_upsert(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "ref_name": "refs/heads/feature/long-lived",
+                "target_ref": "refs/heads/main",
+                "merge_base_commit": "B0",
+                "ref_head_commit": "F4",
+                "target_head_commit": "M0",
+                "validated_target_head": "M0",
+                "snapshot_id": "scope-feature-F4",
+                "projection_id": "semproj-feature-F4",
+                "merge_preview_id": "preview-F4-into-M0",
+                "status": "merge_candidate",
+                "now_iso": "2026-05-17T10:20:00Z",
+            },
+        )
+    )
+
+    listed = server.handle_graph_governance_managed_refs(
+        _ctx(
+            {"project_id": PID},
+            query={"current_target_head": "M1"},
+        )
+    )
+
+    decision = listed["decisions"][0]
+    assert decision["decision_state"] == "stale"
+    assert decision["action"] == "recompute_ref_context"
+    assert decision["target_moved"] is True
+    assert decision["blockers"] == ["target_ref_moved"]
+    assert decision["merge_ready"] is False
+
+
+def test_managed_ref_api_records_merge_then_archives_ref_context(conn, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    server.handle_graph_governance_managed_ref_upsert(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "ref_name": "refs/heads/feature/large-refactor",
+                "target_ref": "refs/heads/main",
+                "merge_base_commit": "B0",
+                "ref_head_commit": "F9",
+                "target_head_commit": "M8",
+                "validated_target_head": "M8",
+                "snapshot_id": "scope-feature-F9",
+                "projection_id": "semproj-feature-F9",
+                "merge_preview_id": "preview-F9-into-M8",
+                "status": "merge_candidate",
+                "now_iso": "2026-05-17T10:30:00Z",
+            },
+        )
+    )
+
+    listed = server.handle_graph_governance_managed_refs(
+        _ctx(
+            {"project_id": PID},
+            query={"current_target_head": "M8"},
+        )
+    )
+    assert listed["decisions"][0]["merge_ready"] is True
+    assert listed["decisions"][0]["action"] == "queue_merge_gate"
+
+    merged = server.handle_graph_governance_managed_ref_merged(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "ref_name": "refs/heads/feature/large-refactor",
+                "merge_commit": "M9",
+                "target_head_commit": "M9",
+                "merge_queue_id": "mergeq-long-ref",
+                "now_iso": "2026-05-17T10:31:00Z",
+            },
+        )
+    )
+
+    assert merged["ref"]["status"] == "merged"
+    assert merged["decision"]["action"] == "archive_ref_context"
+    assert merged["decision"]["archive_allowed"] is True
+
+    archived = server.handle_graph_governance_managed_ref_archive(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "ref_name": "refs/heads/feature/large-refactor",
+                "evidence": {"reason": "merged_to_target_and_retained"},
+                "now_iso": "2026-05-17T10:32:00Z",
+            },
+        )
+    )
+
+    assert archived["ref"]["status"] == "archived"
+    assert archived["deletion_guard"]["allowed"] is True
+    visible = server.handle_graph_governance_managed_refs(_ctx({"project_id": PID}))
+    assert visible["refs"] == []
+    retained = server.handle_graph_governance_managed_refs(
+        _ctx(
+            {"project_id": PID},
+            query={"include_archived": "true"},
+        )
+    )
+    assert retained["refs"][0]["status"] == "archived"

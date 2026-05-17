@@ -39,6 +39,7 @@ ephemeral SQLite database.
 | `GraphRefRuntime` | Active graph snapshot/projection refs for each branch, target ref, merge epoch, rollback epoch, and replay epoch. |
 | `SemanticProjectionRuntime` | Projection activation and invalidation for branch snapshots, merge epochs, rollback epochs, and semantic job carry-forward. |
 | `PendingScopeRuntime` | Branch/ref/batch-aware pending scope reconcile rows and materialization decisions. |
+| `ManagedRefRuntime` | Same-project state for existing long-lived refs, release branches, stale target detection, archive policy, and deletion blockers. |
 | `Dashboard/MCP read model` | Compact operator views for branch lanes, queue blockers, rollback timeline, graph epoch, and recovery actions. |
 | `Chain adapter` | Optional Chain identity fields while MF/observer remains the first client. |
 
@@ -95,6 +96,7 @@ Example dry-run oracle:
 | I7 | Dashboard/MCP compact read model exists. |
 | I8 | Chain adapter identity fields exist without requiring Chain execution. |
 | I9 | Batch branch/worktree retention and cleanup policy exists. |
+| I10 | Managed ref runtime store, decision oracle, and governance API exist for existing long-lived branches. |
 
 ## Fixture Topology
 
@@ -137,6 +139,7 @@ Task fixture:
 | PB-010 | Dashboard/MCP compact read model | Operator opens dashboard or calls MCP after mixed parallel state. | Return bounded payload: branch lanes, task states, dependency blockers, rollback epoch, graph epoch, and action affordances without full backlog/graph expansion. | Implemented as pure-state read model and read-only governance API over durable stores; dashboard UI wiring remains future work. | `agent/tests/test_parallel_branch_read_model.py`, `agent/tests/test_graph_governance_api.py`, `frontend/dashboard/scripts/e2e-parallel-branches.mjs` |
 | PB-011 | Branch graph artifact isolation | Branch-local graph artifacts are produced before merge. | Store branch artifacts as one-hop candidate evidence from the target graph; do not chain branch candidates or mutate active target graph refs until target scope reconcile after merge. | Implemented for graph ref/projection candidate read model and one-hop artifact policy. | `test_graph_rollback_epoch.py`, `test_batch_jobs.py` |
 | PB-012 | Multi-project and batch isolation | Two projects or batches reuse task IDs and branch slugs. | Runtime keys include project, batch, branch/ref, and attempt identity; no task, queue, pending scope, graph, or semantic row crosses boundaries. | Implemented for branch context and merge queue scope; graph/semantic isolation still depends on I3/I4. | `test_parallel_branch_runtime.py`, `test_merge_queue_runtime.py` |
+| PB-013 | Existing long-lived ref governance | A project import discovers release and feature branches that already have many commits. | Keep one project identity; create managed ref contexts; detect target movement as stale; merge code through target reconcile; archive source ref context instead of deleting a project. | Implemented as SQLite managed-ref runtime, decision oracle, and governance API; dashboard wiring remains pending. | `test_managed_ref_runtime.py`, `test_graph_governance_api.py` |
 
 ## Immediate Test Slice
 
@@ -157,6 +160,7 @@ The next slice should create dry-run data structures without production code:
 | `agent/tests/test_parallel_branch_read_model.py` | Compact operator payload for PB-010: branch lanes, queue blockers, rollback timeline, graph epochs, actions, counts, and truncation. | Implemented as pure-state oracle; live MCP/dashboard endpoint still depends on durable queue/batch stores. |
 | `agent/tests/test_graph_rollback_epoch.py` | Graph snapshot/projection activation, rollback, pending-scope isolation, and branch artifact isolation for PB-005 and PB-011. | Implemented for graph/projection/pending-scope read model; semantic job invalidation remains pending. |
 | `agent/tests/test_governance_hint_rollback.py` | Hint add/change/remove/rollback-restored inverse delta behavior for PB-006. | Implemented as pure delta oracle; incremental reconcile integration remains pending. |
+| `agent/tests/test_managed_ref_runtime.py` | Managed ref import, stale target detection, merge readiness, archive policy, and project deletion guard for PB-013. | Implemented as SQLite state/decision oracle; governance API coverage lives in `test_graph_governance_api.py`; dashboard wiring remains future work. |
 | `frontend/dashboard/scripts/e2e-parallel-branches.mjs` | Operator read model for PB-010. | I7 |
 
 The MF adapter API slice is now covered by
@@ -251,5 +255,9 @@ Required rollback assertions:
   artifacts are one-hop candidate deltas from a target graph. They must be
   recomputed when the target ref moves and must not chain from prior branch
   candidates.
+- Existing long-lived refs are managed under the same project identity. They
+  can carry ref-local snapshot/projection pointers, but merge still updates code
+  first and then reconciles the target ref; project deletion is blocked until
+  unresolved managed refs are archived or abandoned.
 - Backlog and dashboard queries must stay compact by default; detailed state
   should be fetched by ID.
