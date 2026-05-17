@@ -293,8 +293,11 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     assert result["semantic_enrichment"]["dynamic_semantic_graph_state"] is True
     assert result["semantic_enrichment"]["requested_ai_batch_size"] == 10
     assert Path(result["semantic_enrichment"]["semantic_index_path"]).exists()
-    assert result["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
+    assert result["scope_file_delta"]["strategy"] == "full_rebuild_fallback"
+    assert result["scope_file_delta"]["fallback_reason"] == "no_active_graph_payload"
     assert "impacted_file_count" in result["scope_file_delta"]
+    assert result["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
+    assert result["scope_graph_delta"]["mode"] == "full_rebuild"
     assert store.get_active_graph_snapshot(conn, PID)["snapshot_id"] == "imported-old-pending"
 
     rows = conn.execute(
@@ -313,7 +316,8 @@ def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     ).fetchone()["notes"]
     pending_notes = json.loads(notes)["pending_scope_reconcile"]
     assert pending_notes["covered_commit_count"] == 3
-    assert pending_notes["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
+    assert pending_notes["scope_file_delta"]["strategy"] == "full_rebuild_fallback"
+    assert pending_notes["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
 
     after = {str(path): _file_sha(path) for path in files}
     assert after == before
@@ -417,10 +421,13 @@ def test_pending_scope_materializer_records_changed_file_delta(conn, tmp_path):
 
     assert result["ok"] is True
     delta = result["scope_file_delta"]
-    assert delta["strategy"] == "full_scan_with_incremental_file_delta"
+    assert delta["strategy"] == "full_rebuild_fallback"
+    assert delta["fallback_reason"] == "structural_or_unknown_file_requires_full_rebuild"
     assert delta["changed_files"] == ["agent/service.py"]
     assert "agent/service.py" in delta["hash_changed_files"]
     assert "agent/service.py" in delta["impacted_files"]
+    assert result["scope_graph_delta"]["strategy"] == "full_rebuild_fallback"
+    assert result["scope_graph_delta"]["mode"] == "full_rebuild"
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/service.py"]
@@ -571,6 +578,10 @@ def test_pending_scope_materializer_does_not_ai_select_test_only_changes(conn, t
 
     assert result["ok"] is True
     assert result["scope_file_delta"]["changed_files"] == ["agent/tests/test_service.py"]
+    assert result["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_file_delta"]["graph_delta_mode"] == "metadata_only"
+    assert result["scope_graph_delta"]["strategy"] == "incremental_graph_delta"
+    assert result["scope_graph_delta"]["mode"] == "metadata_only"
     selector = result["semantic_enrichment"]["semantic_selector"]
     assert selector["scope"] == "changed"
     assert selector["changed_paths"] == ["agent/tests/test_service.py"]

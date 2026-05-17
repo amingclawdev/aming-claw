@@ -286,6 +286,10 @@ def _read_snapshot_companion(project_id: str, snapshot_id: str, filename: str, d
 
 _RECONCILE_COMPARISON_VOLATILE_KEYS = {
     "artifact_path",
+    "attached_to",
+    "attachment_source",
+    "candidate_node_id",
+    "cluster_id",
     "created_at",
     "drift_sha256",
     "generated_at",
@@ -293,6 +297,7 @@ _RECONCILE_COMPARISON_VOLATILE_KEYS = {
     "inventory_sha256",
     "phase_report_path",
     "project_root",
+    "reason",
     "review_report_path",
     "run_id",
     "scratch_dir",
@@ -334,10 +339,11 @@ def normalize_reconcile_snapshot_for_comparison(
     """Return a stable structural view for full-vs-scope reconcile comparison.
 
     The helper deliberately strips run-specific metadata, artifact paths,
-    timestamps, and snapshot ids while preserving node ids, graph structure,
-    file bindings, file hashes, function metadata, and inventory state. It is
-    intended for regression tests that compare full rebuild output with scope
-    reconcile output for the same final project state.
+    cluster provenance, timestamps, and snapshot ids while preserving node ids,
+    graph structure, file bindings, file hashes, function metadata, and
+    inventory state. It is intended for regression tests that compare full
+    rebuild output with scope reconcile output for the same final project
+    state.
     """
     nodes = _deps_graph_nodes(graph_json)
     edges = _deps_graph_edges(graph_json)
@@ -516,6 +522,165 @@ def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
         str(edge.get("type") or edge.get("relation") or edge.get("relation_type") or ""),
         str(metadata.get("edge_kind") or edge.get("kind") or ""),
     )
+
+
+_INCREMENTAL_METADATA_FILE_KINDS = {"config", "doc", "index_doc", "test"}
+
+
+def _json_clone(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def _node_ids_for_paths(graph_json: dict[str, Any], paths: set[str]) -> list[str]:
+    if not paths:
+        return []
+    node_ids: set[str] = set()
+    for node in _graph_nodes(graph_json):
+        node_id = _node_id(node)
+        if not node_id:
+            continue
+        for role in ("primary", "secondary", "test", "config"):
+            if paths.intersection(_path_values(node, role)):
+                node_ids.add(node_id)
+                break
+    return sorted(node_ids)
+
+
+def _edge_delta_payload(key: tuple[str, str, str, str]) -> dict[str, str]:
+    source, target, relation_type, edge_kind = key
+    return {
+        "source": source,
+        "target": target,
+        "relation_type": relation_type,
+        "edge_kind": edge_kind,
+    }
+
+
+def _mark_scope_file_delta_strategy(
+    scope_file_delta: dict[str, Any],
+    *,
+    strategy: str,
+    graph_delta_mode: str = "",
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    out = dict(scope_file_delta)
+    out["strategy"] = strategy
+    if graph_delta_mode:
+        out["graph_delta_mode"] = graph_delta_mode
+    if fallback_reason:
+        out["fallback_reason"] = fallback_reason
+    return out
+
+
+def _incremental_metadata_scope_eligibility(
+    scope_file_delta: dict[str, Any],
+    *,
+    old_rows: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if scope_file_delta.get("added_files"):
+        return {"supported": False, "reason": "added_files_require_full_rebuild"}
+    if scope_file_delta.get("removed_files"):
+        return {"supported": False, "reason": "removed_files_require_full_rebuild"}
+    if scope_file_delta.get("status_changed_files"):
+        return {"supported": False, "reason": "inventory_status_change_requires_full_rebuild"}
+
+    hash_changed = {
+        str(path or "").replace("\\", "/").strip("/")
+        for path in scope_file_delta.get("hash_changed_files", [])
+        if str(path or "").strip()
+    }
+    impacted = {
+        str(path or "").replace("\\", "/").strip("/")
+        for path in scope_file_delta.get("impacted_files", [])
+        if str(path or "").strip()
+    }
+    if not impacted:
+        return {"supported": False, "reason": "no_impacted_files"}
+    if impacted - hash_changed:
+        return {
+            "supported": False,
+            "reason": "non_hash_impacted_files_require_full_rebuild",
+            "paths": sorted(impacted - hash_changed),
+        }
+
+    old_by_path = _rows_by_path(old_rows)
+    new_by_path = _rows_by_path(new_rows)
+    unsupported: list[dict[str, str]] = []
+    for path in sorted(impacted):
+        old_row = old_by_path.get(path) or {}
+        new_row = new_by_path.get(path) or {}
+        kind = str(new_row.get("file_kind") or old_row.get("file_kind") or "")
+        role = str(new_row.get("attachment_role") or old_row.get("attachment_role") or "")
+        if kind not in _INCREMENTAL_METADATA_FILE_KINDS or role == "primary":
+            unsupported.append({"path": path, "file_kind": kind, "attachment_role": role})
+    if unsupported:
+        return {
+            "supported": False,
+            "reason": "structural_or_unknown_file_requires_full_rebuild",
+            "unsupported": unsupported,
+        }
+    return {"supported": True, "reason": "metadata_only_hash_change"}
+
+
+def _build_scope_graph_delta(
+    *,
+    old_graph_json: dict[str, Any],
+    new_graph_json: dict[str, Any],
+    scope_file_delta: dict[str, Any],
+    strategy: str,
+    mode: str,
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    old_nodes = {_node_id(node): node for node in _graph_nodes(old_graph_json) if _node_id(node)}
+    new_nodes = {_node_id(node): node for node in _graph_nodes(new_graph_json) if _node_id(node)}
+    old_edges = {
+        _edge_key(edge): edge
+        for edge in graph_payload_edges(old_graph_json)
+        if _edge_key(edge)[:3] != ("", "", "")
+    }
+    new_edges = {
+        _edge_key(edge): edge
+        for edge in graph_payload_edges(new_graph_json)
+        if _edge_key(edge)[:3] != ("", "", "")
+    }
+    changed_paths = {
+        str(path or "").replace("\\", "/").strip("/")
+        for path in (
+            list(scope_file_delta.get("hash_changed_files") or [])
+            + list(scope_file_delta.get("status_changed_files") or [])
+            + list(scope_file_delta.get("added_files") or [])
+            + list(scope_file_delta.get("removed_files") or [])
+        )
+        if str(path or "").strip()
+    }
+    changed_node_ids = _node_ids_for_paths(new_graph_json, changed_paths)
+    return {
+        "strategy": strategy,
+        "mode": mode,
+        "fallback_reason": fallback_reason,
+        "added_nodes": sorted(set(new_nodes) - set(old_nodes)),
+        "updated_nodes": changed_node_ids,
+        "removed_nodes": sorted(set(old_nodes) - set(new_nodes)),
+        "added_edges": [
+            _edge_delta_payload(key)
+            for key in sorted(set(new_edges) - set(old_edges))
+        ],
+        "removed_edges": [
+            _edge_delta_payload(key)
+            for key in sorted(set(old_edges) - set(new_edges))
+        ],
+        "file_inventory_delta": {
+            "added_files": list(scope_file_delta.get("added_files") or []),
+            "removed_files": list(scope_file_delta.get("removed_files") or []),
+            "hash_changed_files": list(scope_file_delta.get("hash_changed_files") or []),
+            "status_changed_files": list(scope_file_delta.get("status_changed_files") or []),
+            "impacted_files": list(scope_file_delta.get("impacted_files") or []),
+            "changed_file_count": int(scope_file_delta.get("changed_file_count") or 0),
+            "impacted_file_count": int(scope_file_delta.get("impacted_file_count") or 0),
+        },
+        "semantic_stale_node_ids": changed_node_ids,
+    }
 
 
 def _scope_event_id(event_type: str, target_type: str, target_id: str, payload: dict[str, Any]) -> str:
@@ -1339,6 +1504,527 @@ def _has_semantic_selector_override(*values: Any) -> bool:
     return False
 
 
+def _run_scope_semantic_enrichment(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    root: Path,
+    *,
+    created_by: str,
+    semantic_options: dict[str, Any],
+    trace: ReconcileTrace,
+) -> dict[str, Any]:
+    semantic_enrich = bool(semantic_options.get("semantic_enrich", True))
+    semantic_enrichment: dict[str, Any] = {}
+    if semantic_enrich:
+        semantic_result = run_semantic_enrichment(
+            conn,
+            project_id,
+            snapshot_id,
+            root,
+            feedback_items=semantic_options.get("semantic_feedback_items"),
+            feedback_round=semantic_options.get("semantic_feedback_round"),
+            use_ai=semantic_options.get("semantic_use_ai"),
+            ai_call=semantic_options.get("semantic_ai_call"),
+            created_by=created_by,
+            max_excerpt_chars=semantic_options.get("semantic_max_excerpt_chars"),
+            semantic_ai_provider=semantic_options.get("semantic_ai_provider"),
+            semantic_ai_model=semantic_options.get("semantic_ai_model"),
+            semantic_ai_role=semantic_options.get("semantic_ai_role"),
+            semantic_ai_chain_role=semantic_options.get("semantic_ai_chain_role"),
+            semantic_analyzer_role=semantic_options.get("semantic_analyzer_role"),
+            ai_feature_limit=semantic_options.get("semantic_ai_feature_limit"),
+            semantic_ai_batch_size=semantic_options.get("semantic_ai_batch_size"),
+            semantic_ai_batch_by=semantic_options.get("semantic_ai_batch_by", "subsystem"),
+            semantic_ai_input_mode=semantic_options.get("semantic_ai_input_mode"),
+            semantic_dynamic_graph_state=semantic_options.get("semantic_dynamic_graph_state"),
+            semantic_graph_state=bool(semantic_options.get("semantic_graph_state", True)),
+            semantic_skip_completed=bool(semantic_options.get("semantic_skip_completed", True)),
+            semantic_batch_memory=semantic_options.get("semantic_batch_memory", False),
+            semantic_batch_memory_id=semantic_options.get("semantic_batch_memory_id"),
+            semantic_base_snapshot_id=semantic_options.get("semantic_base_snapshot_id") or "",
+            semantic_ai_scope=semantic_options.get("semantic_ai_scope"),
+            semantic_node_ids=semantic_options.get("semantic_node_ids"),
+            semantic_layers=semantic_options.get("semantic_layers"),
+            semantic_quality_flags=semantic_options.get("semantic_quality_flags"),
+            semantic_missing=semantic_options.get("semantic_missing"),
+            semantic_changed_paths=semantic_options.get("semantic_changed_paths"),
+            semantic_path_prefixes=semantic_options.get("semantic_path_prefixes"),
+            semantic_selector_match=semantic_options.get("semantic_selector_match"),
+            semantic_include_structural=bool(semantic_options.get("semantic_include_structural", False)),
+            semantic_config_path=semantic_options.get("semantic_config_path"),
+            trace_dir=trace.trace_dir / "semantic-enrichment",
+            enqueue_stale=bool(semantic_options.get("semantic_enqueue_stale", True)),
+        )
+        semantic_enrichment = _semantic_enrichment_summary(semantic_result)
+        if bool(semantic_options.get("semantic_classify_feedback", True)):
+            from agent.governance import reconcile_feedback
+            from agent.governance import reconcile_semantic_enrichment
+
+            review_gate = reconcile_semantic_enrichment.feedback_review_gate(
+                semantic_result.get("summary") or {},
+            )
+            if review_gate.get("allowed"):
+                semantic_enrichment["feedback_queue"] = reconcile_feedback.classify_semantic_state_rounds(
+                    project_id,
+                    snapshot_id,
+                    created_by=created_by,
+                    base_snapshot_id=semantic_options.get("semantic_base_snapshot_id") or "",
+                )
+            else:
+                semantic_enrichment["feedback_queue"] = {
+                    "blocked": True,
+                    "gate": review_gate,
+                }
+    trace.step(
+        "semantic-enrichment",
+        input_payload={
+            "enabled": semantic_enrich,
+            "snapshot_id": snapshot_id,
+            "semantic_use_ai": semantic_options.get("semantic_use_ai"),
+            "semantic_ai_feature_limit": semantic_options.get("semantic_ai_feature_limit"),
+            "semantic_ai_batch_size": semantic_options.get("semantic_ai_batch_size"),
+            "semantic_ai_batch_by": semantic_options.get("semantic_ai_batch_by", "subsystem"),
+            "semantic_ai_input_mode": semantic_options.get("semantic_ai_input_mode"),
+            "semantic_dynamic_graph_state": semantic_options.get("semantic_dynamic_graph_state"),
+            "semantic_graph_state": semantic_options.get("semantic_graph_state", True),
+            "semantic_skip_completed": semantic_options.get("semantic_skip_completed", True),
+            "semantic_classify_feedback": semantic_options.get("semantic_classify_feedback", True),
+            "semantic_batch_memory": semantic_options.get("semantic_batch_memory", False),
+            "semantic_base_snapshot_id": semantic_options.get("semantic_base_snapshot_id") or "",
+            "semantic_ai_provider": semantic_options.get("semantic_ai_provider"),
+            "semantic_ai_model": semantic_options.get("semantic_ai_model"),
+            "semantic_ai_role": semantic_options.get("semantic_ai_role"),
+            "semantic_ai_chain_role": semantic_options.get("semantic_ai_chain_role"),
+            "semantic_analyzer_role": semantic_options.get("semantic_analyzer_role"),
+            "semantic_ai_scope": semantic_options.get("semantic_ai_scope"),
+            "semantic_node_ids": semantic_options.get("semantic_node_ids"),
+            "semantic_layers": semantic_options.get("semantic_layers"),
+            "semantic_quality_flags": semantic_options.get("semantic_quality_flags"),
+            "semantic_missing": semantic_options.get("semantic_missing"),
+            "semantic_changed_paths": semantic_options.get("semantic_changed_paths"),
+            "semantic_path_prefixes": semantic_options.get("semantic_path_prefixes"),
+            "semantic_selector_match": semantic_options.get("semantic_selector_match"),
+            "semantic_include_structural": semantic_options.get("semantic_include_structural", False),
+            "semantic_config_path": str(semantic_options.get("semantic_config_path") or ""),
+        },
+        output_payload=semantic_enrichment,
+    )
+    return semantic_enrichment
+
+
+def _run_incremental_metadata_scope_reconcile_candidate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    root: Path,
+    *,
+    target: str,
+    rid: str,
+    sid: str,
+    active: dict[str, Any],
+    active_inventory: list[dict[str, Any]],
+    changed_files: list[str],
+    checkout_provenance: dict[str, Any],
+    created_by: str,
+    activate: bool,
+    semantic_options: dict[str, Any],
+) -> dict[str, Any]:
+    active_snapshot_id = str(active.get("snapshot_id") or "")
+    active_commit = str(active.get("commit_sha") or "")
+    active_graph_json = _read_snapshot_graph(project_id, active_snapshot_id)
+    if not active_snapshot_id or not _deps_graph_nodes(active_graph_json):
+        return {"ok": False, "fallback_reason": "no_active_graph_payload"}
+
+    candidate_graph = _json_clone(active_graph_json)
+    if isinstance(candidate_graph, dict):
+        candidate_graph["run_id"] = rid
+        candidate_graph["session_id"] = rid
+        metadata = dict(candidate_graph.get("metadata") or {})
+        metadata["incremental_scope_reconcile"] = {
+            "strategy": "incremental_graph_delta",
+            "mode": "metadata_only",
+            "active_snapshot_id": active_snapshot_id,
+            "active_graph_commit": active_commit,
+            "target_commit": target,
+        }
+        candidate_graph["metadata"] = metadata
+
+    governance_index = build_governance_index(
+        conn,
+        project_id,
+        root,
+        run_id=rid,
+        commit_sha=target,
+        candidate_graph=candidate_graph,
+        snapshot_id=sid,
+        snapshot_kind="scope",
+    )
+    file_inventory = _normalize_inventory_commit(
+        [
+            row for row in (governance_index.get("file_inventory") or [])
+            if isinstance(row, dict)
+        ],
+        commit_sha=target,
+    )
+    scope_file_delta = _build_scope_file_delta(
+        project_root=root,
+        old_rows=active_inventory,
+        new_rows=file_inventory,
+        changed_files=changed_files,
+    )
+    eligibility = _incremental_metadata_scope_eligibility(
+        scope_file_delta,
+        old_rows=active_inventory,
+        new_rows=file_inventory,
+    )
+    if not eligibility.get("supported"):
+        return {
+            "ok": False,
+            "fallback_reason": str(eligibility.get("reason") or "incremental_metadata_unsupported"),
+            "incremental_eligibility": eligibility,
+        }
+
+    state_dir = _governance_state_dir(project_id, rid)
+    scratch_dir = state_dir / "scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    trace = ReconcileTrace(
+        project_id=project_id,
+        run_id=rid,
+        snapshot_id=sid,
+        trace_dir=state_dir / "trace",
+    )
+    trace.step(
+        "run-input",
+        input_payload={
+            "project_id": project_id,
+            "project_root": str(root),
+            "project_root_role": "execution_root",
+            "checkout_provenance": checkout_provenance,
+            "run_id": rid,
+            "snapshot_id": sid,
+            "snapshot_kind": "scope",
+            "commit_sha": target,
+            "created_by": created_by,
+            "scope_reconcile_strategy": "incremental_graph_delta",
+            "scope_graph_delta_mode": "metadata_only",
+        },
+        output_payload={
+            "state_dir": str(state_dir),
+            "scratch_dir": str(scratch_dir),
+            "active_snapshot_id": active_snapshot_id,
+            "active_graph_commit": active_commit,
+            "changed_files": changed_files,
+            "semantic_enrich": semantic_options.get("semantic_enrich", True),
+        },
+    )
+    trace.step(
+        "reuse-active-graph",
+        input_payload={
+            "active_snapshot_id": active_snapshot_id,
+            "active_graph_commit": active_commit,
+            "target_commit": target,
+        },
+        output_payload={
+            "graph_stats": graph_payload_stats(candidate_graph),
+            "eligibility": eligibility,
+        },
+    )
+    hash_metadata_merge = merge_feature_hashes_into_graph_nodes(candidate_graph, governance_index)
+    file_inventory = _normalize_inventory_commit(
+        [
+            row for row in (governance_index.get("file_inventory") or [])
+            if isinstance(row, dict)
+        ],
+        commit_sha=target,
+    )
+    enriched_inventory = governance_index.get("file_inventory")
+    if isinstance(enriched_inventory, list):
+        file_inventory = _normalize_inventory_commit(
+            [row for row in enriched_inventory if isinstance(row, dict)],
+            commit_sha=target,
+        )
+    nodes = _deps_graph_nodes(candidate_graph)
+    edges = _deps_graph_edges(candidate_graph)
+    scope_file_delta = _mark_scope_file_delta_strategy(
+        scope_file_delta,
+        strategy="incremental_graph_delta",
+        graph_delta_mode="metadata_only",
+    )
+    scope_graph_delta = _build_scope_graph_delta(
+        old_graph_json=active_graph_json,
+        new_graph_json=candidate_graph,
+        scope_file_delta=scope_file_delta,
+        strategy="incremental_graph_delta",
+        mode="metadata_only",
+    )
+    notes = {
+        "state_only": True,
+        "run_id": rid,
+        "snapshot_kind": "scope",
+        "scope_reconcile_strategy": "incremental_graph_delta",
+        "scope_graph_delta_mode": "metadata_only",
+        "incremental_scope_reconcile": {
+            "active_snapshot_id": active_snapshot_id,
+            "active_graph_commit": active_commit,
+            "target_commit": target,
+            "eligibility": eligibility,
+        },
+        "scope_file_delta": scope_file_delta,
+        "scope_graph_delta": scope_graph_delta,
+        "file_inventory_summary": governance_index.get("file_inventory_summary") or {},
+        "governance_hint_bindings": governance_index.get("governance_hint_bindings") or {},
+        "governance_index_hash_metadata": hash_metadata_merge,
+        "checkout_provenance": checkout_provenance,
+    }
+    notes["trace"] = {
+        "trace_dir": str(trace.trace_dir),
+        "summary_path": str(trace.trace_dir / "summary.json"),
+    }
+    with sqlite_write_lock():
+        snapshot = create_graph_snapshot(
+            conn,
+            project_id,
+            snapshot_id=sid,
+            commit_sha=target,
+            parent_snapshot_id=active_snapshot_id,
+            snapshot_kind="scope",
+            graph_json=candidate_graph,
+            file_inventory=file_inventory,
+            drift_ledger=[],
+            status=SNAPSHOT_STATUS_CANDIDATE,
+            created_by=created_by,
+            notes=json.dumps(notes, ensure_ascii=False, sort_keys=True),
+        )
+        index_counts = index_graph_snapshot(
+            conn,
+            project_id,
+            sid,
+            nodes=nodes,
+            edges=edges,
+        )
+        governance_index_summary = persist_governance_index(
+            conn,
+            project_id,
+            governance_index,
+            persist_inventory=True,
+        )
+        notes["governance_index"] = governance_index_summary
+        conn.execute(
+            "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+            (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+        )
+        conn.commit()
+    trace.step(
+        "create-graph-snapshot",
+        input_payload={
+            "snapshot_id": sid,
+            "snapshot_kind": "scope",
+            "commit_sha": target,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "file_inventory_count": len(file_inventory),
+        },
+        output_payload={
+            "snapshot": snapshot,
+            "snapshot_path": str(snapshot_graph_path(project_id, sid)),
+            "snapshot_artifact": artifact_ref(snapshot_graph_path(project_id, sid)),
+        },
+    )
+    trace.step(
+        "index-graph-snapshot",
+        input_payload={
+            "snapshot_id": sid,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        },
+        output_payload={"index_counts": index_counts},
+    )
+    trace.step(
+        "build-governance-index",
+        input_payload={
+            "snapshot_id": sid,
+            "run_id": rid,
+            "commit_sha": target,
+            "index_scope": "candidate_snapshot",
+        },
+        output_payload={
+            "summary": governance_index_summary,
+            "artifacts": governance_index_summary.get("artifacts") or {},
+            "hash_metadata_merge": hash_metadata_merge,
+        },
+    )
+    semantic_enrichment = _run_scope_semantic_enrichment(
+        conn,
+        project_id,
+        sid,
+        root,
+        created_by=created_by,
+        semantic_options=semantic_options,
+        trace=trace,
+    )
+    notes["semantic_enrichment"] = semantic_enrichment
+    activation = None
+    if activate:
+        with sqlite_write_lock():
+            activation = activate_graph_snapshot(
+                conn,
+                project_id,
+                sid,
+                expected_old_snapshot_id=active_snapshot_id,
+            )
+            conn.commit()
+        trace.step(
+            "activate-snapshot",
+            input_payload={
+                "snapshot_id": sid,
+                "expected_old_snapshot_id": active_snapshot_id,
+            },
+            output_payload={"activation": activation},
+        )
+    else:
+        trace.step(
+            "activate-snapshot",
+            input_payload={"snapshot_id": sid, "activate": False},
+            output_payload={"activation": None, "status": "skipped"},
+            status="skipped",
+        )
+    with sqlite_write_lock():
+        conn.execute(
+            "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+            (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+        )
+        conn.commit()
+    trace_summary = trace.finalize(status="ok")
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "run_id": rid,
+        "commit_sha": target,
+        "snapshot_id": sid,
+        "snapshot_status": "active" if activation else SNAPSHOT_STATUS_CANDIDATE,
+        "snapshot_path": str(snapshot_graph_path(project_id, sid)),
+        "phase_report_path": "",
+        "graph_stats": graph_payload_stats(candidate_graph),
+        "index_counts": index_counts,
+        "governance_index": governance_index_summary,
+        "semantic_enrichment": semantic_enrichment,
+        "trace": trace_summary,
+        "file_inventory_count": len(file_inventory),
+        "file_inventory_summary": governance_index.get("file_inventory_summary") or {},
+        "feature_cluster_count": governance_index_summary.get("feature_count", 0),
+        "snapshot": snapshot,
+        "activation": activation,
+        "incremental_eligibility": eligibility,
+    }
+
+
+def _finalize_scope_reconcile_candidate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    result: dict[str, Any],
+    root: Path,
+    active: dict[str, Any],
+    active_inventory: list[dict[str, Any]],
+    changed_files: list[str],
+    pending_count: int,
+    covered_commit_shas: list[str],
+    target: str,
+    rid: str,
+    sid: str,
+    created_by: str,
+    semantic_enqueue_stale: bool,
+    strategy: str,
+    graph_delta_mode: str,
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    scope_file_delta = _build_scope_file_delta(
+        project_root=root,
+        old_rows=active_inventory,
+        new_rows=_snapshot_inventory_rows(conn, project_id, sid),
+        changed_files=changed_files,
+    )
+    scope_file_delta = _mark_scope_file_delta_strategy(
+        scope_file_delta,
+        strategy=strategy,
+        graph_delta_mode=graph_delta_mode,
+        fallback_reason=fallback_reason,
+    )
+    old_graph_json = _read_snapshot_graph(project_id, str(active.get("snapshot_id") or ""))
+    new_graph_json = _read_snapshot_graph(project_id, sid)
+    scope_graph_delta = _build_scope_graph_delta(
+        old_graph_json=old_graph_json,
+        new_graph_json=new_graph_json,
+        scope_file_delta=scope_file_delta,
+        strategy=strategy,
+        mode=graph_delta_mode,
+        fallback_reason=fallback_reason,
+    )
+    scope_event_summary: dict[str, Any] = {}
+    pending_notes = {
+        "covered_commit_shas": covered_commit_shas,
+        "covered_commit_count": len(covered_commit_shas),
+        "active_snapshot_id": active.get("snapshot_id", ""),
+        "active_graph_commit": active.get("commit_sha", ""),
+        "scope_file_delta": scope_file_delta,
+        "scope_graph_delta": scope_graph_delta,
+        "semantic_enqueue_stale": bool(semantic_enqueue_stale),
+    }
+    row = conn.execute(
+        "SELECT notes FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
+        (project_id, sid),
+    ).fetchone()
+    with sqlite_write_lock():
+        scope_event_summary = _emit_scope_graph_events(
+            conn,
+            project_id,
+            old_snapshot_id=str(active.get("snapshot_id") or ""),
+            new_snapshot_id=sid,
+            old_graph_json=old_graph_json,
+            new_graph_json=new_graph_json,
+            scope_file_delta=scope_file_delta,
+            baseline_commit=str(active.get("commit_sha") or ""),
+            target_commit=target,
+            created_by=created_by,
+        )
+        pending_notes["scope_graph_events"] = scope_event_summary
+        activation_succeeded = bool(result.get("activation"))
+        updated = _update_pending_scope_candidate(
+            conn,
+            project_id,
+            covered_commit_shas=covered_commit_shas,
+            snapshot_id=sid,
+            target_commit_sha=target,
+            run_id=rid,
+            activated=activation_succeeded,
+        )
+        if row:
+            try:
+                notes = json.loads(row["notes"] if hasattr(row, "keys") else row[0])
+            except Exception:
+                notes = {}
+            notes["scope_file_delta"] = scope_file_delta
+            notes["scope_graph_delta"] = scope_graph_delta
+            notes["pending_scope_reconcile"] = pending_notes
+            conn.execute(
+                "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
+                (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
+            )
+        conn.commit()
+    return {
+        **result,
+        "pending_count": pending_count,
+        "covered_commit_shas": covered_commit_shas,
+        "covered_pending_count": len(covered_commit_shas),
+        "pending_rows_bound": updated,
+        "scope_file_delta": scope_file_delta,
+        "scope_graph_delta": scope_graph_delta,
+        "scope_graph_events": scope_event_summary,
+        "active_snapshot_id": active.get("snapshot_id", ""),
+        "active_graph_commit": active.get("commit_sha", ""),
+    }
+
+
 def run_pending_scope_reconcile_candidate(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1462,6 +2148,84 @@ def run_pending_scope_reconcile_candidate(
         effective_semantic_selector_match = "primary"
     rid = run_id or f"scope-reconcile-{_short_commit(target)}-pending"
     sid = snapshot_id or snapshot_id_for("scope", target)
+    checkout_provenance = describe_checkout(
+        root,
+        project_id=project_id,
+        commit_sha=target,
+    )
+    semantic_options = {
+        "semantic_enrich": semantic_enrich,
+        "semantic_use_ai": semantic_use_ai,
+        "semantic_feedback_items": semantic_feedback_items,
+        "semantic_feedback_round": semantic_feedback_round,
+        "semantic_max_excerpt_chars": semantic_max_excerpt_chars,
+        "semantic_ai_call": semantic_ai_call,
+        "semantic_ai_feature_limit": semantic_ai_feature_limit,
+        "semantic_ai_provider": semantic_ai_provider,
+        "semantic_ai_model": semantic_ai_model,
+        "semantic_ai_role": semantic_ai_role,
+        "semantic_ai_chain_role": semantic_ai_chain_role,
+        "semantic_analyzer_role": semantic_analyzer_role,
+        "semantic_ai_scope": effective_semantic_ai_scope,
+        "semantic_node_ids": semantic_node_ids,
+        "semantic_layers": semantic_layers,
+        "semantic_quality_flags": semantic_quality_flags,
+        "semantic_missing": semantic_missing,
+        "semantic_changed_paths": effective_semantic_changed_paths,
+        "semantic_path_prefixes": semantic_path_prefixes,
+        "semantic_selector_match": effective_semantic_selector_match,
+        "semantic_include_structural": semantic_include_structural,
+        "semantic_ai_batch_size": semantic_ai_batch_size,
+        "semantic_ai_batch_by": semantic_ai_batch_by,
+        "semantic_ai_input_mode": semantic_ai_input_mode,
+        "semantic_dynamic_graph_state": semantic_dynamic_graph_state,
+        "semantic_graph_state": semantic_graph_state,
+        "semantic_skip_completed": semantic_skip_completed,
+        "semantic_classify_feedback": semantic_classify_feedback,
+        "semantic_batch_memory": semantic_batch_memory,
+        "semantic_batch_memory_id": semantic_batch_memory_id,
+        "semantic_base_snapshot_id": semantic_base_snapshot_id or active.get("snapshot_id", ""),
+        "semantic_config_path": semantic_config_path,
+        "semantic_enqueue_stale": semantic_enqueue_stale,
+    }
+    incremental_result = _run_incremental_metadata_scope_reconcile_candidate(
+        conn,
+        project_id,
+        root,
+        target=target,
+        rid=rid,
+        sid=sid,
+        active=active,
+        active_inventory=active_inventory,
+        changed_files=changed_files,
+        checkout_provenance=checkout_provenance,
+        created_by=created_by,
+        activate=activate,
+        semantic_options=semantic_options,
+    )
+    if incremental_result.get("ok"):
+        return _finalize_scope_reconcile_candidate(
+            conn,
+            project_id,
+            result=incremental_result,
+            root=root,
+            active=active,
+            active_inventory=active_inventory,
+            changed_files=changed_files,
+            pending_count=len(pending),
+            covered_commit_shas=covered,
+            target=target,
+            rid=rid,
+            sid=sid,
+            created_by=created_by,
+            semantic_enqueue_stale=semantic_enqueue_stale,
+            strategy="incremental_graph_delta",
+            graph_delta_mode="metadata_only",
+        )
+    fallback_reason = str(
+        incremental_result.get("fallback_reason")
+        or "incremental_scope_unsupported"
+    )
     result = run_state_only_full_reconcile(
         conn,
         project_id,
@@ -1528,78 +2292,25 @@ def run_pending_scope_reconcile_candidate(
             "pending_count": len(pending),
             "covered_commit_shas": covered,
         }
-    scope_file_delta = _build_scope_file_delta(
-        project_root=root,
-        old_rows=active_inventory,
-        new_rows=_snapshot_inventory_rows(conn, project_id, sid),
+    return _finalize_scope_reconcile_candidate(
+        conn,
+        project_id,
+        result=result,
+        root=root,
+        active=active,
+        active_inventory=active_inventory,
         changed_files=changed_files,
+        pending_count=len(pending),
+        covered_commit_shas=covered,
+        target=target,
+        rid=rid,
+        sid=sid,
+        created_by=created_by,
+        semantic_enqueue_stale=semantic_enqueue_stale,
+        strategy="full_rebuild_fallback",
+        graph_delta_mode="full_rebuild",
+        fallback_reason=fallback_reason,
     )
-    old_graph_json = _read_snapshot_graph(project_id, str(active.get("snapshot_id") or ""))
-    new_graph_json = _read_snapshot_graph(project_id, sid)
-    scope_event_summary: dict[str, Any] = {}
-    pending_notes = {
-        "covered_commit_shas": covered,
-        "covered_commit_count": len(covered),
-        "active_snapshot_id": active.get("snapshot_id", ""),
-        "active_graph_commit": active.get("commit_sha", ""),
-        "scope_file_delta": scope_file_delta,
-        "semantic_enqueue_stale": bool(semantic_enqueue_stale),
-    }
-    row = conn.execute(
-        "SELECT notes FROM graph_snapshots WHERE project_id = ? AND snapshot_id = ?",
-        (project_id, sid),
-    ).fetchone()
-    with sqlite_write_lock():
-        scope_event_summary = _emit_scope_graph_events(
-            conn,
-            project_id,
-            old_snapshot_id=str(active.get("snapshot_id") or ""),
-            new_snapshot_id=sid,
-            old_graph_json=old_graph_json,
-            new_graph_json=new_graph_json,
-            scope_file_delta=scope_file_delta,
-            baseline_commit=str(active.get("commit_sha") or ""),
-            target_commit=target,
-            created_by=created_by,
-        )
-        pending_notes["scope_graph_events"] = scope_event_summary
-        # OPT-BACKLOG-PENDING-SCOPE-TRANSITION-MISSING: when activate=True the
-        # candidate is now the active snapshot, so the pending row should land
-        # in `materialized` not `running`. result.get("activation") is set by
-        # run_state_only_full_reconcile when it successfully ran
-        # activate_graph_snapshot earlier in the flow.
-        activation_succeeded = bool(result.get("activation"))
-        updated = _update_pending_scope_candidate(
-            conn,
-            project_id,
-            covered_commit_shas=covered,
-            snapshot_id=sid,
-            target_commit_sha=target,
-            run_id=rid,
-            activated=activation_succeeded,
-        )
-        if row:
-            try:
-                notes = json.loads(row["notes"] if hasattr(row, "keys") else row[0])
-            except Exception:
-                notes = {}
-            notes["pending_scope_reconcile"] = pending_notes
-            conn.execute(
-                "UPDATE graph_snapshots SET notes = ? WHERE project_id = ? AND snapshot_id = ?",
-                (json.dumps(notes, ensure_ascii=False, sort_keys=True), project_id, sid),
-            )
-        conn.commit()
-    return {
-        **result,
-        "pending_count": len(pending),
-        "covered_commit_shas": covered,
-        "covered_pending_count": len(covered),
-        "pending_rows_bound": updated,
-        "scope_file_delta": scope_file_delta,
-        "scope_graph_events": scope_event_summary,
-        "active_snapshot_id": active.get("snapshot_id", ""),
-        "active_graph_commit": active.get("commit_sha", ""),
-    }
 
 
 def run_backfill_escape_hatch(

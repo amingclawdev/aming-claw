@@ -136,8 +136,15 @@ def test_scope_reconcile_output_matches_full_rebuild_for_same_final_state(conn, 
         semantic_enrich=False,
     )
     assert scope["ok"] is True
-    assert scope["scope_file_delta"]["strategy"] == "full_scan_with_incremental_file_delta"
+    assert scope["scope_file_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_file_delta"]["graph_delta_mode"] == "metadata_only"
     assert scope["scope_file_delta"]["changed_files"] == ["README.md"]
+    assert scope["scope_graph_delta"]["strategy"] == "incremental_graph_delta"
+    assert scope["scope_graph_delta"]["mode"] == "metadata_only"
+    assert scope["scope_graph_delta"]["added_nodes"] == []
+    assert scope["scope_graph_delta"]["removed_nodes"] == []
+    assert scope["scope_graph_delta"]["added_edges"] == []
+    assert scope["scope_graph_delta"]["removed_edges"] == []
 
     full = run_state_only_full_reconcile(
         conn,
