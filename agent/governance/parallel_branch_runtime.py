@@ -189,6 +189,28 @@ ACTION_REPLAY_THROUGH_MERGE_QUEUE = "replay_through_merge_queue"
 ACTION_RETAIN_FOR_REPLAY = "retain_for_replay"
 ACTION_RETAIN_FOR_AUDIT = "retain_for_audit"
 ACTION_CLEANUP_RETAINED_BRANCH = "cleanup_retained_branch"
+ACTION_OPERATOR_APPROVE_LIVE_MERGE = "operator_approve_live_merge"
+
+MERGE_GATE_REQUIRED_EVIDENCE = (
+    "git_conflict_check",
+    "dirty_worktree_check",
+    "test_evidence",
+    "graph_currentness",
+    "scope_reconcile",
+    "semantic_projection",
+    "backlog_acceptance",
+)
+MERGE_GATE_PASS_STATUSES = {
+    "clean",
+    "current",
+    "ok",
+    "pass",
+    "passed",
+    "satisfied",
+    "waived",
+}
+MERGE_GATE_DEFERABLE_EVIDENCE = {"semantic_projection"}
+MERGE_GATE_DEFERRED_STATUSES = {"deferred", "intentionally_deferred"}
 
 TERMINAL_NON_BLOCKING_STATES = {"merged", "abandoned", "cleaned"}
 MERGE_DONE_STATES = {STATE_MERGED}
@@ -413,6 +435,36 @@ class MergeQueuePlan:
 
 
 @dataclass(frozen=True)
+class MergeGatePlan:
+    scenario_id: str
+    project_id: str
+    merge_queue_id: str
+    queue_item_id: str
+    task_id: str
+    branch_ref: str
+    target_ref: str
+    branch_head: str
+    current_target_head: str
+    dry_run: bool
+    queue_state: str
+    queue_action: str
+    merge_gate_passed: bool
+    merge_allowed: bool
+    target_branch_mutation_allowed: bool
+    target_graph_activation_allowed: bool
+    target_semantic_activation_allowed: bool
+    blockers: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    blocker_codes: tuple[str, ...] = ()
+    warnings: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    evidence: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    next_actions: tuple[str, ...] = ()
+    merge_steps: tuple[str, ...] = ()
+    merge_preview_id: str = ""
+    snapshot_id: str = ""
+    projection_id: str = ""
+
+
+@dataclass(frozen=True)
 class BatchMergeItem:
     task_id: str
     branch_ref: str
@@ -621,6 +673,17 @@ def batch_rollback_plan_to_dict(plan: BatchRollbackPlan) -> dict[str, Any]:
     payload["cleanup_blockers"] = list(plan.cleanup_blockers)
     payload["operator_actions"] = list(plan.operator_actions)
     payload["dashboard_rows"] = list(plan.dashboard_rows)
+    return payload
+
+
+def merge_gate_plan_to_dict(plan: MergeGatePlan) -> dict[str, Any]:
+    payload = asdict(plan)
+    payload["blockers"] = list(plan.blockers)
+    payload["blocker_codes"] = list(plan.blocker_codes)
+    payload["warnings"] = list(plan.warnings)
+    payload["evidence"] = list(plan.evidence)
+    payload["next_actions"] = list(plan.next_actions)
+    payload["merge_steps"] = list(plan.merge_steps)
     return payload
 
 
@@ -960,6 +1023,42 @@ def decide_persisted_merge_queue(
             merge_queue_id,
             target_ref=target_ref,
         ),
+        scenario_id=scenario_id,
+    )
+
+
+def decide_persisted_merge_gate(
+    conn: sqlite3.Connection,
+    project_id: str,
+    merge_queue_id: str,
+    *,
+    target_ref: str = "",
+    queue_item_id: str = "",
+    task_id: str = "",
+    evidence: dict[str, Any] | None = None,
+    batch_id: str = "",
+    batch_status: str = "",
+    dry_run: bool = True,
+    scenario_id: str = "PB-013",
+) -> MergeGatePlan:
+    """Replay a merge gate plan from durable queue rows without merging git refs."""
+    runtime_status = str(batch_status or "").strip()
+    if not runtime_status and batch_id:
+        runtime = get_batch_merge_runtime(conn, project_id, batch_id)
+        if runtime is not None:
+            runtime_status = runtime.batch_status
+    return decide_merge_gate(
+        list_merge_queue_items(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=target_ref,
+        ),
+        queue_item_id=queue_item_id,
+        task_id=task_id,
+        evidence=evidence,
+        batch_status=runtime_status,
+        dry_run=dry_run,
         scenario_id=scenario_id,
     )
 
@@ -1836,6 +1935,220 @@ def decide_merge_queue(
         stale_task_ids=stale,
         target_mutation_blocked_for=target_mutation_blocked,
         dashboard_rows=tuple(decision.to_dashboard_row() for decision in decisions),
+    )
+
+
+def _select_merge_gate_item(
+    items: list[MergeQueueItem],
+    *,
+    queue_item_id: str,
+    task_id: str,
+) -> MergeQueueItem:
+    item_id = str(queue_item_id or "").strip()
+    task = str(task_id or "").strip()
+    for item in sorted(items, key=lambda it: (it.queue_index, it.queue_item_id)):
+        if item_id and item.queue_item_id == item_id:
+            return item
+        if task and item.task_id == task:
+            return item
+    if len(items) == 1 and not item_id and not task:
+        return items[0]
+    raise KeyError(f"merge queue item not found: {item_id or task or '<unspecified>'}")
+
+
+def _select_merge_gate_decision(
+    plan: MergeQueuePlan,
+    item: MergeQueueItem,
+) -> MergeQueueDecision:
+    for decision in plan.decisions:
+        if decision.queue_item_id == item.queue_item_id:
+            return decision
+    raise KeyError(f"merge queue decision not found: {item.queue_item_id}")
+
+
+def _evidence_status(raw: Any) -> str:
+    if isinstance(raw, dict):
+        raw = raw.get("status") or raw.get("state")
+    return str(raw or "").strip().lower()
+
+
+def _evidence_detail(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if raw is None:
+        return {}
+    return {"status": raw}
+
+
+def _merge_gate_evidence_rows(
+    evidence: dict[str, Any],
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    rows: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    for key in MERGE_GATE_REQUIRED_EVIDENCE:
+        raw = evidence.get(key)
+        status = _evidence_status(raw) or "missing"
+        detail = _evidence_detail(raw)
+        passed = status in MERGE_GATE_PASS_STATUSES
+        deferred = key in MERGE_GATE_DEFERABLE_EVIDENCE and status in MERGE_GATE_DEFERRED_STATUSES
+        row = {
+            "key": key,
+            "status": status,
+            "required": True,
+            "passed": bool(passed or deferred),
+            "deferred": bool(deferred),
+            "evidence_id": str(detail.get("evidence_id") or detail.get("id") or ""),
+            "detail": detail,
+        }
+        rows.append(row)
+        if deferred:
+            warnings.append({
+                "code": f"deferred_evidence:{key}",
+                "source": "evidence",
+                "message": f"{key} is intentionally deferred",
+            })
+            continue
+        if not passed:
+            blockers.append({
+                "code": f"missing_evidence:{key}" if status == "missing" else f"failed_evidence:{key}",
+                "source": "evidence",
+                "message": f"{key} status is {status}",
+                "status": status,
+            })
+
+    return tuple(rows), tuple(blockers), tuple(warnings)
+
+
+def _merge_gate_blockers_for_queue(decision: MergeQueueDecision) -> tuple[dict[str, Any], ...]:
+    if decision.merge_allowed:
+        return ()
+    if decision.stale_target_head:
+        return ({
+            "code": "stale_target_head",
+            "source": "merge_queue",
+            "message": "target head moved after validation",
+            "queue_state": decision.queue_state,
+        },)
+    if decision.dependency_blockers:
+        return ({
+            "code": "queue_dependency_blocked",
+            "source": "merge_queue",
+            "message": "merge queue dependencies are not satisfied",
+            "queue_state": decision.queue_state,
+            "dependency_blockers": list(decision.dependency_blockers),
+            "dependency_blocker_types": {
+                key: list(values)
+                for key, values in sorted(decision.dependency_blocker_types.items())
+            },
+        },)
+    return ({
+        "code": f"queue_state:{decision.queue_state or 'unknown'}",
+        "source": "merge_queue",
+        "message": f"queue action {decision.action} does not permit merge",
+        "queue_state": decision.queue_state,
+    },)
+
+
+def _merge_gate_next_actions(
+    *,
+    blockers: tuple[dict[str, Any], ...],
+    dry_run: bool,
+) -> tuple[str, ...]:
+    if blockers:
+        actions: list[str] = []
+        codes = {str(blocker.get("code") or "") for blocker in blockers}
+        if "queue_dependency_blocked" in codes:
+            actions.append("resolve_queue_dependencies")
+        if "stale_target_head" in codes:
+            actions.extend(("rebase_or_sync", "refresh_merge_preview"))
+        if "batch_rollback_required" in codes:
+            actions.append("resolve_batch_rollback")
+        if any(code.startswith("missing_evidence:") for code in codes):
+            actions.append("provide_required_merge_evidence")
+        if any(code.startswith("failed_evidence:") for code in codes):
+            actions.append("fix_failed_merge_evidence")
+        return tuple(actions or ["do_not_merge"])
+    if dry_run:
+        return (ACTION_OPERATOR_APPROVE_LIVE_MERGE,)
+    return ("execute_merge", "record_merge_result", "activate_target_graph_refs")
+
+
+def decide_merge_gate(
+    items: list[MergeQueueItem],
+    *,
+    queue_item_id: str = "",
+    task_id: str = "",
+    evidence: dict[str, Any] | None = None,
+    batch_status: str = "",
+    dry_run: bool = True,
+    scenario_id: str = "PB-013",
+) -> MergeGatePlan:
+    """Plan the final merge gate for one queue item without mutating refs.
+
+    This composes the ordered queue decision with required evidence checks. It
+    is intentionally side-effect free so dashboard, MCP, MF, and future Chain
+    clients can agree on the gate before any live merge code touches target refs.
+    """
+    _require_single_merge_queue_scope(items)
+    selected = _select_merge_gate_item(items, queue_item_id=queue_item_id, task_id=task_id)
+    queue_plan = decide_merge_queue(items, scenario_id=scenario_id)
+    decision = _select_merge_gate_decision(queue_plan, selected)
+    evidence_rows, evidence_blockers, evidence_warnings = _merge_gate_evidence_rows(evidence or {})
+    queue_blockers = _merge_gate_blockers_for_queue(decision)
+
+    batch = str(batch_status or "").strip()
+    batch_blockers: tuple[dict[str, Any], ...] = ()
+    if batch in BATCH_ROLLBACK_STATES:
+        batch_blockers = ({
+            "code": "batch_rollback_required",
+            "source": "batch",
+            "message": f"batch status {batch} blocks live merge",
+            "batch_status": batch,
+        },)
+
+    blockers = queue_blockers + batch_blockers + evidence_blockers
+    blocker_codes = tuple(str(blocker.get("code") or "") for blocker in blockers)
+    gate_passed = not blockers
+    mutation_allowed = gate_passed and not dry_run
+    merge_steps = (
+        "lock_target_ref",
+        "verify_target_head",
+        "merge_branch",
+        "record_merge_result",
+        "run_scope_catchup",
+        "activate_target_graph_refs",
+        "activate_target_semantic_projection",
+    ) if gate_passed else ()
+
+    return MergeGatePlan(
+        scenario_id=scenario_id,
+        project_id=selected.project_id,
+        merge_queue_id=selected.merge_queue_id,
+        queue_item_id=selected.queue_item_id,
+        task_id=selected.task_id,
+        branch_ref=selected.branch_ref,
+        target_ref=selected.target_ref,
+        branch_head=selected.branch_head,
+        current_target_head=selected.current_target_head,
+        dry_run=dry_run,
+        queue_state=decision.queue_state,
+        queue_action=decision.action,
+        merge_gate_passed=gate_passed,
+        merge_allowed=gate_passed,
+        target_branch_mutation_allowed=mutation_allowed,
+        target_graph_activation_allowed=mutation_allowed and bool(selected.snapshot_id),
+        target_semantic_activation_allowed=mutation_allowed and bool(selected.projection_id),
+        blockers=blockers,
+        blocker_codes=blocker_codes,
+        warnings=evidence_warnings,
+        evidence=evidence_rows,
+        next_actions=_merge_gate_next_actions(blockers=blockers, dry_run=dry_run),
+        merge_steps=merge_steps,
+        merge_preview_id=selected.merge_preview_id,
+        snapshot_id=selected.snapshot_id,
+        projection_id=selected.projection_id,
     )
 
 

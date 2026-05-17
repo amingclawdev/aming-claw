@@ -427,6 +427,104 @@ def test_parallel_branch_merge_queue_route_enforces_fence_and_returns_decision(c
     assert read["read_model"]["branch_lanes"][0]["merge_queue_id"] == queue_id
 
 
+def test_parallel_branch_merge_gate_route_returns_dry_run_plan(conn):
+    queue_id = "mergeq-api-gate"
+    evidence = {
+        "git_conflict_check": {"status": "pass", "evidence_id": "preview-api-gate"},
+        "dirty_worktree_check": {"status": "pass"},
+        "test_evidence": {"status": "pass"},
+        "graph_currentness": {"status": "current"},
+        "scope_reconcile": {"status": "pass"},
+        "semantic_projection": {"status": "pass"},
+        "backlog_acceptance": {"status": "satisfied"},
+    }
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-gate-task",
+                task_id="gate-task",
+                branch_ref="refs/heads/codex/gate-task",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head="head-gate",
+                validated_target_head="target-gate",
+                current_target_head="target-gate",
+                merge_preview_id="preview-api-gate",
+                snapshot_id="scope-gate",
+                projection_id="semproj-gate",
+            )
+        ],
+        now_iso="2026-05-17T08:10:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branch_merge_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": queue_id,
+                "task_id": "gate-task",
+                "evidence": evidence,
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    plan = result["plan"]
+    assert plan["dry_run"] is True
+    assert plan["merge_gate_passed"] is True
+    assert plan["merge_allowed"] is True
+    assert plan["target_branch_mutation_allowed"] is False
+    assert plan["target_graph_activation_allowed"] is False
+    assert plan["next_actions"] == ["operator_approve_live_merge"]
+    assert plan["merge_preview_id"] == "preview-api-gate"
+    assert plan["evidence"][0]["key"] == "git_conflict_check"
+
+
+def test_parallel_branch_merge_gate_route_blocks_batch_rollback(conn):
+    queue_id = "mergeq-api-gate-blocked"
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PID,
+                merge_queue_id=queue_id,
+                queue_item_id="item-gate-blocked",
+                task_id="gate-blocked",
+                branch_ref="refs/heads/codex/gate-blocked",
+                queue_index=1,
+                status="merge_ready",
+                target_ref="refs/heads/main",
+                branch_head="head-gate-blocked",
+                validated_target_head="target-gate",
+                current_target_head="target-gate",
+            )
+        ],
+        now_iso="2026-05-17T08:15:00Z",
+    )
+
+    result = server.handle_graph_governance_parallel_branch_merge_gate(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "merge_queue_id": queue_id,
+                "task_id": "gate-blocked",
+                "batch_status": "rollback_required",
+            },
+        )
+    )
+
+    assert result["plan"]["merge_gate_passed"] is False
+    assert "batch_rollback_required" in result["plan"]["blocker_codes"]
+    assert "missing_evidence:git_conflict_check" in result["plan"]["blocker_codes"]
+    assert result["plan"]["target_branch_mutation_allowed"] is False
+
+
 def test_parallel_branch_batch_runtime_route_returns_rollback_plan(conn):
     batch_id = "PB-api-batch"
     upsert_branch_context(

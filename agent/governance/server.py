@@ -3306,6 +3306,47 @@ def handle_graph_governance_parallel_branch_merge_queue(ctx: RequestContext):
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/parallel-branches/merge-gate")
+def handle_graph_governance_parallel_branch_merge_gate(ctx: RequestContext):
+    """Return a side-effect-free merge gate plan for one queued branch."""
+    project_id = ctx.get_project_id()
+    from .parallel_branch_runtime import (
+        decide_persisted_merge_gate,
+        merge_gate_plan_to_dict,
+    )
+
+    merge_queue_id = str(ctx.body.get("merge_queue_id") or "").strip()
+    if not merge_queue_id:
+        raise ValidationError("merge_queue_id is required")
+    evidence = ctx.body.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        raise ValidationError("evidence must be an object when provided")
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.parallel-branches.merge-gate")
+        plan = decide_persisted_merge_gate(
+            conn,
+            project_id,
+            merge_queue_id,
+            target_ref=str(ctx.body.get("target_ref") or "refs/heads/main"),
+            queue_item_id=str(ctx.body.get("queue_item_id") or ""),
+            task_id=str(ctx.body.get("task_id") or ""),
+            evidence=evidence,
+            batch_id=str(ctx.body.get("batch_id") or ""),
+            batch_status=str(ctx.body.get("batch_status") or ""),
+            dry_run=_query_bool(ctx.body, "dry_run", True),
+            scenario_id=str(ctx.body.get("scenario_id") or "PB-013"),
+        )
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "plan": merge_gate_plan_to_dict(plan),
+        }
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/graph-governance/{project_id}/parallel-branches/batch-runtime")
 def handle_graph_governance_parallel_branch_batch_runtime(ctx: RequestContext):
     """Persist batch runtime state and return rollback/replay planning."""

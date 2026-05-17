@@ -9,8 +9,11 @@ import pytest
 from agent.governance.parallel_branch_runtime import (
     ACTION_ALLOW_MERGE,
     ACTION_BLOCKED_BY_DEPENDENCY,
+    ACTION_OPERATOR_APPROVE_LIVE_MERGE,
     ACTION_REVALIDATE_AFTER_DEPENDENCY_MERGE,
     ACTION_WAIT_FOR_DEPENDENCY,
+    BATCH_STATE_ROLLBACK_REQUIRED,
+    MERGE_GATE_REQUIRED_EVIDENCE,
     STATE_DEPENDENCY_BLOCKED,
     STATE_MERGE_READY,
     STATE_MERGED,
@@ -18,9 +21,12 @@ from agent.governance.parallel_branch_runtime import (
     STATE_STALE_AFTER_DEPENDENCY_MERGE,
     STATE_WAITING_DEPENDENCY,
     MergeQueueItem,
+    decide_merge_gate,
     decide_merge_queue,
+    decide_persisted_merge_gate,
     decide_persisted_merge_queue,
     list_merge_queue_items,
+    merge_gate_plan_to_dict,
     upsert_merge_queue_items,
 )
 
@@ -37,6 +43,13 @@ def _runtime_conn(path: str = ":memory:") -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _passing_merge_evidence() -> dict[str, dict[str, str]]:
+    return {
+        key: {"status": "pass", "evidence_id": f"evidence-{key}"}
+        for key in MERGE_GATE_REQUIRED_EVIDENCE
+    }
 
 
 def test_pb002_downstream_merge_waits_for_unmerged_foundation_dependency() -> None:
@@ -445,6 +458,162 @@ def test_conflict_dependencies_require_operator_resolution() -> None:
         "T1": ("conflicts_with", "same_node_or_file_conflict")
     }
     assert decisions["T2"].next_actions == ("resolve_dependency", "do_not_merge")
+
+
+def test_merge_gate_blocks_target_mutation_until_evidence_is_complete() -> None:
+    item = MergeQueueItem(
+        project_id=PROJECT_ID,
+        merge_queue_id="mergeq-gate",
+        queue_item_id="item-T1",
+        task_id="T1",
+        branch_ref="refs/heads/codex/PB013-T1-ready",
+        queue_index=1,
+        status=STATE_MERGE_READY,
+        target_ref=TARGET_REF,
+        branch_head="head-T1",
+        current_target_head="target-base",
+        validated_target_head="target-base",
+        merge_preview_id="preview-T1",
+        snapshot_id="scope-T1",
+        projection_id="semproj-T1",
+    )
+
+    missing = decide_merge_gate([item], task_id="T1", scenario_id="PB-013")
+
+    assert missing.merge_gate_passed is False
+    assert missing.merge_allowed is False
+    assert missing.target_branch_mutation_allowed is False
+    assert "missing_evidence:git_conflict_check" in missing.blocker_codes
+    assert "provide_required_merge_evidence" in missing.next_actions
+
+    dry_run = decide_merge_gate(
+        [item],
+        task_id="T1",
+        evidence=_passing_merge_evidence(),
+        scenario_id="PB-013",
+    )
+
+    assert dry_run.merge_gate_passed is True
+    assert dry_run.merge_allowed is True
+    assert dry_run.dry_run is True
+    assert dry_run.target_branch_mutation_allowed is False
+    assert dry_run.target_graph_activation_allowed is False
+    assert dry_run.next_actions == (ACTION_OPERATOR_APPROVE_LIVE_MERGE,)
+    assert dry_run.merge_steps == (
+        "lock_target_ref",
+        "verify_target_head",
+        "merge_branch",
+        "record_merge_result",
+        "run_scope_catchup",
+        "activate_target_graph_refs",
+        "activate_target_semantic_projection",
+    )
+
+    payload = merge_gate_plan_to_dict(dry_run)
+    assert payload["evidence"][0]["evidence_id"].startswith("evidence-")
+    assert payload["blockers"] == []
+
+
+def test_merge_gate_blocks_dependency_stale_target_and_batch_rollback() -> None:
+    items = [
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-gate-blocked",
+            queue_item_id="item-T1",
+            task_id="T1",
+            branch_ref="refs/heads/codex/PB013-T1-foundation",
+            queue_index=1,
+            status=STATE_RUNNING,
+            target_ref=TARGET_REF,
+        ),
+        MergeQueueItem(
+            project_id=PROJECT_ID,
+            merge_queue_id="mergeq-gate-blocked",
+            queue_item_id="item-T2",
+            task_id="T2",
+            branch_ref="refs/heads/codex/PB013-T2-downstream",
+            queue_index=2,
+            status=STATE_MERGE_READY,
+            hard_depends_on=("T1",),
+            target_ref=TARGET_REF,
+            branch_head="head-T2",
+            validated_target_head="target-before",
+            current_target_head="target-after",
+        ),
+    ]
+
+    plan = decide_merge_gate(
+        items,
+        task_id="T2",
+        evidence=_passing_merge_evidence(),
+        batch_status=BATCH_STATE_ROLLBACK_REQUIRED,
+        dry_run=False,
+        scenario_id="PB-013",
+    )
+
+    assert plan.merge_gate_passed is False
+    assert plan.target_branch_mutation_allowed is False
+    assert "queue_dependency_blocked" in plan.blocker_codes
+    assert "batch_rollback_required" in plan.blocker_codes
+    assert "resolve_queue_dependencies" in plan.next_actions
+    assert "resolve_batch_rollback" in plan.next_actions
+
+
+def test_persisted_merge_gate_replays_after_restart(tmp_path) -> None:
+    db_path = str(tmp_path / "runtime.db")
+    conn = _runtime_conn(db_path)
+    upsert_merge_queue_items(
+        conn,
+        [
+            MergeQueueItem(
+                project_id=PROJECT_ID,
+                merge_queue_id="mergeq-gate-restart",
+                queue_item_id="item-T1",
+                task_id="T1",
+                branch_ref="refs/heads/codex/PB013-T1-ready",
+                queue_index=1,
+                status=STATE_MERGE_READY,
+                target_ref=TARGET_REF,
+                branch_head="head-T1",
+                validated_target_head="target-base",
+                current_target_head="target-base",
+                merge_preview_id="preview-T1",
+                snapshot_id="scope-T1",
+                projection_id="semproj-T1",
+            ),
+        ],
+        now_iso="2026-05-17T08:00:00Z",
+    )
+    conn.commit()
+    conn.close()
+
+    restarted = _runtime_conn(db_path)
+    plan = decide_persisted_merge_gate(
+        restarted,
+        PROJECT_ID,
+        "mergeq-gate-restart",
+        target_ref=TARGET_REF,
+        task_id="T1",
+        evidence={
+            **_passing_merge_evidence(),
+            "semantic_projection": {
+                "status": "intentionally_deferred",
+                "evidence_id": "semantic-deferred",
+            },
+        },
+        scenario_id="PB-013",
+    )
+
+    assert plan.merge_gate_passed is True
+    assert plan.warnings == (
+        {
+            "code": "deferred_evidence:semantic_projection",
+            "source": "evidence",
+            "message": "semantic_projection is intentionally deferred",
+        },
+    )
+    assert plan.merge_preview_id == "preview-T1"
+    assert plan.snapshot_id == "scope-T1"
 
 
 def test_pb012_merge_queue_rejects_mixed_project_queue_or_target_scope() -> None:

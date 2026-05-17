@@ -195,6 +195,13 @@ merge preview ids, and graph/projection ids. `decide_persisted_merge_queue`
 replays PB-002/PB-003 queue decisions from SQLite after restart without
 performing git merge side effects.
 
+Implemented gate slice: `decide_merge_gate` and the governance merge-gate API
+compose queue readiness with required evidence checks before any live merge.
+The default plan is dry-run and cannot mutate the target ref. A future executor
+slice may use the same plan with explicit operator approval, but dependencies,
+stale target heads, rollback-required batches, and missing or failed evidence
+must block target mutation.
+
 Queue states:
 
 ```text
