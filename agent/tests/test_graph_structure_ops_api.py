@@ -331,6 +331,10 @@ def test_graph_structure_ops_jobs_selector_request_drains_through_ai_generated_p
                 "move_file",
                 "suppress_edge",
             ]
+            assert (
+                payload["output_contract"]["source"]["analyzer_role"]
+                == "reconcile_graph_structure_analyzer"
+            )
             assert "test" in payload["output_contract"]["supported_roles"]
             assert "tests" in payload["output_contract"]["supported_edges"]
             assert "agent/tests/test_service.py" in payload["inventory_paths"]

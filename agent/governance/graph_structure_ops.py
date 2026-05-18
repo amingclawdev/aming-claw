@@ -11,6 +11,7 @@ from agent.governance.graph_structure_hints import write_graph_structure_hints
 
 
 SCHEMA_VERSION = "graph_structure_ops.v1"
+ANALYZER_ROLE = "reconcile_graph_structure_analyzer"
 SUPPORTED_HINT_OPS = {"move_file", "add_edge", "suppress_edge"}
 ROLE_ALLOWLIST = {"primary", "secondary", "test", "config", "doc"}
 EDGE_ALLOWLIST = {
@@ -75,6 +76,8 @@ def validate_graph_structure_ops(
         global_errors.append("source_snapshot_mismatch")
     if base_commit and str(source.get("base_commit") or "") != base_commit:
         global_errors.append("source_base_commit_mismatch")
+    if str(source.get("analyzer_role") or "") != ANALYZER_ROLE:
+        global_errors.append("source_analyzer_role_invalid")
     if self_check.get("valid") is not True:
         global_errors.append("self_check_invalid")
     if not isinstance(self_check.get("checked_rules"), list) or not self_check.get("checked_rules"):

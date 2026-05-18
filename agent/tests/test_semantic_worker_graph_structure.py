@@ -320,6 +320,10 @@ def test_semantic_worker_graph_structure_job_invokes_ai_when_output_missing(
                 "move_file",
                 "suppress_edge",
             ]
+            assert (
+                payload["output_contract"]["source"]["analyzer_role"]
+                == "reconcile_graph_structure_analyzer"
+            )
             assert "test" in payload["output_contract"]["supported_roles"]
             assert "tests" in payload["output_contract"]["supported_edges"]
             assert payload["snapshot_id"] == "worker-graph-structure-ai-base"

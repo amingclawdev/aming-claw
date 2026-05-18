@@ -28,7 +28,11 @@ def test_graph_structure_ai_output_pipeline_dry_run_and_accept_requires_project_
 
     payload = {
         "schema_version": "graph_structure_ops.v1",
-        "source": {"snapshot_id": "snap", "base_commit": "head"},
+        "source": {
+            "snapshot_id": "snap",
+            "base_commit": "head",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
         "operations": [
             {
                 "op": "add_edge",
@@ -217,7 +221,11 @@ def test_graph_structure_ops_gate_rejects_unsupported_structural_ops() -> None:
     validate_graph_structure_ops = _future_api()
     payload = {
         "schema_version": "graph_structure_ops.v1",
-        "source": {"snapshot_id": "scope-current", "base_commit": "abc123"},
+        "source": {
+            "snapshot_id": "scope-current",
+            "base_commit": "abc123",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
         "operations": [
             {
                 "op": "merge_nodes",
@@ -250,7 +258,11 @@ def test_graph_structure_ops_gate_requires_real_snapshot_targets_and_self_check(
     validate_graph_structure_ops = _future_api()
     payload = {
         "schema_version": "graph_structure_ops.v1",
-        "source": {"snapshot_id": "wrong-snapshot", "base_commit": "abc123"},
+        "source": {
+            "snapshot_id": "wrong-snapshot",
+            "base_commit": "abc123",
+            "analyzer_role": "reconcile_node_semantic_analyzer",
+        },
         "operations": [
             {
                 "op": "move_file",
@@ -275,6 +287,7 @@ def test_graph_structure_ops_gate_requires_real_snapshot_targets_and_self_check(
 
     assert report["ok"] is False
     assert "source_snapshot_mismatch" in report["errors"]
+    assert "source_analyzer_role_invalid" in report["errors"]
     assert "self_check_invalid" in report["errors"]
     assert "hint_id_invalid" in errors
     assert "source_path_missing" in errors
@@ -287,7 +300,11 @@ def test_graph_structure_ops_gate_detects_conflicting_operations() -> None:
     validate_graph_structure_ops = _future_api()
     payload = {
         "schema_version": "graph_structure_ops.v1",
-        "source": {"snapshot_id": "scope-current", "base_commit": "abc123"},
+        "source": {
+            "snapshot_id": "scope-current",
+            "base_commit": "abc123",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
         "operations": [
             {
                 "op": "move_file",

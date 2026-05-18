@@ -158,6 +158,7 @@ def _graph_structure_ai_payload(
     from . import db as governance_db
     from . import graph_snapshot_store as store
     from .graph_structure_ops import (
+        ANALYZER_ROLE,
         EDGE_ALLOWLIST,
         ROLE_ALLOWLIST,
         SCHEMA_VERSION,
@@ -250,7 +251,7 @@ def _graph_structure_ai_payload(
             "source": {
                 "snapshot_id": snapshot_id,
                 "base_commit": str(snapshot.get("commit_sha") or ""),
-                "analyzer_role": "reconcile_graph_structure_analyzer",
+                "analyzer_role": ANALYZER_ROLE,
             },
             "self_check_required": True,
             "no_markdown": True,
