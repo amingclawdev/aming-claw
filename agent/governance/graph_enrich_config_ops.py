@@ -14,10 +14,52 @@ from agent.governance.reconcile_semantic_config import PROJECT_OVERRIDE_PATH
 
 SCHEMA_VERSION = "graph_enrich_config_ops.v1"
 ANALYZER_ROLE = "reconcile_graph_enrich_config_analyzer"
-SUPPORTED_OPS = {"upsert_edge_evidence_policy"}
-SUPPORTED_SOURCE_EVIDENCE = {"import_only"}
-SUPPORTED_ACTIONS = {"allow", "downgrade", "reject"}
+SUPPORTED_OPS = {
+    "add_rule",
+    "promote_rule",
+    "review_rule",
+    "upsert_edge_evidence_policy",
+}
+CONFIG_EDGE_ALLOWLIST = set(EDGE_ALLOWLIST) | {
+    "consumes_event",
+    "creates_task",
+    "emits_event",
+    "http_route",
+    "configures_analyzer",
+    "configures_model_routing",
+    "configures_role",
+    "configures_runtime",
+}
+SUPPORTED_SOURCE_EVIDENCE = {
+    "event_bus_subscribe",
+    "function_calls",
+    "import_only",
+    "semantic_feedback",
+    "weak_call_resolver_ambiguous_add",
+}
+SUPPORTED_ACTIONS = {"add", "allow", "downgrade", "ignore", "promote", "reject"}
 _REQUIRED_OPERATION_FIELDS = {
+    "add_rule": [
+        "op",
+        "rule_id",
+        "edge",
+        "source_evidence",
+        "action",
+    ],
+    "promote_rule": [
+        "op",
+        "rule_id",
+        "edge",
+        "source_evidence",
+        "action",
+    ],
+    "review_rule": [
+        "op",
+        "rule_id",
+        "edge",
+        "source_evidence",
+        "action",
+    ],
     "upsert_edge_evidence_policy": [
         "op",
         "rule_id",
@@ -33,7 +75,7 @@ def graph_enrich_config_ops_output_contract() -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "return_exactly_one_json_object": True,
         "supported_operations": sorted(SUPPORTED_OPS),
-        "supported_edges": sorted(EDGE_ALLOWLIST),
+        "supported_edges": sorted(CONFIG_EDGE_ALLOWLIST),
         "supported_source_evidence": sorted(SUPPORTED_SOURCE_EVIDENCE),
         "supported_actions": sorted(SUPPORTED_ACTIONS),
         "required_top_level_fields": ["schema_version", "source", "operations", "self_check"],
@@ -214,12 +256,17 @@ def _validate_operation(
     seen_rule_ids: set[str],
 ) -> dict[str, Any]:
     errors: list[str] = []
+    normalizations: list[str] = []
     op_name = str(op.get("op") or "").strip()
     rule_id = str(op.get("rule_id") or "").strip()
-    edge = str(op.get("edge") or "").strip()
-    source_evidence = str(op.get("source_evidence") or "").strip().lower().replace("-", "_")
-    action = str(op.get("action") or "").strip().lower()
-    downgrade_to = str(op.get("downgrade_to") or "").strip()
+    edge = _normalize_edge(op.get("edge") or op.get("edge_type"))
+    source_evidence = _normalize_source_evidence(op.get("source_evidence"))
+    action = _normalize_action(op.get("action"))
+    downgrade_to = _normalize_edge(op.get("downgrade_to"))
+    if action == "downgrade" and downgrade_to in {"ignore", "ignored"}:
+        action = "ignore"
+        downgrade_to = ""
+        normalizations.append("downgrade_ignored_normalized_to_ignore")
     if op_name not in SUPPORTED_OPS:
         errors.append("unsupported_config_op")
     if not rule_id:
@@ -227,14 +274,18 @@ def _validate_operation(
     elif rule_id in seen_rule_ids:
         errors.append("rule_id_duplicate")
     seen_rule_ids.add(rule_id)
-    if edge not in EDGE_ALLOWLIST:
+    if edge not in CONFIG_EDGE_ALLOWLIST:
         errors.append("edge_unsupported")
     if source_evidence not in SUPPORTED_SOURCE_EVIDENCE:
         errors.append("source_evidence_unsupported")
     if action not in SUPPORTED_ACTIONS:
         errors.append("action_unsupported")
-    if action == "downgrade" and downgrade_to not in EDGE_ALLOWLIST:
+    if action == "downgrade" and downgrade_to not in CONFIG_EDGE_ALLOWLIST:
         errors.append("downgrade_to_unsupported")
+    if op_name == "upsert_edge_evidence_policy" and action not in {"allow", "downgrade", "reject"}:
+        errors.append("action_unsupported_for_policy")
+    if op_name == "upsert_edge_evidence_policy" and source_evidence != "import_only":
+        errors.append("source_evidence_unsupported_for_policy")
     confidence = op.get("confidence")
     if confidence is not None:
         try:
@@ -253,17 +304,19 @@ def _validate_operation(
         "downgrade_to": downgrade_to,
         "status": "accepted" if not errors else "rejected",
         "errors": errors,
+        "normalizations": normalizations,
         "reason": _reason(op.get("evidence")),
     }
 
 
 def _config_patch_for_operations(operations: list[dict[str, Any]]) -> dict[str, Any]:
     policy: dict[str, Any] = {"dedupe_operations": True}
+    rules: dict[str, dict[str, Any]] = {}
     for op in operations:
-        if op["op"] != "upsert_edge_evidence_policy":
-            continue
-        edge = op["edge"]
-        if edge == "calls" and op["source_evidence"] == "import_only":
+        if op["op"] == "upsert_edge_evidence_policy":
+            edge = op["edge"]
+            if edge != "calls" or op["source_evidence"] != "import_only":
+                continue
             policy.setdefault("calls", {})
             policy["calls"].update(
                 {
@@ -272,7 +325,19 @@ def _config_patch_for_operations(operations: list[dict[str, Any]]) -> dict[str, 
                     "downgrade_to": op["downgrade_to"] or "imports",
                 }
             )
-    return {"graph_structure_ops": {"evidence_policy": policy}}
+            continue
+        rules[op["rule_id"]] = {
+            "op": op["op"],
+            "edge": op["edge"],
+            "source_evidence": op["source_evidence"],
+            "action": op["action"],
+            "downgrade_to": op["downgrade_to"],
+            "reason": op["reason"],
+        }
+    patch: dict[str, Any] = {"graph_structure_ops": {"evidence_policy": policy}}
+    if rules:
+        patch["graph_enrich_config_ops"] = {"rules": rules}
+    return patch
 
 
 def _preview(project_root: str | Path, patch: Mapping[str, Any]) -> dict[str, Any]:
@@ -286,6 +351,7 @@ def _empty_preview(project_root: str | Path) -> dict[str, Any]:
     return {
         "config_path": str(Path(project_root).resolve() / PROJECT_OVERRIDE_PATH),
         "graph_structure_ops": {"evidence_policy": {}},
+        "graph_enrich_config_ops": {"rules": {}},
     }
 
 
@@ -310,6 +376,21 @@ def _reason(evidence: Any) -> str:
     if isinstance(evidence, Mapping):
         return str(evidence.get("reason") or evidence.get("summary") or "").strip()
     return str(evidence or "").strip()
+
+
+def _normalize_edge(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _normalize_source_evidence(value: Any) -> str:
+    return _normalize_edge(value)
+
+
+def _normalize_action(value: Any) -> str:
+    action = _normalize_edge(value)
+    if action == "ignored":
+        return "ignore"
+    return action
 
 
 def _dedupe(values: list[str]) -> list[str]:

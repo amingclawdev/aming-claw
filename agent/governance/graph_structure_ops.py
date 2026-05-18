@@ -24,6 +24,18 @@ EDGE_ALLOWLIST = {
     "calls",
     "imports",
 }
+_CALL_EVIDENCE_KINDS = {
+    "call",
+    "calls",
+    "call_reference",
+    "direct_call",
+    "function_call",
+    "function_calls",
+    "resolved_call",
+    "resolved_function_call",
+    "runtime_call",
+    "strong_call",
+}
 _HINT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _DEFAULT_REQUIRED_FIELDS = {
     "move_file": ["op", "hint_id", "source_path", "target_node_id", "role"],
@@ -423,6 +435,9 @@ def _validate_operation(
             if role not in role_allowlist:
                 errors.append("role_unsupported")
         if op_name == "add_edge" and edge == "calls":
+            source_node_id = _node_id_for_source_path(graph_nodes, source_path)
+            if source_node_id and source_node_id == target_node_id:
+                errors.append("calls_self_edge")
             edge, evidence_note = _normalize_calls_edge_from_evidence(
                 op,
                 source_path=source_path,
@@ -430,7 +445,7 @@ def _validate_operation(
                 project_root=project_root,
                 policy=operation_contract.get("evidence_policy") or {},
             )
-            if evidence_note == "calls_import_only_rejected":
+            if evidence_note in {"calls_import_only_rejected", "calls_evidence_missing"}:
                 errors.append(evidence_note)
             elif evidence_note:
                 normalizations.append(evidence_note)
@@ -626,7 +641,10 @@ def _normalize_calls_edge_from_evidence(
             source_path=source_path,
             target_node=target_node,
         )
+    require_evidence = bool(calls_policy.get("require_call_evidence", True))
     if evidence_kind != "import_only":
+        if require_evidence and evidence_kind not in _CALL_EVIDENCE_KINDS:
+            return edge, "calls_evidence_missing"
         return edge, ""
     action = str(calls_policy.get("import_only_action") or "downgrade").strip().lower()
     if action == "reject":
@@ -645,7 +663,7 @@ def _evidence_kind(evidence: Any) -> str:
         or evidence.get("evidence_kind")
         or evidence.get("kind")
         or ""
-    ).strip().lower().replace("-", "_")
+    ).strip().lower().replace("-", "_").replace(".", "_")
 
 
 def _source_evidence_kind(
@@ -685,7 +703,7 @@ def _source_evidence_kind(
         re.search(rf"\b{re.escape(token)}\s*(?:\.|\()", body)
         for token in call_tokens
     )
-    return "" if call_present else "import_only"
+    return "call_reference" if call_present else "import_only"
 
 
 def _imported_symbol_tokens(import_lines: list[str]) -> list[str]:
@@ -718,19 +736,73 @@ def _target_reference_tokens(target_node: Mapping[str, Any]) -> list[str]:
     return tokens
 
 
+def _node_id_for_source_path(
+    graph_nodes: Mapping[str, Mapping[str, Any]],
+    source_path: str,
+) -> str:
+    for node_id, node in graph_nodes.items():
+        if source_path in _node_file_paths(node):
+            return str(node_id or "")
+    return ""
+
+
+def _node_file_paths(node: Mapping[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for key in (
+        "primary",
+        "primary_files",
+        "secondary",
+        "secondary_files",
+        "test",
+        "test_files",
+        "tests",
+        "config",
+        "config_files",
+        "doc",
+        "docs",
+        "doc_files",
+        "documentation",
+        "files",
+    ):
+        raw = node.get(key)
+        if raw is None:
+            continue
+        values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        for value in values:
+            path = _norm_path(value)
+            if path:
+                paths.add(path)
+    return paths
+
+
 def _norm_path(value: Any) -> str:
     return str(value or "").replace("\\", "/").strip("/")
 
 
 def _reason(evidence: Any) -> str:
     if isinstance(evidence, Mapping):
-        return str(evidence.get("reason") or evidence.get("summary") or "").strip()
+        return str(
+            evidence.get("reason")
+            or evidence.get("rationale")
+            or evidence.get("why")
+            or evidence.get("summary")
+            or evidence.get("description")
+            or ""
+        ).strip()
     return ""
 
 
 def _evidence_text(evidence: Any) -> str:
     if isinstance(evidence, Mapping):
-        text = evidence.get("evidence") or evidence.get("basis") or ""
+        text = (
+            evidence.get("evidence")
+            or evidence.get("basis")
+            or evidence.get("details")
+            or evidence.get("detail")
+            or evidence.get("line_evidence")
+            or evidence.get("source_ref")
+            or ""
+        )
         return str(text or "").strip()
     return str(evidence or "").strip()
 

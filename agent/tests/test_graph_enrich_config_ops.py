@@ -88,6 +88,56 @@ def _payload() -> dict:
     }
 
 
+def _rule_payload() -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": {
+            "analyzer_role": "reconcile_graph_enrich_config_analyzer",
+        },
+        "operations": [
+            {
+                "op": "review_rule",
+                "rule_id": "weak_call_resolver.ambiguous_add",
+                "edge": "calls",
+                "source_evidence": "weak_call_resolver.ambiguous_add",
+                "action": "downgrade",
+                "downgrade_to": "ignored",
+                "confidence": 0.81,
+                "evidence": {
+                    "reason": "Ambiguous weak-call suggestions need observer review before calls edges.",
+                },
+            },
+            {
+                "op": "promote_rule",
+                "rule_id": "function_calls.strong_resolved_to_depends_on",
+                "edge": "depends_on",
+                "source_evidence": "function_calls",
+                "action": "promote",
+                "confidence": 0.9,
+                "evidence": {
+                    "reason": "Strong resolved function calls are dependency evidence.",
+                },
+            },
+            {
+                "op": "add_rule",
+                "rule_id": "event_bus.subscribe_to_consumes_event",
+                "edge": "consumes_event",
+                "source_evidence": "event_bus.subscribe",
+                "action": "add",
+                "confidence": 0.86,
+                "evidence": {
+                    "reason": "event_bus subscribers consume published events.",
+                },
+            },
+        ],
+        "self_check": {
+            "valid": True,
+            "checked_rules": ["op_supported", "edge_supported", "config_patch_previewed"],
+            "known_risks": [],
+        },
+    }
+
+
 def test_graph_enrich_config_ops_dry_run_is_non_mutating_generated_project(tmp_path):
     project = tmp_path / "generated-project"
     project.mkdir()
@@ -136,6 +186,26 @@ def test_graph_enrich_config_ops_accept_writes_project_override_and_loader_reads
         "downgrade_to": "imports",
         "require_call_evidence": True,
     }
+
+
+def test_graph_enrich_config_rule_ops_dry_run_previews_project_override(tmp_path):
+    project = tmp_path / "generated-project"
+    project.mkdir()
+
+    result = run_graph_enrich_config_ai_output_pipeline(
+        raw_output=json.dumps(_rule_payload()),
+        mode="dry_run",
+        project_root=project,
+    )
+
+    assert result["ok"] is True
+    assert result["gate"]["accepted_count"] == 3
+    rules = result["preview"]["graph_enrich_config_ops"]["rules"]
+    assert rules["weak_call_resolver.ambiguous_add"]["action"] == "ignore"
+    assert rules["weak_call_resolver.ambiguous_add"]["downgrade_to"] == ""
+    assert rules["function_calls.strong_resolved_to_depends_on"]["action"] == "promote"
+    assert rules["event_bus.subscribe_to_consumes_event"]["edge"] == "consumes_event"
+    assert not (project / PROJECT_OVERRIDE_PATH).exists()
 
 
 def test_graph_enrich_config_ops_api_accepts_ai_output_and_writes_project_override(

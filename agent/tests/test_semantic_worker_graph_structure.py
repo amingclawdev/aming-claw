@@ -236,6 +236,34 @@ def test_semantic_worker_drains_graph_structure_accept_job_generated_project(con
     )
 
 
+def test_semantic_worker_drains_bridge_followups_without_waiting_for_event_bus(
+    monkeypatch,
+):
+    drained: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        semantic_worker,
+        "_drain_graph_structure",
+        lambda project_id, snapshot_id: drained.append(("graph_structure", project_id, snapshot_id)),
+    )
+    monkeypatch.setattr(
+        semantic_worker,
+        "_drain_graph_enrich_config",
+        lambda project_id, snapshot_id: drained.append(("graph_enrich_config", project_id, snapshot_id)),
+    )
+
+    semantic_worker._drain_semantic_bridge_followups(
+        PID,
+        "tail-drain-snapshot",
+        bridge_result={"events": [{"event_type": "graph_structure_requested"}]},
+        config_bridge_result={"events": [{"event_type": "graph_enrich_config_requested"}]},
+    )
+
+    assert drained == [
+        ("graph_structure", PID, "tail-drain-snapshot"),
+        ("graph_enrich_config", PID, "tail-drain-snapshot"),
+    ]
+
+
 def test_semantic_worker_drains_graph_structure_invalid_job_as_failed(conn, tmp_path):
     project = tmp_path / "generated-project"
     _write_generated_project(project)

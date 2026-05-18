@@ -572,3 +572,83 @@ def test_graph_structure_ops_gate_keeps_calls_when_imported_symbol_is_called(
     assert report["operations"][0]["edge"] == "calls"
     assert report["operations"][0]["normalizations"] == []
     assert report["normalized_hint_index"]["hints"][0]["edge"] == "calls"
+
+
+def test_graph_structure_ops_gate_rejects_calls_without_concrete_evidence() -> None:
+    validate_graph_structure_ops = _future_api()
+    payload = {
+        "schema_version": "graph_structure_ops.v1",
+        "source": {
+            "snapshot_id": "scope-current",
+            "base_commit": "abc123",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
+        "operations": [
+            {
+                "op": "add_edge",
+                "hint_id": "gsh-weak-call",
+                "source_path": "agent/governance/server.py",
+                "target_node_id": "L7.runtime",
+                "edge": "calls",
+                "confidence": 0.67,
+                "evidence": {"reason": "AI inferred a possible call without line evidence"},
+            }
+        ],
+        "self_check": {"valid": True, "checked_rules": ["call_evidence"], "known_risks": []},
+    }
+
+    report = validate_graph_structure_ops(
+        payload,
+        graph=_graph(),
+        inventory_paths=_inventory_paths(),
+        snapshot_id="scope-current",
+        base_commit="abc123",
+    )
+
+    assert report["ok"] is False
+    assert report["accepted_count"] == 0
+    assert report["rejected_count"] == 1
+    assert report["operations"][0]["errors"] == ["calls_evidence_missing"]
+
+
+def test_graph_structure_ops_gate_rejects_calls_self_edges() -> None:
+    validate_graph_structure_ops = _future_api()
+    payload = {
+        "schema_version": "graph_structure_ops.v1",
+        "source": {
+            "snapshot_id": "scope-current",
+            "base_commit": "abc123",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
+        "operations": [
+            {
+                "op": "add_edge",
+                "hint_id": "gsh-self-call",
+                "source_path": "agent/governance/parallel_branch_runtime.py",
+                "target_node_id": "L7.runtime",
+                "edge": "calls",
+                "confidence": 0.91,
+                "evidence": {
+                    "source_evidence": "function_call",
+                    "reason": "AI found an internal helper call",
+                    "evidence": "parallel_branch_runtime.py:42 calls helper()",
+                },
+            }
+        ],
+        "self_check": {"valid": True, "checked_rules": ["call_evidence"], "known_risks": []},
+    }
+
+    report = validate_graph_structure_ops(
+        payload,
+        graph=_graph(),
+        inventory_paths=_inventory_paths(),
+        snapshot_id="scope-current",
+        base_commit="abc123",
+    )
+
+    assert report["ok"] is False
+    assert report["operations"][0]["errors"] == ["calls_self_edge"]
+    assert report["operations"][0]["hint"]["reason"] == "AI found an internal helper call"
+    assert report["operations"][0]["hint"]["evidence"] == (
+        "parallel_branch_runtime.py:42 calls helper()"
+    )

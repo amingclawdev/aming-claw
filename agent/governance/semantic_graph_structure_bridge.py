@@ -19,6 +19,7 @@ from .graph_structure_ops import (
 )
 from .graph_enrich_config_ops import (
     ANALYZER_ROLE as CONFIG_ANALYZER_ROLE,
+    CONFIG_EDGE_ALLOWLIST,
     SCHEMA_VERSION as CONFIG_SCHEMA_VERSION,
     SUPPORTED_ACTIONS as CONFIG_SUPPORTED_ACTIONS,
     SUPPORTED_OPS as CONFIG_SUPPORTED_OPS,
@@ -690,15 +691,19 @@ def _convert_config_suggestion(
     ).strip()
     if op not in CONFIG_SUPPORTED_OPS:
         return {"reason": "unsupported_config_op", "suggestion": raw}
-    edge = str(raw.get("edge") or raw.get("edge_type") or "").strip().lower()
+    edge = _normalize_config_token(raw.get("edge") or raw.get("edge_type"))
     source_evidence = str(
         raw.get("source_evidence")
         or raw.get("evidence_kind")
         or raw.get("kind_of_evidence")
         or ""
-    ).strip().lower().replace("-", "_")
-    action = str(raw.get("action") or raw.get("import_only_action") or "").strip().lower()
-    if edge not in EDGE_ALLOWLIST:
+    ).strip().lower().replace("-", "_").replace(".", "_")
+    action = _normalize_config_action(raw.get("action") or raw.get("import_only_action"))
+    downgrade_to = _normalize_config_token(raw.get("downgrade_to"))
+    if action == "downgrade" and downgrade_to in {"ignore", "ignored"}:
+        action = "ignore"
+        downgrade_to = ""
+    if edge not in CONFIG_EDGE_ALLOWLIST:
         return {"reason": "edge_unsupported", "suggestion": raw}
     if source_evidence not in CONFIG_SUPPORTED_SOURCE_EVIDENCE:
         return {"reason": "source_evidence_unsupported", "suggestion": raw}
@@ -717,7 +722,6 @@ def _convert_config_suggestion(
             "source_semantic_event_id": semantic_event.get("event_id", ""),
         },
     }
-    downgrade_to = str(raw.get("downgrade_to") or "").strip()
     if downgrade_to:
         operation["downgrade_to"] = downgrade_to
     return {"operation": operation}
@@ -785,6 +789,17 @@ def _edge_from_suggestion(raw: Mapping[str, Any], kind: str = "") -> str:
         return edge
     normalized = EDGE_KIND_ALIASES.get(edge) or EDGE_KIND_ALIASES.get(kind)
     return normalized if normalized in EDGE_ALLOWLIST else ""
+
+
+def _normalize_config_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(".", "_")
+
+
+def _normalize_config_action(value: Any) -> str:
+    action = _normalize_config_token(value)
+    if action == "ignored":
+        return "ignore"
+    return action
 
 
 def _resolve_source_path(

@@ -36,7 +36,7 @@ import threading
 from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 log = logging.getLogger(__name__)
 
@@ -1124,6 +1124,12 @@ def _process_node_semantic_job(
         except Exception as exc:  # noqa: BLE001 - notification is advisory
             log.debug("semantic_worker: node eventbus publish failed for %s: %s",
                       node_id_s, exc)
+        _drain_semantic_bridge_followups(
+            project_id,
+            snapshot_id,
+            bridge_result=bridge_result,
+            config_bridge_result=config_bridge_result,
+        )
         return {
             "ok": True,
             "status": "proposed",
@@ -1134,6 +1140,41 @@ def _process_node_semantic_job(
         }
     finally:
         conn.close()
+
+
+def _drain_semantic_bridge_followups(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    bridge_result: Mapping[str, Any] | None = None,
+    config_bridge_result: Mapping[str, Any] | None = None,
+) -> None:
+    """Best-effort fallback drain for bridge-created graph jobs.
+
+    The event bus remains the normal wakeup path. This fallback handles the
+    tail case where a node job commits bridge events but no later event arrives
+    to wake the graph-structure/config drains.
+    """
+    bridge_events = (
+        bridge_result.get("events")
+        if isinstance(bridge_result, Mapping) and isinstance(bridge_result.get("events"), list)
+        else []
+    )
+    config_events = (
+        config_bridge_result.get("events")
+        if isinstance(config_bridge_result, Mapping) and isinstance(config_bridge_result.get("events"), list)
+        else []
+    )
+    if any(event.get("event_type") == "graph_structure_requested" for event in bridge_events if isinstance(event, Mapping)):
+        try:
+            _drain_graph_structure(project_id, snapshot_id)
+        except Exception as exc:  # noqa: BLE001 - fallback should not fail node completion
+            log.debug("semantic_worker: bridge graph_structure fallback drain failed: %s", exc)
+    if any(event.get("event_type") == "graph_enrich_config_requested" for event in config_events if isinstance(event, Mapping)):
+        try:
+            _drain_graph_enrich_config(project_id, snapshot_id)
+        except Exception as exc:  # noqa: BLE001 - fallback should not fail node completion
+            log.debug("semantic_worker: bridge graph_enrich_config fallback drain failed: %s", exc)
 
 
 def _finalize_node_semantic_job(

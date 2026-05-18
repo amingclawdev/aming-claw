@@ -625,6 +625,80 @@ def test_bridge_converts_semantic_graph_enrich_config_suggestion_to_dry_run_job(
     assert not (project / PROJECT_OVERRIDE_PATH).exists()
 
 
+def test_bridge_converts_semantic_rule_config_suggestions_to_dry_run_job(
+    conn,
+    tmp_path,
+):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    snapshot_id = _create_snapshot(conn, project, "semantic-bridge-config-rules")
+    service_id = _node_id_for_primary(snapshot_id, "agent/service.py")
+    event = _semantic_event(
+        conn,
+        snapshot_id,
+        service_id,
+        {
+            "graph_enrich_config_suggestions": [
+                {
+                    "op": "review_rule",
+                    "rule_id": "weak_call_resolver.ambiguous_add",
+                    "edge": "calls",
+                    "source_evidence": "weak_call_resolver.ambiguous_add",
+                    "action": "downgrade",
+                    "downgrade_to": "ignored",
+                    "confidence": 0.84,
+                    "evidence": {
+                        "reason": "Weak resolver additions should be ignored until stronger evidence exists.",
+                    },
+                },
+                {
+                    "op": "add_rule",
+                    "rule_id": "event_bus.subscribe_to_consumes_event",
+                    "edge": "consumes_event",
+                    "source_evidence": "event_bus.subscribe",
+                    "action": "add",
+                    "confidence": 0.88,
+                    "evidence": {
+                        "reason": "Subscribers consume the event stream they register for.",
+                    },
+                },
+            ],
+        },
+        event_id="sem-bridge-config-rules",
+    )
+
+    result = bridge.bridge_semantic_events_to_graph_enrich_config_jobs(
+        conn,
+        PID,
+        snapshot_id,
+        event_ids=[event["event_id"]],
+        actor="test",
+        project_root=str(project),
+    )
+    conn.commit()
+
+    assert result["ok"] is True
+    assert result["queued_count"] == 1
+    assert result["skipped_count"] == 0
+    request = result["events"][0]
+    operations = request["payload"]["ai_output"]["operations"]
+    assert [operation["op"] for operation in operations] == ["review_rule", "add_rule"]
+
+    semantic_worker._drain_graph_enrich_config(PID, snapshot_id)
+
+    completed = graph_events.list_events(
+        conn,
+        PID,
+        snapshot_id,
+        event_types=["graph_enrich_config_completed"],
+    )
+    gate_result = completed[0]["payload"]["result"]
+    assert gate_result["ok"] is True
+    rules = gate_result["preview"]["graph_enrich_config_ops"]["rules"]
+    assert rules["weak_call_resolver.ambiguous_add"]["action"] == "ignore"
+    assert rules["event_bus.subscribe_to_consumes_event"]["edge"] == "consumes_event"
+
+
 def test_semantic_worker_drains_graph_enrich_config_accept_job_generated_project(
     conn,
     tmp_path,
