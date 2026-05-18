@@ -6015,6 +6015,72 @@ def handle_graph_governance_snapshot_graph_structure_ops_jobs_create(ctx: Reques
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/semantic/graph-structure-candidates")
+def handle_graph_governance_snapshot_semantic_graph_structure_candidates(ctx: RequestContext):
+    """Queue graph-structure gate jobs derived from semantic node proposals."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import event_bus
+    from . import graph_snapshot_store as store
+    from . import semantic_graph_structure_bridge
+    from .db import sqlite_write_lock
+    from .errors import ValidationError
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.semantic.graph-structure-candidates")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+        if not snapshot:
+            raise ValidationError(f"graph snapshot not found: {snapshot_id}")
+        event_ids = (
+            _body_string_list(body, "event_ids")
+            or _body_string_list(body, "semantic_event_ids")
+            or []
+        )
+        node_ids = (
+            _body_string_list(body, "node_ids")
+            or _body_string_list(body, "semantic_node_ids")
+            or []
+        )
+        with sqlite_write_lock():
+            result = semantic_graph_structure_bridge.bridge_semantic_events_to_graph_structure_jobs(
+                conn,
+                project_id,
+                snapshot_id,
+                event_ids=event_ids,
+                node_ids=node_ids,
+                mode=str(body.get("mode") or "dry_run"),
+                actor=str(body.get("actor") or "dashboard_user"),
+                limit=_query_int(body, "limit", 100),
+            )
+            conn.commit()
+        published = 0
+        for event in result.get("events", []):
+            if event.get("event_type") != "graph_structure_requested":
+                continue
+            try:
+                event_bus.publish("semantic_job.enqueued", {
+                    "project_id": project_id,
+                    "snapshot_id": snapshot_id,
+                    "target_scope": "graph_structure",
+                    "event_id": event.get("event_id", ""),
+                })
+                published += 1
+            except Exception:
+                pass
+        return 202, {
+            **result,
+            "commit_sha": snapshot.get("commit_sha", ""),
+            "published_count": published,
+            "queued": int(result.get("queued_count") or 0) > 0,
+            "operation_type": "graph_structure",
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes")
 def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
     """List indexed graph nodes for one snapshot."""

@@ -639,6 +639,29 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                 except Exception as exc:  # noqa: BLE001 - feedback row is advisory
                     log.warning("semantic_worker: feedback submit failed for %s: %s",
                                 node_id_s, exc)
+                bridge_result: dict[str, Any] = {}
+                if event_id:
+                    try:
+                        from . import semantic_graph_structure_bridge
+
+                        bridge_result = (
+                            semantic_graph_structure_bridge
+                            .bridge_semantic_events_to_graph_structure_jobs(
+                                conn,
+                                project_id,
+                                snapshot_id,
+                                event_ids=[event_id],
+                                mode="dry_run",
+                                actor="semantic_worker_inproc",
+                                limit=1,
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 - graph-structure bridge is advisory
+                        log.warning(
+                            "semantic_worker: semantic graph-structure bridge failed for %s: %s",
+                            node_id_s,
+                            exc,
+                        )
                 conn.commit()
                 # Notify EventBus so dashboard SSE clients refetch. See the
                 # mirror publish in _drain_edge for context — the worker runs
@@ -666,6 +689,15 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                         "method": "WORKER",
                         "source": "semantic_worker_inproc",
                     })
+                    for bridge_event in bridge_result.get("events", []):
+                        if bridge_event.get("event_type") != "graph_structure_requested":
+                            continue
+                        event_bus.publish("semantic_job.enqueued", {
+                            "project_id": project_id,
+                            "snapshot_id": snapshot_id,
+                            "target_scope": "graph_structure",
+                            "event_id": bridge_event.get("event_id", ""),
+                        })
                 except Exception as exc:  # noqa: BLE001 - notification is advisory
                     log.debug("semantic_worker: node eventbus publish failed for %s: %s",
                               node_id_s, exc)

@@ -157,6 +157,7 @@ output_schema:
     - merge_suggestions
     - split_suggestions
     - dead_code_candidates
+    - graph_structure_suggestions
     - rejected_feedback_ids
 
 prompt_template: |-
@@ -176,3 +177,10 @@ prompt_template: |-
   summarize intent, review doc/test/config bindings, and suggest dependency/doc/test/config
   corrections as proposals. The caller will store your output as companion
   semantic artifacts for human or observer review.
+
+  When a graph correction is concrete and source-hint compatible, also emit it
+  in graph_structure_suggestions using only graph_structure_ops.v1-compatible
+  fields: op, source_path, target_node_id or target, edge, confidence, and
+  evidence. These suggestions are never applied directly; the worker converts
+  them into graph-structure dry-run jobs that must pass the gate and observer
+  approval before source hints are written.
