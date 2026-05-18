@@ -149,6 +149,90 @@ def _snapshot_graph_and_inventory(project_id: str, snapshot_id: str) -> tuple[di
     return graph, [row for row in inventory if isinstance(row, dict)]
 
 
+def _graph_structure_ai_payload(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    event_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from . import db as governance_db
+    from . import graph_snapshot_store as store
+
+    event_payload = event_payload if isinstance(event_payload, dict) else {}
+    conn = governance_db.get_connection(project_id)
+    try:
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+    finally:
+        conn.close()
+    graph, inventory = _snapshot_graph_and_inventory(project_id, snapshot_id)
+    deps_graph = graph.get("deps_graph") if isinstance(graph.get("deps_graph"), dict) else {}
+    nodes = deps_graph.get("nodes") if isinstance(deps_graph.get("nodes"), list) else []
+    edges = deps_graph.get("edges") if isinstance(deps_graph.get("edges"), list) else []
+    inventory_paths = [
+        str(row.get("path") or "")
+        for row in inventory
+        if isinstance(row, dict) and str(row.get("path") or "").strip()
+    ]
+    selector = event_payload.get("selector") if isinstance(event_payload.get("selector"), dict) else {}
+    operator_request = (
+        event_payload.get("operator_request")
+        if isinstance(event_payload.get("operator_request"), dict)
+        else {}
+    )
+    return {
+        "schema_version": 1,
+        "project_id": project_id,
+        "snapshot_id": snapshot_id,
+        "base_commit": str(snapshot.get("commit_sha") or ""),
+        "task": "graph_structure_ops",
+        "mode": str(event_payload.get("mode") or "dry_run"),
+        "selector": selector,
+        "operator_request": operator_request,
+        "graph": {
+            "nodes": [
+                {
+                    "id": str(node.get("id") or node.get("node_id") or ""),
+                    "layer": str(node.get("layer") or ""),
+                    "title": str(node.get("title") or ""),
+                    "primary": node.get("primary") or node.get("primary_files") or [],
+                    "test": node.get("test") or node.get("test_files") or [],
+                    "secondary": node.get("secondary") or node.get("secondary_files") or [],
+                }
+                for node in nodes[:200]
+                if isinstance(node, dict)
+            ],
+            "edges": [
+                {
+                    "src": str(edge.get("src") or edge.get("source") or ""),
+                    "dst": str(edge.get("dst") or edge.get("target") or ""),
+                    "edge_type": str(edge.get("edge_type") or edge.get("type") or ""),
+                    "direction": str(edge.get("direction") or ""),
+                }
+                for edge in edges[:500]
+                if isinstance(edge, dict)
+            ],
+            "truncated": {
+                "nodes": len(nodes) > 200,
+                "edges": len(edges) > 500,
+            },
+        },
+        "inventory_paths": inventory_paths[:1000],
+        "output_contract": {
+            "schema_version": "graph_structure_ops.v1",
+            "return_exactly_one_json_object": True,
+            "supported_operations": ["move_file", "add_edge", "suppress_edge"],
+            "required_top_level_fields": ["schema_version", "source", "operations", "self_check"],
+            "source": {
+                "snapshot_id": snapshot_id,
+                "base_commit": str(snapshot.get("commit_sha") or ""),
+                "analyzer_role": "reconcile_graph_structure_analyzer",
+            },
+            "self_check_required": True,
+            "no_markdown": True,
+        },
+    }
+
+
 def _drain(project_id: str, snapshot_id: str) -> None:
     """Backwards-compat shim. Pre MF-2026-05-10-017 the worker only handled
     nodes; callers expecting `_drain(project_id, snapshot_id)` still work."""
@@ -156,12 +240,7 @@ def _drain(project_id: str, snapshot_id: str) -> None:
 
 
 def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
-    """Drain queued graph-structure AI-output events for one snapshot.
-
-    The model call is intentionally out of scope here. This worker consumes raw
-    AI output already attached to a `graph_structure_requested` event, runs the
-    graph-structure gate/pipeline, and records a completion or failure event.
-    """
+    """Drain queued graph-structure events for one snapshot."""
     lock = _drain_lock_for(project_id, snapshot_id + ":graph_structure")
     if not lock.acquire(blocking=False):
         log.debug("semantic_worker: graph-structure drain skipped (busy) %s/%s",
@@ -171,6 +250,11 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
         from . import db as governance_db
         from . import graph_events
         from .db import sqlite_write_lock
+        from .reconcile_semantic_ai import build_semantic_ai_call
+        from .reconcile_semantic_config import (
+            apply_project_ai_routing,
+            load_semantic_enrichment_config,
+        )
 
         conn = governance_db.get_connection(project_id)
         try:
@@ -212,6 +296,28 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                             evidence={"source": "semantic_worker_inproc_graph_structure"},
                         )
                         conn.commit()
+                    if raw_output in (None, ""):
+                        root = Path(project_root or _project_root_for(project_id))
+                        cfg = apply_project_ai_routing(
+                            load_semantic_enrichment_config(project_root=root),
+                            project_id=project_id,
+                        )
+                        ai_call = build_semantic_ai_call(
+                            semantic_config=cfg,
+                            project_id=project_id,
+                            snapshot_id=snapshot_id,
+                            project_root=root,
+                        )
+                        if ai_call is None:
+                            raise RuntimeError("graph_structure_ai_not_configured")
+                        raw_output = ai_call(
+                            "graph_structure",
+                            _graph_structure_ai_payload(
+                                project_id,
+                                snapshot_id,
+                                event_payload=payload,
+                            ),
+                        )
                     result = handle_graph_structure_ai_output(
                         project_id,
                         snapshot_id,

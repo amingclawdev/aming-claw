@@ -283,6 +283,169 @@ def test_semantic_worker_drains_graph_structure_invalid_job_as_failed(conn, tmp_
     assert failed[0]["evidence"]["errors"] == ["ai_output_json_invalid"]
 
 
+def test_semantic_worker_graph_structure_job_invokes_ai_when_output_missing(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="worker-graph-structure-ai-base",
+        commit_sha="workerai_base",
+        snapshot_id="worker-graph-structure-ai-base",
+        created_by="test",
+    )
+    assert base["ok"] is True
+    service_id = _service_node_id("worker-graph-structure-ai-base")
+    calls: list[tuple[str, dict]] = []
+
+    def _stub_build_ai_call(*, semantic_config, project_id, snapshot_id, project_root):
+        assert semantic_config.job_profile("graph_structure").analyzer_role == (
+            "reconcile_graph_structure_analyzer"
+        )
+        assert project_id == PID
+        assert snapshot_id == "worker-graph-structure-ai-base"
+        assert Path(project_root) == project
+
+        def _ai_call(stage: str, payload: dict):
+            calls.append((stage, payload))
+            assert stage == "graph_structure"
+            assert payload["output_contract"]["schema_version"] == SCHEMA_VERSION
+            assert payload["snapshot_id"] == "worker-graph-structure-ai-base"
+            assert payload["base_commit"] == "workerai_base"
+            assert "agent/tests/test_service.py" in payload["inventory_paths"]
+            assert any(
+                "agent/service.py" in node.get("primary", [])
+                for node in payload["graph"]["nodes"]
+            )
+            return _payload("worker-graph-structure-ai-base", "workerai_base", service_id)
+
+        return _ai_call
+
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        _stub_build_ai_call,
+    )
+    request = graph_events.create_event(
+        conn,
+        PID,
+        "worker-graph-structure-ai-base",
+        event_type="graph_structure_requested",
+        event_kind="semantic_job",
+        target_type="snapshot",
+        target_id="worker-graph-structure-ai-base",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        operation_type="graph_structure",
+        payload={
+            "mode": "accept",
+            "project_root": str(project),
+            "operator_request": {"goal": "attach generated test to service"},
+        },
+        created_by="test",
+    )
+    conn.commit()
+
+    semantic_worker._drain_graph_structure(PID, "worker-graph-structure-ai-base")
+
+    assert len(calls) == 1
+    request_after = graph_events.get_event(
+        conn,
+        PID,
+        "worker-graph-structure-ai-base",
+        request["event_id"],
+    )
+    assert request_after["status"] == graph_events.EVENT_STATUS_MATERIALIZED
+    completed = graph_events.list_events(
+        conn,
+        PID,
+        "worker-graph-structure-ai-base",
+        event_types=["graph_structure_completed"],
+    )
+    assert len(completed) == 1
+    assert completed[0]["payload"]["result"]["ok"] is True
+    assert "worker-generated-test-edge" in (
+        project / "agent" / "tests" / "test_service.py"
+    ).read_text(encoding="utf-8")
+
+    materialized = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="worker-graph-structure-ai-materialized",
+        commit_sha="workerai_head",
+        snapshot_id="worker-graph-structure-ai-materialized",
+        created_by="test",
+    )
+    assert materialized["ok"] is True
+    graph = state_reconcile._read_snapshot_graph(PID, "worker-graph-structure-ai-materialized")
+    assert any(
+        edge.get("src") == "agent/tests/test_service.py"
+        and edge.get("dst") == service_id
+        and edge.get("edge_type") == "tests"
+        and edge.get("direction") == "source_hint"
+        for edge in state_reconcile._deps_graph_edges(graph)
+    )
+
+
+def test_semantic_worker_graph_structure_job_fails_when_ai_unconfigured(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="worker-graph-structure-ai-missing-base",
+        commit_sha="workerai_missing",
+        snapshot_id="worker-graph-structure-ai-missing-base",
+        created_by="test",
+    )
+    assert base["ok"] is True
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        lambda **_kwargs: None,
+    )
+    request = graph_events.create_event(
+        conn,
+        PID,
+        "worker-graph-structure-ai-missing-base",
+        event_type="graph_structure_requested",
+        event_kind="semantic_job",
+        target_type="snapshot",
+        target_id="worker-graph-structure-ai-missing-base",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        operation_type="graph_structure",
+        payload={"mode": "dry_run", "project_root": str(project)},
+        created_by="test",
+    )
+    conn.commit()
+
+    semantic_worker._drain_graph_structure(PID, "worker-graph-structure-ai-missing-base")
+
+    request_after = graph_events.get_event(
+        conn,
+        PID,
+        "worker-graph-structure-ai-missing-base",
+        request["event_id"],
+    )
+    assert request_after["status"] == graph_events.EVENT_STATUS_FAILED
+    failed = graph_events.list_events(
+        conn,
+        PID,
+        "worker-graph-structure-ai-missing-base",
+        event_types=["graph_structure_failed"],
+    )
+    assert len(failed) == 1
+    assert failed[0]["evidence"]["errors"] == ["graph_structure_ai_not_configured"]
+
+
 def test_semantic_worker_graph_structure_bridge_rejects_missing_snapshot(conn):
     result = semantic_worker.handle_graph_structure_ai_output(
         PID,
