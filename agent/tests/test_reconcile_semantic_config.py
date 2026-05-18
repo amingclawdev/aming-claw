@@ -29,6 +29,18 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.job_profiles["edge"].analyzer_role == "reconcile_edge_semantic_analyzer"
     assert config.job_profiles["global_review"].analyzer_role == "reconcile_global_semantic_reviewer"
     assert config.job_profiles["graph_structure"].analyzer_role == "reconcile_graph_structure_analyzer"
+    assert config.graph_structure_ops.schema_version == "graph_structure_ops.v1"
+    assert config.graph_structure_ops.analyzer_role == "reconcile_graph_structure_analyzer"
+    assert config.graph_structure_ops.operations["add_edge"]["enabled"] is True
+    assert config.graph_structure_ops.operations["add_edge"]["edge_allowlist"] == [
+        "calls",
+        "configures",
+        "depends_on",
+        "documents",
+        "imports",
+        "tests",
+        "uses",
+    ]
     assert config.job_profiles["retry"].analyzer_role == "reconcile_semantic_retry_reviewer"
     assert config.job_profiles["dry_run"].analyzer_role == "reconcile_semantic_dry_run"
     assert config.executables["anthropic"] == "claude"
@@ -57,6 +69,32 @@ def test_default_semantic_config_loads_state_only_profile():
     assert structure_payload["role"] == "reconcile_graph_structure_analyzer"
     assert "graph_structure_ops.v1" in structure_payload["job_profile"]["prompt_template"]
     assert Path(DEFAULT_CONFIG_PATH).exists()
+
+
+def test_graph_structure_ops_config_can_disable_operations_and_edges(tmp_path):
+    cfg = tmp_path / "semantic-ops.yaml"
+    cfg.write_text(
+        "\n".join(
+            [
+                'version: "1.0"',
+                "analyzer: reconcile_semantic",
+                "prompt_template: semantic prompt",
+                "graph_structure_ops:",
+                "  operations:",
+                "    add_edge:",
+                "      enabled: true",
+                "      edge_allowlist: [tests]",
+                "    suppress_edge:",
+                "      enabled: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_semantic_enrichment_config(config_path=cfg)
+
+    assert config.graph_structure_ops.operations["add_edge"]["edge_allowlist"] == ["tests"]
+    assert config.graph_structure_ops.operations["suppress_edge"]["enabled"] is False
 
 
 def test_project_ai_routing_overrides_semantic_provider_and_model(monkeypatch):
@@ -105,7 +143,7 @@ def test_legacy_role_field_maps_to_chain_role_not_analyzer(tmp_path):
     assert payload["legacy_role_alias"] == "qa"
     graph_structure = config.to_instruction_payload("graph_structure")
     assert "graph_structure_ops.v1" in graph_structure["job_profile"]["prompt_template"]
-    assert "move_file" in graph_structure["job_profile"]["prompt_template"]
+    assert "payload.output_contract" in graph_structure["job_profile"]["prompt_template"]
 
 
 def test_job_profile_aliases_support_per_job_overrides(tmp_path):

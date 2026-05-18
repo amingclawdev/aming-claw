@@ -24,6 +24,106 @@ EDGE_ALLOWLIST = {
     "imports",
 }
 _HINT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_DEFAULT_REQUIRED_FIELDS = {
+    "move_file": ["op", "hint_id", "source_path", "target_node_id", "role"],
+    "add_edge": ["op", "hint_id", "source_path", "target_node_id", "edge"],
+    "suppress_edge": ["op", "hint_id", "source_path", "target_node_id", "edge"],
+}
+
+
+def default_graph_structure_ops_contract() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "analyzer_role": ANALYZER_ROLE,
+        "operations": {
+            op: {
+                "enabled": True,
+                "materializer": "source_hint",
+                "required_fields": list(_DEFAULT_REQUIRED_FIELDS[op]),
+                "role_allowlist": sorted(ROLE_ALLOWLIST) if op == "move_file" else [],
+                "edge_allowlist": sorted(EDGE_ALLOWLIST) if op in {"add_edge", "suppress_edge"} else [],
+            }
+            for op in sorted(SUPPORTED_HINT_OPS)
+        },
+    }
+
+
+def normalize_graph_structure_ops_contract(raw: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    contract = default_graph_structure_ops_contract()
+    if raw is None:
+        return contract
+    if not isinstance(raw, Mapping):
+        raise ValueError("graph_structure_ops contract must be a mapping")
+    if raw.get("schema_version") is not None:
+        contract["schema_version"] = str(raw.get("schema_version") or "").strip()
+    if raw.get("analyzer_role") is not None:
+        contract["analyzer_role"] = str(raw.get("analyzer_role") or "").strip()
+    operations_raw = raw.get("operations")
+    if operations_raw is None:
+        return _validate_contract(contract)
+    if not isinstance(operations_raw, Mapping):
+        raise ValueError("graph_structure_ops.operations must be a mapping")
+    operations = dict(contract["operations"])
+    for op_name_raw, spec_raw in operations_raw.items():
+        op_name = str(op_name_raw or "").strip()
+        if not op_name:
+            raise ValueError("graph_structure_ops operation name cannot be empty")
+        if op_name not in SUPPORTED_HINT_OPS:
+            raise ValueError(f"graph_structure_ops operation has no source_hint handler: {op_name}")
+        if spec_raw is None:
+            continue
+        if not isinstance(spec_raw, Mapping):
+            raise ValueError("graph_structure_ops operation specs must be mappings")
+        spec = dict(operations.get(op_name) or {})
+        for key in ("enabled", "materializer"):
+            if key in spec_raw:
+                spec[key] = bool(spec_raw[key]) if key == "enabled" else str(spec_raw[key] or "").strip()
+        for key in ("required_fields", "role_allowlist", "edge_allowlist"):
+            if key in spec_raw:
+                value = spec_raw[key]
+                if isinstance(value, str):
+                    value = [item.strip() for item in value.split(",")]
+                if not isinstance(value, list):
+                    raise ValueError(f"graph_structure_ops.{op_name}.{key} must be a list")
+                spec[key] = [str(item).strip() for item in value if str(item).strip()]
+        operations[op_name] = spec
+    contract["operations"] = operations
+    return _validate_contract(contract)
+
+
+def graph_structure_ops_output_contract(contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    normalized = normalize_graph_structure_ops_contract(contract)
+    operations = normalized["operations"]
+    enabled = {
+        name: spec
+        for name, spec in operations.items()
+        if spec.get("enabled") is True
+    }
+    return {
+        "schema_version": normalized["schema_version"],
+        "return_exactly_one_json_object": True,
+        "supported_operations": sorted(enabled),
+        "supported_roles": sorted({
+            role
+            for spec in enabled.values()
+            for role in spec.get("role_allowlist", [])
+        }),
+        "supported_edges": sorted({
+            edge
+            for spec in enabled.values()
+            for edge in spec.get("edge_allowlist", [])
+        }),
+        "required_top_level_fields": ["schema_version", "source", "operations", "self_check"],
+        "required_operation_fields": {
+            name: list(spec.get("required_fields") or [])
+            for name, spec in sorted(enabled.items())
+        },
+        "source": {
+            "analyzer_role": normalized["analyzer_role"],
+        },
+        "self_check_required": True,
+        "no_markdown": True,
+    }
 
 
 def parse_graph_structure_ai_output(raw_output: Any) -> dict[str, Any]:
@@ -57,6 +157,7 @@ def validate_graph_structure_ops(
     inventory_paths: Iterable[str],
     snapshot_id: str = "",
     base_commit: str = "",
+    operation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate graph_structure_ops.v1 and emit hint-compatible operations.
 
@@ -66,17 +167,18 @@ def validate_graph_structure_ops(
     source = payload.get("source") if isinstance(payload.get("source"), Mapping) else {}
     operations_raw = payload.get("operations") if isinstance(payload.get("operations"), list) else []
     self_check = payload.get("self_check") if isinstance(payload.get("self_check"), Mapping) else {}
+    contract = normalize_graph_structure_ops_contract(operation_contract)
     node_ids = _graph_node_ids(graph)
     paths = {_norm_path(path) for path in inventory_paths if _norm_path(path)}
 
     global_errors: list[str] = []
-    if str(payload.get("schema_version") or "") != SCHEMA_VERSION:
+    if str(payload.get("schema_version") or "") != contract["schema_version"]:
         global_errors.append("schema_version_invalid")
     if snapshot_id and str(source.get("snapshot_id") or "") != snapshot_id:
         global_errors.append("source_snapshot_mismatch")
     if base_commit and str(source.get("base_commit") or "") != base_commit:
         global_errors.append("source_base_commit_mismatch")
-    if str(source.get("analyzer_role") or "") != ANALYZER_ROLE:
+    if str(source.get("analyzer_role") or "") != contract["analyzer_role"]:
         global_errors.append("source_analyzer_role_invalid")
     if self_check.get("valid") is not True:
         global_errors.append("self_check_invalid")
@@ -95,6 +197,7 @@ def validate_graph_structure_ops(
             node_ids=node_ids,
             inventory_paths=paths,
             seen_hint_ids=seen_hint_ids,
+            operation_contract=contract,
         )
         normalized.append(entry)
 
@@ -111,7 +214,8 @@ def validate_graph_structure_ops(
     return {
         "ok": ok,
         "status": "passed" if ok else "failed",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": contract["schema_version"],
+        "operation_contract": graph_structure_ops_output_contract(contract),
         "errors": _dedupe(global_errors),
         "accepted_count": len(accepted_hints),
         "rejected_count": rejected_count,
@@ -131,6 +235,7 @@ def dry_run_graph_structure_ops(
     inventory_paths: Iterable[str],
     snapshot_id: str = "",
     base_commit: str = "",
+    operation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate AI graph-structure ops and preview hint projection effects.
 
@@ -144,6 +249,7 @@ def dry_run_graph_structure_ops(
         inventory_paths=inventory_paths,
         snapshot_id=snapshot_id,
         base_commit=base_commit,
+        operation_contract=operation_contract,
     )
     if not gate["ok"]:
         return {
@@ -172,6 +278,7 @@ def run_graph_structure_ai_output_pipeline(
     snapshot_id: str = "",
     base_commit: str = "",
     project_root: str = "",
+    operation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run raw AI graph-structure output through parse, gate, and action.
 
@@ -206,6 +313,7 @@ def run_graph_structure_ai_output_pipeline(
         inventory_paths=inventory_paths,
         snapshot_id=snapshot_id,
         base_commit=base_commit,
+        operation_contract=operation_contract,
     )
     if normalized_mode in {"dry_run", "dryrun", "preview"} or not dry_run["ok"]:
         return {
@@ -254,6 +362,7 @@ def _validate_operation(
     node_ids: set[str],
     inventory_paths: set[str],
     seen_hint_ids: set[str],
+    operation_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     errors: list[str] = []
     op_name = str(op.get("op") or "").strip()
@@ -263,7 +372,14 @@ def _validate_operation(
     role = str(op.get("role") or "").strip()
     edge = str(op.get("edge") or op.get("edge_type") or "").strip()
 
-    if op_name not in SUPPORTED_HINT_OPS:
+    operations = operation_contract.get("operations") if isinstance(operation_contract.get("operations"), Mapping) else {}
+    spec = operations.get(op_name) if isinstance(operations.get(op_name), Mapping) else {}
+    enabled = bool(spec.get("enabled")) and op_name in SUPPORTED_HINT_OPS
+    required_fields = set(spec.get("required_fields") or [])
+    role_allowlist = set(spec.get("role_allowlist") or [])
+    edge_allowlist = set(spec.get("edge_allowlist") or [])
+
+    if not enabled:
         errors.append("unsupported_op_for_hint_materialization")
     if not hint_id:
         errors.append("hint_id_missing")
@@ -272,7 +388,7 @@ def _validate_operation(
     elif hint_id in seen_hint_ids:
         errors.append("hint_id_duplicate")
     seen_hint_ids.add(hint_id)
-    if op_name in SUPPORTED_HINT_OPS:
+    if enabled:
         if not source_path:
             errors.append("source_path_missing")
         elif source_path not in inventory_paths:
@@ -281,11 +397,11 @@ def _validate_operation(
             errors.append("target_node_missing")
         elif target_node_id not in node_ids:
             errors.append("target_node_missing")
-        if op_name == "move_file":
-            if role not in ROLE_ALLOWLIST:
+        if "role" in required_fields or op_name == "move_file":
+            if role not in role_allowlist:
                 errors.append("role_unsupported")
-        elif op_name in {"add_edge", "suppress_edge"}:
-            if edge not in EDGE_ALLOWLIST:
+        if "edge" in required_fields or op_name in {"add_edge", "suppress_edge"}:
+            if edge not in edge_allowlist:
                 errors.append("edge_unsupported")
     confidence = op.get("confidence")
     if confidence is not None:
@@ -445,3 +561,27 @@ def _dedupe(values: Iterable[str]) -> list[str]:
             out.append(value)
             seen.add(value)
     return out
+
+
+def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    if contract.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("graph_structure_ops.schema_version must be graph_structure_ops.v1")
+    if not contract.get("analyzer_role"):
+        raise ValueError("graph_structure_ops.analyzer_role cannot be empty")
+    operations = contract.get("operations")
+    if not isinstance(operations, Mapping):
+        raise ValueError("graph_structure_ops.operations must be a mapping")
+    for name, spec in operations.items():
+        if name not in SUPPORTED_HINT_OPS:
+            raise ValueError(f"graph_structure_ops operation has no source_hint handler: {name}")
+        if not isinstance(spec, Mapping):
+            raise ValueError("graph_structure_ops operation specs must be mappings")
+        if spec.get("materializer") != "source_hint":
+            raise ValueError(f"graph_structure_ops.{name}.materializer must be source_hint")
+        if not isinstance(spec.get("required_fields"), list):
+            raise ValueError(f"graph_structure_ops.{name}.required_fields must be a list")
+        if not isinstance(spec.get("role_allowlist"), list):
+            raise ValueError(f"graph_structure_ops.{name}.role_allowlist must be a list")
+        if not isinstance(spec.get("edge_allowlist"), list):
+            raise ValueError(f"graph_structure_ops.{name}.edge_allowlist must be a list")
+    return contract

@@ -12,6 +12,7 @@ import sys
 import uuid
 import hashlib
 import traceback
+from dataclasses import asdict
 from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
@@ -5644,6 +5645,23 @@ def _graph_structure_ops_payload_from_body(body: dict) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _graph_structure_ops_contract_for_project(project_id: str, body: dict) -> dict:
+    from .reconcile_semantic_config import (
+        apply_project_ai_routing,
+        load_semantic_enrichment_config,
+    )
+
+    try:
+        root = _graph_governance_project_root(project_id, body)
+    except ValidationError:
+        root = None
+    cfg = apply_project_ai_routing(
+        load_semantic_enrichment_config(project_root=root),
+        project_id=project_id,
+    )
+    return asdict(cfg.graph_structure_ops)
+
+
 def _ctx_with_graph_structure_ops_payload(ctx: RequestContext, payload: dict) -> RequestContext:
     next_ctx = RequestContext(
         ctx.handler,
@@ -5720,6 +5738,7 @@ def handle_graph_governance_snapshot_graph_structure_ops_dry_run(ctx: RequestCon
             inventory_paths=[str(row.get("path") or "") for row in inventory],
             snapshot_id=snapshot_id,
             base_commit=str(snapshot.get("commit_sha") or ""),
+            operation_contract=_graph_structure_ops_contract_for_project(project_id, body),
         )
         status_code = 200 if result["ok"] else 422
         return status_code, {
@@ -5762,6 +5781,7 @@ def handle_graph_governance_snapshot_graph_structure_ops_accept(ctx: RequestCont
             inventory_paths=[str(row.get("path") or "") for row in inventory],
             snapshot_id=snapshot_id,
             base_commit=str(snapshot.get("commit_sha") or ""),
+            operation_contract=_graph_structure_ops_contract_for_project(project_id, body),
         )
         if not dry_run["ok"]:
             return 422, {
@@ -5829,6 +5849,7 @@ def handle_graph_governance_snapshot_graph_structure_ops_ai_output(ctx: RequestC
             snapshot_id=snapshot_id,
             base_commit=str(snapshot.get("commit_sha") or ""),
             project_root=root,
+            operation_contract=_graph_structure_ops_contract_for_project(project_id, body),
         )
         status_code = 200 if result["ok"] else 422
         return status_code, {

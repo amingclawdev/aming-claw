@@ -32,9 +32,9 @@ graph_structure_ops.v1 gate and later materialized as source hint blocks. You
 do not modify files, database rows, or graph topology.
 
 Return exactly one JSON object with schema_version "graph_structure_ops.v1".
-Only emit operations supported by source hint projection in the current gate:
-move_file, add_edge, and suppress_edge. Do not emit merge_nodes, split_node,
-reparent_node, or direct DB patches."""
+Only emit operations listed in payload.output_contract.supported_operations.
+Do not emit operations missing from the supplied contract, direct DB patches,
+or graph topology mutations outside the gate contract."""
 
 
 class SemanticConfigError(Exception):
@@ -83,6 +83,13 @@ class SemanticJobProfile:
 
 
 @dataclass
+class GraphStructureOpsConfig:
+    schema_version: str = "graph_structure_ops.v1"
+    analyzer_role: str = "reconcile_graph_structure_analyzer"
+    operations: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
 class SemanticAnalyzerConfig:
     version: str
     analyzer: str
@@ -104,6 +111,7 @@ class SemanticAnalyzerConfig:
     execution_policy: SemanticExecutionPolicy = field(default_factory=SemanticExecutionPolicy)
     automation_policy: SemanticAutomationPolicy = field(default_factory=SemanticAutomationPolicy)
     job_profiles: dict[str, SemanticJobProfile] = field(default_factory=dict)
+    graph_structure_ops: GraphStructureOpsConfig = field(default_factory=GraphStructureOpsConfig)
     output_schema: dict[str, Any] = field(default_factory=dict)
     prompt_template: str = ""
     source_path: str = ""
@@ -234,6 +242,7 @@ class SemanticAnalyzerConfig:
         if not chain_role:
             raise SemanticConfigValidationError("'chain_role' cannot be empty")
         job_profiles = _parse_job_profiles(data.get("job_profiles") or data.get("job_profile") or {})
+        graph_structure_ops = _parse_graph_structure_ops_config(data.get("graph_structure_ops"))
         return cls(
             version=str(data.get("version") or ""),
             analyzer=analyzer,
@@ -252,6 +261,7 @@ class SemanticAnalyzerConfig:
             execution_policy=execution_policy,
             automation_policy=automation_policy,
             job_profiles=job_profiles,
+            graph_structure_ops=graph_structure_ops,
             output_schema=data.get("output_schema") if isinstance(data.get("output_schema"), dict) else {},
             prompt_template=prompt_template,
             source_path=source_path,
@@ -317,6 +327,7 @@ class SemanticAnalyzerConfig:
                 name: asdict(profile)
                 for name, profile in sorted(self.job_profiles.items())
             },
+            "graph_structure_ops": asdict(self.graph_structure_ops),
         }
 
 
@@ -453,6 +464,26 @@ def _parse_job_profiles(raw: Any) -> dict[str, SemanticJobProfile]:
     return profiles
 
 
+def _parse_graph_structure_ops_config(raw: Any) -> GraphStructureOpsConfig:
+    from .graph_structure_ops import normalize_graph_structure_ops_contract
+
+    if raw not in (None, "") and not isinstance(raw, dict):
+        raise SemanticConfigValidationError("'graph_structure_ops' must be a mapping")
+    try:
+        contract = normalize_graph_structure_ops_contract(raw if isinstance(raw, dict) else None)
+    except ValueError as exc:
+        raise SemanticConfigValidationError(str(exc)) from exc
+    return GraphStructureOpsConfig(
+        schema_version=str(contract.get("schema_version") or ""),
+        analyzer_role=str(contract.get("analyzer_role") or ""),
+        operations={
+            str(name): dict(spec)
+            for name, spec in (contract.get("operations") or {}).items()
+            if isinstance(spec, dict)
+        },
+    )
+
+
 def _default_config_dict() -> dict[str, Any]:
     return {
         "version": "1.0",
@@ -486,6 +517,7 @@ def _default_config_dict() -> dict[str, Any]:
             name: asdict(profile)
             for name, profile in _default_job_profiles().items()
         },
+        "graph_structure_ops": asdict(_parse_graph_structure_ops_config(None)),
         "output_schema": {
             "required": [
                 "feature_name",

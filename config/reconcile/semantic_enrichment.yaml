@@ -59,6 +59,29 @@ automation_policy:
     - graph_patch_candidate
     - review_required
 
+graph_structure_ops:
+  schema_version: graph_structure_ops.v1
+  analyzer_role: reconcile_graph_structure_analyzer
+  operations:
+    move_file:
+      enabled: true
+      materializer: source_hint
+      required_fields: [op, hint_id, source_path, target_node_id, role]
+      role_allowlist: [config, doc, primary, secondary, test]
+      edge_allowlist: []
+    add_edge:
+      enabled: true
+      materializer: source_hint
+      required_fields: [op, hint_id, source_path, target_node_id, edge]
+      role_allowlist: []
+      edge_allowlist: [calls, configures, depends_on, documents, imports, tests, uses]
+    suppress_edge:
+      enabled: true
+      materializer: source_hint
+      required_fields: [op, hint_id, source_path, target_node_id, edge]
+      role_allowlist: []
+      edge_allowlist: [calls, configures, depends_on, documents, imports, tests, uses]
+
 job_profiles:
   node:
     analyzer_role: reconcile_node_semantic_analyzer
@@ -74,6 +97,7 @@ job_profiles:
       Your job is to propose graph structure operations that can be validated
       by the graph_structure_ops.v1 gate and later materialized as source
       hint blocks. You do not modify files, database rows, or graph topology.
+      Only emit operations listed in payload.output_contract.supported_operations.
 
       Return exactly one JSON object:
       {

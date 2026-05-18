@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,7 @@ def handle_graph_structure_ai_output(
     raw_output: Any,
     mode: str = "dry_run",
     project_root: str | Path | None = None,
+    operation_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Process one graph_structure AI output without making a model call.
 
@@ -118,6 +120,7 @@ def handle_graph_structure_ai_output(
             snapshot_id=snapshot_id,
             base_commit=str(snapshot.get("commit_sha") or ""),
             project_root=root,
+            operation_contract=operation_contract,
         )
         return {
             "project_id": project_id,
@@ -154,15 +157,12 @@ def _graph_structure_ai_payload(
     snapshot_id: str,
     *,
     event_payload: dict[str, Any] | None = None,
+    operation_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from . import db as governance_db
     from . import graph_snapshot_store as store
     from .graph_structure_ops import (
-        ANALYZER_ROLE,
-        EDGE_ALLOWLIST,
-        ROLE_ALLOWLIST,
-        SCHEMA_VERSION,
-        SUPPORTED_HINT_OPS,
+        graph_structure_ops_output_contract,
     )
 
     event_payload = event_payload if isinstance(event_payload, dict) else {}
@@ -196,6 +196,12 @@ def _graph_structure_ai_payload(
         if isinstance(event_payload.get("options"), dict)
         else {}
     )
+    output_contract = graph_structure_ops_output_contract(operation_contract)
+    output_contract["source"] = {
+        **output_contract["source"],
+        "snapshot_id": snapshot_id,
+        "base_commit": str(snapshot.get("commit_sha") or ""),
+    }
     return {
         "schema_version": 1,
         "project_id": project_id,
@@ -236,26 +242,7 @@ def _graph_structure_ai_payload(
             },
         },
         "inventory_paths": inventory_paths[:1000],
-        "output_contract": {
-            "schema_version": SCHEMA_VERSION,
-            "return_exactly_one_json_object": True,
-            "supported_operations": sorted(SUPPORTED_HINT_OPS),
-            "supported_roles": sorted(ROLE_ALLOWLIST),
-            "supported_edges": sorted(EDGE_ALLOWLIST),
-            "required_top_level_fields": ["schema_version", "source", "operations", "self_check"],
-            "required_operation_fields": {
-                "move_file": ["op", "hint_id", "source_path", "target_node_id", "role"],
-                "add_edge": ["op", "hint_id", "source_path", "target_node_id", "edge"],
-                "suppress_edge": ["op", "hint_id", "source_path", "target_node_id", "edge"],
-            },
-            "source": {
-                "snapshot_id": snapshot_id,
-                "base_commit": str(snapshot.get("commit_sha") or ""),
-                "analyzer_role": ANALYZER_ROLE,
-            },
-            "self_check_required": True,
-            "no_markdown": True,
-        },
+        "output_contract": output_contract,
     }
 
 
@@ -322,12 +309,13 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                             evidence={"source": "semantic_worker_inproc_graph_structure"},
                         )
                         conn.commit()
+                    root = Path(project_root or _project_root_for(project_id))
+                    cfg = apply_project_ai_routing(
+                        load_semantic_enrichment_config(project_root=root),
+                        project_id=project_id,
+                    )
+                    operation_contract = asdict(cfg.graph_structure_ops)
                     if raw_output in (None, ""):
-                        root = Path(project_root or _project_root_for(project_id))
-                        cfg = apply_project_ai_routing(
-                            load_semantic_enrichment_config(project_root=root),
-                            project_id=project_id,
-                        )
                         ai_call = build_semantic_ai_call(
                             semantic_config=cfg,
                             project_id=project_id,
@@ -342,6 +330,7 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                                 project_id,
                                 snapshot_id,
                                 event_payload=payload,
+                                operation_contract=asdict(cfg.graph_structure_ops),
                             ),
                         )
                     result = handle_graph_structure_ai_output(
@@ -350,6 +339,7 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                         raw_output=raw_output,
                         mode=mode,
                         project_root=project_root,
+                        operation_contract=operation_contract,
                     )
                     if result.get("ok"):
                         with sqlite_write_lock():

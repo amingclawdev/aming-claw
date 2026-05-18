@@ -356,3 +356,56 @@ def test_graph_structure_ops_gate_detects_conflicting_operations() -> None:
         "conflicting_move_file_target",
         "conflicting_edge_add_suppress",
     } <= set(report["errors"])
+
+
+def test_graph_structure_ops_gate_uses_configured_operation_contract() -> None:
+    validate_graph_structure_ops = _future_api()
+    payload = {
+        "schema_version": "graph_structure_ops.v1",
+        "source": {
+            "snapshot_id": "scope-current",
+            "base_commit": "abc123",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
+        "operations": [
+            {
+                "op": "add_edge",
+                "hint_id": "gsh-import-edge",
+                "source_path": "agent/tests/test_parallel_branch_runtime.py",
+                "target_node_id": "L7.runtime",
+                "edge": "imports",
+                "confidence": 0.8,
+            },
+            {
+                "op": "suppress_edge",
+                "hint_id": "gsh-suppress-disabled",
+                "source_path": "agent/tests/test_parallel_branch_runtime.py",
+                "target_node_id": "L7.server",
+                "edge": "tests",
+                "confidence": 0.8,
+            },
+        ],
+        "self_check": {"valid": True, "checked_rules": ["configured_contract"], "known_risks": []},
+    }
+    contract = {
+        "schema_version": "graph_structure_ops.v1",
+        "analyzer_role": "reconcile_graph_structure_analyzer",
+        "operations": {
+            "add_edge": {"enabled": True, "edge_allowlist": ["tests"]},
+            "suppress_edge": {"enabled": False},
+        },
+    }
+
+    report = validate_graph_structure_ops(
+        payload,
+        graph=_graph(),
+        inventory_paths=_inventory_paths(),
+        snapshot_id="scope-current",
+        base_commit="abc123",
+        operation_contract=contract,
+    )
+
+    assert report["ok"] is False
+    assert report["operation_contract"]["supported_operations"] == ["add_edge", "move_file"]
+    assert report["operations"][0]["errors"] == ["edge_unsupported"]
+    assert report["operations"][1]["errors"] == ["unsupported_op_for_hint_materialization"]

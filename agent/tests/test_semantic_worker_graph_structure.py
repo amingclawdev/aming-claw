@@ -409,6 +409,45 @@ def test_semantic_worker_graph_structure_job_invokes_ai_when_output_missing(
     )
 
 
+def test_semantic_worker_graph_structure_payload_uses_operation_contract(conn, tmp_path):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="worker-graph-structure-contract-base",
+        commit_sha="workercontract_base",
+        snapshot_id="worker-graph-structure-contract-base",
+        created_by="test",
+    )
+    assert base["ok"] is True
+
+    payload = semantic_worker._graph_structure_ai_payload(
+        PID,
+        "worker-graph-structure-contract-base",
+        operation_contract={
+            "schema_version": SCHEMA_VERSION,
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+            "operations": {
+                "add_edge": {"enabled": True, "edge_allowlist": ["tests"]},
+                "suppress_edge": {"enabled": False},
+            },
+        },
+    )
+
+    contract = payload["output_contract"]
+    assert contract["supported_operations"] == ["add_edge", "move_file"]
+    assert contract["supported_edges"] == ["tests"]
+    assert contract["required_operation_fields"]["add_edge"] == [
+        "op",
+        "hint_id",
+        "source_path",
+        "target_node_id",
+        "edge",
+    ]
+
+
 def test_semantic_worker_graph_structure_job_fails_when_ai_unconfigured(
     conn,
     tmp_path,
