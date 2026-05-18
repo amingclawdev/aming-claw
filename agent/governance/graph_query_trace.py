@@ -1606,6 +1606,7 @@ def traced_query(
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
     ensure_schema(conn)
+    created_trace = False
     if not trace_id:
         trace = start_trace(
             conn,
@@ -1619,6 +1620,7 @@ def traced_query(
             budget=budget,
         )["trace"]
         trace_id = trace["trace_id"]
+        created_trace = True
     else:
         trace = _load_trace_for_query(conn, project_id, trace_id)
     usage = dict(trace.get("usage") or _empty_usage())
@@ -1703,6 +1705,17 @@ def traced_query(
         "status": status,
         "ts": now,
     })
+    if created_trace:
+        if budget_key:
+            terminal_status = "budget_exceeded"
+            reason = str(budget_key)
+        elif error:
+            terminal_status = "failed"
+            reason = error
+        else:
+            terminal_status = "complete"
+            reason = "one_shot_query"
+        finish_trace(conn, project_id, trace_id, status=terminal_status, reason=reason)
     return {
         "ok": bool(result.get("ok", False)),
         "trace_id": trace_id,

@@ -264,6 +264,7 @@ def test_trace_records_queries_and_budget_usage(conn, tmp_path):
     assert stored["usage"]["query_count"] == 1
     assert stored["event_count"] == 1
     assert stored["events"][0]["tool"] == "get_node"
+    assert stored["status"] == "running"
     assert stored["artifact_path"]
 
 
@@ -288,7 +289,28 @@ def test_query_tools_reuse_graph_files_and_search_docs(conn, tmp_path):
     trace = graph_query_trace.get_trace(conn, PID, result["trace_id"])["trace"]
     assert trace["query_source"] == "dashboard"
     assert trace["query_purpose"] == "inspect_node"
+    assert trace["status"] == "complete"
     assert trace["usage"]["file_excerpt_chars"] > 0
+
+
+def test_one_shot_query_finishes_failed_trace_on_error(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="inspect_node",
+        tool="not_a_real_tool",
+        project_root=project_root,
+    )
+
+    assert result["ok"] is False
+    trace = graph_query_trace.get_trace(conn, PID, result["trace_id"])["trace"]
+    assert trace["status"] == "failed"
+    assert trace["event_count"] == 1
+    assert trace["events"][0]["tool"] == "not_a_real_tool"
 
 
 def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, tmp_path):

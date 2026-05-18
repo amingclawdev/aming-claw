@@ -4499,6 +4499,7 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
     )
     assert fetched["trace"]["event_count"] == 1
     assert fetched["trace"]["events"][0]["tool"] == "get_node"
+    assert fetched["trace"]["status"] == "running"
 
     finished = server.handle_graph_governance_query_trace_finish(
         _ctx(
@@ -4508,6 +4509,24 @@ def test_graph_governance_query_trace_api_records_source_and_events(conn):
         )
     )
     assert finished["trace"]["status"] == "complete"
+
+    one_shot = server.handle_graph_governance_query(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "snapshot_id": "active",
+                "tool": "get_node",
+                "args": {"node_id": "L7.1"},
+            },
+        )
+    )
+    assert one_shot["ok"] is True
+    one_shot_trace = server.handle_graph_governance_query_trace_get(
+        _ctx({"project_id": PID, "trace_id": one_shot["trace_id"]})
+    )
+    assert one_shot_trace["trace"]["status"] == "complete"
+    assert one_shot_trace["trace"]["event_count"] == 1
 
 
 def test_mf_sub_graph_query_requires_task_scope_and_uses_bounded_source(conn):
