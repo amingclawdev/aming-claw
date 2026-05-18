@@ -21,6 +21,50 @@ def test_graph_structure_ai_output_parser_accepts_only_one_json_object() -> None
     assert parse_graph_structure_ai_output('{"a": 1}\ntrailing')["errors"] == ["ai_output_extra_content"]
 
 
+def test_graph_structure_ai_output_pipeline_dry_run_and_accept_requires_project_root() -> None:
+    import json
+
+    from agent.governance.graph_structure_ops import run_graph_structure_ai_output_pipeline
+
+    payload = {
+        "schema_version": "graph_structure_ops.v1",
+        "source": {"snapshot_id": "snap", "base_commit": "head"},
+        "operations": [
+            {
+                "op": "add_edge",
+                "hint_id": "pipeline-edge",
+                "source_path": "agent/tests/test_service.py",
+                "target_node_id": "L7.service",
+                "edge": "tests",
+            }
+        ],
+        "self_check": {"valid": True, "checked_rules": ["json", "snapshot"]},
+    }
+    graph = {"deps_graph": {"nodes": [{"id": "L7.service"}], "edges": []}}
+
+    dry_run = run_graph_structure_ai_output_pipeline(
+        raw_output=json.dumps(payload),
+        mode="dry_run",
+        graph=graph,
+        inventory_paths=["agent/tests/test_service.py"],
+        snapshot_id="snap",
+        base_commit="head",
+    )
+    assert dry_run["ok"] is True
+    assert dry_run["projection"]["effect_counts"]["edges_added"] == 1
+
+    accept = run_graph_structure_ai_output_pipeline(
+        raw_output=json.dumps(payload),
+        mode="accept",
+        graph=graph,
+        inventory_paths=["agent/tests/test_service.py"],
+        snapshot_id="snap",
+        base_commit="head",
+    )
+    assert accept["ok"] is False
+    assert accept["errors"] == ["project_root_required"]
+
+
 def _graph():
     return {
         "deps_graph": {

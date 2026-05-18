@@ -5746,37 +5746,41 @@ def handle_graph_governance_snapshot_graph_structure_ops_ai_output(ctx: RequestC
     body = ctx.body
     mode = str(body.get("mode") or "dry_run").strip().lower().replace("-", "_")
     raw_output = body.get("ai_output") if "ai_output" in body else body.get("output")
-    from .graph_structure_ops import parse_graph_structure_ai_output
+    from . import graph_snapshot_store as store
+    from .errors import ValidationError
+    from .graph_structure_ops import run_graph_structure_ai_output_pipeline
 
-    parsed = parse_graph_structure_ai_output(raw_output)
-    if not parsed["ok"]:
-        return 422, {
-            "ok": False,
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.graph-structure-ops.ai-output")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+        if not snapshot:
+            raise ValidationError(f"graph snapshot not found: {snapshot_id}")
+        graph, inventory = _snapshot_graph_and_inventory(store, project_id, snapshot_id)
+        root = ""
+        if mode in {"accept", "apply", "write"}:
+            root = str(_graph_governance_project_root(project_id, body))
+        result = run_graph_structure_ai_output_pipeline(
+            raw_output=raw_output,
+            mode=mode,
+            graph=graph,
+            inventory_paths=[str(row.get("path") or "") for row in inventory],
+            snapshot_id=snapshot_id,
+            base_commit=str(snapshot.get("commit_sha") or ""),
+            project_root=root,
+        )
+        status_code = 200 if result["ok"] else 422
+        return status_code, {
+            "ok": result["ok"],
             "project_id": project_id,
-            "snapshot_id": raw_snapshot_id,
-            "mode": mode,
-            "accepted": False,
-            "mutated": False,
-            "parse": parsed,
+            "snapshot_id": snapshot_id,
+            "commit_sha": snapshot.get("commit_sha", ""),
+            "dry_run": mode in {"dry_run", "dryrun", "preview"},
+            **result,
         }
-    if mode in {"accept", "apply", "write"}:
-        return handle_graph_governance_snapshot_graph_structure_ops_accept(
-            _ctx_with_graph_structure_ops_payload(ctx, parsed["payload"])
-        )
-    if mode in {"dry_run", "dryrun", "preview"}:
-        return handle_graph_governance_snapshot_graph_structure_ops_dry_run(
-            _ctx_with_graph_structure_ops_payload(ctx, parsed["payload"])
-        )
-    return 422, {
-        "ok": False,
-        "project_id": project_id,
-        "snapshot_id": raw_snapshot_id,
-        "mode": mode,
-        "accepted": False,
-        "mutated": False,
-        "parse": parsed,
-        "errors": ["mode_unsupported"],
-    }
+    finally:
+        conn.close()
 
 
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes")

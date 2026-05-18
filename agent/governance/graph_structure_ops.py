@@ -7,6 +7,7 @@ import re
 from typing import Any, Iterable, Mapping
 
 from agent.governance.graph_hint_projection import build_hint_projection
+from agent.governance.graph_structure_hints import write_graph_structure_hints
 
 
 SCHEMA_VERSION = "graph_structure_ops.v1"
@@ -156,6 +157,90 @@ def dry_run_graph_structure_ops(
         "status": "passed" if preview["status"] == "ok" else "failed",
         "gate": gate,
         "projection": preview,
+    }
+
+
+def run_graph_structure_ai_output_pipeline(
+    *,
+    raw_output: Any,
+    mode: str = "dry_run",
+    graph: Mapping[str, Any],
+    inventory_paths: Iterable[str],
+    snapshot_id: str = "",
+    base_commit: str = "",
+    project_root: str = "",
+) -> dict[str, Any]:
+    """Run raw AI graph-structure output through parse, gate, and action.
+
+    This is the worker-ready orchestration surface. It performs no model calls;
+    callers pass the raw AI output they already obtained.
+    """
+    normalized_mode = str(mode or "dry_run").strip().lower().replace("-", "_")
+    parsed = parse_graph_structure_ai_output(raw_output)
+    if not parsed["ok"]:
+        return {
+            "ok": False,
+            "status": "failed",
+            "mode": normalized_mode,
+            "accepted": False,
+            "mutated": False,
+            "parse": parsed,
+        }
+    if normalized_mode not in {"dry_run", "dryrun", "preview", "accept", "apply", "write"}:
+        return {
+            "ok": False,
+            "status": "failed",
+            "mode": normalized_mode,
+            "accepted": False,
+            "mutated": False,
+            "parse": parsed,
+            "errors": ["mode_unsupported"],
+        }
+
+    dry_run = dry_run_graph_structure_ops(
+        parsed["payload"],
+        graph=graph,
+        inventory_paths=inventory_paths,
+        snapshot_id=snapshot_id,
+        base_commit=base_commit,
+    )
+    if normalized_mode in {"dry_run", "dryrun", "preview"} or not dry_run["ok"]:
+        return {
+            **dry_run,
+            "mode": normalized_mode,
+            "accepted": False,
+            "mutated": False,
+            "parse": parsed,
+        }
+    if not project_root:
+        return {
+            "ok": False,
+            "status": "failed",
+            "mode": normalized_mode,
+            "accepted": False,
+            "mutated": False,
+            "parse": parsed,
+            "gate": dry_run["gate"],
+            "projection": dry_run["projection"],
+            "errors": ["project_root_required"],
+        }
+
+    write_result = write_graph_structure_hints(
+        project_root,
+        dry_run["gate"]["normalized_hint_index"]["hints"],
+    )
+    return {
+        "ok": write_result["ok"],
+        "status": "passed" if write_result["ok"] else "failed",
+        "mode": normalized_mode,
+        "accepted": write_result["ok"],
+        "mutated": write_result["written_count"] > 0,
+        "requires_commit": write_result["written_count"] > 0,
+        "update_graph_after_commit": write_result["written_count"] > 0,
+        "parse": parsed,
+        "gate": dry_run["gate"],
+        "projection": dry_run["projection"],
+        "write": write_result,
     }
 
 
