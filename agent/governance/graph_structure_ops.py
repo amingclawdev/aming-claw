@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from agent.governance.graph_hint_projection import build_hint_projection
+
 
 SCHEMA_VERSION = "graph_structure_ops.v1"
 SUPPORTED_HINT_OPS = {"move_file", "add_edge", "suppress_edge"}
@@ -90,6 +92,45 @@ def validate_graph_structure_ops(
             "hint_count": len(accepted_hints),
             "hints": accepted_hints,
         },
+    }
+
+
+def dry_run_graph_structure_ops(
+    payload: Mapping[str, Any],
+    *,
+    graph: Mapping[str, Any],
+    inventory_paths: Iterable[str],
+    snapshot_id: str = "",
+    base_commit: str = "",
+) -> dict[str, Any]:
+    """Validate AI graph-structure ops and preview hint projection effects.
+
+    Dry-run is intentionally state-only: it does not write hint comments,
+    persist graph events, or mutate the graph DB. The returned projection
+    summary is enough for dashboard/observer review before an accept step.
+    """
+    gate = validate_graph_structure_ops(
+        payload,
+        graph=graph,
+        inventory_paths=inventory_paths,
+        snapshot_id=snapshot_id,
+        base_commit=base_commit,
+    )
+    if not gate["ok"]:
+        return {
+            "ok": False,
+            "status": "failed",
+            "gate": gate,
+            "projection": _empty_projection_preview(),
+        }
+
+    projection = build_hint_projection(graph, gate["normalized_hint_index"])
+    preview = _projection_preview(projection)
+    return {
+        "ok": preview["status"] == "ok",
+        "status": "passed" if preview["status"] == "ok" else "failed",
+        "gate": gate,
+        "projection": preview,
     }
 
 
@@ -209,6 +250,51 @@ def _mark_conflicts(operations: list[dict[str, Any]]) -> list[str]:
     if conflicting_edges:
         errors.append("conflicting_edge_add_suppress")
     return errors
+
+
+def _empty_projection_preview() -> dict[str, Any]:
+    return {
+        "status": "not_run",
+        "materialized_count": 0,
+        "conflict_count": 0,
+        "effect_counts": {
+            "edges_added": 0,
+            "edges_suppressed": 0,
+            "files_moved": 0,
+        },
+        "hint_states": {},
+        "suppressed_edges": [],
+    }
+
+
+def _projection_preview(projection: Mapping[str, Any]) -> dict[str, Any]:
+    hint_states = (
+        projection.get("hint_states")
+        if isinstance(projection.get("hint_states"), Mapping)
+        else {}
+    )
+    counts = {
+        "edges_added": 0,
+        "edges_suppressed": 0,
+        "files_moved": 0,
+    }
+    for state in hint_states.values():
+        if not isinstance(state, Mapping):
+            continue
+        effect = state.get("effect") if isinstance(state.get("effect"), Mapping) else {}
+        counts["edges_added"] += len(effect.get("edges_added") or [])
+        counts["edges_suppressed"] += len(effect.get("edges_suppressed") or [])
+        counts["files_moved"] += len(effect.get("files_moved") or [])
+    return {
+        "status": str(projection.get("status") or ""),
+        "materialized_count": int(projection.get("materialized_count") or 0),
+        "conflict_count": int(projection.get("conflict_count") or 0),
+        "effect_counts": counts,
+        "hint_states": dict(hint_states),
+        "suppressed_edges": projection.get("suppressed_edges")
+        if isinstance(projection.get("suppressed_edges"), list)
+        else [],
+    }
 
 
 def _graph_node_ids(graph: Mapping[str, Any]) -> set[str]:

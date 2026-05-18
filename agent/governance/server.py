@@ -5561,6 +5561,24 @@ def _graph_structure_hint_projection_from_snapshot(snapshot: dict) -> dict:
     return out
 
 
+def _snapshot_graph_and_inventory(store, project_id: str, snapshot_id: str) -> tuple[dict, list[dict]]:
+    graph_path = store.snapshot_companion_dir(project_id, snapshot_id) / "graph.json"
+    inventory_path = store.snapshot_companion_dir(project_id, snapshot_id) / "file_inventory.json"
+    try:
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        graph = {}
+    try:
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        inventory = []
+    if not isinstance(graph, dict):
+        graph = {}
+    if not isinstance(inventory, list):
+        inventory = []
+    return graph, [row for row in inventory if isinstance(row, dict)]
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-hints")
 def handle_graph_governance_snapshot_graph_structure_hints(ctx: RequestContext):
     """Return source-hint graph projection status recorded on a graph snapshot."""
@@ -5591,6 +5609,46 @@ def handle_graph_governance_snapshot_graph_structure_hints(ctx: RequestContext):
             "conflict_count": projection["conflict_count"],
             "hint_states": projection["hint_states"],
             "suppressed_edges": projection["suppressed_edges"],
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-ops/dry-run")
+def handle_graph_governance_snapshot_graph_structure_ops_dry_run(ctx: RequestContext):
+    """Validate AI graph-structure ops and preview hint projection effects."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .errors import ValidationError
+    from .graph_structure_ops import dry_run_graph_structure_ops
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.graph-structure-ops.dry-run")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+        if not snapshot:
+            raise ValidationError(f"graph snapshot not found: {snapshot_id}")
+        graph, inventory = _snapshot_graph_and_inventory(store, project_id, snapshot_id)
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+        result = dry_run_graph_structure_ops(
+            payload,
+            graph=graph,
+            inventory_paths=[str(row.get("path") or "") for row in inventory],
+            snapshot_id=snapshot_id,
+            base_commit=str(snapshot.get("commit_sha") or ""),
+        )
+        status_code = 200 if result["ok"] else 422
+        return status_code, {
+            "ok": result["ok"],
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "commit_sha": snapshot.get("commit_sha", ""),
+            "dry_run": True,
+            "mutated": False,
+            **result,
         }
     finally:
         conn.close()
