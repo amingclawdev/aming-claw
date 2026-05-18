@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Iterable, Mapping
 
@@ -21,6 +22,30 @@ EDGE_ALLOWLIST = {
     "imports",
 }
 _HINT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def parse_graph_structure_ai_output(raw_output: Any) -> dict[str, Any]:
+    """Parse one AI-produced graph_structure_ops JSON object.
+
+    The analyzer prompt requires exactly one JSON object. This parser keeps that
+    boundary strict so downstream dry-run/accept code never has to guess around
+    prose, arrays, or partial JSON fragments.
+    """
+    if isinstance(raw_output, Mapping):
+        return {"ok": True, "payload": dict(raw_output), "errors": []}
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        return {"ok": False, "payload": {}, "errors": ["ai_output_missing"]}
+    decoder = json.JSONDecoder()
+    text = raw_output.strip()
+    try:
+        payload, end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        return {"ok": False, "payload": {}, "errors": ["ai_output_json_invalid"]}
+    if text[end:].strip():
+        return {"ok": False, "payload": {}, "errors": ["ai_output_extra_content"]}
+    if not isinstance(payload, dict):
+        return {"ok": False, "payload": {}, "errors": ["ai_output_not_object"]}
+    return {"ok": True, "payload": payload, "errors": []}
 
 
 def validate_graph_structure_ops(

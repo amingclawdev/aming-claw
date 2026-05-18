@@ -5579,6 +5579,27 @@ def _snapshot_graph_and_inventory(store, project_id: str, snapshot_id: str) -> t
     return graph, [row for row in inventory if isinstance(row, dict)]
 
 
+def _graph_structure_ops_payload_from_body(body: dict) -> dict:
+    payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+    return payload if isinstance(payload, dict) else {}
+
+
+def _ctx_with_graph_structure_ops_payload(ctx: RequestContext, payload: dict) -> RequestContext:
+    next_ctx = RequestContext(
+        ctx.handler,
+        ctx.method,
+        dict(ctx.path_params),
+        dict(ctx.query),
+        {**ctx.body, "payload": payload},
+        ctx.request_id,
+        ctx.token,
+        ctx.idem_key,
+    )
+    next_ctx._session = ctx._session
+    next_ctx._conn = ctx._conn
+    return next_ctx
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-hints")
 def handle_graph_governance_snapshot_graph_structure_hints(ctx: RequestContext):
     """Return source-hint graph projection status recorded on a graph snapshot."""
@@ -5632,7 +5653,7 @@ def handle_graph_governance_snapshot_graph_structure_ops_dry_run(ctx: RequestCon
         if not snapshot:
             raise ValidationError(f"graph snapshot not found: {snapshot_id}")
         graph, inventory = _snapshot_graph_and_inventory(store, project_id, snapshot_id)
-        payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+        payload = _graph_structure_ops_payload_from_body(body)
         result = dry_run_graph_structure_ops(
             payload,
             graph=graph,
@@ -5674,7 +5695,7 @@ def handle_graph_governance_snapshot_graph_structure_ops_accept(ctx: RequestCont
             raise ValidationError(f"graph snapshot not found: {snapshot_id}")
         root = _graph_governance_project_root(project_id, body)
         graph, inventory = _snapshot_graph_and_inventory(store, project_id, snapshot_id)
-        payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+        payload = _graph_structure_ops_payload_from_body(body)
         dry_run = dry_run_graph_structure_ops(
             payload,
             graph=graph,
@@ -5715,6 +5736,47 @@ def handle_graph_governance_snapshot_graph_structure_ops_accept(ctx: RequestCont
         }
     finally:
         conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-ops/ai-output")
+def handle_graph_governance_snapshot_graph_structure_ops_ai_output(ctx: RequestContext):
+    """Parse AI graph-structure JSON output and run dry-run or accept."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    mode = str(body.get("mode") or "dry_run").strip().lower().replace("-", "_")
+    raw_output = body.get("ai_output") if "ai_output" in body else body.get("output")
+    from .graph_structure_ops import parse_graph_structure_ai_output
+
+    parsed = parse_graph_structure_ai_output(raw_output)
+    if not parsed["ok"]:
+        return 422, {
+            "ok": False,
+            "project_id": project_id,
+            "snapshot_id": raw_snapshot_id,
+            "mode": mode,
+            "accepted": False,
+            "mutated": False,
+            "parse": parsed,
+        }
+    if mode in {"accept", "apply", "write"}:
+        return handle_graph_governance_snapshot_graph_structure_ops_accept(
+            _ctx_with_graph_structure_ops_payload(ctx, parsed["payload"])
+        )
+    if mode in {"dry_run", "dryrun", "preview"}:
+        return handle_graph_governance_snapshot_graph_structure_ops_dry_run(
+            _ctx_with_graph_structure_ops_payload(ctx, parsed["payload"])
+        )
+    return 422, {
+        "ok": False,
+        "project_id": project_id,
+        "snapshot_id": raw_snapshot_id,
+        "mode": mode,
+        "accepted": False,
+        "mutated": False,
+        "parse": parsed,
+        "errors": ["mode_unsupported"],
+    }
 
 
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes")

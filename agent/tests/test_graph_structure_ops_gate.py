@@ -9,6 +9,18 @@ def _future_api():
     return validate_graph_structure_ops
 
 
+def test_graph_structure_ai_output_parser_accepts_only_one_json_object() -> None:
+    from agent.governance.graph_structure_ops import parse_graph_structure_ai_output
+
+    parsed = parse_graph_structure_ai_output('{"schema_version":"graph_structure_ops.v1","operations":[]}')
+    assert parsed["ok"] is True
+    assert parsed["payload"]["schema_version"] == "graph_structure_ops.v1"
+
+    assert parse_graph_structure_ai_output("not json")["errors"] == ["ai_output_json_invalid"]
+    assert parse_graph_structure_ai_output("[]")["errors"] == ["ai_output_not_object"]
+    assert parse_graph_structure_ai_output('{"a": 1}\ntrailing')["errors"] == ["ai_output_extra_content"]
+
+
 def _graph():
     return {
         "deps_graph": {

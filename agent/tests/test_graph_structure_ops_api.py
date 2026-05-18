@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -199,6 +200,33 @@ def test_graph_structure_ops_dry_run_rejects_invalid_payload_without_projection(
     assert result["projection"]["status"] == "not_run"
 
 
+def test_graph_structure_ops_ai_output_dry_run_rejects_malformed_output(conn):
+    snapshot_id = _create_snapshot(conn)
+
+    status, result = server.handle_graph_governance_snapshot_graph_structure_ops_ai_output(
+        _ctx(snapshot_id, {"mode": "dry_run", "ai_output": "not json"})
+    )
+
+    assert status == 422
+    assert result["ok"] is False
+    assert result["mutated"] is False
+    assert result["parse"]["errors"] == ["ai_output_json_invalid"]
+
+
+def test_graph_structure_ops_ai_output_dry_run_accepts_raw_json(conn):
+    snapshot_id = _create_snapshot(conn)
+
+    status, result = server.handle_graph_governance_snapshot_graph_structure_ops_ai_output(
+        _ctx(snapshot_id, {"mode": "dry_run", "ai_output": json.dumps(_payload(snapshot_id))})
+    )
+
+    assert status == 200
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["mutated"] is False
+    assert result["gate"]["accepted_count"] == 1
+
+
 def test_graph_structure_ops_accept_writes_hint_in_generated_project_and_reconcile_materializes(
     conn,
     tmp_path,
@@ -241,8 +269,15 @@ def test_graph_structure_ops_accept_writes_hint_in_generated_project_and_reconci
         },
     }
 
-    status, accepted = server.handle_graph_governance_snapshot_graph_structure_ops_accept(
-        _ctx("graph-ops-accept-base", {"project_root": str(project), "payload": payload})
+    status, accepted = server.handle_graph_governance_snapshot_graph_structure_ops_ai_output(
+        _ctx(
+            "graph-ops-accept-base",
+            {
+                "mode": "accept",
+                "project_root": str(project),
+                "ai_output": json.dumps(payload),
+            },
+        )
     )
 
     assert status == 200
