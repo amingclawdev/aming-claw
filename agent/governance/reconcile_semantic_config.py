@@ -25,6 +25,17 @@ _FORBIDDEN_ALLOWED = {
     "finalize_snapshot",
 }
 
+GRAPH_STRUCTURE_PROMPT_TEMPLATE = """You are the reconcile graph structure analyzer.
+
+Your job is to propose graph structure operations that can be validated by the
+graph_structure_ops.v1 gate and later materialized as source hint blocks. You
+do not modify files, database rows, or graph topology.
+
+Return exactly one JSON object with schema_version "graph_structure_ops.v1".
+Only emit operations supported by source hint projection in the current gate:
+move_file, add_edge, and suppress_edge. Do not emit merge_nodes, split_node,
+reparent_node, or direct DB patches."""
+
 
 class SemanticConfigError(Exception):
     """Base exception for semantic analyzer config failures."""
@@ -368,7 +379,10 @@ def _default_job_profiles() -> dict[str, SemanticJobProfile]:
         "node": SemanticJobProfile(analyzer_role="reconcile_node_semantic_analyzer"),
         "edge": SemanticJobProfile(analyzer_role="reconcile_edge_semantic_analyzer"),
         "global_review": SemanticJobProfile(analyzer_role="reconcile_global_semantic_reviewer"),
-        "graph_structure": SemanticJobProfile(analyzer_role="reconcile_graph_structure_analyzer"),
+        "graph_structure": SemanticJobProfile(
+            analyzer_role="reconcile_graph_structure_analyzer",
+            prompt_template=GRAPH_STRUCTURE_PROMPT_TEMPLATE,
+        ),
         "retry": SemanticJobProfile(analyzer_role="reconcile_semantic_retry_reviewer"),
         "dry_run": SemanticJobProfile(analyzer_role="reconcile_semantic_dry_run"),
     }

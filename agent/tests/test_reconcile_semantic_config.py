@@ -103,6 +103,9 @@ def test_legacy_role_field_maps_to_chain_role_not_analyzer(tmp_path):
     assert payload["role"] == "reconcile_node_semantic_analyzer"
     assert payload["chain_role"] == "qa"
     assert payload["legacy_role_alias"] == "qa"
+    graph_structure = config.to_instruction_payload("graph_structure")
+    assert "graph_structure_ops.v1" in graph_structure["job_profile"]["prompt_template"]
+    assert "move_file" in graph_structure["job_profile"]["prompt_template"]
 
 
 def test_job_profile_aliases_support_per_job_overrides(tmp_path):
@@ -310,6 +313,61 @@ def test_semantic_ai_openai_call_streams_prompt_on_stdin(monkeypatch, tmp_path):
     assert "Payload:" in calls[0]["input"]
     assert result["feature_name"] == "Governance Trace"
     assert result["_ai_route"]["provider"] == "openai"
+
+
+def test_graph_structure_ai_prompt_uses_structure_contract(monkeypatch, tmp_path):
+    config = load_semantic_enrichment_config()
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_PROVIDER", "openai")
+    monkeypatch.setenv("RECONCILE_SEMANTIC_AI_MODEL", "gpt-test-semantic")
+    monkeypatch.setenv("CODEX_BIN", "codex-test")
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        calls.append({"cmd": cmd, "input": kwargs.get("input")})
+        output_path = Path(cmd[cmd.index("-o") + 1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            (
+                '{"schema_version":"graph_structure_ops.v1",'
+                '"source":{"snapshot_id":"scope-test","base_commit":"abc",'
+                '"analyzer_role":"reconcile_graph_structure_analyzer"},'
+                '"operations":[],"self_check":{"valid":true,'
+                '"checked_rules":["schema_version"],"known_risks":[]}}'
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(reconcile_semantic_ai.subprocess, "run", fake_run)
+    ai_call = build_semantic_ai_call(
+        semantic_config=config,
+        project_id="aming-claw",
+        snapshot_id="scope-test",
+        project_root=tmp_path,
+    )
+
+    result = ai_call(
+        "graph_structure",
+        {
+            "snapshot_id": "scope-test",
+            "output_contract": {
+                "schema_version": "graph_structure_ops.v1",
+                "supported_operations": ["move_file", "add_edge", "suppress_edge"],
+            },
+        },
+    )
+
+    assert result["schema_version"] == "graph_structure_ops.v1"
+    assert calls
+    prompt = calls[0]["input"]
+    assert "graph_structure_ops.v1" in prompt
+    assert "payload.output_contract" in prompt
+    assert "move_file" in prompt
+    assert "add_edge" in prompt
+    assert "suppress_edge" in prompt
+    assert "requested semantic fields" not in prompt
 
 
 def test_semantic_ai_rejects_error_only_json(monkeypatch, tmp_path):

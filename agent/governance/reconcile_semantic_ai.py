@@ -235,7 +235,8 @@ def build_semantic_ai_call(
             )
         stage_route["analyzer_role"] = stage_profile.analyzer_role or semantic_config.analyzer_role
         stage_route["chain_role"] = semantic_config.chain_role or semantic_config.role or "pm"
-        stage_route["job_type"] = semantic_config.to_instruction_payload(stage).get("job_type", "node")
+        stage_job_type = semantic_config.to_instruction_payload(stage).get("job_type", "node")
+        stage_route["job_type"] = stage_job_type
         call_provider = stage_route.get("provider", "")
         call_model = stage_route.get("model", "")
         if call_provider not in {"openai", "anthropic"}:
@@ -248,10 +249,20 @@ def build_semantic_ai_call(
                 "feature.node_id, and include node_id on each output object. "
             )
         prompt_template = stage_profile.prompt_template or semantic_config.prompt_template
+        if stage_job_type == "graph_structure":
+            output_instruction = (
+                "Return exactly one JSON object matching payload.output_contract. "
+                "The top-level schema_version must be graph_structure_ops.v1. "
+                "Only use supported operations listed in the supplied payload. "
+            )
+        else:
+            output_instruction = (
+                "Return exactly one JSON object matching the requested semantic fields. "
+                f"{batch_hint}"
+            )
         prompt = (
             f"{prompt_template}\n\n"
-            "Return exactly one JSON object matching the requested semantic fields. "
-            f"{batch_hint}"
+            f"{output_instruction}"
             "Do not modify files, create tasks, or inspect project files outside the supplied payload.\n\n"
             "Payload:\n"
             f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
