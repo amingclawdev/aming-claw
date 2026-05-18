@@ -6,8 +6,10 @@ import pytest
 
 from agent.governance import graph_snapshot_store as store
 from agent.governance import server
+from agent.governance import state_reconcile
 from agent.governance.db import _ensure_schema
 from agent.governance.graph_structure_ops import SCHEMA_VERSION
+from agent.governance.state_reconcile import run_state_only_full_reconcile
 
 
 PID = "graph-structure-ops-api-test"
@@ -133,6 +135,37 @@ def _payload(snapshot_id: str, *, source_path: str = "agent/governance/server.py
     }
 
 
+def _write(path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_generated_project(root) -> None:
+    _write(
+        root / "agent" / "service.py",
+        "def service_entry():\n"
+        "    return helper()\n\n"
+        "def helper():\n"
+        "    return 'ok'\n",
+    )
+    _write(
+        root / "agent" / "tests" / "test_service.py",
+        "from agent.service import service_entry\n\n"
+        "def test_service_entry():\n"
+        "    assert service_entry() == 'ok'\n",
+    )
+    _write(root / "README.md", "# Generated Project\n")
+
+
+def _service_node_id(snapshot_id: str) -> str:
+    graph = state_reconcile._read_snapshot_graph(PID, snapshot_id)
+    service_node = next(
+        node for node in state_reconcile._deps_graph_nodes(graph)
+        if "agent/service.py" in (node.get("primary") or [])
+    )
+    return state_reconcile._node_id(service_node)
+
+
 def test_graph_structure_ops_dry_run_returns_projection_preview(conn):
     snapshot_id = _create_snapshot(conn)
 
@@ -164,3 +197,86 @@ def test_graph_structure_ops_dry_run_rejects_invalid_payload_without_projection(
     assert result["gate"]["rejected_count"] == 1
     assert result["gate"]["operations"][0]["errors"] == ["source_path_missing"]
     assert result["projection"]["status"] == "not_run"
+
+
+def test_graph_structure_ops_accept_writes_hint_in_generated_project_and_reconcile_materializes(
+    conn,
+    tmp_path,
+):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    base = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="graph-ops-accept-base",
+        commit_sha="acceptbase",
+        snapshot_id="graph-ops-accept-base",
+        created_by="test",
+    )
+    assert base["ok"] is True
+    service_id = _service_node_id("graph-ops-accept-base")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "source": {
+            "snapshot_id": "graph-ops-accept-base",
+            "base_commit": "acceptbase",
+            "analyzer_role": "reconcile_graph_structure_analyzer",
+        },
+        "operations": [
+            {
+                "op": "add_edge",
+                "hint_id": "generated-project-test-edge",
+                "source_path": "agent/tests/test_service.py",
+                "target_node_id": service_id,
+                "edge": "tests",
+                "confidence": 0.91,
+                "evidence": {"reason": "generated project test covers service entry"},
+            }
+        ],
+        "self_check": {
+            "valid": True,
+            "checked_rules": ["hint-compatible-op", "snapshot-match"],
+            "known_risks": [],
+        },
+    }
+
+    status, accepted = server.handle_graph_governance_snapshot_graph_structure_ops_accept(
+        _ctx("graph-ops-accept-base", {"project_root": str(project), "payload": payload})
+    )
+
+    assert status == 200
+    assert accepted["ok"] is True
+    assert accepted["mutated"] is True
+    assert accepted["requires_commit"] is True
+    test_file = project / "agent" / "tests" / "test_service.py"
+    text = test_file.read_text(encoding="utf-8")
+    assert "aming-claw-hint:start id=\"generated-project-test-edge\"" in text
+    assert "target=" + f'"{service_id}"' in text
+
+    status, second = server.handle_graph_governance_snapshot_graph_structure_ops_accept(
+        _ctx("graph-ops-accept-base", {"project_root": str(project), "payload": payload})
+    )
+    assert status == 200
+    assert second["ok"] is True
+    assert second["mutated"] is False
+    assert second["write"]["skipped"][0]["reason"] == "already_present"
+
+    materialized = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="graph-ops-accept-materialized",
+        commit_sha="accepthead",
+        snapshot_id="graph-ops-accept-materialized",
+        created_by="test",
+    )
+    assert materialized["ok"] is True
+    graph = state_reconcile._read_snapshot_graph(PID, "graph-ops-accept-materialized")
+    assert any(
+        edge.get("src") == "agent/tests/test_service.py"
+        and edge.get("dst") == service_id
+        and edge.get("edge_type") == "tests"
+        and edge.get("direction") == "source_hint"
+        for edge in state_reconcile._deps_graph_edges(graph)
+    )

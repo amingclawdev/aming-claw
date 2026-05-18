@@ -94,6 +94,101 @@ def load_graph_structure_hints(project_root: str | Path) -> dict[str, Any]:
     return scan_graph_structure_hints(files)
 
 
+def write_graph_structure_hints(
+    project_root: str | Path,
+    hints: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Write source-controlled graph structure hint blocks.
+
+    This is the accept side of the AI graph-structure flow. It writes only to
+    the source files named by each accepted hint and is idempotent by
+    ``hint_id`` within that file.
+    """
+    root = Path(project_root).resolve()
+    written: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for raw_hint in hints:
+        hint = raw_hint if isinstance(raw_hint, Mapping) else {}
+        source_path = _norm_relpath(hint.get("source_path"))
+        hint_id = str(hint.get("hint_id") or "").strip()
+        if not source_path or not hint_id:
+            errors.append({"source_path": source_path, "hint_id": hint_id, "error": "missing_hint_identity"})
+            continue
+        target = (root / source_path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            errors.append({"source_path": source_path, "hint_id": hint_id, "error": "path_outside_project"})
+            continue
+        if not target.exists() or not target.is_file():
+            errors.append({"source_path": source_path, "hint_id": hint_id, "error": "source_file_missing"})
+            continue
+        marker = _comment_marker_for_path(source_path)
+        if not marker:
+            errors.append({"source_path": source_path, "hint_id": hint_id, "error": "unsupported_comment_style"})
+            continue
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            errors.append({"source_path": source_path, "hint_id": hint_id, "error": "source_file_not_utf8"})
+            continue
+        current = scan_graph_structure_hints({source_path: text})
+        if any(str(item.get("hint_id") or "") == hint_id for item in current.get("hints") or []):
+            skipped.append({"source_path": source_path, "hint_id": hint_id, "reason": "already_present"})
+            continue
+        block = render_graph_structure_hint_block(source_path, hint)
+        if not block:
+            errors.append({"source_path": source_path, "hint_id": hint_id, "error": "render_failed"})
+            continue
+        separator = "" if not text or text.endswith("\n") else "\n"
+        target.write_text(text + separator + block + "\n", encoding="utf-8")
+        written.append({"source_path": source_path, "hint_id": hint_id, "bytes_written": len(block.encode("utf-8"))})
+
+    return {
+        "ok": not errors,
+        "written_count": len(written),
+        "skipped_count": len(skipped),
+        "error_count": len(errors),
+        "written": written,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def render_graph_structure_hint_block(source_path: str, hint: Mapping[str, Any]) -> str:
+    marker = _comment_marker_for_path(source_path)
+    if not marker:
+        return ""
+    hint_id = str(hint.get("hint_id") or "").strip()
+    op = str(hint.get("op") or "").strip()
+    target_node_id = str(hint.get("target_node_id") or "").strip()
+    edge = str(hint.get("edge") or "").strip()
+    role = str(hint.get("role") or "").strip()
+    attrs = [
+        f"id={_quote_attr(hint_id)}",
+        f"op={_quote_attr(op)}",
+    ]
+    if edge:
+        attrs.append(f"edge={_quote_attr(edge)}")
+    if role:
+        attrs.append(f"role={_quote_attr(role)}")
+    if target_node_id:
+        attrs.append(f"target={_quote_attr(target_node_id)}")
+    reason = str(hint.get("reason") or "").strip()
+    evidence = str(hint.get("evidence") or "").strip()
+    lines = [
+        _comment_line(marker, "aming-claw-hint:start " + " ".join(attrs)),
+    ]
+    if reason:
+        lines.append(_comment_line(marker, f"reason: {reason}"))
+    if evidence:
+        lines.append(_comment_line(marker, f"evidence: {evidence}"))
+    lines.append(_comment_line(marker, "aming-claw-hint:end"))
+    return "\n".join(lines)
+
+
 def _scan_one_file(source_path: str, text: str) -> list[GraphStructureHint]:
     hints: list[GraphStructureHint] = []
     lines = text.splitlines()
@@ -171,5 +266,33 @@ def _body_value(lines: list[str], key: str) -> str:
                 text = text[len(marker):].strip()
                 break
         if text.startswith(prefix):
-            return text[len(prefix):].strip().strip("-").strip()
+            return text[len(prefix):].strip().removesuffix("-->").strip().strip("-").strip()
     return ""
+
+
+def _norm_relpath(value: Any) -> str:
+    return str(value or "").replace("\\", "/").strip().strip("/")
+
+
+def _quote_attr(value: str) -> str:
+    escaped = str(value or "").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _comment_marker_for_path(source_path: str) -> str:
+    path = Path(str(source_path or ""))
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    if suffix in {".py", ".pyw", ".sh", ".bash", ".ps1", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".txt", ".rst", ".adoc"} or name in {"dockerfile", "makefile"}:
+        return "#"
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".css", ".scss"}:
+        return "//"
+    if suffix in {".md", ".mdx", ".html", ".htm"}:
+        return "<!--"
+    return ""
+
+
+def _comment_line(marker: str, text: str) -> str:
+    if marker == "<!--":
+        return f"<!-- {text} -->"
+    return f"{marker} {text}"

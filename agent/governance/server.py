@@ -5654,6 +5654,69 @@ def handle_graph_governance_snapshot_graph_structure_ops_dry_run(ctx: RequestCon
         conn.close()
 
 
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/graph-structure-ops/accept")
+def handle_graph_governance_snapshot_graph_structure_ops_accept(ctx: RequestContext):
+    """Accept validated graph-structure ops by writing source hint blocks."""
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .errors import ValidationError
+    from .graph_structure_hints import write_graph_structure_hints
+    from .graph_structure_ops import dry_run_graph_structure_ops
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.graph-structure-ops.accept")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id)
+        if not snapshot:
+            raise ValidationError(f"graph snapshot not found: {snapshot_id}")
+        root = _graph_governance_project_root(project_id, body)
+        graph, inventory = _snapshot_graph_and_inventory(store, project_id, snapshot_id)
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+        dry_run = dry_run_graph_structure_ops(
+            payload,
+            graph=graph,
+            inventory_paths=[str(row.get("path") or "") for row in inventory],
+            snapshot_id=snapshot_id,
+            base_commit=str(snapshot.get("commit_sha") or ""),
+        )
+        if not dry_run["ok"]:
+            return 422, {
+                "ok": False,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "commit_sha": snapshot.get("commit_sha", ""),
+                "dry_run": True,
+                "mutated": False,
+                "accepted": False,
+                **dry_run,
+            }
+        write_result = write_graph_structure_hints(
+            root,
+            dry_run["gate"]["normalized_hint_index"]["hints"],
+        )
+        status_code = 200 if write_result["ok"] else 422
+        return status_code, {
+            "ok": write_result["ok"],
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "commit_sha": snapshot.get("commit_sha", ""),
+            "project_root": str(root),
+            "dry_run": False,
+            "mutated": write_result["written_count"] > 0,
+            "accepted": write_result["ok"],
+            "requires_commit": write_result["written_count"] > 0,
+            "update_graph_after_commit": write_result["written_count"] > 0,
+            "gate": dry_run["gate"],
+            "projection": dry_run["projection"],
+            "write": write_result,
+        }
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/nodes")
 def handle_graph_governance_snapshot_nodes(ctx: RequestContext):
     """List indexed graph nodes for one snapshot."""
