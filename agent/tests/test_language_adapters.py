@@ -166,7 +166,14 @@ def test_graph_hooks_return_policy_metadata_and_safe_defaults():
     assert any(symbol["name"] == "run" and symbol["kind"] == "function" for symbol in symbols)
     imports = py.parse_imports("agent/service.py", "import os\nfrom agent.db import save\n")
     assert {"local": "os", "imported": "os", "kind": "import"} in imports
-    assert {"local": "save", "imported": "agent.db.save", "kind": "from_import"} in imports
+    assert {
+        "local": "save",
+        "imported": "agent.db.save",
+        "kind": "from_import",
+        "module": "agent.db",
+        "name": "save",
+        "level": 0,
+    } in imports
     assert py.extract_relations("agent/service.py", "def run():\n    pass\n") == []
 
     assert ft.language() == ""
@@ -179,6 +186,42 @@ def test_graph_hooks_return_policy_metadata_and_safe_defaults():
     assert ft.parse_symbols("web/src/App.tsx", "export function App() {}") == []
     assert ft.parse_imports("web/src/App.tsx", "import React from 'react'") == []
     assert ft.extract_relations("web/src/App.tsx", "") == []
+
+
+def test_python_adapter_preserves_relative_import_facts():
+    py = PythonAdapter()
+
+    imports = py.parse_imports(
+        "agent/governance/graph_events.py",
+        "from . import graph_snapshot_store as store\n"
+        "from .graph_snapshot_store import ensure_schema\n"
+        "from ..shared import helpers\n",
+    )
+
+    assert {
+        "local": "store",
+        "imported": "graph_snapshot_store",
+        "kind": "from_import",
+        "module": "",
+        "name": "graph_snapshot_store",
+        "level": 1,
+    } in imports
+    assert {
+        "local": "ensure_schema",
+        "imported": "graph_snapshot_store.ensure_schema",
+        "kind": "from_import",
+        "module": "graph_snapshot_store",
+        "name": "ensure_schema",
+        "level": 1,
+    } in imports
+    assert {
+        "local": "helpers",
+        "imported": "shared.helpers",
+        "kind": "from_import",
+        "module": "shared",
+        "name": "helpers",
+        "level": 2,
+    } in imports
 
 
 # ---------------------------------------------------------------------------

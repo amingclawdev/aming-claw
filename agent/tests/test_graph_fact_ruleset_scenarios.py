@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
@@ -57,13 +55,6 @@ def _edge_titles(candidate: dict) -> set[tuple[str, str, str]]:
     return out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Python relative imports are not yet normalized into standard import "
-        "facts before module dependency edge generation."
-    ),
-)
 def test_generated_project_relative_import_fact_drives_dependency_edge(tmp_path: Path) -> None:
     project = tmp_path / "generated-relative-import-project"
     _write(project / "agent" / "__init__.py", "")
@@ -89,13 +80,6 @@ def test_generated_project_relative_import_fact_drives_dependency_edge(tmp_path:
     ) in _edge_titles(candidate)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "pytest fixture usage is not yet represented as consumer-side facts "
-        "that fan in through conftest imports to the tested module."
-    ),
-)
 def test_generated_project_pytest_fixture_consumer_fanin_attaches_test_to_subject(tmp_path: Path) -> None:
     project = tmp_path / "generated-pytest-fixture-fanin-project"
     _write(project / "agent" / "__init__.py", "")
@@ -130,13 +114,6 @@ def test_generated_project_pytest_fixture_consumer_fanin_attaches_test_to_subjec
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Ruleset/config changes are currently metadata-only eligible; rule-aware "
-        "reconcile must classify them as interpretation changes instead."
-    ),
-)
 def test_ruleset_change_is_not_metadata_only_scope_incremental() -> None:
     scope_delta = {
         "impacted_files": ["aming_claw/graph_rules/python.yml"],

@@ -128,8 +128,25 @@ class CycleDecision:
 class _ImportExtractor(ast.NodeVisitor):
     """Extract import map from a module AST."""
 
-    def __init__(self) -> None:
+    def __init__(self, module_name: str = "") -> None:
+        self.module_name = module_name
         self.import_map: Dict[str, str] = {}
+
+    def _resolve_from_import(self, node: ast.ImportFrom, alias_name: str) -> str:
+        module = node.module or ""
+        if int(getattr(node, "level", 0) or 0) <= 0:
+            return f"{module}.{alias_name}" if module else alias_name
+        package_parts = self.module_name.split(".")[:-1]
+        levels_up = int(node.level) - 1
+        if levels_up > 0:
+            package_parts = package_parts[:-levels_up] if levels_up < len(package_parts) else []
+        parts = [part for part in package_parts if part]
+        if module:
+            parts.extend(part for part in module.split(".") if part)
+            parts.append(alias_name)
+        else:
+            parts.append(alias_name)
+        return ".".join(parts)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -138,11 +155,9 @@ class _ImportExtractor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        module = node.module or ""
         for alias in node.names:
             local = alias.asname or alias.name
-            fqn = f"{module}.{alias.name}" if module else alias.name
-            self.import_map[local] = fqn
+            self.import_map[local] = self._resolve_from_import(node, alias.name)
         self.generic_visit(node)
 
 
@@ -262,7 +277,7 @@ def _parse_python_module(fpath: str, mod_name: str, source: str) -> Optional[Mod
     except (SyntaxError, ValueError):
         return None
 
-    imp_ext = _ImportExtractor()
+    imp_ext = _ImportExtractor(mod_name)
     imp_ext.visit(tree)
 
     func_ext = _FunctionExtractor(mod_name, imp_ext.import_map)
@@ -416,10 +431,36 @@ def _adapter_import_map(
         specifier = str(row.get("specifier") or row.get("imported") or "").strip()
         if not specifier:
             continue
-        imported = _resolve_source_import(project_root, source_file, specifier)
+        imported = _resolve_adapter_import_row(project_root, source_file, row, specifier)
         local = str(row.get("local") or specifier).strip() or specifier
         import_map[local] = imported
     return import_map
+
+
+def _resolve_adapter_import_row(
+    project_root: str,
+    source_file: str,
+    row: Dict[str, Any],
+    specifier: str,
+) -> str:
+    level = int(row.get("level") or 0)
+    if level <= 0:
+        return _resolve_source_import(project_root, source_file, specifier)
+    source_module = _path_to_module(source_file, project_root)
+    package_parts = source_module.split(".")[:-1]
+    levels_up = level - 1
+    if levels_up > 0:
+        package_parts = package_parts[:-levels_up] if levels_up < len(package_parts) else []
+    module = str(row.get("module") or "").strip(".")
+    name = str(row.get("name") or "").strip(".")
+    parts = [part for part in package_parts if part]
+    if module:
+        parts.extend(part for part in module.split(".") if part)
+        if name:
+            parts.append(name)
+    elif name:
+        parts.append(name)
+    return ".".join(parts) or specifier
 
 
 def _resolve_source_import(project_root: str, source_file: str, specifier: str) -> str:
@@ -1412,11 +1453,91 @@ def _test_import_tokens(project_root: str, test_file: str, source: str) -> Set[s
         imported = str(row.get("imported") or "").strip()
         specifier = str(row.get("specifier") or "").strip()
         if imported:
-            tokens.add(imported)
+            tokens.add(_resolve_adapter_import_row(project_root, test_file, row, imported))
         if specifier:
             tokens.add(specifier)
             tokens.add(_resolve_source_import(project_root, test_file, specifier))
     return {token for token in tokens if token}
+
+
+def _pytest_fixture_names(source: str, file_path: str = "<test>") -> Set[str]:
+    try:
+        tree = ast.parse(source or "", filename=file_path)
+    except (SyntaxError, ValueError):
+        return set()
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in getattr(node, "decorator_list", []) or []:
+            dec_name = _decorator_name(decorator)
+            if dec_name in {"pytest.fixture", "fixture"} or dec_name.endswith(".fixture"):
+                names.add(node.name)
+                break
+    return names
+
+
+def _decorator_name(dec: Any) -> str:
+    if isinstance(dec, ast.Name):
+        return dec.id
+    if isinstance(dec, ast.Attribute):
+        parent = _decorator_name(dec.value)
+        return f"{parent}.{dec.attr}" if parent else dec.attr
+    if isinstance(dec, ast.Call):
+        return _decorator_name(dec.func)
+    return ""
+
+
+def _pytest_test_fixture_args(source: str, file_path: str = "<test>") -> Set[str]:
+    try:
+        tree = ast.parse(source or "", filename=file_path)
+    except (SyntaxError, ValueError):
+        return set()
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        for arg in getattr(node.args, "args", []) or []:
+            if arg.arg not in {"self", "cls"}:
+                names.add(arg.arg)
+    return names
+
+
+def _pytest_fixture_fanin_index(
+    project_root: str,
+    profile: Any,
+    alias_to_modules: Dict[str, Set[str]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    fixtures: Dict[str, List[Dict[str, Any]]] = {}
+    for rel, fpath in _iter_test_source_files(project_root, profile):
+        if os.path.basename(rel) != "conftest.py":
+            continue
+        try:
+            source = _read_file(fpath)
+        except (UnicodeDecodeError, OSError):
+            continue
+        fixture_names = _pytest_fixture_names(source, fpath)
+        if not fixture_names:
+            continue
+        module_hits: Dict[str, Set[str]] = {}
+        for token in _test_import_tokens(project_root, fpath, source):
+            module_name = _resolve_import_token_to_unique_module(token, alias_to_modules)
+            if module_name:
+                module_hits.setdefault(module_name, set()).add(token)
+        if not module_hits:
+            continue
+        for fixture_name in sorted(fixture_names):
+            for module_name, tokens in sorted(module_hits.items()):
+                fixtures.setdefault(fixture_name, []).append({
+                    "module_name": module_name,
+                    "fixture": fixture_name,
+                    "fixture_path": fpath,
+                    "fixture_rel_path": rel,
+                    "imports": sorted(tokens),
+                })
+    return fixtures
 
 
 def build_test_consumer_fanin_index(
@@ -1431,6 +1552,7 @@ def build_test_consumer_fanin_index(
     alias_to_modules = _production_module_alias_index(project_root, modules, profile)
     if not alias_to_modules:
         return {}
+    fixture_index = _pytest_fixture_fanin_index(project_root, profile, alias_to_modules)
 
     index: Dict[str, List[Dict[str, Any]]] = {}
     for rel, fpath in _iter_test_source_files(project_root, profile):
@@ -1451,6 +1573,22 @@ def build_test_consumer_fanin_index(
                 "imports": sorted(tokens),
                 "covered_lines": source.count("\n"),
             })
+        for fixture_name in sorted(_pytest_test_fixture_args(source, fpath)):
+            for fixture_hit in fixture_index.get(fixture_name) or []:
+                module_name = str(fixture_hit.get("module_name") or "")
+                if not module_name:
+                    continue
+                imports = list(fixture_hit.get("imports") or [])
+                imports.append(f"pytest_fixture:{fixture_name}")
+                index.setdefault(module_name, []).append({
+                    "path": fpath,
+                    "rel_path": rel,
+                    "evidence": "pytest_fixture_consumer_fanin",
+                    "imports": sorted(set(imports)),
+                    "covered_lines": source.count("\n"),
+                    "fixture": fixture_name,
+                    "fixture_path": fixture_hit.get("fixture_rel_path") or fixture_hit.get("fixture_path"),
+                })
     for entries in index.values():
         entries.sort(key=lambda item: str(item.get("rel_path") or item.get("path") or ""))
     return index

@@ -564,6 +564,19 @@ def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 _INCREMENTAL_METADATA_FILE_KINDS = {"config", "doc", "index_doc"}
+_RULESET_SCOPE_MARKERS = {
+    "graph_fact_interpretation",
+    "graph_relation_rules",
+    "graph_ruleset",
+    "ruleset",
+}
+_RULESET_PATH_MARKERS = (
+    "/graph_rules/",
+    "/rulesets/",
+    "/relation_rules/",
+    "config/graph_rules/",
+    "config/reconcile/rules/",
+)
 
 
 def _norm_repo_path(path: Any) -> str:
@@ -583,6 +596,23 @@ def _node_for_primary_path(graph_json: dict[str, Any], path: str) -> dict[str, A
         if norm in set(_path_values(node, "primary"))
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def _is_ruleset_interpretation_row(row: dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    scope = str(row.get("ruleset_scope") or row.get("interpretation_scope") or "").strip()
+    if scope in _RULESET_SCOPE_MARKERS:
+        return True
+    role = str(row.get("config_role") or row.get("rule_role") or "").strip()
+    return role in _RULESET_SCOPE_MARKERS
+
+
+def _looks_like_ruleset_path(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    return any(marker.strip("/") in normalized for marker in _RULESET_PATH_MARKERS)
 
 
 def _module_function_signature(module: Any) -> list[dict[str, Any]]:
@@ -769,6 +799,20 @@ def _incremental_metadata_scope_eligibility(
     }
     if not impacted:
         return {"supported": False, "reason": "no_impacted_files"}
+
+    ruleset_paths = sorted(
+        path for path in impacted
+        if _is_ruleset_interpretation_row(old_by_path.get(path) or {})
+        or _is_ruleset_interpretation_row(new_by_path.get(path) or {})
+        or _looks_like_ruleset_path(path)
+    )
+    if ruleset_paths:
+        return {
+            "supported": False,
+            "reason": "ruleset_change_requires_rule_aware_reconcile",
+            "rule_aware": True,
+            "ruleset_paths": ruleset_paths,
+        }
 
     def _is_non_primary_test(path: str) -> bool:
         old_row = old_by_path.get(path) or {}

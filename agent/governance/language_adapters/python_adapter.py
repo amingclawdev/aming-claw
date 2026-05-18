@@ -191,6 +191,9 @@ class PythonAdapter:
                         "local": alias.asname or alias.name,
                         "imported": imported,
                         "kind": "from_import",
+                        "module": module,
+                        "name": alias.name,
+                        "level": int(getattr(node, "level", 0) or 0),
                     })
         return imports
 
