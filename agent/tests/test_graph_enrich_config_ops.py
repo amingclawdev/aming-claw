@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,12 @@ from agent.governance.graph_enrich_config_ops import (
 from agent.governance.reconcile_semantic_config import (
     PROJECT_OVERRIDE_PATH,
     load_semantic_enrichment_config,
+)
+from agent.tests.fixtures.semantic_project_config_scenarios import (
+    core_semantic_config_texts,
+    create_external_semantic_project,
+    project_local_policy_payload,
+    register_function_payload,
 )
 
 
@@ -335,6 +342,49 @@ def test_graph_enrich_config_ops_accept_writes_project_override_and_loader_reads
         "downgrade_to": "imports",
         "require_call_evidence": True,
     }
+
+
+def test_graph_enrich_config_accept_isolates_external_project_override_from_core_repo(
+    tmp_path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    core_before = core_semantic_config_texts(repo_root)
+    scenario = create_external_semantic_project(tmp_path / "user-project")
+
+    result = run_graph_enrich_config_ai_output_pipeline(
+        raw_output=json.dumps(project_local_policy_payload()),
+        mode="accept",
+        project_root=scenario.root,
+    )
+
+    assert result["ok"] is True
+    assert result["accepted"] is True
+    assert result["mutated"] is True
+    assert result["write"]["config_path"] == str(scenario.override_path)
+    assert scenario.override_path.exists()
+    assert "import_only_action: downgrade" in scenario.override_path.read_text(encoding="utf-8")
+    assert core_semantic_config_texts(repo_root) == core_before
+
+
+def test_graph_enrich_config_rejects_register_function_payload_without_mutation(
+    tmp_path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    core_before = core_semantic_config_texts(repo_root)
+    scenario = create_external_semantic_project(tmp_path / "user-project")
+
+    result = run_graph_enrich_config_ai_output_pipeline(
+        raw_output=json.dumps(register_function_payload()),
+        mode="accept",
+        project_root=scenario.root,
+    )
+
+    assert result["ok"] is False
+    assert result["accepted"] is False
+    assert result["mutated"] is False
+    assert result["gate"]["operations"][0]["errors"] == ["unsupported_config_op"]
+    assert not scenario.override_path.exists()
+    assert core_semantic_config_texts(repo_root) == core_before
 
 
 def test_graph_enrich_config_rule_ops_dry_run_previews_project_override(tmp_path):

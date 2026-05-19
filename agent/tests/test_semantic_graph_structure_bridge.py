@@ -16,6 +16,10 @@ from agent.governance import state_reconcile
 from agent.governance.db import _ensure_schema
 from agent.governance.reconcile_semantic_config import PROJECT_OVERRIDE_PATH
 from agent.governance.state_reconcile import run_state_only_full_reconcile
+from agent.tests.fixtures.semantic_project_config_scenarios import (
+    create_external_semantic_project,
+    register_function_semantic_payload,
+)
 
 
 PID = "semantic-graph-structure-bridge-test"
@@ -1428,6 +1432,47 @@ def test_semantic_worker_drains_graph_enrich_config_accept_job_generated_project
     override_path = project / PROJECT_OVERRIDE_PATH
     assert override_path.exists()
     assert "import_only_action: downgrade" in override_path.read_text(encoding="utf-8")
+
+
+def test_bridge_audits_register_function_proposal_without_project_config_mutation(
+    conn,
+    tmp_path,
+):
+    scenario = create_external_semantic_project(tmp_path / "user-project")
+    snapshot_id = _create_snapshot(conn, scenario.root, "semantic-bridge-register-function")
+    service_id = _node_id_for_primary(snapshot_id, "agent/service.py")
+    event = _semantic_event(
+        conn,
+        snapshot_id,
+        service_id,
+        register_function_semantic_payload(),
+        event_id="sem-bridge-register-function",
+    )
+
+    result = bridge.bridge_semantic_events_to_graph_enrich_config_jobs(
+        conn,
+        PID,
+        snapshot_id,
+        event_ids=[event["event_id"]],
+        actor="test",
+        project_root=str(scenario.root),
+    )
+    conn.commit()
+
+    assert result["ok"] is True
+    assert result["queued_count"] == 0
+    assert result["audit_event_count"] == 1
+    assert result["skipped_count"] == 1
+    assert not scenario.override_path.exists()
+    skip = result["skipped"][0]
+    assert skip["reason"] == "unsupported_config_op"
+    assert skip["suggestion"]["op"] == "register_function"
+    assert skip["suggestion"]["proposal_scope"] == "upstream"
+    audit = result["events"][0]
+    assert audit["event_type"] == "graph_enrich_config_completed"
+    assert audit["payload"]["result"]["status"] == "skipped"
+    assert audit["payload"]["result"]["accepted"] is False
+    assert audit["payload"]["result"]["mutated"] is False
 
 
 def test_semantic_enrichment_persists_graph_enrich_config_suggestions_for_bridge(
