@@ -48,6 +48,8 @@ SEMANTIC_JOB_TERMINAL_STATUSES = {
     "rejected",
     "rule_complete",
 }
+SEMANTIC_JOB_PENDING_STATUSES = {"ai_pending", "pending_ai"}
+SEMANTIC_JOB_ACTIVE_STATUSES = {"running"}
 
 SEMANTIC_STATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS graph_semantic_nodes (
@@ -1613,7 +1615,11 @@ def _persist_semantic_state_to_db(
             bool(existing_claim_id)
             and existing_status == "running"
             and not raw_claim_id
-            and raw_status in {"running", "ai_complete", "ai_failed"}
+            and raw_status in (
+                SEMANTIC_JOB_PENDING_STATUSES
+                | SEMANTIC_JOB_ACTIVE_STATUSES
+                | {"ai_complete", "ai_failed"}
+            )
         )
         attempt_count = int(raw_job.get("attempt_count") or 0)
         worker_id = str(raw_job.get("worker_id") or "")
@@ -1623,7 +1629,8 @@ def _persist_semantic_state_to_db(
         claimed_by = str(raw_job.get("claimed_by") or "")
         if preserve_existing_claim_attempt:
             attempt_count = int(existing_job["attempt_count"] or 0)
-            if raw_status == "running":
+            if raw_status in SEMANTIC_JOB_PENDING_STATUSES | SEMANTIC_JOB_ACTIVE_STATUSES:
+                raw_status = existing_status
                 worker_id = str(existing_job["worker_id"] or "")
                 claim_id = existing_claim_id
                 claimed_at = str(existing_job["claimed_at"] or "")
@@ -1724,6 +1731,8 @@ def _upsert_semantic_job(
     existing_status = str(existing.get("status") or "")
     existing_claim_id = str(existing.get("claim_id") or "")
     existing_attempt_count = int(existing.get("attempt_count") or 0)
+    if status in SEMANTIC_JOB_PENDING_STATUSES and existing_status == "running":
+        status = existing_status
     already_running_job = (
         bool(increment_attempt)
         and status == "running"
