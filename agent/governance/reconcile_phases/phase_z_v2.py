@@ -17,7 +17,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from agent.governance.language_adapters import (
     FileTreeAdapter,
@@ -658,7 +658,11 @@ def _read_file(path: str) -> str:
 # R2: Import-aware call graph construction
 # ---------------------------------------------------------------------------
 
-def build_call_graph(modules: Dict[str, ModuleInfo]) -> CallGraph:
+def build_call_graph(
+    modules: Dict[str, ModuleInfo],
+    *,
+    call_resolution_rules: Optional[Mapping[str, str]] = None,
+) -> CallGraph:
     """Build a call graph with import-aware resolution.
 
     For each call in each function:
@@ -710,6 +714,7 @@ def build_call_graph(modules: Dict[str, ModuleInfo]) -> CallGraph:
                     module_local_funcs=module_local_funcs,
                     caller_language=str(mod_info.language or ""),
                     function_languages=function_languages,
+                    call_resolution_rules=call_resolution_rules,
                 )
 
                 if resolved is None:
@@ -744,6 +749,7 @@ def _resolve_call(
     module_local_funcs: Dict[str, Dict[str, str]],
     caller_language: str = "",
     function_languages: Optional[Dict[str, str]] = None,
+    call_resolution_rules: Optional[Mapping[str, str]] = None,
 ) -> Optional[str | List[str]]:
     """Resolve a call target to a qualified function name.
 
@@ -778,13 +784,18 @@ def _resolve_call(
         if resolved is not None:
             return resolved
 
-    # 3. JS/TS has common lexical closures and hook setters whose short names
-    # are intentionally local. Without import evidence, do not cross module
-    # boundaries by short name for these languages.
+    # 3. Language policy decides whether unqualified short names may use the
+    # cross-module fallback. JS/TS defaults to import evidence only; Python and
+    # legacy adapters keep the same-namespace fallback.
     if (
         "." not in call_target
         and call_target not in import_map
-        and _requires_import_for_cross_module_short_name(caller_language)
+        and not _allow_cross_module_short_name_fallback(
+            caller_language,
+            call_target=call_target,
+            import_map=import_map,
+            call_resolution_rules=call_resolution_rules,
+        )
     ):
         return None
 
@@ -814,12 +825,54 @@ def _resolve_call(
     return None
 
 
-def _requires_import_for_cross_module_short_name(language: str) -> bool:
-    return str(language or "").lower() in {
-        "javascript",
-        "typescript",
-        "javascript_typescript",
-    }
+ShortNameCrossModulePolicy = Callable[[Dict[str, Any]], bool]
+_SHORT_NAME_CROSS_MODULE_POLICY_HANDLERS: Dict[str, ShortNameCrossModulePolicy] = {}
+
+
+def register_short_name_cross_module_policy(
+    name: str,
+) -> Callable[[ShortNameCrossModulePolicy], ShortNameCrossModulePolicy]:
+    key = str(name or "").lower().strip()
+    if not key:
+        raise ValueError("short-name cross-module policy name is required")
+
+    def decorator(fn: ShortNameCrossModulePolicy) -> ShortNameCrossModulePolicy:
+        _SHORT_NAME_CROSS_MODULE_POLICY_HANDLERS[key] = fn
+        return fn
+
+    return decorator
+
+
+@register_short_name_cross_module_policy("same_namespace_fallback")
+def _short_name_policy_same_namespace_fallback(context: Dict[str, Any]) -> bool:
+    return True
+
+
+@register_short_name_cross_module_policy("import_required")
+def _short_name_policy_import_required(context: Dict[str, Any]) -> bool:
+    return False
+
+
+def _allow_cross_module_short_name_fallback(
+    language: str,
+    *,
+    call_target: str,
+    import_map: Dict[str, str],
+    call_resolution_rules: Optional[Mapping[str, str]] = None,
+) -> bool:
+    policy = DEFAULT_LANGUAGE_POLICY.short_name_cross_module_policy(
+        language,
+        overrides=call_resolution_rules,
+    )
+    handler = _SHORT_NAME_CROSS_MODULE_POLICY_HANDLERS.get(policy)
+    if handler is None:
+        handler = _SHORT_NAME_CROSS_MODULE_POLICY_HANDLERS["same_namespace_fallback"]
+    return bool(handler({
+        "language": language,
+        "call_target": call_target,
+        "import_map": import_map,
+        "policy": policy,
+    }))
 
 
 def _top_level_namespace(module_name: str) -> str:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 def _lowered(values: Iterable[str]) -> frozenset[str]:
@@ -80,6 +80,12 @@ class LanguagePolicy:
         ".rst": "text",
         ".txt": "text",
         ".adoc": "text",
+    })
+    call_resolution_short_name_policies: dict[str, str] = field(default_factory=lambda: {
+        "*": "same_namespace_fallback",
+        "javascript": "import_required",
+        "javascript_typescript": "import_required",
+        "typescript": "import_required",
     })
     config_filenames: frozenset[str] = frozenset({
         ".env", ".env.example", "Dockerfile", "Makefile", "Pipfile",
@@ -206,6 +212,25 @@ class LanguagePolicy:
         if kind in {"doc", "index_doc"}:
             return "text"
         return ""
+
+    def short_name_cross_module_policy(
+        self,
+        language: str,
+        overrides: Mapping[str, str] | None = None,
+    ) -> str:
+        """Return the registered policy for unqualified cross-module calls."""
+        rules = {
+            str(key or "").lower().strip(): str(value or "").lower().strip()
+            for key, value in self.call_resolution_short_name_policies.items()
+            if str(key or "").strip()
+        }
+        for key, value in (overrides or {}).items():
+            norm_key = str(key or "").lower().strip()
+            norm_value = str(value or "").lower().strip()
+            if norm_key and norm_value:
+                rules[norm_key] = norm_value
+        normalized = str(language or "").lower().strip()
+        return rules.get(normalized) or rules.get("*", "same_namespace_fallback")
 
     def is_generated_path(self, rel_path: str) -> bool:
         rel = str(rel_path or "").replace("\\", "/").strip("/")

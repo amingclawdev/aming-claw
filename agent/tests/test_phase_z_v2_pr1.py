@@ -25,6 +25,7 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     enrich_nodes_with_function_call_facts,
     handle_cycle,
     parse_production_modules,
+    register_short_name_cross_module_policy,
     tarjan_scc,
 )
 
@@ -250,7 +251,7 @@ class TestBuildCallGraph:
         assert graph.weak_edges == []
 
     def test_build_call_graph_does_not_cross_module_js_ts_local_closures(self):
-        """TS/JS short-name fallback must not bind local closures across modules."""
+        """TS/JS short-name fallback policy is registry/config driven."""
         modules = _make_modules({
             "frontend.dashboard.src.components.InspectorDrawer": {
                 "language": "typescript",
@@ -297,6 +298,25 @@ class TestBuildCallGraph:
         )
         assert graph.weak_edges == []
 
+        permissive_graph = build_call_graph(
+            modules,
+            call_resolution_rules={"typescript": "same_namespace_fallback"},
+        )
+        assert (
+            "frontend.dashboard.src.components.InspectorDrawer::setTab"
+            in permissive_graph.edges.get(
+                "frontend.dashboard.src.components.ActionPanel::ActionPanel",
+                [],
+            )
+        )
+        assert (
+            "frontend.dashboard.src.components.InspectorDrawer::score"
+            in permissive_graph.edges.get(
+                "frontend.dashboard.src.components.FocusCard::NodeFocusCard",
+                [],
+            )
+        )
+
     def test_build_call_graph_import_resolved(self):
         """Import map resolves call to correct target — not naive match."""
         modules = _make_modules({
@@ -326,6 +346,37 @@ class TestBuildCallGraph:
         assert len(graph.weak_edges) == 0
         assert "mod_a::helper" in graph.edges.get("mod_caller::work", [])
         assert "mod_b::helper" not in graph.edges.get("mod_caller::work", [])
+
+    def test_build_call_graph_uses_registered_short_name_policy(self):
+        """Call resolution rules can use newly registered policy handlers."""
+
+        @register_short_name_cross_module_policy("test_no_cross_module_short_names")
+        def _deny_cross_module_short_names(context):
+            return False
+
+        modules = _make_modules({
+            "pkg.helpers": {
+                "language": "python",
+                "functions": [
+                    {"name": "helper", "calls": []},
+                ],
+            },
+            "pkg.worker": {
+                "language": "python",
+                "functions": [
+                    {"name": "run", "calls": ["helper"]},
+                ],
+            },
+        })
+
+        default_graph = build_call_graph(modules)
+        configured_graph = build_call_graph(
+            modules,
+            call_resolution_rules={"python": "test_no_cross_module_short_names"},
+        )
+
+        assert "pkg.helpers::helper" in default_graph.edges.get("pkg.worker::run", [])
+        assert configured_graph.edges.get("pkg.worker::run") == []
 
     def test_build_function_call_facts_persists_callers_and_callees(self):
         """MVP graph metadata can carry function-level call evidence."""
