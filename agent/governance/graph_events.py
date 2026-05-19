@@ -110,6 +110,15 @@ ALLOWED_EVENT_STATUSES = {
     EVENT_STATUS_OBSERVED,
 }
 
+BACKFILL_PRESERVED_EVENT_STATUSES = {
+    EVENT_STATUS_ACCEPTED,
+    EVENT_STATUS_REJECTED,
+    EVENT_STATUS_STALE,
+    EVENT_STATUS_FAILED,
+    EVENT_STATUS_MATERIALIZED,
+    EVENT_STATUS_BACKLOG_FILED,
+}
+
 ALLOWED_EVENT_TYPES = {
     "file_hash_changed",
     "node_added",
@@ -707,6 +716,12 @@ def _row_to_event(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     item["evidence"] = _json_load(item.pop("evidence_json", "{}"), {})
     item["ai_review"] = _json_load(item.pop("ai_review_json", "{}"), {})
     return item
+
+
+def _backfill_event_status(existing: dict[str, Any] | None, derived_status: str) -> str:
+    if existing and str(existing.get("status") or "") in BACKFILL_PRESERVED_EVENT_STATUSES:
+        return str(existing.get("status") or "")
+    return derived_status
 
 
 def create_event(
@@ -1730,6 +1745,7 @@ def backfill_existing_semantic_events(
                 str(row["feature_hash"] or "")[:12],
             )
             existed = get_event(conn, project_id, snapshot_id, event_id)
+            event_status = _backfill_event_status(existed, event_status)
             source_snapshot_id = str(_row_get(row, "source_snapshot_id") or "")
             if not source_snapshot_id and isinstance(semantic_payload, dict):
                 source_snapshot_id = str(semantic_payload.get("carried_forward_from_snapshot_id") or "")
@@ -1877,6 +1893,7 @@ def backfill_existing_semantic_events(
                 str(row["edge_signature_hash"] or "")[:12],
             )
             existed = get_event(conn, project_id, snapshot_id, event_id)
+            event_status = _backfill_event_status(existed, event_status)
             edge_struct = edges_by_id.get(edge_id, {})
             source_snapshot_id = str(_row_get(row, "source_snapshot_id") or "")
             if not source_snapshot_id and isinstance(semantic_entry, dict):

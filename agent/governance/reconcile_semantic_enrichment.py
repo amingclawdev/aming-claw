@@ -1323,15 +1323,18 @@ def _persist_semantic_state_to_db(
     state: dict[str, Any],
     *,
     submit_for_review: bool = False,
+    review_node_ids: set[str] | None = None,
+    review_edge_ids: set[str] | None = None,
 ) -> None:
     """Persist node_semantics + semantic_jobs into the per-snapshot tables.
 
-    MF-2026-05-10-016: when `submit_for_review` is True, force the
-    graph_semantic_nodes status to `pending_review` regardless of the
-    record's own status. `backfill_existing_semantic_events` then maps
-    `pending_review` to `EVENT_STATUS_PROPOSED`, keeping the projection
-    blind until an operator explicitly accepts via
-    `accept_semantic_enrichment` decision.
+    MF-2026-05-10-016: when `submit_for_review` is True, force freshly
+    enriched graph_semantic_nodes rows to `pending_review` regardless of the
+    record's own status. `review_node_ids`/`review_edge_ids` scope that
+    override for selected-node worker runs so accepted rows loaded from the
+    existing semantic state are not downgraded by a later batch. Passing None
+    preserves the legacy direct-call behavior: all non-carried-forward rows
+    are submitted for review.
     """
     _ensure_semantic_state_schema(conn)
     node_semantics = state.get("node_semantics") if isinstance(state.get("node_semantics"), dict) else {}
@@ -1345,7 +1348,12 @@ def _persist_semantic_state_to_db(
         # snapshot and don't need re-review just because the worker happened
         # to call run_semantic_enrichment.
         is_carried_forward = bool(raw_entry.get("carried_forward_from_snapshot_id"))
-        if submit_for_review and not is_carried_forward:
+        should_submit_node = (
+            submit_for_review
+            and not is_carried_forward
+            and (review_node_ids is None or str(node_id) in review_node_ids)
+        )
+        if should_submit_node:
             row_status = "pending_review"
         else:
             row_status = str(raw_entry.get("status") or "")
@@ -1403,7 +1411,12 @@ def _persist_semantic_state_to_db(
         if not isinstance(raw_entry, dict):
             continue
         is_carried_forward = bool(raw_entry.get("carried_forward_from_snapshot_id"))
-        if submit_for_review and not is_carried_forward:
+        should_submit_edge = (
+            submit_for_review
+            and not is_carried_forward
+            and (review_edge_ids is None or str(edge_id) in review_edge_ids)
+        )
+        if should_submit_edge:
             edge_row_status = "pending_review"
         else:
             edge_row_status = str(raw_entry.get("status") or "")
@@ -2531,6 +2544,8 @@ def _write_semantic_graph_state_artifacts(
     round_number: int,
     feature_index: dict[str, dict[str, Any]] | None = None,
     submit_for_review: bool = False,
+    review_node_ids: set[str] | None = None,
+    review_edge_ids: set[str] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     base = _semantic_base_dir(project_id, snapshot_id)
     rdir = _round_dir(project_id, snapshot_id, round_number)
@@ -2542,6 +2557,8 @@ def _write_semantic_graph_state_artifacts(
         _persist_semantic_state_to_db(
             conn, project_id, snapshot_id, state,
             submit_for_review=submit_for_review,
+            review_node_ids=review_node_ids,
+            review_edge_ids=review_edge_ids,
         )
         _commit_semantic_write(conn)
     semantic_graph = _materialize_semantic_graph(
@@ -2951,6 +2968,8 @@ def run_semantic_enrichment(
         str(record["feature"].get("node_id") or "")
         for record in allowed_records
     }
+    review_node_ids: set[str] = set()
+    review_edge_ids: set[str] = set()
     # MF-2026-05-10-015: load the base projection's current-node set so
     # we don't spuriously re-enqueue phantom-current carried_forward nodes.
     projection_current_ids = _projection_current_node_ids(
@@ -3022,6 +3041,8 @@ def run_semantic_enrichment(
                 round_number=round_number,
                 feature_index=feature_index,
                 submit_for_review=submit_for_review,
+                review_node_ids=review_node_ids,
+                review_edge_ids=review_edge_ids,
             )
         if ai_batch_size <= 1:
             for record in allowed_records:
@@ -3074,6 +3095,9 @@ def run_semantic_enrichment(
                         semantic_state,
                         round_number=round_number,
                         feature_index=feature_index,
+                        submit_for_review=submit_for_review,
+                        review_node_ids=review_node_ids,
+                        review_edge_ids=review_edge_ids,
                     )
                 response = _call_ai(
                     ai_call,
@@ -3117,6 +3141,7 @@ def run_semantic_enrichment(
                         batch_index=None,
                         updated_at=utc_now(),
                     )
+                    review_node_ids.add(node_id)
                 if memory_enabled and response is not None and not response.get("_ai_error"):
                     updated_batch, update_error = _record_semantic_memory_decision(
                         conn,
@@ -3140,6 +3165,9 @@ def run_semantic_enrichment(
                         semantic_state,
                         round_number=round_number,
                         feature_index=feature_index,
+                        submit_for_review=submit_for_review,
+                        review_node_ids=review_node_ids,
+                        review_edge_ids=review_edge_ids,
                     )
         else:
             for batch_index, batch in enumerate(
@@ -3238,6 +3266,9 @@ def run_semantic_enrichment(
                         semantic_state,
                         round_number=round_number,
                         feature_index=feature_index,
+                        submit_for_review=submit_for_review,
+                        review_node_ids=review_node_ids,
+                        review_edge_ids=review_edge_ids,
                     )
                 batch_response = _call_ai(
                     ai_call,
@@ -3306,6 +3337,7 @@ def run_semantic_enrichment(
                             batch_index=batch_index,
                             updated_at=utc_now(),
                         )
+                        review_node_ids.add(node_id)
                     if not (memory_enabled and response is not None and not response.get("_ai_error")):
                         continue
                     updated_batch, update_error = _record_semantic_memory_decision(
@@ -3330,6 +3362,9 @@ def run_semantic_enrichment(
                         semantic_state,
                         round_number=round_number,
                         feature_index=feature_index,
+                        submit_for_review=submit_for_review,
+                        review_node_ids=review_node_ids,
+                        review_edge_ids=review_edge_ids,
                     )
 
     for record in records:
@@ -3464,6 +3499,8 @@ def run_semantic_enrichment(
             round_number=round_number,
             feature_index=feature_index,
             submit_for_review=submit_for_review,
+            review_node_ids=review_node_ids,
+            review_edge_ids=review_edge_ids,
         )
         semantic_graph_state_report.update({
             "state_path": str(latest_state_path),

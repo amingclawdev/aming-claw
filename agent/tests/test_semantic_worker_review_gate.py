@@ -60,17 +60,20 @@ def conn(tmp_path, monkeypatch):
     c.close()
 
 
-def _create_snapshot_with_node(conn, snapshot_id: str, node_id: str = "L7.1") -> dict:
-    nodes = [{
-        "id": node_id,
-        "layer": "L7",
-        "title": f"Feature {node_id}",
-        "kind": "service_runtime",
-        "primary": [f"agent/governance/{node_id.replace('.', '_')}.py"],
-        "secondary": [],
-        "test": [],
-        "metadata": {"subsystem": "governance"},
-    }]
+def _create_snapshot_with_nodes(conn, snapshot_id: str, node_ids: list[str]) -> dict:
+    nodes = [
+        {
+            "id": node_id,
+            "layer": "L7",
+            "title": f"Feature {node_id}",
+            "kind": "service_runtime",
+            "primary": [f"agent/governance/{node_id.replace('.', '_')}.py"],
+            "secondary": [],
+            "test": [],
+            "metadata": {"subsystem": "governance"},
+        }
+        for node_id in node_ids
+    ]
     snap = store.create_graph_snapshot(
         conn, PID, snapshot_id=snapshot_id, commit_sha="head",
         snapshot_kind="scope",
@@ -78,6 +81,10 @@ def _create_snapshot_with_node(conn, snapshot_id: str, node_id: str = "L7.1") ->
     )
     store.index_graph_snapshot(conn, PID, snap["snapshot_id"], nodes=nodes, edges=[])
     return snap
+
+
+def _create_snapshot_with_node(conn, snapshot_id: str, node_id: str = "L7.1") -> dict:
+    return _create_snapshot_with_nodes(conn, snapshot_id, [node_id])
 
 
 def test_a_persist_submit_for_review_writes_pending_review_status(conn):
@@ -215,6 +222,112 @@ def test_a2_submit_for_review_skips_carried_forward_rows(conn):
     )
 
 
+def test_a3_submit_for_review_scopes_to_current_run_node_ids(conn):
+    """A3: selected-node worker runs must not resubmit older accepted memory."""
+    snap = _create_snapshot_with_nodes(conn, "review-node-scope", ["L7.1", "L7.2"])
+    sid = snap["snapshot_id"]
+    semantic._persist_semantic_state_to_db(
+        conn,
+        PID,
+        sid,
+        {
+            "node_semantics": {
+                "L7.1": {
+                    "status": "ai_complete",
+                    "feature_hash": "sha256:old",
+                    "semantic_summary": "already accepted",
+                },
+                "L7.2": {
+                    "status": "ai_complete",
+                    "feature_hash": "sha256:new",
+                    "semantic_summary": "new proposal",
+                },
+            }
+        },
+        submit_for_review=True,
+        review_node_ids={"L7.2"},
+    )
+    conn.commit()
+
+    rows = {
+        row["node_id"]: row["status"]
+        for row in conn.execute(
+            """
+            SELECT node_id, status
+            FROM graph_semantic_nodes
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (PID, sid),
+        ).fetchall()
+    }
+    assert rows == {"L7.1": "ai_complete", "L7.2": "pending_review"}
+
+
+def test_a4_run_selected_node_review_does_not_resubmit_existing_memory(conn, tmp_path):
+    """A4 regression: batch B must not move accepted batch A back to pending."""
+    snap = _create_snapshot_with_nodes(conn, "run-review-node-scope", ["L7.1", "L7.2"])
+    sid = snap["snapshot_id"]
+    source_dir = tmp_path / "agent" / "governance"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "L7_1.py").write_text("def old():\n    return 'old'\n", encoding="utf-8")
+    (source_dir / "L7_2.py").write_text("def new():\n    return 'new'\n", encoding="utf-8")
+    semantic._persist_semantic_state_to_db(
+        conn,
+        PID,
+        sid,
+        {
+            "node_semantics": {
+                "L7.1": {
+                    "status": "ai_complete",
+                    "feature_hash": "sha256:old",
+                    "semantic_summary": "accepted batch A",
+                },
+            }
+        },
+        submit_for_review=False,
+    )
+    conn.commit()
+
+    def _ai_call(stage, payload):
+        assert stage == "reconcile_semantic_feature"
+        assert payload["feature"]["node_id"] == "L7.2"
+        return {
+            "feature_name": "Batch B Feature",
+            "semantic_summary": "Generated semantic proposal for batch B.",
+            "intent": "Exercise scoped review.",
+            "confidence": 0.8,
+        }
+
+    result = semantic.run_semantic_enrichment(
+        conn,
+        PID,
+        sid,
+        str(tmp_path),
+        use_ai=True,
+        ai_call=_ai_call,
+        semantic_node_ids=["L7.2"],
+        semantic_skip_completed=True,
+        submit_for_review=True,
+        created_by="test",
+        max_excerpt_chars=200,
+    )
+
+    assert result["summary"]["ai_complete_count"] == 1
+    rows = {
+        row["node_id"]: row["status"]
+        for row in conn.execute(
+            """
+            SELECT node_id, status
+            FROM graph_semantic_nodes
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (PID, sid),
+        ).fetchall()
+    }
+    assert rows["L7.1"] == "ai_complete"
+    assert rows["L7.2"] == "pending_review"
+
+
 def test_b_backfill_maps_pending_review_to_proposed_event(conn):
     """B: backfill writes PROPOSED event for pending_review rows."""
     snap = _create_snapshot_with_node(conn, "backfill-review")
@@ -247,6 +360,56 @@ def test_b_backfill_maps_pending_review_to_proposed_event(conn):
     ).fetchone()
     assert ev is not None, "backfill must emit an event for pending_review rows"
     assert ev["status"] == graph_events.EVENT_STATUS_PROPOSED
+
+
+def test_b2_backfill_preserves_accepted_semantic_event_status(conn):
+    """B2: later cache backfill must not downgrade operator-accepted events."""
+    snap = _create_snapshot_with_node(conn, "backfill-preserve-accepted")
+    sid = snap["snapshot_id"]
+    semantic._persist_semantic_state_to_db(
+        conn,
+        PID,
+        sid,
+        {
+            "node_semantics": {
+                "L7.1": {
+                    "status": "pending_review",
+                    "feature_hash": "sha256:p",
+                    "semantic_summary": "p",
+                },
+            }
+        },
+        submit_for_review=False,
+    )
+    conn.commit()
+    graph_events.backfill_existing_semantic_events(conn, PID, sid, actor="test")
+    event_id = conn.execute(
+        """
+        SELECT event_id
+        FROM graph_events
+        WHERE project_id = ? AND snapshot_id = ?
+          AND event_type = 'semantic_node_enriched'
+          AND target_id = 'L7.1'
+        LIMIT 1
+        """,
+        (PID, sid),
+    ).fetchone()["event_id"]
+    graph_events.update_event_status(
+        conn,
+        PID,
+        sid,
+        event_id,
+        status=graph_events.EVENT_STATUS_ACCEPTED,
+        actor="test",
+    )
+    conn.commit()
+
+    graph_events.backfill_existing_semantic_events(conn, PID, sid, actor="test")
+    row = conn.execute(
+        "SELECT status FROM graph_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert row["status"] == graph_events.EVENT_STATUS_ACCEPTED
 
 
 def test_c_accept_semantic_enrichment_in_decision_actions():
