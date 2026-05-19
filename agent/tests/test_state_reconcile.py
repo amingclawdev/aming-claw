@@ -512,6 +512,142 @@ def test_state_only_full_reconcile_can_activate_with_explicit_signoff(conn, tmp_
     assert old_status["status"] == store.SNAPSHOT_STATUS_SUPERSEDED
 
 
+def test_state_only_full_reconcile_auto_waives_pending_scope_rows_through_target(conn, tmp_path):
+    project = tmp_path / "project"
+    _write_project(project)
+
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-auto-waive",
+        commit_sha="old",
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    for commit, status in (
+        ("a1", store.PENDING_STATUS_QUEUED),
+        ("head", store.PENDING_STATUS_RUNNING),
+        ("zfuture", store.PENDING_STATUS_QUEUED),
+    ):
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=commit,
+            parent_commit_sha="old",
+            status=status,
+            evidence={"source": "test"},
+        )
+
+    result = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-auto-waive-head-test",
+        commit_sha="head",
+        snapshot_id="full-head-auto-waive",
+        created_by="test",
+        activate=True,
+        expected_old_snapshot_id=old["snapshot_id"],
+        semantic_enrich=False,
+    )
+
+    assert result["ok"] is True
+    assert result["pending_scope_waiver"]["waived_count"] == 2
+    assert result["pending_scope_waiver"]["commit_shas"] == ["a1", "head"]
+    rows = {
+        row["commit_sha"]: row
+        for row in conn.execute(
+            """
+            SELECT commit_sha, status, snapshot_id FROM pending_scope_reconcile
+            WHERE project_id=?
+            """,
+            (PID,),
+        ).fetchall()
+    }
+    assert rows["a1"]["status"] == store.PENDING_STATUS_WAIVED
+    assert rows["head"]["status"] == store.PENDING_STATUS_WAIVED
+    assert rows["a1"]["snapshot_id"] == "full-head-auto-waive"
+    assert rows["head"]["snapshot_id"] == "full-head-auto-waive"
+    assert rows["zfuture"]["status"] == store.PENDING_STATUS_QUEUED
+    assert rows["zfuture"]["snapshot_id"] == ""
+
+
+def test_state_only_full_reconcile_auto_waiver_preserves_non_ancestor_pending_rows(conn, tmp_path):
+    project = tmp_path / "project"
+    files = _write_project(project)
+    _init_git(project)
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "initial")
+    default_branch = _git(project, "branch", "--show-current")
+
+    service_path = files[0]
+    _write(service_path, service_path.read_text(encoding="utf-8") + "\ndef a1_marker():\n    return 1\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "a1")
+    a1_commit = _git(project, "rev-parse", "HEAD")
+
+    _git(project, "checkout", "-b", "future")
+    readme_path = project / "README.md"
+    _write(readme_path, readme_path.read_text(encoding="utf-8") + "\nFuture branch only.\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "future")
+    future_commit = _git(project, "rev-parse", "HEAD")
+
+    _git(project, "checkout", default_branch)
+    _write(service_path, service_path.read_text(encoding="utf-8") + "\ndef head_marker():\n    return 2\n")
+    _git(project, "add", ".")
+    _git(project, "commit", "-m", "head")
+    head_commit = _git(project, "rev-parse", "HEAD")
+
+    old = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="imported-old-auto-waive-git",
+        commit_sha=a1_commit,
+        snapshot_kind="imported",
+    )
+    store.activate_graph_snapshot(conn, PID, old["snapshot_id"])
+    for commit in (a1_commit, head_commit, future_commit):
+        store.queue_pending_scope_reconcile(
+            conn,
+            PID,
+            commit_sha=commit,
+            parent_commit_sha=a1_commit,
+            evidence={"source": "test"},
+        )
+
+    result = run_state_only_full_reconcile(
+        conn,
+        PID,
+        project,
+        run_id="full-auto-waive-head-git-test",
+        commit_sha=head_commit,
+        snapshot_id="full-head-auto-waive-git",
+        created_by="test",
+        activate=True,
+        expected_old_snapshot_id=old["snapshot_id"],
+        semantic_enrich=False,
+    )
+
+    assert result["ok"] is True
+    assert set(result["pending_scope_waiver"]["commit_shas"]) == {a1_commit, head_commit}
+    assert result["pending_scope_waiver"]["waived_count"] == 2
+    rows = {
+        row["commit_sha"]: row
+        for row in conn.execute(
+            """
+            SELECT commit_sha, status, snapshot_id FROM pending_scope_reconcile
+            WHERE project_id=?
+            """,
+            (PID,),
+        ).fetchall()
+    }
+    assert rows[a1_commit]["status"] == store.PENDING_STATUS_WAIVED
+    assert rows[head_commit]["status"] == store.PENDING_STATUS_WAIVED
+    assert rows[future_commit]["status"] == store.PENDING_STATUS_QUEUED
+    assert rows[future_commit]["snapshot_id"] == ""
+
+
 def test_pending_scope_materializer_binds_pending_rows_to_scope_candidate(
     conn,
     tmp_path,

@@ -2471,8 +2471,34 @@ def run_state_only_full_reconcile(
         output_payload=semantic_enrichment,
     )
     activation = None
+    pending_scope_waiver = {
+        "project_id": project_id,
+        "waived_count": 0,
+        "commit_shas": [],
+        "snapshot_id": sid,
+    }
     if activate:
         with sqlite_write_lock():
+            pending_scope_commits: list[str] = []
+            if str(snapshot_kind or "").strip().lower() == "full":
+                pending_scope_rows = list_pending_scope_reconcile(
+                    conn,
+                    project_id,
+                    statuses=[
+                        PENDING_STATUS_QUEUED,
+                        PENDING_STATUS_RUNNING,
+                        PENDING_STATUS_FAILED,
+                    ],
+                    ref_name=activation_ref_name,
+                    branch_ref=activation_branch_ref,
+                    worktree_id="",
+                    worktree_path="",
+                )
+                pending_scope_commits = _full_reconcile_pending_scope_waiver_commits(
+                    root,
+                    pending_scope_rows,
+                    commit,
+                )
             activation = activate_graph_snapshot(
                 conn,
                 project_id,
@@ -2481,6 +2507,25 @@ def run_state_only_full_reconcile(
                 ref_name=activation_ref_name,
                 branch_ref=activation_branch_ref,
             )
+            if pending_scope_commits:
+                pending_scope_waiver = waive_pending_scope_reconcile(
+                    conn,
+                    project_id,
+                    commit_shas=pending_scope_commits,
+                    ref_name=activation_ref_name,
+                    branch_ref=activation_branch_ref,
+                    worktree_id="",
+                    worktree_path="",
+                    snapshot_id=sid,
+                    actor=created_by,
+                    reason="full reconcile activated current graph snapshot",
+                    evidence={
+                        "source": "full_reconcile_activation",
+                        "run_id": rid,
+                        "snapshot_kind": snapshot_kind,
+                        "target_commit_sha": commit,
+                    },
+                )
             conn.commit()
         trace.step(
             "activate-snapshot",
@@ -2490,13 +2535,20 @@ def run_state_only_full_reconcile(
                 "ref_name": activation_ref_name,
                 "branch_ref": activation_branch_ref,
             },
-            output_payload={"activation": activation},
+            output_payload={
+                "activation": activation,
+                "pending_scope_waiver": pending_scope_waiver,
+            },
         )
     else:
         trace.step(
             "activate-snapshot",
             input_payload={"snapshot_id": sid, "activate": False},
-            output_payload={"activation": None, "status": "skipped"},
+            output_payload={
+                "activation": None,
+                "status": "skipped",
+                "pending_scope_waiver": pending_scope_waiver,
+            },
             status="skipped",
         )
     trace_summary = trace.finalize(status="ok")
@@ -2519,6 +2571,7 @@ def run_state_only_full_reconcile(
         "feature_cluster_count": len(phase_result.get("feature_clusters") or []),
         "snapshot": snapshot,
         "activation": activation,
+        "pending_scope_waiver": pending_scope_waiver,
     }
 
 
@@ -2534,6 +2587,82 @@ def _pending_commits_through_target(
     if target_commit_sha in commits:
         return commits[: commits.index(target_commit_sha) + 1]
     return commits
+
+
+def _git_commit_is_ancestor(
+    project_root: str | Path,
+    ancestor_ref: str,
+    target_ref: str,
+) -> bool | None:
+    ancestor = str(ancestor_ref or "").strip()
+    target = str(target_ref or "").strip()
+    if not ancestor or not target:
+        return None
+    if ancestor == target:
+        return True
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _git_ref_resolves(project_root: str | Path, ref: str) -> bool:
+    target = str(ref or "").strip()
+    if not target:
+        return False
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", f"{target}^{{commit}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _full_reconcile_pending_scope_waiver_commits(
+    project_root: str | Path,
+    pending: list[dict[str, Any]],
+    target_commit_sha: str,
+) -> list[str]:
+    commits = [
+        str(row.get("commit_sha") or "").strip()
+        for row in pending
+        if str(row.get("commit_sha") or "").strip()
+    ]
+    if not commits:
+        return []
+    target = str(target_commit_sha or "").strip()
+    if not _git_ref_resolves(project_root, target):
+        return _pending_commits_through_target(pending, target)
+    ancestor_checked = False
+    covered: list[str] = []
+    for commit in commits:
+        is_ancestor = _git_commit_is_ancestor(project_root, commit, target)
+        if is_ancestor is None:
+            continue
+        ancestor_checked = True
+        if is_ancestor:
+            covered.append(commit)
+    if ancestor_checked:
+        return covered
+    return _pending_commits_through_target(pending, target)
 
 
 def _update_pending_scope_candidate(
