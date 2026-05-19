@@ -17,6 +17,22 @@ graph_enrich_config_ops:
           - add
         - predicate: call_syntax_is
           value: method
+    consumes_event.string_literal.exclude_module_name_tokens:
+      action: reject
+      downgrade_to: ignore
+      edge: consumes_event
+      op: add_rule
+      reason: R7 L7.39 showed governance.db materialized as a consumes_event edge;
+        module-name string literals are not EventBus subscriptions.
+      source_evidence: string_literal
+      when:
+        all:
+        - predicate: source_evidence_is
+          value: string_literal
+        - predicate: raw_target_in
+          values:
+          - governance_db
+          - agent_governance_db
     emits_event.string_literal.exclude_cli_executable_names:
       action: reject
       downgrade_to: ignore
@@ -40,10 +56,9 @@ graph_enrich_config_ops:
       action: reject
       downgrade_to: ignore
       edge: emits_event
-      op: tighten_rule
-      reason: R6 semantic dogfood L7.121 found library method, module, fixture, and
-        config-path string literals materialized as emits_event. These are graph-builder
-        vocabulary tokens, not event names; also covers the L7.142 governance.db observation.
+      op: update_rule
+      reason: R7 L7.23 showed auto_chain.py materialized as an emits_event edge; extend
+        the existing R6 module-token exclusion instead of adding a one-off rule.
       source_evidence: string_literal
       when:
         all:
@@ -68,6 +83,24 @@ graph_enrich_config_ops:
           - agent_governance_role_config
           - agent_pipeline_config
           - agent_project_config
+          - auto_chain_py
+    emits_event.string_literal.exclude_schema_version_tokens:
+      action: reject
+      downgrade_to: ignore
+      edge: emits_event
+      op: add_rule
+      reason: R7 L7.125 showed graph/enrich config schema-version literals materialized
+        as emits_event edges; they are analyzer contract identifiers, not runtime
+        event topics.
+      source_evidence: string_literal
+      when:
+        all:
+        - predicate: source_evidence_is
+          value: string_literal
+        - predicate: raw_target_in
+          values:
+          - graph_structure_ops_v1
+          - graph_enrich_config_ops_v1
     emits_event.string_literal.exclude_subprocess_script_paths:
       action: reject
       downgrade_to: ignore
