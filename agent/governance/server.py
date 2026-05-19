@@ -8912,6 +8912,18 @@ def _reject_semantic_enrichment_for_feedback_items(
     }
 
 
+def _successful_feedback_decision_ids(result: dict[str, Any]) -> list[str]:
+    """Feedback side effects are allowed only for rows the decision step updated."""
+    ids: list[str] = []
+    for item in result.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        feedback_id = str(item.get("feedback_id") or "").strip()
+        if feedback_id:
+            ids.append(feedback_id)
+    return ids
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/feedback/decision")
 def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
     """Apply explicit user/observer decisions to feedback items."""
@@ -8959,20 +8971,32 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
                     else None
                 ),
             )
+            successful_feedback_ids = _successful_feedback_decision_ids(result)
             if action == "accept_graph_correction" and body.get("create_patch", True):
                 from . import graph_snapshot_store as store
 
                 snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
-                result["graph_patches"] = reconcile_feedback.promote_feedback_items_to_graph_patches(
-                    conn,
-                    project_id,
-                    snapshot_id,
-                    feedback_ids,
-                    actor=str(body.get("actor") or "observer"),
-                    accept_patch=True,
-                    allow_high_risk_accept=bool(body.get("allow_high_risk_patch_accept")),
-                    base_commit=str(body.get("base_commit") or snapshot.get("commit_sha") or ""),
-                )
+                if successful_feedback_ids:
+                    result["graph_patches"] = reconcile_feedback.promote_feedback_items_to_graph_patches(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        successful_feedback_ids,
+                        actor=str(body.get("actor") or "observer"),
+                        accept_patch=True,
+                        allow_high_risk_accept=bool(body.get("allow_high_risk_patch_accept")),
+                        base_commit=str(body.get("base_commit") or snapshot.get("commit_sha") or ""),
+                    )
+                else:
+                    result["graph_patches"] = {
+                        "ok": False,
+                        "requested_count": 0,
+                        "created_count": 0,
+                        "error_count": 0,
+                        "patches": [],
+                        "errors": [],
+                        "skipped_reason": "no_successful_feedback_decisions",
+                    }
             elif action == "accept_semantic_enrichment":
                 # MF-2026-05-10-016: promote worker-produced semantic from
                 # pending_review (PROPOSED event) to ai_complete (ACCEPTED
@@ -8986,7 +9010,7 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
                     conn,
                     project_id,
                     snapshot_id,
-                    feedback_ids,
+                    successful_feedback_ids,
                     actor=str(body.get("actor") or "observer"),
                 )
                 result["semantic_enrichment_accepted"] = accepted
@@ -9006,7 +9030,7 @@ def handle_graph_governance_snapshot_feedback_decision(ctx: RequestContext):
                     conn,
                     project_id,
                     snapshot_id,
-                    feedback_ids,
+                    successful_feedback_ids,
                     actor=str(body.get("actor") or "observer"),
                 )
                 result["semantic_enrichment_rejected"] = rejected

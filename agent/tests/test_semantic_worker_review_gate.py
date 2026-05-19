@@ -625,6 +625,99 @@ def test_c2_decide_feedback_accept_semantic_enrichment_maps_to_accept_true(
     assert item["accepted_by"] == "test"
 
 
+def test_c2b_feedback_decision_invalid_decision_does_not_accept_semantic_side_effects(
+    conn, monkeypatch,
+):
+    """A failed feedback decision must not still accept linked semantic output."""
+    snap = _create_snapshot_with_node(conn, "invalid-decision-side-effect")
+    sid = snap["snapshot_id"]
+    semantic._persist_semantic_state_to_db(
+        conn, PID, sid,
+        {
+            "node_semantics": {
+                "L7.1": {
+                    "status": "pending_review",
+                    "feature_hash": "sha256:invalid-decision",
+                    "semantic_summary": "pending semantic",
+                    "feature_name": "Pending Semantic",
+                },
+            }
+        },
+        submit_for_review=False,
+    )
+    graph_events.backfill_existing_semantic_events(conn, PID, sid, actor="test")
+    conn.commit()
+    ev_id = conn.execute(
+        """
+        SELECT event_id FROM graph_events
+        WHERE project_id=? AND snapshot_id=? AND target_id='L7.1'
+          AND event_type='semantic_node_enriched'
+        LIMIT 1
+        """,
+        (PID, sid),
+    ).fetchone()["event_id"]
+    submitted = reconcile_feedback.submit_feedback_item(
+        PID, sid,
+        feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+        issue={
+            "issue": "AI semantic enrichment generated for L7.1 -- awaiting review",
+            "source_node_ids": ["L7.1"],
+            "target_id": "L7.1",
+            "target_type": "node",
+            "priority": "P3",
+            "evidence": {
+                "node_id": "L7.1",
+                "linked_event_ids": [ev_id],
+            },
+        },
+        actor="test",
+    )
+    feedback_id = submitted["items"][0]["feedback_id"]
+
+    monkeypatch.setattr(server, "get_connection", lambda _project_id: _NoCloseConn(conn))
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    ctx = server.RequestContext(
+        None,
+        "POST",
+        {"project_id": PID, "snapshot_id": sid},
+        {},
+        {
+            "feedback_id": feedback_id,
+            "action": "accept_semantic_enrichment",
+            "decision": "accepted",
+            "actor": "test",
+        },
+        "req-test",
+        "",
+        "",
+    )
+    result = server.handle_graph_governance_snapshot_feedback_decision(ctx)
+
+    assert result["ok"] is False
+    assert result["decided_count"] == 0
+    assert result["error_count"] == 1
+    assert result["semantic_enrichment_accepted"]["node_ids_flipped"] == []
+    assert result["semantic_enrichment_accepted"]["event_ids_flipped"] == []
+    assert result.get("projection_rebuilt") is not True
+    node_row = conn.execute(
+        """
+        SELECT status FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id='L7.1'
+        """,
+        (PID, sid),
+    ).fetchone()
+    assert node_row["status"] == "pending_review"
+    event_row = conn.execute(
+        "SELECT status FROM graph_events WHERE project_id=? AND snapshot_id=? AND event_id=?",
+        (PID, sid, ev_id),
+    ).fetchone()
+    assert event_row["status"] == graph_events.EVENT_STATUS_PROPOSED
+
+
 def test_c_accept_helper_flips_node_status_and_event(conn):
     """C: helper transitions pending_review → ai_complete and proposed → accepted."""
     snap = _create_snapshot_with_node(conn, "accept-helper")
