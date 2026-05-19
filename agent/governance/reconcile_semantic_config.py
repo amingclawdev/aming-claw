@@ -72,6 +72,16 @@ Only emit operations listed in payload.output_contract.supported_operations.
 Do not emit direct file patches or graph topology mutations."""
 
 
+def _graph_enrich_config_ops_instruction_payload() -> dict[str, Any]:
+    from .graph_enrich_config_ops import graph_enrich_config_ops_output_contract
+
+    contract = graph_enrich_config_ops_output_contract()
+    return {
+        "schema_version": str(contract.get("schema_version") or "graph_enrich_config_ops.v1"),
+        "output_contract": contract,
+    }
+
+
 class SemanticConfigError(Exception):
     """Base exception for semantic analyzer config failures."""
 
@@ -376,6 +386,7 @@ class SemanticAnalyzerConfig:
             "execution_policy": asdict(self.execution_policy),
             "automation_policy": asdict(self.automation_policy),
             "graph_structure_ops": asdict(self.graph_structure_ops),
+            "graph_enrich_config_ops": _graph_enrich_config_ops_instruction_payload(),
             "output_schema": self.output_schema,
             "prompt_template": self.prompt_template,
         }

@@ -79,7 +79,16 @@ def test_default_semantic_config_loads_state_only_profile():
     assert payload["execution_policy"]["worker_claim_batch_size"] == 10
     assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"
     assert payload["graph_structure_ops"]["bridge_policy"]["calls"]["downgrade_to"] == "imports"
+    config_contract = payload["graph_enrich_config_ops"]["output_contract"]
+    assert payload["graph_enrich_config_ops"]["schema_version"] == "graph_enrich_config_ops.v1"
+    assert "tighten_rule" in config_contract["supported_operations"]
+    assert "ensure_rule" not in config_contract["supported_operations"]
+    assert "documents" in config_contract["supported_edges"]
+    assert "downgrade" in config_contract["supported_actions"]
     assert payload["prompt_template"]
+    assert "payload.instructions.graph_enrich_config_ops.output_contract.supported_operations" in (
+        payload["prompt_template"]
+    )
     structure_payload = config.to_instruction_payload("graph_structure")
     assert structure_payload["job_type"] == "graph_structure"
     assert structure_payload["role"] == "reconcile_graph_structure_analyzer"
