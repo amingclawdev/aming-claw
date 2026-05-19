@@ -1,0 +1,17 @@
+graph_enrich_config_ops:
+  rules:
+    tests.test_import_fanin.require_direct_symbol_import:
+      action: require_direct_symbol_import
+      downgrade_to: weak_tests
+      edge: tests
+      op: tighten_rule
+      reason: Synthesized from 8 dogfood graph_enrich_config proposals; requires direct
+        test symbol import and preserves weak test evidence.
+      source_evidence: test_import_fanin
+      when:
+        all:
+        - predicate: source_evidence_is
+          value: test_import_fanin
+graph_structure_ops:
+  evidence_policy:
+    dedupe_operations: true
