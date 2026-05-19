@@ -691,6 +691,165 @@ def _feature_context_from_node(
     }
 
 
+def _semantic_ai_graph_query_run_id(
+    snapshot_id: str,
+    round_number: int,
+    node_id: str,
+    *,
+    batch_index: int | None = None,
+) -> str:
+    suffix = f":batch-{batch_index:03d}" if batch_index is not None else ""
+    return f"semantic:{snapshot_id}:round-{round_number:03d}:{node_id}{suffix}"
+
+
+def _semantic_ai_graph_query_context(
+    conn: sqlite3.Connection,
+    project_id: str,
+    snapshot_id: str,
+    feature: dict[str, Any],
+    *,
+    project_root: Path | None,
+    actor: str,
+    round_number: int,
+    batch_index: int | None = None,
+) -> dict[str, Any]:
+    """Build bounded, audited graph context for a semantic AI payload."""
+    node_id = str(feature.get("node_id") or "")
+    run_id = _semantic_ai_graph_query_run_id(
+        snapshot_id,
+        round_number,
+        node_id or "feature",
+        batch_index=batch_index,
+    )
+    audit: dict[str, Any] = {
+        "query_source": "ai_semantic_review",
+        "query_purpose": "semantic_enrichment",
+        "target_node_id": node_id,
+        "run_id": run_id,
+        "trace_id": "",
+        "status": "not_started",
+        "queries": [],
+        "usage": {},
+        "error": "",
+    }
+    context: dict[str, Any] = {
+        "node": {},
+        "neighbors": {},
+        "path_bindings": [],
+    }
+    if not node_id:
+        audit["status"] = "skipped"
+        audit["error"] = "missing_node_id"
+        return {"audit": audit, "context": context}
+
+    trace_id = ""
+    try:
+        from . import graph_query_trace
+
+        trace = graph_query_trace.start_trace(
+            conn,
+            project_id,
+            snapshot_id,
+            actor=actor or "semantic-ai",
+            query_source="ai_semantic_review",
+            query_purpose="semantic_enrichment",
+            run_id=run_id,
+            budget={"max_queries": 8},
+        )["trace"]
+        trace_id = str(trace.get("trace_id") or "")
+        audit["trace_id"] = trace_id
+
+        def record_query(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            result = graph_query_trace.traced_query(
+                conn,
+                project_id,
+                snapshot_id,
+                trace_id=trace_id,
+                tool=tool,
+                args=args,
+                project_root=project_root,
+            )
+            result_payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            audit["queries"].append({
+                "tool": tool,
+                "ok": bool(result.get("ok")),
+                "seq": result.get("seq"),
+                "result_count": result.get("result_count", 0),
+                "args_hash": result.get("args_hash", ""),
+                "result_hash": result.get("result_hash", ""),
+            })
+            return result_payload
+
+        context["node"] = record_query(
+            "get_node",
+            {
+                "node_id": node_id,
+                "compact": True,
+                "include_semantic": True,
+                "include_feedback": True,
+                "feedback_limit": 20,
+            },
+        )
+        context["neighbors"] = record_query(
+            "get_neighbors",
+            {
+                "node_id": node_id,
+                "direction": "both",
+                "limit": 50,
+                "include_edge_semantic": True,
+            },
+        )
+        for path in _path_list(feature.get("primary"))[:3]:
+            context["path_bindings"].append({
+                "path": path,
+                "result": record_query(
+                    "find_node_by_path",
+                    {
+                        "path": path,
+                        "limit": 10,
+                        "compact": True,
+                    },
+                ),
+            })
+
+        current = graph_query_trace.get_trace(conn, project_id, trace_id)["trace"]
+        status = str(current.get("status") or "")
+        if status not in {"complete", "failed", "cancelled", "budget_exceeded"}:
+            current = graph_query_trace.finish_trace(
+                conn,
+                project_id,
+                trace_id,
+                status="complete",
+                reason="semantic_ai_context_build",
+            )["trace"]
+        audit["status"] = str(current.get("status") or "complete")
+        audit["usage"] = current.get("usage") if isinstance(current.get("usage"), dict) else {}
+    except Exception as exc:  # noqa: BLE001 - graph context is audit evidence, not AI fatality
+        audit["status"] = "failed"
+        audit["error"] = str(exc)
+        if trace_id:
+            try:
+                from . import graph_query_trace
+
+                current = graph_query_trace.get_trace(conn, project_id, trace_id)["trace"]
+                if str(current.get("status") or "") not in {
+                    "complete",
+                    "failed",
+                    "cancelled",
+                    "budget_exceeded",
+                }:
+                    audit["usage"] = graph_query_trace.finish_trace(
+                        conn,
+                        project_id,
+                        trace_id,
+                        status="failed",
+                        reason=str(exc),
+                    )["trace"].get("usage", {})
+            except Exception:
+                pass
+    return {"audit": audit, "context": context}
+
+
 def normalize_feedback_item(
     item: dict[str, Any],
     *,
@@ -2412,6 +2571,16 @@ def _semantic_state_entry(
             if isinstance(semantic_entry.get("semantic_ai_self_check"), dict)
             else {}
         ),
+        "graph_query_audit": (
+            semantic_entry.get("graph_query_audit")
+            if isinstance(semantic_entry.get("graph_query_audit"), dict)
+            else {}
+        ),
+        "semantic_graph_query_audit": (
+            semantic_entry.get("semantic_graph_query_audit")
+            if isinstance(semantic_entry.get("semantic_graph_query_audit"), dict)
+            else {}
+        ),
         "open_issues": open_issues,
         "health_issues": health_issues,
         "feedback_round": feedback_round,
@@ -3187,6 +3356,31 @@ def run_semantic_enrichment(
     }
     review_node_ids: set[str] = set()
     review_edge_ids: set[str] = set()
+
+    def attach_graph_query_context(record: dict[str, Any], *, batch_index: int | None = None) -> None:
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if ai_call is None or not payload or isinstance(payload.get("graph_query_audit"), dict):
+            return
+        evidence = _semantic_ai_graph_query_context(
+            conn,
+            project_id,
+            snapshot_id,
+            record.get("feature") if isinstance(record.get("feature"), dict) else {},
+            project_root=root,
+            actor=created_by,
+            round_number=round_number,
+            batch_index=batch_index,
+        )
+        payload["graph_query_audit"] = evidence.get("audit") if isinstance(evidence.get("audit"), dict) else {}
+        payload["graph_query_context"] = evidence.get("context") if isinstance(evidence.get("context"), dict) else {}
+
+    def attach_graph_query_audit_entry(entry: dict[str, Any], record: dict[str, Any]) -> None:
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        audit = payload.get("graph_query_audit") if isinstance(payload.get("graph_query_audit"), dict) else {}
+        if audit:
+            entry["graph_query_audit"] = dict(audit)
+            entry["semantic_graph_query_audit"] = dict(audit)
+
     # MF-2026-05-10-015: load the base projection's current-node set so
     # we don't spuriously re-enqueue phantom-current carried_forward nodes.
     projection_current_ids = _projection_current_node_ids(
@@ -3296,6 +3490,12 @@ def run_semantic_enrichment(
                             payload_trace_base / "feature-inputs" / f"{record['node_name']}.json",
                             record["payload"],
                         )
+                attach_graph_query_context(record)
+                if persist_feature_payloads:
+                    write_json(
+                        payload_trace_base / "feature-inputs" / f"{record['node_name']}.json",
+                        record["payload"],
+                    )
                 if semantic_state_enabled:
                     _upsert_semantic_job(
                         semantic_state,
@@ -3354,6 +3554,7 @@ def run_semantic_enrichment(
                     )
                     if response.get("_ai_route"):
                         state_entry["semantic_ai_route"] = response.get("_ai_route")
+                    attach_graph_query_audit_entry(state_entry, record)
                     _upsert_semantic_graph_state_entry(
                         semantic_state,
                         record["feature"],
@@ -3417,6 +3618,8 @@ def run_semantic_enrichment(
                     if semantic_state_enabled
                     else {}
                 )
+                for record in batch:
+                    attach_graph_query_context(record, batch_index=batch_index)
                 batch_payload = {
                     "schema_version": SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
                     "project_id": project_id,
@@ -3446,6 +3649,8 @@ def run_semantic_enrichment(
                                 if semantic_state_enabled
                                 else []
                             ),
+                            "graph_query_audit": record["payload"].get("graph_query_audit") or {},
+                            "graph_query_context": record["payload"].get("graph_query_context") or {},
                         }
                         for record in batch
                     ],
@@ -3554,6 +3759,7 @@ def run_semantic_enrichment(
                         )
                         if response.get("_ai_route"):
                             state_entry["semantic_ai_route"] = response.get("_ai_route")
+                        attach_graph_query_audit_entry(state_entry, record)
                         _upsert_semantic_graph_state_entry(
                             semantic_state,
                             record["feature"],
@@ -3644,6 +3850,7 @@ def run_semantic_enrichment(
                     semantic_entry["semantic_ai_route"] = ai_response.get("_ai_route")
                 if ai_response.get("_ai_elapsed_ms") is not None:
                     semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
+        attach_graph_query_audit_entry(semantic_entry, record)
         semantic_entry["semantic_selection_status"] = "selected" if selected_for_ai else "not_selected"
         semantic_entry["semantic_selection_reasons"] = selection_reasons
         semantic_entry["health_issues"] = _semantic_health_issues(

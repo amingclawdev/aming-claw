@@ -686,6 +686,115 @@ def test_semantic_enrichment_persists_node_ai_self_check(conn, tmp_path):
     assert persisted["semantic_ai_self_check"]["valid"] is True
 
 
+def test_semantic_enrichment_builds_ai_graph_query_audit_trace(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project)
+    graph = _graph()
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+    seen_payloads: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_payloads.append(payload)
+        audit = payload["graph_query_audit"]
+        assert audit["query_source"] == "ai_semantic_review"
+        assert audit["query_purpose"] == "semantic_enrichment"
+        assert audit["target_node_id"] == "L7.1"
+        assert audit["trace_id"]
+        assert audit["status"] == "complete"
+        assert [query["tool"] for query in audit["queries"]] == [
+            "get_node",
+            "get_neighbors",
+            "find_node_by_path",
+        ]
+        assert audit["queries"][0]["ok"] is True
+        return {
+            "feature_name": "Audited Backlog Runtime",
+            "semantic_summary": "Uses audited graph context before semantic output.",
+            "intent": "audit semantic graph evidence",
+            "domain_label": "governance.audit",
+            "applied_feedback_ids": [],
+            "doc_coverage_review": {"bound": True, "action": "keep"},
+            "test_coverage_review": {"bound": True, "action": "keep"},
+            "config_coverage_review": {"bound": True, "action": "keep"},
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": [
+                    "required_fields_present",
+                    "source_payload_only",
+                    "no_project_mutation",
+                    "review_feedback_accounted_for",
+                    "graph_suggestions_contract_checked",
+                ],
+                "checked_rules_count": 5,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.1"],
+        created_by="semantic-worker-test",
+        trace_dir=project / "semantic-trace",
+    )
+
+    assert len(seen_payloads) == 1
+    audit = seen_payloads[0]["graph_query_audit"]
+    trace = conn.execute(
+        """
+        SELECT query_source, query_purpose, actor, run_id, status
+        FROM graph_query_traces
+        WHERE project_id=? AND snapshot_id=? AND trace_id=?
+        """,
+        (PID, "full-semantic-test", audit["trace_id"]),
+    ).fetchone()
+    assert dict(trace) == {
+        "query_source": "ai_semantic_review",
+        "query_purpose": "semantic_enrichment",
+        "actor": "semantic-worker-test",
+        "run_id": audit["run_id"],
+        "status": "complete",
+    }
+    event_tools = [
+        row["tool"]
+        for row in conn.execute(
+            "SELECT tool FROM graph_query_events WHERE trace_id=? ORDER BY seq",
+            (audit["trace_id"],),
+        ).fetchall()
+    ]
+    assert event_tools == ["get_node", "get_neighbors", "find_node_by_path"]
+
+    feature = result["semantic_index"]["features"][0]
+    assert feature["graph_query_audit"]["trace_id"] == audit["trace_id"]
+    output = json.loads((project / "semantic-trace" / "feature-outputs" / "L7.1.json").read_text())
+    assert output["semantic_entry"]["graph_query_audit"]["trace_id"] == audit["trace_id"]
+    row = conn.execute(
+        """
+        SELECT semantic_json FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-test", "L7.1"),
+    ).fetchone()
+    persisted = json.loads(row["semantic_json"])
+    assert persisted["graph_query_audit"]["trace_id"] == audit["trace_id"]
+
+
 def test_semantic_enrichment_marks_missing_node_ai_self_check(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)
@@ -1030,6 +1139,94 @@ def test_semantic_enrichment_can_batch_ai_features(conn, tmp_path):
     assert graph_nodes["L7.1"]["metadata"]["semantic"]["feature_name"] == "Batch L7.1"
     assert Path(result["summary"]["batch_payload_input_dir"]).exists()
     assert Path(result["summary"]["batch_payload_output_dir"]).exists()
+
+
+def test_semantic_enrichment_batch_payload_carries_per_feature_graph_query_audit(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_extra=True)
+    graph = _graph(include_extra=True)
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+    seen_payloads: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_payloads.append(payload)
+        features = payload["features"]
+        assert {item["feature"]["node_id"] for item in features} == {"L7.1", "L7.2"}
+        for item in features:
+            audit = item["graph_query_audit"]
+            assert audit["query_source"] == "ai_semantic_review"
+            assert audit["query_purpose"] == "semantic_enrichment"
+            assert audit["run_id"].endswith(":batch-000")
+            assert audit["status"] == "complete"
+            assert item["graph_query_context"]["node"]
+        return {
+            "features": [
+                {
+                    "node_id": item["feature"]["node_id"],
+                    "feature_name": f"Audited batch {item['feature']['node_id']}",
+                    "semantic_summary": f"Audited batch summary {item['feature']['node_id']}",
+                    "self_check": {
+                        "required": True,
+                        "valid": True,
+                        "status": "passed",
+                        "checked_rules": [
+                            "required_fields_present",
+                            "source_payload_only",
+                            "no_project_mutation",
+                            "review_feedback_accounted_for",
+                            "graph_suggestions_contract_checked",
+                        ],
+                        "checked_rules_count": 5,
+                        "repair_attempts": 0,
+                        "max_repair_attempts": 1,
+                        "known_risks": [],
+                    },
+                }
+                for item in features
+            ],
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="all",
+        semantic_ai_batch_size=10,
+        semantic_ai_batch_by="none",
+        semantic_ai_input_mode="batch",
+        created_by="semantic-worker-test",
+    )
+
+    assert len(seen_payloads) == 1
+    traces = conn.execute(
+        """
+        SELECT query_source, query_purpose, actor, run_id, status
+        FROM graph_query_traces
+        WHERE project_id=? AND snapshot_id=?
+        ORDER BY run_id
+        """,
+        (PID, "full-semantic-test"),
+    ).fetchall()
+    assert len(traces) == 2
+    assert {row["query_source"] for row in traces} == {"ai_semantic_review"}
+    assert {row["query_purpose"] for row in traces} == {"semantic_enrichment"}
+    assert {row["actor"] for row in traces} == {"semantic-worker-test"}
+    assert {row["status"] for row in traces} == {"complete"}
+
+    by_id = {item["node_id"]: item for item in result["semantic_index"]["features"]}
+    assert by_id["L7.1"]["graph_query_audit"]["trace_id"]
+    assert by_id["L7.2"]["graph_query_audit"]["trace_id"]
+    assert by_id["L7.1"]["graph_query_audit"]["trace_id"] != by_id["L7.2"]["graph_query_audit"]["trace_id"]
 
 
 def test_semantic_enrichment_defaults_to_dynamic_feature_input(conn, tmp_path):

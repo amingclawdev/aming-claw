@@ -275,9 +275,15 @@ def build_semantic_ai_call(
                 "Return exactly one JSON object matching the requested semantic fields. "
                 f"{batch_hint}{self_check_instruction}"
             )
+        graph_context_instruction = (
+            "When graph_query_audit or graph_query_context is present in the payload, "
+            "treat it as the authoritative audited graph evidence for this task. "
+            "Do not invent graph facts beyond the supplied payload.\n"
+        )
         prompt = (
             f"{prompt_template}\n\n"
             f"{output_instruction}"
+            f"{graph_context_instruction}"
             "Do not modify files, create tasks, or inspect project files outside the supplied payload.\n\n"
             "Payload:\n"
             f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
