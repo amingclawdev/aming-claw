@@ -206,6 +206,37 @@ def test_persist_semantic_jobs_preserves_claimed_attempt_from_stale_state(conn):
         "claim_id": "",
     }
 
+    _persist_semantic_state_to_db(
+        conn,
+        PID,
+        "scope-demo",
+        {
+            "semantic_jobs": {
+                "L7.1": {
+                    "node_id": "L7.1",
+                    "status": "pending_ai",
+                    "attempt_count": 1,
+                    "updated_at": "2026-05-18T00:03:00Z",
+                }
+            }
+        },
+    )
+
+    row = conn.execute(
+        """
+        SELECT status, attempt_count, worker_id, claim_id
+        FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+        """,
+        (PID, "scope-demo", "L7.1"),
+    ).fetchone()
+    assert dict(row) == {
+        "status": "ai_complete",
+        "attempt_count": 1,
+        "worker_id": "",
+        "claim_id": "",
+    }
+
 
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):

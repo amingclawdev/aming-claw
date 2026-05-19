@@ -508,6 +508,8 @@ def _semantic_job_existing_terminal_wins(existing: sqlite3.Row | None, incoming:
     incoming_status = str(incoming.get("status") or "pending_ai")
     if not _semantic_job_terminal(existing_status) or _semantic_job_terminal(incoming_status):
         return False
+    if existing_status in {"ai_complete", "complete", "rule_complete"}:
+        return True
     existing_updated_at = str(existing["updated_at"] or "")
     incoming_updated_at = str(incoming.get("updated_at") or "")
     return bool(existing_updated_at and incoming_updated_at and existing_updated_at >= incoming_updated_at)
