@@ -395,6 +395,105 @@ def test_a5_persist_jobs_preserves_newer_terminal_cancelled_status(conn):
     assert row["updated_at"] == "2026-05-19T05:25:00Z"
 
 
+def test_a6_drain_node_continues_after_first_claim_batch(conn, tmp_path, monkeypatch):
+    """A6: one enqueue event must drain more rows than one claim batch."""
+    node_ids = ["L7.1", "L7.2", "L7.3"]
+    snap = _create_snapshot_with_nodes(conn, "worker-node-multi-batch", node_ids)
+    sid = snap["snapshot_id"]
+    source_dir = tmp_path / "agent" / "governance"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    for node_id in node_ids:
+        (source_dir / f"{node_id.replace('.', '_')}.py").write_text(
+            f"def feature_{node_id.replace('.', '_')}():\n    return '{node_id}'\n",
+            encoding="utf-8",
+        )
+        conn.execute(
+            """
+            INSERT INTO graph_semantic_jobs
+              (project_id, snapshot_id, node_id, status, feature_hash, file_hashes_json,
+               feedback_round, batch_index, attempt_count, updated_at, created_at)
+            VALUES (?, ?, ?, 'ai_pending', '', '{}',
+                    0, 0, 0, '2026-05-19T05:30:00Z', '2026-05-19T05:30:00Z')
+            """,
+            (PID, sid, node_id),
+        )
+    conn.commit()
+
+    calls: list[str] = []
+
+    def _stub_build_ai_call(*, semantic_config, project_id, snapshot_id, project_root):
+        def _ai(stage, payload):
+            assert stage == "reconcile_semantic_feature"
+            node_id = payload["feature"]["node_id"]
+            calls.append(node_id)
+            return {
+                "feature_name": f"Feature {node_id}",
+                "semantic_summary": f"Generated proposal for {node_id}.",
+                "intent": "Exercise multi-batch semantic worker drain.",
+                "confidence": 0.8,
+            }
+
+        return _ai
+
+    class _StubCfg:
+        pass
+
+    monkeypatch.setattr(
+        semantic_worker,
+        "_worker_runtime_config",
+        lambda project_id="": {"max_workers": 1, "claim_batch_size": 2, "lease_seconds": 600},
+    )
+    monkeypatch.setattr(semantic_worker, "_project_root_for", lambda _pid: tmp_path)
+    monkeypatch.setattr("agent.governance.db.get_connection", lambda _pid: _NoCloseConn(conn))
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.load_semantic_enrichment_config",
+        lambda project_root=None: _StubCfg(),
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.apply_project_ai_routing",
+        lambda cfg, project_id=None: cfg,
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        _stub_build_ai_call,
+    )
+
+    semantic_worker._drain_node(PID, sid)
+
+    assert calls == node_ids
+    job_statuses = {
+        row["node_id"]: row["status"]
+        for row in conn.execute(
+            """
+            SELECT node_id, status
+            FROM graph_semantic_jobs
+            WHERE project_id = ? AND snapshot_id = ?
+            ORDER BY node_id
+            """,
+            (PID, sid),
+        ).fetchall()
+    }
+    assert job_statuses == {node_id: "ai_complete" for node_id in node_ids}
+    node_statuses = {
+        row["node_id"]: row["status"]
+        for row in conn.execute(
+            """
+            SELECT node_id, status
+            FROM graph_semantic_nodes
+            WHERE project_id = ? AND snapshot_id = ?
+            ORDER BY node_id
+            """,
+            (PID, sid),
+        ).fetchall()
+    }
+    assert node_statuses == {node_id: "pending_review" for node_id in node_ids}
+    feedback_targets = {
+        str(item.get("target_id") or "")
+        for item in reconcile_feedback.list_feedback_items(PID, sid)
+    }
+    assert set(node_ids).issubset(feedback_targets)
+
+
 def test_b_backfill_maps_pending_review_to_proposed_event(conn):
     """B: backfill writes PROPOSED event for pending_review rows."""
     snap = _create_snapshot_with_node(conn, "backfill-review")

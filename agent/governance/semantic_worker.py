@@ -947,9 +947,10 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
 def _drain_node(project_id: str, snapshot_id: str) -> None:
     """Drain ai_pending semantic jobs for one snapshot.
 
-    Claims one configured batch, then processes claimed nodes concurrently
-    up to execution_policy.worker_max_concurrency. The snapshot lock only
-    protects claim ownership; each node uses its own DB connection.
+    Claims configured batches until no claimable rows remain. Each batch
+    processes claimed nodes concurrently up to
+    execution_policy.worker_max_concurrency. The snapshot lock only protects
+    claim ownership; each node uses its own DB connection.
     """
     runtime_config = _worker_runtime_config(project_id)
     lock = _drain_lock_for(project_id, snapshot_id)
@@ -968,92 +969,113 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
 
         conn = governance_db.get_connection(project_id)
         try:
-            try:
-                claim = semantic.claim_semantic_jobs(
-                    conn,
-                    project_id,
-                    snapshot_id,
-                    worker_id="semantic_worker_inproc",
-                    statuses=["ai_pending", "pending_ai"],
-                    limit=runtime_config["claim_batch_size"],
-                    lease_seconds=runtime_config["lease_seconds"],
-                    actor="semantic_worker_inproc",
-                )
-            except Exception as exc:  # noqa: BLE001 - claim is best-effort
-                log.warning("semantic_worker: claim failed %s/%s: %s",
-                            project_id, snapshot_id, exc)
-                conn.commit()
-                return
-            claim_id = str(claim.get("claim_id") or "")
-            # MF-2026-05-10-016 fix: claim_semantic_jobs returns `jobs` (list
-            # of row dicts), not `node_ids`. Extract node_id per row.
-            jobs = claim.get("jobs") or []
-            node_ids = [str(j.get("node_id") or "").strip() for j in jobs if j.get("node_id")]
-            if not node_ids:
-                log.info("semantic_worker: nothing claimed %s/%s (claim_id=%s claimed_count=%d)",
-                         project_id, snapshot_id, claim_id, int(claim.get("claimed_count") or 0))
-                return
-            log.info("semantic_worker: claim_id=%s node_ids=%s",
-                     claim_id, list(node_ids)[:5])
-            root = _project_root_for(project_id)
-            cfg = apply_project_ai_routing(
-                load_semantic_enrichment_config(project_root=root),
-                project_id=project_id,
-            )
-            try:
-                ai_call = build_semantic_ai_call(
-                    semantic_config=cfg,
-                    project_id=project_id,
-                    snapshot_id=snapshot_id,
-                    project_root=root,
-                )
-            except Exception as exc:  # noqa: BLE001 - record + leave rows for next drain
-                log.error("semantic_worker: build_semantic_ai_call failed: %s", exc)
-                return
-            max_node_workers = min(runtime_config["max_workers"], len(node_ids))
-            if max_node_workers <= 1:
-                for node_id in node_ids:
-                    _process_node_semantic_job(
-                        project_id, snapshot_id, root=root, ai_call=ai_call, node_id=node_id
+            root: Path | None = None
+            ai_call: Any | None = None
+            batch_count = 0
+            while True:
+                try:
+                    claim = semantic.claim_semantic_jobs(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        worker_id="semantic_worker_inproc",
+                        statuses=["ai_pending", "pending_ai"],
+                        limit=runtime_config["claim_batch_size"],
+                        lease_seconds=runtime_config["lease_seconds"],
+                        actor="semantic_worker_inproc",
                     )
-            else:
-                with ThreadPoolExecutor(
-                    max_workers=max_node_workers,
-                    thread_name_prefix="semantic-node",
-                ) as node_pool:
-                    futures = {
-                        node_pool.submit(
-                            _process_node_semantic_job,
-                            project_id,
-                            snapshot_id,
-                            root=root,
-                            ai_call=ai_call,
-                            node_id=node_id,
-                        ): node_id
-                        for node_id in node_ids
-                    }
-                    for future in as_completed(futures):
-                        node_id = futures[future]
-                        try:
-                            future.result()
-                        except Exception as exc:  # noqa: BLE001 - record + carry on
-                            log.exception(
-                                "semantic_worker: node job failed for %s: %s",
-                                node_id,
-                                exc,
-                            )
-            finalized = _finalize_completed_node_jobs_from_events(
-                project_id,
-                snapshot_id,
-                node_ids=node_ids,
-            )
-            if finalized:
+                except Exception as exc:  # noqa: BLE001 - claim is best-effort
+                    log.warning("semantic_worker: claim failed %s/%s: %s",
+                                project_id, snapshot_id, exc)
+                    conn.commit()
+                    return
+                claim_id = str(claim.get("claim_id") or "")
+                # MF-2026-05-10-016 fix: claim_semantic_jobs returns `jobs` (list
+                # of row dicts), not `node_ids`. Extract node_id per row.
+                jobs = claim.get("jobs") or []
+                node_ids = [
+                    str(j.get("node_id") or "").strip()
+                    for j in jobs
+                    if j.get("node_id")
+                ]
+                if not node_ids:
+                    log.info(
+                        "semantic_worker: nothing claimed %s/%s (claim_id=%s claimed_count=%d batches=%d)",
+                        project_id,
+                        snapshot_id,
+                        claim_id,
+                        int(claim.get("claimed_count") or 0),
+                        batch_count,
+                    )
+                    return
+                batch_count += 1
                 log.info(
-                    "semantic_worker: finalized %d completed node job(s) for %s/%s",
-                    finalized,
+                    "semantic_worker: claim_id=%s batch=%d node_ids=%s",
+                    claim_id,
+                    batch_count,
+                    list(node_ids)[:5],
+                )
+                if root is None:
+                    root = _project_root_for(project_id)
+                if ai_call is None:
+                    cfg = apply_project_ai_routing(
+                        load_semantic_enrichment_config(project_root=root),
+                        project_id=project_id,
+                    )
+                    try:
+                        ai_call = build_semantic_ai_call(
+                            semantic_config=cfg,
+                            project_id=project_id,
+                            snapshot_id=snapshot_id,
+                            project_root=root,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - record + leave rows for next drain
+                        log.error("semantic_worker: build_semantic_ai_call failed: %s", exc)
+                        return
+                max_node_workers = min(runtime_config["max_workers"], len(node_ids))
+                if max_node_workers <= 1:
+                    for node_id in node_ids:
+                        _process_node_semantic_job(
+                            project_id, snapshot_id, root=root, ai_call=ai_call, node_id=node_id
+                        )
+                else:
+                    with ThreadPoolExecutor(
+                        max_workers=max_node_workers,
+                        thread_name_prefix="semantic-node",
+                    ) as node_pool:
+                        futures = {
+                            node_pool.submit(
+                                _process_node_semantic_job,
+                                project_id,
+                                snapshot_id,
+                                root=root,
+                                ai_call=ai_call,
+                                node_id=node_id,
+                            ): node_id
+                            for node_id in node_ids
+                        }
+                        for future in as_completed(futures):
+                            node_id = futures[future]
+                            try:
+                                future.result()
+                            except Exception as exc:  # noqa: BLE001 - record + carry on
+                                log.exception(
+                                    "semantic_worker: node job failed for %s: %s",
+                                    node_id,
+                                    exc,
+                                )
+                finalized = _finalize_completed_node_jobs_from_events(
                     project_id,
                     snapshot_id,
+                    node_ids=node_ids,
                 )
+                if finalized:
+                    log.info(
+                        "semantic_worker: finalized %d completed node job(s) for %s/%s",
+                        finalized,
+                        project_id,
+                        snapshot_id,
+                    )
         finally:
             conn.close()
     finally:
