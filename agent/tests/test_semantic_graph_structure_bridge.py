@@ -1059,6 +1059,135 @@ def test_bridge_converts_semantic_rule_config_suggestions_to_dry_run_job(
     assert rules["event_bus.subscribe_to_consumes_event"]["edge"] == "consumes_event"
 
 
+def test_bridge_prechecks_graph_enrich_config_predicate_guards_before_queue(
+    conn,
+    tmp_path,
+):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    snapshot_id = _create_snapshot(conn, project, "semantic-bridge-config-guard-precheck")
+    service_id = _node_id_for_primary(snapshot_id, "agent/service.py")
+    event = _semantic_event(
+        conn,
+        snapshot_id,
+        service_id,
+        {
+            "graph_enrich_config_suggestions": [
+                {
+                    "op": "tighten_rule",
+                    "rule_id": "emits_event.string_literal.cli_binary_filenames",
+                    "edge": "emits_event",
+                    "source_evidence": "string_literal",
+                    "action": "ignore",
+                    "confidence": 0.85,
+                    "when": {
+                        "all": [
+                            {"predicate": "source_evidence_is", "value": "string_literal"},
+                            {
+                                "predicate": "raw_target_in",
+                                "values": ["claude.cmd", "codex.ps1"],
+                            },
+                        ]
+                    },
+                },
+                {
+                    "op": "tighten_rule",
+                    "rule_id": "emits_event.string_literal.executable_extensions_python",
+                    "edge": "emits_event",
+                    "source_evidence": "string_literal",
+                    "action": "ignore",
+                    "confidence": 0.7,
+                    "when": {
+                        "all": [
+                            {"predicate": "source_evidence_is", "value": "string_literal"},
+                            {"predicate": "language_is", "value": "python"},
+                        ]
+                    },
+                },
+                {
+                    "op": "review_rule",
+                    "rule_id": "weak_calls_add_short_name_in_reconcile",
+                    "edge": "calls",
+                    "source_evidence": "weak_call_resolver_ambiguous_short_name",
+                    "action": "downgrade",
+                    "downgrade_to": "drop",
+                    "confidence": 0.5,
+                    "when": {
+                        "all": [
+                            {
+                                "predicate": "source_evidence_is",
+                                "value": "weak_call_resolver_ambiguous_short_name",
+                            },
+                            {"predicate": "raw_target_in", "values": ["add"]},
+                        ]
+                    },
+                },
+                {
+                    "op": "review_rule",
+                    "rule_id": "weak_calls_container_add_attr_call",
+                    "edge": "calls",
+                    "source_evidence": "weak_call_resolver_ambiguous_short_name",
+                    "action": "downgrade",
+                    "downgrade_to": "drop",
+                    "confidence": 0.6,
+                    "when": {
+                        "all": [
+                            {
+                                "predicate": "source_evidence_is",
+                                "value": "weak_call_resolver_ambiguous_short_name",
+                            },
+                            {"predicate": "raw_target_in", "values": ["add"]},
+                            {"predicate": "call_syntax_is", "value": "attribute_call"},
+                            {"predicate": "receiver_kind_in", "values": ["set", "list"]},
+                        ]
+                    },
+                },
+            ],
+        },
+        event_id="sem-bridge-config-guard-precheck",
+    )
+
+    result = bridge.bridge_semantic_events_to_graph_enrich_config_jobs(
+        conn,
+        PID,
+        snapshot_id,
+        event_ids=[event["event_id"]],
+        actor="test",
+        project_root=str(project),
+    )
+    conn.commit()
+
+    assert result["ok"] is True
+    assert result["queued_count"] == 1
+    assert result["skipped_count"] == 2
+    skipped_reasons = {item["reason"] for item in result["skipped"]}
+    assert skipped_reasons == {
+        "predicate_underconstrained_string_literal",
+        "predicate_underconstrained_weak_call",
+    }
+    request = result["events"][0]
+    ai_output = request["payload"]["ai_output"]
+    assert [operation["rule_id"] for operation in ai_output["operations"]] == [
+        "emits_event.string_literal.cli_binary_filenames",
+        "weak_calls_container_add_attr_call",
+    ]
+    assert "predicate_guard_string_literal_requires_raw_target" in ai_output["self_check"]["checked_rules"]
+    assert ai_output["bridge"]["skipped_count"] == 2
+
+    semantic_worker._drain_graph_enrich_config(PID, snapshot_id)
+
+    completed = graph_events.list_events(
+        conn,
+        PID,
+        snapshot_id,
+        event_types=["graph_enrich_config_completed"],
+    )
+    gate_result = completed[0]["payload"]["result"]
+    assert gate_result["ok"] is True
+    assert gate_result["gate"]["accepted_count"] == 2
+    assert gate_result["gate"]["rejected_count"] == 0
+
+
 def test_bridge_dedupes_config_rule_from_ops_and_suggestions(
     conn,
     tmp_path,

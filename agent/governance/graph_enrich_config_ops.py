@@ -87,6 +87,8 @@ GRAPH_ENRICH_CONFIG_SELF_PRECHECK_RULES = [
     "edge_supported_or_canonical_alias",
     "source_evidence_present",
     "action_present",
+    "predicate_guard_weak_call_requires_call_syntax_or_receiver",
+    "predicate_guard_string_literal_requires_raw_target",
     "config_patch_previewed",
     "observer_approval_required",
 ]
@@ -157,7 +159,22 @@ def graph_enrich_config_ops_output_contract() -> dict[str, Any]:
         "self_precheck": {
             "required": True,
             "checked_rules_required": list(GRAPH_ENRICH_CONFIG_SELF_PRECHECK_RULES),
-            "must_not_mark_valid_when": [],
+            "must_not_mark_valid_when": [
+                {
+                    "error": "predicate_underconstrained_weak_call",
+                    "when": (
+                        "edge=calls and source_evidence starts with weak_call_resolver "
+                        "and when.raw_target_in is present without call_syntax_is or receiver_kind_in"
+                    ),
+                },
+                {
+                    "error": "predicate_underconstrained_string_literal",
+                    "when": (
+                        "edge=emits_event and source_evidence=string_literal and "
+                        "action is ignore/drop/downgrade/reject without a target-specific raw_target_in"
+                    ),
+                },
+            ],
             "repair_policy": {
                 "max_attempts": MAX_AI_REPAIR_ATTEMPTS,
                 "retry_only_model_repairable": True,
@@ -233,6 +250,18 @@ def validate_graph_enrich_config_ops(payload: Mapping[str, Any]) -> dict[str, An
         max_repair_attempts=MAX_AI_REPAIR_ATTEMPTS,
     )
     return report
+
+
+def precheck_graph_enrich_config_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one config-rule operation with the same guard used by the gate."""
+    report = _validate_operation(operation, index=0, seen_rule_ids=set())
+    errors = list(report.get("errors") or [])
+    return {
+        "ok": not errors,
+        "status": "passed" if not errors else "failed",
+        "errors": errors,
+        "operation": report,
+    }
 
 
 def dry_run_graph_enrich_config_ops(

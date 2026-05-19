@@ -30,6 +30,7 @@ from .graph_enrich_config_ops import (
     POLICY_OP_EDGES as CONFIG_POLICY_OP_EDGES,
     POLICY_OP_SOURCE_EVIDENCE as CONFIG_POLICY_OP_SOURCE_EVIDENCE,
     SCHEMA_VERSION as CONFIG_SCHEMA_VERSION,
+    precheck_graph_enrich_config_operation,
     SUPPORTED_ACTIONS as CONFIG_SUPPORTED_ACTIONS,
     SUPPORTED_OPS as CONFIG_SUPPORTED_OPS,
     SUPPORTED_SOURCE_EVIDENCE as CONFIG_SUPPORTED_SOURCE_EVIDENCE,
@@ -1158,6 +1159,14 @@ def _convert_config_suggestion(
         operation["downgrade_to"] = downgrade_to
     if when:
         operation["when"] = dict(when)
+    precheck = precheck_graph_enrich_config_operation(operation)
+    if not precheck["ok"]:
+        errors = list(precheck.get("errors") or [])
+        return {
+            "reason": errors[0] if errors else "config_operation_precheck_failed",
+            "errors": errors,
+            "suggestion": raw,
+        }
     return {"operation": operation}
 
 

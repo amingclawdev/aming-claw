@@ -100,6 +100,15 @@ def test_graph_enrich_config_contract_exposes_policy_op_constraints():
     assert "function_calls" in constraints["note"]
     assert "language_is" in contract["supported_predicates"]
     assert "receiver_kind_in" in contract["supported_predicates"]
+    must_not_mark_valid = contract["self_precheck"]["must_not_mark_valid_when"]
+    assert any(item["error"] == "predicate_underconstrained_weak_call" for item in must_not_mark_valid)
+    assert any(
+        item["error"] == "predicate_underconstrained_string_literal"
+        for item in must_not_mark_valid
+    )
+    required_rules = contract["self_precheck"]["checked_rules_required"]
+    assert "predicate_guard_weak_call_requires_call_syntax_or_receiver" in required_rules
+    assert "predicate_guard_string_literal_requires_raw_target" in required_rules
 
 
 def _rule_payload() -> dict:
