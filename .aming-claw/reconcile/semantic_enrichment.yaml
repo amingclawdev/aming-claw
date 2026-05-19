@@ -17,6 +17,25 @@ graph_enrich_config_ops:
           - add
         - predicate: call_syntax_is
           value: method
+    emits_event.string_literal.exclude_cli_executable_names:
+      action: reject
+      downgrade_to: ignore
+      edge: emits_event
+      op: tighten_rule
+      reason: R5 semantic dogfood found CLI executable fallback names in reconcile_semantic_ai.py
+        being materialized as emits_event relations; these are shutil.which candidates,
+        not EventBus or chain event names.
+      source_evidence: string_literal
+      when:
+        all:
+        - predicate: source_evidence_is
+          value: string_literal
+        - predicate: raw_target_in
+          values:
+          - claude_cmd
+          - claude_exe
+          - codex_cmd
+          - codex_ps1
     tests.test_import_fanin.require_direct_symbol_import:
       action: require_direct_symbol_import
       downgrade_to: weak_tests

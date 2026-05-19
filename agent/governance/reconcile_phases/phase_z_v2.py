@@ -1920,7 +1920,12 @@ def _module_name_tokens(module_name: str) -> Set[str]:
     return {p.lower() for p in parts if p}
 
 
-def extract_typed_relations(project_root: str, modules: Dict[str, ModuleInfo]) -> List[Dict[str, Any]]:
+def extract_typed_relations(
+    project_root: str,
+    modules: Dict[str, ModuleInfo],
+    *,
+    graph_enrich_config_rules: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """Extract typed state/workflow/contract/artifact edges from modules.
 
     This is intentionally deterministic.  AI can later review ambiguous labels,
@@ -1977,8 +1982,15 @@ def extract_typed_relations(project_root: str, modules: Dict[str, ModuleInfo]) -
                 lower = source.lower()
                 if "chain_events" in lower or "event_type" in lower or "emit" in lower:
                     rel_type = "emits_event" if ("insert into chain_events" in lower or "persist_event" in lower or "emit" in lower) else "consumes_event"
-                    relations.append(TypedRelation(module.module_name, rel_type, value, "event",
-                                                   "event literal", rel_file))
+                    relation = TypedRelation(module.module_name, rel_type, value, "event",
+                                             "event literal", rel_file)
+                    relation = _apply_graph_enrich_config_rule_to_typed_relation(
+                        relation,
+                        module=module,
+                        rules=graph_enrich_config_rules,
+                    )
+                    if relation is not None:
+                        relations.append(relation)
 
         lowered = source.lower()
         if "/api/task" in lowered or "create_task" in lowered or "task_create" in lowered:
@@ -2005,6 +2017,66 @@ def extract_typed_relations(project_root: str, modules: Dict[str, ModuleInfo]) -
             ))
 
     return [r.__dict__ for r in _dedupe_typed_relations(relations)]
+
+
+def _apply_graph_enrich_config_rule_to_typed_relation(
+    relation: TypedRelation,
+    *,
+    module: ModuleInfo,
+    rules: Optional[Dict[str, Any]] = None,
+) -> Optional[TypedRelation]:
+    decision = _graph_enrich_config_rule_decision_for_typed_relation(
+        relation,
+        module=module,
+        rules=rules,
+    )
+    if _graph_enrich_config_rule_suppresses(decision):
+        return None
+    downgrade_to = str(decision.get("downgrade_to") or "")
+    if decision.get("matched") and downgrade_to and downgrade_to != relation.relation_type:
+        return TypedRelation(
+            source_module=relation.source_module,
+            relation_type=downgrade_to,
+            target=relation.target,
+            target_kind=relation.target_kind,
+            evidence=relation.evidence,
+            source_file=relation.source_file,
+        )
+    return relation
+
+
+def _graph_enrich_config_rule_decision_for_typed_relation(
+    relation: TypedRelation,
+    *,
+    module: ModuleInfo,
+    rules: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not rules:
+        return {"matched": False, "rule_id": "", "action": "", "downgrade_to": "", "errors": []}
+    source_evidence = _typed_relation_source_evidence(relation)
+    if not source_evidence:
+        return {"matched": False, "rule_id": "", "action": "", "downgrade_to": "", "errors": []}
+    context = {
+        "edge": relation.relation_type,
+        "source_evidence": source_evidence,
+        "language": str((module.language if module else "") or ""),
+        "source_path": str(relation.source_file or (module.path if module else "") or ""),
+        "raw_target": str(relation.target or ""),
+        "target_kind": str(relation.target_kind or ""),
+    }
+    try:
+        from agent.governance.graph_enrich_config_ops import evaluate_graph_enrich_config_rules
+
+        return evaluate_graph_enrich_config_rules(rules, context)
+    except Exception:
+        return {"matched": False, "rule_id": "", "action": "", "downgrade_to": "", "errors": ["rule_eval_failed"]}
+
+
+def _typed_relation_source_evidence(relation: TypedRelation) -> str:
+    evidence = str(relation.evidence or "").strip().lower().replace(" ", "_")
+    if evidence in {"event_literal", "string_literal"}:
+        return "string_literal"
+    return evidence
 
 
 def _dedupe_typed_relations(relations: List[TypedRelation]) -> List[TypedRelation]:
@@ -4479,7 +4551,12 @@ def build_graph_v2_from_symbols(
             "pending_decision_sample": [],
         }
 
-    typed_relations = extract_typed_relations(project_root, modules)
+    graph_enrich_config_rules = _load_graph_enrich_config_rules(project_root)
+    typed_relations = extract_typed_relations(
+        project_root,
+        modules,
+        graph_enrich_config_rules=graph_enrich_config_rules,
+    )
     typed_relations.extend(materialize_config_file_relations(
         project_root,
         nodes,
@@ -4496,7 +4573,7 @@ def build_graph_v2_from_symbols(
     function_call_facts = build_function_call_facts(
         modules,
         call_graph,
-        graph_enrich_config_rules=_load_graph_enrich_config_rules(project_root),
+        graph_enrich_config_rules=graph_enrich_config_rules,
     )
     enrich_nodes_with_function_call_facts(nodes, function_call_facts)
     enrich_nodes_with_architecture_signals(nodes, typed_relations)

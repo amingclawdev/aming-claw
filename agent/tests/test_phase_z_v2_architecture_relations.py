@@ -82,6 +82,58 @@ def test_extracts_state_route_task_event_and_artifact_relations(tmp_path):
     )
 
 
+def test_graph_enrich_config_suppresses_string_literal_event_false_positive(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        str(project / "agent" / "governance" / "reconcile_semantic_ai.py"),
+        "def _resolve_cli_binary():\n"
+        "    event_type = 'semantic.worker.checked'\n"
+        "    emit(event_type)\n"
+        "    return ['claude.cmd', 'claude.exe', 'codex.cmd', 'codex.ps1']\n",
+    )
+
+    modules = parse_production_modules(str(project))
+    rules = {
+        "emits_event.string_literal.exclude_cli_executable_names": {
+            "op": "tighten_rule",
+            "edge": "emits_event",
+            "source_evidence": "string_literal",
+            "action": "reject",
+            "downgrade_to": "ignore",
+            "when": {
+                "all": [
+                    {"predicate": "source_evidence_is", "value": "string_literal"},
+                    {
+                        "predicate": "raw_target_in",
+                        "values": ["claude.cmd", "claude.exe", "codex.cmd", "codex.ps1"],
+                    },
+                ]
+            },
+        }
+    }
+
+    baseline = extract_typed_relations(str(project), modules)
+    filtered = extract_typed_relations(
+        str(project),
+        modules,
+        graph_enrich_config_rules=rules,
+    )
+    baseline_events = {
+        rel["target"]
+        for rel in baseline
+        if rel["relation_type"] == "emits_event"
+    }
+    filtered_events = {
+        rel["target"]
+        for rel in filtered
+        if rel["relation_type"] == "emits_event"
+    }
+
+    assert {"claude.cmd", "claude.exe", "codex.cmd", "codex.ps1"} <= baseline_events
+    assert "semantic.worker.checked" in filtered_events
+    assert not ({"claude.cmd", "claude.exe", "codex.cmd", "codex.ps1"} & filtered_events)
+
+
 def test_legacy_graph_rebuild_scripts_keep_mapping_out_of_docs_dev():
     repo_root = Path(__file__).resolve().parents[2]
     shared_mapping = (

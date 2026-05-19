@@ -81,6 +81,7 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     build_module_dependency_edges,
     enrich_nodes_with_architecture_signals,
     extract_typed_relations,
+    _load_graph_enrich_config_rules,
     parse_production_modules,
     parse_production_module_file,
 )
@@ -678,9 +679,11 @@ def _source_path_incremental_eligibility(
             "parsed_module": parsed_module,
         }
     try:
+        project_root_resolved = str(Path(project_root).resolve())
         typed_relations = extract_typed_relations(
-            str(Path(project_root).resolve()),
+            project_root_resolved,
             {parsed_module: module},
+            graph_enrich_config_rules=_load_graph_enrich_config_rules(project_root_resolved),
         )
     except Exception:
         return {"supported": False, "reason": "source_typed_relation_scan_failed", "path": path}
@@ -1532,7 +1535,12 @@ def _apply_incremental_source_dependency_delta(
             if func.name
         }
         temp_node = {"module": module_name}
-        module_relations = extract_typed_relations(str(Path(project_root).resolve()), {module_name: module})
+        project_root_resolved = str(Path(project_root).resolve())
+        module_relations = extract_typed_relations(
+            project_root_resolved,
+            {module_name: module},
+            graph_enrich_config_rules=_load_graph_enrich_config_rules(project_root_resolved),
+        )
         enrich_nodes_with_architecture_signals([temp_node], module_relations)
         metadata["typed_relations"] = temp_node.get("typed_relations") or []
         metadata["architecture_signals"] = temp_node.get("architecture_signals") or {}
