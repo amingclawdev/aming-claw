@@ -736,6 +736,62 @@ def test_budget_blocks_queries_after_limit(conn, tmp_path):
     assert stored["status"] == "budget_exceeded"
 
 
+def test_get_neighbors_compact_keeps_large_neighbor_metadata_budget_safe(conn, tmp_path):
+    snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
+    huge_functions = [
+        {"name": f"fn_{idx}", "path": "agent/governance/helper.py", "lineno": idx}
+        for idx in range(1500)
+    ]
+    conn.execute(
+        """
+        UPDATE graph_nodes_index
+        SET metadata_json = ?
+        WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+        """,
+        (
+            json.dumps({
+                "hierarchy_parent": "L3.1",
+                "function_count": len(huge_functions),
+                "functions": huge_functions,
+            }),
+            PID,
+            snapshot_id,
+            "L7.2",
+        ),
+    )
+    conn.commit()
+    trace = graph_query_trace.start_trace(
+        conn,
+        PID,
+        snapshot_id,
+        actor="semantic-worker",
+        query_source="ai_semantic_review",
+        query_purpose="semantic_enrichment",
+        budget={"max_result_chars": 10_000},
+    )["trace"]
+
+    result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        trace_id=trace["trace_id"],
+        tool="get_neighbors",
+        args={"node_id": "L7.1", "direction": "both", "limit": 10, "compact": True},
+        project_root=project_root,
+    )
+
+    assert result["ok"] is True
+    assert result["budget_exceeded"] is False
+    assert result["usage"]["result_chars"] < 10_000
+    assert result["result"]["compact"] is True
+    neighbor = {
+        node["node_id"]: node
+        for node in result["result"]["nodes"]
+    }["L7.2"]
+    assert neighbor["metadata"]["function_count"] == len(huge_functions)
+    assert "functions" not in neighbor["metadata"]
+
+
 def test_low_health_query_uses_structural_and_feedback_signals(conn, tmp_path):
     snapshot_id, project_root = _seed_snapshot(conn, tmp_path)
     result = graph_query_trace.traced_query(

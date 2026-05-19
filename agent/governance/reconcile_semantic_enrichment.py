@@ -786,8 +786,7 @@ def _semantic_ai_graph_query_context(
                 "node_id": node_id,
                 "compact": True,
                 "include_semantic": True,
-                "include_feedback": True,
-                "feedback_limit": 20,
+                "include_feedback": False,
             },
         )
         context["neighbors"] = record_query(
@@ -795,8 +794,9 @@ def _semantic_ai_graph_query_context(
             {
                 "node_id": node_id,
                 "direction": "both",
-                "limit": 50,
-                "include_edge_semantic": True,
+                "limit": 25,
+                "compact": True,
+                "include_edge_semantic": False,
             },
         )
         for path in _path_list(feature.get("primary"))[:3]:

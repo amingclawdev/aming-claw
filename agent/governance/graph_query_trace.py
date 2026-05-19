@@ -103,7 +103,7 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "get_neighbors": {
         "required_args": ["node_id"],
         "summary": "Fetch structural neighbors; pass include_edge_semantic=true for projection payloads.",
-        "optional_args": ["direction", "limit", "include_edge_semantic", "include_semantic_edges"],
+        "optional_args": ["direction", "limit", "compact", "include_edge_semantic", "include_semantic_edges"],
         "args": {"direction": {"enum": ["in", "out", "both"], "default": "both"}},
     },
     "find_node_by_path": {
@@ -836,6 +836,7 @@ def _query_get_neighbors(conn: sqlite3.Connection, project_id: str, snapshot_id:
         raise ValueError("node_id is required")
     direction = str(args.get("direction") or "both").strip().lower()
     limit = max(1, min(int(args.get("limit") or 100), 500))
+    compact = _bool_arg(args, "compact")
     params: list[Any] = [project_id, snapshot_id]
     if direction == "in":
         where = "dst = ?"
@@ -882,7 +883,15 @@ def _query_get_neighbors(conn: sqlite3.Connection, project_id: str, snapshot_id:
         )
         if node
     ]
-    return {"node_id": node_id, "edges": edges, "nodes": nodes, "count": len(edges)}
+    if compact:
+        nodes = [_compact_node(node) for node in nodes]
+    return {
+        "node_id": node_id,
+        "edges": edges,
+        "nodes": nodes,
+        "count": len(edges),
+        "compact": compact,
+    }
 
 
 def _query_find_node_by_path(conn: sqlite3.Connection, project_id: str, snapshot_id: str, args: dict[str, Any]) -> dict[str, Any]:

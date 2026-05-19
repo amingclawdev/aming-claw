@@ -795,6 +795,135 @@ def test_semantic_enrichment_builds_ai_graph_query_audit_trace(conn, tmp_path):
     assert persisted["graph_query_audit"]["trace_id"] == audit["trace_id"]
 
 
+def test_semantic_ai_graph_query_audit_uses_budget_safe_compact_neighbors(conn, tmp_path):
+    project = tmp_path / "project"
+    _write(
+        project / "agent" / "governance" / "backlog_runtime.py",
+        "def claim_next():\n    return 'task'\n",
+    )
+    _write(
+        project / "agent" / "governance" / "large_neighbor.py",
+        "def large_neighbor():\n    return None\n",
+    )
+    huge_functions = [
+        {"name": f"generated_{idx}", "path": "agent/governance/large_neighbor.py", "lineno": idx}
+        for idx in range(2000)
+    ]
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.1",
+                    "layer": "L7",
+                    "title": "Backlog Runtime",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/backlog_runtime.py"],
+                    "metadata": {
+                        "subsystem": "backlog",
+                        "functions": [{"name": "claim_next", "path": "agent/governance/backlog_runtime.py"}],
+                    },
+                },
+                {
+                    "id": "L7.2",
+                    "layer": "L7",
+                    "title": "Large Neighbor",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_neighbor.py"],
+                    "metadata": {
+                        "subsystem": "backlog",
+                        "function_count": len(huge_functions),
+                        "functions": huge_functions,
+                    },
+                },
+            ],
+            "edges": [{"source": "L7.1", "target": "L7.2", "type": "depends_on"}],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=store.graph_payload_edges(graph),
+    )
+    conn.commit()
+    seen_payloads: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_payloads.append(payload)
+        audit = payload["graph_query_audit"]
+        assert audit["status"] == "complete"
+        assert audit["usage"]["result_chars"] < 80_000
+        neighbors = payload["graph_query_context"]["neighbors"]
+        assert neighbors["compact"] is True
+        assert neighbors["nodes"][0]["metadata"]["function_count"] == len(huge_functions)
+        assert "functions" not in neighbors["nodes"][0]["metadata"]
+        return {
+            "feature_name": "Budget Safe Semantic Context",
+            "semantic_summary": "Uses compact audited graph context.",
+            "intent": "avoid oversized graph payloads",
+            "domain_label": "governance.audit",
+            "applied_feedback_ids": [],
+            "doc_coverage_review": {"bound": True, "action": "keep"},
+            "test_coverage_review": {"bound": True, "action": "keep"},
+            "config_coverage_review": {"bound": True, "action": "keep"},
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": [
+                    "required_fields_present",
+                    "source_payload_only",
+                    "no_project_mutation",
+                    "review_feedback_accounted_for",
+                    "graph_suggestions_contract_checked",
+                ],
+                "checked_rules_count": 5,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.1"],
+        created_by="semantic-worker-test",
+    )
+
+    assert len(seen_payloads) == 1
+    audit = seen_payloads[0]["graph_query_audit"]
+    assert [query["tool"] for query in audit["queries"]] == [
+        "get_node",
+        "get_neighbors",
+        "find_node_by_path",
+    ]
+    trace = conn.execute(
+        """
+        SELECT status FROM graph_query_traces
+        WHERE project_id=? AND snapshot_id=? AND trace_id=?
+        """,
+        (PID, "full-semantic-test", audit["trace_id"]),
+    ).fetchone()
+    assert trace["status"] == "complete"
+    assert result["semantic_index"]["features"][0]["graph_query_audit"]["status"] == "complete"
+
+
 def test_semantic_enrichment_marks_missing_node_ai_self_check(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)
