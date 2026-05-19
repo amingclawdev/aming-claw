@@ -972,6 +972,7 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
             root: Path | None = None
             ai_call: Any | None = None
             batch_count = 0
+            empty_claim_retry_count = 0
             while True:
                 try:
                     claim = semantic.claim_semantic_jobs(
@@ -999,6 +1000,41 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                     if j.get("node_id")
                 ]
                 if not node_ids:
+                    pending_count = _count_claimable_pending_node_jobs(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        worker_id="semantic_worker_inproc",
+                    )
+                    if pending_count > 0 and empty_claim_retry_count < 2:
+                        empty_claim_retry_count += 1
+                        log.warning(
+                            "semantic_worker: empty claim but %d pending job(s) remain "
+                            "%s/%s (claim_id=%s retry=%d)",
+                            pending_count,
+                            project_id,
+                            snapshot_id,
+                            claim_id,
+                            empty_claim_retry_count,
+                        )
+                        _record_node_drain_gap(
+                            conn,
+                            project_id,
+                            snapshot_id,
+                            pending_count=pending_count,
+                            claim_id=claim_id,
+                            batch_count=batch_count,
+                            retry_count=empty_claim_retry_count,
+                        )
+                        _publish_node_drain_gap(
+                            project_id,
+                            snapshot_id,
+                            pending_count=pending_count,
+                            claim_id=claim_id,
+                            batch_count=batch_count,
+                            retry_count=empty_claim_retry_count,
+                        )
+                        continue
                     log.info(
                         "semantic_worker: nothing claimed %s/%s (claim_id=%s claimed_count=%d batches=%d)",
                         project_id,
@@ -1008,6 +1044,7 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
                         batch_count,
                     )
                     return
+                empty_claim_retry_count = 0
                 batch_count += 1
                 log.info(
                     "semantic_worker: claim_id=%s batch=%d node_ids=%s",
@@ -1080,6 +1117,125 @@ def _drain_node(project_id: str, snapshot_id: str) -> None:
             conn.close()
     finally:
         lock.release()
+
+
+def _count_claimable_pending_node_jobs(
+    conn: Any,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    worker_id: str,
+) -> int:
+    from . import reconcile_semantic_enrichment as semantic
+
+    try:
+        semantic._ensure_semantic_state_schema(conn)
+        now = semantic.utc_now()
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM graph_semantic_jobs
+            WHERE project_id = ?
+              AND snapshot_id = ?
+              AND status IN ('ai_pending', 'pending_ai')
+              AND (
+                COALESCE(lease_expires_at, '') = ''
+                OR lease_expires_at <= ?
+                OR COALESCE(worker_id, '') = ?
+              )
+            """,
+            (project_id, snapshot_id, now, str(worker_id or "")),
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - advisory drain guard
+        log.debug(
+            "semantic_worker: pending node job count failed for %s/%s: %s",
+            project_id,
+            snapshot_id,
+            exc,
+        )
+        return 0
+    try:
+        return int(row["n"] if row else 0)
+    except Exception:
+        try:
+            return int(row[0] if row else 0)
+        except Exception:
+            return 0
+
+
+def _record_node_drain_gap(
+    conn: Any,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    pending_count: int,
+    claim_id: str,
+    batch_count: int,
+    retry_count: int,
+) -> None:
+    try:
+        from . import graph_events
+
+        payload = {
+            "pending_count": int(pending_count or 0),
+            "claim_id": str(claim_id or ""),
+            "batch_count": int(batch_count or 0),
+            "retry_count": int(retry_count or 0),
+            "target_scope": "node",
+        }
+        graph_events.create_event(
+            conn,
+            project_id,
+            snapshot_id,
+            event_type="semantic_job_requested",
+            event_kind="semantic_job",
+            target_type="snapshot",
+            target_id=snapshot_id,
+            status=graph_events.EVENT_STATUS_OBSERVED,
+            operation_type="node_semantic_drain_gap",
+            payload=payload,
+            evidence={
+                "source": "semantic_worker_inproc",
+                "reason": "empty_claim_with_claimable_pending_jobs",
+            },
+            created_by="semantic_worker_inproc",
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - audit evidence is advisory
+        log.debug("semantic_worker: drain-gap audit event failed: %s", exc)
+
+
+def _publish_node_drain_gap(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    pending_count: int,
+    claim_id: str,
+    batch_count: int,
+    retry_count: int,
+) -> None:
+    try:
+        from . import event_bus
+
+        payload = {
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "pending_count": int(pending_count or 0),
+            "claim_id": str(claim_id or ""),
+            "batch_count": int(batch_count or 0),
+            "retry_count": int(retry_count or 0),
+            "target_scope": "node",
+            "source": "semantic_worker_inproc",
+        }
+        event_bus.publish("semantic_worker.drain_gap", payload)
+        event_bus.publish("dashboard.changed", {
+            "project_id": project_id,
+            "path": "/semantic_worker/drain_gap",
+            "method": "WORKER",
+            "source": "semantic_worker_inproc",
+        })
+    except Exception as exc:  # noqa: BLE001 - notification is advisory
+        log.debug("semantic_worker: drain-gap publish failed: %s", exc)
 
 
 def _process_node_semantic_job(

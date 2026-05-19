@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -155,7 +156,13 @@ def test_semantic_worker_node_drain_processes_claimed_nodes_in_parallel(monkeypa
         lambda **kwargs: (lambda stage, payload: {}),
     )
 
+    claim_calls = 0
+
     def fake_claim_semantic_jobs(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls > 1:
+            return {"claim_id": "claim-empty", "claimed_count": 0, "jobs": []}
         return {
             "claim_id": "claim-demo",
             "claimed_count": 3,
@@ -195,6 +202,183 @@ def test_semantic_worker_node_drain_processes_claimed_nodes_in_parallel(monkeypa
     semantic_worker._drain_node("demo", "scope-demo")
 
     assert max_active == 3
+
+
+def test_semantic_worker_node_drain_retries_empty_claim_with_pending_jobs(monkeypatch):
+    fake_conn = _FakeConn()
+    processed: list[str] = []
+    published: list[tuple[str, dict]] = []
+    claim_calls = 0
+    semantic_worker._reset_worker_runtime_for_tests()
+    monkeypatch.setattr(
+        semantic_worker,
+        "_worker_runtime_config",
+        lambda project_id="": {
+            "max_workers": 1,
+            "claim_batch_size": 2,
+            "lease_seconds": 600,
+        },
+    )
+    monkeypatch.setattr(semantic_worker, "_project_root_for", lambda project_id: ".")
+    monkeypatch.setattr(
+        "agent.governance.db.get_connection",
+        lambda project_id: fake_conn,
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.load_semantic_enrichment_config",
+        lambda project_root=None: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_config.apply_project_ai_routing",
+        lambda config, project_id=None: config,
+    )
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_ai.build_semantic_ai_call",
+        lambda **kwargs: (lambda stage, payload: {}),
+    )
+
+    def fake_claim_semantic_jobs(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            return {
+                "claim_id": "claim-first",
+                "claimed_count": 2,
+                "jobs": [{"node_id": "L7.1"}, {"node_id": "L7.2"}],
+            }
+        if claim_calls == 2:
+            return {"claim_id": "claim-gap", "claimed_count": 0, "jobs": []}
+        if claim_calls == 3:
+            return {
+                "claim_id": "claim-retry",
+                "claimed_count": 1,
+                "jobs": [{"node_id": "L7.3"}],
+            }
+        return {"claim_id": "claim-empty", "claimed_count": 0, "jobs": []}
+
+    def fake_pending_count(conn, project_id, snapshot_id, *, worker_id):
+        return 1 if claim_calls == 2 else 0
+
+    def fake_process_node_job(project_id, snapshot_id, *, root, ai_call, node_id):
+        processed.append(node_id)
+        return {"ok": True, "node_id": node_id}
+
+    def fake_publish(topic, payload):
+        published.append((topic, payload))
+
+    monkeypatch.setattr(
+        "agent.governance.reconcile_semantic_enrichment.claim_semantic_jobs",
+        fake_claim_semantic_jobs,
+    )
+    monkeypatch.setattr(
+        semantic_worker,
+        "_count_claimable_pending_node_jobs",
+        fake_pending_count,
+    )
+    monkeypatch.setattr(
+        semantic_worker,
+        "_process_node_semantic_job",
+        fake_process_node_job,
+    )
+    monkeypatch.setattr(
+        semantic_worker,
+        "_finalize_completed_node_jobs_from_events",
+        lambda project_id, snapshot_id, *, node_ids: len(node_ids),
+    )
+    monkeypatch.setattr("agent.governance.event_bus.publish", fake_publish)
+
+    semantic_worker._drain_node("demo", "scope-demo")
+
+    assert processed == ["L7.1", "L7.2", "L7.3"]
+    assert claim_calls == 4
+    assert any(topic == "semantic_worker.drain_gap" for topic, _payload in published)
+    gap_payload = next(
+        payload for topic, payload in published if topic == "semantic_worker.drain_gap"
+    )
+    assert gap_payload["pending_count"] == 1
+    assert gap_payload["claim_id"] == "claim-gap"
+
+
+def test_semantic_worker_records_drain_gap_event():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+
+    semantic_worker._record_node_drain_gap(
+        conn,
+        "demo",
+        "scope-demo",
+        pending_count=1,
+        claim_id="claim-gap",
+        batch_count=1,
+        retry_count=1,
+    )
+
+    row = conn.execute(
+        """
+        SELECT event_type, event_kind, target_type, target_id, status,
+               operation_type, payload_json, evidence_json, created_by
+        FROM graph_events
+        """
+    ).fetchone()
+    assert row is not None
+    payload = json.loads(row["payload_json"])
+    evidence = json.loads(row["evidence_json"])
+    assert row["event_type"] == "semantic_job_requested"
+    assert row["event_kind"] == "semantic_job"
+    assert row["target_type"] == "snapshot"
+    assert row["target_id"] == "scope-demo"
+    assert row["status"] == graph_events.EVENT_STATUS_OBSERVED
+    assert row["operation_type"] == "node_semantic_drain_gap"
+    assert row["created_by"] == "semantic_worker_inproc"
+    assert payload["pending_count"] == 1
+    assert payload["claim_id"] == "claim-gap"
+    assert evidence["source"] == "semantic_worker_inproc"
+
+
+def test_claim_semantic_jobs_does_not_increment_unclaimed_attempts():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    semantic._ensure_semantic_state_schema(conn)
+    for node_id in ["L7.1", "L7.2"]:
+        conn.execute(
+            """
+            INSERT INTO graph_semantic_jobs
+              (project_id, snapshot_id, node_id, status, updated_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "demo",
+                "scope-demo",
+                node_id,
+                "pending_ai",
+                "2026-05-18T00:00:00Z",
+                "2026-05-18T00:00:00Z",
+            ),
+        )
+
+    claim = semantic.claim_semantic_jobs(
+        conn,
+        "demo",
+        "scope-demo",
+        worker_id="worker-1",
+        statuses=["pending_ai"],
+        limit=1,
+        lease_seconds=600,
+        actor="test",
+    )
+
+    assert claim["claimed_count"] == 1
+    rows = {
+        row["node_id"]: row["attempt_count"]
+        for row in conn.execute(
+            """
+            SELECT node_id, attempt_count
+            FROM graph_semantic_jobs
+            ORDER BY node_id
+            """
+        )
+    }
+    assert rows == {"L7.1": 1, "L7.2": 0}
 
 
 def test_semantic_worker_finalize_node_job_clears_claim_state():
