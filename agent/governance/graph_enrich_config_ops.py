@@ -113,6 +113,7 @@ GRAPH_ENRICH_CONFIG_NON_RETRYABLE_GATE_ERRORS: set[str] = {
     "duplicate_or_weaken_existing_rule",
     "existing_rule_conflict",
 }
+ADDITIVE_RULE_PREDICATES = {"raw_target_in"}
 MAX_AI_REPAIR_ATTEMPTS = 1
 _REQUIRED_OPERATION_FIELDS = {
     name: ["op", "rule_id", "edge", "source_evidence", "action"]
@@ -510,6 +511,8 @@ def _validate_operation(
     )
     if existing_rule.get("error"):
         errors.append(str(existing_rule["error"]))
+    if existing_rule.get("merged_rule"):
+        normalizations.append("existing_rule_additive_merge")
     confidence = op.get("confidence")
     if confidence is not None:
         try:
@@ -534,6 +537,9 @@ def _validate_operation(
     }
     if existing_rule:
         report["existing_rule"] = existing_rule
+    merged_rule = existing_rule.get("merged_rule") if isinstance(existing_rule, Mapping) else {}
+    if isinstance(merged_rule, Mapping) and merged_rule:
+        report["config_rule"] = dict(merged_rule)
     if upstream_proposal:
         report["upstream_proposal"] = upstream_proposal
         normalizations.append("classified_as_upstream_proposal")
@@ -634,6 +640,10 @@ def _config_patch_for_operations(operations: list[dict[str, Any]]) -> dict[str, 
                 }
             )
             continue
+        config_rule = op.get("config_rule") if isinstance(op.get("config_rule"), Mapping) else {}
+        if config_rule:
+            rules[op["rule_id"]] = dict(config_rule)
+            continue
         rules[op["rule_id"]] = {
             "op": op["op"],
             "edge": op["edge"],
@@ -676,6 +686,18 @@ def _existing_rule_diagnostic(
         return {}
     incoming = _canonical_rule(operation)
     existing = _canonical_rule(existing_raw)
+    additive_merge = _additive_update_rule_merge(existing_raw, operation, existing, incoming)
+    if additive_merge:
+        return {
+            "rule_id": rule_id,
+            "relation": "incoming_additive_merge",
+            "existing": existing,
+            "reason": (
+                "update_rule adds target-specific predicate values to an existing rule "
+                "without removing existing coverage"
+            ),
+            "merged_rule": additive_merge,
+        }
     relation = _existing_rule_relation(existing, incoming)
     diagnostic = {
         "rule_id": rule_id,
@@ -698,6 +720,47 @@ def _existing_rule_diagnostic(
             "or an explicit observer-authored config override"
         )
     return diagnostic
+
+
+def _additive_update_rule_merge(
+    existing_raw: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    existing: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+) -> dict[str, Any]:
+    if str(operation.get("op") or "") != "update_rule":
+        return {}
+    behavior_keys = ("edge", "source_evidence", "action", "downgrade_to")
+    if any(str(existing.get(key) or "") != str(incoming.get(key) or "") for key in behavior_keys):
+        return {}
+    existing_when = existing.get("when")
+    incoming_when = incoming.get("when")
+    existing_map = _when_condition_map(existing_when)
+    incoming_map = _when_condition_map(incoming_when)
+    if "raw_target_in" not in existing_map or "raw_target_in" not in incoming_map:
+        return {}
+    existing_non_additive = set(existing_map) - ADDITIVE_RULE_PREDICATES
+    incoming_non_additive = set(incoming_map) - ADDITIVE_RULE_PREDICATES
+    if existing_non_additive != incoming_non_additive:
+        return {}
+    for predicate in sorted(existing_non_additive):
+        if existing_map.get(predicate) != incoming_map.get(predicate):
+            return {}
+    existing_values = _when_predicate_values(existing_when, "raw_target_in")
+    incoming_values = _when_predicate_values(incoming_when, "raw_target_in")
+    existing_set = set(existing_values)
+    additions = [value for value in incoming_values if value not in existing_set]
+    if not additions:
+        return {}
+    return {
+        "op": str(existing_raw.get("op") or operation.get("op") or "").strip(),
+        "edge": str(existing.get("edge") or ""),
+        "source_evidence": str(existing.get("source_evidence") or ""),
+        "action": str(existing.get("action") or ""),
+        "downgrade_to": str(existing.get("downgrade_to") or ""),
+        "reason": _reason(operation.get("evidence")) or _reason(existing_raw.get("reason")),
+        "when": _merge_when_predicate_values(existing_when, "raw_target_in", additions),
+    }
 
 
 def _canonical_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -756,6 +819,40 @@ def _when_condition_map(raw_when: Any) -> dict[str, set[str]]:
             continue
         out.setdefault(predicate, set()).update(_predicate_values(item))
     return out
+
+
+def _when_predicate_values(raw_when: Any, predicate: str) -> list[str]:
+    normalized = _normalize_when(raw_when)
+    if normalized["errors"] or not normalized["when"]:
+        return []
+    for item in normalized["when"].get("all") or []:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("predicate") or "") == predicate:
+            return _predicate_values(item)
+    return []
+
+
+def _merge_when_predicate_values(raw_when: Any, predicate: str, additions: list[str]) -> dict[str, Any]:
+    normalized = _normalize_when(raw_when)
+    if normalized["errors"] or not normalized["when"]:
+        return {}
+    merged_all: list[dict[str, Any]] = []
+    for item in normalized["when"].get("all") or []:
+        if not isinstance(item, Mapping):
+            continue
+        current = dict(item)
+        if str(current.get("predicate") or "") == predicate:
+            values = _predicate_values(current)
+            seen = set(values)
+            for value in additions:
+                if value in seen:
+                    continue
+                values.append(value)
+                seen.add(value)
+            current = {"predicate": predicate, "values": values}
+        merged_all.append(current)
+    return {"all": merged_all} if merged_all else {}
 
 
 def _op_action_compatibility_errors(op_name: str, action: str) -> list[str]:

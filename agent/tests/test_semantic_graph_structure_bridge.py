@@ -113,6 +113,35 @@ def _write_generated_project(root: Path) -> None:
     )
 
 
+def _write_existing_emits_event_update_rule(root: Path) -> None:
+    _write(
+        root / PROJECT_OVERRIDE_PATH,
+        "\n".join(
+            [
+                "graph_enrich_config_ops:",
+                "  schema_version: graph_enrich_config_ops.v1",
+                "  rules:",
+                "    emits_event.string_literal.exclude_library_method_and_module_tokens:",
+                "      op: update_rule",
+                "      edge: emits_event",
+                "      source_evidence: string_literal",
+                "      action: reject",
+                "      downgrade_to: ignore",
+                "      reason: Existing dogfood string literal exclusion rule.",
+                "      when:",
+                "        all:",
+                "          - predicate: source_evidence_is",
+                "            value: string_literal",
+                "          - predicate: raw_target_in",
+                "            values:",
+                "              - governance_db",
+                "              - auto_chain_py",
+                "",
+            ]
+        ),
+    )
+
+
 def _create_snapshot(conn: sqlite3.Connection, project: Path, snapshot_id: str) -> str:
     result = run_state_only_full_reconcile(
         conn,
@@ -896,6 +925,86 @@ def test_bridge_converts_semantic_graph_enrich_config_suggestion_to_dry_run_job(
         "observed": 1,
         "proposed": 1,
     }
+
+
+def test_bridge_drains_update_rule_additive_raw_target_merge(
+    conn,
+    tmp_path,
+):
+    project = tmp_path / "generated-project"
+    _write_generated_project(project)
+    _write_existing_emits_event_update_rule(project)
+    snapshot_id = _create_snapshot(conn, project, "semantic-bridge-config-additive-merge")
+    service_id = _node_id_for_primary(snapshot_id, "agent/service.py")
+    event = _semantic_event(
+        conn,
+        snapshot_id,
+        service_id,
+        {
+            "graph_enrich_config_suggestions": [
+                {
+                    "op": "update_rule",
+                    "rule_id": "emits_event.string_literal.exclude_library_method_and_module_tokens",
+                    "edge": "emits_event",
+                    "source_evidence": "string_literal",
+                    "action": "reject",
+                    "downgrade_to": "ignore",
+                    "confidence": 0.82,
+                    "when": {
+                        "all": [
+                            {"predicate": "source_evidence_is", "value": "string_literal"},
+                            {
+                                "predicate": "raw_target_in",
+                                "values": ["gpt-5.5", "powershell.exe"],
+                            },
+                        ]
+                    },
+                    "evidence": {
+                        "reason": (
+                            "Dogfood L7.139: model ids and shell executable names "
+                            "are not emitted runtime events."
+                        ),
+                    },
+                }
+            ],
+        },
+        event_id="sem-bridge-config-additive-merge",
+    )
+
+    result = bridge.bridge_semantic_events_to_graph_enrich_config_jobs(
+        conn,
+        PID,
+        snapshot_id,
+        event_ids=[event["event_id"]],
+        actor="test",
+        project_root=str(project),
+    )
+    conn.commit()
+
+    assert result["ok"] is True
+    assert result["queued_count"] == 1
+    semantic_worker._drain_graph_enrich_config(PID, snapshot_id)
+
+    completed = graph_events.list_events(
+        conn,
+        PID,
+        snapshot_id,
+        event_types=["graph_enrich_config_completed"],
+    )
+    assert len(completed) == 1
+    gate_result = completed[0]["payload"]["result"]
+    assert gate_result["ok"] is True
+    operation = gate_result["gate"]["operations"][0]
+    assert operation["existing_rule"]["relation"] == "incoming_additive_merge"
+    rule = gate_result["preview"]["graph_enrich_config_ops"]["rules"][
+        "emits_event.string_literal.exclude_library_method_and_module_tokens"
+    ]
+    assert rule["when"]["all"][1]["values"] == [
+        "governance_db",
+        "auto_chain_py",
+        "gpt_5_5",
+        "powershell_exe",
+    ]
 
 
 def test_bridge_skips_graph_enrich_policy_ops_that_gate_would_reject(
