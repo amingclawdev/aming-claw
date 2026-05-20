@@ -1349,6 +1349,354 @@ def _extract_batch_ai_responses(
     return out
 
 
+def _json_payload_size(payload: Any) -> int:
+    try:
+        return len(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    except Exception:
+        return len(str(payload or ""))
+
+
+def _normal_int(raw: Any, default: int, *, minimum: int = 1) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def _feature_functions(feature: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = feature.get("metadata") if isinstance(feature.get("metadata"), dict) else {}
+    raw_functions = metadata.get("functions")
+    functions: list[dict[str, Any]] = []
+    if isinstance(raw_functions, list):
+        for idx, item in enumerate(raw_functions):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("function") or item.get("qualname") or "").strip()
+            path = str(item.get("path") or item.get("file") or "").strip()
+            if not name and not path:
+                continue
+            try:
+                lineno = int(item.get("lineno") or item.get("line") or item.get("start_line") or 0)
+            except (TypeError, ValueError):
+                lineno = 0
+            try:
+                end_lineno = int(item.get("end_lineno") or item.get("end_line") or 0)
+            except (TypeError, ValueError):
+                end_lineno = 0
+            functions.append({
+                **item,
+                "name": name,
+                "path": path,
+                "lineno": lineno,
+                "end_lineno": end_lineno,
+                "order": idx,
+            })
+    if functions:
+        return sorted(
+            functions,
+            key=lambda item: (
+                str(item.get("path") or ""),
+                int(item.get("lineno") or 0),
+                int(item.get("order") or 0),
+                str(item.get("name") or ""),
+            ),
+        )
+
+    function_hashes = feature.get("function_hashes") if isinstance(feature.get("function_hashes"), dict) else {}
+    for idx, key in enumerate(sorted(function_hashes)):
+        name = str(key).split("::")[-1].split(".")[-1]
+        functions.append({"name": name, "path": "", "lineno": 0, "end_lineno": 0, "order": idx})
+    return functions
+
+
+def _function_hash_subset(feature: dict[str, Any], functions: list[dict[str, Any]]) -> dict[str, str]:
+    hashes = feature.get("function_hashes") if isinstance(feature.get("function_hashes"), dict) else {}
+    if not hashes:
+        return {}
+    names = {str(item.get("name") or "").strip() for item in functions if str(item.get("name") or "").strip()}
+    paths = {str(item.get("path") or "").strip() for item in functions if str(item.get("path") or "").strip()}
+    out: dict[str, str] = {}
+    for key, value in hashes.items():
+        key_s = str(key)
+        if any(key_s.endswith(f"::{name}") or key_s.endswith(f".{name}") or key_s == name for name in names):
+            out[key_s] = str(value)
+            continue
+        if any(path and path in key_s for path in paths):
+            out[key_s] = str(value)
+    return out
+
+
+def _source_lines_by_path(project_root: Path | None, paths: list[str]) -> dict[str, list[str]]:
+    if project_root is None:
+        return {}
+    out: dict[str, list[str]] = {}
+    for rel in paths:
+        path = project_root / rel
+        try:
+            out[rel] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+    return out
+
+
+def _slice_source_excerpt(
+    functions: list[dict[str, Any]],
+    *,
+    source_lines: dict[str, list[str]],
+    max_chars: int,
+) -> dict[str, str]:
+    if max_chars <= 0:
+        return {}
+    by_path: dict[str, list[str]] = {}
+    remaining = max_chars
+    sorted_functions = sorted(
+        functions,
+        key=lambda item: (str(item.get("path") or ""), int(item.get("lineno") or 0), str(item.get("name") or "")),
+    )
+    next_by_path: dict[tuple[str, int], int] = {}
+    by_path_functions: dict[str, list[dict[str, Any]]] = {}
+    for item in sorted_functions:
+        path = str(item.get("path") or "")
+        if path:
+            by_path_functions.setdefault(path, []).append(item)
+    for path, items in by_path_functions.items():
+        for idx, item in enumerate(items):
+            if int(item.get("end_lineno") or 0) > 0:
+                next_by_path[(path, int(item.get("order") or idx))] = int(item.get("end_lineno") or 0)
+            elif idx + 1 < len(items) and int(items[idx + 1].get("lineno") or 0) > 0:
+                next_by_path[(path, int(item.get("order") or idx))] = int(items[idx + 1].get("lineno") or 0) - 1
+
+    for item in sorted_functions:
+        if remaining <= 0:
+            break
+        path = str(item.get("path") or "")
+        lines = source_lines.get(path) or []
+        if not path or not lines:
+            continue
+        start = max(1, int(item.get("lineno") or 1))
+        fallback_end = min(len(lines), start + 80)
+        end = int(item.get("end_lineno") or 0)
+        if end <= 0:
+            end = next_by_path.get((path, int(item.get("order") or 0)), fallback_end)
+        end = max(start, min(len(lines), end))
+        snippet = "\n".join(lines[start - 1:end])
+        if not snippet:
+            continue
+        header = f"# function {item.get('name') or '<anonymous>'} lines {start}-{end}\n"
+        chunk = (header + snippet)[:remaining]
+        by_path.setdefault(path, []).append(chunk)
+        remaining -= len(chunk)
+    return {path: "\n\n".join(chunks) for path, chunks in by_path.items()}
+
+
+def _compact_feature_for_slice(
+    feature: dict[str, Any],
+    functions: list[dict[str, Any]],
+    *,
+    source_excerpt: dict[str, str],
+) -> dict[str, Any]:
+    compact = copy.deepcopy(feature)
+    metadata = compact.get("metadata") if isinstance(compact.get("metadata"), dict) else {}
+    compact["metadata"] = dict(metadata)
+    compact["metadata"]["functions"] = [
+        {
+            key: item.get(key)
+            for key in ("name", "path", "lineno", "end_lineno")
+            if item.get(key) not in {None, ""}
+        }
+        for item in functions
+    ]
+    compact["metadata"]["function_count"] = len(functions)
+    compact["function_hashes"] = _function_hash_subset(feature, functions)
+    compact["source_excerpt"] = source_excerpt
+    return compact
+
+
+def _plan_semantic_function_slices(
+    feature: dict[str, Any],
+    *,
+    project_root: Path | None,
+    max_slices: int,
+    max_functions_per_slice: int,
+    max_source_chars: int,
+) -> dict[str, Any]:
+    functions = _feature_functions(feature)
+    if not functions:
+        return {"enabled": False, "reason": "no_functions", "slices": []}
+    max_slices = _normal_int(max_slices, 16)
+    max_functions_per_slice = _normal_int(max_functions_per_slice, 40)
+    max_source_chars = _normal_int(max_source_chars, 12000, minimum=500)
+    if len(functions) > max_slices * max_functions_per_slice:
+        max_functions_per_slice = max(max_functions_per_slice, (len(functions) + max_slices - 1) // max_slices)
+    primary_paths = _path_list(feature.get("primary"))
+    function_paths = sorted({str(item.get("path") or "") for item in functions if str(item.get("path") or "")})
+    source_lines = _source_lines_by_path(project_root, function_paths or primary_paths)
+    slices: list[dict[str, Any]] = []
+    for idx in range(0, len(functions), max_functions_per_slice):
+        part = functions[idx: idx + max_functions_per_slice]
+        slice_index = len(slices)
+        slice_id = f"{feature.get('node_id') or 'node'}:slice-{slice_index:03d}"
+        source_excerpt = _slice_source_excerpt(
+            part,
+            source_lines=source_lines,
+            max_chars=max_source_chars,
+        )
+        compact_feature = _compact_feature_for_slice(feature, part, source_excerpt=source_excerpt)
+        slices.append({
+            "slice_id": slice_id,
+            "slice_index": slice_index,
+            "covered_functions": [
+                {
+                    "name": item.get("name") or "",
+                    "path": item.get("path") or "",
+                    "lineno": int(item.get("lineno") or 0),
+                    "end_lineno": int(item.get("end_lineno") or 0),
+                }
+                for item in part
+            ],
+            "feature": compact_feature,
+            "function_hashes": compact_feature.get("function_hashes") or {},
+            "source_excerpt_chars": sum(len(value) for value in source_excerpt.values()),
+        })
+        if len(slices) >= max_slices:
+            break
+    return {
+        "enabled": True,
+        "reason": "function_count_threshold",
+        "function_count": len(functions),
+        "slice_count": len(slices),
+        "max_functions_per_slice": max_functions_per_slice,
+        "max_source_chars": max_source_chars,
+        "slices": slices,
+    }
+
+
+def _prompt_too_long_response(response: dict[str, Any] | None) -> bool:
+    if not isinstance(response, dict):
+        return False
+    text = str(response.get("_ai_error") or response.get("error") or response.get("result") or "")
+    text = text.lower()
+    return "prompt_too_long" in text or "prompt is too long" in text or "context length" in text
+
+
+def _slice_response_self_check(responses: list[dict[str, Any]]) -> dict[str, Any]:
+    checks = [
+        item.get("self_check")
+        for item in responses
+        if isinstance(item, dict) and isinstance(item.get("self_check"), dict)
+    ]
+    valid = bool(responses) and all(not item.get("_ai_error") for item in responses)
+    return {
+        "required": True,
+        "valid": valid,
+        "status": "passed" if valid else "failed",
+        "checked_rules": [
+            "required_fields_present",
+            "source_payload_only",
+            "no_project_mutation",
+            "review_feedback_accounted_for",
+            "chunk_slices_accounted_for",
+        ],
+        "checked_rules_count": 5,
+        "repair_attempts": 0,
+        "max_repair_attempts": 1,
+        "known_risks": [
+            "Node semantic payload was deterministically aggregated from function-slice AI outputs."
+        ] + [
+            risk
+            for check in checks
+            for risk in (check.get("known_risks") or [])[:2]
+            if isinstance(check, dict)
+        ][:6],
+    }
+
+
+def _aggregate_chunked_semantic_response(
+    feature: dict[str, Any],
+    feedback: list[dict[str, Any]],
+    plan: dict[str, Any],
+    responses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ok_responses = [item for item in responses if isinstance(item, dict) and not item.get("_ai_error")]
+    if len(ok_responses) != len(plan.get("slices") or []):
+        return {
+            "_ai_error": "semantic chunk aggregation failed: one or more slices failed",
+            "semantic_chunking": {
+                "mode": "function_slices",
+                "status": "failed",
+                "slice_count": len(plan.get("slices") or []),
+                "completed_slice_count": len(ok_responses),
+            },
+        }
+    summaries = [
+        str(item.get("semantic_summary") or item.get("purpose") or "").strip()
+        for item in ok_responses
+        if str(item.get("semantic_summary") or item.get("purpose") or "").strip()
+    ]
+    first = ok_responses[0] if ok_responses else {}
+    slice_records = []
+    for slice_plan, response in zip(plan.get("slices") or [], ok_responses):
+        slice_records.append({
+            "slice_id": slice_plan.get("slice_id") or "",
+            "slice_index": slice_plan.get("slice_index", 0),
+            "covered_functions": slice_plan.get("covered_functions") or [],
+            "function_hashes": slice_plan.get("function_hashes") or {},
+            "semantic_summary": str(response.get("semantic_summary") or response.get("purpose") or ""),
+            "self_check": response.get("self_check") if isinstance(response.get("self_check"), dict) else {},
+        })
+    def collect(key: str) -> list[Any]:
+        out: list[Any] = []
+        seen: set[str] = set()
+        for item in ok_responses:
+            raw = item.get(key)
+            values = raw if isinstance(raw, list) else []
+            for value in values:
+                fingerprint = json.dumps(value, sort_keys=True, ensure_ascii=False) if isinstance(value, dict) else str(value)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                out.append(value)
+        return out
+
+    return {
+        "node_id": feature.get("node_id") or "",
+        "feature_name": str(first.get("feature_name") or feature.get("title") or feature.get("node_id") or ""),
+        "semantic_summary": (
+            f"Chunked semantic aggregate over {len(slice_records)} function slices. "
+            + " ".join(summaries)
+        )[:4000],
+        "intent": str(first.get("intent") or first.get("purpose") or ""),
+        "domain_label": str(first.get("domain_label") or ""),
+        "applied_feedback_ids": collect("applied_feedback_ids"),
+        "rejected_feedback_ids": collect("rejected_feedback_ids"),
+        "doc_coverage_review": first.get("doc_coverage_review") or {},
+        "test_coverage_review": first.get("test_coverage_review") or {},
+        "config_coverage_review": first.get("config_coverage_review") or {},
+        "graph_structure_suggestions": collect("graph_structure_suggestions"),
+        "graph_structure_candidates": collect("graph_structure_candidates"),
+        "graph_enrich_config_suggestions": collect("graph_enrich_config_suggestions"),
+        "graph_enrich_config_candidates": collect("graph_enrich_config_candidates"),
+        "dead_code_candidates": collect("dead_code_candidates"),
+        "health_issues": collect("health_issues"),
+        "self_check": _slice_response_self_check(ok_responses),
+        "semantic_chunking": {
+            "mode": "function_slices",
+            "status": "complete",
+            "function_count": plan.get("function_count", 0),
+            "slice_count": len(slice_records),
+            "completed_slice_count": len(slice_records),
+            "slices": slice_records,
+        },
+        "_ai_route": first.get("_ai_route") or {},
+        "_ai_elapsed_ms": sum(
+            int(item.get("_ai_elapsed_ms") or 0)
+            for item in ok_responses
+            if isinstance(item.get("_ai_elapsed_ms") or 0, int)
+        ),
+    }
+
+
 def _safe_node_filename(node_id: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in node_id)
     return safe or "feature"
@@ -2640,6 +2988,11 @@ def _semantic_state_entry(
             if isinstance(semantic_entry.get("semantic_graph_query_audit"), dict)
             else {}
         ),
+        "semantic_chunking": (
+            semantic_entry.get("semantic_chunking")
+            if isinstance(semantic_entry.get("semantic_chunking"), dict)
+            else {}
+        ),
         "open_issues": open_issues,
         "health_issues": health_issues,
         "feedback_round": feedback_round,
@@ -3145,6 +3498,12 @@ def run_semantic_enrichment(
     semantic_ai_batch_size: int | None = None,
     semantic_ai_batch_by: str = "subsystem",
     semantic_ai_input_mode: str | None = None,
+    semantic_ai_chunk_large_nodes: bool | None = None,
+    semantic_ai_chunk_function_threshold: int | None = None,
+    semantic_ai_chunk_payload_threshold_chars: int | None = None,
+    semantic_ai_chunk_max_slices: int | None = None,
+    semantic_ai_chunk_max_functions_per_slice: int | None = None,
+    semantic_ai_chunk_max_source_chars: int | None = None,
     semantic_dynamic_graph_state: bool | None = None,
     semantic_graph_state: bool = True,
     semantic_skip_completed: bool = True,
@@ -3308,6 +3667,33 @@ def run_semantic_enrichment(
         semantic_ai_input_mode,
         default=semantic_config.execution_policy.ai_input_mode,
     )
+    chunk_large_nodes = (
+        bool(semantic_config.execution_policy.chunk_large_nodes)
+        if semantic_ai_chunk_large_nodes is None
+        else bool(semantic_ai_chunk_large_nodes)
+    )
+    chunk_function_threshold = _normal_int(
+        semantic_ai_chunk_function_threshold,
+        semantic_config.execution_policy.chunk_function_threshold,
+    )
+    chunk_payload_threshold_chars = _normal_int(
+        semantic_ai_chunk_payload_threshold_chars,
+        semantic_config.execution_policy.chunk_payload_threshold_chars,
+        minimum=1000,
+    )
+    chunk_max_slices = _normal_int(
+        semantic_ai_chunk_max_slices,
+        semantic_config.execution_policy.chunk_max_slices,
+    )
+    chunk_max_functions_per_slice = _normal_int(
+        semantic_ai_chunk_max_functions_per_slice,
+        semantic_config.execution_policy.chunk_max_functions_per_slice,
+    )
+    chunk_max_source_chars = _normal_int(
+        semantic_ai_chunk_max_source_chars,
+        semantic_config.execution_policy.chunk_max_source_chars,
+        minimum=500,
+    )
     dynamic_graph_state = (
         semantic_config.execution_policy.dynamic_semantic_graph_state
         if semantic_dynamic_graph_state is None
@@ -3317,6 +3703,10 @@ def run_semantic_enrichment(
     ai_batch_count = 0
     ai_batch_complete_count = 0
     ai_batch_error_count = 0
+    ai_chunked_node_count = 0
+    ai_chunk_call_count = 0
+    ai_chunk_complete_count = 0
+    ai_chunk_error_count = 0
     semantic_graph_state_hit_count = 0
     payload_input_paths: list[str] = []
     payload_output_paths: list[str] = []
@@ -3453,6 +3843,111 @@ def run_semantic_enrichment(
         if audit:
             entry["graph_query_audit"] = dict(audit)
             entry["semantic_graph_query_audit"] = dict(audit)
+
+    def should_chunk_record(record: dict[str, Any]) -> bool:
+        if not chunk_large_nodes:
+            return False
+        feature = record.get("feature") if isinstance(record.get("feature"), dict) else {}
+        metadata = feature.get("metadata") if isinstance(feature.get("metadata"), dict) else {}
+        function_count = int(metadata.get("function_count") or len(_feature_functions(feature)) or 0)
+        if function_count >= chunk_function_threshold:
+            return True
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        return _json_payload_size(payload) >= chunk_payload_threshold_chars and bool(_feature_functions(feature))
+
+    def run_chunked_feature(
+        record: dict[str, Any],
+        *,
+        fallback_error: str = "",
+    ) -> dict[str, Any]:
+        nonlocal ai_chunked_node_count
+        nonlocal ai_chunk_call_count
+        nonlocal ai_chunk_complete_count
+        nonlocal ai_chunk_error_count
+
+        feature = record.get("feature") if isinstance(record.get("feature"), dict) else {}
+        node_id = str(feature.get("node_id") or "")
+        plan = _plan_semantic_function_slices(
+            feature,
+            project_root=root,
+            max_slices=chunk_max_slices,
+            max_functions_per_slice=chunk_max_functions_per_slice,
+            max_source_chars=chunk_max_source_chars,
+        )
+        slices = plan.get("slices") if isinstance(plan.get("slices"), list) else []
+        if not plan.get("enabled") or not slices:
+            ai_chunk_error_count += 1
+            return {
+                "_ai_error": fallback_error or f"semantic chunk plan unavailable: {plan.get('reason') or 'unknown'}",
+                "semantic_chunking": {
+                    "mode": "function_slices",
+                    "status": "failed",
+                    "reason": plan.get("reason") or "chunk_plan_unavailable",
+                },
+            }
+        ai_chunked_node_count += 1
+        responses: list[dict[str, Any]] = []
+        for slice_plan in slices:
+            slice_payload = copy.deepcopy(record["payload"])
+            slice_payload["feature"] = slice_plan.get("feature") if isinstance(slice_plan.get("feature"), dict) else {}
+            slice_payload["semantic_chunk"] = {
+                "mode": "function_slice",
+                "node_id": node_id,
+                "slice_id": slice_plan.get("slice_id") or "",
+                "slice_index": slice_plan.get("slice_index", 0),
+                "slice_count": len(slices),
+                "function_count": plan.get("function_count", 0),
+                "covered_functions": slice_plan.get("covered_functions") or [],
+                "fallback_error": fallback_error,
+            }
+            slice_payload["instructions"] = {
+                **slice_payload.get("instructions", {}),
+                "chunk_mode": True,
+                "chunk_output_contract": (
+                    "Return one JSON object describing only this function slice. "
+                    "Use the same semantic fields as single-feature enrichment; do not infer beyond covered_functions."
+                ),
+            }
+            slice_name = f"{record['node_name']}-slice-{int(slice_plan.get('slice_index') or 0):03d}"
+            if persist_feature_payloads:
+                write_json(
+                    payload_trace_base / "chunk-inputs" / f"{slice_name}.json",
+                    slice_payload,
+                )
+            response = _call_ai(
+                ai_call,
+                stage="reconcile_semantic_feature_slice",
+                payload=slice_payload,
+            )
+            ai_chunk_call_count += 1
+            if response is not None and not response.get("_ai_error"):
+                ai_chunk_complete_count += 1
+                responses.append(response)
+            else:
+                ai_chunk_error_count += 1
+                responses.append(response or {"_ai_error": "ai_response_missing"})
+            if persist_feature_payloads:
+                write_json(
+                    payload_trace_base / "chunk-outputs" / f"{slice_name}.json",
+                    {
+                        "node_id": node_id,
+                        "slice_id": slice_plan.get("slice_id") or "",
+                        "slice_index": slice_plan.get("slice_index", 0),
+                        "ai_response_present": bool(response and not response.get("_ai_error")),
+                        "ai_error": (
+                            response.get("_ai_error")
+                            if isinstance(response, dict)
+                            else "ai_response_missing"
+                        ),
+                        "ai_response": response if isinstance(response, dict) else None,
+                    },
+                )
+        return _aggregate_chunked_semantic_response(
+            feature,
+            record["feedback"],
+            plan,
+            responses,
+        )
 
     # MF-2026-05-10-015: load the base projection's current-node set so
     # we don't spuriously re-enqueue phantom-current carried_forward nodes.
@@ -3593,11 +4088,19 @@ def run_semantic_enrichment(
                         persist_node_ids=persist_node_ids,
                         persist_edge_ids=persist_edge_ids,
                     )
-                response = _call_ai(
-                    ai_call,
-                    stage="reconcile_semantic_feature",
-                    payload=record["payload"],
+                if should_chunk_record(record):
+                    response = run_chunked_feature(record)
+                else:
+                    response = _call_ai(
+                        ai_call,
+                        stage="reconcile_semantic_feature",
+                        payload=record["payload"],
                     )
+                    if _prompt_too_long_response(response):
+                        response = run_chunked_feature(
+                            record,
+                            fallback_error=str(response.get("_ai_error") or ""),
+                        )
                 if response is not None:
                     ai_responses[node_id] = response
                 if semantic_state_enabled:
@@ -3627,6 +4130,8 @@ def run_semantic_enrichment(
                     )
                     if response.get("_ai_route"):
                         state_entry["semantic_ai_route"] = response.get("_ai_route")
+                    if isinstance(response.get("semantic_chunking"), dict):
+                        state_entry["semantic_chunking"] = response["semantic_chunking"]
                     attach_graph_query_audit_entry(state_entry, record)
                     _upsert_semantic_graph_state_entry(
                         semantic_state,
@@ -3832,6 +4337,8 @@ def run_semantic_enrichment(
                         )
                         if response.get("_ai_route"):
                             state_entry["semantic_ai_route"] = response.get("_ai_route")
+                        if isinstance(response.get("semantic_chunking"), dict):
+                            state_entry["semantic_chunking"] = response["semantic_chunking"]
                         attach_graph_query_audit_entry(state_entry, record)
                         _upsert_semantic_graph_state_entry(
                             semantic_state,
@@ -3923,6 +4430,8 @@ def run_semantic_enrichment(
                     semantic_entry["semantic_ai_route"] = ai_response.get("_ai_route")
                 if ai_response.get("_ai_elapsed_ms") is not None:
                     semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
+                if isinstance(ai_response.get("semantic_chunking"), dict):
+                    semantic_entry["semantic_chunking"] = ai_response["semantic_chunking"]
         attach_graph_query_audit_entry(semantic_entry, record)
         semantic_entry["semantic_selection_status"] = "selected" if selected_for_ai else "not_selected"
         semantic_entry["semantic_selection_reasons"] = selection_reasons
@@ -4039,6 +4548,18 @@ def run_semantic_enrichment(
             "batch_by": semantic_ai_batch_by,
             "batch_count": ai_batch_count,
         },
+        "semantic_chunking": {
+            "enabled": bool(chunk_large_nodes),
+            "function_threshold": chunk_function_threshold,
+            "payload_threshold_chars": chunk_payload_threshold_chars,
+            "max_slices": chunk_max_slices,
+            "max_functions_per_slice": chunk_max_functions_per_slice,
+            "max_source_chars": chunk_max_source_chars,
+            "chunked_node_count": ai_chunked_node_count,
+            "chunk_call_count": ai_chunk_call_count,
+            "chunk_complete_count": ai_chunk_complete_count,
+            "chunk_error_count": ai_chunk_error_count,
+        },
         "semantic_graph_state": semantic_graph_state_report,
         "semantic_batch_memory": memory_report,
         "feature_count": len(semantic_features),
@@ -4073,6 +4594,22 @@ def run_semantic_enrichment(
         "ai_batch_count": ai_batch_count,
         "ai_batch_complete_count": ai_batch_complete_count,
         "ai_batch_error_count": ai_batch_error_count,
+        "ai_chunked_node_count": ai_chunked_node_count,
+        "ai_chunk_call_count": ai_chunk_call_count,
+        "ai_chunk_complete_count": ai_chunk_complete_count,
+        "ai_chunk_error_count": ai_chunk_error_count,
+        "semantic_chunking": {
+            "enabled": bool(chunk_large_nodes),
+            "function_threshold": chunk_function_threshold,
+            "payload_threshold_chars": chunk_payload_threshold_chars,
+            "max_slices": chunk_max_slices,
+            "max_functions_per_slice": chunk_max_functions_per_slice,
+            "max_source_chars": chunk_max_source_chars,
+            "chunked_node_count": ai_chunked_node_count,
+            "chunk_call_count": ai_chunk_call_count,
+            "chunk_complete_count": ai_chunk_complete_count,
+            "chunk_error_count": ai_chunk_error_count,
+        },
         "semantic_graph_state": semantic_graph_state_report,
         "semantic_batch_memory": memory_report,
         "feedback_count": len(feedback),
@@ -4088,6 +4625,8 @@ def run_semantic_enrichment(
         "feature_payload_output_dir": str(payload_trace_base / "feature-outputs") if persist_feature_payloads else "",
         "batch_payload_input_dir": str(payload_trace_base / "batch-inputs") if persist_feature_payloads else "",
         "batch_payload_output_dir": str(payload_trace_base / "batch-outputs") if persist_feature_payloads else "",
+        "chunk_payload_input_dir": str(payload_trace_base / "chunk-inputs") if persist_feature_payloads else "",
+        "chunk_payload_output_dir": str(payload_trace_base / "chunk-outputs") if persist_feature_payloads else "",
     }
 
     base = _semantic_base_dir(project_id, snapshot_id)
@@ -4121,6 +4660,7 @@ def run_semantic_enrichment(
             "ai_batch_size": ai_batch_size,
             "ai_batch_by": semantic_ai_batch_by,
             "ai_batch_count": ai_batch_count,
+            "semantic_chunking": report["semantic_chunking"],
             "semantic_graph_state": semantic_graph_state_report,
             "semantic_batch_memory": memory_report,
             "feedback_count": len(feedback),

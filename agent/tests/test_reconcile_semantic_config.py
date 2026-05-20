@@ -60,6 +60,12 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.use_ai_default is False
     assert config.execution_policy.ai_input_mode == "feature"
     assert config.execution_policy.dynamic_semantic_graph_state is True
+    assert config.execution_policy.chunk_large_nodes is True
+    assert config.execution_policy.chunk_function_threshold == 80
+    assert config.execution_policy.chunk_payload_threshold_chars == 90000
+    assert config.execution_policy.chunk_max_slices == 16
+    assert config.execution_policy.chunk_max_functions_per_slice == 40
+    assert config.execution_policy.chunk_max_source_chars == 12000
     assert config.execution_policy.worker_max_concurrency == 10
     assert config.execution_policy.worker_claim_batch_size == 10
     assert config.execution_policy.worker_lease_seconds == 600
@@ -77,6 +83,8 @@ def test_default_semantic_config_loads_state_only_profile():
     assert payload["legacy_role_alias"] == "pm"
     assert payload["job_type"] == "node"
     assert payload["execution_policy"]["ai_input_mode"] == "feature"
+    assert payload["execution_policy"]["chunk_large_nodes"] is True
+    assert payload["execution_policy"]["chunk_max_slices"] == 16
     assert payload["execution_policy"]["worker_max_concurrency"] == 10
     assert payload["execution_policy"]["worker_claim_batch_size"] == 10
     assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"

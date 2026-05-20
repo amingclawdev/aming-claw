@@ -107,6 +107,12 @@ class SemanticInputPolicy:
 class SemanticExecutionPolicy:
     ai_input_mode: str = "feature"
     dynamic_semantic_graph_state: bool = True
+    chunk_large_nodes: bool = True
+    chunk_function_threshold: int = 80
+    chunk_payload_threshold_chars: int = 90000
+    chunk_max_slices: int = 16
+    chunk_max_functions_per_slice: int = 40
+    chunk_max_source_chars: int = 12000
     worker_max_concurrency: int = DEFAULT_SEMANTIC_WORKER_MAX_CONCURRENCY
     worker_claim_batch_size: int = DEFAULT_SEMANTIC_WORKER_CLAIM_BATCH_SIZE
     worker_lease_seconds: int = DEFAULT_SEMANTIC_WORKER_LEASE_SECONDS
@@ -233,6 +239,57 @@ class SemanticAnalyzerConfig:
             ),
             dynamic_semantic_graph_state=bool(
                 execution_policy_raw.get("dynamic_semantic_graph_state", True)
+            ),
+            chunk_large_nodes=bool(execution_policy_raw.get("chunk_large_nodes", True)),
+            chunk_function_threshold=_bounded_int(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_function_threshold",
+                    "semantic_chunk_function_threshold",
+                ),
+                default=80,
+                min_value=1,
+                max_value=10000,
+            ),
+            chunk_payload_threshold_chars=_bounded_int(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_payload_threshold_chars",
+                    "semantic_chunk_payload_threshold_chars",
+                ),
+                default=90000,
+                min_value=1000,
+                max_value=5_000_000,
+            ),
+            chunk_max_slices=_bounded_int(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_max_slices",
+                    "semantic_chunk_max_slices",
+                ),
+                default=16,
+                min_value=1,
+                max_value=256,
+            ),
+            chunk_max_functions_per_slice=_bounded_int(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_max_functions_per_slice",
+                    "semantic_chunk_max_functions_per_slice",
+                ),
+                default=40,
+                min_value=1,
+                max_value=1000,
+            ),
+            chunk_max_source_chars=_bounded_int(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_max_source_chars",
+                    "semantic_chunk_max_source_chars",
+                ),
+                default=12000,
+                min_value=500,
+                max_value=500000,
             ),
             worker_max_concurrency=_bounded_int(
                 _first_present(

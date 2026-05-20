@@ -1017,6 +1017,239 @@ def test_semantic_ai_graph_query_audit_uses_budget_safe_compact_neighbors(conn, 
     assert result["semantic_index"]["features"][0]["graph_query_audit"]["status"] == "complete"
 
 
+def test_semantic_enrichment_chunks_large_function_node_and_aggregates(conn, tmp_path):
+    project = tmp_path / "project"
+    source = "\n\n".join(
+        f"def generated_{idx}():\n    return {idx}\n"
+        for idx in range(6)
+    )
+    _write(project / "agent" / "governance" / "large_node.py", source)
+    functions = [
+        {
+            "name": f"generated_{idx}",
+            "path": "agent/governance/large_node.py",
+            "lineno": idx * 3 + 1,
+        }
+        for idx in range(6)
+    ]
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.large",
+                    "layer": "L7",
+                    "title": "Large Semantic Node",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_node.py"],
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "function_count": len(functions),
+                        "functions": functions,
+                        "function_hashes": {
+                            f"agent.governance.large_node::generated_{idx}": f"sha256:fn-{idx}"
+                            for idx in range(6)
+                        },
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+    calls: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        calls.append({"stage": stage, "payload": payload})
+        assert stage == "reconcile_semantic_feature_slice"
+        chunk = payload["semantic_chunk"]
+        assert chunk["mode"] == "function_slice"
+        assert len(chunk["covered_functions"]) <= 2
+        assert len(payload["feature"]["metadata"]["functions"]) <= 2
+        assert "graph_query_audit" in payload
+        names = ", ".join(item["name"] for item in chunk["covered_functions"])
+        return {
+            "feature_name": f"Slice {chunk['slice_index']}",
+            "semantic_summary": f"Slice covers {names}.",
+            "intent": "chunked semantic coverage",
+            "domain_label": "semantic.chunk",
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": [
+                    "required_fields_present",
+                    "source_payload_only",
+                    "no_project_mutation",
+                    "review_feedback_accounted_for",
+                    "graph_suggestions_contract_checked",
+                ],
+                "checked_rules_count": 5,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.large"],
+        semantic_ai_chunk_function_threshold=3,
+        semantic_ai_chunk_max_functions_per_slice=2,
+        semantic_ai_chunk_max_slices=8,
+        created_by="semantic-worker-test",
+        trace_dir=project / "semantic-trace",
+    )
+
+    assert [call["stage"] for call in calls] == [
+        "reconcile_semantic_feature_slice",
+        "reconcile_semantic_feature_slice",
+        "reconcile_semantic_feature_slice",
+    ]
+    assert result["summary"]["ai_complete_count"] == 1
+    assert result["summary"]["ai_chunked_node_count"] == 1
+    assert result["summary"]["ai_chunk_call_count"] == 3
+    feature = result["semantic_index"]["features"][0]
+    assert feature["enrichment_status"] == "ai_complete"
+    assert feature["semantic_chunking"]["status"] == "complete"
+    assert feature["semantic_chunking"]["slice_count"] == 3
+    assert feature["semantic_chunking"]["completed_slice_count"] == 3
+    assert feature["self_check"]["checked_rules"][-1] == "chunk_slices_accounted_for"
+    assert Path(result["summary"]["chunk_payload_input_dir"]).exists()
+    output = json.loads((project / "semantic-trace" / "feature-outputs" / "L7.large.json").read_text())
+    assert output["semantic_entry"]["semantic_chunking"]["mode"] == "function_slices"
+
+
+def test_semantic_enrichment_retries_prompt_too_long_with_function_slices(conn, tmp_path):
+    project = tmp_path / "project"
+    source = "\n\n".join(
+        f"def generated_{idx}():\n    return {idx}\n"
+        for idx in range(4)
+    )
+    _write(project / "agent" / "governance" / "large_retry.py", source)
+    functions = [
+        {
+            "name": f"generated_{idx}",
+            "path": "agent/governance/large_retry.py",
+            "lineno": idx * 3 + 1,
+        }
+        for idx in range(4)
+    ]
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.retry",
+                    "layer": "L7",
+                    "title": "Retry Semantic Node",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_retry.py"],
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "function_count": len(functions),
+                        "functions": functions,
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+    stages: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        stages.append(stage)
+        if stage == "reconcile_semantic_feature":
+            return {"_ai_error": "Prompt is too long", "terminal_reason": "prompt_too_long"}
+        assert stage == "reconcile_semantic_feature_slice"
+        assert payload["semantic_chunk"]["fallback_error"] == "Prompt is too long"
+        return {
+            "feature_name": "Retried slice",
+            "semantic_summary": "Retried bounded function slice.",
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": ["required_fields_present"],
+                "checked_rules_count": 1,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.retry"],
+        semantic_ai_chunk_large_nodes=True,
+        semantic_ai_chunk_function_threshold=99,
+        semantic_ai_chunk_max_functions_per_slice=2,
+        created_by="semantic-worker-test",
+    )
+
+    assert stages[0] == "reconcile_semantic_feature"
+    assert stages[1:] == [
+        "reconcile_semantic_feature_slice",
+        "reconcile_semantic_feature_slice",
+    ]
+    assert result["summary"]["ai_complete_count"] == 1
+    assert result["summary"]["ai_error_count"] == 0
+    feature = result["semantic_index"]["features"][0]
+    assert feature["semantic_chunking"]["status"] == "complete"
+    row = conn.execute(
+        """
+        SELECT status, semantic_json FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-test", "L7.retry"),
+    ).fetchone()
+    assert row["status"] == "ai_complete"
+    assert json.loads(row["semantic_json"])["semantic_chunking"]["slice_count"] == 2
+
+
 def test_semantic_enrichment_marks_missing_node_ai_self_check(conn, tmp_path):
     project = tmp_path / "project"
     _create_snapshot(conn, project)
