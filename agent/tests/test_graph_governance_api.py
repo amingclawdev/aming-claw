@@ -2066,6 +2066,132 @@ def test_semantic_jobs_explicit_node_ids_do_not_expand_by_inferred_layer(conn, t
     assert [dict(row) for row in rows] == [{"node_id": "L7.1", "status": "ai_pending"}]
 
 
+def test_semantic_jobs_stale_scope_uses_projection_stale_nodes(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    monkeypatch.setattr("agent.governance.event_bus.publish", lambda *_args, **_kwargs: None)
+    base_graph = _graph_with_dependency()
+    base_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-jobs-stale-base",
+        commit_sha="commit-a",
+        snapshot_kind="full",
+        graph_json=base_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        base_snapshot["snapshot_id"],
+        nodes=base_graph["deps_graph"]["nodes"],
+        edges=base_graph["deps_graph"]["edges"],
+    )
+    for node in base_graph["deps_graph"]["nodes"]:
+        node_id = str(node["id"])
+        graph_events.create_event(
+            conn,
+            PID,
+            base_snapshot["snapshot_id"],
+            event_type="semantic_node_enriched",
+            event_kind="semantic_job",
+            target_type="node",
+            target_id=node_id,
+            status=graph_events.EVENT_STATUS_ACCEPTED,
+            stable_node_key=graph_events.stable_node_key_for_node(node),
+            feature_hash=graph_events.feature_hash_for_node(node),
+            payload={"semantic_payload": {"feature_name": f"Base {node_id}"}},
+            created_by="test",
+        )
+    graph_events.build_semantic_projection(
+        conn,
+        PID,
+        base_snapshot["snapshot_id"],
+        actor="observer",
+        projection_id="semproj-stale-base",
+    )
+
+    current_graph = json.loads(json.dumps(base_graph))
+    current_graph["deps_graph"]["nodes"][1]["title"] = "Dependency Node Renamed"
+    current_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-jobs-stale-current",
+        commit_sha="commit-b",
+        snapshot_kind="scope",
+        parent_snapshot_id=base_snapshot["snapshot_id"],
+        graph_json=current_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        current_snapshot["snapshot_id"],
+        nodes=current_graph["deps_graph"]["nodes"],
+        edges=current_graph["deps_graph"]["edges"],
+    )
+    projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        current_snapshot["snapshot_id"],
+        actor="observer",
+        projection_id="semproj-stale-current",
+        backfill_existing=False,
+    )
+    assert projection["health"]["semantic_stale_count"] == 1
+    assert (
+        projection["projection"]["node_semantics"]["L7.2"]["validity"]["status"]
+        == "semantic_stale_feature_hash"
+    )
+    assert (
+        projection["projection"]["node_semantics"]["L7.1"]["validity"]["status"]
+        == "semantic_carried_forward_current"
+    )
+
+    status, dry_run = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": current_snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "snapshot",
+                "options": {"scope": "stale", "dry_run": True, "retry_stale_failed": True},
+                "created_by": "dashboard_user",
+            },
+        )
+    )
+    assert status == 202
+    assert dry_run["planned_count"] == 1
+    assert dry_run["batch_plan"]["selector"]["semantic_node_ids"] == ["L7.2"]
+
+    status, queued = server.handle_graph_governance_snapshot_semantic_jobs_create(
+        _ctx(
+            {"project_id": PID, "snapshot_id": current_snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "project_root": str(tmp_path),
+                "target_scope": "snapshot",
+                "options": {"scope": "stale", "retry_stale_failed": True},
+                "created_by": "dashboard_user",
+            },
+        )
+    )
+    assert status == 202
+    assert queued["queued_count"] == 1
+    assert queued["batch_plan"]["selector"]["node_ids"] == ["L7.2"]
+    rows = conn.execute(
+        """
+        SELECT node_id, status
+        FROM graph_semantic_jobs
+        WHERE project_id = ? AND snapshot_id = ?
+        ORDER BY node_id
+        """,
+        (PID, current_snapshot["snapshot_id"]),
+    ).fetchall()
+    assert [dict(row) for row in rows] == [{"node_id": "L7.2", "status": "ai_pending"}]
+
+
 def test_semantic_jobs_operator_request_uses_project_ai_routing(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(
         server,

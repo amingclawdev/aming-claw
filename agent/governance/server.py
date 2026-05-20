@@ -9857,6 +9857,14 @@ def _semantic_jobs_node_plan_targets(
     )
     if explicit:
         return explicit
+    semantic_scope = str(enqueue_body.get("semantic_ai_scope") or "").strip().lower()
+    if semantic_scope in {"stale", "stale_nodes", "stale_node", "semantic_stale"}:
+        return _semantic_jobs_stale_node_targets(
+            conn,
+            project_id,
+            snapshot_id,
+            enqueue_body,
+        )
     layers = {
         str(layer or "").upper()
         for layer in (enqueue_body.get("semantic_layers") or [])
@@ -9883,6 +9891,102 @@ def _semantic_jobs_node_plan_targets(
         primary = node.get("primary_files") or node.get("primary") or []
         if primary or include_structural:
             planned.append(node_id)
+    return planned
+
+
+def _semantic_jobs_stale_node_targets(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    enqueue_body: dict,
+) -> list[str]:
+    """Return nodes whose current semantic projection is stale.
+
+    The dashboard's stale semantic retry affordance is driven by projection
+    health (`semantic_stale_count`), so the job selector must use the same
+    source of truth instead of broad L7 layer matching.
+    """
+    from . import graph_events
+    from . import graph_snapshot_store as store
+
+    projection = graph_events.get_semantic_projection(conn, project_id, snapshot_id) or {}
+    projection_body = projection.get("projection") if isinstance(projection.get("projection"), dict) else {}
+    node_semantics = (
+        projection_body.get("node_semantics")
+        if isinstance(projection_body.get("node_semantics"), dict)
+        else {}
+    )
+    if not node_semantics:
+        return []
+    layers = {
+        str(layer or "").upper()
+        for layer in (enqueue_body.get("semantic_layers") or [])
+        if str(layer or "").strip()
+    }
+    include_structural = bool(enqueue_body.get("semantic_include_structural"))
+    stale_statuses = {
+        "semantic_stale_feature_hash",
+        "semantic_stale_file_hash",
+        "semantic_stale",
+        "stale_hash_mismatch",
+        "stale_file_hash",
+        "hash_mismatch",
+        "stale",
+    }
+    nodes = store.list_graph_snapshot_nodes(
+        conn,
+        project_id,
+        snapshot_id,
+        limit=1000,
+        include_semantic=False,
+    )
+    planned: list[str] = []
+    for node in nodes:
+        node_id = str(node.get("node_id") or node.get("id") or "").strip()
+        if not node_id:
+            continue
+        if layers and str(node.get("layer") or "").upper() not in layers:
+            continue
+        primary = node.get("primary_files") or node.get("primary") or []
+        if not primary and not include_structural:
+            continue
+        semantic = node_semantics.get(node_id)
+        if not isinstance(semantic, dict):
+            continue
+        validity = semantic.get("validity") if isinstance(semantic.get("validity"), dict) else {}
+        status = str(validity.get("status") or "").strip().lower()
+        if status in stale_statuses:
+            planned.append(node_id)
+    return planned
+
+
+def _semantic_jobs_resolve_stale_scope_targets(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    enqueue_body: dict,
+) -> list[str]:
+    """Freeze stale scope to explicit node ids before enqueueing."""
+    if _semantic_jobs_target_ids(
+        enqueue_body.get("semantic_node_ids")
+        or enqueue_body.get("target_ids")
+        or enqueue_body.get("node_ids")
+        or enqueue_body.get("node_id")
+    ):
+        return []
+    semantic_scope = str(enqueue_body.get("semantic_ai_scope") or "").strip().lower()
+    if semantic_scope not in {"stale", "stale_nodes", "stale_node", "semantic_stale"}:
+        return []
+    planned = _semantic_jobs_stale_node_targets(
+        conn,
+        project_id,
+        snapshot_id,
+        enqueue_body,
+    )
+    enqueue_body["semantic_node_ids"] = planned
+    enqueue_body["semantic_ai_scope"] = "selected"
+    enqueue_body.pop("semantic_layers", None)
+    enqueue_body.pop("layers", None)
     return planned
 
 
@@ -12167,6 +12271,12 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
                 "jobs": [],
                 "queued_ops": [],
             }
+        _semantic_jobs_resolve_stale_scope_targets(
+            conn,
+            project_id,
+            snapshot_id,
+            enqueue_body,
+        )
         try:
             result = semantic.run_semantic_enrichment(
                 conn,
