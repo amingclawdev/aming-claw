@@ -134,6 +134,49 @@ def test_graph_enrich_config_suppresses_string_literal_event_false_positive(tmp_
     assert not ({"claude.cmd", "claude.exe", "codex.cmd", "codex.ps1"} & filtered_events)
 
 
+def test_eventbus_subscribe_and_publish_materialize_directional_event_relations(tmp_path):
+    project = tmp_path / "project"
+    _write(
+        str(project / "agent" / "governance" / "semantic_worker.py"),
+        "def register(bus):\n"
+        "    bus.subscribe('semantic_job.enqueued', on_semantic_job_enqueued)\n"
+        "    bus.subscribe('system.startup', on_governance_startup)\n\n"
+        "def requeue(event_bus):\n"
+        "    event_bus.publish('semantic_job.enqueued', {'project_id': 'demo'})\n",
+    )
+    _write(
+        str(project / "agent" / "governance" / "server.py"),
+        "from agent.governance import event_bus\n\n"
+        "def queue_job():\n"
+        "    event_bus.publish('semantic_job.enqueued', {'project_id': 'demo'})\n",
+    )
+
+    modules = parse_production_modules(str(project))
+    relations = extract_typed_relations(str(project), modules)
+    triples = {
+        (rel["source_module"], rel["relation_type"], rel["target"])
+        for rel in relations
+    }
+    by_triple = {
+        (rel["source_module"], rel["relation_type"], rel["target"]): rel
+        for rel in relations
+    }
+
+    assert ("agent.governance.semantic_worker", "consumes_event", "semantic_job.enqueued") in triples
+    assert ("agent.governance.semantic_worker", "consumes_event", "system.startup") in triples
+    assert ("agent.governance.semantic_worker", "emits_event", "semantic_job.enqueued") in triples
+    assert ("agent.governance.semantic_worker", "emits_event", "system.startup") not in triples
+    assert ("agent.governance.server", "emits_event", "semantic_job.enqueued") in triples
+    assert (
+        by_triple[("agent.governance.semantic_worker", "consumes_event", "system.startup")]["evidence"]
+        == "EventBus.subscribe"
+    )
+    assert (
+        by_triple[("agent.governance.server", "emits_event", "semantic_job.enqueued")]["evidence"]
+        == "EventBus.publish"
+    )
+
+
 def test_legacy_graph_rebuild_scripts_keep_mapping_out_of_docs_dev():
     repo_root = Path(__file__).resolve().parents[2]
     shared_mapping = (

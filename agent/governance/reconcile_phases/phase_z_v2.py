@@ -2002,6 +2002,42 @@ def _artifact_relation_type(source: str) -> str:
     return "reads_artifact"
 
 
+def _event_bus_call_relations(module: ModuleInfo, project_root: str) -> List[TypedRelation]:
+    try:
+        tree = ast.parse(module.source or "", filename=module.path)
+    except (SyntaxError, ValueError):
+        return []
+    rel_file = _repo_relpath(project_root, module.path)
+    out: List[TypedRelation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_target = _call_target_name(node) or ""
+        raw_target = call_target.rsplit(".", 1)[-1]
+        if raw_target not in {"publish", "subscribe"}:
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+            continue
+        event_name = str(first.value)
+        if not _EVENT_TOKEN_RE.match(event_name) or event_name.startswith(("http.", "https.")):
+            continue
+        if re.match(r"^L\d+\.\d+$", event_name):
+            continue
+        relation_type = "emits_event" if raw_target == "publish" else "consumes_event"
+        out.append(TypedRelation(
+            module.module_name,
+            relation_type,
+            event_name,
+            "event",
+            f"EventBus.{raw_target}",
+            rel_file,
+        ))
+    return out
+
+
 def _module_name_tokens(module_name: str) -> Set[str]:
     raw = module_name.replace("-", "_").replace("/", ".")
     parts = []
@@ -2040,6 +2076,8 @@ def extract_typed_relations(
         rel_file = _repo_relpath(project_root, module.path)
         constants = _string_constants(source)
         sql_blob = sql_by_module.get(module.module_name, "")
+        event_call_relations = _event_bus_call_relations(module, project_root)
+        event_call_targets = {str(rel.target) for rel in event_call_relations}
 
         for table in sorted(set(_SQL_CREATE_RE.findall(sql_blob))):
             relations.append(TypedRelation(module.module_name, "owns_state", table, "db_table",
@@ -2069,6 +2107,8 @@ def extract_typed_relations(
             if _EVENT_TOKEN_RE.match(value) and not value.startswith(("http.", "https.")):
                 if re.match(r"^L\d+\.\d+$", value):
                     continue
+                if value in event_call_targets:
+                    continue
                 lower = source.lower()
                 if "chain_events" in lower or "event_type" in lower or "emit" in lower:
                     rel_type = "emits_event" if ("insert into chain_events" in lower or "persist_event" in lower or "emit" in lower) else "consumes_event"
@@ -2082,6 +2122,7 @@ def extract_typed_relations(
                     if relation is not None:
                         relations.append(relation)
 
+        relations.extend(event_call_relations)
         lowered = source.lower()
         if "/api/task" in lowered or "create_task" in lowered or "task_create" in lowered:
             relations.append(TypedRelation(module.module_name, "creates_task", "governance_task",
