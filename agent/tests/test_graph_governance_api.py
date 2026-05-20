@@ -19,6 +19,7 @@ from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance import reconcile_semantic_enrichment as semantic_enrichment
 from agent.governance import server
+from agent.governance import state_reconcile
 from agent.governance.db import _ensure_schema
 from agent.governance.errors import PermissionDeniedError, ValidationError
 from agent.governance.governance_index import merge_feature_hashes_into_graph_nodes
@@ -6880,6 +6881,154 @@ def test_graph_governance_backfill_input_errors_are_validation_errors(conn, tmp_
             )
         )
     assert "target_commit_sha must equal HEAD" in str(exc.value)
+
+
+def test_git_diff_changed_line_ranges_map_to_node_functions(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    src = project / "src"
+    src.mkdir()
+    service = src / "service.py"
+    service.write_text(
+        "def keep():\n"
+        "    return 'stable'\n\n"
+        "def serve():\n"
+        "    value = 'old'\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=project, check=True, capture_output=True, text=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    service.write_text(
+        "def keep():\n"
+        "    return 'stable'\n\n"
+        "def serve():\n"
+        "    value = 'new'\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "change serve"], cwd=project, check=True, capture_output=True, text=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    ranges = state_reconcile._git_changed_line_ranges(project, base, head, ["src/service.py"])
+    node = {
+        "id": "L7.service",
+        "primary": ["src/service.py"],
+        "metadata": {
+            "functions": ["src.service::keep", "src.service::serve"],
+            "function_lines": {"keep": [1, 2], "serve": [4, 6]},
+        },
+    }
+    function_delta = state_reconcile._changed_functions_for_line_ranges([node], ranges)
+
+    assert ranges == {"src/service.py": [[5, 5]]}
+    assert function_delta["changed_function_ids"] == ["src.service::serve"]
+    assert function_delta["changed_functions_by_node"] == {"L7.service": ["src.service::serve"]}
+
+
+def test_semantic_projection_reports_changed_function_hashes_for_stale_node(conn):
+    base_graph = _graph("L7.1")
+    base_node = base_graph["deps_graph"]["nodes"][0]
+    base_node["metadata"].update({
+        "module": "agent.governance.server",
+        "feature_hash": "sha256:feature-v1",
+        "functions": [
+            "agent.governance.server::keep",
+            "agent.governance.server::serve",
+        ],
+        "function_lines": {"keep": [1, 2], "serve": [4, 6]},
+        "function_hashes": {
+            "agent.governance.server::keep": "sha256:keep-v1",
+            "agent.governance.server::serve": "sha256:serve-v1",
+        },
+    })
+    base_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-function-hash-base",
+        commit_sha="commit-a",
+        snapshot_kind="full",
+        graph_json=base_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        base_snapshot["snapshot_id"],
+        nodes=base_graph["deps_graph"]["nodes"],
+        edges=base_graph["deps_graph"]["edges"],
+    )
+    graph_events.create_event(
+        conn,
+        PID,
+        base_snapshot["snapshot_id"],
+        event_type="semantic_node_enriched",
+        event_kind="semantic",
+        target_type="node",
+        target_id="L7.1",
+        status=graph_events.EVENT_STATUS_OBSERVED,
+        stable_node_key=graph_events.stable_node_key_for_node(base_node),
+        feature_hash=graph_events.feature_hash_for_node(base_node),
+        file_hashes={"agent/governance/server.py": "sha256:file-v1"},
+        payload={
+            "semantic_payload": {"summary": "ok", "open_issues": []},
+            "function_hashes": base_node["metadata"]["function_hashes"],
+        },
+        created_by="test",
+    )
+
+    current_graph = json.loads(json.dumps(base_graph))
+    current_node = current_graph["deps_graph"]["nodes"][0]
+    current_node["metadata"]["feature_hash"] = "sha256:feature-v2"
+    current_node["metadata"]["function_hashes"]["agent.governance.server::serve"] = "sha256:serve-v2"
+    current_snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="semantic-function-hash-current",
+        commit_sha="commit-b",
+        snapshot_kind="scope",
+        parent_snapshot_id=base_snapshot["snapshot_id"],
+        graph_json=current_graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        current_snapshot["snapshot_id"],
+        nodes=current_graph["deps_graph"]["nodes"],
+        edges=current_graph["deps_graph"]["edges"],
+    )
+
+    projection = graph_events.build_semantic_projection(
+        conn,
+        PID,
+        current_snapshot["snapshot_id"],
+        actor="test",
+        backfill_existing=False,
+    )
+
+    validity = projection["projection"]["node_semantics"]["L7.1"]["validity"]
+    assert validity["status"] == "semantic_stale_feature_hash"
+    assert validity["hash_validation"] == "function_hash_mismatch"
+    assert validity["function_hash_status"] == "mismatch"
+    assert validity["function_hash_match"] is False
+    assert validity["changed_function_ids"] == ["agent.governance.server::serve"]
+    assert projection["health"]["semantic_stale_count"] == 1
 
 
 def test_semantic_projection_uses_indexed_hash_metadata(conn):

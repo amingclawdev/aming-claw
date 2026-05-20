@@ -23,6 +23,7 @@ from agent.governance.reconcile_file_inventory import summarize_file_inventory
 from agent.governance.reconcile_phases.phase_z_v2 import (
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
+    function_source_hashes,
     parse_production_modules,
 )
 
@@ -238,6 +239,7 @@ def build_symbol_index(
     for module_name, module in sorted(modules.items()):
         rel = _relpath(root, module.path)
         covered_files.add(rel)
+        function_hashes = function_source_hashes(module)
         for func in module.functions:
             symbol = {
                 "id": func.qualified_name,
@@ -247,6 +249,7 @@ def build_symbol_index(
                 "path": rel,
                 "line_start": func.lineno,
                 "line_end": func.end_lineno,
+                "source_hash": function_hashes.get(func.qualified_name, ""),
                 "decorators": list(func.decorators or []),
                 "calls": list(func.calls or []),
             }

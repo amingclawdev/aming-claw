@@ -11,6 +11,7 @@ from agent.governance.db import _ensure_schema
 from agent.governance.governance_index import (
     build_governance_index,
     load_snapshot_nodes_for_inventory,
+    merge_feature_hashes_into_graph_nodes,
     persist_governance_index,
 )
 
@@ -159,10 +160,25 @@ def test_build_and_persist_governance_index_maps_hashes_symbols_docs_and_graph(c
     feature_index = index["feature_index"]
     feature = next(item for item in feature_index["features"] if item["node_id"] == "L7.service")
     assert feature["feature_hash"].startswith("sha256:")
-    assert feature["symbol_refs"][0]["id"].endswith("::calculate_total")
-    assert feature["symbol_refs"][0]["line_start"] == 1
+    function_ref = next(item for item in feature["symbol_refs"] if item["id"].endswith("::calculate_total"))
+    assert function_ref["line_start"] == 1
+    assert function_ref["source_hash"].startswith("sha256:")
+    assert feature["function_hashes"][function_ref["id"]] == function_ref["source_hash"]
     assert feature["test_symbol_refs"][0]["id"] == "tests.test_service::test_calculate_total"
     assert feature["doc_refs"][0]["path"] in {"README.md", "docs/usage.md"}
+    graph_payload = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.service",
+                    "metadata": {},
+                }
+            ]
+        }
+    }
+    merge = merge_feature_hashes_into_graph_nodes(graph_payload, index)
+    assert merge["nodes_updated"] == 1
+    assert graph_payload["deps_graph"]["nodes"][0]["metadata"]["function_hashes"] == feature["function_hashes"]
     assert index["coverage_state"]["active_snapshot_id"] == "imported-abc1234-index"
     assert index["coverage_state"]["feature_count"] == 1
     assert index["coverage_state"]["file_states"]["src/demo_app/service.py"]["file_hash"]

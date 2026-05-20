@@ -669,7 +669,15 @@ def _feature_context_from_node(
         "test": tests,
         "config": config,
         "functions": metadata.get("functions") or [],
+        "function_hashes": metadata.get("function_hashes") or {},
     }
+    indexed_function_hashes = indexed.get("function_hashes") if isinstance(indexed.get("function_hashes"), dict) else {}
+    metadata_function_hashes = (
+        metadata.get("function_hashes")
+        if isinstance(metadata.get("function_hashes"), dict)
+        else {}
+    )
+    function_hashes = indexed_function_hashes or metadata_function_hashes
     return {
         "node_id": node_id,
         "title": str(node.get("title") or node_id),
@@ -681,6 +689,7 @@ def _feature_context_from_node(
         "config": config,
         "metadata": metadata,
         "file_hashes": indexed.get("file_hashes") or {},
+        "function_hashes": function_hashes,
         "feature_hash": indexed.get("feature_hash") or _hash_payload(fallback_hash_payload),
         "symbol_refs": indexed.get("symbol_refs") or [],
         "doc_refs": indexed.get("doc_refs") or [],
@@ -1154,6 +1163,7 @@ def _heuristic_semantic_entry(
         "feedback_count": len(feedback),
         "feature_hash": feature.get("feature_hash") or "",
         "file_hashes": feature.get("file_hashes") or {},
+        "function_hashes": feature.get("function_hashes") or {},
         "primary": feature.get("primary") or [],
         "secondary": feature.get("secondary") or [],
         "test": feature.get("test") or [],
@@ -2679,7 +2689,11 @@ def _semantic_state_validation(feature: dict[str, Any], state_entry: dict[str, A
     stored_hash = str(state_entry.get("feature_hash") or "")
     feature_hash_match = bool(current_hash and stored_hash and current_hash == stored_hash)
     file_hash_match = _file_hashes_match(feature.get("file_hashes"), state_entry.get("file_hashes"))
-    status = "current" if feature_hash_match and file_hash_match else "stale_hash_mismatch"
+    function_hash_match = _file_hashes_match(
+        feature.get("function_hashes"),
+        state_entry.get("function_hashes"),
+    )
+    status = "current" if feature_hash_match and file_hash_match and function_hash_match else "stale_hash_mismatch"
     return {
         "status": status,
         "valid": status == "current",
@@ -2687,6 +2701,7 @@ def _semantic_state_validation(feature: dict[str, Any], state_entry: dict[str, A
         "stored_feature_hash": stored_hash,
         "feature_hash_match": feature_hash_match,
         "file_hash_match": file_hash_match,
+        "function_hash_match": function_hash_match,
     }
 
 

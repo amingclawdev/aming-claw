@@ -76,6 +76,24 @@ class ModuleInfo:
     adapter_relations: List[Dict[str, Any]] = field(default_factory=list)
 
 
+def function_source_hashes(module: ModuleInfo) -> Dict[str, str]:
+    source = str(getattr(module, "source", "") or "")
+    if not source:
+        return {}
+    lines = source.splitlines()
+    out: Dict[str, str] = {}
+    for func in getattr(module, "functions", []) or []:
+        qualified_name = str(getattr(func, "qualified_name", "") or "").strip()
+        start = int(getattr(func, "lineno", 0) or 0)
+        end = int(getattr(func, "end_lineno", start) or start)
+        if not qualified_name or start <= 0:
+            continue
+        end = max(start, end)
+        snippet = "\n".join(lines[start - 1 : min(len(lines), end)])
+        out[qualified_name] = f"sha256:{hashlib.sha256(snippet.encode('utf-8')).hexdigest()}"
+    return out
+
+
 @dataclass
 class TypedRelation:
     """Language-neutral relation extracted from code, state, or artifacts."""
@@ -1178,6 +1196,7 @@ def aggregate_functions_into_nodes(
             "layer": agg_layer,
             "functions": [f.qualified_name for f in mod_info.functions],
             "function_lines": _function_line_index(mod_info.functions),
+            "function_hashes": function_source_hashes(mod_info),
             "function_count": len(mod_info.functions),
             "language": mod_info.language,
             "source_kind": mod_info.source_kind,
@@ -3467,6 +3486,7 @@ def build_rebase_candidate_graph(
                 "function_count": node.get("function_count", 0),
                 "functions": node.get("functions") or [],
                 "function_lines": node.get("function_lines") or {},
+                "function_hashes": node.get("function_hashes") or {},
                 "function_calls": node.get("function_calls") or [],
                 "function_called_by": node.get("function_called_by") or [],
                 "function_weak_calls": node.get("function_weak_calls") or [],

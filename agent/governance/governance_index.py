@@ -219,7 +219,8 @@ def merge_feature_hashes_into_graph_nodes(
             continue
         feature_hash = str(feature.get("feature_hash") or "")
         file_hashes = feature.get("file_hashes") if isinstance(feature.get("file_hashes"), dict) else {}
-        if not feature_hash and not file_hashes:
+        function_hashes = feature.get("function_hashes") if isinstance(feature.get("function_hashes"), dict) else {}
+        if not feature_hash and not file_hashes and not function_hashes:
             missing += 1
             continue
         metadata = dict(node.get("metadata") or {}) if isinstance(node.get("metadata"), dict) else {}
@@ -231,6 +232,12 @@ def merge_feature_hashes_into_graph_nodes(
                 str(path): str(value)
                 for path, value in file_hashes.items()
                 if str(path)
+            }
+        if function_hashes:
+            metadata["function_hashes"] = {
+                str(function_id): str(value)
+                for function_id, value in function_hashes.items()
+                if str(function_id) and str(value)
             }
         node["metadata"] = metadata
         updated += 1
@@ -376,16 +383,29 @@ def build_feature_index(
             config = _path_list(metadata, "config_files")
         if not (primary or secondary or tests or config):
             continue
+        function_hashes = {
+            str(function_id): str(value)
+            for function_id, value in (
+                metadata.get("function_hashes")
+                if isinstance(metadata.get("function_hashes"), dict)
+                else {}
+            ).items()
+            if str(function_id) and str(value)
+        }
         symbol_refs = []
         for path in primary:
             for symbol in symbols_by_path.get(path, []):
-                symbol_refs.append({
+                symbol_ref = {
                     "id": symbol.get("id") or "",
                     "kind": symbol.get("kind") or "",
                     "path": path,
                     "line_start": symbol.get("line_start", 0),
                     "line_end": symbol.get("line_end", 0),
-                })
+                    "source_hash": symbol.get("source_hash") or "",
+                }
+                symbol_refs.append(symbol_ref)
+                if symbol_ref["id"] and symbol_ref["source_hash"]:
+                    function_hashes[str(symbol_ref["id"])] = str(symbol_ref["source_hash"])
         doc_refs = []
         for path in secondary:
             doc = docs_by_path.get(path)
@@ -405,6 +425,7 @@ def build_feature_index(
                     "path": path,
                     "line_start": symbol.get("line_start", 0),
                     "line_end": symbol.get("line_end", 0),
+                    "source_hash": symbol.get("source_hash") or "",
                 })
         config_refs = [
             {
@@ -422,6 +443,7 @@ def build_feature_index(
             "test": tests,
             "config": config,
             "file_hashes": {path: file_hashes.get(path, "") for path in primary + secondary + tests + config},
+            "function_hashes": function_hashes,
             "symbol_ids": [ref["id"] for ref in symbol_refs],
             "test_symbol_ids": [ref["id"] for ref in test_symbol_refs],
             "doc_paths": [ref["path"] for ref in doc_refs],

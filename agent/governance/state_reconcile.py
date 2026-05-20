@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -76,6 +77,7 @@ from agent.governance.reconcile_phases.phase_z_v2 import (
     build_call_graph,
     build_function_call_facts,
     build_test_consumer_fanin_index,
+    function_source_hashes,
     build_graph_v2_from_symbols,
     build_rebase_candidate_graph,
     build_module_dependency_edges,
@@ -144,6 +146,112 @@ def _git_changed_files(project_root: str | Path, base_ref: str, target_ref: str)
         for path in line.split("\t")[1:]
         if path.strip()
     })
+
+
+_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def _git_changed_line_ranges(
+    project_root: str | Path,
+    base_ref: str,
+    target_ref: str,
+    paths: list[str] | None = None,
+) -> dict[str, list[list[int]]]:
+    base = str(base_ref or "").strip()
+    target = str(target_ref or "").strip()
+    if not base or not target or base == target:
+        return {}
+    root = Path(project_root).resolve()
+    cmd = [
+        "git",
+        "-C",
+        str(root),
+        "diff",
+        "--unified=0",
+        "--no-renames",
+        f"{base}..{target}",
+        "--",
+    ]
+    cmd.extend(path.replace("\\", "/").strip("/") for path in (paths or []) if str(path or "").strip())
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return {}
+    ranges: dict[str, list[list[int]]] = {}
+    current_path = ""
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("diff --git "):
+            current_path = ""
+            continue
+        if line.startswith("+++ "):
+            raw_path = line[4:].strip()
+            if raw_path == "/dev/null":
+                current_path = ""
+                continue
+            current_path = raw_path[2:] if raw_path.startswith("b/") else raw_path
+            current_path = current_path.replace("\\", "/").strip("/")
+            continue
+        if not current_path:
+            continue
+        match = _DIFF_HUNK_RE.match(line)
+        if not match:
+            continue
+        start = max(1, int(match.group(1) or 1))
+        count = int(match.group(2) or 1)
+        end = start if count <= 0 else start + count - 1
+        ranges.setdefault(current_path, []).append([start, end])
+    return {path: values for path, values in sorted(ranges.items()) if values}
+
+
+def _changed_functions_for_line_ranges(
+    nodes: list[dict[str, Any]],
+    changed_line_ranges_by_path: dict[str, list[list[int]]],
+) -> dict[str, Any]:
+    changed_by_node: dict[str, list[str]] = {}
+    changed_ids: set[str] = set()
+    changed_paths = {
+        path.replace("\\", "/").strip("/"): ranges
+        for path, ranges in changed_line_ranges_by_path.items()
+        if path and ranges
+    }
+    for node in nodes:
+        node_id = _node_id(node)
+        metadata = _node_metadata(node)
+        functions = metadata.get("functions") if isinstance(metadata.get("functions"), list) else []
+        line_index = metadata.get("function_lines") if isinstance(metadata.get("function_lines"), dict) else {}
+        node_paths = set(_path_values(node, "primary"))
+        node_changed: set[str] = set()
+        for path in node_paths.intersection(changed_paths):
+            ranges = changed_paths.get(path) or []
+            for raw_function in functions:
+                function_id = str(raw_function or "")
+                if not function_id:
+                    continue
+                function_name = function_id.rsplit("::", 1)[-1]
+                lines = line_index.get(function_name) if isinstance(line_index.get(function_name), list) else []
+                if not lines:
+                    continue
+                start = int(lines[0] or 0)
+                end = int(lines[1] if len(lines) > 1 else lines[0] or 0)
+                if start <= 0:
+                    continue
+                end = max(start, end)
+                if any(max(start, int(rng[0] or 0)) <= min(end, int(rng[1] or rng[0] or 0)) for rng in ranges):
+                    node_changed.add(function_id)
+                    changed_ids.add(function_id)
+        if node_changed:
+            changed_by_node[node_id] = sorted(node_changed)
+    return {
+        "changed_function_ids": sorted(changed_ids),
+        "changed_functions_by_node": dict(sorted(changed_by_node.items())),
+        "changed_function_count": len(changed_ids),
+    }
 
 
 def _git_dirty_files(project_root: str | Path) -> list[str]:
@@ -1534,6 +1642,7 @@ def _apply_incremental_source_dependency_delta(
             for func in module.functions
             if func.name
         }
+        metadata["function_hashes"] = function_source_hashes(module)
         temp_node = {"module": module_name}
         project_root_resolved = str(Path(project_root).resolve())
         module_relations = extract_typed_relations(
@@ -3375,6 +3484,18 @@ def _finalize_scope_reconcile_candidate(
     )
     old_graph_json = _read_snapshot_graph(project_id, str(active.get("snapshot_id") or ""))
     new_graph_json = _read_snapshot_graph(project_id, sid)
+    changed_line_ranges = _git_changed_line_ranges(
+        root,
+        str(active.get("commit_sha") or ""),
+        target,
+        changed_files,
+    )
+    scope_function_delta = _changed_functions_for_line_ranges(
+        _deps_graph_nodes(new_graph_json),
+        changed_line_ranges,
+    )
+    if scope_function_delta.get("changed_function_ids"):
+        scope_file_delta["scope_function_delta"] = scope_function_delta
     scope_graph_delta = _build_scope_graph_delta(
         old_graph_json=old_graph_json,
         new_graph_json=new_graph_json,
