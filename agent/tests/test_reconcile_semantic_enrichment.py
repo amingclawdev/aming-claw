@@ -461,7 +461,39 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _graph(node_id: str = "L7.1", *, include_extra: bool = False) -> dict:
+def _graph(
+    node_id: str = "L7.1",
+    *,
+    include_extra: bool = False,
+    include_function_hash_evidence: bool = False,
+) -> dict:
+    metadata = {
+        "subsystem": "backlog",
+        "config_files": ["config/roles/default/pm.yaml"],
+        "functions": [
+            {
+                "name": "claim_next",
+                "path": "agent/governance/backlog_runtime.py",
+                "lineno": 12,
+            }
+        ],
+    }
+    if include_function_hash_evidence:
+        metadata.update({
+            "function_hashes": {
+                "agent.governance.backlog_runtime::claim_next": "sha256:source-claim-next",
+            },
+            "test_functions": [
+                "agent.tests.test_backlog_runtime::test_claim_next",
+            ],
+            "test_function_hashes": {
+                "agent.tests.test_backlog_runtime::test_claim_next": "sha256:test-claim-next",
+            },
+            "test_function_lines": {
+                "test_claim_next": [1, 2],
+                "agent.tests.test_backlog_runtime::test_claim_next": [1, 2],
+            },
+        })
     nodes = [
         {
             "id": node_id,
@@ -472,17 +504,7 @@ def _graph(node_id: str = "L7.1", *, include_extra: bool = False) -> dict:
             "secondary": ["docs/dev/backlog-runtime.md"],
             "test": ["agent/tests/test_backlog_runtime.py"],
             "config": ["config/roles/default/pm.yaml"],
-            "metadata": {
-                "subsystem": "backlog",
-                "config_files": ["config/roles/default/pm.yaml"],
-                "functions": [
-                    {
-                        "name": "claim_next",
-                        "path": "agent/governance/backlog_runtime.py",
-                        "lineno": 12,
-                    }
-                ],
-            },
+            "metadata": metadata,
         }
     ]
     if include_extra:
@@ -522,6 +544,7 @@ def _create_snapshot(
     *,
     snapshot_kind: str = "full",
     include_extra: bool = False,
+    include_function_hash_evidence: bool = False,
 ) -> None:
     _write(
         project / "agent" / "governance" / "backlog_runtime.py",
@@ -538,7 +561,10 @@ def _create_snapshot(
         snapshot_id=f"{snapshot_kind}-semantic-test",
         commit_sha="abc1234",
         snapshot_kind=snapshot_kind,
-        graph_json=_graph(include_extra=include_extra),
+        graph_json=_graph(
+            include_extra=include_extra,
+            include_function_hash_evidence=include_function_hash_evidence,
+        ),
         notes=json.dumps({"state_only": True}),
     )
     conn.commit()
@@ -623,6 +649,66 @@ def test_semantic_enrichment_uses_feedback_on_retry(conn, tmp_path):
     )
     assert notes["semantic_enrichment"]["latest_round"] == 1
     assert notes["semantic_feedback"]["feedback_count"] == 1
+
+
+def test_semantic_enrichment_payload_carries_test_function_hash_evidence(conn, tmp_path):
+    project = tmp_path / "project"
+    _create_snapshot(conn, project, include_function_hash_evidence=True)
+    seen_payloads: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_payloads.append(payload)
+        feature = payload["feature"]
+        assert feature["function_hashes"] == {
+            "agent.governance.backlog_runtime::claim_next": "sha256:source-claim-next",
+        }
+        assert feature["test_functions"] == [
+            "agent.tests.test_backlog_runtime::test_claim_next",
+        ]
+        assert feature["test_function_hashes"] == {
+            "agent.tests.test_backlog_runtime::test_claim_next": "sha256:test-claim-next",
+        }
+        assert feature["test_function_lines"]["test_claim_next"] == [1, 2]
+        return {
+            "feature_name": "Backlog Runtime State Flow",
+            "semantic_summary": "Owns backlog task state transitions.",
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": [
+                    "required_fields_present",
+                    "source_payload_only",
+                    "no_project_mutation",
+                    "review_feedback_accounted_for",
+                    "graph_suggestions_contract_checked",
+                ],
+                "checked_rules_count": 5,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        created_by="test",
+    )
+
+    assert seen_payloads
+    feature = result["semantic_index"]["features"][0]
+    assert feature["function_hashes"] == {
+        "agent.governance.backlog_runtime::claim_next": "sha256:source-claim-next",
+    }
+    assert feature["test_function_hashes"] == {
+        "agent.tests.test_backlog_runtime::test_claim_next": "sha256:test-claim-next",
+    }
+    assert feature["test_function_lines"]["agent.tests.test_backlog_runtime::test_claim_next"] == [1, 2]
 
 
 def test_semantic_enrichment_persists_node_ai_self_check(conn, tmp_path):

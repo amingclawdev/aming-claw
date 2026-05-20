@@ -679,6 +679,28 @@ def _feature_context_from_node(
         else {}
     )
     function_hashes = indexed_function_hashes or metadata_function_hashes
+    indexed_test_function_hashes = (
+        indexed.get("test_function_hashes")
+        if isinstance(indexed.get("test_function_hashes"), dict)
+        else {}
+    )
+    metadata_test_function_hashes = (
+        metadata.get("test_function_hashes")
+        if isinstance(metadata.get("test_function_hashes"), dict)
+        else {}
+    )
+    indexed_test_function_lines = (
+        indexed.get("test_function_lines")
+        if isinstance(indexed.get("test_function_lines"), dict)
+        else {}
+    )
+    metadata_test_function_lines = (
+        metadata.get("test_function_lines")
+        if isinstance(metadata.get("test_function_lines"), dict)
+        else {}
+    )
+    indexed_test_functions = _path_list(indexed.get("test_functions"))
+    metadata_test_functions = _path_list(metadata.get("test_functions"))
     return {
         "node_id": node_id,
         "title": str(node.get("title") or node_id),
@@ -691,8 +713,12 @@ def _feature_context_from_node(
         "metadata": metadata,
         "file_hashes": indexed.get("file_hashes") or {},
         "function_hashes": function_hashes,
+        "test_function_hashes": indexed_test_function_hashes or metadata_test_function_hashes,
+        "test_functions": indexed_test_functions or metadata_test_functions,
+        "test_function_lines": indexed_test_function_lines or metadata_test_function_lines,
         "feature_hash": indexed.get("feature_hash") or _hash_payload(fallback_hash_payload),
         "symbol_refs": indexed.get("symbol_refs") or [],
+        "test_symbol_refs": indexed.get("test_symbol_refs") or [],
         "doc_refs": indexed.get("doc_refs") or [],
         "config_refs": indexed.get("config_refs") or [
             {"path": path, "kind": "config"} for path in config
@@ -1166,11 +1192,15 @@ def _heuristic_semantic_entry(
         "feature_hash": feature.get("feature_hash") or "",
         "file_hashes": feature.get("file_hashes") or {},
         "function_hashes": feature.get("function_hashes") or {},
+        "test_function_hashes": feature.get("test_function_hashes") or {},
+        "test_functions": feature.get("test_functions") or [],
+        "test_function_lines": feature.get("test_function_lines") or {},
         "primary": feature.get("primary") or [],
         "secondary": feature.get("secondary") or [],
         "test": feature.get("test") or [],
         "config": feature.get("config") or [],
         "symbol_refs": feature.get("symbol_refs") or [],
+        "test_symbol_refs": feature.get("test_symbol_refs") or [],
         "doc_refs": feature.get("doc_refs") or [],
         "config_refs": feature.get("config_refs") or [],
         "enrichment_status": enrichment_status,
@@ -2218,6 +2248,14 @@ def _carry_forward_semantic_graph_state(
             entry["test"] = _path_list(feature.get("test"))
             entry["config"] = _path_list(feature.get("config"))
             entry["file_hashes"] = feature.get("file_hashes") or entry.get("file_hashes") or {}
+            entry["function_hashes"] = feature.get("function_hashes") or entry.get("function_hashes") or {}
+            entry["test_function_hashes"] = (
+                feature.get("test_function_hashes") or entry.get("test_function_hashes") or {}
+            )
+            entry["test_functions"] = _path_list(feature.get("test_functions") or entry.get("test_functions"))
+            entry["test_function_lines"] = (
+                feature.get("test_function_lines") or entry.get("test_function_lines") or {}
+            )
             current[node_id] = entry
             carried += 1
     # Edge carry-forward (mirror of the node loop above).
@@ -2564,6 +2602,14 @@ def _semantic_state_entry(
         "config": _path_list(feature.get("config")),
         "feature_hash": feature.get("feature_hash") or semantic_entry.get("feature_hash") or "",
         "file_hashes": feature.get("file_hashes") or semantic_entry.get("file_hashes") or {},
+        "function_hashes": feature.get("function_hashes") or semantic_entry.get("function_hashes") or {},
+        "test_function_hashes": (
+            feature.get("test_function_hashes") or semantic_entry.get("test_function_hashes") or {}
+        ),
+        "test_functions": _path_list(feature.get("test_functions") or semantic_entry.get("test_functions")),
+        "test_function_lines": (
+            feature.get("test_function_lines") or semantic_entry.get("test_function_lines") or {}
+        ),
         "doc_status": _semantic_review_status(semantic_entry.get("doc_coverage_review")),
         "test_status": _semantic_review_status(semantic_entry.get("test_coverage_review")),
         "config_status": _semantic_review_status(semantic_entry.get("config_coverage_review")),
