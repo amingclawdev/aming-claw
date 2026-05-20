@@ -165,6 +165,15 @@ GRAPH_QUERY_TOOLS: dict[str, dict[str, Any]] = {
     "list_tools": {"required_args": [], "summary": "Alias for query_schema."},
 }
 
+GRAPH_CONTRACT_DIRECT_TOOLS = frozenset({
+    "get_node",
+    "get_neighbors",
+    "find_node_by_path",
+    "degree_summary",
+    "high_degree_nodes",
+    "search_semantic",
+})
+
 DEFAULT_BUDGETS: dict[str, dict[str, int]] = {
     "dashboard": {
         "max_queries": 20,
@@ -1536,8 +1545,28 @@ def _query_schema() -> dict[str, Any]:
         "tool_names": sorted(GRAPH_QUERY_TOOLS),
         "query_sources": sorted(QUERY_SOURCES),
         "query_purposes": sorted(QUERY_PURPOSES),
+        "graph_contract_policy": {
+            "direct_tools": sorted(GRAPH_CONTRACT_DIRECT_TOOLS),
+            "caller_envelope_tools": [
+                name for name in sorted(GRAPH_QUERY_TOOLS)
+                if name not in GRAPH_CONTRACT_DIRECT_TOOLS
+            ],
+            "description": (
+                "Tools that expose nodes plus structural dependency direction "
+                "attach graph_contract directly. Other tools rely on the caller "
+                "or prompt envelope when direction semantics are needed."
+            ),
+        },
         "count": len(GRAPH_QUERY_TOOLS),
     }
+
+
+def _with_graph_contract(tool: str, result: dict[str, Any]) -> dict[str, Any]:
+    if tool not in GRAPH_CONTRACT_DIRECT_TOOLS or "graph_contract" in result:
+        return result
+    wrapped = dict(result)
+    wrapped["graph_contract"] = graph_direction_contract()
+    return wrapped
 
 
 def run_tool(
@@ -1559,17 +1588,17 @@ def run_tool(
     if tool == "list_features":
         return _query_list_features(conn, project_id, snapshot_id, args)
     if tool == "get_node":
-        return _query_get_node(conn, project_id, snapshot_id, args)
+        return _with_graph_contract(tool, _query_get_node(conn, project_id, snapshot_id, args))
     if tool == "get_neighbors":
-        return _query_get_neighbors(conn, project_id, snapshot_id, args)
+        return _with_graph_contract(tool, _query_get_neighbors(conn, project_id, snapshot_id, args))
     if tool == "find_node_by_path":
-        return _query_find_node_by_path(conn, project_id, snapshot_id, args)
+        return _with_graph_contract(tool, _query_find_node_by_path(conn, project_id, snapshot_id, args))
     if tool == "search_structure":
         return _query_search_structure(conn, project_id, snapshot_id, args)
     if tool == "degree_summary":
-        return _query_degree_summary(conn, project_id, snapshot_id, args)
+        return _with_graph_contract(tool, _query_degree_summary(conn, project_id, snapshot_id, args))
     if tool == "high_degree_nodes":
-        return _query_high_degree_nodes(conn, project_id, snapshot_id, args)
+        return _with_graph_contract(tool, _query_high_degree_nodes(conn, project_id, snapshot_id, args))
     if tool == "function_index":
         return _query_function_index(conn, project_id, snapshot_id, args)
     if tool == "function_callees":
@@ -1579,7 +1608,7 @@ def run_tool(
     if tool == "high_function_degree":
         return _query_high_function_degree(conn, project_id, snapshot_id, args)
     if tool == "search_semantic":
-        return _query_search_semantic(conn, project_id, snapshot_id, args)
+        return _with_graph_contract(tool, _query_search_semantic(conn, project_id, snapshot_id, args))
     if tool == "search_docs":
         return _query_search_docs(conn, project_id, snapshot_id, args, project_root)
     if tool == "get_docs":

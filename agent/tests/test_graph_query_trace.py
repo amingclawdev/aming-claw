@@ -152,6 +152,13 @@ def _seed_snapshot(conn, tmp_path):
     return snapshot["snapshot_id"], project_root
 
 
+def _assert_depends_on_direction_contract(result: dict):
+    contract = result["result"]["graph_contract"]
+    depends_on = contract["deps_graph"]["depends_on"]
+    assert depends_on["direction"] == "dependency_to_dependent"
+    assert "B -> A" in depends_on["interpretation"]
+
+
 def _seed_edge_projection(conn, snapshot_id):
     projection = {
         "node_semantics": {},
@@ -330,6 +337,22 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
     assert path_result["ok"] is True
     assert path_result["result"]["matches"][0]["node"]["node_id"] == "L7.1"
     assert path_result["result"]["matches"][0]["matched_files"][0]["role"] == "primary"
+    _assert_depends_on_direction_contract(path_result)
+
+    node_result = graph_query_trace.traced_query(
+        conn,
+        PID,
+        snapshot_id,
+        actor="observer",
+        query_source="observer",
+        query_purpose="prompt_context_build",
+        tool="get_node",
+        args={"node_id": "L7.1", "compact": True},
+        project_root=project_root,
+    )
+    assert node_result["ok"] is True
+    assert node_result["result"]["node"]["node_id"] == "L7.1"
+    _assert_depends_on_direction_contract(node_result)
 
     subtree_result = graph_query_trace.traced_query(
         conn,
@@ -435,6 +458,7 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
     assert degree["result"]["fan_in"] == 1
     assert degree["result"]["fan_out"] == 1
     assert degree["result"]["by_type"]["depends_on"]["out"] == 1
+    _assert_depends_on_direction_contract(degree)
 
     neighbors = graph_query_trace.traced_query(
         conn,
@@ -447,10 +471,7 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
         args={"node_id": "L7.1", "compact": True},
         project_root=project_root,
     )
-    contract = neighbors["result"]["graph_contract"]
-    depends_on = contract["deps_graph"]["depends_on"]
-    assert depends_on["direction"] == "dependency_to_dependent"
-    assert "B -> A" in depends_on["interpretation"]
+    _assert_depends_on_direction_contract(neighbors)
 
     high_degree = graph_query_trace.traced_query(
         conn,
@@ -464,6 +485,7 @@ def test_graph_native_discovery_queries_cover_paths_functions_and_degrees(conn, 
         project_root=project_root,
     )
     assert high_degree["result"]["nodes"][0]["node"]["node_id"] == "L7.1"
+    _assert_depends_on_direction_contract(high_degree)
 
 
 def test_list_features_defaults_to_compact_budget_safe_payload(conn, tmp_path):
@@ -610,6 +632,7 @@ def test_graph_native_queries_search_edge_projection_and_neighbor_semantics(conn
     assert semantic["result"]["matches"][0]["result_type"] == "edge"
     assert semantic["result"]["matches"][0]["edge_id"] == "L7.1->L7.2:depends_on"
     assert semantic["result"]["matches"][0]["validity"]["status"] == "edge_semantic_current"
+    _assert_depends_on_direction_contract(semantic)
 
     neighbors = graph_query_trace.traced_query(
         conn,
@@ -674,6 +697,16 @@ def test_query_schema_exposes_tools_and_enums(conn, tmp_path):
         "edges",
     ]
     assert "timeout_ms" in result["result"]["tools"]["function_callees"]["optional_args"]
+    contract_policy = result["result"]["graph_contract_policy"]
+    assert set(contract_policy["direct_tools"]) >= {
+        "get_node",
+        "get_neighbors",
+        "find_node_by_path",
+        "degree_summary",
+        "high_degree_nodes",
+        "search_semantic",
+    }
+    assert "query_schema" in contract_policy["caller_envelope_tools"]
 
 
 def test_snapshot_orphan_file_filter_excludes_attached_rows(conn, tmp_path):
