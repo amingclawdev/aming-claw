@@ -149,6 +149,123 @@ def _project_root_for(project_id: str) -> Path:
     return Path.cwd()
 
 
+def _snapshot_commit_sha(conn: Any, project_id: str, snapshot_id: str) -> str:
+    try:
+        from . import graph_snapshot_store as store
+
+        snapshot = store.get_graph_snapshot(conn, project_id, snapshot_id) or {}
+        return str(snapshot.get("commit_sha") or "")
+    except Exception:
+        return ""
+
+
+def _structured_ai_payload(raw_output: Any, result: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    if isinstance(result, Mapping):
+        parsed = result.get("parse") if isinstance(result.get("parse"), Mapping) else {}
+        payload = parsed.get("payload") if isinstance(parsed.get("payload"), Mapping) else None
+        if isinstance(payload, Mapping) and payload:
+            return dict(payload)
+    if isinstance(raw_output, Mapping):
+        return dict(raw_output)
+    return {}
+
+
+def _self_precheck_payload(payload: Mapping[str, Any], result: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    model_check = (
+        payload.get("self_precheck")
+        if isinstance(payload.get("self_precheck"), Mapping)
+        else payload.get("self_check")
+    )
+    if not isinstance(model_check, Mapping):
+        model_check = {}
+    gate_check = _result_precheck(result or {}) if isinstance(result, Mapping) else {}
+    out: dict[str, Any] = {
+        "source": "semantic_worker_ai_output_intake",
+        "model_self_check": dict(model_check),
+    }
+    if gate_check:
+        out["gate_precheck"] = gate_check
+    return out
+
+
+def _graph_query_trace_ids_from_payload(payload: Mapping[str, Any]) -> list[str]:
+    trace_ids: list[str] = []
+    for key in ("graph_query_audit", "semantic_graph_query_audit"):
+        audit = payload.get(key)
+        if not isinstance(audit, Mapping):
+            continue
+        trace_id = str(audit.get("trace_id") or "").strip()
+        if trace_id and trace_id not in trace_ids:
+            trace_ids.append(trace_id)
+    return trace_ids
+
+
+def _mirror_ai_output_intake(
+    conn: Any,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    task_type: str,
+    target_type: str,
+    target_id: str,
+    raw_output: Any,
+    result: Mapping[str, Any] | None = None,
+    actor: str = "semantic_worker_inproc",
+    producer: str = "semantic_worker_inproc",
+    source_run_id: str = "",
+    base_commit: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _structured_ai_payload(raw_output, result)
+    if not payload:
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": "structured_payload_missing",
+            "task_type": task_type,
+        }
+    try:
+        from . import ai_output_intake
+
+        mirror = ai_output_intake.submit_ai_output(
+            conn,
+            project_id,
+            {
+                "task_type": task_type,
+                "snapshot_id": snapshot_id,
+                "base_commit": base_commit or _snapshot_commit_sha(conn, project_id, snapshot_id),
+                "target_type": target_type,
+                "target_id": target_id,
+                "producer": producer,
+                "source_run_id": source_run_id,
+                "payload": payload,
+                "self_precheck": _self_precheck_payload(payload, result),
+                "graph_query_trace_ids": _graph_query_trace_ids_from_payload(payload),
+                "metadata": {
+                    "source": "semantic_worker_ai_output_intake",
+                    **dict(metadata or {}),
+                },
+            },
+            actor=actor,
+        )
+        return {
+            "ok": True,
+            "status": mirror.get("route_status", "queued"),
+            "output_id": mirror.get("output_id", ""),
+            "idempotent": bool(mirror.get("idempotent")),
+            "task_type": task_type,
+        }
+    except Exception as exc:  # noqa: BLE001 - mirror must not fail primary path
+        log.warning("semantic_worker: ai output intake mirror failed for %s/%s: %s",
+                    task_type, target_id, exc)
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": str(exc),
+            "task_type": task_type,
+        }
+
+
 def handle_graph_structure_ai_output(
     project_id: str,
     snapshot_id: str,
@@ -578,10 +695,32 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                                 "status": "passed" if repaired_result.get("ok") else "failed",
                                 "precheck_after": _result_precheck(repaired_result),
                             })
+                            raw_output = repaired_output
                             result = {**repaired_result, "repair": repair}
                         except Exception as exc:  # noqa: BLE001 - keep original gate failure visible
                             repair.update({"status": "failed", "error": str(exc)})
                             result = {**result, "repair": repair}
+                    selector = payload.get("selector") if isinstance(payload.get("selector"), Mapping) else {}
+                    target_id = str(event.get("target_id") or selector.get("source_node_id") or "")
+                    intake_mirror = _mirror_ai_output_intake(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        task_type="graph_structure_ops",
+                        target_type=str(event.get("target_type") or "node"),
+                        target_id=target_id or snapshot_id,
+                        raw_output=raw_output,
+                        result=result if isinstance(result, Mapping) else {},
+                        actor="semantic_worker_inproc",
+                        producer="semantic_worker_inproc_graph_structure",
+                        source_run_id=event_id,
+                        metadata={
+                            "mode": mode,
+                            "ai_generated": ai_generated,
+                            "source_event_id": event_id,
+                            "event_type": "graph_structure_requested",
+                        },
+                    )
                     if result.get("ok"):
                         precheck = _result_precheck(result)
                         with sqlite_write_lock():
@@ -601,6 +740,7 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                                     "source": "semantic_worker_inproc_graph_structure",
                                     "mode": mode,
                                     "precheck": precheck,
+                                    "ai_output_intake": intake_mirror,
                                 },
                                 created_by="semantic_worker_inproc",
                             )
@@ -617,6 +757,7 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                                     "completed": True,
                                     "mode": mode,
                                     "precheck": precheck,
+                                    "ai_output_intake": intake_mirror,
                                 },
                             )
                             conn.commit()
@@ -641,6 +782,7 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                                     "errors": errors,
                                     "mode": mode,
                                     "precheck": precheck,
+                                    "ai_output_intake": intake_mirror,
                                 },
                                 created_by="semantic_worker_inproc",
                             )
@@ -657,6 +799,7 @@ def _drain_graph_structure(project_id: str, snapshot_id: str) -> None:
                                     "errors": errors,
                                     "mode": mode,
                                     "precheck": precheck,
+                                    "ai_output_intake": intake_mirror,
                                 },
                             )
                             conn.commit()
@@ -820,10 +963,31 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
                                 "status": "passed" if repaired_result.get("ok") else "failed",
                                 "precheck_after": _result_precheck(repaired_result),
                             })
+                            raw_output = repaired_output
                             result = {**repaired_result, "repair": repair}
                         except Exception as exc:  # noqa: BLE001 - keep original gate failure visible
                             repair.update({"status": "failed", "error": str(exc)})
                             result = {**result, "repair": repair}
+                    selector = payload.get("selector") if isinstance(payload.get("selector"), Mapping) else {}
+                    intake_mirror = _mirror_ai_output_intake(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        task_type="graph_enrich_config_ops",
+                        target_type=str(event.get("target_type") or "project"),
+                        target_id=str(event.get("target_id") or selector.get("source_node_id") or project_id),
+                        raw_output=raw_output,
+                        result=result if isinstance(result, Mapping) else {},
+                        actor="semantic_worker_inproc",
+                        producer="semantic_worker_inproc_graph_enrich_config",
+                        source_run_id=event_id,
+                        metadata={
+                            "mode": mode,
+                            "ai_generated": ai_generated,
+                            "source_event_id": event_id,
+                            "event_type": "graph_enrich_config_requested",
+                        },
+                    )
                     if result.get("ok"):
                         precheck = _result_precheck(result)
                         accepted = bool(result.get("accepted"))
@@ -854,6 +1018,7 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
                                     "accepted": accepted,
                                     "mutated": mutated,
                                     "requires_observer_approval": review_required,
+                                    "ai_output_intake": intake_mirror,
                                 },
                                 created_by="semantic_worker_inproc",
                             )
@@ -873,6 +1038,7 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
                                     "accepted": accepted,
                                     "mutated": mutated,
                                     "requires_observer_approval": review_required,
+                                    "ai_output_intake": intake_mirror,
                                 },
                             )
                             conn.commit()
@@ -897,6 +1063,7 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
                                     "errors": errors,
                                     "mode": mode,
                                     "precheck": precheck,
+                                    "ai_output_intake": intake_mirror,
                                 },
                                 created_by="semantic_worker_inproc",
                             )
@@ -913,6 +1080,7 @@ def _drain_graph_enrich_config(project_id: str, snapshot_id: str) -> None:
                                     "errors": errors,
                                     "mode": mode,
                                     "precheck": precheck,
+                                    "ai_output_intake": intake_mirror,
                                 },
                             )
                             conn.commit()
@@ -1336,12 +1504,25 @@ def _process_node_semantic_job(
             conn.commit()
             return {"ok": False, "status": "ai_incomplete", "node_id": node_id_s}
         feature_hash = ""
+        semantic_payload: dict[str, Any] = {}
+        semantic_payload_hash = ""
         row = conn.execute(
-            "SELECT feature_hash FROM graph_semantic_nodes WHERE project_id=? AND snapshot_id=? AND node_id=?",
+            """
+            SELECT feature_hash, semantic_json, payload_hash
+            FROM graph_semantic_nodes
+            WHERE project_id=? AND snapshot_id=? AND node_id=?
+            """,
             (project_id, snapshot_id, node_id_s),
         ).fetchone()
         if row:
             feature_hash = str(row["feature_hash"] or "")
+            semantic_payload_hash = str(row["payload_hash"] or "")
+            try:
+                import json
+                parsed_payload = json.loads(row["semantic_json"] or "{}")
+                semantic_payload = parsed_payload if isinstance(parsed_payload, dict) else {}
+            except Exception:
+                semantic_payload = {}
         try:
             from . import graph_events
             graph_events.backfill_existing_semantic_events(
@@ -1370,6 +1551,24 @@ def _process_node_semantic_job(
         except Exception as exc:  # noqa: BLE001
             log.warning("semantic_worker: event lookup failed for %s: %s",
                         node_id_s, exc)
+        intake_mirror = _mirror_ai_output_intake(
+            conn,
+            project_id,
+            snapshot_id,
+            task_type="semantic_node",
+            target_type="node",
+            target_id=node_id_s,
+            raw_output=semantic_payload,
+            actor="semantic_worker_inproc",
+            producer="semantic_worker_inproc_node",
+            source_run_id=event_id or semantic_payload_hash or node_id_s,
+            metadata={
+                "event_id": event_id,
+                "feature_hash": feature_hash,
+                "payload_hash": semantic_payload_hash,
+                "source": "semantic_worker_inproc",
+            },
+        )
         try:
             reconcile_feedback.submit_feedback_item(
                 project_id,
@@ -1386,6 +1585,7 @@ def _process_node_semantic_job(
                         "node_id": node_id_s,
                         "feature_hash": feature_hash,
                         "linked_event_ids": [event_id] if event_id else [],
+                        "ai_output_intake": intake_mirror,
                     },
                 },
                 actor="semantic_worker_inproc",
@@ -1486,6 +1686,7 @@ def _process_node_semantic_job(
             "status": "proposed",
             "node_id": node_id_s,
             "event_id": event_id,
+            "ai_output_intake": intake_mirror,
             "bridge": bridge_result,
             "config_bridge": config_bridge_result,
         }
