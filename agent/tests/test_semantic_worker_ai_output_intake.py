@@ -146,9 +146,13 @@ def test_process_node_semantic_job_mirrors_structured_output(monkeypatch, tmp_pa
     assert result["ai_output_intake"]["ok"] is True
     output = ai_output_intake.list_ai_outputs(conn, "demo", task_type="semantic_node")[0]
     assert output["target_id"] == "L7.1"
+    assert output["route_status"] == "review_pending"
     assert output["payload"]["semantic_summary"] == "Structured semantic output for dogfood."
     assert output["self_precheck"]["model_self_check"]["valid"] is True
     assert output["graph_query_trace_ids"] == ["gqt-node-demo"]
+    assert ai_output_intake.list_ai_output_queue(conn, "demo") == []
+    review_pending = ai_output_intake.list_ai_output_queue(conn, "demo", status="review_pending")
+    assert [row["output_id"] for row in review_pending] == [output["output_id"]]
 
 
 def test_graph_structure_and_config_mirrors_are_idempotent():
@@ -227,5 +231,8 @@ def test_graph_structure_and_config_mirrors_are_idempotent():
     outputs = ai_output_intake.list_ai_outputs(conn, "demo")
     by_type = {row["task_type"]: row for row in outputs}
     assert set(by_type) == {"graph_structure_ops", "graph_enrich_config_ops"}
+    assert by_type["graph_structure_ops"]["route_status"] == "completed"
+    assert by_type["graph_enrich_config_ops"]["route_status"] == "completed"
     assert by_type["graph_structure_ops"]["self_precheck"]["gate_precheck"]["status"] == "passed"
     assert by_type["graph_enrich_config_ops"]["payload"]["operations"][0]["rule_id"] == "calls-import-only"
+    assert ai_output_intake.list_ai_output_queue(conn, "demo") == []

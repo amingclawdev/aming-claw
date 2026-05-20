@@ -214,6 +214,7 @@ def _mirror_ai_output_intake(
     producer: str = "semantic_worker_inproc",
     source_run_id: str = "",
     base_commit: str = "",
+    route_status: str = "completed",
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _structured_ai_payload(raw_output, result)
@@ -238,6 +239,7 @@ def _mirror_ai_output_intake(
                 "target_id": target_id,
                 "producer": producer,
                 "source_run_id": source_run_id,
+                "route_status": route_status,
                 "payload": payload,
                 "self_precheck": _self_precheck_payload(payload, result),
                 "graph_query_trace_ids": _graph_query_trace_ids_from_payload(payload),
@@ -1562,6 +1564,7 @@ def _process_node_semantic_job(
             actor="semantic_worker_inproc",
             producer="semantic_worker_inproc_node",
             source_run_id=event_id or semantic_payload_hash or node_id_s,
+            route_status="review_pending",
             metadata={
                 "event_id": event_id,
                 "feature_hash": feature_hash,

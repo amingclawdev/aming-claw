@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from agent.governance import event_bus
+from agent.governance import ai_output_intake
 from agent.governance import graph_events
 from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
@@ -656,6 +657,19 @@ def test_c2b_feedback_decision_invalid_decision_does_not_accept_semantic_side_ef
         """,
         (PID, sid),
     ).fetchone()["event_id"]
+    output = ai_output_intake.submit_ai_output(
+        conn,
+        PID,
+        {
+            "task_type": "semantic_node",
+            "snapshot_id": sid,
+            "target_type": "node",
+            "target_id": "L7.1",
+            "route_status": "review_pending",
+            "payload": {"node_id": "L7.1", "semantic_summary": "reject me"},
+        },
+        actor="test",
+    )
     submitted = reconcile_feedback.submit_feedback_item(
         PID, sid,
         feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
@@ -668,6 +682,7 @@ def test_c2b_feedback_decision_invalid_decision_does_not_accept_semantic_side_ef
             "evidence": {
                 "node_id": "L7.1",
                 "linked_event_ids": [ev_id],
+                "ai_output_intake": {"output_id": output["output_id"]},
             },
         },
         actor="test",
@@ -739,6 +754,19 @@ def test_c_accept_helper_flips_node_status_and_event(conn):
         "SELECT event_id FROM graph_events WHERE project_id=? AND snapshot_id=? AND target_id='L7.1' LIMIT 1",
         (PID, sid),
     ).fetchone()["event_id"]
+    output = ai_output_intake.submit_ai_output(
+        conn,
+        PID,
+        {
+            "task_type": "semantic_node",
+            "snapshot_id": sid,
+            "target_type": "node",
+            "target_id": "L7.1",
+            "route_status": "review_pending",
+            "payload": {"node_id": "L7.1", "semantic_summary": "pending"},
+        },
+        actor="test",
+    )
     submitted = reconcile_feedback.submit_feedback_item(
         PID, sid,
         feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
@@ -751,6 +779,7 @@ def test_c_accept_helper_flips_node_status_and_event(conn):
             "evidence": {
                 "node_id": "L7.1",
                 "linked_event_ids": [ev_id],
+                "ai_output_intake": {"output_id": output["output_id"]},
             },
         },
         actor="test",
@@ -762,6 +791,7 @@ def test_c_accept_helper_flips_node_status_and_event(conn):
     )
     assert result["node_ids_flipped"] == ["L7.1"]
     assert result["event_ids_flipped"] == [ev_id]
+    assert result["ai_output_ids_marked_completed"] == [output["output_id"]]
     assert result["errors"] == []
 
     # Verify DB state.
@@ -775,6 +805,11 @@ def test_c_accept_helper_flips_node_status_and_event(conn):
         (ev_id,),
     ).fetchone()
     assert ev_row["status"] == graph_events.EVENT_STATUS_ACCEPTED
+    route_row = conn.execute(
+        "SELECT status FROM ai_output_queue WHERE output_id=?",
+        (output["output_id"],),
+    ).fetchone()
+    assert route_row["status"] == "completed"
 
 
 def test_c4_direct_event_accept_flips_node_status_and_projection(conn, monkeypatch):
@@ -903,6 +938,19 @@ def test_c3_reject_decision_clears_node_pending_review_payload(conn, monkeypatch
         """,
         (PID, sid),
     ).fetchone()["event_id"]
+    output = ai_output_intake.submit_ai_output(
+        conn,
+        PID,
+        {
+            "task_type": "semantic_node",
+            "snapshot_id": sid,
+            "target_type": "node",
+            "target_id": "L7.1",
+            "route_status": "review_pending",
+            "payload": {"node_id": "L7.1", "semantic_summary": "reject me"},
+        },
+        actor="test",
+    )
     submitted = reconcile_feedback.submit_feedback_item(
         PID, sid,
         feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
@@ -915,6 +963,7 @@ def test_c3_reject_decision_clears_node_pending_review_payload(conn, monkeypatch
             "evidence": {
                 "node_id": "L7.1",
                 "linked_event_ids": [ev_id],
+                "ai_output_intake": {"output_id": output["output_id"]},
             },
         },
         actor="test",
@@ -947,6 +996,7 @@ def test_c3_reject_decision_clears_node_pending_review_payload(conn, monkeypatch
     assert result["semantic_enrichment_rejected"]["node_ids_cleared"] == ["L7.1"]
     assert result["semantic_enrichment_rejected"]["event_ids_rejected"] == [ev_id]
     assert result["semantic_enrichment_rejected"]["job_ids_marked_rejected"] == ["L7.1"]
+    assert result["semantic_enrichment_rejected"]["ai_output_ids_marked_rejected"] == [output["output_id"]]
     assert result["projection_rebuilt"] is True
     row = conn.execute(
         """
@@ -966,6 +1016,11 @@ def test_c3_reject_decision_clears_node_pending_review_payload(conn, monkeypatch
         (PID, sid),
     ).fetchone()
     assert job["status"] == "rejected"
+    route_row = conn.execute(
+        "SELECT status FROM ai_output_queue WHERE output_id=?",
+        (output["output_id"],),
+    ).fetchone()
+    assert route_row["status"] == "rejected"
     node = store.list_graph_snapshot_nodes(conn, PID, sid, include_semantic=True, limit=10)[0]
     assert node["semantic"]["has_semantic_payload"] is False
     assert "feature_name" not in node["semantic"]

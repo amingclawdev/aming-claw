@@ -8730,6 +8730,19 @@ def handle_graph_governance_snapshot_feedback_queue_claim(ctx: RequestContext):
         conn.close()
 
 
+def _semantic_feedback_ai_output_id(evidence: dict[str, Any], worker_evidence: dict[str, Any]) -> str:
+    ai_output = worker_evidence.get("ai_output_intake")
+    if not isinstance(ai_output, dict):
+        ai_output = evidence.get("ai_output_intake")
+    if not isinstance(ai_output, dict):
+        raw_issue = evidence.get("raw_issue") if isinstance(evidence.get("raw_issue"), dict) else {}
+        raw_evidence = raw_issue.get("evidence") if isinstance(raw_issue.get("evidence"), dict) else {}
+        ai_output = raw_evidence.get("ai_output_intake")
+    if not isinstance(ai_output, dict):
+        return ""
+    return str(ai_output.get("output_id") or "").strip()
+
+
 def _accept_semantic_enrichment_for_feedback_items(
     conn,
     project_id: str,
@@ -8750,6 +8763,7 @@ def _accept_semantic_enrichment_for_feedback_items(
     Returns a summary dict with `node_ids_flipped`, `event_ids_flipped`,
     `errors`. Caller is responsible for triggering a projection rebuild.
     """
+    from . import ai_output_intake
     from . import graph_events
     from . import reconcile_feedback
 
@@ -8758,6 +8772,7 @@ def _accept_semantic_enrichment_for_feedback_items(
     node_ids_flipped: list[str] = []
     edge_ids_flipped: list[str] = []
     event_ids_flipped: list[str] = []
+    ai_output_ids_marked_completed: list[str] = []
     errors: list[dict[str, Any]] = []
     for fid in feedback_ids:
         item = by_id.get(fid)
@@ -8791,6 +8806,26 @@ def _accept_semantic_enrichment_for_feedback_items(
         )
         if not isinstance(event_ids, list):
             event_ids = [event_ids]
+        ai_output_id = _semantic_feedback_ai_output_id(evidence, worker_evidence)
+        if ai_output_id:
+            try:
+                marked = ai_output_intake.mark_ai_output_route_status(
+                    conn,
+                    project_id,
+                    ai_output_id,
+                    "completed",
+                    actor=actor,
+                )
+                if marked.get("ok"):
+                    ai_output_ids_marked_completed.append(ai_output_id)
+                else:
+                    errors.append({
+                        "feedback_id": fid,
+                        "output_id": ai_output_id,
+                        "error": marked.get("error") or "ai_output_route_update_failed",
+                    })
+            except Exception as exc:  # noqa: BLE001 - advisory
+                errors.append({"feedback_id": fid, "output_id": ai_output_id, "error": str(exc)})
         if not target_id and not event_ids:
             errors.append({"feedback_id": fid, "error": "missing_target_id_and_event_ids"})
             continue
@@ -8858,6 +8893,7 @@ def _accept_semantic_enrichment_for_feedback_items(
         "node_ids_flipped": node_ids_flipped,
         "edge_ids_flipped": edge_ids_flipped,
         "event_ids_flipped": event_ids_flipped,
+        "ai_output_ids_marked_completed": ai_output_ids_marked_completed,
         "errors": errors,
     }
 
@@ -8877,6 +8913,7 @@ def _reject_semantic_enrichment_for_feedback_items(
     into future projections. Rejecting the review must therefore also reject
     linked semantic events and clear the pending persistent cache row.
     """
+    from . import ai_output_intake
     from . import graph_events
     from . import reconcile_feedback
 
@@ -8886,6 +8923,7 @@ def _reject_semantic_enrichment_for_feedback_items(
     edge_ids_cleared: list[str] = []
     event_ids_rejected: list[str] = []
     job_ids_marked_rejected: list[str] = []
+    ai_output_ids_marked_rejected: list[str] = []
     errors: list[dict[str, Any]] = []
     semantic_event_types = {"semantic_node_enriched", "edge_semantic_enriched"}
     for fid in feedback_ids:
@@ -8916,6 +8954,26 @@ def _reject_semantic_enrichment_for_feedback_items(
         )
         if not isinstance(event_ids, list):
             event_ids = [event_ids]
+        ai_output_id = _semantic_feedback_ai_output_id(evidence, worker_evidence)
+        if ai_output_id:
+            try:
+                marked = ai_output_intake.mark_ai_output_route_status(
+                    conn,
+                    project_id,
+                    ai_output_id,
+                    "rejected",
+                    actor=actor,
+                )
+                if marked.get("ok"):
+                    ai_output_ids_marked_rejected.append(ai_output_id)
+                else:
+                    errors.append({
+                        "feedback_id": fid,
+                        "output_id": ai_output_id,
+                        "error": marked.get("error") or "ai_output_route_update_failed",
+                    })
+            except Exception as exc:  # noqa: BLE001 - advisory
+                errors.append({"feedback_id": fid, "output_id": ai_output_id, "error": str(exc)})
         linked_events: list[dict[str, Any]] = []
         for eid in event_ids:
             eid_s = str(eid or "").strip()
@@ -9000,6 +9058,7 @@ def _reject_semantic_enrichment_for_feedback_items(
         "edge_ids_cleared": edge_ids_cleared,
         "event_ids_rejected": event_ids_rejected,
         "job_ids_marked_rejected": job_ids_marked_rejected,
+        "ai_output_ids_marked_rejected": ai_output_ids_marked_rejected,
         "errors": errors,
     }
 

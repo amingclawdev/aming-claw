@@ -31,6 +31,15 @@ SUPPORTED_TASK_TYPES = {
 }
 
 RESERVED_TASK_TYPES = {"chain_stage_result"}
+ROUTE_STATUSES = {
+    "queued",
+    "reserved",
+    "review_pending",
+    "completed",
+    "rejected",
+    "failed",
+}
+OPEN_QUEUE_STATUS = "queued"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS ai_outputs (
@@ -172,7 +181,10 @@ def submit_ai_output(
         payload_hash=payload_hash,
     )
     output_id = _output_id(project_id, dedupe_key)
-    route_status = "reserved" if task_type in RESERVED_TASK_TYPES else "queued"
+    default_route_status = "reserved" if task_type in RESERVED_TASK_TYPES else "queued"
+    route_status = _route_status_field(request, default_route_status)
+    if task_type in RESERVED_TASK_TYPES and route_status != "reserved":
+        raise ValidationError("reserved task_type must use route_status='reserved'")
 
     row = {
         "output_id": output_id,
@@ -294,6 +306,78 @@ def get_ai_output(conn: sqlite3.Connection, project_id: str, output_id: str) -> 
     return output_row_to_dict(row) if row else None
 
 
+def mark_ai_output_route_status(
+    conn: sqlite3.Connection,
+    project_id: str,
+    output_id: str,
+    route_status: str,
+    *,
+    actor: str = "observer",
+    request_id: str = "",
+    last_error: str = "",
+) -> dict[str, Any]:
+    """Update downstream route lifecycle while preserving the submitted output."""
+    ensure_schema(conn)
+    project_id = _required_str(project_id, "project_id")
+    output_id = _required_str(output_id, "output_id")
+    route_status = _route_status_value(route_status)
+    now = _utc_now()
+
+    from .db import sqlite_write_lock
+
+    with sqlite_write_lock():
+        row = conn.execute(
+            "SELECT * FROM ai_outputs WHERE project_id = ? AND output_id = ?",
+            (project_id, output_id),
+        ).fetchone()
+        if not row:
+            return {
+                "ok": False,
+                "error": "ai_output_not_found",
+                "output_id": output_id,
+                "route_status": route_status,
+            }
+        conn.execute(
+            """
+            UPDATE ai_outputs
+            SET route_status = ?, updated_at = ?
+            WHERE project_id = ? AND output_id = ?
+            """,
+            (route_status, now, project_id, output_id),
+        )
+        conn.execute(
+            """
+            UPDATE ai_output_queue
+            SET status = ?, last_error = ?, updated_at = ?
+            WHERE project_id = ? AND output_id = ?
+            """,
+            (route_status, _optional_str(last_error), now, project_id, output_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO ai_output_events (
+                output_id, project_id, event_type, actor, request_id,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                output_id,
+                project_id,
+                "route_status_updated",
+                _optional_str(actor),
+                _optional_str(request_id),
+                _json_dumps({"route_status": route_status, "schema": INTAKE_SCHEMA_VERSION}),
+                now,
+            ),
+        )
+    return {
+        "ok": True,
+        "output_id": output_id,
+        "route_status": route_status,
+        "output": get_ai_output(conn, project_id, output_id),
+    }
+
+
 def list_ai_outputs(
     conn: sqlite3.Connection,
     project_id: str,
@@ -343,11 +427,18 @@ def list_ai_output_queue(
     ensure_schema(conn)
     where = ["project_id = ?"]
     params: list[Any] = [project_id]
-    for column, value in [("task_type", task_type), ("status", status)]:
+    for column, value in [("task_type", task_type)]:
         clean = _optional_str(value)
         if clean:
             where.append(f"{column} = ?")
             params.append(clean)
+    status_clean = _optional_str(status)
+    if status_clean and status_clean.lower() not in {"*", "all"}:
+        where.append("status = ?")
+        params.append(status_clean)
+    elif not status_clean:
+        where.append("status = ?")
+        params.append(OPEN_QUEUE_STATUS)
     params.extend([_limit(limit), max(0, int(offset or 0))])
     rows = conn.execute(
         f"""
@@ -434,6 +525,20 @@ def _limit(value: int) -> int:
         return 50
 
 
+def _route_status_field(request: dict[str, Any], default: str) -> str:
+    return _route_status_value(request.get("route_status") or default)
+
+
+def _route_status_value(value: Any) -> str:
+    clean = _optional_str(value)
+    if clean not in ROUTE_STATUSES:
+        raise ValidationError(
+            f"unsupported route_status {clean!r}",
+            {"supported_route_statuses": sorted(ROUTE_STATUSES)},
+        )
+    return clean
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -484,4 +589,5 @@ __all__ = [
     "get_ai_output",
     "list_ai_outputs",
     "list_ai_output_queue",
+    "mark_ai_output_route_status",
 ]

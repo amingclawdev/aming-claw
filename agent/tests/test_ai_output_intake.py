@@ -93,6 +93,39 @@ def test_submit_ai_output_creates_output_event_and_queue():
     assert fetched["graph_query_trace_ids"] == ["gq-test-1"]
 
 
+def test_review_only_route_status_is_not_default_queue():
+    conn = _conn()
+
+    result = ai_output_intake.submit_ai_output(
+        conn,
+        PID,
+        {**_request("semantic_node"), "route_status": "review_pending"},
+        actor="semantic-worker",
+    )
+    conn.commit()
+
+    assert result["route_status"] == "review_pending"
+    assert ai_output_intake.list_ai_output_queue(conn, PID) == []
+    pending = ai_output_intake.list_ai_output_queue(conn, PID, status="review_pending")
+    assert [row["output_id"] for row in pending] == [result["output_id"]]
+
+    marked = ai_output_intake.mark_ai_output_route_status(
+        conn,
+        PID,
+        result["output_id"],
+        "completed",
+        actor="observer",
+    )
+    conn.commit()
+
+    assert marked["ok"] is True
+    assert marked["route_status"] == "completed"
+    assert ai_output_intake.get_ai_output(conn, PID, result["output_id"])["route_status"] == "completed"
+    assert ai_output_intake.list_ai_output_queue(conn, PID) == []
+    completed = ai_output_intake.list_ai_output_queue(conn, PID, status="completed")
+    assert [row["output_id"] for row in completed] == [result["output_id"]]
+
+
 def test_submit_ai_output_is_idempotent_by_explicit_key():
     conn = _conn()
     body = _request()
