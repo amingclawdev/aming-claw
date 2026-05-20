@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 import yaml
 
 from agent.governance.graph_structure_ops import EDGE_ALLOWLIST
-from agent.governance.reconcile_semantic_config import PROJECT_OVERRIDE_PATH
+from agent.governance.reconcile_semantic_config import DEFAULT_CONFIG_PATH, PROJECT_OVERRIDE_PATH
 from agent.governance.semantic_precheck import (
     gate_precheck,
     parse_precheck,
@@ -105,10 +105,14 @@ GRAPH_ENRICH_CONFIG_SELF_PRECHECK_RULES = [
     "predicate_guard_weak_call_requires_call_syntax_or_receiver",
     "predicate_guard_string_literal_requires_raw_target",
     "op_action_compatible",
+    "existing_rule_no_weaken",
     "config_patch_previewed",
     "observer_approval_required",
 ]
-GRAPH_ENRICH_CONFIG_NON_RETRYABLE_GATE_ERRORS: set[str] = set()
+GRAPH_ENRICH_CONFIG_NON_RETRYABLE_GATE_ERRORS: set[str] = {
+    "duplicate_or_weaken_existing_rule",
+    "existing_rule_conflict",
+}
 MAX_AI_REPAIR_ATTEMPTS = 1
 _REQUIRED_OPERATION_FIELDS = {
     name: ["op", "rule_id", "edge", "source_evidence", "action"]
@@ -235,7 +239,11 @@ def parse_graph_enrich_config_ai_output(raw_output: Any) -> dict[str, Any]:
     return {"ok": True, "payload": payload, "errors": []}
 
 
-def validate_graph_enrich_config_ops(payload: Mapping[str, Any]) -> dict[str, Any]:
+def validate_graph_enrich_config_ops(
+    payload: Mapping[str, Any],
+    *,
+    existing_rules: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     source = payload.get("source") if isinstance(payload.get("source"), Mapping) else {}
     operations_raw = payload.get("operations") if isinstance(payload.get("operations"), list) else []
     self_check = payload.get("self_check") if isinstance(payload.get("self_check"), Mapping) else {}
@@ -255,7 +263,14 @@ def validate_graph_enrich_config_ops(payload: Mapping[str, Any]) -> dict[str, An
     seen_rule_ids: set[str] = set()
     for index, raw in enumerate(operations_raw):
         op = raw if isinstance(raw, Mapping) else {}
-        operations.append(_validate_operation(op, index=index, seen_rule_ids=seen_rule_ids))
+        operations.append(
+            _validate_operation(
+                op,
+                index=index,
+                seen_rule_ids=seen_rule_ids,
+                existing_rules=existing_rules or {},
+            )
+        )
 
     accepted = [item for item in operations if item["status"] == "accepted"]
     rejected_count = len(operations) - len(accepted)
@@ -310,7 +325,10 @@ def dry_run_graph_enrich_config_ops(
     *,
     project_root: str | Path,
 ) -> dict[str, Any]:
-    gate = validate_graph_enrich_config_ops(payload)
+    gate = validate_graph_enrich_config_ops(
+        payload,
+        existing_rules=_effective_graph_enrich_config_rules(project_root),
+    )
     if not gate["ok"]:
         return {
             "ok": False,
@@ -422,6 +440,7 @@ def _validate_operation(
     *,
     index: int,
     seen_rule_ids: set[str],
+    existing_rules: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     normalizations: list[str] = []
@@ -476,6 +495,21 @@ def _validate_operation(
         errors.append("source_evidence_unsupported_for_policy")
     errors.extend(when["errors"])
     errors.extend(_predicate_guard_errors(edge, source_evidence, action, when["when"]))
+    existing_rule = _existing_rule_diagnostic(
+        {
+            "op": op_name,
+            "rule_id": rule_id,
+            "edge": edge,
+            "source_evidence": source_evidence,
+            "action": action,
+            "downgrade_to": downgrade_to,
+            "when": when["when"],
+        },
+        existing_rules or {},
+        is_rule_op=is_rule_op,
+    )
+    if existing_rule.get("error"):
+        errors.append(str(existing_rule["error"]))
     confidence = op.get("confidence")
     if confidence is not None:
         try:
@@ -498,6 +532,8 @@ def _validate_operation(
         "reason": _reason(op.get("evidence")),
         "when": when["when"],
     }
+    if existing_rule:
+        report["existing_rule"] = existing_rule
     if upstream_proposal:
         report["upstream_proposal"] = upstream_proposal
         normalizations.append("classified_as_upstream_proposal")
@@ -612,6 +648,114 @@ def _config_patch_for_operations(operations: list[dict[str, Any]]) -> dict[str, 
     if rules:
         patch["graph_enrich_config_ops"] = {"rules": rules}
     return patch
+
+
+def _effective_graph_enrich_config_rules(project_root: str | Path) -> dict[str, Any]:
+    root = Path(project_root).resolve()
+    base = _read_yaml_mapping(DEFAULT_CONFIG_PATH)
+    override = _read_yaml_mapping(root / PROJECT_OVERRIDE_PATH)
+    effective = _deep_merge(base, override)
+    graph_config = effective.get("graph_enrich_config_ops")
+    if not isinstance(graph_config, Mapping):
+        return {}
+    rules = graph_config.get("rules")
+    return dict(rules) if isinstance(rules, Mapping) else {}
+
+
+def _existing_rule_diagnostic(
+    operation: Mapping[str, Any],
+    existing_rules: Mapping[str, Any],
+    *,
+    is_rule_op: bool,
+) -> dict[str, Any]:
+    if not is_rule_op:
+        return {}
+    rule_id = str(operation.get("rule_id") or "").strip()
+    existing_raw = existing_rules.get(rule_id)
+    if not rule_id or not isinstance(existing_raw, Mapping):
+        return {}
+    incoming = _canonical_rule(operation)
+    existing = _canonical_rule(existing_raw)
+    relation = _existing_rule_relation(existing, incoming)
+    diagnostic = {
+        "rule_id": rule_id,
+        "relation": relation,
+        "existing": existing,
+    }
+    if relation == "same":
+        diagnostic["error"] = "duplicate_or_weaken_existing_rule"
+        diagnostic["reason"] = "same rule_id already exists with equivalent behavior"
+    elif relation == "existing_broader_or_equal":
+        diagnostic["error"] = "duplicate_or_weaken_existing_rule"
+        diagnostic["reason"] = (
+            "same rule_id already exists and matches a broader or equal predicate scope; "
+            "replacing it would weaken existing coverage"
+        )
+    else:
+        diagnostic["error"] = "existing_rule_conflict"
+        diagnostic["reason"] = (
+            "same rule_id already exists with different behavior; use a new rule_id "
+            "or an explicit observer-authored config override"
+        )
+    return diagnostic
+
+
+def _canonical_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
+    when = _normalize_when(raw.get("when"))
+    return {
+        "op": str(raw.get("op") or "").strip(),
+        "edge": _normalize_edge(raw.get("edge") or raw.get("edge_type")),
+        "source_evidence": _normalize_source_evidence(raw.get("source_evidence")),
+        "action": _normalize_action(raw.get("action")),
+        "downgrade_to": _normalize_edge(raw.get("downgrade_to")),
+        "when": when["when"],
+    }
+
+
+def _existing_rule_relation(existing: Mapping[str, Any], incoming: Mapping[str, Any]) -> str:
+    comparable_keys = ("op", "edge", "source_evidence", "action", "downgrade_to")
+    comparable = all(
+        str(existing.get(key) or "") == str(incoming.get(key) or "")
+        for key in comparable_keys
+    )
+    if comparable and _when_equal(existing.get("when"), incoming.get("when")):
+        return "same"
+    if comparable and _when_is_broader_or_equal(existing.get("when"), incoming.get("when")):
+        return "existing_broader_or_equal"
+    return "different"
+
+
+def _when_equal(left: Any, right: Any) -> bool:
+    return _when_condition_map(left) == _when_condition_map(right)
+
+
+def _when_is_broader_or_equal(existing_when: Any, incoming_when: Any) -> bool:
+    existing = _when_condition_map(existing_when)
+    incoming = _when_condition_map(incoming_when)
+    for predicate, existing_values in existing.items():
+        incoming_values = incoming.get(predicate)
+        if not incoming_values:
+            return False
+        if not incoming_values.issubset(existing_values):
+            return False
+    return True
+
+
+def _when_condition_map(raw_when: Any) -> dict[str, set[str]]:
+    if raw_when in (None, "", {}):
+        return {}
+    normalized = _normalize_when(raw_when)
+    if normalized["errors"] or not normalized["when"]:
+        return {}
+    out: dict[str, set[str]] = {}
+    for item in normalized["when"].get("all") or []:
+        if not isinstance(item, Mapping):
+            continue
+        predicate = str(item.get("predicate") or "")
+        if not predicate:
+            continue
+        out.setdefault(predicate, set()).update(_predicate_values(item))
+    return out
 
 
 def _op_action_compatibility_errors(op_name: str, action: str) -> list[str]:

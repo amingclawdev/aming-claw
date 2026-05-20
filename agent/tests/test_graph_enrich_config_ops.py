@@ -791,6 +791,71 @@ def test_graph_enrich_config_rejects_tighten_rule_that_allows_evidence(tmp_path)
     assert result["preview"]["graph_enrich_config_ops"]["rules"] == {}
 
 
+def test_graph_enrich_config_rejects_same_rule_id_weaken_existing_broad_rule(tmp_path):
+    project = tmp_path / "generated-project"
+    override_path = project / PROJECT_OVERRIDE_PATH
+    override_path.parent.mkdir(parents=True)
+    override_path.write_text(
+        "\n".join(
+            [
+                "graph_enrich_config_ops:",
+                "  schema_version: graph_enrich_config_ops.v1",
+                "  rules:",
+                "    tests.test_import_fanin.require_direct_symbol_import:",
+                "      op: tighten_rule",
+                "      edge: tests",
+                "      source_evidence: test_import_fanin",
+                "      action: require_direct_symbol_import",
+                "      downgrade_to: weak_tests",
+                "      reason: Existing broad dogfood rule.",
+                "      when:",
+                "        all:",
+                "          - predicate: source_evidence_is",
+                "            value: test_import_fanin",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    payload = _predicate_rule_payload()
+    payload["operations"][0] = {
+        "op": "tighten_rule",
+        "rule_id": "tests.test_import_fanin.require_direct_symbol_import",
+        "edge": "tests",
+        "source_evidence": "test_import_fanin",
+        "action": "require_direct_symbol_import",
+        "downgrade_to": "weak_tests",
+        "confidence": 0.5,
+        "when": {
+            "all": [
+                {"predicate": "source_evidence_is", "value": "test_import_fanin"},
+                {"predicate": "language_is", "value": "python"},
+            ]
+        },
+        "evidence": {
+            "reason": (
+                "Dogfood regression: adding language_is=python would replace the "
+                "broader existing test_import_fanin rule."
+            ),
+        },
+    }
+
+    result = run_graph_enrich_config_ai_output_pipeline(
+        raw_output=json.dumps(payload),
+        mode="dry_run",
+        project_root=project,
+    )
+
+    assert result["ok"] is False
+    assert result["precheck"]["classification"] == "policy_rejected"
+    assert result["precheck"]["retryable"] is False
+    operation = result["gate"]["operations"][0]
+    assert operation["status"] == "rejected"
+    assert "duplicate_or_weaken_existing_rule" in operation["errors"]
+    assert operation["existing_rule"]["relation"] == "existing_broader_or_equal"
+    assert result["preview"]["graph_enrich_config_ops"]["rules"] == {}
+
+
 def test_graph_enrich_config_ops_precheck_marks_malformed_output_repairable(tmp_path):
     project = tmp_path / "generated-project"
     project.mkdir()
