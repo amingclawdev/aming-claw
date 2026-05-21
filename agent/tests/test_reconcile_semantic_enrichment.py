@@ -1073,6 +1073,106 @@ def test_semantic_ai_graph_query_audit_uses_budget_safe_compact_neighbors(conn, 
     assert result["semantic_index"]["features"][0]["graph_query_audit"]["status"] == "complete"
 
 
+def test_semantic_ai_graph_query_audit_scales_budget_for_many_path_bindings(conn, tmp_path):
+    project = tmp_path / "project"
+    _write(
+        project / "agent" / "governance" / "semantic_worker.py",
+        "def drain():\n    return 'semantic'\n",
+    )
+    test_paths = [
+        f"agent/tests/test_semantic_worker_{idx}.py"
+        for idx in range(12)
+    ]
+    for path in test_paths:
+        _write(project / path, "def test_semantic_worker():\n    assert True\n")
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.large-paths",
+                    "layer": "L7",
+                    "title": "Semantic Worker",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/semantic_worker.py"],
+                    "test": test_paths,
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "functions": [
+                            {
+                                "name": "drain",
+                                "path": "agent/governance/semantic_worker.py",
+                            }
+                        ],
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+    seen_payloads: list[dict] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        seen_payloads.append(payload)
+        assert payload["graph_query_audit"]["status"] == "complete"
+        return {
+            "feature_name": "Semantic Worker",
+            "semantic_summary": "Uses scaled graph audit budgets for many path bindings.",
+            "intent": "avoid path fan-in budget overflow",
+            "domain_label": "governance.semantic",
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": NODE_SEMANTIC_SELF_CHECK_RULES,
+                "checked_rules_count": len(NODE_SEMANTIC_SELF_CHECK_RULES),
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.large-paths"],
+        created_by="semantic-worker-test",
+    )
+
+    assert len(seen_payloads) == 1
+    audit = seen_payloads[0]["graph_query_audit"]
+    trace = conn.execute(
+        """
+        SELECT status, budget_json FROM graph_query_traces
+        WHERE project_id=? AND snapshot_id=? AND trace_id=?
+        """,
+        (PID, "full-semantic-test", audit["trace_id"]),
+    ).fetchone()
+    assert trace["status"] == "complete"
+    assert json.loads(trace["budget_json"])["max_result_chars"] > 80_000
+
+
 def test_semantic_enrichment_chunks_large_function_node_and_aggregates(conn, tmp_path):
     project = tmp_path / "project"
     source = "\n\n".join(

@@ -236,6 +236,7 @@ def test_process_node_semantic_job_scopes_persist_and_trace_dir(monkeypatch, tmp
                 "status": "passed",
                 "checked_rules": semantic.NODE_SEMANTIC_SELF_CHECK_RULES,
             },
+            "graph_query_audit": {"trace_id": "gqt-node-demo", "status": "complete"},
         }
         conn.execute(
             """

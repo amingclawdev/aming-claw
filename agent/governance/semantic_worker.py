@@ -225,6 +225,20 @@ def _semantic_node_gate_precheck(payload: Mapping[str, Any]) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - gate should still fail closed on model validity
         missing_rules = []
     errors.extend(f"missing_self_check_rule:{rule}" for rule in missing_rules)
+    graph_audit = {}
+    for key in ("semantic_graph_query_audit", "graph_query_audit"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            graph_audit = dict(value)
+            break
+    graph_audit_status = str(graph_audit.get("status") or "").strip().lower()
+    graph_audit_trace_id = str(graph_audit.get("trace_id") or "").strip()
+    if not graph_audit:
+        errors.append("missing_graph_query_audit")
+    elif not graph_audit_trace_id:
+        errors.append("missing_graph_query_trace_id")
+    elif graph_audit_status not in {"complete", "completed", "ok", "passed"}:
+        errors.append(f"graph_query_audit_not_complete:{graph_audit_status or 'missing'}")
     return {
         "source": "semantic_node_system_gate",
         "gate_name": "semantic_node_self_check",
@@ -235,6 +249,8 @@ def _semantic_node_gate_precheck(payload: Mapping[str, Any]) -> dict[str, Any]:
         "checked_rules": checked_rule_names,
         "checked_rules_count": len(checked_rule_names),
         "model_status": status,
+        "graph_query_audit_status": graph_audit_status,
+        "graph_query_trace_id": graph_audit_trace_id,
         "required": True,
         "retryable": False,
     }
@@ -280,6 +296,7 @@ def _mirror_ai_output_intake(
     try:
         from . import ai_output_intake
 
+        ai_route = payload.get("ai_route") if isinstance(payload.get("ai_route"), Mapping) else {}
         mirror = ai_output_intake.submit_ai_output(
             conn,
             project_id,
@@ -291,6 +308,8 @@ def _mirror_ai_output_intake(
                 "target_id": target_id,
                 "producer": producer,
                 "source_run_id": source_run_id,
+                "provider": ai_route.get("provider") or (metadata or {}).get("provider"),
+                "model": ai_route.get("model") or (metadata or {}).get("model"),
                 "route_status": route_status,
                 "payload": payload,
                 "self_precheck": _self_precheck_payload(payload, result),

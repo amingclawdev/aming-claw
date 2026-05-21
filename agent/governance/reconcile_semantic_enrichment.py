@@ -811,6 +811,11 @@ def _semantic_ai_graph_query_context(
         from . import graph_query_trace
 
         path_roles = _semantic_evidence_path_roles(feature)
+        # Path fan-in can be high for shared test files. Keep query count
+        # bounded by the exact path list, but scale the result-char ceiling so
+        # graph audit completion does not fail solely because many compact
+        # path lookups each return several owning nodes.
+        max_result_chars = max(80_000, 30_000 + (len(path_roles) * 12_000))
         trace = graph_query_trace.start_trace(
             conn,
             project_id,
@@ -819,7 +824,10 @@ def _semantic_ai_graph_query_context(
             query_source="ai_semantic_review",
             query_purpose="semantic_enrichment",
             run_id=run_id,
-            budget={"max_queries": max(8, 2 + len(path_roles))},
+            budget={
+                "max_queries": max(8, 2 + len(path_roles)),
+                "max_result_chars": max_result_chars,
+            },
         )["trace"]
         trace_id = str(trace.get("trace_id") or "")
         audit["trace_id"] = trace_id
