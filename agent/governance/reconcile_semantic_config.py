@@ -114,6 +114,7 @@ class SemanticExecutionPolicy:
     chunk_max_slices: int = 16
     chunk_max_functions_per_slice: int = 40
     chunk_max_source_chars: int = 12000
+    chunk_slice_max_concurrency: int = 4
     worker_max_concurrency: int = DEFAULT_SEMANTIC_WORKER_MAX_CONCURRENCY
     worker_claim_batch_size: int = DEFAULT_SEMANTIC_WORKER_CLAIM_BATCH_SIZE
     worker_lease_seconds: int = DEFAULT_SEMANTIC_WORKER_LEASE_SECONDS
@@ -299,6 +300,18 @@ class SemanticAnalyzerConfig:
                 default=12000,
                 min_value=500,
                 max_value=500000,
+            ),
+            chunk_slice_max_concurrency=_bounded_int(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_slice_max_concurrency",
+                    "semantic_chunk_slice_max_concurrency",
+                    "chunk_slice_workers",
+                    "semantic_chunk_slice_workers",
+                ),
+                default=4,
+                min_value=1,
+                max_value=32,
             ),
             worker_max_concurrency=_bounded_int(
                 _first_present(
@@ -961,6 +974,18 @@ def apply_project_ai_routing(
             min_value=30,
             max_value=86400,
         )
+        policy.chunk_slice_max_concurrency = _bounded_int(
+            _first_present(
+                worker_override,
+                "chunk_slice_max_concurrency",
+                "semantic_chunk_slice_max_concurrency",
+                "chunk_slice_workers",
+                "semantic_chunk_slice_workers",
+            ),
+            default=policy.chunk_slice_max_concurrency,
+            min_value=1,
+            max_value=32,
+        )
     if provider or model or worker_override:
         marker = f"aming_claw_registry:{project_key}:ai.routing.semantic"
         existing = str(getattr(config, "override_path", "") or "").strip()
@@ -990,6 +1015,10 @@ def _project_worker_policy_override(
                 "worker_lease_seconds",
                 "claim_lease_seconds",
                 "semantic_worker_lease_seconds",
+                "chunk_slice_max_concurrency",
+                "semantic_chunk_slice_max_concurrency",
+                "chunk_slice_workers",
+                "semantic_chunk_slice_workers",
             ):
                 if key in source:
                     merged[key] = source.get(key)

@@ -59,6 +59,9 @@ execution_policy:
   chunk_max_slices: 16
   chunk_max_functions_per_slice: 40
   chunk_max_source_chars: 12000
+  # Per-large-node function slices can run concurrently. This is separate from
+  # worker_max_concurrency, which controls how many nodes a worker drains at once.
+  chunk_slice_max_concurrency: 4
   # Worker runtime is config-driven so dogfood runs can temporarily raise
   # throughput without code changes. Code falls back to 4/4/600 if config is
   # absent or invalid.

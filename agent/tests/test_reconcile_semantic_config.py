@@ -67,6 +67,7 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.execution_policy.chunk_max_slices == 16
     assert config.execution_policy.chunk_max_functions_per_slice == 40
     assert config.execution_policy.chunk_max_source_chars == 12000
+    assert config.execution_policy.chunk_slice_max_concurrency == 4
     assert config.execution_policy.worker_max_concurrency == 10
     assert config.execution_policy.worker_claim_batch_size == 10
     assert config.execution_policy.worker_lease_seconds == 600
@@ -87,6 +88,7 @@ def test_default_semantic_config_loads_state_only_profile():
     assert payload["execution_policy"]["chunk_large_nodes"] is True
     assert payload["execution_policy"]["chunk_context_mode"] == "function_index"
     assert payload["execution_policy"]["chunk_max_slices"] == 16
+    assert payload["execution_policy"]["chunk_slice_max_concurrency"] == 4
     assert payload["execution_policy"]["worker_max_concurrency"] == 10
     assert payload["execution_policy"]["worker_claim_batch_size"] == 10
     assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"
@@ -223,6 +225,7 @@ def test_semantic_worker_execution_policy_invalid_values_fall_back(tmp_path):
                 "analyzer: reconcile_semantic",
                 "prompt_template: semantic prompt",
                 "execution_policy:",
+                "  chunk_slice_max_concurrency: nope",
                 "  worker_max_concurrency: nope",
                 "  worker_claim_batch_size: -5",
                 "  worker_lease_seconds: 5",
@@ -233,6 +236,7 @@ def test_semantic_worker_execution_policy_invalid_values_fall_back(tmp_path):
 
     config = load_semantic_enrichment_config(config_path=cfg)
 
+    assert config.execution_policy.chunk_slice_max_concurrency == 4
     assert config.execution_policy.worker_max_concurrency == 4
     assert config.execution_policy.worker_claim_batch_size == 4
     assert config.execution_policy.worker_lease_seconds == 600
@@ -272,6 +276,7 @@ def test_project_ai_routing_can_override_semantic_worker_policy(monkeypatch):
                             "worker_max_concurrency": 7,
                             "claim_batch_size": 8,
                             "claim_lease_seconds": 901,
+                            "chunk_slice_workers": 6,
                         }
                     }
                 }
@@ -284,6 +289,7 @@ def test_project_ai_routing_can_override_semantic_worker_policy(monkeypatch):
     assert updated.execution_policy.worker_max_concurrency == 7
     assert updated.execution_policy.worker_claim_batch_size == 8
     assert updated.execution_policy.worker_lease_seconds == 901
+    assert updated.execution_policy.chunk_slice_max_concurrency == 6
     assert "demo-project:ai.routing.semantic" in updated.override_path
 
 
@@ -365,6 +371,7 @@ def test_project_override_merges_with_default(tmp_path):
                 "  max_excerpt_chars: 77",
                 "execution_policy:",
                 "  ai_input_mode: batch",
+                "  chunk_slice_max_concurrency: 3",
                 "automation_policy:",
                 "  semantic_mode: auto",
                 "  feedback_review_mode: auto",
@@ -383,6 +390,7 @@ def test_project_override_merges_with_default(tmp_path):
     assert config.use_ai_default is True
     assert config.input_policy.max_excerpt_chars == 77
     assert config.execution_policy.ai_input_mode == "batch"
+    assert config.execution_policy.chunk_slice_max_concurrency == 3
     assert config.execution_policy.worker_max_concurrency == 10
     assert config.execution_policy.worker_claim_batch_size == 10
     assert config.automation_policy.semantic_mode == "auto"
@@ -523,6 +531,15 @@ def test_semantic_ai_openai_call_streams_prompt_on_stdin(monkeypatch, tmp_path):
     assert "When semantic_evidence is present" in calls[0]["input"]
     assert result["feature_name"] == "Governance Trace"
     assert result["_ai_route"]["provider"] == "openai"
+
+
+def test_semantic_ai_attempt_tag_includes_chunk_slice_id():
+    tag = reconcile_semantic_ai._semantic_attempt_node_tag({
+        "feature": {"node_id": "L7.large"},
+        "semantic_chunk": {"slice_id": "L7.large:slice-003"},
+    })
+
+    assert tag == "L7.large-L7.large:slice-003"
 
 
 def test_graph_structure_ai_prompt_uses_structure_contract(monkeypatch, tmp_path):

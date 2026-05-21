@@ -136,6 +136,16 @@ def _semantic_error_message(parsed: dict[str, Any], config: SemanticAnalyzerConf
     return "" if has_semantic_payload else str(error)
 
 
+def _semantic_attempt_node_tag(payload: dict[str, Any]) -> str:
+    feature = payload.get("feature") if isinstance(payload.get("feature"), dict) else {}
+    node_id = str(feature.get("node_id") or "feature").strip() or "feature"
+    chunk = payload.get("semantic_chunk") if isinstance(payload.get("semantic_chunk"), dict) else {}
+    slice_id = str(chunk.get("slice_id") or "").strip()
+    if slice_id:
+        return f"{node_id}-{slice_id}"
+    return node_id
+
+
 def resolve_semantic_ai_route(config: SemanticAnalyzerConfig) -> dict[str, str]:
     """Resolve provider/model for semantic AI from config/env/pipeline."""
     chain_role = config.chain_role or config.role or "pm"
@@ -290,7 +300,7 @@ def build_semantic_ai_call(
             "Payload:\n"
             f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
         )
-        node_id = str(payload.get("feature", {}).get("node_id") or "feature")
+        node_id = _semantic_attempt_node_tag(payload)
         attempt_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{snapshot_id}-{node_id}-{stage}")
         timeout_sec = int(os.getenv("RECONCILE_SEMANTIC_AI_TIMEOUT_SEC", os.getenv("CODEX_TIMEOUT_SEC", "900")))
         before = git_changed()

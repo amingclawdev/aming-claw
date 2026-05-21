@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1330,6 +1332,129 @@ def test_semantic_enrichment_chunks_large_function_node_and_aggregates(conn, tmp
     assert chunk_payload["semantic_retrieval"]["mode"] == "function_index"
     output = json.loads((project / "semantic-trace" / "feature-outputs" / "L7.large.json").read_text())
     assert output["semantic_entry"]["semantic_chunking"]["mode"] == "function_slices"
+
+
+def test_semantic_enrichment_runs_function_slices_concurrently_and_orders_results(conn, tmp_path):
+    project = tmp_path / "project"
+    functions = [
+        {
+            "name": f"generated_{idx}",
+            "path": "agent/governance/large_parallel.py",
+            "lineno": idx + 1,
+        }
+        for idx in range(8)
+    ]
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.parallel",
+                    "layer": "L7",
+                    "title": "Parallel Semantic Node",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_parallel.py"],
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "function_count": len(functions),
+                        "functions": functions,
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+    completion_order: list[int] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        nonlocal active
+        nonlocal max_active
+
+        assert stage == "reconcile_semantic_feature_slice"
+        slice_index = int(payload["semantic_chunk"]["slice_index"])
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.08 - (slice_index * 0.01))
+        with lock:
+            active -= 1
+            completion_order.append(slice_index)
+        return {
+            "feature_name": f"Slice {slice_index}",
+            "semantic_summary": f"Slice {slice_index} summary.",
+            "intent": f"slice-{slice_index}",
+            "domain_label": "semantic.parallel",
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": [
+                    "required_fields_present",
+                    "source_payload_only",
+                    "no_project_mutation",
+                    "review_feedback_accounted_for",
+                    "graph_suggestions_contract_checked",
+                ],
+                "checked_rules_count": 5,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.parallel"],
+        semantic_ai_chunk_function_threshold=3,
+        semantic_ai_chunk_max_functions_per_slice=2,
+        semantic_ai_chunk_max_slices=8,
+        semantic_ai_chunk_slice_max_concurrency=4,
+        created_by="semantic-worker-test",
+        trace_dir=project / "semantic-trace",
+    )
+
+    assert max_active > 1
+    assert completion_order != sorted(completion_order)
+    assert result["summary"]["ai_chunk_call_count"] == 4
+    assert result["summary"]["semantic_chunking"]["slice_max_concurrency"] == 4
+    feature = result["semantic_index"]["features"][0]
+    assert [item["slice_index"] for item in feature["semantic_chunking"]["slices"]] == [0, 1, 2, 3]
+    assert [item["semantic_summary"] for item in feature["semantic_chunking"]["slices"]] == [
+        "Slice 0 summary.",
+        "Slice 1 summary.",
+        "Slice 2 summary.",
+        "Slice 3 summary.",
+    ]
+    output = json.loads(
+        (project / "semantic-trace" / "feature-outputs" / "L7.parallel.json").read_text()
+    )
+    assert output["semantic_entry"]["semantic_chunking"]["completed_slice_count"] == 4
 
 
 def test_semantic_enrichment_source_excerpt_chunk_mode_remains_available(conn, tmp_path):

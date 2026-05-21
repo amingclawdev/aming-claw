@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -3846,6 +3847,7 @@ def run_semantic_enrichment(
     semantic_ai_chunk_max_slices: int | None = None,
     semantic_ai_chunk_max_functions_per_slice: int | None = None,
     semantic_ai_chunk_max_source_chars: int | None = None,
+    semantic_ai_chunk_slice_max_concurrency: int | None = None,
     semantic_dynamic_graph_state: bool | None = None,
     semantic_graph_state: bool = True,
     semantic_skip_completed: bool = True,
@@ -4040,6 +4042,10 @@ def run_semantic_enrichment(
         semantic_ai_chunk_max_source_chars,
         semantic_config.execution_policy.chunk_max_source_chars,
         minimum=500,
+    )
+    chunk_slice_max_concurrency = _normal_int(
+        semantic_ai_chunk_slice_max_concurrency,
+        semantic_config.execution_policy.chunk_slice_max_concurrency,
     )
     dynamic_graph_state = (
         semantic_config.execution_policy.dynamic_semantic_graph_state
@@ -4248,7 +4254,7 @@ def run_semantic_enrichment(
                 },
             }
         ai_chunked_node_count += 1
-        responses: list[dict[str, Any]] = []
+        slice_jobs: list[dict[str, Any]] = []
         for slice_plan in slices:
             slice_payload = copy.deepcopy(record["payload"])
             slice_payload["feature"] = slice_plan.get("feature") if isinstance(slice_plan.get("feature"), dict) else {}
@@ -4288,34 +4294,65 @@ def run_semantic_enrichment(
                     payload_trace_base / "chunk-inputs" / f"{slice_name}.json",
                     slice_payload,
                 )
+            slice_jobs.append({
+                "slice_plan": slice_plan,
+                "slice_payload": slice_payload,
+                "slice_name": slice_name,
+                "slice_index": int(slice_plan.get("slice_index") or 0),
+            })
+
+        def call_slice(job: dict[str, Any]) -> tuple[int, dict[str, Any], dict[str, Any]]:
             response = _call_ai(
                 ai_call,
                 stage="reconcile_semantic_feature_slice",
-                payload=slice_payload,
+                payload=job["slice_payload"],
             )
+            if response is None:
+                response = {"_ai_error": "ai_response_missing"}
+            return int(job["slice_index"]), job, response
+
+        responses_by_index: dict[int, dict[str, Any]] = {}
+
+        def record_slice_result(slice_index: int, job: dict[str, Any], response: dict[str, Any]) -> None:
+            nonlocal ai_chunk_call_count
+            nonlocal ai_chunk_complete_count
+            nonlocal ai_chunk_error_count
+
             ai_chunk_call_count += 1
-            if response is not None and not response.get("_ai_error"):
+            if not response.get("_ai_error"):
                 ai_chunk_complete_count += 1
-                responses.append(response)
             else:
                 ai_chunk_error_count += 1
-                responses.append(response or {"_ai_error": "ai_response_missing"})
+            responses_by_index[slice_index] = response
             if persist_feature_payloads:
                 write_json(
-                    payload_trace_base / "chunk-outputs" / f"{slice_name}.json",
+                    payload_trace_base / "chunk-outputs" / f"{job['slice_name']}.json",
                     {
                         "node_id": node_id,
-                        "slice_id": slice_plan.get("slice_id") or "",
-                        "slice_index": slice_plan.get("slice_index", 0),
-                        "ai_response_present": bool(response and not response.get("_ai_error")),
-                        "ai_error": (
-                            response.get("_ai_error")
-                            if isinstance(response, dict)
-                            else "ai_response_missing"
-                        ),
-                        "ai_response": response if isinstance(response, dict) else None,
+                        "slice_id": job["slice_plan"].get("slice_id") or "",
+                        "slice_index": slice_index,
+                        "ai_response_present": bool(not response.get("_ai_error")),
+                        "ai_error": response.get("_ai_error"),
+                        "ai_response": response,
                     },
                 )
+
+        max_slice_workers = min(chunk_slice_max_concurrency, len(slice_jobs))
+        if max_slice_workers <= 1:
+            for job in slice_jobs:
+                record_slice_result(*call_slice(job))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=max_slice_workers,
+                thread_name_prefix="semantic-slice",
+            ) as slice_pool:
+                futures = [slice_pool.submit(call_slice, job) for job in slice_jobs]
+                for future in as_completed(futures):
+                    record_slice_result(*future.result())
+        responses = [
+            responses_by_index.get(int(slice_plan.get("slice_index") or 0), {"_ai_error": "ai_response_missing"})
+            for slice_plan in slices
+        ]
         return _aggregate_chunked_semantic_response(
             feature,
             record["feedback"],
@@ -4932,6 +4969,7 @@ def run_semantic_enrichment(
             "max_slices": chunk_max_slices,
             "max_functions_per_slice": chunk_max_functions_per_slice,
             "max_source_chars": chunk_max_source_chars,
+            "slice_max_concurrency": chunk_slice_max_concurrency,
             "chunked_node_count": ai_chunked_node_count,
             "chunk_call_count": ai_chunk_call_count,
             "chunk_complete_count": ai_chunk_complete_count,
@@ -4983,6 +5021,7 @@ def run_semantic_enrichment(
             "max_slices": chunk_max_slices,
             "max_functions_per_slice": chunk_max_functions_per_slice,
             "max_source_chars": chunk_max_source_chars,
+            "slice_max_concurrency": chunk_slice_max_concurrency,
             "chunked_node_count": ai_chunked_node_count,
             "chunk_call_count": ai_chunk_call_count,
             "chunk_complete_count": ai_chunk_complete_count,
