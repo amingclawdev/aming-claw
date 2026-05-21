@@ -62,6 +62,10 @@ execution_policy:
   # Per-large-node function slices can run concurrently. This is separate from
   # worker_max_concurrency, which controls how many nodes a worker drains at once.
   chunk_slice_max_concurrency: 4
+  # After all slices complete, repair only the final node-level aggregate with
+  # a cheaper Codex-routed call so completed slice outputs are not discarded
+  # when deterministic aggregation leaks slice-local names.
+  chunk_fix_enabled: true
   # Worker runtime is config-driven so dogfood runs can temporarily raise
   # throughput without code changes. Code falls back to 4/4/600 if config is
   # absent or invalid.
@@ -272,6 +276,23 @@ job_profiles:
       canonical edge names from payload.output_contract.supported_edges; when
       using an alias, normalize it in your output or explain the alias risk in
       self_check.known_risks.
+  chunk_fix:
+    analyzer_role: reconcile_semantic_chunk_fix_analyzer
+    provider: openai
+    model: gpt-5.5
+    prompt_template: |-
+      You are the reconcile semantic chunk-fix analyzer.
+
+      The payload already contains completed function-slice semantic outputs
+      and a deterministic aggregate. Repair only the final node-level semantic
+      fields so they describe the whole node instead of one slice.
+
+      Do not rerun slice analysis, do not propose graph topology changes, and
+      do not mention slice ids in feature_name, intent, or domain_label.
+      Preserve useful coverage reviews and suggestions already present in
+      payload.aggregate unless the supplied slice summaries clearly require a
+      concise node-level wording change. Return exactly one JSON object with
+      the normal node semantic fields and a valid self_check.
   retry:
     analyzer_role: reconcile_semantic_retry_reviewer
   dry_run:

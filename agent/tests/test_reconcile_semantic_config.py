@@ -29,6 +29,9 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.job_profiles["edge"].analyzer_role == "reconcile_edge_semantic_analyzer"
     assert config.job_profiles["global_review"].analyzer_role == "reconcile_global_semantic_reviewer"
     assert config.job_profiles["graph_structure"].analyzer_role == "reconcile_graph_structure_analyzer"
+    assert config.job_profiles["chunk_fix"].analyzer_role == "reconcile_semantic_chunk_fix_analyzer"
+    assert config.job_profiles["chunk_fix"].provider == "openai"
+    assert config.job_profiles["chunk_fix"].model == "gpt-5.5"
     assert config.graph_structure_ops.schema_version == "graph_structure_ops.v1"
     assert config.graph_structure_ops.analyzer_role == "reconcile_graph_structure_analyzer"
     assert config.graph_enrich_config_ops.schema_version == "graph_enrich_config_ops.v1"
@@ -68,6 +71,7 @@ def test_default_semantic_config_loads_state_only_profile():
     assert config.execution_policy.chunk_max_functions_per_slice == 40
     assert config.execution_policy.chunk_max_source_chars == 12000
     assert config.execution_policy.chunk_slice_max_concurrency == 4
+    assert config.execution_policy.chunk_fix_enabled is True
     assert config.execution_policy.worker_max_concurrency == 10
     assert config.execution_policy.worker_claim_batch_size == 10
     assert config.execution_policy.worker_lease_seconds == 600
@@ -89,6 +93,7 @@ def test_default_semantic_config_loads_state_only_profile():
     assert payload["execution_policy"]["chunk_context_mode"] == "function_index"
     assert payload["execution_policy"]["chunk_max_slices"] == 16
     assert payload["execution_policy"]["chunk_slice_max_concurrency"] == 4
+    assert payload["execution_policy"]["chunk_fix_enabled"] is True
     assert payload["execution_policy"]["worker_max_concurrency"] == 10
     assert payload["execution_policy"]["worker_claim_batch_size"] == 10
     assert payload["automation_policy"]["feedback_review_mode"] == "enqueue_only"
@@ -109,6 +114,11 @@ def test_default_semantic_config_loads_state_only_profile():
     assert structure_payload["role"] == "reconcile_graph_structure_analyzer"
     assert "graph_structure_ops.v1" in structure_payload["job_profile"]["prompt_template"]
     assert structure_payload["graph_structure_ops"]["bridge_policy"]["calls"]["weak_evidence_action"] == "downgrade"
+    chunk_fix_payload = config.to_instruction_payload("reconcile_semantic_chunk_fix")
+    assert chunk_fix_payload["job_type"] == "chunk_fix"
+    assert chunk_fix_payload["role"] == "reconcile_semantic_chunk_fix_analyzer"
+    assert chunk_fix_payload["job_profile"]["provider"] == "openai"
+    assert chunk_fix_payload["job_profile"]["model"] == "gpt-5.5"
     assert Path(DEFAULT_CONFIG_PATH).exists()
 
 

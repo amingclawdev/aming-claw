@@ -73,6 +73,19 @@ Return exactly one JSON object with schema_version "graph_enrich_config_ops.v1".
 Only emit operations listed in payload.output_contract.supported_operations.
 Do not emit direct file patches or graph topology mutations."""
 
+CHUNK_FIX_PROMPT_TEMPLATE = """You are the reconcile semantic chunk-fix analyzer.
+
+The payload already contains completed function-slice semantic outputs and a
+deterministic aggregate. Your job is to repair only the final node-level
+semantic fields so they describe the whole node instead of one slice.
+
+Do not rerun slice analysis, do not propose graph topology changes, and do not
+mention slice ids in feature_name, intent, or domain_label. Preserve useful
+coverage reviews and suggestions already present in payload.aggregate unless
+the supplied slice summaries clearly require a concise node-level wording
+change. Return exactly one JSON object with the normal node semantic fields
+and a valid self_check."""
+
 
 def _graph_enrich_config_ops_instruction_payload() -> dict[str, Any]:
     from .graph_enrich_config_ops import graph_enrich_config_ops_output_contract
@@ -115,6 +128,7 @@ class SemanticExecutionPolicy:
     chunk_max_functions_per_slice: int = 40
     chunk_max_source_chars: int = 12000
     chunk_slice_max_concurrency: int = 4
+    chunk_fix_enabled: bool = True
     worker_max_concurrency: int = DEFAULT_SEMANTIC_WORKER_MAX_CONCURRENCY
     worker_claim_batch_size: int = DEFAULT_SEMANTIC_WORKER_CLAIM_BATCH_SIZE
     worker_lease_seconds: int = DEFAULT_SEMANTIC_WORKER_LEASE_SECONDS
@@ -312,6 +326,16 @@ class SemanticAnalyzerConfig:
                 default=4,
                 min_value=1,
                 max_value=32,
+            ),
+            chunk_fix_enabled=_bounded_bool(
+                _first_present(
+                    execution_policy_raw,
+                    "chunk_fix_enabled",
+                    "semantic_chunk_fix_enabled",
+                    "chunk_aggregate_fix_enabled",
+                    "semantic_chunk_aggregate_fix_enabled",
+                ),
+                default=True,
             ),
             worker_max_concurrency=_bounded_int(
                 _first_present(
@@ -569,6 +593,19 @@ def _bounded_int(
     return parsed
 
 
+def _bounded_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
 def _normalize_automation_mode(value: Any) -> str:
     mode = str(value or "manual").strip().lower().replace("-", "_")
     if mode in {"off", "disabled", "false"}:
@@ -605,6 +642,15 @@ def _normalize_semantic_job_type(value: Any) -> str:
         return "graph_structure"
     if "graph_enrich_config" in mode or mode in {"enrich_config", "config_ops"}:
         return "graph_enrich_config"
+    if (
+        "chunk_fix" in mode
+        or "chunk_aggregate_fix" in mode
+        or (
+            "chunk" in mode
+            and ("fix" in mode or "repair" in mode or "aggregate" in mode)
+        )
+    ):
+        return "chunk_fix"
     if "retry" in mode or "feedback" in mode or mode in {"repair", "refine"}:
         return "retry"
     if "dry_run" in mode or "preview" in mode:
@@ -626,6 +672,12 @@ def _default_job_profiles() -> dict[str, SemanticJobProfile]:
         "graph_enrich_config": SemanticJobProfile(
             analyzer_role="reconcile_graph_enrich_config_analyzer",
             prompt_template=GRAPH_ENRICH_CONFIG_PROMPT_TEMPLATE,
+        ),
+        "chunk_fix": SemanticJobProfile(
+            analyzer_role="reconcile_semantic_chunk_fix_analyzer",
+            provider="openai",
+            model="gpt-5.5",
+            prompt_template=CHUNK_FIX_PROMPT_TEMPLATE,
         ),
         "retry": SemanticJobProfile(analyzer_role="reconcile_semantic_retry_reviewer"),
         "dry_run": SemanticJobProfile(analyzer_role="reconcile_semantic_dry_run"),

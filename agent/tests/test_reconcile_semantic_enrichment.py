@@ -1305,6 +1305,7 @@ def test_semantic_enrichment_chunks_large_function_node_and_aggregates(conn, tmp
         semantic_ai_chunk_function_threshold=3,
         semantic_ai_chunk_max_functions_per_slice=2,
         semantic_ai_chunk_max_slices=8,
+        semantic_ai_chunk_fix_enabled=False,
         created_by="semantic-worker-test",
         trace_dir=project / "semantic-trace",
     )
@@ -1332,6 +1333,150 @@ def test_semantic_enrichment_chunks_large_function_node_and_aggregates(conn, tmp
     assert chunk_payload["semantic_retrieval"]["mode"] == "function_index"
     output = json.loads((project / "semantic-trace" / "feature-outputs" / "L7.large.json").read_text())
     assert output["semantic_entry"]["semantic_chunking"]["mode"] == "function_slices"
+
+
+def test_semantic_enrichment_chunk_fix_repairs_slice_scoped_aggregate(conn, tmp_path):
+    project = tmp_path / "project"
+    functions = [
+        {
+            "name": f"generated_{idx}",
+            "path": "agent/governance/large_fix.py",
+            "lineno": idx + 1,
+        }
+        for idx in range(4)
+    ]
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.fix",
+                    "layer": "L7",
+                    "title": "Large Fix Node",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_fix.py"],
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "function_count": len(functions),
+                        "functions": functions,
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-test",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-test",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+    stages: list[str] = []
+
+    def fake_ai(stage: str, payload: dict) -> dict:
+        stages.append(stage)
+        if stage == "reconcile_semantic_chunk_fix":
+            assert payload["instructions"]["job_type"] == "chunk_fix"
+            assert payload["instructions"]["job_profile"]["provider"] == "openai"
+            assert payload["semantic_chunk_fix"]["mode"] == "node_aggregate_repair"
+            assert payload["semantic_chunk_fix"]["completed_slice_count"] == 2
+            assert "slice" in payload["aggregate"]["feature_name"].lower()
+            return {
+                "feature_name": "Large Fix Node Runtime",
+                "semantic_summary": "Node-level aggregate covering generated runtime helpers.",
+                "intent": "coordinate generated runtime helpers",
+                "domain_label": "semantic.large_node",
+                "doc_coverage_review": payload["aggregate"].get("doc_coverage_review") or {},
+                "test_coverage_review": payload["aggregate"].get("test_coverage_review") or {},
+                "config_coverage_review": payload["aggregate"].get("config_coverage_review") or {},
+                "self_check": {
+                    "required": True,
+                    "valid": True,
+                    "status": "passed",
+                    "checked_rules": [
+                        "required_fields_present",
+                        "source_payload_only",
+                        "no_project_mutation",
+                        "review_feedback_accounted_for",
+                        "graph_suggestions_contract_checked",
+                    ],
+                    "checked_rules_count": 5,
+                    "repair_attempts": 0,
+                    "max_repair_attempts": 1,
+                    "known_risks": [],
+                },
+                "_ai_route": {"provider": "openai", "model": "gpt-5.5"},
+                "_ai_elapsed_ms": 12,
+            }
+        assert stage == "reconcile_semantic_feature_slice"
+        chunk = payload["semantic_chunk"]
+        return {
+            "feature_name": f"Large Fix Node (slice {chunk['slice_index']:03d}/2)",
+            "semantic_summary": f"Slice {chunk['slice_index']} helper summary.",
+            "intent": f"slice-{chunk['slice_index']}",
+            "domain_label": "semantic.slice",
+            "self_check": {
+                "required": True,
+                "valid": True,
+                "status": "passed",
+                "checked_rules": [
+                    "required_fields_present",
+                    "source_payload_only",
+                    "no_project_mutation",
+                    "review_feedback_accounted_for",
+                    "graph_suggestions_contract_checked",
+                ],
+                "checked_rules_count": 5,
+                "repair_attempts": 0,
+                "max_repair_attempts": 1,
+                "known_risks": [],
+            },
+        }
+
+    result = run_semantic_enrichment(
+        conn,
+        PID,
+        "full-semantic-test",
+        project,
+        use_ai=True,
+        ai_call=fake_ai,
+        semantic_ai_scope="selected",
+        semantic_node_ids=["L7.fix"],
+        semantic_ai_chunk_function_threshold=3,
+        semantic_ai_chunk_max_functions_per_slice=2,
+        created_by="semantic-worker-test",
+        trace_dir=project / "semantic-trace",
+    )
+
+    assert stages == [
+        "reconcile_semantic_feature_slice",
+        "reconcile_semantic_feature_slice",
+        "reconcile_semantic_chunk_fix",
+    ]
+    assert result["summary"]["ai_chunk_fix_call_count"] == 1
+    assert result["summary"]["ai_chunk_fix_complete_count"] == 1
+    feature = result["semantic_index"]["features"][0]
+    assert feature["feature_name"] == "Large Fix Node Runtime"
+    assert "slice" not in feature["feature_name"].lower()
+    assert feature["semantic_chunking"]["aggregate_fix"]["status"] == "complete"
+    assert feature["semantic_chunking"]["aggregate_fix"]["provider"] == "openai"
+    assert feature["self_check"]["checked_rules"][-1] == "chunk_aggregate_fix_applied"
+    output = json.loads(
+        (project / "semantic-trace" / "feature-outputs" / "L7.fix.json").read_text()
+    )
+    assert output["semantic_entry"]["feature_name"] == "Large Fix Node Runtime"
+    assert (project / "semantic-trace" / "chunk-fix-inputs" / "L7.fix.json").exists()
+    assert (project / "semantic-trace" / "chunk-fix-outputs" / "L7.fix.json").exists()
 
 
 def test_semantic_enrichment_runs_function_slices_concurrently_and_orders_results(conn, tmp_path):
@@ -1435,6 +1580,7 @@ def test_semantic_enrichment_runs_function_slices_concurrently_and_orders_result
         semantic_ai_chunk_max_functions_per_slice=2,
         semantic_ai_chunk_max_slices=8,
         semantic_ai_chunk_slice_max_concurrency=4,
+        semantic_ai_chunk_fix_enabled=False,
         created_by="semantic-worker-test",
         trace_dir=project / "semantic-trace",
     )
@@ -1541,6 +1687,7 @@ def test_semantic_enrichment_source_excerpt_chunk_mode_remains_available(conn, t
         semantic_ai_chunk_function_threshold=3,
         semantic_ai_chunk_max_functions_per_slice=2,
         semantic_ai_chunk_context_mode="source_excerpt",
+        semantic_ai_chunk_fix_enabled=False,
         created_by="semantic-worker-test",
     )
 
@@ -1634,6 +1781,7 @@ def test_semantic_enrichment_retries_prompt_too_long_with_function_slices(conn, 
         semantic_ai_chunk_large_nodes=True,
         semantic_ai_chunk_function_threshold=99,
         semantic_ai_chunk_max_functions_per_slice=2,
+        semantic_ai_chunk_fix_enabled=False,
         created_by="semantic-worker-test",
     )
 
