@@ -12792,6 +12792,7 @@ def handle_graph_governance_snapshot_semantic_chunk_fix_replay(ctx: RequestConte
                     node_id=str(node_id),
                     source_trace_dir=source_trace_dir,
                     trace_dir=node_trace_dir,
+                    dry_run=dry_run,
                     ai_call=semantic_ai_call,
                     created_by=str(body.get("actor") or body.get("created_by") or "observer"),
                     semantic_config_path=body.get("semantic_config_path"),

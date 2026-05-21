@@ -1664,6 +1664,179 @@ def test_semantic_chunk_fix_replay_reuses_persisted_slice_outputs(conn, tmp_path
     assert semantic_json["graph_query_audit"]["trace_id"] == "gqt-replay"
 
 
+def test_semantic_chunk_fix_replay_persists_not_needed_without_ai(conn, tmp_path):
+    project = tmp_path / "project"
+    functions = [
+        {
+            "name": f"generated_{idx}",
+            "path": "agent/governance/large_replay.py",
+            "lineno": idx + 1,
+        }
+        for idx in range(2)
+    ]
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.replay",
+                    "layer": "L7",
+                    "title": "Large Replay Node",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_replay.py"],
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "function_count": len(functions),
+                        "functions": functions,
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-not-needed-replay",
+        commit_sha="abc1234",
+        snapshot_kind="full",
+        graph_json=graph,
+        notes=json.dumps({"state_only": True}),
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        "full-semantic-not-needed-replay",
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+    source_trace = project / "semantic-source-trace"
+    node_name = "L7.replay"
+    _write(
+        source_trace / "feature-inputs" / f"{node_name}.json",
+        json.dumps({
+            "graph_query_audit": {
+                "status": "complete",
+                "trace_id": "gqt-not-needed-replay",
+            }
+        }),
+    )
+    self_check = {
+        "required": True,
+        "valid": True,
+        "status": "passed",
+        "checked_rules": [
+            "required_fields_present",
+            "source_payload_only",
+            "no_project_mutation",
+            "review_feedback_accounted_for",
+            "graph_suggestions_contract_checked",
+        ],
+        "checked_rules_count": 5,
+        "repair_attempts": 0,
+        "max_repair_attempts": 1,
+        "known_risks": [],
+    }
+    _write(
+        source_trace / "chunk-outputs" / f"{node_name}-slice-000.json",
+        json.dumps({
+            "node_id": "L7.replay",
+            "slice_id": "L7.replay-slice-000",
+            "slice_index": 0,
+            "ai_response_present": True,
+            "ai_error": "",
+            "ai_response": {
+                "feature_name": "Large Replay Runtime Part",
+                "semantic_summary": "Persisted output for replay.",
+                "intent": "describe replay runtime behavior",
+                "domain_label": "semantic.large_node",
+                "self_check": self_check,
+            },
+        }),
+    )
+    _write(
+        source_trace / "feature-outputs" / f"{node_name}.json",
+        json.dumps({
+            "node_id": "L7.replay",
+            "ai_response_present": True,
+            "ai_response": {
+                "node_id": "L7.replay",
+                "feature_name": "Large Replay Runtime",
+                "semantic_summary": "Persisted aggregate is already node scoped.",
+                "intent": "coordinate replayed chunk outputs",
+                "domain_label": "semantic.large_node",
+                "self_check": self_check,
+                "semantic_chunking": {
+                    "mode": "function_slices",
+                    "status": "complete",
+                    "slice_count": 1,
+                    "completed_slice_count": 1,
+                },
+            },
+        }),
+    )
+
+    dry_run = replay_semantic_chunk_aggregate_fix(
+        conn,
+        PID,
+        "full-semantic-not-needed-replay",
+        project,
+        node_id="L7.replay",
+        source_trace_dir=source_trace,
+        trace_dir=project / "semantic-dry-run-trace",
+        dry_run=True,
+        ai_call=None,
+        persist_feature_payloads=False,
+    )
+
+    assert dry_run["ok"] is True
+    assert dry_run["status"] == "not_needed"
+    dry_row = conn.execute(
+        """
+        SELECT status FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-not-needed-replay", "L7.replay"),
+    ).fetchone()
+    assert dry_row is None
+    assert not (project / "semantic-dry-run-trace" / "feature-outputs" / "L7.replay.json").exists()
+
+    result = replay_semantic_chunk_aggregate_fix(
+        conn,
+        PID,
+        "full-semantic-not-needed-replay",
+        project,
+        node_id="L7.replay",
+        source_trace_dir=source_trace,
+        trace_dir=project / "semantic-replay-trace",
+        ai_call=None,
+        created_by="semantic-worker-test",
+        submit_for_review=True,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "not_needed"
+    assert result["semantic_entry"]["feature_name"] == "Large Replay Runtime"
+    assert (
+        result["semantic_entry"]["semantic_chunking"]["aggregate_fix"]["status"]
+        == "not_needed"
+    )
+    row = conn.execute(
+        """
+        SELECT status, semantic_json FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-not-needed-replay", "L7.replay"),
+    ).fetchone()
+    assert row["status"] == "pending_review"
+    semantic_json = json.loads(row["semantic_json"])
+    assert semantic_json["feature_name"] == "Large Replay Runtime"
+    assert semantic_json["graph_query_audit"]["trace_id"] == "gqt-not-needed-replay"
+    assert (
+        project / "semantic-replay-trace" / "feature-outputs" / "L7.replay.json"
+    ).exists()
+
+
 def test_semantic_enrichment_runs_function_slices_concurrently_and_orders_results(conn, tmp_path):
     project = tmp_path / "project"
     functions = [

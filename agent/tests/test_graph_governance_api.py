@@ -5638,6 +5638,148 @@ def test_graph_governance_semantic_chunk_fix_replay_api(conn, tmp_path, monkeypa
     assert event["status"] == "proposed"
 
 
+def test_graph_governance_semantic_chunk_fix_replay_api_dry_run_not_needed_no_db_write(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    graph = {
+        "deps_graph": {
+            "nodes": [
+                {
+                    "id": "L7.replay",
+                    "layer": "L7",
+                    "title": "Large Replay Node",
+                    "kind": "service_runtime",
+                    "primary": ["agent/governance/large_replay.py"],
+                    "metadata": {
+                        "subsystem": "semantic",
+                        "function_count": 1,
+                        "functions": [
+                            {
+                                "name": "generated",
+                                "path": "agent/governance/large_replay.py",
+                                "lineno": 1,
+                            }
+                        ],
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    }
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-semantic-chunk-replay-api-dry-run",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    conn.commit()
+    source_trace = project / "semantic-source-trace"
+
+    def write_trace(path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    self_check = {
+        "required": True,
+        "valid": True,
+        "status": "passed",
+        "checked_rules": [
+            "required_fields_present",
+            "source_payload_only",
+            "no_project_mutation",
+            "review_feedback_accounted_for",
+            "graph_suggestions_contract_checked",
+        ],
+        "checked_rules_count": 5,
+        "repair_attempts": 0,
+        "max_repair_attempts": 1,
+        "known_risks": [],
+    }
+    write_trace(
+        source_trace / "chunk-outputs" / "L7.replay-slice-000.json",
+        {
+            "node_id": "L7.replay",
+            "slice_id": "L7.replay-slice-000",
+            "slice_index": 0,
+            "ai_response_present": True,
+            "ai_error": "",
+            "ai_response": {
+                "feature_name": "Large Replay Runtime Part",
+                "semantic_summary": "Persisted output for replay.",
+                "intent": "describe replay runtime behavior",
+                "domain_label": "semantic.large_node",
+                "self_check": self_check,
+            },
+        },
+    )
+    write_trace(
+        source_trace / "feature-outputs" / "L7.replay.json",
+        {
+            "node_id": "L7.replay",
+            "ai_response_present": True,
+            "ai_response": {
+                "node_id": "L7.replay",
+                "feature_name": "Large Replay Runtime",
+                "semantic_summary": "Persisted aggregate is already node scoped.",
+                "intent": "coordinate replayed chunk outputs",
+                "domain_label": "semantic.large_node",
+                "self_check": self_check,
+                "semantic_chunking": {
+                    "mode": "function_slices",
+                    "status": "complete",
+                    "slice_count": 1,
+                    "completed_slice_count": 1,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_semantic_ai_call_from_body",
+        lambda *_args, **_kwargs: pytest.fail("dry-run replay must not create an AI call"),
+    )
+
+    code, result = server.handle_graph_governance_snapshot_semantic_chunk_fix_replay(
+        _ctx(
+            {"project_id": PID, "snapshot_id": "full-semantic-chunk-replay-api-dry-run"},
+            method="POST",
+            body={
+                "project_root": str(project),
+                "actor": "observer",
+                "node_id": "L7.replay",
+                "source_trace_dir": str(source_trace),
+                "dry_run": True,
+                "persist_feature_payloads": False,
+            },
+        )
+    )
+
+    assert code == 200
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["results"][0]["status"] == "not_needed"
+    row = conn.execute(
+        """
+        SELECT status FROM graph_semantic_nodes
+        WHERE project_id=? AND snapshot_id=? AND node_id=?
+        """,
+        (PID, "full-semantic-chunk-replay-api-dry-run", "L7.replay"),
+    ).fetchone()
+    assert row is None
+
+
 def test_graph_governance_semantic_review_queue_waits_for_ai_semantics(conn, tmp_path):
     project = tmp_path / "project"
     primary = project / "agent" / "governance" / "server.py"

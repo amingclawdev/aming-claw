@@ -2187,6 +2187,7 @@ def replay_semantic_chunk_aggregate_fix(
     node_id: str,
     source_trace_dir: str | Path,
     trace_dir: str | Path | None = None,
+    dry_run: bool = False,
     ai_call: FeedbackAiCall | None = None,
     created_by: str = "observer",
     semantic_config_path: str | Path | None = None,
@@ -2299,8 +2300,100 @@ def replay_semantic_chunk_aggregate_fix(
         if trace_dir is not None
         else source_base / "chunk-fix-replays" / f"{node_name}-{uuid.uuid4().hex[:8]}"
     )
+
+    def _persist_replayed_semantic_entry(
+        fixed: dict[str, Any],
+        *,
+        replay_status: str,
+    ) -> dict[str, Any]:
+        semantic_entry = _heuristic_semantic_entry(
+            feature,
+            feedback,
+            enrichment_status="ai_complete",
+            ai_response=fixed,
+        )
+        if fixed.get("_ai_route"):
+            semantic_entry["semantic_ai_route"] = fixed.get("_ai_route")
+        if fixed.get("_ai_elapsed_ms") is not None:
+            semantic_entry["semantic_ai_elapsed_ms"] = fixed.get("_ai_elapsed_ms")
+        if isinstance(fixed.get("semantic_chunking"), dict):
+            semantic_entry["semantic_chunking"] = fixed["semantic_chunking"]
+        for key in ("graph_query_audit", "semantic_graph_query_audit"):
+            audit = record_payload.get(key)
+            if isinstance(audit, dict) and audit:
+                semantic_entry[key] = dict(audit)
+        semantic_state = _load_semantic_graph_state_source(conn, project_id, snapshot_id, snapshot)
+        existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
+        round_number = len(existing_rounds)
+        _upsert_semantic_graph_state_entry(
+            semantic_state,
+            feature,
+            semantic_entry,
+            feedback_round=round_number,
+            batch_index=None,
+            updated_at=utc_now(),
+        )
+        _write_semantic_graph_state_artifacts(
+            conn,
+            project_id,
+            snapshot_id,
+            graph_json,
+            semantic_state,
+            round_number=round_number,
+            feature_index=_load_feature_index(snapshot),
+            submit_for_review=submit_for_review,
+            review_node_ids={node_id_s},
+            persist_node_ids={node_id_s},
+        )
+        if persist_feature_payloads:
+            write_json(
+                trace_base / "feature-outputs" / f"{node_name}.json",
+                {
+                    "node_id": node_id_s,
+                    "enrichment_status": "ai_complete",
+                    "ai_response_present": True,
+                    "ai_error": "",
+                    "ai_response": fixed,
+                    "semantic_selection_status": "selected",
+                    "semantic_selection_reasons": ["semantic_chunk_fix_replay"],
+                    "semantic_entry": semantic_entry,
+                },
+            )
+        events_result: dict[str, Any] = {}
+        if backfill_events:
+            try:
+                from . import graph_events
+
+                with _semantic_write_lock():
+                    events_result = graph_events.backfill_existing_semantic_events(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        actor=created_by,
+                    )
+                    _commit_semantic_write(conn)
+            except Exception as exc:  # noqa: BLE001 - semantic state is still persisted
+                events_result = {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "status": replay_status,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "node_id": node_id_s,
+            "source_trace_dir": str(source_base),
+            "trace_dir": str(trace_base),
+            "slice_response_count": len(responses),
+            "semantic_entry": semantic_entry,
+            "events_backfill": events_result,
+        }
+
     if not _chunk_fix_needed(aggregate):
         aggregate = _annotate_chunk_fix_status(aggregate, status="not_needed")
+        if not dry_run:
+            return _persist_replayed_semantic_entry(
+                aggregate,
+                replay_status="not_needed",
+            )
         return {
             "ok": True,
             "status": "not_needed",
@@ -2386,86 +2479,7 @@ def replay_semantic_chunk_aggregate_fix(
             "slice_response_count": len(responses),
             "semantic_entry": fixed,
         }
-    semantic_entry = _heuristic_semantic_entry(
-        feature,
-        feedback,
-        enrichment_status="ai_complete",
-        ai_response=fixed,
-    )
-    if fixed.get("_ai_route"):
-        semantic_entry["semantic_ai_route"] = fixed.get("_ai_route")
-    if fixed.get("_ai_elapsed_ms") is not None:
-        semantic_entry["semantic_ai_elapsed_ms"] = fixed.get("_ai_elapsed_ms")
-    if isinstance(fixed.get("semantic_chunking"), dict):
-        semantic_entry["semantic_chunking"] = fixed["semantic_chunking"]
-    for key in ("graph_query_audit", "semantic_graph_query_audit"):
-        audit = record_payload.get(key)
-        if isinstance(audit, dict) and audit:
-            semantic_entry[key] = dict(audit)
-    semantic_state = _load_semantic_graph_state_source(conn, project_id, snapshot_id, snapshot)
-    existing_rounds = sorted((_semantic_base_dir(project_id, snapshot_id) / "rounds").glob("round-*"))
-    round_number = len(existing_rounds)
-    _upsert_semantic_graph_state_entry(
-        semantic_state,
-        feature,
-        semantic_entry,
-        feedback_round=round_number,
-        batch_index=None,
-        updated_at=utc_now(),
-    )
-    _write_semantic_graph_state_artifacts(
-        conn,
-        project_id,
-        snapshot_id,
-        graph_json,
-        semantic_state,
-        round_number=round_number,
-        feature_index=_load_feature_index(snapshot),
-        submit_for_review=submit_for_review,
-        review_node_ids={node_id_s},
-        persist_node_ids={node_id_s},
-    )
-    if persist_feature_payloads:
-        write_json(
-            trace_base / "feature-outputs" / f"{node_name}.json",
-            {
-                "node_id": node_id_s,
-                "enrichment_status": "ai_complete",
-                "ai_response_present": True,
-                "ai_error": "",
-                "ai_response": fixed,
-                "semantic_selection_status": "selected",
-                "semantic_selection_reasons": ["semantic_chunk_fix_replay"],
-                "semantic_entry": semantic_entry,
-            },
-        )
-    events_result: dict[str, Any] = {}
-    if backfill_events:
-        try:
-            from . import graph_events
-
-            with _semantic_write_lock():
-                events_result = graph_events.backfill_existing_semantic_events(
-                    conn,
-                    project_id,
-                    snapshot_id,
-                    actor=created_by,
-                )
-                _commit_semantic_write(conn)
-        except Exception as exc:  # noqa: BLE001 - semantic state is still persisted
-            events_result = {"ok": False, "error": str(exc)}
-    return {
-        "ok": True,
-        "status": "complete",
-        "project_id": project_id,
-        "snapshot_id": snapshot_id,
-        "node_id": node_id_s,
-        "source_trace_dir": str(source_base),
-        "trace_dir": str(trace_base),
-        "slice_response_count": len(responses),
-        "semantic_entry": semantic_entry,
-        "events_backfill": events_result,
-    }
+    return _persist_replayed_semantic_entry(fixed, replay_status="complete")
 
 
 def _aggregate_chunked_semantic_response(
