@@ -124,6 +124,9 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     assert "aming-claw://current-context" in resources
     assert "aming-claw://seed-graph-summary" in resources
     assert "aming-claw://self-graph-bundle-manifest" in resources
+    assert "aming-claw://self-graph-bundle/manifest" in resources
+    assert "aming-claw://self-graph-bundle/graph-structure" in resources
+    assert "aming-claw://self-graph-bundle/semantic-projection" in resources
     templates = responses[1]["result"]["resourceTemplates"]
     assert templates[0]["uriTemplate"] == "aming-claw://project/{project_id}/context"
     skill_text = responses[2]["result"]["contents"][0]["text"]
@@ -147,6 +150,8 @@ def test_mcp_stdio_resources_expose_skill_and_context_without_governance():
     manifest = json.loads(responses[5]["result"]["contents"][0]["text"])
     assert manifest["bundle_major"] == 1
     assert manifest["consumer_contract"]["incompatible_major_action"] == "emit_plugin_update_reminder"
+    assert manifest["resource_uris"]["graph_structure"] == "aming-claw://self-graph-bundle/graph-structure"
+    assert manifest["resource_uris"]["semantic_projection"] == "aming-claw://self-graph-bundle/semantic-projection"
 
 
 def test_mcp_current_context_prefers_workspace_project_config(tmp_path: Path):

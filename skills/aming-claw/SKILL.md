@@ -55,9 +55,13 @@ use node, function, edge, or coverage evidence.
 The Aming Claw repo itself does not need an active local graph snapshot for the
 plugin to be usable. When working on Aming Claw internals and no active
 `project_id="aming-claw"` snapshot exists, use `aming-claw://seed-graph-summary`
-as the packaged navigation map for core surfaces, then use bounded workspace
-search/file reads for exact code. Do not claim node-level or function-level
-graph evidence for Aming Claw itself unless an active `aming-claw` graph exists.
+as the compact packaged navigation map for core surfaces. If richer packaged
+context is needed and the MCP resource is available, read
+`aming-claw://self-graph-bundle/graph-structure` and
+`aming-claw://self-graph-bundle/semantic-projection` as read-only orientation
+for the sealed self graph. Then use bounded workspace search/file reads for
+exact code. Do not claim live node-level or function-level graph evidence for
+Aming Claw itself unless an active `aming-claw` graph exists.
 
 A missing active graph for `aming-claw` is not an install failure. A missing
 active graph for the user's target project means the project should be

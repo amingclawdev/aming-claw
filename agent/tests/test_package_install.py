@@ -158,6 +158,11 @@ class TestLocalPluginPackaging:
         bundle = json.loads(manifest.read_text(encoding="utf-8"))
         assert bundle["bundle_major"] == 1
         assert bundle["resources"][0]["path"] == "agent/mcp/resources/seed-graph-summary.json"
+        resource_roles = {resource["role"]: resource for resource in bundle["resources"]}
+        assert "graph_structure" in resource_roles
+        assert "semantic_projection" in resource_roles
+        for resource in bundle["resources"]:
+            assert (ROOT / resource["path"]).is_file()
 
     def test_mcp_config_is_relocatable_and_uses_stdio_module_entrypoint(self):
         config_text = (ROOT / ".mcp.json").read_text(encoding="utf-8")

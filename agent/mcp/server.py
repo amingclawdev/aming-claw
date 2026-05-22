@@ -80,6 +80,21 @@ RESOURCE_FILES: dict[str, tuple[str, str, str]] = {
         "agent/mcp/resources/self-graph-bundle-manifest.json",
         "application/json",
     ),
+    "aming-claw://self-graph-bundle/manifest": (
+        "Self Graph Bundle Manifest Copy",
+        "agent/mcp/resources/self-graph-bundle/manifest.json",
+        "application/json",
+    ),
+    "aming-claw://self-graph-bundle/graph-structure": (
+        "Self Graph Structure",
+        "agent/mcp/resources/self-graph-bundle/graph-structure.json",
+        "application/json",
+    ),
+    "aming-claw://self-graph-bundle/semantic-projection": (
+        "Self Graph Semantic Projection",
+        "agent/mcp/resources/self-graph-bundle/semantic-projection.json",
+        "application/json",
+    ),
 }
 
 # JSON-RPC error codes

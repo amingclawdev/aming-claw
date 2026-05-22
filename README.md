@@ -217,7 +217,7 @@ instead of guessed from each diff.
 - **Review Queue** — dashboard view where AI-proposed semantic memories wait for human accept/reject; nothing becomes trusted project memory until an operator approves.
 - **Semantic projection** — derived semantic memory for the active graph snapshot. Accepted semantic events are source; the projection is the current materialized view.
 - **Typed proposal** — AI output submitted as machine-checkable workflow input. Proposals are routed through schema/precheck, policy, review, and reconcile paths before anything becomes trusted state.
-- **Self graph bundle** — packaged read-only Aming Claw graph/semantic context used by fresh plugin sessions before the Aming Claw repo bootstraps itself as a governed project.
+- **Self graph bundle** — packaged read-only Aming Claw graph/semantic context used by fresh plugin sessions before the Aming Claw repo bootstraps itself as a governed project. The sealed bundle includes a curated structure read model, function index, hashes, and accepted node semantic projection; it does not import raw governance DB state.
 - **Source-Controlled Hints** — reviewed comment metadata written into tracked files, then materialized by reconcile after commit plus Update Graph. V1 uses this contract for two graph repairs: binding orphan doc/test/config files to existing nodes, and topology fixes such as `add_edge`, `suppress_edge`, and `move_file`. Deleting the hint withdraws the projected effect.
 - **AI Enrich** — request the AI provider to generate a semantic summary/intent/risk for selected nodes or edges. Proposals land in Review Queue; the AI provider is the local `claude` or `codex` CLI (see [AI Providers](#ai-providers)).
 
@@ -674,6 +674,8 @@ Aming Claw ships these assets in the repo:
   for fresh sessions
 - `agent/mcp/resources/self-graph-bundle-manifest.json` — read-only compatibility
   manifest for packaged self graph/semantic context
+- `agent/mcp/resources/self-graph-bundle/` — sealed structure and semantic
+  projection resources for fresh-session orientation and smoke checks
 
 After install, the plugin exposes two skills (Claude Code namespacing shown):
 
@@ -722,6 +724,20 @@ silently importing context the runtime may not understand.
 ```bash
 python scripts/check_self_graph_bundle.py --json-output
 ```
+
+The current sealed bundle exposes:
+
+- `aming-claw://self-graph-bundle/graph-structure` — portable graph structure,
+  file bindings, function lines, and function hashes.
+- `aming-claw://self-graph-bundle/semantic-projection` — accepted node semantic
+  memory for the sealed snapshot.
+- `aming-claw://self-graph-bundle/manifest` — repo-local copy of the manifest
+  that ties the resources to one commit, snapshot, and projection.
+
+The bundle is read-only context. It is trusted as a replayable projection from
+committed code, source-controlled hints/config/rules, accepted semantic events,
+and reconcile output; it is not a governance DB import and it intentionally
+does not claim unfinished edge semantics are complete.
 
 Starting governance is a separate long-running service command; keep it in its
 own terminal instead of expecting plugin install to start it. On Windows use a
@@ -805,9 +821,11 @@ is reconfigured and rebuilt.
 
 For Aming Claw internals, an active local `project_id="aming-claw"` graph is not
 required for the plugin to be usable. Use `aming-claw://seed-graph-summary` as
-the packaged MVP navigation map when no active self graph exists. Use
-`aming-claw://self-graph-bundle-manifest` to inspect the packaged self-context
-compatibility contract. Target/user projects need bootstrap before graph-backed
+the compact packaged navigation map when no active self graph exists. Use
+`aming-claw://self-graph-bundle-manifest`,
+`aming-claw://self-graph-bundle/graph-structure`, and
+`aming-claw://self-graph-bundle/semantic-projection` to inspect the sealed
+self-context bundle. Target/user projects need bootstrap before graph-backed
 claims are available.
 
 ## CLI
@@ -830,6 +848,7 @@ Repo-local diagnostic helper:
 
 ```bash
 python scripts/check_self_graph_bundle.py --json-output
+python scripts/export_self_graph_bundle.py --snapshot-dir <snapshot-dir> --snapshot-id <snapshot-id> --projection-id <projection-id> --event-watermark <n>
 python -m agent.cli mf precommit-check --json-output
 ```
 

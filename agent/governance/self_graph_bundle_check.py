@@ -301,9 +301,29 @@ def _check_resources(
                 )
                 reports.append(report)
                 continue
+        content_findings = _resource_content_path_safety_findings(rel_path, path)
+        if content_findings:
+            blockers.extend(content_findings)
+            reports.append(report)
+            continue
         report["status"] = "pass"
         reports.append(report)
     return reports, blockers, warnings
+
+
+def _resource_content_path_safety_findings(rel_path: str, path: Path) -> list[str]:
+    if path.suffix.lower() != ".json":
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return [f"self graph bundle resource is not UTF-8 JSON text: {rel_path}"]
+    findings: list[str] = []
+    if "/Users/" in text or "\\Users\\" in text:
+        findings.append(f"self graph bundle resource contains user-home path: {rel_path}")
+    if "shared-volume/codex-tasks/state/governance" in text:
+        findings.append(f"self graph bundle resource contains local governance snapshot path: {rel_path}")
+    return findings
 
 
 def _normalize_sha256(value: Any) -> str:

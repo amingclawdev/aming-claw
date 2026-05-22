@@ -1,0 +1,80 @@
+{
+  "bundle_kind": "aming_claw_self_graph_semantic_bundle",
+  "bundle_major": 1,
+  "bundle_manifest_copy": "agent/mcp/resources/self-graph-bundle/manifest.json",
+  "bundle_version": "1.1.0",
+  "consumer_contract": {
+    "import_behavior": "read_only_context; do not import into governance DB automatically",
+    "incompatible_major_action": "emit_plugin_update_reminder",
+    "path_contract": "resources are repo-relative and must not contain private machine paths",
+    "supported_bundle_major": 1
+  },
+  "event_watermark": 109,
+  "generated_at": "2026-05-22T03:18:44Z",
+  "manifest_resource": "agent/mcp/resources/self-graph-bundle-manifest.json",
+  "projection_id": "semproj-54dff56-109-1acd02",
+  "resource_uris": {
+    "bundle_manifest": "aming-claw://self-graph-bundle/manifest",
+    "graph_structure": "aming-claw://self-graph-bundle/graph-structure",
+    "manifest": "aming-claw://self-graph-bundle-manifest",
+    "seed_summary": "aming-claw://seed-graph-summary",
+    "semantic_projection": "aming-claw://self-graph-bundle/semantic-projection"
+  },
+  "resources": [
+    {
+      "bytes": 2904,
+      "mime_type": "application/json",
+      "path": "agent/mcp/resources/seed-graph-summary.json",
+      "required": true,
+      "role": "seed_graph_summary",
+      "sha256": "ca71ee8f7ee8485415ffffab4b9a1ccdadc52d06dbd7ce2903ea8ea80c13e660"
+    },
+    {
+      "bytes": 4683879,
+      "mime_type": "application/json",
+      "path": "agent/mcp/resources/self-graph-bundle/graph-structure.json",
+      "required": true,
+      "role": "graph_structure",
+      "sha256": "dc41cbba6f947e2ece81daf81dbd927530b76836b92d6f97708509f4aff14489"
+    },
+    {
+      "bytes": 970595,
+      "mime_type": "application/json",
+      "path": "agent/mcp/resources/self-graph-bundle/semantic-projection.json",
+      "required": true,
+      "role": "semantic_projection",
+      "sha256": "c3a4c29e982febf3dcbe2e4bc3ed02ae627e906decf7b3a4d64892e9fdd2dd76"
+    }
+  ],
+  "schema_version": 1,
+  "snapshot_id": "full-54dff56-d4b4",
+  "source_commit": "54dff56b2dbc71f375a9ac39f324e05552e7d33a",
+  "source_commit_short": "54dff56",
+  "source_truth_contract": {
+    "derived_state": [
+      "graph structure read model",
+      "semantic projection read model",
+      "file/function indexes"
+    ],
+    "not_trusted_state": [
+      "raw AI proposals before observer/review acceptance",
+      "direct graph database edits"
+    ],
+    "trusted_sources": [
+      "committed code at source_commit",
+      "source-controlled hints/config/rules",
+      "accepted semantic events through review gates",
+      "deterministic reconcile output"
+    ]
+  },
+  "summary": {
+    "accepted_node_semantics": 42,
+    "completed_node_count": 42,
+    "edge_count": 3342,
+    "edge_semantic_scope": "edge semantic enrichment is not packaged in this V1 seal",
+    "edge_semantics": 0,
+    "function_index_count": 4660,
+    "node_count": 701,
+    "node_semantic_scope": "accepted node semantics only; missing nodes are intentionally not synthesized"
+  }
+}
