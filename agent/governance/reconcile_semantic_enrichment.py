@@ -1238,6 +1238,11 @@ def _heuristic_semantic_entry(
         "health_issues": ai_response.get("health_issues") or [],
         "self_check": self_check,
         "semantic_ai_self_check": self_check,
+        "semantic_aggregation": (
+            ai_response.get("semantic_aggregation")
+            if isinstance(ai_response.get("semantic_aggregation"), dict)
+            else {}
+        ),
         "applied_feedback_ids": applied,
         "rejected_feedback_ids": rejected,
         "unresolved_feedback_ids": unresolved,
@@ -2321,6 +2326,8 @@ def replay_semantic_chunk_aggregate_fix(
             semantic_entry["semantic_ai_elapsed_ms"] = fixed.get("_ai_elapsed_ms")
         if isinstance(fixed.get("semantic_chunking"), dict):
             semantic_entry["semantic_chunking"] = fixed["semantic_chunking"]
+        if isinstance(fixed.get("semantic_aggregation"), dict):
+            semantic_entry["semantic_aggregation"] = fixed["semantic_aggregation"]
         for key in ("graph_query_audit", "semantic_graph_query_audit"):
             audit = record_payload.get(key)
             if isinstance(audit, dict) and audit:
@@ -2485,6 +2492,63 @@ def replay_semantic_chunk_aggregate_fix(
     return _persist_replayed_semantic_entry(fixed, replay_status="complete")
 
 
+def _semantic_chunk_aggregation_state(
+    plan: dict[str, Any],
+    responses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    slices = plan.get("slices") if isinstance(plan.get("slices"), list) else []
+    units: list[dict[str, Any]] = []
+    completed = 0
+    blocked_ids: list[str] = []
+    for idx, slice_plan_raw in enumerate(slices):
+        slice_plan = slice_plan_raw if isinstance(slice_plan_raw, dict) else {}
+        response = responses[idx] if idx < len(responses) and isinstance(responses[idx], dict) else {}
+        slice_id = str(slice_plan.get("slice_id") or f"slice-{idx:03d}")
+        ok = bool(response and not response.get("_ai_error"))
+        status = "current" if ok else "blocked"
+        if ok:
+            completed += 1
+        else:
+            blocked_ids.append(slice_id)
+        response_payload = (
+            {
+                "feature_name": response.get("feature_name") or "",
+                "semantic_summary": response.get("semantic_summary") or response.get("purpose") or "",
+                "intent": response.get("intent") or response.get("purpose") or "",
+                "domain_label": response.get("domain_label") or "",
+                "self_check": response.get("self_check") if isinstance(response.get("self_check"), dict) else {},
+            }
+            if ok
+            else {}
+        )
+        units.append({
+            "semantic_unit_id": slice_id,
+            "slice_id": slice_id,
+            "slice_index": int(slice_plan.get("slice_index") or idx),
+            "status": status,
+            "covered_functions": slice_plan.get("covered_functions") or [],
+            "function_hashes": slice_plan.get("function_hashes") or {},
+            "response_hash": f"sha256:{_hash_payload(response_payload)}" if ok else "",
+            "error": str(response.get("_ai_error") or "") if response else "missing_slice_response",
+            "reused": bool(response.get("_semantic_slice_reused")) if response else False,
+        })
+    required = len(slices)
+    blocked = max(0, required - completed)
+    status = "current" if required > 0 and blocked == 0 else "blocked"
+    return {
+        "schema_version": "semantic_aggregation.v1",
+        "mode": "deterministic_function_slice_aggregate",
+        "status": status,
+        "auto_materialized": status == "current",
+        "required_unit_count": required,
+        "completed_unit_count": completed,
+        "blocked_unit_count": blocked,
+        "blocked_unit_ids": blocked_ids,
+        "source_unit_hash": f"sha256:{_hash_payload(units)}",
+        "units": units,
+    }
+
+
 def _aggregate_chunked_semantic_response(
     feature: dict[str, Any],
     feedback: list[dict[str, Any]],
@@ -2492,15 +2556,19 @@ def _aggregate_chunked_semantic_response(
     responses: list[dict[str, Any]],
 ) -> dict[str, Any]:
     ok_responses = [item for item in responses if isinstance(item, dict) and not item.get("_ai_error")]
+    aggregation = _semantic_chunk_aggregation_state(plan, responses)
     if len(ok_responses) != len(plan.get("slices") or []):
         return {
             "_ai_error": "semantic chunk aggregation failed: one or more slices failed",
+            "semantic_aggregation": aggregation,
             "semantic_chunking": {
                 "mode": "function_slices",
                 "status": "failed",
+                "aggregate_status": aggregation["status"],
                 "context_mode": plan.get("context_mode") or "",
                 "slice_count": len(plan.get("slices") or []),
                 "completed_slice_count": len(ok_responses),
+                "semantic_aggregation": aggregation,
             },
         }
     summaries = [
@@ -2558,14 +2626,18 @@ def _aggregate_chunked_semantic_response(
         "dead_code_candidates": collect("dead_code_candidates"),
         "health_issues": collect("health_issues"),
         "self_check": _slice_response_self_check(ok_responses),
+        "semantic_aggregation": aggregation,
         "semantic_chunking": {
             "mode": "function_slices",
             "status": "complete",
+            "aggregate_status": aggregation["status"],
             "context_mode": plan.get("context_mode") or "",
             "function_count": plan.get("function_count", 0),
             "slice_count": len(slice_records),
             "completed_slice_count": len(slice_records),
             "reused_slice_count": sum(1 for item in ok_responses if item.get("_semantic_slice_reused")),
+            "source_unit_hash": aggregation["source_unit_hash"],
+            "semantic_aggregation": aggregation,
             "slices": slice_records,
         },
         "_ai_route": first.get("_ai_route") or {},
@@ -3925,6 +3997,11 @@ def _semantic_state_entry(
         "semantic_chunking": (
             semantic_entry.get("semantic_chunking")
             if isinstance(semantic_entry.get("semantic_chunking"), dict)
+            else {}
+        ),
+        "semantic_aggregation": (
+            semantic_entry.get("semantic_aggregation")
+            if isinstance(semantic_entry.get("semantic_aggregation"), dict)
             else {}
         ),
         "open_issues": open_issues,
@@ -5347,6 +5424,8 @@ def run_semantic_enrichment(
                         state_entry["semantic_ai_route"] = response.get("_ai_route")
                     if isinstance(response.get("semantic_chunking"), dict):
                         state_entry["semantic_chunking"] = response["semantic_chunking"]
+                    if isinstance(response.get("semantic_aggregation"), dict):
+                        state_entry["semantic_aggregation"] = response["semantic_aggregation"]
                     attach_graph_query_audit_entry(state_entry, record)
                     _upsert_semantic_graph_state_entry(
                         semantic_state,
@@ -5556,6 +5635,8 @@ def run_semantic_enrichment(
                             state_entry["semantic_ai_route"] = response.get("_ai_route")
                         if isinstance(response.get("semantic_chunking"), dict):
                             state_entry["semantic_chunking"] = response["semantic_chunking"]
+                        if isinstance(response.get("semantic_aggregation"), dict):
+                            state_entry["semantic_aggregation"] = response["semantic_aggregation"]
                         attach_graph_query_audit_entry(state_entry, record)
                         _upsert_semantic_graph_state_entry(
                             semantic_state,
@@ -5652,6 +5733,8 @@ def run_semantic_enrichment(
                     semantic_entry["semantic_ai_elapsed_ms"] = ai_response.get("_ai_elapsed_ms")
                 if isinstance(ai_response.get("semantic_chunking"), dict):
                     semantic_entry["semantic_chunking"] = ai_response["semantic_chunking"]
+                if isinstance(ai_response.get("semantic_aggregation"), dict):
+                    semantic_entry["semantic_aggregation"] = ai_response["semantic_aggregation"]
         attach_graph_query_audit_entry(semantic_entry, record)
         semantic_entry["semantic_selection_status"] = "selected" if selected_for_ai else "not_selected"
         semantic_entry["semantic_selection_reasons"] = selection_reasons

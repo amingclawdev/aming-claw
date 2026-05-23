@@ -13,6 +13,7 @@ from agent.governance import graph_snapshot_store as store
 from agent.governance import reconcile_feedback
 from agent.governance.reconcile_semantic_enrichment import (
     NODE_SEMANTIC_SELF_CHECK_RULES,
+    _aggregate_chunked_semantic_response,
     _batch_key,
     _carry_forward_semantic_graph_state,
     _ensure_semantic_state_schema,
@@ -1337,6 +1338,102 @@ def test_semantic_enrichment_chunks_large_function_node_and_aggregates(conn, tmp
     assert chunk_payload["semantic_retrieval"]["mode"] == "function_index"
     output = json.loads((project / "semantic-trace" / "feature-outputs" / "L7.large.json").read_text())
     assert output["semantic_entry"]["semantic_chunking"]["mode"] == "function_slices"
+
+
+def test_semantic_chunk_aggregate_state_current_when_all_function_units_complete():
+    plan = {
+        "context_mode": "function_index",
+        "function_count": 2,
+        "slices": [
+            {
+                "slice_id": "L7.large:slice-000",
+                "slice_index": 0,
+                "covered_functions": [{"name": "alpha"}],
+                "function_hashes": {"agent.large::alpha": "sha256:alpha"},
+            },
+            {
+                "slice_id": "L7.large:slice-001",
+                "slice_index": 1,
+                "covered_functions": [{"name": "beta"}],
+                "function_hashes": {"agent.large::beta": "sha256:beta"},
+            },
+        ],
+    }
+    responses = [
+        {
+            "feature_name": "alpha",
+            "semantic_summary": "Alpha source semantics.",
+            "intent": "alpha",
+            "self_check": {"valid": True, "status": "passed"},
+        },
+        {
+            "feature_name": "beta",
+            "semantic_summary": "Beta source semantics.",
+            "intent": "beta",
+            "self_check": {"valid": True, "status": "passed"},
+        },
+    ]
+
+    aggregate = _aggregate_chunked_semantic_response(
+        {"node_id": "L7.large", "title": "Large Semantic Node"},
+        [],
+        plan,
+        responses,
+    )
+
+    assert aggregate["semantic_aggregation"]["status"] == "current"
+    assert aggregate["semantic_aggregation"]["auto_materialized"] is True
+    assert aggregate["semantic_aggregation"]["required_unit_count"] == 2
+    assert aggregate["semantic_aggregation"]["completed_unit_count"] == 2
+    assert aggregate["semantic_aggregation"]["blocked_unit_count"] == 0
+    assert aggregate["semantic_aggregation"]["source_unit_hash"].startswith("sha256:")
+    assert aggregate["semantic_chunking"]["aggregate_status"] == "current"
+
+
+def test_semantic_chunk_aggregate_state_blocked_when_function_unit_fails():
+    plan = {
+        "context_mode": "function_index",
+        "function_count": 2,
+        "slices": [
+            {
+                "slice_id": "L7.large:slice-000",
+                "slice_index": 0,
+                "covered_functions": [{"name": "alpha"}],
+                "function_hashes": {"agent.large::alpha": "sha256:alpha"},
+            },
+            {
+                "slice_id": "L7.large:slice-001",
+                "slice_index": 1,
+                "covered_functions": [{"name": "beta"}],
+                "function_hashes": {"agent.large::beta": "sha256:beta"},
+            },
+        ],
+    }
+    responses = [
+        {
+            "feature_name": "alpha",
+            "semantic_summary": "Alpha source semantics.",
+            "intent": "alpha",
+            "self_check": {"valid": True, "status": "passed"},
+        },
+        {"_ai_error": "provider_rate_limited"},
+    ]
+
+    aggregate = _aggregate_chunked_semantic_response(
+        {"node_id": "L7.large", "title": "Large Semantic Node"},
+        [],
+        plan,
+        responses,
+    )
+
+    assert aggregate["_ai_error"]
+    assert aggregate["semantic_aggregation"]["status"] == "blocked"
+    assert aggregate["semantic_aggregation"]["auto_materialized"] is False
+    assert aggregate["semantic_aggregation"]["required_unit_count"] == 2
+    assert aggregate["semantic_aggregation"]["completed_unit_count"] == 1
+    assert aggregate["semantic_aggregation"]["blocked_unit_count"] == 1
+    assert aggregate["semantic_aggregation"]["blocked_unit_ids"] == ["L7.large:slice-001"]
+    assert aggregate["semantic_chunking"]["aggregate_status"] == "blocked"
 
 
 def test_semantic_enrichment_reuses_unchanged_function_slices_on_function_hash_mismatch(conn, tmp_path):
