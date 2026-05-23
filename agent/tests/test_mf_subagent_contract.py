@@ -75,6 +75,12 @@ def test_build_input_carries_branch_runtime_identity() -> None:
     assert payload["work"]["acceptance_criteria"] == ["tests pass"]
     assert "modify_code" in payload["capabilities"]["can"]
     assert set(MF_SUB_FORBIDDEN_ACTIONS).issubset(payload["capabilities"]["cannot"])
+    assert payload["prechecks"]["asset_binding_proposal"]["proposal_schema_version"] == (
+        "asset_binding_proposal.v1"
+    )
+    assert payload["prechecks"]["asset_binding_proposal"]["precheck_schema_version"] == (
+        "asset_binding_precheck.v1"
+    )
     assert payload["required_output"] == [
         "status",
         "changed_files",

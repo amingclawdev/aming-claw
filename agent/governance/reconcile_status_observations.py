@@ -215,6 +215,46 @@ def _missing_binding_issues(features: list[dict[str, Any]]) -> list[dict[str, An
     return issues
 
 
+def _asset_binding_candidate_issues(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for feature in features:
+        node_id = _node_id(feature)
+        if not node_id:
+            continue
+        metadata = feature.get("metadata") if isinstance(feature.get("metadata"), dict) else {}
+        candidates = metadata.get("asset_binding_candidates")
+        if not isinstance(candidates, list):
+            continue
+        title = str(feature.get("title") or feature.get("feature_name") or node_id)
+        for candidate in candidates[:25]:
+            if not isinstance(candidate, dict):
+                continue
+            precheck = candidate.get("self_precheck") if isinstance(candidate.get("self_precheck"), dict) else {}
+            asset_kind = str(candidate.get("asset_kind") or "asset")
+            asset_path = str(candidate.get("asset_path") or "").replace("\\", "/").strip("/")
+            if not asset_path:
+                continue
+            decision = str(precheck.get("decision") or "")
+            if decision and decision != "review_required":
+                continue
+            issues.append(_issue(
+                issue_type=f"{asset_kind}_binding_candidate_review",
+                reason="weak_evidence_requires_review",
+                node_id=node_id,
+                paths=[asset_path],
+                summary=(
+                    f"{node_id} {title} has weak {asset_kind} binding candidate "
+                    f"{asset_path}; review or add a source-controlled governance hint before graph binding."
+                ),
+                evidence={
+                    "candidate": candidate,
+                    "precheck": precheck,
+                    "proposal_policy": "weak_asset_binding_proposal_first",
+                },
+            ))
+    return issues
+
+
 def _file_state_issues(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     watched_statuses = {"orphan", "pending_decision", "error"}
@@ -389,6 +429,7 @@ def build_status_observation_issues(
     issues: list[dict[str, Any]] = []
     if include_missing_bindings:
         issues.extend(_missing_binding_issues(features))
+        issues.extend(_asset_binding_candidate_issues(features))
     if include_file_state:
         issues.extend(_file_state_issues(file_rows))
     if include_scope_delta:

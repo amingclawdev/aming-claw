@@ -232,8 +232,12 @@ then reconciling, not by editing the graph database as trusted state.
 
 **Proposal before mutation.** AI does not directly edit graph topology or
 semantic memory. It submits typed proposals such as semantic updates, graph
-corrections, config changes, or backlog items. Governance routes each proposal
-through the relevant precheck, policy gate, Review Queue, and reconcile path.
+corrections, config changes, asset-binding proposals, or backlog items.
+Governance routes each proposal through the relevant precheck, policy gate,
+Review Queue, and reconcile path. Weak doc/test/config evidence such as path
+mentions, import-only references, semantic summaries, or downgraded weak test
+fan-in stays as reviewable proposal evidence; it does not become trusted graph
+binding until a reviewed hint/rule/decision or direct symbol evidence exists.
 
 Example proposal shape:
 

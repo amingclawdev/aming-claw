@@ -23,9 +23,13 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
 6. For new features or user-visible behavior changes, record the E2E impact decision:
    - run or add/update the relevant E2E and record evidence;
    - for dashboard/graph/bootstrap/file-hygiene paths, update the repo-owned fixture artifact first, materialize it into an isolated temp project, then run the E2E against that generated project;
-   - for orphan file flows, put the orphan doc/test/config file in the fixture artifact, let the E2E write the governance hint, commit the fixture change, run Update graph, and assert the binding;
+   - for orphan file flows, put the orphan doc/test/config file in the fixture artifact, verify weak evidence first appears as an `asset_binding_proposal`, then let the E2E write the source-controlled governance hint, commit the fixture change, run Update graph, and assert the binding;
    - file a follow-up backlog row when live-AI, DB-mutating, slow, or human-approval E2E is deferred;
    - write `e2e_not_applicable` with a reason for docs-only or non-runtime changes.
+7. If an AI session or `mf_sub` worker proposes doc/test/config binding changes, require the local asset-binding precheck first:
+   - run `agent.governance.asset_binding_proposals.precheck_asset_binding_proposal` against the draft proposal;
+   - include compact `self_precheck` evidence with the submitted proposal;
+   - do not request direct graph materialization from weak evidence.
 
 ## Commit
 

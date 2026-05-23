@@ -5,6 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from agent.governance.asset_binding_proposals import (
+    PRECHECK_SCHEMA_VERSION as ASSET_BINDING_PRECHECK_SCHEMA_VERSION,
+    PROPOSAL_SCHEMA_VERSION as ASSET_BINDING_PROPOSAL_SCHEMA_VERSION,
+)
 from agent.governance.parallel_branch_runtime import BranchTaskRuntimeContext
 
 
@@ -173,6 +177,21 @@ def build_mf_subagent_input(
         "capabilities": {
             "can": list(MF_SUB_ALLOWED_CAPABILITIES),
             "cannot": list(MF_SUB_FORBIDDEN_ACTIONS),
+        },
+        "prechecks": {
+            "asset_binding_proposal": {
+                "proposal_schema_version": ASSET_BINDING_PROPOSAL_SCHEMA_VERSION,
+                "precheck_schema_version": ASSET_BINDING_PRECHECK_SCHEMA_VERSION,
+                "local_function": (
+                    "agent.governance.asset_binding_proposals."
+                    "precheck_asset_binding_proposal"
+                ),
+                "gate_rule": (
+                    "Run the same precheck on any doc/test/config binding proposal "
+                    "before submitting it; include the compact self_precheck object "
+                    "with the proposal so the server gate can verify the hash."
+                ),
+            },
         },
         "required_output": list(MF_SUB_REQUIRED_OUTPUT),
     }

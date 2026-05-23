@@ -34,6 +34,11 @@ _ROLE_TO_FIELD = {
     "configs": "config",
     "config_files": "config",
 }
+_FIELD_TO_ASSET_KIND = {
+    "secondary": "doc",
+    "test": "test",
+    "config": "config",
+}
 
 
 @dataclass(frozen=True)
@@ -266,6 +271,7 @@ def apply_binding_hints_to_graph_nodes(
                     "field": hint.field,
                     "source_path": hint.source_path,
                 })
+            _prune_asset_binding_candidate(metadata, rel, hint.field)
         already_bound.add(rel)
         applied.append({
             "path": rel,
@@ -398,6 +404,30 @@ def _resolve_target(
     if hint.target_node_id and hint.target_node_id in by_title:
         return by_title[hint.target_node_id]
     return None
+
+
+def _prune_asset_binding_candidate(metadata: dict[str, Any], path: str, field: str) -> None:
+    asset_kind = _FIELD_TO_ASSET_KIND.get(field, "")
+    if not asset_kind:
+        return
+    rel = normalize_relpath("", path)
+    candidates = metadata.get("asset_binding_candidates")
+    if isinstance(candidates, list):
+        kept = [
+            item for item in candidates
+            if not (
+                isinstance(item, dict)
+                and normalize_relpath("", str(item.get("asset_path") or "")) == rel
+                and str(item.get("asset_kind") or "") == asset_kind
+            )
+        ]
+        metadata["asset_binding_candidates"] = kept
+    if asset_kind == "doc":
+        docs = [item for item in _path_list(metadata.get("candidate_doc_files")) if item != rel]
+        metadata["candidate_doc_files"] = docs
+    elif asset_kind == "test":
+        tests = [item for item in _path_list(metadata.get("weak_test_files")) if item != rel]
+        metadata["weak_test_files"] = tests
 
 
 def _path_list(value: Any) -> list[str]:

@@ -18,6 +18,7 @@ from .errors import ValidationError
 INTAKE_SCHEMA_VERSION = "ai_output_intake.v1"
 
 SUPPORTED_TASK_TYPES = {
+    "asset_binding_proposal",
     "semantic_node",
     "semantic_edge",
     "graph_structure_ops",
@@ -31,6 +32,7 @@ SUPPORTED_TASK_TYPES = {
 }
 
 RESERVED_TASK_TYPES = {"chain_stage_result"}
+REVIEW_PENDING_TASK_TYPES = {"asset_binding_proposal"}
 ROUTE_STATUSES = {
     "queued",
     "reserved",
@@ -168,6 +170,23 @@ def submit_ai_output(
     priority = _int_field(request, "priority", 0)
     max_attempts = max(1, _int_field(request, "max_attempts", 3))
 
+    if task_type == "asset_binding_proposal":
+        from .asset_binding_proposals import compact_precheck, precheck_asset_binding_proposal
+
+        gate_result = precheck_asset_binding_proposal(
+            {**payload, "self_precheck": self_precheck},
+            mode="server_gate",
+        )
+        if not gate_result["ok"]:
+            raise ValidationError(
+                "asset binding proposal failed precheck",
+                {"precheck": compact_precheck(gate_result)},
+            )
+        metadata = {
+            **metadata,
+            "asset_binding_precheck": compact_precheck(gate_result),
+        }
+
     payload_json = _json_dumps(payload)
     payload_hash = _payload_hash(payload_json)
     _validate_payload_hash(request.get("payload_hash"), payload_hash)
@@ -182,7 +201,12 @@ def submit_ai_output(
         payload_hash=payload_hash,
     )
     output_id = _output_id(project_id, dedupe_key)
-    default_route_status = "reserved" if task_type in RESERVED_TASK_TYPES else "queued"
+    if task_type in RESERVED_TASK_TYPES:
+        default_route_status = "reserved"
+    elif task_type in REVIEW_PENDING_TASK_TYPES:
+        default_route_status = "review_pending"
+    else:
+        default_route_status = "queued"
     route_status = _route_status_field(request, default_route_status)
     if task_type in RESERVED_TASK_TYPES and route_status != "reserved":
         raise ValidationError("reserved task_type must use route_status='reserved'")

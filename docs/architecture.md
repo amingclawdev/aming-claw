@@ -42,6 +42,12 @@ graph/backlog/review/reconcile loop.
   graph behavior becomes a typed proposal with precheck evidence. Server-side
   parsing, policy gates, Review Queue decisions, and reconcile remain
   authoritative.
+- **Asset bindings are proposal-first unless evidence is strong.** Weak
+  doc/test/config signals such as path mentions, import-only references,
+  semantic summaries, or downgraded weak test fan-in are review candidates.
+  They become trusted bindings only after a source-controlled hint, accepted
+  review decision, direct test symbol import, or registered config rule/loader
+  provides durable evidence.
 - **Source-controlled graph repair.** Graph defects are fixed through reviewed
   source-controlled hints/config/rules plus reconcile, not direct graph database
   edits.
@@ -241,7 +247,7 @@ Supported source-controlled repairs:
 
 | Repair | Meaning |
 |--------|---------|
-| file binding | attach orphan doc/test/config files to existing nodes |
+| file binding | attach orphan doc/test/config files to existing nodes after proposal review or source-controlled hint evidence |
 | `add_edge` | add a reviewed graph relation |
 | `suppress_edge` | suppress an incorrect inferred relation |
 | `move_file` | move file ownership/binding to a different node |

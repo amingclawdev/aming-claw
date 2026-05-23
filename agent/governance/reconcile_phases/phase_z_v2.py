@@ -25,6 +25,11 @@ from agent.governance.language_adapters import (
     LanguageAdapter,
     PythonAdapter,
 )
+from agent.governance.asset_binding_proposals import (
+    doc_binding_candidates,
+    trusted_doc_files,
+    weak_test_binding_candidates,
+)
 from agent.governance.language_policy import DEFAULT_LANGUAGE_POLICY
 
 # ---------------------------------------------------------------------------
@@ -3262,7 +3267,7 @@ def synthesize_feature_clusters(
                     rel = _repo_relpath(project_root, str(test_file))
                     if rel:
                         secondary_files.add(rel)
-                for doc_file in (node.get("doc_coverage") or {}).get("doc_files", []):
+                for doc_file in trusted_doc_files(node.get("doc_coverage") or {}, project_root):
                     rel = _repo_relpath(project_root, str(doc_file))
                     if rel:
                         secondary_files.add(rel)
@@ -3683,7 +3688,7 @@ def build_rebase_candidate_graph(
         ]
         doc_files = [
             _repo_relpath(project_root, f)
-            for f in (node.get("doc_coverage") or {}).get("doc_files", [])
+            for f in trusted_doc_files(node.get("doc_coverage") or {}, project_root)
             if f
         ]
         config_files = [
@@ -3691,6 +3696,21 @@ def build_rebase_candidate_graph(
             for f in (node.get("config_files") or [])
             if f
         ]
+        asset_binding_candidates = (
+            doc_binding_candidates(
+                node.get("doc_coverage") or {},
+                project_root=project_root,
+                target_node_id=node_id,
+                target_module=module_name,
+                target_title=module_name or str(node.get("node_id") or node_id),
+            )
+            + weak_test_binding_candidates(
+                node.get("test_coverage") or {},
+                target_node_id=node_id,
+                target_module=module_name,
+                target_title=module_name or str(node.get("node_id") or node_id),
+            )
+        )
         out_nodes.append({
             "id": node_id,
             "title": module_name or str(node.get("node_id") or node_id),
@@ -3718,6 +3738,17 @@ def build_rebase_candidate_graph(
                 "function_weak_call_count": node.get("function_weak_call_count", 0),
                 "config_files": sorted({p for p in config_files if p}),
                 "test_consumer_fanin": (node.get("test_coverage") or {}).get("fan_in_evidence") or [],
+                "asset_binding_candidates": asset_binding_candidates,
+                "candidate_doc_files": sorted({
+                    str(candidate.get("asset_path") or "")
+                    for candidate in asset_binding_candidates
+                    if candidate.get("asset_kind") == "doc"
+                }),
+                "weak_test_files": sorted({
+                    str(candidate.get("asset_path") or "")
+                    for candidate in asset_binding_candidates
+                    if candidate.get("asset_kind") == "test"
+                }),
                 "architecture_signals": node.get("architecture_signals") or {},
                 "typed_relations": node.get("typed_relations") or [],
             },
