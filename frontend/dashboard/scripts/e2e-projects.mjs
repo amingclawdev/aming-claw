@@ -460,8 +460,8 @@ function verifyAiConfigProjectScopeContract() {
 function verifyQueueLaneCopyContract() {
   phase("semantic queue lane copy contract");
   const opsSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/OperationsQueueView.tsx"), "utf8");
-  assert(opsSource.includes("parallel workers"), "Operations Queue KPI should not imply strict serial execution");
-  assert(opsSource.includes("semantic worker lanes"), "Running section should explain parallel semantic lanes");
+  assert(opsSource.includes("semantic lanes"), "Operations Queue KPI should describe semantic lanes, not executor workers");
+  assert(opsSource.includes("governance semantic lanes"), "Running section should explain governance-owned semantic lanes");
   ok("queue wording matches parallel semantic worker behavior");
 }
 

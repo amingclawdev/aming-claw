@@ -1854,6 +1854,7 @@ def doctor_plugin(
     codex_config: Optional[Union[Path, str]] = None,
     codex_home: Optional[Union[Path, str]] = None,
     check_governance: bool = True,
+    check_service_manager: bool = False,
     python_executable: Optional[str] = None,
 ) -> DoctorResult:
     """Run read-only aftercare checks for a local plugin install."""
@@ -1883,13 +1884,18 @@ def doctor_plugin(
     if check_governance:
         result.checks.append(_check_governance(governance_url))
         result.checks.append(_check_dashboard_route(governance_url))
+    if check_service_manager:
         result.checks.append(_check_manager_health(os.environ.get("MANAGER_URL", "http://127.0.0.1:40101")))
 
     result.manual_steps.extend(
         [
             "Restart/reload Codex or open a new session after installing the plugin; existing threads may not hot-load new skills/MCP tools.",
             "In the new session, confirm the Aming Claw skill is visible and mcp__aming_claw tools are available.",
-            "Remember: `aming-claw start` only starts governance; it does not prove plugin loading, dashboard assets, ServiceManager, executor, or AI auth.",
+            "Remember: `aming-claw start` only starts governance; it does not prove plugin loading, dashboard assets, or AI auth.",
+            (
+                "ServiceManager/executor checks are advanced chain/ops checks; "
+                "run doctor with `--check-service-manager` only when testing chain automation."
+            ),
         ]
     )
     return result

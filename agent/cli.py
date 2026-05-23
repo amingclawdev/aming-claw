@@ -478,8 +478,9 @@ def plugin_update(repo_url, check_only, apply_update, install_root, ref, python_
 @click.option("--codex-home", default="", help="Optional Codex home for plugin cache checks.")
 @click.option("--python", "python_executable", default=sys.executable, help="Python executable to validate for local runtime.")
 @click.option("--skip-governance", is_flag=True, help="Skip governance health probe.")
+@click.option("--check-service-manager", is_flag=True, help="Also check advanced chain/executor ServiceManager health.")
 @click.option("--json-output", is_flag=True, help="Print machine-readable JSON.")
-def plugin_doctor(plugin_root, governance_url, codex_config, codex_home, python_executable, skip_governance, json_output):
+def plugin_doctor(plugin_root, governance_url, codex_config, codex_home, python_executable, skip_governance, check_service_manager, json_output):
     """Run read-only aftercare checks for a local plugin install."""
     from agent.plugin_installer import doctor_plugin, format_doctor_result
 
@@ -490,6 +491,7 @@ def plugin_doctor(plugin_root, governance_url, codex_config, codex_home, python_
         codex_home=codex_home or None,
         python_executable=python_executable,
         check_governance=not skip_governance,
+        check_service_manager=check_service_manager,
     )
     if json_output:
         click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))

@@ -12,8 +12,9 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher`.
 - MCP runs through the stdio module entrypoint:
   `python -m agent.mcp.server --project aming-claw --workers 0`.
-- Governance and ServiceManager stay host-owned. Plugin MCP sessions should
-  control/query them, not spawn duplicate executor workers.
+- Governance stays host-owned. Plugin MCP sessions should query/control
+  governance and should not spawn duplicate executor workers. ServiceManager is
+  an advanced chain/ops surface, not a V1 first-run requirement.
 - The dashboard is served by governance at `/dashboard`. The root path `/` is
   not the dashboard and may return `404`.
 - Dashboard static assets are required. No build is needed if
@@ -27,7 +28,7 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
   `/dashboard` without a target-machine npm build.
 - A plugin launcher is explicit: `aming-claw launcher` writes a local HTML
   entry artifact with status/start guidance and a dashboard link. It does not
-  auto-start governance or ServiceManager.
+  auto-start governance or advanced ServiceManager/chain services.
 - Git URL bootstrap is explicit: `aming-claw plugin install <repo-url>` and
   `python scripts/install_from_git.py <repo-url>` clone/update a user-local
   checkout, validate Codex/Claude plugin assets, optionally pip-install the
@@ -37,14 +38,16 @@ This repo is treated as the plugin root for the initial Aming Claw plugin packag
 - Git URL update is explicit: `aming-claw plugin update --check` fetches the
   configured remote and writes local update state, while
   `aming-claw plugin update --apply` fast-forwards the checkout, refreshes the
-  Python/Codex install surfaces, and records whether MCP, governance, or
-  ServiceManager must be reloaded/restarted before MF close. After those
+  Python/Codex install surfaces, and records whether MCP or governance must be
+  reloaded/restarted before MF close. ServiceManager restart obligations are
+  advanced chain/ops checks, not default plugin aftercare. After those
   actions are complete, rerun `aming-claw plugin update --check` to mark the
   installed commit current.
 - Installing plugin assets, installing the Python package, starting governance,
   serving the dashboard, loading MCP tools in the current Codex/Claude session,
-  and ServiceManager/executor health are separate states. After plugin install
-  or update, open a new editor session before expecting new skills/MCP tools.
+  and optional chain/executor readiness are separate states. After plugin
+  install or update, open a new editor session before expecting new skills/MCP
+  tools.
 
 ## Layout
 
@@ -100,7 +103,9 @@ The active MCP server entrypoint is:
 python -m agent.mcp.server --project aming-claw --workers 0 --governance-url http://localhost:40000
 ```
 
-Keep `--workers 0` for normal editor/plugin sessions. ServiceManager owns executor lifecycle.
+Keep `--workers 0` for normal editor/plugin sessions. External executor
+lifecycle belongs to the advanced chain/ops path, not the V1 dashboard, graph,
+backlog, Review Queue, or Manual Fix path.
 Redis event forwarding is off by default for local plugin sessions; use
 `MCP_ENABLE_EVENTS=1` or `--enable-events` only when push notifications are
 needed.

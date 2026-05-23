@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Aming Claw",
     "shortDescription": "Graph-first governance workflow guard",
-    "longDescription": "Provides the Aming Claw session skill, MCP resources, and MCP configuration so agents start with graph-first discovery, backlog/MF discipline, ServiceManager-aware runtime checks, and dashboard governance context.",
+    "longDescription": "Provides the Aming Claw session skill, MCP resources, and MCP configuration so agents start with graph-first discovery, backlog/MF discipline, core runtime checks, and dashboard governance context.",
     "developerName": "Aming Claw",
     "category": "Productivity",
     "capabilities": [

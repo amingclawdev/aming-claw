@@ -16,6 +16,8 @@ aming-claw plugin doctor
 
 The doctor is read-only. It reports missing CLI, marketplace, manifest, or MCP
 config issues; fix anything that reads `fail` before continuing.
+It does not check ServiceManager by default because ServiceManager/executor are
+advanced chain/ops surfaces, not V1 onboarding requirements.
 
 Then start governance in a separate terminal:
 
@@ -154,7 +156,9 @@ dependency/function-call relations.
 ## 7. What Is Not The V1 Default
 
 - Auto-chain PM -> Dev -> Test -> QA -> Merge is experimental in V1.
-- ServiceManager/executor degraded is not a dashboard/graph failure.
+- ServiceManager/executor are advanced chain/ops surfaces. They are not
+  required for governance, dashboard, graph query, backlog, AI Enrich Review
+  Queue, or Manual Fix.
 - Workflow acceptance graph tools (`wf_*`) are separate from the snapshot graph
   and require import before use.
 - Telegram, Redis, dbservice, and full production deployment are advanced

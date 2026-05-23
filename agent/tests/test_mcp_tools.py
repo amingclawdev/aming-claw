@@ -56,6 +56,25 @@ class _RuntimeMismatchGovRecorder(_Recorder):
         return {"ok": True, "method": method, "path": path, "data": data}
 
 
+class _AdvancedRuntimeMismatchGovRecorder(_Recorder):
+    def api(self, method: str, path: str, data: dict | None = None) -> dict:
+        self.calls.append((method, path, data))
+        if path == "/api/health":
+            return {"status": "ok", "version": "new1234"}
+        if path == "/api/version-check/aming-claw":
+            return {
+                "ok": True,
+                "head": "new1234",
+                "chain_version": "new1234",
+                "dirty": False,
+                "runtime_match": False,
+                "gov_runtime_version": "new1234",
+                "sm_runtime_version": "old1234",
+                "message": "ServiceManager runtime is behind",
+            }
+        return {"ok": True, "method": method, "path": path, "data": data}
+
+
 class _OfflineGovRecorder(_Recorder):
     def api(self, method: str, path: str, data: dict | None = None) -> dict:
         self.calls.append((method, path, data))
@@ -322,6 +341,8 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     assert status["severity"] == "ok"
     assert status["usable"] is True
     assert status["capabilities"]["graph_queries"] is True
+    assert status["capabilities"]["core_runtime"] is True
+    assert status["capabilities"]["advanced_chain_ops"] is True
     assert status["governance"]["status"] == "ok"
     assert status["manager"]["ok"] is True
     assert status["version_check"]["runtime_match"] is True
@@ -332,7 +353,7 @@ def test_mcp_runtime_status_aggregates_governance_and_manager():
     assert manager.calls == [("GET", "/api/manager/health", None)]
 
 
-def test_mcp_runtime_status_runtime_mismatch_is_degraded_but_usable():
+def test_mcp_runtime_status_runtime_mismatch_is_advanced_ops_only():
     governance = _RuntimeMismatchGovRecorder()
     manager = _Recorder()
     dispatcher = _dispatcher(governance, manager)
@@ -341,13 +362,32 @@ def test_mcp_runtime_status_runtime_mismatch_is_degraded_but_usable():
 
     assert status["ok"] is True
     assert status["strict_ok"] is False
-    assert status["severity"] == "degraded"
+    assert status["severity"] == "warning"
     assert status["usable"] is True
     assert status["capabilities"]["graph_queries"] is True
     assert status["capabilities"]["backlog"] is True
+    assert status["capabilities"]["core_runtime"] is False
+    assert status["capabilities"]["advanced_chain_ops"] is False
     assert status["capabilities"]["executor"] is False
-    assert "Governance graph/backlog queries are usable" in status["summary"]
-    assert "governance_redeploy_or_restart_sm" in status["recommended_actions"]
+    assert "version metadata needs attention" in status["summary"]
+    assert "advanced_chain_ops_redeploy_or_restart" in status["recommended_actions"]
+
+
+def test_mcp_runtime_status_service_manager_mismatch_keeps_core_ok():
+    governance = _AdvancedRuntimeMismatchGovRecorder()
+    manager = _Recorder()
+    dispatcher = _dispatcher(governance, manager)
+
+    status = dispatcher.dispatch("runtime_status", {"project_id": "aming-claw"})
+
+    assert status["ok"] is True
+    assert status["strict_ok"] is True
+    assert status["severity"] == "ok"
+    assert status["capabilities"]["core_runtime"] is True
+    assert status["capabilities"]["advanced_chain_ops"] is False
+    assert status["capabilities"]["executor"] is False
+    assert "Governance core is healthy" in status["summary"]
+    assert "advanced_chain_ops_redeploy_or_restart" in status["recommended_actions"]
 
 
 def test_mcp_runtime_status_governance_offline_reports_loaded_mcp():

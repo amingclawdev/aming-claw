@@ -505,23 +505,25 @@ def _runtime_status_classification(
     version_ok = bool(version.get("ok"))
     runtime_match = bool(version.get("runtime_match"))
     dirty = bool(version.get("dirty"))
-    strict_ok = bool(gov_ok and manager_ok and version_ok and runtime_match and not dirty)
+    core_ok = bool(gov_ok and version_ok and not dirty)
+    advanced_chain_ops_ok = bool(manager_ok and runtime_match and not dirty)
+    strict_ok = core_ok
 
     if not gov_ok:
         severity = "blocking"
         summary = "Governance API is unavailable; graph, backlog, and dashboard actions are blocked."
-    elif not manager_ok:
-        severity = "degraded"
-        summary = "Governance is usable, but ServiceManager is offline so executor actions are unavailable."
     elif dirty:
         severity = "warning"
         summary = "Governance is usable, but the worktree has uncommitted files."
-    elif not version_ok or not runtime_match:
-        severity = "degraded"
-        summary = "Governance graph/backlog queries are usable, but runtime versions are out of sync."
+    elif not version_ok:
+        severity = "warning"
+        summary = "Governance is usable, but version metadata needs attention."
+    elif not manager_ok or not runtime_match:
+        severity = "ok"
+        summary = "Governance core is healthy; advanced chain/ops readiness needs attention."
     else:
         severity = "ok"
-        summary = "Governance runtime is healthy."
+        summary = "Governance core runtime is healthy."
 
     usable = severity != "blocking"
     return {
@@ -534,8 +536,10 @@ def _runtime_status_classification(
             "dashboard": gov_ok,
             "graph_queries": gov_ok,
             "backlog": gov_ok,
+            "core_runtime": core_ok,
+            "advanced_chain_ops": advanced_chain_ops_ok,
             "service_manager": manager_ok,
-            "executor": bool(manager_ok and runtime_match and not dirty),
+            "executor": advanced_chain_ops_ok,
         },
     }
 
@@ -841,11 +845,11 @@ class ToolDispatcher:
             elif governance.get("status") != "ok":
                 status["recommended_actions"].append("governance_redeploy")
             if not manager.get("ok"):
-                status["recommended_actions"].append("manager_start")
+                status["recommended_actions"].append("advanced_chain_ops_manager_start")
             if version.get("dirty"):
                 status["recommended_actions"].append("commit_or_stash_dirty_files")
             if not version.get("runtime_match"):
-                status["recommended_actions"].append("governance_redeploy_or_restart_sm")
+                status["recommended_actions"].append("advanced_chain_ops_redeploy_or_restart")
             return status
 
         # --- System ---

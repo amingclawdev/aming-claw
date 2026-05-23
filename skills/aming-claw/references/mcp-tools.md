@@ -6,14 +6,16 @@ Prefer MCP tools over raw SQLite or hand-rolled HTTP calls when the tool exists.
 
 - `health`: governance service health.
 - `version_check`: HEAD, chain version, dirty files, and runtime match.
-- `runtime_status`: combined governance, ServiceManager, and version state.
+- `runtime_status`: core governance/version state plus optional advanced
+  chain/ops readiness when ServiceManager is present.
   Pass `project_id`, for example `runtime_status(project_id="aming-claw")`.
 - `preflight_check`: system, version, graph, coverage, queue, and plugin update
   state baseline.
 
 Use these at session start, after commits, and before closing a backlog row.
-ServiceManager or executor offline means runtime is degraded for chain/executor
-work; it does not by itself mean governance or the dashboard is down.
+ServiceManager or executor offline means advanced chain/executor work is
+degraded; it does not by itself mean governance, dashboard, graph, backlog, or
+Review Queue is down.
 If a runtime tool returns `governance_online=false`, the MCP server and skill
 loaded successfully but the governance HTTP service is offline or timed out.
 Tell the user to start it with `aming-claw start` or the launcher, then retry;
@@ -21,8 +23,7 @@ do not describe that state as a plugin or MCP install failure.
 
 ## AI Config And Local Runtime
 
-Use the project AI config endpoint before queueing AI Enrich or claiming that
-chain/executor work is ready:
+Use the project AI config endpoint before queueing AI Enrich:
 
 - HTTP fallback: `GET /api/projects/{project_id}/ai-config`.
 - Check `tool_health.openai` and `tool_health.anthropic` for local CLI probe
@@ -46,8 +47,6 @@ Status wording must separate command detection from real AI availability:
 - `missing`: command or configured path is absent.
 - `routing missing`: project semantic provider/model is unset; block AI Enrich
   and ask the user to configure AI config.
-- `executor degraded`: ServiceManager/executor is unavailable, so automatic
-  chain/executor work is not ready even if CLIs are detected.
 
 Do not run a real Codex or Claude model call as a readiness check unless the
 user explicitly asks; it may spend quota or trigger interactive login.
@@ -217,7 +216,10 @@ instead.
 
 Use observer controls for review/takeover flows. Preserve task metadata when manually completing or re-creating chain stages.
 
-## ServiceManager And Executor
+## Advanced ServiceManager And Executor
+
+These tools are not part of the V1 dashboard/graph/backlog/Review Queue happy
+path. Use them only for chain automation, host redeploy, or executor debugging.
 
 - `manager_health`: ServiceManager sidecar status.
 - `manager_start`: fixed bootstrap facade. Do not request takeover from MCP; run takeover from an external ops shell when needed.
@@ -225,4 +227,6 @@ Use observer controls for review/takeover flows. Preserve task metadata when man
 - `executor_respawn`: ask ServiceManager to respawn the external executor.
 - `executor_status` and `executor_scale`: only manage MCP-local workers when the MCP server was intentionally started with workers.
 
-Normal editor/plugin MCP sessions should use `--workers 0`. The executor is owned by ServiceManager, not by ad hoc MCP sessions.
+Normal editor/plugin MCP sessions should use `--workers 0`. V1 semantic jobs
+are drained by the governance in-process semantic worker; executor workers are
+for advanced chain automation.

@@ -461,6 +461,8 @@ def test_doctor_plugin_validates_aftercare_without_governance(tmp_path):
     }
     assert "Restart/reload Codex" in format_doctor_result(result)
     assert "auth unknown" in format_doctor_result(result) or "missing" in format_doctor_result(result)
+    assert "service_manager_health" not in {check.name for check in result.checks}
+    assert "ServiceManager/executor checks are advanced" in format_doctor_result(result)
 
 
 def test_ai_cli_check_uses_env_override(monkeypatch, tmp_path):

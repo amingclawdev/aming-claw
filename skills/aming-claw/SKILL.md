@@ -1,6 +1,6 @@
 ---
 name: aming-claw
-description: Use when working in the Aming Claw repo or any governance, dashboard, MCP, ServiceManager, backlog, graph, semantic reconcile, scope/full reconcile, chain, executor, or manual-fix/observer-hotfix task. Enforces graph-first discovery, backlog/MF tracking before mutations, MCP-first operations, Chain trailers on commits, and post-commit runtime/graph checks.
+description: Use when working in the Aming Claw repo or any governance, dashboard, MCP, backlog, graph, semantic reconcile, scope/full reconcile, chain/executor advanced ops, or manual-fix/observer-hotfix task. Enforces graph-first discovery, backlog/MF tracking before mutations, MCP-first operations, Chain trailers on commits, and post-commit runtime/graph checks.
 ---
 
 # Aming Claw
@@ -10,7 +10,7 @@ description: Use when working in the Aming Claw repo or any governance, dashboar
 Use Aming Claw as a local graph-first governance assistant. In a fresh session,
 tell the user you can help with:
 
-- Diagnose project governance state: runtime, ServiceManager, version, active snapshot, graph stale/current, pending scope reconcile, operations queue, semantic queue, and open backlog.
+- Diagnose project governance state: core runtime, version, active snapshot, graph stale/current, pending scope reconcile, operations queue, semantic queue, and open backlog. Treat ServiceManager/executor as advanced chain/ops readiness, not V1 core health.
 - Explore graph structure: layers, subsystems, features, hierarchy, node files, function indexes, neighbors, edge evidence, fan-in/fan-out, quality flags, orphan/low-relation signals, and doc/test coverage.
 - Locate code precisely: resolve file paths to nodes, search module/title/file/function metadata, inspect `function_lines`, query `function_callers` / `function_callees`, and fetch bounded file excerpts only after graph lookup.
 - Rank PR opportunities: use graph evidence to identify high fan-out nodes, missing tests/docs, suspicious dependencies, semantic drift, review debt, and candidate refactor/test/doc issues.
@@ -290,7 +290,7 @@ is stale, then close the backlog row with commit and verification evidence.
 
 ## Local AI Runtime Readiness
 
-Before claiming AI Enrich, semantic review, or chain/executor readiness, inspect
+Before claiming AI Enrich or semantic review readiness, inspect
 the selected project's AI config:
 
 - HTTP fallback: `GET /api/projects/{project_id}/ai-config`.
@@ -308,8 +308,8 @@ Report these states separately:
 - `missing`: the CLI is absent or the configured path is wrong.
 - `routing missing`: the project has no semantic provider/model; AI Enrich must
   be blocked and the user should configure AI config first.
-- `ServiceManager/executor unavailable`: automatic chain/executor work is
-  degraded even when the local CLIs are present.
+- `chain/executor unavailable`: advanced chain automation is unavailable or
+  degraded; this does not block V1 graph/backlog/dashboard/Review Queue work.
 
 Use a compact status shape when helping the user:
 
@@ -318,7 +318,7 @@ Codex CLI: detected at <path>, version <version>, auth unknown.
 Claude CLI: detected at <path>, version <version>, auth unknown.
 Semantic route: <provider/model or unset>.
 AI Enrich: ready / blocked because <reason>.
-Chain executor: ready / degraded because <reason>.
+Advanced chain/executor: ready / degraded because <reason>.
 ```
 
 Do not treat `codex --version` or `claude --version` as proof that a real AI

@@ -71,7 +71,7 @@ const ENRICH_MODES: { id: EnrichMode; label: string; desc: string }[] = [
 
 const ENRICH_EXEC: { id: EnrichExec; label: string; desc: string }[] = [
   { id: "dry_run", label: "Dry run", desc: "Plan + queue tally, no AI calls billed" },
-  { id: "apply", label: "Apply", desc: "Queue real AI work — runs in the executor" },
+  { id: "apply", label: "Apply", desc: "Queue real AI work through the governance semantic worker" },
 ];
 
 const FEEDBACK_KINDS: {

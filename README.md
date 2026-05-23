@@ -434,8 +434,9 @@ V1 boundaries to keep visible:
 - Chain dev/test/qa/merge automation is experimental. The recommended V1
   implementation path is Manual Fix with backlog-first, graph-first, tests,
   explicit commits, and Update Graph after commit.
-- ServiceManager/executor degraded means chain automation is degraded; it does
-  not mean governance, dashboard, graph query, or backlog are broken.
+- ServiceManager/executor are advanced chain/ops surfaces, not V1 first-run
+  requirements. The stable V1 path is governance, dashboard, MCP, graph,
+  backlog, Review Queue, and Manual Fix.
 - Full semantic coverage is not required for V1. AI-generated semantics are
   proposals until reviewed and accepted.
 - Function-level call queries exist for supported snapshots, but dashboard
@@ -445,7 +446,7 @@ V1 boundaries to keep visible:
   hints for `add_edge`, `suppress_edge`, and `move_file`, all materialized by
   reconcile and reversible by source changes.
 - Plugin install, governance startup, dashboard availability, MCP visibility,
-  ServiceManager health, and local AI CLI readiness are separate states.
+  local AI CLI readiness, and optional chain/ops readiness are separate states.
 
 Best-fit V1 use cases:
 
@@ -484,7 +485,9 @@ aming-claw plugin doctor
 
 `aming-claw start` only starts the local governance service. It does not prove
 that Codex/Claude loaded the plugin, MCP tools, dashboard static files,
-ServiceManager, executor, or AI CLI auth.
+optional chain/executor services, or AI CLI auth.
+`plugin doctor` checks V1 install/governance readiness by default. Add
+`--check-service-manager` only when testing advanced chain/executor operations.
 
 ### Requirements
 
@@ -610,8 +613,10 @@ Expected checks:
   reports AI auth as unknown.
 - Governance health is reachable after services are started.
 - `/dashboard` returns `200` when governance is running and static assets exist.
-- ServiceManager is either reachable or reported as degraded for chain/executor.
 - A new Codex or Claude Code session can see the Aming Claw skill and MCP tools.
+
+ServiceManager/executor health is intentionally not a default V1 doctor gate;
+check it only when exercising advanced chain automation or host redeploy flows.
 
 Open the local launcher or dashboard:
 
@@ -646,14 +651,15 @@ Keep these states separate when troubleshooting:
 - Codex or Claude Code loaded the skill/MCP in the current session.
 - Governance `/api/health` is running on port `40000`.
 - Dashboard static assets are present and `/dashboard` returns `200`.
-- ServiceManager responds on port `40101`.
-- Executor/chain automation is available.
 - Local AI CLIs are detected and the project has AI routing.
 - Packaged self graph bundle compatibility is current for the installed runtime.
+- Optional advanced chain/ops readiness: ServiceManager on port `40101` and
+  executor/chain automation.
 
 `aming-claw start` only starts governance. It does not prove the current
 Codex/Claude session loaded the plugin, that dashboard assets exist, that
-ServiceManager/executor are online, or that Codex/Claude CLI auth is valid.
+optional ServiceManager/executor chain automation is online, or that
+Codex/Claude CLI auth is valid.
 Reload/open a new editor session after installing or updating plugin assets.
 
 Aming Claw is local-first. The governance DB, backlog, graph snapshots, review
@@ -707,8 +713,9 @@ Use `aming-claw plugin update --check` to fetch the configured Git remote,
 compare the installed checkout with the remote commit, and refresh the local
 plugin update state. Use `aming-claw plugin update --apply` to fast-forward the
 checkout, refresh the Python/Codex install surfaces, and write restart/reload
-obligations for MCP, governance, or ServiceManager when changed files require
-operator action. After completing those restarts/reloads, run
+obligations for MCP, governance, or advanced ServiceManager/chain surfaces when
+changed files require operator action. After completing those restarts/reloads,
+run
 `aming-claw plugin update --check` again to mark the installed commit current.
 
 Plugin update state is intentionally explicit:
@@ -716,7 +723,7 @@ Plugin update state is intentionally explicit:
 - `current` - installed checkout matches the checked remote commit.
 - `available` - a newer remote commit exists; apply when ready.
 - `applied_pending_restart` - files changed that require MCP, governance, or
-  ServiceManager reload before the new runtime is fully in use.
+  advanced ServiceManager/chain reload before the new runtime is fully in use.
 - `failed` - the last update attempt failed and should block MF precommit.
 - missing state - warning only; run `aming-claw plugin update --check` when you
   want a fresh remote comparison.
@@ -761,7 +768,8 @@ Confirm visibility:
 
 - Skills `/aming-claw:aming-claw` and `/aming-claw:aming-claw-launcher` resolve.
 - MCP tool `mcp__aming_claw__health` returns `ok`.
-- `runtime_status` returns aggregated governance + ServiceManager + version_check state.
+- `runtime_status` reports core governance/version state and separates optional
+  chain/ops readiness when ServiceManager/executor are present.
 - MCP resource `aming-claw://self-graph-bundle-manifest` is readable when the
   plugin session needs packaged Aming Claw self-context.
 

@@ -262,6 +262,8 @@ class TestCliPlugin:
         assert "Restart/reload Codex" in result.output
         assert "dashboard_static_assets" in result.output
         assert "ai_cli_openai" in result.output
+        assert "service_manager_health" not in result.output
+        assert "ServiceManager/executor checks are advanced" in result.output
 
     def test_plugin_update_check_json_reports_current(self, tmp_path):
         runner = CliRunner()

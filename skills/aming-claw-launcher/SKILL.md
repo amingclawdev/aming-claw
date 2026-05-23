@@ -29,8 +29,8 @@ Help the user start and verify Aming Claw locally. Default mode is show-the-comm
    exits. If another process owns the port, it reports a conflict. Otherwise it
    runs `start_governance.main` as a long-running foreground service; do not run
    that path as a normal one-shot Codex tool call and wait for it to exit.
-   ServiceManager is started independently;
-   do not let the plugin session spawn executor workers.
+   ServiceManager/executor are advanced chain/ops surfaces and are not part of
+   the V1 first-run path.
 
 3. Confirm health (CLI):
 
@@ -41,13 +41,13 @@ Help the user start and verify Aming Claw locally. Default mode is show-the-comm
 
    Or, when MCP is available, prefer structured probes for a richer snapshot:
 
-   - `runtime_status(project_id="<project_id>")` — governance + ServiceManager + version_check in one call.
+   - `runtime_status(project_id="<project_id>")` - core governance/version state, with optional chain/ops readiness reported separately.
    - `version_check` — HEAD vs CHAIN_VERSION + dirty files.
    - `graph_status` — active graph snapshot + stale check + semantic drift summary.
    - `health` — bare governance ping.
 
 4. Check local AI runtime readiness for the selected project before promising
-   AI Enrich or chain/executor work:
+   AI Enrich work:
 
    - HTTP fallback: `GET /api/projects/{project_id}/ai-config`.
    - Inspect `tool_health.openai`, `tool_health.anthropic`,
@@ -61,8 +61,8 @@ Help the user start and verify Aming Claw locally. Default mode is show-the-comm
      authentication as unknown unless the user explicitly asks for a real check.
    - If the semantic provider/model is unset, report that AI Enrich is blocked
      until AI config is saved for the project.
-   - If ServiceManager or executor is unavailable, report chain/executor as
-     degraded even when local AI CLIs are detected.
+   - Do not report ServiceManager/executor status as part of AI Enrich
+     readiness. Those are advanced chain/ops checks.
 
    Suggested status copy:
 
@@ -71,7 +71,6 @@ Help the user start and verify Aming Claw locally. Default mode is show-the-comm
    Claude CLI: detected at <path>, version <version>, auth unknown.
    Semantic route: <provider/model or unset>.
    AI Enrich: ready / blocked because <reason>.
-   Chain executor: ready / degraded because <reason>.
    ```
 
 5. Open the dashboard:
@@ -106,8 +105,8 @@ Help the user start and verify Aming Claw locally. Default mode is show-the-comm
    `failed to load plugin`, `plugin is not installed`, or invalid marketplace
    paths, run `aming-claw plugin install` and `aming-claw plugin doctor` first;
    do not present reload as the primary fix.
-   Treat ServiceManager/executor offline as degraded runtime, not as dashboard
-   or governance failure.
+   Treat ServiceManager/executor as advanced chain/ops readiness, not as
+   dashboard or governance health.
 
 ## Current Workspace Registration
 
@@ -152,18 +151,18 @@ claims are available.
 | `aming-claw scan --path <dir> --project-id <id>` | Scan an external project into a `.aming-claw` candidate workspace. |
 | `aming-claw start --port 40000 [--workspace <runtime-root>]` | Start governance in the foreground from a separate terminal/window. By default the runtime root is the plugin checkout/package root, not the current target project. |
 | `aming-claw status` | GET `/api/health` against the running governance service. |
-| `aming-claw plugin doctor [--plugin-root <dir>] [--python <python3.9+>]` | Run read-only aftercare checks for plugin assets, generated marketplace, versioned Codex plugin cache, MCP config, Codex config hints, Python runtime, dashboard assets, AI CLI probes, and governance health. |
+| `aming-claw plugin doctor [--plugin-root <dir>] [--python <python3.9+>]` | Run read-only V1 aftercare checks for plugin assets, generated marketplace, versioned Codex plugin cache, MCP config, Codex config hints, Python runtime, dashboard assets, AI CLI probes, and governance health. Add `--check-service-manager` only for advanced chain/ops checks. |
 | `aming-claw open --governance-url <url>` | Open the dashboard in the default browser. |
 | `aming-claw launcher [--open-browser] [--output path]` | Write the launcher HTML artifact. |
 | `aming-claw plugin install <git-url>` | Clone/update a user-local plugin checkout, validate Codex/Claude manifests, optionally pip-install the runtime, install Codex cache/config, and print next steps. |
 | `aming-claw plugin update --check\|--apply [<git-url>]` | Check a Git-backed plugin checkout for updates, apply fast-forward updates, refresh install surfaces, and write local restart/reload obligations. |
 | `aming-claw backlog export\|import --project-id <id>` | Move backlog rows between local machines with portable JSON, dry-run, and explicit conflict handling. |
 | `aming-claw mf precommit-check [--plugin-state <json>]` | Run local manual-fix pre-commit guards, including plugin update/restart state blockers. |
-| `aming-claw run-executor` | Start an executor worker directly. Normally ServiceManager owns this — only use for explicit debugging. |
+| `aming-claw run-executor` | Start an executor worker directly for advanced chain debugging only. Not used by the V1 dashboard/graph/backlog/Review Queue path. |
 
 ## Project-Local Plugin Contract
 
-- MCP server config: `.mcp.json` at the Aming Claw plugin/repo root, stdio entrypoint `python -m agent.mcp.server --project aming-claw --workers 0 --governance-url http://localhost:40000`. Do not copy that file into an external target project; a target-local `.mcp.json` with `--project aming-claw` is install/startup pollution. Plugin sessions keep `--workers 0`; ServiceManager owns executor lifecycle.
+- MCP server config: `.mcp.json` at the Aming Claw plugin/repo root, stdio entrypoint `python -m agent.mcp.server --project aming-claw --workers 0 --governance-url http://localhost:40000`. Do not copy that file into an external target project; a target-local `.mcp.json` with `--project aming-claw` is install/startup pollution. Plugin sessions keep `--workers 0`; V1 semantic jobs are drained by the governance in-process semantic worker.
 - This skill is auto-discovered through the Claude Code plugin manifest at `.claude-plugin/plugin.json`. It is namespaced as `/aming-claw:aming-claw-launcher`. (Note: `CLAUDE.md` at repo root is **workspace** project rules — loaded by Claude Code when the repo is opened as a workspace, not part of plugin context; plugin-time guidance lives in this skill.)
 
 ## Offline / Fresh Install

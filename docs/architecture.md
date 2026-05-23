@@ -48,10 +48,10 @@ graph/backlog/review/reconcile loop.
 - **Local-first operation.** Governance DB, backlog, graph snapshots, review
   queues, plugin update state, and dashboard state live on the user's machine.
   AI features use local `claude` or `codex` CLI routing when configured.
-- **Graceful degradation.** Chain/executor, ServiceManager, gateway, Redis,
-  dbservice, and AI provider availability are separate runtime states. Graph
-  query, backlog, dashboard, and Manual Fix can remain useful when advanced
-  automation is degraded.
+- **V1 core before advanced ops.** Governance, dashboard, MCP graph queries,
+  backlog, Review Queue, and Manual Fix are the stable local path.
+  Chain/executor, ServiceManager, gateway, Redis, dbservice, and AI provider
+  availability are separate advanced or optional runtime states.
 
 ## 3. State Contract
 
@@ -108,7 +108,8 @@ provides:
 - **Review Queue** for human accept/reject of AI-proposed memory or follow-ups
 - **Backlog** as the durable work ledger
 - **Source-controlled hint APIs** for file binding and graph repair
-- **Runtime status** combining health, version, graph, and ServiceManager state
+- **Runtime status** for core governance/version/graph state, with optional
+  chain/ops readiness reported separately when ServiceManager is present
 
 Key implementation areas:
 
@@ -152,11 +153,12 @@ Important stable tools:
 - Backlog: `backlog_list`, `backlog_get`, `backlog_upsert`, `backlog_close`
 - Manual operation support: `task_*`, `observer_mode`, `wf_*`, `node_update`
   where applicable
-- Host/service status: `manager_health`, `governance_redeploy`,
-  `executor_status`, `executor_scale`
 
-MCP does not own long-lived governance or executor lifecycle. It exposes tools
-and delegates service lifecycle to the host process or ServiceManager.
+Advanced chain/ops tools include `manager_health`, `governance_redeploy`,
+`executor_status`, `executor_scale`, and `executor_respawn`. MCP does not own
+long-lived governance or executor lifecycle. It exposes tools and delegates
+service lifecycle to the host process or ServiceManager when those advanced
+flows are in use.
 
 Key files: `agent/mcp/server.py`, `agent/mcp/tools.py`
 
@@ -317,13 +319,14 @@ Keep these states separate:
 - dashboard static assets are present
 - the active workspace is registered/bootstrapped
 - the active graph snapshot is current for the target commit
-- ServiceManager is healthy
-- executor/chain automation is available
 - local AI CLIs are detected and project AI routing is configured
 - self graph bundle compatibility is current for the installed runtime
+- optional advanced chain/ops readiness: ServiceManager is healthy and
+  executor/chain automation is available
 
 `aming-claw start` starts governance. It does not prove plugin reload,
-dashboard asset availability, ServiceManager/executor health, or AI CLI auth.
+dashboard asset availability, optional ServiceManager/executor chain
+automation, or AI CLI auth.
 
 Graph snapshots are commit-bound. When the worktree is dirty, graph query
 results describe the active snapshot commit, not uncommitted files.
