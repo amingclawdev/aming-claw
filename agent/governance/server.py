@@ -14595,6 +14595,28 @@ def handle_task_create(ctx: RequestContext):
                 if _policy:
                     metadata = backlog_runtime.merge_policy_into_metadata(metadata, _policy)
 
+        if not _force_bypass:
+            try:
+                from .parallel_agent_contract import (
+                    ParallelAgentContractError,
+                    validate_parallel_agent_task_gate,
+                )
+
+                with DBContext(project_id) as _contract_conn:
+                    _contract_evidence = validate_parallel_agent_task_gate(
+                        _contract_conn,
+                        project_id,
+                        task_type,
+                        metadata,
+                    )
+                if _contract_evidence:
+                    metadata["parallel_contract_evidence"] = _contract_evidence
+            except ParallelAgentContractError as exc:
+                _msg = str(exc)
+                log.warning("parallel_contract_gate: %s (mode=%s)", _msg, _enforce_mode)
+                if _enforce_mode == "strict":
+                    raise GovernanceError("parallel_contract_invalid", _msg, status=422)
+
         # R1: parent_task_id requirement for non-pm code-change types
         _PARENT_REQUIRED_TYPES = ("dev", "test", "qa", "gatekeeper", "merge", "deploy")
         if task_type in _PARENT_REQUIRED_TYPES and not _force_bypass:

@@ -400,7 +400,7 @@ def test_grep_verify_parent_task_id_not_found_in_server() -> None:
 def test_grep_verify_bug_status_check_in_server() -> None:
     server_py = Path(__file__).resolve().parents[1] / "governance" / "server.py"
     content = server_py.read_text(encoding="utf-8")
-    assert "is not OPEN (current status=" in content
+    assert "is not active (current status=" in content
 
 
 def test_grep_verify_force_reason_length_in_server() -> None:
