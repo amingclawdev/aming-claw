@@ -10,6 +10,7 @@ import type {
   OperationsQueueResponse,
   ProjectionResponse,
   StatusResponse,
+  TaskTimelineResponse,
 } from "../types";
 
 const DEFAULT_PROJECT_ID = (import.meta.env.VITE_PROJECT_ID as string | undefined) || "aming-claw";
@@ -42,6 +43,13 @@ function backlogListQuery(): string {
     limit: "200",
     offset: "0",
     include_closed: "true",
+  }).toString();
+}
+
+function backlogTimelineQuery(backlogId: string, limit: number): string {
+  return new URLSearchParams({
+    backlog_id: backlogId,
+    limit: String(limit),
   }).toString();
 }
 
@@ -223,6 +231,10 @@ export const api = {
   },
   backlogFor(projectId: string, signal?: AbortSignal) {
     return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}?${backlogListQuery()}`, signal);
+  },
+  taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
+    const q = backlogTimelineQuery(backlogId, limit);
+    return getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
   },
   snapshotFiles(
     snapshotId: string,

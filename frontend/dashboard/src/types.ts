@@ -437,6 +437,45 @@ export interface BacklogBug {
   compact?: boolean;
 }
 
+export interface TaskTimelineResponse {
+  ok?: boolean;
+  project_id: string;
+  task_id?: string;
+  backlog_id: string;
+  trace_id?: string;
+  events: TaskTimelineEvent[];
+  count: number;
+  request_id?: string;
+}
+
+export interface TaskTimelineEvent {
+  id?: number;
+  event_id?: string;
+  project_id?: string;
+  backlog_id?: string;
+  mf_id?: string;
+  task_id?: string;
+  attempt_num?: number;
+  event_type: string;
+  actor?: string;
+  status?: string;
+  payload?: Record<string, unknown>;
+  verification?: TaskTimelineVerification | Record<string, unknown>;
+  artifact_refs?: Record<string, unknown>;
+  trace_id?: string;
+  commit_sha?: string;
+  created_at?: string;
+}
+
+export interface TaskTimelineVerification {
+  passed?: boolean;
+  status?: string;
+  warnings?: string[];
+  errors?: string[];
+  checks?: Record<string, boolean>;
+  [key: string]: unknown;
+}
+
 export interface FileInventoryRow {
   path: string;
   file_kind?: string;

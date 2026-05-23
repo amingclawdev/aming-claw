@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import type { BacklogBug, BacklogResponse, FileInventoryRow, NodeRecord } from "../types";
+import type { BacklogBug, BacklogResponse, FileInventoryRow, NodeRecord, TaskTimelineEvent } from "../types";
 
 interface Props {
   backlog: BacklogResponse;
@@ -28,6 +28,15 @@ interface AttachResult {
   message: string;
 }
 
+interface TimelineState {
+  expanded: boolean;
+  loading: boolean;
+  loaded: boolean;
+  error: string;
+  events: TaskTimelineEvent[];
+  count?: number;
+}
+
 export default function BacklogView({ backlog, projectId, snapshotId, nodes }: Props) {
   const bugs = backlog.bugs ?? [];
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("OPEN");
@@ -38,6 +47,7 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
   const [filesError, setFilesError] = useState("");
   const [drafts, setDrafts] = useState<Record<string, AttachDraft>>({});
   const [attachResults, setAttachResults] = useState<Record<string, AttachResult>>({});
+  const [timelineByBug, setTimelineByBug] = useState<Record<string, TimelineState>>({});
 
   const stats = useMemo(() => {
     if (backlog.summary) {
@@ -110,6 +120,10 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
   const pageNote = backlog.has_more ? ` · next offset ${backlog.next_offset ?? rows.length}` : "";
 
   useEffect(() => {
+    setTimelineByBug({});
+  }, [projectId]);
+
+  useEffect(() => {
     if (!snapshotId) return;
     const ac = new AbortController();
     setFilesLoading(true);
@@ -128,6 +142,69 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
       });
     return () => ac.abort();
   }, [snapshotId, projectId]);
+
+  const toggleTimeline = (bugId: string) => {
+    const current = timelineByBug[bugId];
+    if (current?.expanded) {
+      setTimelineByBug((states) => ({
+        ...states,
+        [bugId]: { ...states[bugId], expanded: false },
+      }));
+      return;
+    }
+
+    setTimelineByBug((states) => {
+      const existing = states[bugId];
+      return {
+        ...states,
+        [bugId]: {
+          expanded: true,
+          loading: existing?.loaded ? false : true,
+          loaded: existing?.loaded ?? false,
+          error: "",
+          events: existing?.events ?? [],
+          count: existing?.count,
+        },
+      };
+    });
+
+    if (current?.loaded || current?.loading) return;
+
+    api.taskTimelineFor(projectId, bugId, 50)
+      .then((res) => {
+        setTimelineByBug((states) => {
+          const existing = states[bugId];
+          return {
+            ...states,
+            [bugId]: {
+              expanded: existing?.expanded ?? true,
+              loading: false,
+              loaded: true,
+              error: "",
+              events: res.events ?? [],
+              count: res.count,
+            },
+          };
+        });
+      })
+      .catch((error) => {
+        const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
+        setTimelineByBug((states) => {
+          const existing = states[bugId];
+          return {
+            ...states,
+            [bugId]: {
+              expanded: existing?.expanded ?? true,
+              loading: false,
+              loaded: true,
+              error: msg,
+              events: existing?.events ?? [],
+              count: existing?.count,
+            },
+          };
+        });
+      });
+  };
 
   const updateDraft = (path: string, patch: Partial<AttachDraft>) => {
     setDrafts((current) => {
@@ -361,7 +438,12 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
               </thead>
               <tbody>
                 {rows.map((bug) => (
-                  <BacklogRow key={bug.bug_id} bug={bug} />
+                  <BacklogRow
+                    key={bug.bug_id}
+                    bug={bug}
+                    timeline={timelineByBug[bug.bug_id]}
+                    onToggleTimeline={() => toggleTimeline(bug.bug_id)}
+                  />
                 ))}
               </tbody>
             </table>
@@ -372,59 +454,208 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
   );
 }
 
-function BacklogRow({ bug }: { bug: BacklogBug }) {
+function BacklogRow({
+  bug,
+  timeline,
+  onToggleTimeline,
+}: {
+  bug: BacklogBug;
+  timeline?: TimelineState;
+  onToggleTimeline: () => void;
+}) {
   const files = listFrom(bug.target_files);
   const criteria = listFrom(bug.acceptance_criteria);
   const runtime = bug.runtime_state || bug.chain_stage || bug.mf_type || "idle";
   return (
-    <tr>
-      <td>
-        <span className={`backlog-priority tone-${priorityTone(bug.priority)}`}>
-          {normalizePriority(bug.priority)}
-        </span>
-      </td>
-      <td>
-        <span className={`status-badge ${statusClass(bug.status)}`}>
-          {normalizeStatus(bug.status)}
-        </span>
-      </td>
-      <td className="backlog-title-cell">
-        <div className="cell-strong">{bug.title || bug.bug_id}</div>
-        <div className="cell-mono-id">{bug.bug_id}</div>
-        {bug.details_md ? <div className="backlog-details">{truncate(bug.details_md, 220)}</div> : null}
-        {criteria.length > 0 ? (
-          <div className="backlog-criteria">
-            {criteria.slice(0, 2).map((item) => (
-              <span key={item}>{item}</span>
-            ))}
-            {criteria.length > 2 ? <em>+{criteria.length - 2}</em> : null}
-          </div>
-        ) : null}
-      </td>
-      <td>
-        {files.length > 0 ? (
-          <div className="backlog-file-list">
-            {files.slice(0, 4).map((file) => (
-              <span className="mono" key={file} title={file}>
-                {file}
-              </span>
-            ))}
-            {files.length > 4 ? <em>+{files.length - 4} more</em> : null}
-          </div>
-        ) : (
-          <span className="muted">No target files</span>
-        )}
-      </td>
-      <td>
-        <div className="mono">{runtime}</div>
-        {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
-        {bug.worktree_branch ? <div className="backlog-commit mono">{bug.worktree_branch}</div> : null}
-      </td>
-      <td>
-        <span className="mono">{shortDate(bug.updated_at || bug.created_at || bug.fixed_at)}</span>
-      </td>
-    </tr>
+    <>
+      <tr>
+        <td>
+          <span className={`backlog-priority tone-${priorityTone(bug.priority)}`}>
+            {normalizePriority(bug.priority)}
+          </span>
+        </td>
+        <td>
+          <span className={`status-badge ${statusClass(bug.status)}`}>
+            {normalizeStatus(bug.status)}
+          </span>
+        </td>
+        <td className="backlog-title-cell">
+          <div className="cell-strong">{bug.title || bug.bug_id}</div>
+          <div className="cell-mono-id">{bug.bug_id}</div>
+          <button
+            type="button"
+            className={`timeline-toggle ${timeline?.expanded ? "on" : "off"}`}
+            onClick={onToggleTimeline}
+            aria-expanded={timeline?.expanded ?? false}
+          >
+            {timeline?.expanded ? "Hide evidence" : "Show evidence"}
+            {timeline?.loaded && !timeline.error ? (
+              <span className="timeline-toggle-count">{timeline.count ?? timeline.events.length}</span>
+            ) : null}
+          </button>
+          {bug.details_md ? <div className="backlog-details">{truncate(bug.details_md, 220)}</div> : null}
+          {criteria.length > 0 ? (
+            <div className="backlog-criteria">
+              {criteria.slice(0, 2).map((item) => (
+                <span key={item}>{item}</span>
+              ))}
+              {criteria.length > 2 ? <em>+{criteria.length - 2}</em> : null}
+            </div>
+          ) : null}
+        </td>
+        <td>
+          {files.length > 0 ? (
+            <div className="backlog-file-list">
+              {files.slice(0, 4).map((file) => (
+                <span className="mono" key={file} title={file}>
+                  {file}
+                </span>
+              ))}
+              {files.length > 4 ? <em>+{files.length - 4} more</em> : null}
+            </div>
+          ) : (
+            <span className="muted">No target files</span>
+          )}
+        </td>
+        <td>
+          <div className="mono">{runtime}</div>
+          {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
+          {bug.worktree_branch ? <div className="backlog-commit mono">{bug.worktree_branch}</div> : null}
+        </td>
+        <td>
+          <span className="mono">{shortDate(bug.updated_at || bug.created_at || bug.fixed_at)}</span>
+        </td>
+      </tr>
+      {timeline?.expanded ? (
+        <tr className="backlog-timeline-row">
+          <td colSpan={6}>
+            <TimelinePanel timeline={timeline} backlogId={bug.bug_id} />
+          </td>
+        </tr>
+      ) : null}
+    </>
   );
+}
+
+function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backlogId: string }) {
+  const count = timeline.count ?? timeline.events.length;
+  return (
+    <div className="backlog-timeline-panel">
+      <div className="backlog-timeline-head">
+        <span>Execution evidence</span>
+        <span className="mono">
+          {backlogId} · {count} event{count === 1 ? "" : "s"}
+        </span>
+      </div>
+      {timeline.loading ? <div className="timeline-empty">Loading timeline...</div> : null}
+      {timeline.error ? <div className="timeline-empty timeline-error">Timeline load failed: {timeline.error}</div> : null}
+      {!timeline.loading && !timeline.error && timeline.events.length === 0 ? (
+        <div className="timeline-empty">No execution events linked to this backlog row.</div>
+      ) : null}
+      {!timeline.loading && !timeline.error && timeline.events.length > 0 ? (
+        <div className="backlog-timeline-list">
+          {timeline.events.map((event, index) => (
+            <div className="backlog-timeline-event" key={timelineEventKey(event, index)}>
+              <div className="backlog-timeline-meta">
+                <span className={`status-badge ${statusClass(event.status || event.event_type)}`}>
+                  {event.status || event.event_type || "event"}
+                </span>
+                <span className="mono">{event.event_type || "unknown_event"}</span>
+                <span className="mono">{shortDateTime(event.created_at)}</span>
+                <span>{event.actor || "actor unknown"}</span>
+                <span className="mono">event {timelineEventId(event)}</span>
+              </div>
+              <div className="backlog-timeline-facts">
+                <span>{formatVerification(event.verification)}</span>
+                <span>{formatArtifactRefs(event.artifact_refs)}</span>
+                {event.task_id ? <span className="mono">task {event.task_id}</span> : null}
+                {event.attempt_num ? <span className="mono">attempt {event.attempt_num}</span> : null}
+                {event.commit_sha ? <span className="mono">commit {shortCommit(event.commit_sha)}</span> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function timelineEventKey(event: TaskTimelineEvent, index: number): string {
+  return String(event.event_id || event.id || event.trace_id || `${event.event_type}-${index}`);
+}
+
+function timelineEventId(event: TaskTimelineEvent): string {
+  if (event.event_id) return event.event_id;
+  if (event.id != null) return `#${event.id}`;
+  return event.trace_id || "n/a";
+}
+
+function formatVerification(value?: TaskTimelineEvent["verification"]): string {
+  const record = asRecord(value);
+  const keys = Object.keys(record);
+  if (keys.length === 0) return "verification: none";
+
+  const parts: string[] = [];
+  if (typeof record.passed === "boolean") parts.push(record.passed ? "passed" : "failed");
+  if (typeof record.status === "string" && record.status) parts.push(record.status);
+  const warnings = listUnknown(record.warnings);
+  const errors = listUnknown(record.errors);
+  if (errors.length > 0) parts.push(`${errors.length} error${errors.length === 1 ? "" : "s"}`);
+  if (warnings.length > 0) parts.push(`${warnings.length} warning${warnings.length === 1 ? "" : "s"}`);
+
+  const checks = asRecord(record.checks);
+  const checkValues = Object.values(checks).filter((item): item is boolean => typeof item === "boolean");
+  if (checkValues.length > 0) {
+    const passed = checkValues.filter(Boolean).length;
+    parts.push(`${passed}/${checkValues.length} checks`);
+  }
+
+  return `verification: ${parts.length > 0 ? stableUnique(parts).join(" | ") : keys.slice(0, 3).join(", ")}`;
+}
+
+function formatArtifactRefs(value?: Record<string, unknown>): string {
+  const record = asRecord(value);
+  const entries = Object.entries(record);
+  if (entries.length === 0) return "artifacts: none";
+  const summary = entries
+    .slice(0, 3)
+    .map(([key, item]) => `${key}: ${compactUnknown(item)}`)
+    .join(" | ");
+  return `artifacts: ${summary}${entries.length > 3 ? ` | +${entries.length - 3}` : ""}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function listUnknown(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === "") return [];
+  return [value];
+}
+
+function compactUnknown(value: unknown): string {
+  if (value == null || value === "") return "empty";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "[]";
+    return value.slice(0, 2).map(compactUnknown).join(", ");
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return keys.length === 0 ? "{}" : keys.slice(0, 3).join(", ");
+  }
+  return String(value);
+}
+
+function stableUnique(values: string[]): string[] {
+  return values.filter((value, index) => values.indexOf(value) === index);
+}
+
+function shortDateTime(value?: string): string {
+  if (!value) return "-";
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return value.slice(0, 16) || "-";
+  return `${new Date(time).toISOString().replace("T", " ").slice(0, 16)}Z`;
 }
 
 function Kpi({

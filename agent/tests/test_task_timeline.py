@@ -21,6 +21,21 @@ def _conn(tmp_dir):
     return get_connection("proj")
 
 
+def _ctx(query):
+    from agent.governance import server
+
+    return server.RequestContext(
+        None,
+        "GET",
+        {"project_id": "proj"},
+        query,
+        {},
+        "req-test",
+        "",
+        "",
+    )
+
+
 class TestTaskTimeline(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -120,6 +135,97 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(gate_event["status"], "passed")
         self.assertTrue(gate_event["verification"]["passed"])
         self.assertEqual(gate_event["backlog_id"], "BUG-TL")
+
+    def test_list_events_filters_by_backlog_id_without_task_id(self):
+        from agent.governance import task_timeline
+
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-a",
+            backlog_id="BUG-A",
+            event_type="task.started",
+            actor="worker-a",
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-b",
+            backlog_id="BUG-A",
+            event_type="task.completed",
+            actor="worker-b",
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-c",
+            backlog_id="BUG-B",
+            event_type="task.completed",
+            actor="worker-c",
+        )
+
+        events = task_timeline.list_events(self.conn, "proj", backlog_id="BUG-A")
+
+        self.assertEqual([event["task_id"] for event in events], ["task-a", "task-b"])
+        self.assertEqual({event["backlog_id"] for event in events}, {"BUG-A"})
+
+    def test_task_timeline_list_handler_filters_by_backlog_id_query(self):
+        from agent.governance import server, task_timeline
+
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-a",
+            backlog_id="BUG-A",
+            event_type="task.started",
+            actor="worker-a",
+            trace_id="trace-a",
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-b",
+            backlog_id="BUG-A",
+            event_type="task.completed",
+            actor="worker-b",
+            trace_id="trace-b",
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            task_id="task-c",
+            backlog_id="BUG-B",
+            event_type="task.completed",
+            actor="worker-c",
+            trace_id="trace-c",
+        )
+        self.conn.commit()
+
+        result = server.handle_task_timeline_list(_ctx({"backlog_id": "BUG-A"}))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["project_id"], "proj")
+        self.assertEqual(result["task_id"], "")
+        self.assertEqual(result["backlog_id"], "BUG-A")
+        self.assertEqual(result["trace_id"], "")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(
+            [event["task_id"] for event in result["events"]],
+            ["task-a", "task-b"],
+        )
+
+        filtered = server.handle_task_timeline_list(
+            _ctx({
+                "backlog_id": "BUG-A",
+                "task_id": "task-b",
+                "trace_id": "trace-b",
+                "limit": ["5"],
+            })
+        )
+        self.assertEqual(filtered["task_id"], "task-b")
+        self.assertEqual(filtered["trace_id"], "trace-b")
+        self.assertEqual(filtered["count"], 1)
+        self.assertEqual(filtered["events"][0]["task_id"], "task-b")
 
 
 if __name__ == "__main__":

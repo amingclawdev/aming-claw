@@ -15092,6 +15092,39 @@ def handle_task_timeline_append(ctx: RequestContext):
         )
 
 
+@route("GET", "/api/task/{project_id}/timeline")
+def handle_task_timeline_list(ctx: RequestContext):
+    """List append-only task implementation timeline events by query filters."""
+    project_id = ctx.get_project_id()
+    task_id = _first_query_value(ctx.query, "task_id")
+    backlog_id = _first_query_value(ctx.query, "backlog_id")
+    trace_id = _first_query_value(ctx.query, "trace_id")
+    try:
+        limit = int(_first_query_value(ctx.query, "limit", "200") or "200")
+    except (TypeError, ValueError):
+        limit = 200
+    from . import task_timeline
+
+    with DBContext(project_id) as conn:
+        events = task_timeline.list_events(
+            conn,
+            project_id,
+            task_id=task_id,
+            backlog_id=backlog_id,
+            trace_id=trace_id,
+            limit=limit,
+        )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "task_id": task_id,
+        "backlog_id": backlog_id,
+        "trace_id": trace_id,
+        "events": events,
+        "count": len(events),
+    }
+
+
 @route("GET", "/api/task/{project_id}/{task_id}/timeline")
 def handle_task_timeline_get(ctx: RequestContext):
     """List append-only task implementation timeline events."""
