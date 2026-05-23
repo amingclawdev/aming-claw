@@ -28,6 +28,14 @@ CREATE TABLE IF NOT EXISTS task_timeline_events (
     task_id              TEXT NOT NULL DEFAULT '',
     attempt_num          INTEGER NOT NULL DEFAULT 0,
     event_type           TEXT NOT NULL,
+    phase                TEXT NOT NULL DEFAULT '',
+    event_kind           TEXT NOT NULL DEFAULT '',
+    scenario_id          TEXT NOT NULL DEFAULT '',
+    parent_event_id      INTEGER NOT NULL DEFAULT 0,
+    correlation_id       TEXT NOT NULL DEFAULT '',
+    severity             TEXT NOT NULL DEFAULT '',
+    decision             TEXT NOT NULL DEFAULT '',
+    schema_version       INTEGER NOT NULL DEFAULT 2,
     actor                TEXT NOT NULL DEFAULT '',
     status               TEXT NOT NULL DEFAULT '',
     payload_json         TEXT NOT NULL DEFAULT '{}',
@@ -37,17 +45,53 @@ CREATE TABLE IF NOT EXISTS task_timeline_events (
     commit_sha           TEXT NOT NULL DEFAULT '',
     created_at           TEXT NOT NULL
 );
+"""
+
+INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_task_timeline_task
     ON task_timeline_events(project_id, task_id, attempt_num, id);
 CREATE INDEX IF NOT EXISTS idx_task_timeline_backlog
     ON task_timeline_events(project_id, backlog_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_timeline_trace
     ON task_timeline_events(project_id, trace_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_scenario
+    ON task_timeline_events(project_id, scenario_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_correlation
+    ON task_timeline_events(project_id, correlation_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_timeline_kind
+    ON task_timeline_events(project_id, event_kind, phase, id);
 """
+
+TIMELINE_SCHEMA_VERSION = 2
+
+_V2_COLUMNS = {
+    "phase": "TEXT NOT NULL DEFAULT ''",
+    "event_kind": "TEXT NOT NULL DEFAULT ''",
+    "scenario_id": "TEXT NOT NULL DEFAULT ''",
+    "parent_event_id": "INTEGER NOT NULL DEFAULT 0",
+    "correlation_id": "TEXT NOT NULL DEFAULT ''",
+    "severity": "TEXT NOT NULL DEFAULT ''",
+    "decision": "TEXT NOT NULL DEFAULT ''",
+    "schema_version": f"INTEGER NOT NULL DEFAULT {TIMELINE_SCHEMA_VERSION}",
+}
+
+MF_TEST_SCENARIO_POLICIES = {
+    "none",
+    "reuse_existing",
+    "new_scenario_required",
+}
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
+    existing = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(task_timeline_events)").fetchall()
+    }
+    for column, ddl in _V2_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE task_timeline_events ADD COLUMN {column} {ddl}")
+    conn.executescript(INDEX_SQL)
 
 
 def _utc_iso() -> str:
@@ -63,6 +107,28 @@ def _json(value: Any, default: Any) -> str:
         return json.dumps({"unserializable": repr(value)}, ensure_ascii=False)
 
 
+def _text(value: Any) -> str:
+    return str(value or "")
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    if isinstance(value, tuple):
+        return [str(item) for item in value if str(item or "").strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _scenario_spec(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("test_scenario_spec", "test_scenario", "scenario"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, Any]:
     from .db import sqlite_write_lock
 
@@ -71,31 +137,45 @@ def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, 
         cur = conn.execute(
             """INSERT INTO task_timeline_events
                (project_id, backlog_id, mf_id, task_id, attempt_num, event_type,
-                actor, status, payload_json, verification_json,
-                artifact_refs_json, trace_id, commit_sha, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                phase, event_kind, scenario_id, parent_event_id, correlation_id,
+                severity, decision, schema_version, actor, status, payload_json,
+                verification_json, artifact_refs_json, trace_id, commit_sha, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                event.get("project_id", ""),
-                event.get("backlog_id", ""),
-                event.get("mf_id", ""),
-                event.get("task_id", ""),
+                _text(event.get("project_id")),
+                _text(event.get("backlog_id")),
+                _text(event.get("mf_id")),
+                _text(event.get("task_id")),
                 int(event.get("attempt_num") or 0),
-                event.get("event_type", ""),
-                event.get("actor", ""),
-                event.get("status", ""),
+                _text(event.get("event_type")),
+                _text(event.get("phase")),
+                _text(event.get("event_kind")),
+                _text(event.get("scenario_id")),
+                int(event.get("parent_event_id") or 0),
+                _text(event.get("correlation_id")),
+                _text(event.get("severity")),
+                _text(event.get("decision")),
+                int(event.get("schema_version") or TIMELINE_SCHEMA_VERSION),
+                _text(event.get("actor")),
+                _text(event.get("status")),
                 _json(event.get("payload"), {}),
                 _json(event.get("verification"), {}),
                 _json(event.get("artifact_refs"), {}),
-                event.get("trace_id", ""),
-                event.get("commit_sha", ""),
+                _text(event.get("trace_id")),
+                _text(event.get("commit_sha")),
                 created_at,
             ),
         )
     return {
         "id": cur.lastrowid,
-        "project_id": event.get("project_id", ""),
-        "task_id": event.get("task_id", ""),
-        "event_type": event.get("event_type", ""),
+        "project_id": _text(event.get("project_id")),
+        "task_id": _text(event.get("task_id")),
+        "event_type": _text(event.get("event_type")),
+        "phase": _text(event.get("phase")),
+        "event_kind": _text(event.get("event_kind")),
+        "scenario_id": _text(event.get("scenario_id")),
+        "correlation_id": _text(event.get("correlation_id")),
+        "schema_version": int(event.get("schema_version") or TIMELINE_SCHEMA_VERSION),
         "created_at": created_at,
     }
 
@@ -109,6 +189,14 @@ def record_event(
     backlog_id: str = "",
     mf_id: str = "",
     attempt_num: int = 0,
+    phase: str = "",
+    event_kind: str = "",
+    scenario_id: str = "",
+    parent_event_id: int = 0,
+    correlation_id: str = "",
+    severity: str = "",
+    decision: str = "",
+    schema_version: int = TIMELINE_SCHEMA_VERSION,
     actor: str = "",
     status: str = "",
     payload: dict[str, Any] | None = None,
@@ -130,6 +218,14 @@ def record_event(
             "task_id": task_id,
             "attempt_num": attempt_num,
             "event_type": event_type,
+            "phase": phase,
+            "event_kind": event_kind,
+            "scenario_id": scenario_id,
+            "parent_event_id": parent_event_id,
+            "correlation_id": correlation_id,
+            "severity": severity,
+            "decision": decision,
+            "schema_version": schema_version,
             "actor": actor,
             "status": status,
             "payload": payload or {},
@@ -207,6 +303,14 @@ def enqueue_event(
     backlog_id: str = "",
     mf_id: str = "",
     attempt_num: int = 0,
+    phase: str = "",
+    event_kind: str = "",
+    scenario_id: str = "",
+    parent_event_id: int = 0,
+    correlation_id: str = "",
+    severity: str = "",
+    decision: str = "",
+    schema_version: int = TIMELINE_SCHEMA_VERSION,
     actor: str = "",
     status: str = "",
     payload: dict[str, Any] | None = None,
@@ -230,6 +334,14 @@ def enqueue_event(
             "task_id": task_id,
             "attempt_num": attempt_num,
             "event_type": event_type,
+            "phase": phase,
+            "event_kind": event_kind,
+            "scenario_id": scenario_id,
+            "parent_event_id": parent_event_id,
+            "correlation_id": correlation_id,
+            "severity": severity,
+            "decision": decision,
+            "schema_version": schema_version,
             "actor": actor,
             "status": status,
             "payload": payload or {},
@@ -295,6 +407,72 @@ def completion_verification(status: str, result: dict[str, Any] | None) -> dict[
     }
 
 
+def mf_test_scenario_verification(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate the MF test-scenario decision shape.
+
+    MF work can choose no new test, reuse an existing scenario, or require a new
+    scenario. The helper does not judge coverage quality; it makes the decision
+    explicit enough for later gates and observers to inspect.
+    """
+
+    payload = payload if isinstance(payload, dict) else {}
+    policy = str(payload.get("test_scenario_policy") or "").strip()
+    verification_notes = _string_list(payload.get("verification_notes"))
+    tests_run = _string_list(payload.get("tests_run"))
+    scenario_id = str(payload.get("scenario_id") or "").strip()
+    scenario = _scenario_spec(payload)
+    if not scenario_id and scenario:
+        scenario_id = str(scenario.get("id") or "").strip()
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if policy not in MF_TEST_SCENARIO_POLICIES:
+        errors.append(
+            "test_scenario_policy must be one of: "
+            + ", ".join(sorted(MF_TEST_SCENARIO_POLICIES))
+        )
+    elif policy == "none":
+        if not verification_notes and not tests_run:
+            errors.append("policy=none requires verification_notes or tests_run explaining why no scenario is needed")
+    elif policy == "reuse_existing":
+        if not scenario_id and not tests_run and not verification_notes:
+            errors.append("policy=reuse_existing requires scenario_id, tests_run, or verification_notes")
+    elif policy == "new_scenario_required":
+        steps = _string_list(scenario.get("steps")) if scenario else []
+        expected = _string_list(scenario.get("expected")) if scenario else []
+        if not scenario:
+            errors.append("policy=new_scenario_required requires test_scenario_spec")
+        else:
+            if not steps:
+                errors.append("test_scenario_spec.steps must be non-empty")
+            if not expected:
+                errors.append("test_scenario_spec.expected must be non-empty")
+        if not scenario_id:
+            warnings.append("test_scenario_spec.id missing")
+
+    has_new_scenario_spec = bool(
+        scenario
+        and _string_list(scenario.get("steps"))
+        and _string_list(scenario.get("expected"))
+    )
+    return {
+        "passed": not errors,
+        "status": "passed" if not errors else "failed",
+        "policy": policy,
+        "scenario_id": scenario_id,
+        "warnings": warnings,
+        "errors": errors,
+        "checks": {
+            "has_explicit_policy": policy in MF_TEST_SCENARIO_POLICIES,
+            "has_verification_notes": bool(verification_notes),
+            "has_tests_run": bool(tests_run),
+            "has_scenario_id": bool(scenario_id),
+            "has_new_scenario_spec": has_new_scenario_spec,
+        },
+    }
+
+
 def synthetic_failure_envelope(
     *,
     failure_class: str,
@@ -328,6 +506,13 @@ def list_events(
     task_id: str = "",
     backlog_id: str = "",
     trace_id: str = "",
+    phase: str = "",
+    event_kind: str = "",
+    scenario_id: str = "",
+    correlation_id: str = "",
+    severity: str = "",
+    decision: str = "",
+    parent_event_id: int = 0,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
     ensure_schema(conn)
@@ -342,6 +527,27 @@ def list_events(
     if trace_id:
         clauses.append("trace_id = ?")
         params.append(trace_id)
+    if phase:
+        clauses.append("phase = ?")
+        params.append(phase)
+    if event_kind:
+        clauses.append("event_kind = ?")
+        params.append(event_kind)
+    if scenario_id:
+        clauses.append("scenario_id = ?")
+        params.append(scenario_id)
+    if correlation_id:
+        clauses.append("correlation_id = ?")
+        params.append(correlation_id)
+    if severity:
+        clauses.append("severity = ?")
+        params.append(severity)
+    if decision:
+        clauses.append("decision = ?")
+        params.append(decision)
+    if parent_event_id:
+        clauses.append("parent_event_id = ?")
+        params.append(int(parent_event_id))
     params.append(max(1, min(int(limit or 200), 1000)))
     rows = conn.execute(
         f"""SELECT * FROM task_timeline_events

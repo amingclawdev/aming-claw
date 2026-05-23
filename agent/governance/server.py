@@ -15082,6 +15082,14 @@ def handle_task_timeline_append(ctx: RequestContext):
             mf_id=ctx.body.get("mf_id", ""),
             attempt_num=int(ctx.body.get("attempt_num", 0) or 0),
             event_type=ctx.body.get("event_type", ""),
+            phase=ctx.body.get("phase", ""),
+            event_kind=ctx.body.get("event_kind", ""),
+            scenario_id=ctx.body.get("scenario_id", ""),
+            parent_event_id=_query_int(ctx.body, "parent_event_id", 0),
+            correlation_id=ctx.body.get("correlation_id", ""),
+            severity=ctx.body.get("severity", ""),
+            decision=ctx.body.get("decision", ""),
+            schema_version=_query_int(ctx.body, "schema_version", 2),
             actor=ctx.body.get("actor", ""),
             status=ctx.body.get("status", ""),
             payload=ctx.body.get("payload") or {},
@@ -15099,6 +15107,16 @@ def handle_task_timeline_list(ctx: RequestContext):
     task_id = _first_query_value(ctx.query, "task_id")
     backlog_id = _first_query_value(ctx.query, "backlog_id")
     trace_id = _first_query_value(ctx.query, "trace_id")
+    phase = _first_query_value(ctx.query, "phase")
+    event_kind = _first_query_value(ctx.query, "event_kind")
+    scenario_id = _first_query_value(ctx.query, "scenario_id")
+    correlation_id = _first_query_value(ctx.query, "correlation_id")
+    severity = _first_query_value(ctx.query, "severity")
+    decision = _first_query_value(ctx.query, "decision")
+    try:
+        parent_event_id = int(_first_query_value(ctx.query, "parent_event_id", "0") or "0")
+    except (TypeError, ValueError):
+        parent_event_id = 0
     try:
         limit = int(_first_query_value(ctx.query, "limit", "200") or "200")
     except (TypeError, ValueError):
@@ -15112,6 +15130,13 @@ def handle_task_timeline_list(ctx: RequestContext):
             task_id=task_id,
             backlog_id=backlog_id,
             trace_id=trace_id,
+            phase=phase,
+            event_kind=event_kind,
+            scenario_id=scenario_id,
+            correlation_id=correlation_id,
+            severity=severity,
+            decision=decision,
+            parent_event_id=parent_event_id,
             limit=limit,
         )
     return {
@@ -15120,6 +15145,13 @@ def handle_task_timeline_list(ctx: RequestContext):
         "task_id": task_id,
         "backlog_id": backlog_id,
         "trace_id": trace_id,
+        "phase": phase,
+        "event_kind": event_kind,
+        "scenario_id": scenario_id,
+        "correlation_id": correlation_id,
+        "severity": severity,
+        "decision": decision,
+        "parent_event_id": parent_event_id,
         "events": events,
         "count": len(events),
     }
@@ -15130,6 +15162,14 @@ def handle_task_timeline_get(ctx: RequestContext):
     """List append-only task implementation timeline events."""
     project_id = ctx.get_project_id()
     task_id = ctx.path_params.get("task_id", "")
+    try:
+        parent_event_id = int(_first_query_value(ctx.query, "parent_event_id", "0") or "0")
+    except (TypeError, ValueError):
+        parent_event_id = 0
+    try:
+        limit = int(_first_query_value(ctx.query, "limit", "200") or "200")
+    except (TypeError, ValueError):
+        limit = 200
     from . import task_timeline
 
     with DBContext(project_id) as conn:
@@ -15137,9 +15177,16 @@ def handle_task_timeline_get(ctx: RequestContext):
             conn,
             project_id,
             task_id=task_id,
-            backlog_id=ctx.query.get("backlog_id", ""),
-            trace_id=ctx.query.get("trace_id", ""),
-            limit=int(ctx.query.get("limit", "200")),
+            backlog_id=_first_query_value(ctx.query, "backlog_id"),
+            trace_id=_first_query_value(ctx.query, "trace_id"),
+            phase=_first_query_value(ctx.query, "phase"),
+            event_kind=_first_query_value(ctx.query, "event_kind"),
+            scenario_id=_first_query_value(ctx.query, "scenario_id"),
+            correlation_id=_first_query_value(ctx.query, "correlation_id"),
+            severity=_first_query_value(ctx.query, "severity"),
+            decision=_first_query_value(ctx.query, "decision"),
+            parent_event_id=parent_event_id,
+            limit=limit,
         )
     return {"task_id": task_id, "events": events, "count": len(events)}
 

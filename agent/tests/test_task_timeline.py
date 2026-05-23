@@ -1,6 +1,7 @@
 """Tests for task implementation timeline evidence."""
 
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -169,6 +170,201 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual([event["task_id"] for event in events], ["task-a", "task-b"])
         self.assertEqual({event["backlog_id"] for event in events}, {"BUG-A"})
 
+    def test_mf_process_timeline_records_queryable_test_scenario_decision(self):
+        from agent.governance import task_timeline
+
+        verification = task_timeline.mf_test_scenario_verification({
+            "test_scenario_policy": "new_scenario_required",
+            "test_scenario_spec": {
+                "id": "scn-mf-timeline",
+                "name": "MF timeline schema scenario",
+                "steps": [
+                    "record the observer scenario decision",
+                    "record the implementation/gate result against the same scenario",
+                ],
+                "expected": [
+                    "timeline rows are queryable by scenario and correlation",
+                    "gate evidence keeps a parent pointer to the scenario decision",
+                ],
+            },
+            "verification_notes": ["scenario was designed before implementation"],
+        })
+        self.assertTrue(verification["passed"], verification)
+
+        scenario_event = task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF",
+            mf_id="MF-20260523",
+            task_id="task-mf",
+            attempt_num=1,
+            event_type="mf.test_scenario.decision",
+            phase="plan",
+            event_kind="scenario_spec",
+            scenario_id="scn-mf-timeline",
+            correlation_id="corr-mf-1",
+            severity="info",
+            decision="required",
+            actor="observer",
+            status="accepted",
+            payload={
+                "test_scenario_policy": "new_scenario_required",
+                "test_scenario_spec": {
+                    "id": "scn-mf-timeline",
+                    "steps": ["record scenario", "record gate result"],
+                    "expected": ["rows can be filtered"],
+                },
+            },
+            verification=verification,
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF",
+            mf_id="MF-20260523",
+            task_id="task-mf",
+            attempt_num=1,
+            event_type="gate.mf_scenario.verified",
+            phase="gate",
+            event_kind="gate_result",
+            scenario_id="scn-mf-timeline",
+            parent_event_id=scenario_event["id"],
+            correlation_id="corr-mf-1",
+            severity="info",
+            decision="approved",
+            actor="gate",
+            status="passed",
+            verification={"passed": True, "checks": {"scenario_executed": True}},
+        )
+        self.conn.commit()
+
+        events = task_timeline.list_events(
+            self.conn,
+            "proj",
+            backlog_id="BUG-MF",
+            scenario_id="scn-mf-timeline",
+            correlation_id="corr-mf-1",
+        )
+
+        self.assertEqual([event["event_kind"] for event in events], ["scenario_spec", "gate_result"])
+        self.assertEqual(events[0]["phase"], "plan")
+        self.assertEqual(events[0]["decision"], "required")
+        self.assertEqual(events[0]["schema_version"], 2)
+        self.assertEqual(events[1]["parent_event_id"], scenario_event["id"])
+
+        gate_events = task_timeline.list_events(
+            self.conn,
+            "proj",
+            backlog_id="BUG-MF",
+            scenario_id="scn-mf-timeline",
+            event_kind="gate_result",
+        )
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0]["event_type"], "gate.mf_scenario.verified")
+
+    def test_mf_test_scenario_policy_verification(self):
+        from agent.governance import task_timeline
+
+        cases = [
+            (
+                "none with note",
+                {"test_scenario_policy": "none", "verification_notes": ["copy-only README wording"]},
+                True,
+            ),
+            (
+                "none without note",
+                {"test_scenario_policy": "none"},
+                False,
+            ),
+            (
+                "reuse existing with test command",
+                {
+                    "test_scenario_policy": "reuse_existing",
+                    "tests_run": ["pytest -q agent/tests/test_task_timeline.py"],
+                },
+                True,
+            ),
+            (
+                "reuse existing without evidence",
+                {"test_scenario_policy": "reuse_existing"},
+                False,
+            ),
+            (
+                "new scenario missing spec",
+                {"test_scenario_policy": "new_scenario_required", "verification_notes": ["high-risk path"]},
+                False,
+            ),
+            (
+                "new scenario with spec",
+                {
+                    "test_scenario_policy": "new_scenario_required",
+                    "test_scenario_spec": {
+                        "id": "scn-new",
+                        "steps": ["seed fixture", "run MF command"],
+                        "expected": ["gate sees scenario evidence"],
+                    },
+                },
+                True,
+            ),
+        ]
+        for label, payload, expected in cases:
+            with self.subTest(label=label):
+                result = task_timeline.mf_test_scenario_verification(payload)
+                self.assertEqual(result["passed"], expected, result)
+
+    def test_db_migration_from_v41_adds_timeline_v2_columns_and_indexes(self):
+        from agent.governance import db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO schema_meta (key, value) VALUES ('schema_version', '41');
+            CREATE TABLE task_timeline_events (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id           TEXT NOT NULL,
+                backlog_id           TEXT NOT NULL DEFAULT '',
+                mf_id                TEXT NOT NULL DEFAULT '',
+                task_id              TEXT NOT NULL DEFAULT '',
+                attempt_num          INTEGER NOT NULL DEFAULT 0,
+                event_type           TEXT NOT NULL,
+                actor                TEXT NOT NULL DEFAULT '',
+                status               TEXT NOT NULL DEFAULT '',
+                payload_json         TEXT NOT NULL DEFAULT '{}',
+                verification_json    TEXT NOT NULL DEFAULT '{}',
+                artifact_refs_json   TEXT NOT NULL DEFAULT '{}',
+                trace_id             TEXT NOT NULL DEFAULT '',
+                commit_sha           TEXT NOT NULL DEFAULT '',
+                created_at           TEXT NOT NULL
+            );
+        """)
+
+        db._ensure_schema(conn)
+
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(task_timeline_events)").fetchall()
+        }
+        self.assertIn("phase", columns)
+        self.assertIn("event_kind", columns)
+        self.assertIn("scenario_id", columns)
+        self.assertIn("correlation_id", columns)
+        self.assertIn("schema_version", columns)
+        indexes = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA index_list(task_timeline_events)").fetchall()
+        }
+        self.assertIn("idx_task_timeline_scenario", indexes)
+        self.assertIn("idx_task_timeline_kind", indexes)
+        version = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+        self.assertEqual(version, "42")
+        conn.close()
+
     def test_task_timeline_list_handler_filters_by_backlog_id_query(self):
         from agent.governance import server, task_timeline
 
@@ -180,6 +376,10 @@ class TestTaskTimeline(unittest.TestCase):
             event_type="task.started",
             actor="worker-a",
             trace_id="trace-a",
+            phase="implement",
+            event_kind="observation",
+            scenario_id="scn-handler",
+            correlation_id="corr-handler",
         )
         task_timeline.record_event(
             self.conn,
@@ -189,6 +389,11 @@ class TestTaskTimeline(unittest.TestCase):
             event_type="task.completed",
             actor="worker-b",
             trace_id="trace-b",
+            phase="gate",
+            event_kind="gate_result",
+            scenario_id="scn-handler",
+            correlation_id="corr-handler",
+            decision="approved",
         )
         task_timeline.record_event(
             self.conn,
@@ -219,11 +424,21 @@ class TestTaskTimeline(unittest.TestCase):
                 "backlog_id": "BUG-A",
                 "task_id": "task-b",
                 "trace_id": "trace-b",
+                "phase": "gate",
+                "event_kind": "gate_result",
+                "scenario_id": "scn-handler",
+                "correlation_id": "corr-handler",
+                "decision": "approved",
                 "limit": ["5"],
             })
         )
         self.assertEqual(filtered["task_id"], "task-b")
         self.assertEqual(filtered["trace_id"], "trace-b")
+        self.assertEqual(filtered["phase"], "gate")
+        self.assertEqual(filtered["event_kind"], "gate_result")
+        self.assertEqual(filtered["scenario_id"], "scn-handler")
+        self.assertEqual(filtered["correlation_id"], "corr-handler")
+        self.assertEqual(filtered["decision"], "approved")
         self.assertEqual(filtered["count"], 1)
         self.assertEqual(filtered["events"][0]["task_id"], "task-b")
 
