@@ -30,6 +30,10 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - run `agent.governance.asset_binding_proposals.precheck_asset_binding_proposal` against the draft proposal;
    - include compact `self_precheck` evidence with the submitted proposal;
    - do not request direct graph materialization from weak evidence.
+8. Treat documentation as a commit-bound asset before impact scope:
+   - weak doc path matches stay as doc asset state `candidate` rows;
+   - only accepted bindings from review decisions, source-controlled hints, or durable rules count as node-owned docs;
+   - when changing doc binding behavior, verify `doc-asset-state.json` shows path/hash/status/proposal evidence.
 
 ## Commit
 

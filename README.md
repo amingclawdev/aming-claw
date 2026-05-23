@@ -216,6 +216,9 @@ instead of guessed from each diff.
 - **Operations Queue** — dashboard view of in-flight graph operations: snapshot builds, semantic enrichment jobs, reconcile work, governance hint patches.
 - **Review Queue** — dashboard view where AI-proposed semantic memories wait for human accept/reject; nothing becomes trusted project memory until an operator approves.
 - **Semantic projection** — derived semantic memory for the active graph snapshot. Accepted semantic events are source; the projection is the current materialized view.
+- **Doc asset state** — commit-bound inventory of documentation files, their
+  hashes, and binding status. Weak matches remain `candidate`; only accepted
+  graph bindings enter impact scope.
 - **Typed proposal** — AI output submitted as machine-checkable workflow input. Proposals are routed through schema/precheck, policy, review, and reconcile paths before anything becomes trusted state.
 - **Self graph bundle** — packaged read-only Aming Claw graph/semantic context used by fresh plugin sessions before the Aming Claw repo bootstraps itself as a governed project. The sealed bundle includes a curated structure read model, function index, hashes, and accepted node semantic projection; it does not import raw governance DB state.
 - **Source-Controlled Hints** — reviewed comment metadata written into tracked files, then materialized by reconcile after commit plus Update Graph. V1 uses this contract for two graph repairs: binding orphan doc/test/config files to existing nodes, and topology fixes such as `add_edge`, `suppress_edge`, and `move_file`. Deleting the hint withdraws the projected effect.
@@ -238,6 +241,9 @@ Review Queue, and reconcile path. Weak doc/test/config evidence such as path
 mentions, import-only references, semantic summaries, or downgraded weak test
 fan-in stays as reviewable proposal evidence; it does not become trusted graph
 binding until a reviewed hint/rule/decision or direct symbol evidence exists.
+Documentation is tracked as an atomic commit-bound asset first: reconcile writes
+`doc-asset-state.json` with path/hash/status/candidate evidence, and impact
+scope consumes accepted bindings only.
 
 Example proposal shape:
 
@@ -314,9 +320,11 @@ Run targeted AI Enrich, watch Operations Queue, then accept or reject the Review
 ![Governance Hint — bind an orphan file to a node via a committed comment](docs/assets/demos/governance-hint.gif)
 
 This clip shows the file-binding surface: bind an orphan doc/test/config file
-to a node, commit the source-controlled hint, run Update Graph. The same
-source -> commit -> reconcile contract also covers reviewed topology repairs:
-`add_edge`, `suppress_edge`, and `move_file`.
+to a node, commit the source-controlled hint, run Update Graph. Before that
+hint lands, documentation path matches remain proposal/candidate evidence in
+doc asset state rather than trusted impact scope. The same source -> commit ->
+reconcile contract also covers reviewed topology repairs: `add_edge`,
+`suppress_edge`, and `move_file`.
 
 ## Dashboard Surfaces
 
@@ -388,6 +396,12 @@ to existing nodes, add a missing edge, suppress an incorrect inferred edge, or
 move file ownership. Hints are written as source-controlled evidence and only
 take effect after commit plus Update Graph. Removing the hint removes the
 projected graph effect on the next reconcile.
+
+Documentation binding is deliberately conservative. New docs can stay unbound
+or candidate-bound in doc asset state until an AI/observer proposal is reviewed
+or a source-controlled hint supplies durable evidence. That keeps orphan-state
+auditing intact and prevents weak path mentions from silently expanding review
+impact.
 
 ## Observer-Led Manual Fix
 

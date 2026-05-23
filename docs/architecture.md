@@ -3,7 +3,7 @@
 > **Canonical V1 architecture document.** This document describes the stable
 > Aming Claw control plane first, then lists chain/executor/gateway surfaces as
 > advanced or experimental.
-> Last updated: 2026-05-21 | V1 graph review control-plane alignment
+> Last updated: 2026-05-23 | V1 graph review control-plane alignment
 
 ## 1. Overview
 
@@ -68,7 +68,7 @@ projection from source records.
 |-------|------|----------|
 | Source | Durable input | committed code, source-controlled hints/config/rules, backlog rows, accepted semantic events |
 | Proposal | Untrusted workflow input | AI semantic payloads, graph/config suggestions, backlog suggestions |
-| Derived projection | Materialized view | graph snapshots, semantic projections, file/test/doc/config bindings, review queue overlays |
+| Derived projection | Materialized view | graph snapshots, semantic projections, doc asset state, file/test/doc/config bindings, review queue overlays |
 | Runtime status | Operational evidence | health checks, version checks, operations queue rows, plugin update state |
 
 SQLite is the local persistence substrate for governance state. It is not a
@@ -122,6 +122,7 @@ Key implementation areas:
 - `agent/governance/server.py` - governance HTTP API
 - `agent/governance/reconcile.py` and reconcile phases - graph build/update
 - `agent/governance/state_reconcile.py` - state-only reconcile and projection
+- `agent/governance/doc_asset_state.py` - commit-bound doc inventory/binding projection
 - `agent/governance/graph_hint_projection.py` - materialize graph structure hints
 - `agent/governance/graph_structure_hints.py` - scan/write source graph hints
 - `agent/governance/governance_hints.py` - doc/test/config binding hints
@@ -208,6 +209,7 @@ The graph snapshot is a commit-bound project fact layer. It indexes:
 - test function line ranges and hashes
 - dependency/relation evidence
 - file inventory and orphan state
+- doc asset state: documentation hashes plus unbound/candidate/accepted binding status
 - semantic current/stale/missing status
 
 Function-level hashes allow governance to detect changed functions, stale
@@ -226,7 +228,21 @@ state, and review queues.
 If graph rule inputs or source-controlled graph hints change in a way that
 alters the rule fingerprint, full reconcile may be required.
 
-### 6.3 Semantic Projection
+### 6.3 Doc Asset State
+
+Documentation files are tracked as commit-bound assets before they are treated
+as node impact scope. Reconcile projects a `doc-asset-state.json` artifact from
+file inventory and graph nodes. Each row records path, file hash, commit, run id,
+doc kind, accepted graph bindings, and candidate binding proposals with
+precheck evidence.
+
+The rule is conservative: weak evidence such as a path mention makes the doc a
+binding candidate, not trusted state. Impact calculations consume accepted doc
+bindings only. A doc becomes accepted when a source-controlled hint, accepted
+review decision, or another durable rule materializes the binding during
+reconcile.
+
+### 6.4 Semantic Projection
 
 Semantic memory is event/projection based:
 

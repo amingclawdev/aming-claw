@@ -44,6 +44,9 @@ Limited or deferred capabilities:
 - Function-level call graph queries are available for supported adapters through
   `function_callees`, `function_callers`, and `high_function_degree`; dashboard
   visualization is still evolving.
+- Documentation is tracked as commit-bound doc asset state before it is trusted
+  as node impact scope. Weak path/semantic matches remain proposal candidates
+  until review or source-controlled hint evidence materializes the binding.
 - Arbitrary graph editing, node moves, ownership rewrites, dependency rewrites, and automatic topology mutation are out of scope.
 
 ## MVP Graph Model
@@ -209,6 +212,10 @@ existing node. Do not create nodes, edit the DB, move ownership, change primary
 files, rewrite hierarchy/dependency edges, or invent function-call relations
 through this flow. If the API says `file inventory row not found`, run Update
 Graph first so the file enters snapshot inventory, then retry.
+
+Do not treat weak documentation matches as impact scope. Reconcile records them
+in doc asset state with path/hash/status/proposal evidence; only accepted doc
+bindings should be used when claiming node-owned documentation.
 
 When summarizing work, explicitly report whether a hint is still uncommitted or
 not yet materialized into the graph.

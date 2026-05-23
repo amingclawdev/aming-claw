@@ -22,6 +22,7 @@ from agent.governance.external_project_governance import (
     build_symbol_index,
 )
 from agent.governance.checkout_provenance import describe_checkout
+from agent.governance.doc_asset_state import build_doc_asset_state
 from agent.governance.graph_snapshot_store import (
     ensure_schema as ensure_graph_snapshot_schema,
     get_active_graph_snapshot,
@@ -583,6 +584,13 @@ def build_governance_index(
         profile=profile,
     )
     doc_index = build_doc_index(project_root=root, file_inventory=file_inventory)
+    doc_asset_state = build_doc_asset_state(
+        project_id=project_id,
+        run_id=rid,
+        commit_sha=commit,
+        file_inventory=file_inventory,
+        graph_nodes=source_nodes,
+    )
     coverage_state = build_coverage_state(
         candidate_graph=candidate_graph or _candidate_graph_from_nodes(source_nodes),
         file_inventory=file_inventory,
@@ -630,6 +638,7 @@ def build_governance_index(
         "governance_hint_bindings": governance_hint_bindings,
         "symbol_index": symbol_index,
         "doc_index": doc_index,
+        "doc_asset_state": doc_asset_state,
         "feature_index": feature_index,
         "coverage_state": coverage_state,
     }
@@ -666,6 +675,7 @@ def persist_governance_index(
         "file_inventory_path": base / "file-inventory.json",
         "symbol_index_path": base / "symbol-index.json",
         "doc_index_path": base / "doc-index.json",
+        "doc_asset_state_path": base / "doc-asset-state.json",
         "feature_index_path": base / "feature-index.json",
         "coverage_state_path": base / "coverage-state.json",
         "summary_path": base / "summary.json",
@@ -674,6 +684,7 @@ def persist_governance_index(
     _write_json(artifacts["file_inventory_path"], index.get("file_inventory") or [])
     _write_json(artifacts["symbol_index_path"], index.get("symbol_index") or {})
     _write_json(artifacts["doc_index_path"], index.get("doc_index") or {})
+    _write_json(artifacts["doc_asset_state_path"], index.get("doc_asset_state") or {})
     _write_json(artifacts["feature_index_path"], index.get("feature_index") or {})
     _write_json(artifacts["coverage_state_path"], index.get("coverage_state") or {})
 
@@ -698,6 +709,7 @@ def persist_governance_index(
         "file_inventory_summary": index.get("file_inventory_summary") or {},
         "symbol_count": (index.get("symbol_index") or {}).get("symbol_count", 0),
         "doc_heading_count": (index.get("doc_index") or {}).get("heading_count", 0),
+        "doc_asset_state": (index.get("doc_asset_state") or {}).get("summary", {}),
         "feature_count": (index.get("feature_index") or {}).get("feature_count", 0),
         "inventory_rows_persisted": inventory_count,
         "artifacts": {name: str(path) for name, path in artifacts.items()},
