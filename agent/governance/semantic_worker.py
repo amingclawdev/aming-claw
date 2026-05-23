@@ -17,10 +17,10 @@ which `backfill_existing_semantic_events` maps to
 `EVENT_STATUS_PROPOSED` — invisible to the projection until an operator
 flips it via `/feedback/decision` action `accept_semantic_enrichment`.
 
-Scope guardrail: worker only handles `operation_type IN
-('node_semantic', 'edge_semantic')`. Other op types (scope_reconcile,
-feedback_review) are ignored at the claim layer (`claim_semantic_jobs`
-already filters node-shaped rows).
+Scope guardrail: worker handles node AI work from `graph_semantic_jobs`
+and branches by `operation_type`: ordinary node semantics use source evidence,
+while `ai_summary` uses accepted child semantic memory. Other op types
+(scope_reconcile, feedback_review) are ignored at the claim layer.
 
 Concurrency: a per-(project, snapshot) lock prevents overlapping
 drains. A semantic enrichment config policy caps total concurrent AI
@@ -1508,6 +1508,14 @@ def _process_node_semantic_job(
     node_id_s = str(node_id or "").strip()
     if not node_id_s:
         return {"ok": False, "status": "skipped", "reason": "empty_node_id"}
+    if _node_job_operation_type(project_id, snapshot_id, node_id_s) == "ai_summary":
+        return _process_node_summary_job(
+            project_id,
+            snapshot_id,
+            root=root,
+            ai_call=ai_call,
+            node_id=node_id_s,
+        )
     conn = governance_db.get_connection(project_id)
     try:
         # MF 2026-05-11: emit ai_reviewing interstitial publish for the
@@ -1820,6 +1828,255 @@ def _process_node_semantic_job(
             "ai_output_intake": intake_mirror,
             "bridge": bridge_result,
             "config_bridge": config_bridge_result,
+        }
+    finally:
+        conn.close()
+
+
+def _node_job_operation_type(project_id: str, snapshot_id: str, node_id: str) -> str:
+    try:
+        from . import db as governance_db
+        from . import reconcile_semantic_enrichment as semantic
+
+        conn = governance_db.get_connection(project_id)
+        try:
+            semantic._ensure_semantic_state_schema(conn)
+            row = conn.execute(
+                """
+                SELECT operation_type
+                FROM graph_semantic_jobs
+                WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                """,
+                (project_id, snapshot_id, node_id),
+            ).fetchone()
+            return str(row["operation_type"] or "").strip().lower().replace("-", "_") if row else ""
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+
+
+def _process_node_summary_job(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    root: Path,
+    ai_call: Any,
+    node_id: str,
+) -> dict[str, Any]:
+    from . import db as governance_db
+    from . import reconcile_feedback
+    from . import reconcile_semantic_enrichment as semantic
+    from . import reconcile_semantic_summary as summary
+
+    node_id_s = str(node_id or "").strip()
+    conn = governance_db.get_connection(project_id)
+    try:
+        try:
+            from . import event_bus
+            event_bus.publish("semantic_node.running", {
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "node_id": node_id_s,
+                "operation_type": summary.SUMMARY_OPERATION_TYPE,
+                "source": "semantic_worker_inproc",
+            })
+            event_bus.publish("dashboard.changed", {
+                "project_id": project_id,
+                "path": "/semantic_worker/node_summary_running",
+                "method": "WORKER",
+                "source": "semantic_worker_inproc",
+            })
+        except Exception as exc:  # noqa: BLE001 - advisory
+            log.debug("semantic_worker: summary running publish failed for %s: %s",
+                      node_id_s, exc)
+        try:
+            result = summary.run_summary_job(
+                conn,
+                project_id,
+                snapshot_id,
+                target_id=node_id_s,
+                ai_call=ai_call,
+                options={"root": str(root)},
+                require_current_children=True,
+                created_by="semantic_worker_inproc",
+            )
+        except Exception as exc:  # noqa: BLE001 - record + carry on
+            log.exception("semantic_worker: summary failed for %s: %s", node_id_s, exc)
+            _finalize_node_semantic_job(
+                conn,
+                project_id,
+                snapshot_id,
+                node_id_s,
+                status="ai_failed",
+                last_error=str(exc),
+            )
+            conn.commit()
+            return {"ok": False, "status": "failed", "node_id": node_id_s, "error": str(exc)}
+
+        feature_hash = str(result.get("feature_hash") or "")
+        semantic_payload = result.get("semantic_payload") if isinstance(result.get("semantic_payload"), Mapping) else {}
+        semantic_payload_hash = str(result.get("payload_hash") or "")
+        event_id = ""
+        try:
+            ev_row = conn.execute(
+                """
+                SELECT event_id FROM graph_events
+                WHERE project_id = ? AND snapshot_id = ?
+                  AND event_type = 'semantic_node_enriched'
+                  AND target_id = ?
+                  AND status = 'proposed'
+                ORDER BY event_seq DESC LIMIT 1
+                """,
+                (project_id, snapshot_id, node_id_s),
+            ).fetchone()
+            if ev_row:
+                event_id = str(ev_row["event_id"] or "")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("semantic_worker: summary event lookup failed for %s: %s",
+                        node_id_s, exc)
+
+        semantic_gate_precheck = _semantic_node_gate_precheck(semantic_payload)
+        semantic_gate_passed = str(semantic_gate_precheck.get("status") or "") == "passed"
+        intake_mirror = _mirror_ai_output_intake(
+            conn,
+            project_id,
+            snapshot_id,
+            task_type="semantic_node",
+            target_type="node",
+            target_id=node_id_s,
+            raw_output=semantic_payload,
+            actor="semantic_worker_inproc",
+            producer="semantic_worker_inproc_summary",
+            source_run_id=event_id or semantic_payload_hash or node_id_s,
+            result={"precheck": semantic_gate_precheck},
+            route_status="review_pending" if semantic_gate_passed else "gate_failed",
+            metadata={
+                "event_id": event_id,
+                "feature_hash": feature_hash,
+                "payload_hash": semantic_payload_hash,
+                "operation_type": summary.SUMMARY_OPERATION_TYPE,
+                "source": "semantic_worker_inproc",
+            },
+        )
+        if not semantic_gate_passed:
+            gate_errors = [
+                str(item or "")
+                for item in semantic_gate_precheck.get("errors", [])
+                if str(item or "")
+            ]
+            last_error = "semantic_summary_self_check gate failed"
+            if gate_errors:
+                last_error = f"{last_error}: {', '.join(gate_errors)}"
+            try:
+                from . import graph_events
+
+                conn.execute(
+                    """
+                    UPDATE graph_semantic_nodes
+                    SET status = 'gate_failed', updated_at = ?
+                    WHERE project_id = ? AND snapshot_id = ? AND node_id = ?
+                      AND status IN ('pending_review', 'ai_complete')
+                    """,
+                    (semantic.utc_now(), project_id, snapshot_id, node_id_s),
+                )
+                if event_id:
+                    graph_events.update_event_status(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        event_id,
+                        status=graph_events.EVENT_STATUS_REJECTED,
+                        actor="semantic_worker_inproc",
+                        operation_type="semantic_summary_gate",
+                        evidence={
+                            "source": "semantic_summary_system_gate",
+                            "gate_precheck": semantic_gate_precheck,
+                            "ai_output_intake": intake_mirror,
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("semantic_worker: summary gate state update failed for %s: %s",
+                            node_id_s, exc)
+            _finalize_node_semantic_job(
+                conn,
+                project_id,
+                snapshot_id,
+                node_id_s,
+                status="rejected",
+                last_error=last_error,
+            )
+            conn.commit()
+            return {
+                "ok": False,
+                "status": "gate_failed",
+                "node_id": node_id_s,
+                "event_id": event_id,
+                "gate_precheck": semantic_gate_precheck,
+                "ai_output_intake": intake_mirror,
+            }
+        try:
+            reconcile_feedback.submit_feedback_item(
+                project_id,
+                snapshot_id,
+                feedback_kind=reconcile_feedback.KIND_NEEDS_OBSERVER_DECISION,
+                issue={
+                    "issue": f"AI semantic summary generated for {node_id_s} - awaiting operator review",
+                    "source_node_ids": [node_id_s],
+                    "target_id": node_id_s,
+                    "target_type": "node",
+                    "priority": "P3",
+                    "evidence": {
+                        "source": "semantic_worker_inproc",
+                        "node_id": node_id_s,
+                        "feature_hash": feature_hash,
+                        "operation_type": summary.SUMMARY_OPERATION_TYPE,
+                        "linked_event_ids": [event_id] if event_id else [],
+                        "summary_source": result.get("summary_source"),
+                        "ai_output_intake": intake_mirror,
+                    },
+                },
+                actor="semantic_worker_inproc",
+            )
+        except Exception as exc:  # noqa: BLE001 - feedback row is advisory
+            log.warning("semantic_worker: summary feedback submit failed for %s: %s",
+                        node_id_s, exc)
+        _finalize_node_semantic_job(
+            conn,
+            project_id,
+            snapshot_id,
+            node_id_s,
+            status="ai_complete",
+        )
+        conn.commit()
+        try:
+            from . import event_bus
+            payload = {
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "node_id": node_id_s,
+                "event_id": event_id,
+                "feature_hash": feature_hash,
+                "operation_type": summary.SUMMARY_OPERATION_TYPE,
+                "source": "semantic_worker_inproc",
+            }
+            event_bus.publish("semantic_node.proposed", payload)
+            event_bus.publish("dashboard.changed", {
+                "project_id": project_id,
+                "path": "/semantic_worker/node_summary_proposed",
+                "method": "WORKER",
+                "source": "semantic_worker_inproc",
+            })
+        except Exception as exc:  # noqa: BLE001 - notification is advisory
+            log.debug("semantic_worker: summary eventbus publish failed for %s: %s",
+                      node_id_s, exc)
+        return {
+            "ok": True,
+            "status": "proposed",
+            "node_id": node_id_s,
+            "event_id": event_id,
+            "ai_output_intake": intake_mirror,
+            "summary_source": result.get("summary_source"),
         }
     finally:
         conn.close()

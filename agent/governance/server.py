@@ -5289,13 +5289,18 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
             operations.append(stale_operation)
 
         for job in node_jobs:
+            job_operation_type = str(job.get("operation_type") or "").strip().lower().replace("-", "_")
+            is_summary_job = job_operation_type == "ai_summary"
+            operation_type = "ai_summary" if is_summary_job else "node_semantic"
+            operation_prefix = "ai-summary" if is_summary_job else "node-semantic"
+            target_id = job.get("node_id", "")
             op_status = _normalize_operation_status(job.get("status", ""))
             operations.append({
-                "operation_id": f"node-semantic:{job.get('job_id') or job.get('node_id')}",
-                "operation_type": "node_semantic",
+                "operation_id": f"{operation_prefix}:{job.get('job_id') or target_id}",
+                "operation_type": operation_type,
                 "target_scope": "node",
-                "target_id": job.get("node_id", ""),
-                "target_label": job.get("node_id", ""),
+                "target_id": target_id,
+                "target_label": f"{target_id} summary" if is_summary_job else target_id,
                 "status": op_status,
                 "progress": _operation_unit_progress(op_status),
                 "created_at": job.get("created_at", ""),
@@ -5304,7 +5309,7 @@ def handle_graph_governance_operations_queue(ctx: RequestContext):
                 "worker_id": job.get("worker_id", ""),
                 "lease_expires_at": job.get("lease_expires_at", ""),
                 "last_error": job.get("last_error", ""),
-                "last_result": "",
+                "last_result": job_operation_type,
                 "trace_id": job.get("claim_id", ""),
                 "supported_actions": ["retry", "cancel", "view_trace"],
             })
@@ -11141,7 +11146,8 @@ def _semantic_job_rows(conn, project_id: str, snapshot_id: str, *, statuses: lis
     sql = """
         SELECT node_id, status, feature_hash, file_hashes_json, feedback_round,
                batch_index, attempt_count, worker_id, claim_id, claimed_at,
-               lease_expires_at, claimed_by, last_error, updated_at, created_at
+               lease_expires_at, claimed_by, last_error, operation_type,
+               updated_at, created_at
         FROM graph_semantic_jobs
         WHERE project_id = ? AND snapshot_id = ?
     """
@@ -11173,6 +11179,7 @@ def _semantic_job_rows(conn, project_id: str, snapshot_id: str, *, statuses: lis
             "lease_expires_at": row["lease_expires_at"],
             "claimed_by": row["claimed_by"],
             "last_error": row["last_error"],
+            "operation_type": row["operation_type"],
             "updated_at": row["updated_at"],
             "created_at": row["created_at"],
         })
@@ -11348,6 +11355,14 @@ def _semantic_queued_op(job: dict, operation_type: str) -> dict[str, str]:
             "job_id": str(job.get("job_id") or target_id),
         }
     target_id = str(job.get("node_id") or job.get("target_id") or job.get("job_id") or "").strip()
+    if operation_type == "ai_summary":
+        return {
+            "operation_id": f"ai-summary:{target_id}",
+            "operation_type": "ai_summary",
+            "target_scope": "node",
+            "target_id": target_id,
+            "job_id": str(job.get("job_id") or target_id),
+        }
     return {
         "operation_id": f"node-semantic:{target_id}",
         "operation_type": "node_semantic",
@@ -11400,7 +11415,10 @@ def _semantic_cancel_requested_bucket(status: str | None) -> str:
 def _semantic_cancel_kind_allowed(kind: str, operation_type: str, target_scope: str) -> bool:
     operation_type = str(operation_type or "").strip().lower().replace("-", "_")
     target_scope = str(target_scope or "").strip().lower().replace("-", "_")
-    if operation_type and operation_type != f"{kind}_semantic":
+    if operation_type == "ai_summary":
+        if kind != "node":
+            return False
+    elif operation_type and operation_type != f"{kind}_semantic":
         return False
     if target_scope in {"edge", "edges"}:
         return kind == "edge"
@@ -12510,6 +12528,122 @@ def handle_graph_governance_snapshot_semantic_jobs_create(ctx: RequestContext):
         snapshot_id = _resolve_graph_snapshot_id(conn, project_id, snapshot_id)
         _require_project_semantic_route_for_jobs(project_id)
         dry_run = _semantic_jobs_dry_run(body)
+        job_type = str(body.get("job_type") or "semantic_enrichment").strip().lower().replace("-", "_")
+        if job_type == "semantic_summary":
+            from . import graph_events
+            from . import reconcile_semantic_summary as summary
+            from .errors import ValidationError
+
+            target_scope = _semantic_jobs_target_scope(body)
+            if target_scope in {"edge", "edges", "snapshot"}:
+                raise ValidationError("semantic_summary supports only node or subtree targets")
+            target_ids = _semantic_jobs_target_ids(
+                body.get("target_ids")
+                or body.get("target_id")
+                or body.get("semantic_node_ids")
+                or body.get("node_ids")
+                or body.get("node_id")
+            )
+            planned_target_ids = summary.validate_summary_targets(
+                conn,
+                project_id,
+                snapshot_id,
+                target_scope=target_scope,
+                target_ids=target_ids,
+            )
+            options = _semantic_jobs_options(body)
+            operator_request = _semantic_jobs_operator_request(
+                body,
+                snapshot_id,
+                root,
+                project_id=project_id,
+                target_scope=target_scope,
+                target_ids=planned_target_ids,
+                layers=[],
+            )
+            operator_request["operation_type"] = summary.SUMMARY_OPERATION_TYPE
+            operator_request["summary_options"] = options
+            session_job_id = f"semantic-summary-jobs-{snapshot_id}-{uuid.uuid4().hex[:8]}"
+            if dry_run:
+                return 202, {
+                    "ok": True,
+                    "project_id": project_id,
+                    "snapshot_id": snapshot_id,
+                    "job_id": session_job_id,
+                    "job_type": "semantic_summary",
+                    "target_scope": target_scope,
+                    "status": "dry_run",
+                    "dry_run": True,
+                    "queued_count": 0,
+                    "planned_count": len(planned_target_ids),
+                    "operator_request": operator_request,
+                    "batch_plan": operator_request["batch_plan"],
+                    "jobs": [],
+                    "queued_ops": [],
+                }
+            with sqlite_write_lock():
+                jobs = summary.queue_summary_jobs(
+                    conn,
+                    project_id,
+                    snapshot_id,
+                    target_ids=planned_target_ids,
+                    created_by=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                )
+                for node_id in planned_target_ids:
+                    graph_events.create_event(
+                        conn,
+                        project_id,
+                        snapshot_id,
+                        event_type="semantic_retry_requested",
+                        event_kind="semantic_job",
+                        target_type="node",
+                        target_id=node_id,
+                        status="observed",
+                        operation_type=summary.SUMMARY_OPERATION_TYPE,
+                        payload={
+                            "semantic_session_job_id": session_job_id,
+                            "job_type": "semantic_summary",
+                            "operator_request": operator_request,
+                            "batch_plan": operator_request["batch_plan"],
+                            "selector": {"node_ids": planned_target_ids},
+                            "summary_options": options,
+                        },
+                        evidence={"source": "semantic_jobs_api_summary"},
+                        created_by=str(body.get("actor") or body.get("created_by") or "dashboard_user"),
+                    )
+                conn.commit()
+            queued_count = len(jobs)
+            _publish_semantic_job_enqueued(
+                project_id,
+                snapshot_id,
+                queued_count,
+                target_scope="node",
+                source="semantic_jobs_create_api_summary",
+            )
+            persisted_jobs = _semantic_job_rows(conn, project_id, snapshot_id, limit=1000)
+            target_set = set(planned_target_ids)
+            persisted_jobs = [
+                job for job in persisted_jobs
+                if str(job.get("node_id") or "") in target_set
+            ][: int(body.get("limit") or 200)]
+            counts = _semantic_job_status_counts(conn, project_id, snapshot_id)
+            return 202, {
+                "ok": True,
+                "project_id": project_id,
+                "snapshot_id": snapshot_id,
+                "job_id": session_job_id,
+                "job_type": "semantic_summary",
+                "target_scope": target_scope,
+                "status": "queued",
+                "dry_run": False,
+                "queued_count": queued_count,
+                "planned_count": len(planned_target_ids),
+                "operator_request": operator_request,
+                "batch_plan": operator_request["batch_plan"],
+                "summary": {"by_status": counts, "progress": _semantic_job_progress(counts)},
+                "jobs": persisted_jobs,
+                "queued_ops": _semantic_queued_ops(persisted_jobs, summary.SUMMARY_OPERATION_TYPE),
+            }
         if _semantic_jobs_target_scope(body) in {"edge", "edges"}:
             from . import graph_events
             from .errors import ValidationError

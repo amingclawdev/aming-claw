@@ -174,7 +174,7 @@ export default function InspectorDrawer({
   const status = classifyNode(node);
   const tone = statusTone(status);
   const isContainer = (byParent.get(node.node_id)?.length ?? 0) > 0;
-  const drawerCta = drawerCtaFor(status);
+  const drawerCta = drawerCtaFor(status, node, isContainer);
 
   return (
     <aside className="inspector-drawer">
@@ -1377,12 +1377,19 @@ function FunctionCallGraphBlock({
   );
 }
 
-function drawerCtaFor(status: SemanticStatus): {
+function drawerCtaFor(status: SemanticStatus, node: NodeRecord, isContainer: boolean): {
   kind: ActionKind;
   label: string;
   hint: string;
   forceMode?: "semanticize" | "retry" | "review";
 } {
+  if (isSummaryTarget(node, isContainer)) {
+    return {
+      kind: "summary",
+      label: "AI Summary",
+      hint: "Summarize this container from child semantics",
+    };
+  }
   // Mirrors FocusCard.ctaFor — the inspector CTA always launches the AI
   // enrich modal; when a semantic already exists the button flips to
   // "Retry AI enrich" with forceMode=retry so the modal lands directly
@@ -1426,6 +1433,10 @@ function drawerCtaFor(status: SemanticStatus): {
         hint: "No AI semantic yet — enrich to populate",
       };
   }
+}
+
+function isSummaryTarget(node: NodeRecord, isContainer: boolean): boolean {
+  return isContainer && (node.layer === "L1" || node.layer === "L2" || node.layer === "L3");
 }
 
 function FunctionLink({

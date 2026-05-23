@@ -64,7 +64,7 @@ function NodeFocusCard({
   const tone = statusToTone(status);
   const isContainer = (byParent.get(node.node_id)?.length ?? 0) > 0;
   const meta = nodeMetrics(node, byParent, edgesBySrc, edgesByDst);
-  const cta = ctaFor(status);
+  const cta = ctaFor(status, node, isContainer);
 
   return (
     <div className="focus-card">
@@ -289,12 +289,19 @@ function MinimizedFocusCard({
 
 // ---------------- CTA classifier ----------------
 
-function ctaFor(status: SemanticStatus): {
+function ctaFor(status: SemanticStatus, node: NodeRecord, isContainer: boolean): {
   kind: ActionKind;
   label: string;
   hint: string;
   forceMode?: "semanticize" | "retry" | "review";
 } {
+  if (isSummaryTarget(node, isContainer)) {
+    return {
+      kind: "summary",
+      label: "AI Summary",
+      hint: "Summarize this container from child semantics",
+    };
+  }
   // CTA always launches the AI enrich modal — when the AI semantic is already
   // current/reviewed the CTA becomes "Retry AI enrich" (operator wants the
   // model to take another pass, possibly with a note to course-correct).
@@ -338,6 +345,10 @@ function ctaFor(status: SemanticStatus): {
         hint: "No AI semantic yet — enrich to populate",
       };
   }
+}
+
+function isSummaryTarget(node: NodeRecord, isContainer: boolean): boolean {
+  return isContainer && (node.layer === "L1" || node.layer === "L2" || node.layer === "L3");
 }
 
 // ---------------- Helpers ----------------

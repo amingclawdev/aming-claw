@@ -4,7 +4,7 @@ import type { PinnedEdge } from "./FocusCard";
 import { classifyNode, semStatusLabel, type SemanticStatus } from "../lib/semantic";
 import { api, ApiError, type AiConfigResponse, type FeedbackSubmitPayload, type SemanticJobPayload } from "../lib/api";
 
-export type ActionKind = "enrich" | "feedback";
+export type ActionKind = "enrich" | "summary" | "feedback";
 
 // Preset triggered from the global Action Panel (vs. per-node CTA from the
 // FocusCard / drawer head). Each preset seeds the form with prototype-style
@@ -221,11 +221,26 @@ export default function ActionControlPanel({
   // Build the payload reactively so it's available for both submit + the
   // collapsible JSON preview pane.
   const semanticJobPayload = useMemo<SemanticJobPayload | null>(() => {
-    if (kind !== "enrich" || !target) return null;
+    if ((kind !== "enrich" && kind !== "summary") || !target) return null;
     const t = target;
     const targetId = t.edge
       ? `${t.edge.src}|${t.edge.dst}|${t.edge.type}`
       : t.node?.node_id ?? "";
+    if (kind === "summary") {
+      if (!t.node?.node_id) return null;
+      return {
+        job_type: "semantic_summary",
+        target_scope: "node",
+        target_ids: [t.node.node_id],
+        options: {
+          target: "summary",
+          summary_source: "child_semantics",
+          require_current_children: true,
+          submit_for_review: true,
+        },
+        created_by: "dashboard_user",
+      };
+    }
     const target_ids: string[] = [];
     if ((enrichScope === "selected_node" || enrichScope === "selected_subtree") && targetId) {
       target_ids.push(targetId);
@@ -307,9 +322,11 @@ export default function ActionControlPanel({
     ? `${tEdge.src} ${tEdge.type} ${tEdge.dst}`
     : tNode?.node_id ?? "";
   const status: SemanticStatus | null = tNode ? classifyNode(tNode) : null;
-  const previewPayload = kind === "enrich" ? semanticJobPayload : feedbackPayload;
+  const previewPayload = kind === "enrich" || kind === "summary" ? semanticJobPayload : feedbackPayload;
   const aiReadiness = semanticAiReadiness(aiConfig);
-  const isLiveAiApply = kind === "enrich" && enrichExec === "apply";
+  const isSemanticJob = kind === "enrich" || kind === "summary";
+  const isLiveAiApply = (kind === "enrich" && enrichExec === "apply") || kind === "summary";
+  const operationLabel = kind === "summary" ? "AI Summary" : "AI enrich";
 
   async function dispatch() {
     if (!snapshotId) {
@@ -322,11 +339,11 @@ export default function ActionControlPanel({
     }
     setBusy(true);
     try {
-      if (kind === "enrich" && semanticJobPayload) {
+      if (isSemanticJob && semanticJobPayload) {
         const res = await api.submitSemanticJob(snapshotId, semanticJobPayload);
-        const verb = enrichExec === "dry_run" ? "queued (dry run)" : "queued";
+        const verb = kind === "enrich" && enrichExec === "dry_run" ? "queued (dry run)" : "queued";
         onSubmitted(
-          `AI enrich ${verb} · job_id=${res.job_id ?? "—"} · queued ${res.queued_count ?? 0}`,
+          `${operationLabel} ${verb} · job_id=${res.job_id ?? "—"} · queued ${res.queued_count ?? 0}`,
           "success",
         );
       } else if (kind === "feedback" && feedbackPayload) {
@@ -367,7 +384,9 @@ export default function ActionControlPanel({
       >
         <header className="action-panel-head">
           <span className={`action-panel-kind kind-${kind}`}>
-            {kind === "enrich"
+            {kind === "summary"
+              ? "AI Summary"
+              : kind === "enrich"
               ? target?.forceMode === "retry"
                 ? "↻ Retry AI enrich"
                 : "⚡ AI enrich"
@@ -394,7 +413,7 @@ export default function ActionControlPanel({
         </div>
 
         <div className="action-panel-body">
-          {kind === "enrich" ? (
+          {isSemanticJob ? (
             <>
               {/* Simple per-target enrich (FocusCard / drawer CTA, no preset)
                   hides the radio knobs: target type is derived from the
@@ -403,7 +422,7 @@ export default function ActionControlPanel({
                   just types a note and clicks Apply. The full radio form
                   is only shown for preset-driven flows (global Action
                   Panel "Run scope reconcile" / "Run global review" etc.). */}
-              {target?.preset ? (
+              {kind === "enrich" && target?.preset ? (
                 <>
                   <RadioGroup
                     legend="Target"
@@ -437,8 +456,8 @@ export default function ActionControlPanel({
               ) : null}
               <div className={`action-ai-readiness ${aiReadiness.ready ? "ok" : "blocked"}`}>
                 {aiReadiness.ready
-                  ? `Live AI route: ${aiReadiness.routeLabel}`
-                  : `${aiReadiness.blockMessage} Use AI config before applying live jobs.`}
+                  ? `${operationLabel} route: ${aiReadiness.routeLabel}`
+                  : `${semanticAiBlockMessage(aiReadiness.blockMessage, operationLabel)} Use AI config before applying live jobs.`}
               </div>
               <fieldset className="action-fieldset">
                 <legend>
@@ -448,7 +467,7 @@ export default function ActionControlPanel({
                   ref={noteRef}
                   className="action-textarea"
                   rows={3}
-                  placeholder="Why now? Anything the AI should know — drift hint, recent refactor, etc."
+                  placeholder={kind === "summary" ? "Context for the summary run." : "Why now? Anything the AI should know — drift hint, recent refactor, etc."}
                   value={note}
                   onChange={(e) => setNote(e.target.value)}
                 />
@@ -526,7 +545,9 @@ export default function ActionControlPanel({
           >
             {busy
               ? "Submitting…"
-              : kind === "enrich"
+              : kind === "summary"
+                ? "Apply summary"
+                : kind === "enrich"
                 ? enrichExec === "dry_run"
                   ? "⚡ Dry-run enrich"
                   : target?.forceMode === "retry"
@@ -613,4 +634,8 @@ function semanticAiReadiness(config?: AiConfigResponse | null): {
     };
   }
   return { ready: true, routeLabel: `${provider}/${model}`, blockMessage: "" };
+}
+
+function semanticAiBlockMessage(message: string, operationLabel: string): string {
+  return message.replace(/^AI enrich/, operationLabel);
 }

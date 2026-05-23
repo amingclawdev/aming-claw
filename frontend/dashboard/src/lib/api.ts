@@ -792,11 +792,11 @@ export interface ProjectGitRefSelectPayload {
 }
 
 export interface SemanticJobPayload {
-  job_type: "semantic_enrichment" | "global_review";
+  job_type: "semantic_enrichment" | "semantic_summary" | "global_review";
   target_scope: "snapshot" | "node" | "subtree" | "edge";
   target_ids: string[];
   options: {
-    target?: "nodes" | "edges" | "both";
+    target?: "nodes" | "edges" | "both" | "summary";
     include_nodes?: boolean;
     include_edges?: boolean;
     scope?: string;
@@ -810,6 +810,9 @@ export interface SemanticJobPayload {
     include_contains?: boolean;
     edge_types?: string[];
     limit?: number;
+    summary_source?: "child_semantics";
+    require_current_children?: boolean;
+    submit_for_review?: boolean;
   };
   created_by?: string;
 }

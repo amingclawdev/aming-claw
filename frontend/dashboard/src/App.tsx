@@ -807,7 +807,7 @@ export default function App() {
             kind: res.status === "cancelled" ? "success" : "info",
             msg: `Reconcile cancel · ${res.status} · waived=${res.cancelled_count}`,
           });
-        } else if (opType === "node_semantic" || opType === "edge_semantic") {
+        } else if (opType === "node_semantic" || opType === "edge_semantic" || opType === "ai_summary") {
           if (!snapshotId) throw new Error("no active snapshot");
           const ok = window.confirm(`Cancel ${opType} job for ${targetId}?`);
           if (!ok) return;
