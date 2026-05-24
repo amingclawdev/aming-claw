@@ -14,6 +14,7 @@ try:
     from agent.cli import main
     from agent.plugin_installer import (
         configure_codex_plugin,
+        codex_cache_plugin_root,
         install_codex_marketplace,
         install_codex_plugin_cache,
         plugin_root_for,
@@ -94,7 +95,7 @@ def _write_cli_plugin_fixture(root):
     server_path.write_text("# test runtime entrypoint\n", encoding="utf-8")
 
 
-def _make_cli_remote_plugin_repo(tmp_path):
+def _make_cli_remote_plugin_repo_with_source(tmp_path):
     remote = tmp_path / "remote.git"
     source = tmp_path / "source"
     _git(["init", "--bare", str(remote)], tmp_path)
@@ -106,7 +107,29 @@ def _make_cli_remote_plugin_repo(tmp_path):
     _git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial plugin"], source)
     _git(["remote", "add", "origin", str(remote)], source)
     _git(["push", "-u", "origin", "main"], source)
+    return remote, source
+
+
+def _make_cli_remote_plugin_repo(tmp_path):
+    remote, _source = _make_cli_remote_plugin_repo_with_source(tmp_path)
     return remote
+
+
+def _git_commit_all(repo: Path, message: str) -> str:
+    _git(["add", "."], repo)
+    _git(
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            message,
+        ],
+        repo,
+    )
+    return _git(["rev-parse", "HEAD"], repo)
 
 
 class TestCliHelp:
@@ -293,6 +316,75 @@ class TestCliPlugin:
         assert payload["ok"] is True
         assert payload["status"] == "current"
         assert payload["update_available"] is False
+
+    def test_plugin_update_apply_from_external_cwd_does_not_pollute_target(self, tmp_path, monkeypatch):
+        runner = CliRunner()
+        remote, source = _make_cli_remote_plugin_repo_with_source(tmp_path)
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        plugin_root = plugin_root_for(str(remote), install_root)
+        _git(["clone", str(remote), str(plugin_root)], install_root)
+        _git(["checkout", "main"], plugin_root)
+
+        skill = source / "skills" / "aming-claw" / "SKILL.md"
+        skill.write_text("---\nname: test\n---\nupdated\n", encoding="utf-8")
+        remote_commit = _git_commit_all(source, "update skill")
+        _git(["push", "origin", "main"], source)
+
+        external_project = tmp_path / "my-app"
+        (external_project / "src").mkdir(parents=True)
+        (external_project / "src" / "App.js").write_text(
+            "export default function App() { return null; }\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(external_project)
+
+        codex_home = tmp_path / "codex-home"
+        marketplace_root = tmp_path / "marketplace-root"
+        state_path = tmp_path / "state.json"
+        result = runner.invoke(main, [
+            "plugin",
+            "update",
+            str(remote),
+            "--apply",
+            "--install-root",
+            str(install_root),
+            "--plugin-state",
+            str(state_path),
+            "--no-pip",
+            "--codex-home",
+            str(codex_home),
+            "--codex-config",
+            str(codex_home / "config.toml"),
+            "--codex-marketplace-root",
+            str(marketplace_root),
+            "--json-output",
+        ])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        assert payload["applied"] is True
+        assert payload["installed_package"] is False
+        assert payload["installed_codex_plugin"] is True
+        assert payload["status"] == "applied_pending_restart"
+        assert payload["changed_surfaces"] == ["mcp"]
+        assert _git(["rev-parse", "HEAD"], plugin_root) == remote_commit
+        assert (codex_cache_plugin_root(plugin_root, codex_home=codex_home) / ".mcp.json").is_file()
+        assert (marketplace_root / ".agents" / "plugins" / "aming-claw" / ".mcp.json").is_file()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["update_status"] == "applied_pending_restart"
+        assert state["remote_commit"] == remote_commit
+
+        for rel in (
+            ".mcp.json",
+            "shared-volume",
+            ".codex-plugin",
+            ".claude-plugin",
+            ".agents/plugins",
+            "agent/mcp/resources",
+        ):
+            assert not (external_project / rel).exists(), f"unexpected target-local plugin artifact: {rel}"
 
     def test_plugin_update_missing_checkout_exits_nonzero(self, tmp_path):
         runner = CliRunner()
