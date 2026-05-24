@@ -407,6 +407,16 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
                     "target_files": ["a.py", "b.py", "c.py", "d.py"],
                     "test_files": ["test_a.py", "test_b.py"],
                     "acceptance_criteria": ["one", "two", "three"],
+                    "chain_trigger_json": {
+                        "parallel_contract": {
+                            "template_id": "mf_parallel.v1",
+                            "contract_instance_id": bug_id,
+                            "evidence_requirements": [
+                                {"id": "unit_tests", "required": True},
+                                {"id": "dashboard_e2e", "required": False},
+                            ],
+                        }
+                    },
                     "force_admit": True,
                 },
             )
@@ -432,6 +442,9 @@ class TestBacklogRESTEndpoints(unittest.TestCase):
         self.assertEqual(bug["target_file_count"], 4)
         self.assertEqual(bug["acceptance_count"], 3)
         self.assertEqual(bug["target_files"], ["a.py", "b.py", "c.py"])
+        self.assertEqual(bug["contract_summary"]["template_id"], "mf_parallel.v1")
+        self.assertEqual(bug["contract_summary"]["required_evidence_count"], 1)
+        self.assertEqual(bug["contract_summary"]["optional_evidence_count"], 1)
 
     def test_list_search_and_exclude_closed(self):
         from governance.server import handle_backlog_upsert, handle_backlog_list

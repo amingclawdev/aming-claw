@@ -16772,7 +16772,36 @@ def _backlog_compact_bug(row: sqlite3.Row | dict) -> dict:
         "provenance_count": len(_json_list_field(raw.get("provenance_paths"))),
         "required_docs": required_docs,
         "provenance_paths": provenance_paths,
+        "contract_summary": _backlog_contract_summary(raw.get("chain_trigger_json")),
         "compact": True,
+    }
+
+
+def _backlog_contract_summary(value: Any) -> dict:
+    contract = backlog_runtime.parse_json_object(value)
+    root = contract.get("parallel_contract") if isinstance(contract.get("parallel_contract"), dict) else contract
+    if not isinstance(root, dict) or not root:
+        return {
+            "has_contract": False,
+            "template_id": "",
+            "contract_instance_id": "",
+            "required_evidence_count": 0,
+            "optional_evidence_count": 0,
+        }
+    try:
+        from . import task_timeline
+
+        requirements = task_timeline.mf_contract_requirements(contract)
+    except Exception:
+        requirements = []
+    required = [item for item in requirements if item.get("required", True)]
+    optional = [item for item in requirements if not item.get("required", True)]
+    return {
+        "has_contract": bool(requirements or root.get("template_id") or root.get("contract_instance_id")),
+        "template_id": str(root.get("template_id") or ""),
+        "contract_instance_id": str(root.get("contract_instance_id") or ""),
+        "required_evidence_count": len(required),
+        "optional_evidence_count": len(optional),
     }
 
 

@@ -6,6 +6,7 @@ import type {
   AssetImpactResolutionKind,
   AssetInboxResponse,
   AttachFileHintResponse,
+  BacklogTimelineGateResponse,
   BacklogResponse,
   EdgesResponse,
   FeedbackQueueResponse,
@@ -54,6 +55,13 @@ function backlogListQuery(): string {
 function backlogTimelineQuery(backlogId: string, limit: number): string {
   return new URLSearchParams({
     backlog_id: backlogId,
+    limit: String(limit),
+  }).toString();
+}
+
+function backlogTimelineGateQuery(limit: number): string {
+  return new URLSearchParams({
+    include_events: "true",
     limit: String(limit),
   }).toString();
 }
@@ -308,6 +316,13 @@ export const api = {
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineQuery(backlogId, limit);
     return getJSON<TaskTimelineResponse>(`/api/task/${pidFor(projectId)}/timeline?${q}`, signal);
+  },
+  backlogTimelineGateFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
+    const q = backlogTimelineGateQuery(limit);
+    return getJSON<BacklogTimelineGateResponse>(
+      `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}/timeline-gate?${q}`,
+      signal,
+    );
   },
   snapshotFiles(
     snapshotId: string,

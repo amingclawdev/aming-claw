@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import type { BacklogBug, BacklogResponse, FileInventoryRow, NodeRecord, TaskTimelineEvent } from "../types";
+import type {
+  BacklogBug,
+  BacklogResponse,
+  BacklogTimelineGateResponse,
+  FileInventoryRow,
+  MfCloseTimelineGate,
+  NodeRecord,
+  TaskTimelineEvent,
+} from "../types";
 
 interface Props {
   backlog: BacklogResponse;
@@ -35,6 +43,7 @@ interface TimelineState {
   error: string;
   events: TaskTimelineEvent[];
   count?: number;
+  gate?: BacklogTimelineGateResponse;
 }
 
 export default function BacklogView({ backlog, projectId, snapshotId, nodes }: Props) {
@@ -164,13 +173,14 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
           error: "",
           events: existing?.events ?? [],
           count: existing?.count,
+          gate: existing?.gate,
         },
       };
     });
 
     if (current?.loaded || current?.loading) return;
 
-    api.taskTimelineFor(projectId, bugId, 50)
+    api.backlogTimelineGateFor(projectId, bugId, 50)
       .then((res) => {
         setTimelineByBug((states) => {
           const existing = states[bugId];
@@ -182,7 +192,8 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
               loaded: true,
               error: "",
               events: res.events ?? [],
-              count: res.count,
+              count: res.event_count ?? res.events?.length ?? 0,
+              gate: res,
             },
           };
         });
@@ -200,6 +211,7 @@ export default function BacklogView({ backlog, projectId, snapshotId, nodes }: P
               error: msg,
               events: existing?.events ?? [],
               count: existing?.count,
+              gate: existing?.gate,
             },
           };
         });
@@ -466,6 +478,7 @@ function BacklogRow({
   const files = listFrom(bug.target_files);
   const criteria = listFrom(bug.acceptance_criteria);
   const runtime = bug.runtime_state || bug.chain_stage || bug.mf_type || "idle";
+  const contract = bug.contract_summary;
   return (
     <>
       <tr>
@@ -519,6 +532,11 @@ function BacklogRow({
         </td>
         <td>
           <div className="mono">{runtime}</div>
+          {contract?.has_contract ? (
+            <div className="backlog-commit mono" title="Contract evidence requirements">
+              contract {contract.template_id || contract.contract_instance_id || "declared"} · req {contract.required_evidence_count ?? 0}
+            </div>
+          ) : null}
           {bug.commit ? <div className="backlog-commit mono">{shortCommit(bug.commit)}</div> : null}
           {bug.worktree_branch ? <div className="backlog-commit mono">{bug.worktree_branch}</div> : null}
         </td>
@@ -539,6 +557,8 @@ function BacklogRow({
 
 function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backlogId: string }) {
   const count = timeline.count ?? timeline.events.length;
+  const gate = timeline.gate?.timeline_gate;
+  const lanes = buildTimelineLanes(timeline.events);
   return (
     <div className="backlog-timeline-panel">
       <div className="backlog-timeline-head">
@@ -552,6 +572,35 @@ function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backl
       {!timeline.loading && !timeline.error && timeline.events.length === 0 ? (
         <div className="timeline-empty">No execution events linked to this backlog row.</div>
       ) : null}
+      {!timeline.loading && !timeline.error && gate ? (
+        <GateSummary gate={gate} response={timeline.gate} />
+      ) : null}
+      {!timeline.loading && !timeline.error && lanes.length > 0 ? (
+        <div className="backlog-lane-grid" aria-label="One-hop agent lanes">
+          {lanes.map((lane) => (
+            <div className="backlog-lane-card" key={lane.id}>
+              <div className="backlog-lane-head">
+                <span>{lane.label}</span>
+                <span className="mono">{lane.events.length} event{lane.events.length === 1 ? "" : "s"}</span>
+              </div>
+              <div className="backlog-lane-meta">
+                <span className={`status-badge ${statusClass(lane.latestStatus)}`}>
+                  {lane.latestStatus || "unknown"}
+                </span>
+                {lane.latestActor ? <span>{lane.latestActor}</span> : null}
+                {lane.latestCommit ? <span className="mono">{shortCommit(lane.latestCommit)}</span> : null}
+              </div>
+              {lane.blockers.length > 0 ? (
+                <div className="backlog-lane-blockers">
+                  {lane.blockers.slice(0, 2).map((blocker) => (
+                    <span key={blocker}>{blocker}</span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
       {!timeline.loading && !timeline.error && timeline.events.length > 0 ? (
         <div className="backlog-timeline-list">
           {timeline.events.map((event, index) => (
@@ -561,11 +610,13 @@ function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backl
                   {event.status || event.event_type || "event"}
                 </span>
                 <span className="mono">{event.event_type || "unknown_event"}</span>
+                {event.event_kind ? <span className="mono">{event.event_kind}</span> : null}
                 <span className="mono">{shortDateTime(event.created_at)}</span>
                 <span>{event.actor || "actor unknown"}</span>
                 <span className="mono">event {timelineEventId(event)}</span>
               </div>
               <div className="backlog-timeline-facts">
+                <span className="mono">lane {laneLabelForEvent(event)}</span>
                 <span>{formatVerification(event.verification)}</span>
                 <span>{formatArtifactRefs(event.artifact_refs)}</span>
                 {event.task_id ? <span className="mono">task {event.task_id}</span> : null}
@@ -578,6 +629,168 @@ function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backl
       ) : null}
     </div>
   );
+}
+
+function GateSummary({
+  gate,
+  response,
+}: {
+  gate: MfCloseTimelineGate;
+  response?: BacklogTimelineGateResponse;
+}) {
+  const contract = gate.contract_gate;
+  const present = gate.present_event_kinds ?? [];
+  const missing = gate.missing_event_kinds ?? [];
+  const required = gate.required_event_kinds ?? [];
+  const contractRequired = contract?.required_requirement_ids ?? [];
+  const contractPresent = contract?.present_requirement_ids ?? [];
+  const contractMissing = contract?.missing_requirement_ids ?? [];
+  const contractLabel = contract?.template_id || contract?.contract_instance_id || "no contract";
+  const hasContract = contractRequired.length > 0 || Boolean(contract?.template_id || contract?.contract_instance_id);
+  return (
+    <div className="backlog-gate-grid">
+      <div className={`backlog-gate-card ${gate.passed ? "pass" : "fail"}`}>
+        <div className="backlog-gate-title">
+          <span>Close gate</span>
+          <span className={`status-badge ${gate.passed ? "status-complete" : "status-failed"}`}>
+            {response?.applicable === false ? "not applicable" : gate.status || (gate.passed ? "passed" : "blocked")}
+          </span>
+        </div>
+        <div className="backlog-gate-facts">
+          <span>required {required.length}</span>
+          <span>present {present.length}</span>
+          <span>missing {missing.length}</span>
+          {response?.reason ? <span>{response.reason}</span> : null}
+        </div>
+        <TokenList label="missing" values={missing} empty="none" tone={missing.length ? "red" : "green"} />
+      </div>
+      <div className={`backlog-gate-card ${hasContract && contract?.passed ? "pass" : hasContract ? "fail" : "neutral"}`}>
+        <div className="backlog-gate-title">
+          <span>Contract</span>
+          <span className={`status-badge ${hasContract && contract?.passed ? "status-complete" : hasContract ? "status-failed" : "status-unknown"}`}>
+            {hasContract ? contract?.status || "blocked" : "not declared"}
+          </span>
+        </div>
+        <div className="backlog-gate-facts">
+          <span className="mono">{contractLabel}</span>
+          {contract?.contract_instance_id ? <span className="mono">{contract.contract_instance_id}</span> : null}
+        </div>
+        <TokenList label="required" values={contractRequired} empty="none" />
+        <TokenList label="present" values={contractPresent} empty="none" tone="green" />
+        <TokenList label="missing" values={contractMissing} empty="none" tone={contractMissing.length ? "red" : "green"} />
+      </div>
+    </div>
+  );
+}
+
+function TokenList({
+  label,
+  values,
+  empty,
+  tone = "neutral",
+}: {
+  label: string;
+  values: string[];
+  empty: string;
+  tone?: "neutral" | "green" | "red";
+}) {
+  return (
+    <div className={`backlog-token-list tone-${tone}`}>
+      <span>{label}</span>
+      {(values.length > 0 ? values : [empty]).slice(0, 8).map((value) => (
+        <em key={value} className="mono">{value}</em>
+      ))}
+      {values.length > 8 ? <strong>+{values.length - 8}</strong> : null}
+    </div>
+  );
+}
+
+interface TimelineLane {
+  id: string;
+  label: string;
+  events: TaskTimelineEvent[];
+  latestStatus: string;
+  latestActor: string;
+  latestCommit: string;
+  blockers: string[];
+}
+
+function buildTimelineLanes(events: TaskTimelineEvent[]): TimelineLane[] {
+  const grouped = new Map<string, TaskTimelineEvent[]>();
+  for (const event of events) {
+    const lane = laneLabelForEvent(event);
+    grouped.set(lane, [...(grouped.get(lane) ?? []), event]);
+  }
+  const preferred = ["observer", "backend", "frontend", "gate", "merge", "verification"];
+  return Array.from(grouped.entries())
+    .map(([id, laneEvents]) => {
+      const latest = laneEvents[laneEvents.length - 1] ?? {};
+      return {
+        id,
+        label: titleizeLane(id),
+        events: laneEvents,
+        latestStatus: String(latest.status || latest.decision || latest.event_kind || "unknown"),
+        latestActor: latest.actor || "",
+        latestCommit: latest.commit_sha || "",
+        blockers: laneEvents.flatMap((event) => eventBlockers(event)).filter(Boolean),
+      };
+    })
+    .sort((a, b) => {
+      const ai = preferred.indexOf(a.id);
+      const bi = preferred.indexOf(b.id);
+      if (ai !== bi) return (ai < 0 ? preferred.length : ai) - (bi < 0 ? preferred.length : bi);
+      return a.id.localeCompare(b.id);
+    });
+}
+
+function laneLabelForEvent(event: TaskTimelineEvent): string {
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  const raw =
+    stringField(payload, "lane") ||
+    stringField(payload, "agent_lane") ||
+    stringField(payload, "worker_lane") ||
+    stringField(payload, "agent_id") ||
+    stringField(payload, "parallel_agent_id") ||
+    stringField(verification, "lane") ||
+    event.actor ||
+    event.phase ||
+    event.event_kind ||
+    event.event_type;
+  const normalized = raw.toLowerCase();
+  if (normalized.includes("front")) return "frontend";
+  if (normalized.includes("back")) return "backend";
+  if (normalized.includes("observer")) return "observer";
+  if (normalized.includes("gate") || normalized.includes("close_ready")) return "gate";
+  if (normalized.includes("merge")) return "merge";
+  if (normalized.includes("verify") || normalized.includes("test")) return "verification";
+  if (normalized.includes("implement")) return "implementation";
+  return normalized.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "event";
+}
+
+function eventBlockers(event: TaskTimelineEvent): string[] {
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  return [
+    ...listUnknown(payload.blockers).map(compactUnknown),
+    ...listUnknown(verification.blockers).map(compactUnknown),
+    ...listUnknown(verification.errors).map(compactUnknown),
+  ].filter(Boolean);
+}
+
+function stringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function titleizeLane(value: string): string {
+  if (value === "frontend") return "Frontend";
+  if (value === "backend") return "Backend";
+  if (value === "observer") return "Observer";
+  if (value === "gate") return "Gate";
+  if (value === "merge") return "Merge";
+  if (value === "verification") return "Verification";
+  return value.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
 function timelineEventKey(event: TaskTimelineEvent, index: number): string {

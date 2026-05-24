@@ -551,7 +551,16 @@ export interface BacklogBug {
   acceptance_count?: number;
   required_doc_count?: number;
   provenance_count?: number;
+  contract_summary?: BacklogContractSummary;
   compact?: boolean;
+}
+
+export interface BacklogContractSummary {
+  has_contract?: boolean;
+  template_id?: string;
+  contract_instance_id?: string;
+  required_evidence_count?: number;
+  optional_evidence_count?: number;
 }
 
 export interface TaskTimelineResponse {
@@ -565,6 +574,46 @@ export interface TaskTimelineResponse {
   request_id?: string;
 }
 
+export interface BacklogTimelineGateResponse {
+  ok?: boolean;
+  project_id: string;
+  bug_id: string;
+  applicable: boolean;
+  reason?: string;
+  can_close: boolean;
+  timeline_gate: MfCloseTimelineGate;
+  event_count: number;
+  events?: TaskTimelineEvent[];
+  request_id?: string;
+}
+
+export interface MfCloseTimelineGate {
+  schema_version?: string;
+  passed?: boolean;
+  status?: string;
+  required_event_kinds?: string[];
+  present_event_kinds?: string[];
+  missing_event_kinds?: string[];
+  event_count?: number;
+  ignored_required_events?: Record<string, unknown>[];
+  contract_gate?: MfContractGate;
+  checks?: Record<string, boolean | number | string>;
+}
+
+export interface MfContractGate {
+  schema_version?: string;
+  passed?: boolean;
+  status?: string;
+  template_id?: string;
+  contract_instance_id?: string;
+  required_requirement_ids?: string[];
+  optional_requirement_ids?: string[];
+  present_requirement_ids?: string[];
+  missing_requirement_ids?: string[];
+  evidence_events?: Record<string, unknown>[];
+  checks?: Record<string, boolean | number | string>;
+}
+
 export interface TaskTimelineEvent {
   id?: number;
   event_id?: string;
@@ -574,6 +623,12 @@ export interface TaskTimelineEvent {
   task_id?: string;
   attempt_num?: number;
   event_type: string;
+  phase?: string;
+  event_kind?: string;
+  scenario_id?: string;
+  correlation_id?: string;
+  severity?: string;
+  decision?: string;
   actor?: string;
   status?: string;
   payload?: Record<string, unknown>;

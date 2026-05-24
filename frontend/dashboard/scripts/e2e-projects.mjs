@@ -510,6 +510,27 @@ function verifyEditorJumpWorkspaceContract() {
   ok("editor jump resolves through active project workspace contract");
 }
 
+function verifyBacklogEvidenceContract() {
+  phase("backlog evidence contract");
+  const apiSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/lib/api.ts"), "utf8");
+  const viewSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/views/BacklogView.tsx"), "utf8");
+  const typeSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/types.ts"), "utf8");
+  const cssSource = readFileSync(path.join(REPO_ROOT, "frontend/dashboard/src/styles.css"), "utf8");
+  const serverSource = readFileSync(path.join(REPO_ROOT, "agent/governance/server.py"), "utf8");
+  assert(apiSource.includes("backlogTimelineGateFor"), "Backlog API client should fetch per-row timeline gate evidence");
+  assert(apiSource.includes("/timeline-gate?"), "Backlog API client should call the timeline-gate endpoint");
+  assert(viewSource.includes("GateSummary"), "Backlog row expansion should render close gate and contract state");
+  assert(viewSource.includes("buildTimelineLanes"), "Backlog row expansion should group execution events into one-hop lanes");
+  assert(viewSource.includes("One-hop agent lanes"), "Backlog lane grid should be accessible as one-hop agent lanes");
+  assert(viewSource.includes("contract {contract.template_id"), "Backlog compact rows should scan contract metadata");
+  assert(typeSource.includes("BacklogTimelineGateResponse"), "Dashboard types should model timeline gate response");
+  assert(typeSource.includes("BacklogContractSummary"), "Dashboard types should model compact backlog contract summary");
+  assert(cssSource.includes(".backlog-gate-grid"), "Backlog gate UI should have stable layout CSS");
+  assert(cssSource.includes(".backlog-lane-grid"), "Backlog lane UI should have stable layout CSS");
+  assert(serverSource.includes("contract_summary"), "Compact backlog API should expose contract summary metadata");
+  ok("backlog evidence row exposes timeline gate, contract, and one-hop lanes");
+}
+
 async function main() {
   console.log(c("bold", "dashboard-projects-e2e"));
   console.log(c("dim", `backend=${BACKEND} project=${PROJECT} workspace=${WORKSPACE} apply=${APPLY}`));
@@ -529,6 +550,7 @@ async function main() {
     verifyTreeLayerFilterContract();
     verifyVisualCollaborationPanelsContract();
     verifyEditorJumpWorkspaceContract();
+    verifyBacklogEvidenceContract();
     const project = await ensureProjectRegistered();
     await verifyProjectConfig();
     const runtime = await verifyGraphRuntime(project);

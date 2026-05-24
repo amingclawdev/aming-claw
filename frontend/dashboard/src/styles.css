@@ -1254,6 +1254,97 @@ a:hover { text-decoration: underline; }
   gap: 7px;
 }
 
+.backlog-gate-grid,
+.backlog-lane-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.backlog-gate-card,
+.backlog-lane-card {
+  padding: 8px 10px;
+  border: 1px solid var(--ink-100);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.backlog-gate-card.pass {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.backlog-gate-card.fail {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.backlog-gate-card.neutral {
+  background: var(--ink-50);
+}
+
+.backlog-gate-title,
+.backlog-lane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ink-700);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.backlog-gate-facts,
+.backlog-lane-meta,
+.backlog-lane-blockers {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  color: var(--ink-500);
+  font-size: 10.5px;
+}
+
+.backlog-token-list {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  color: var(--ink-500);
+  font-size: 10.5px;
+}
+
+.backlog-token-list em,
+.backlog-token-list strong {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #fff;
+  color: var(--ink-600);
+  font-style: normal;
+  border: 1px solid var(--ink-100);
+}
+
+.backlog-token-list.tone-green em {
+  color: var(--green-fg);
+  border-color: #bbf7d0;
+}
+
+.backlog-token-list.tone-red em {
+  color: var(--red-fg);
+  border-color: #fecaca;
+}
+
+.backlog-lane-card {
+  background: var(--ink-50);
+}
+
+.backlog-lane-blockers span {
+  color: var(--red-fg);
+}
+
 .backlog-timeline-event {
   padding: 8px 10px;
   border: 1px solid var(--ink-100);
