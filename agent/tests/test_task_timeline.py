@@ -742,6 +742,67 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertTrue(ready["can_close"], ready)
         self.assertTrue(ready["timeline_gate"]["contract_gate"]["passed"])
 
+    def test_backlog_close_handler_loads_instantiated_contract(self):
+        from agent.governance import server, task_timeline
+        from agent.governance.errors import GovernanceError
+
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": "BUG-MF-CONTRACT-CLOSE"},
+                body={
+                    "title": "MF contract close",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        "parallel_contract": {
+                            "template_id": "mf_parallel.v1",
+                            "contract_instance_id": "BUG-MF-CONTRACT-CLOSE",
+                            "evidence_requirements": [
+                                {"id": "unit_tests", "required": True, "phase": "verification"},
+                                {"id": "dashboard_e2e", "required": True, "phase": "integration", "kind": "e2e"},
+                            ],
+                        }
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        for kind in ("implementation", "close_ready"):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-MF-CONTRACT-CLOSE",
+                event_type=f"mf.{kind}",
+                phase=kind,
+                event_kind=kind,
+                status="accepted",
+            )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-CONTRACT-CLOSE",
+            event_type="mf.verification",
+            phase="verification",
+            event_kind="verification",
+            status="passed",
+            verification={"requirement_id": "unit_tests"},
+        )
+        self.conn.commit()
+
+        with self.assertRaises(GovernanceError) as raised:
+            server.handle_backlog_close(
+                _ctx(
+                    path_params={"bug_id": "BUG-MF-CONTRACT-CLOSE"},
+                    body={"actor": "observer"},
+                    method="POST",
+                )
+            )
+
+        self.assertEqual(raised.exception.code, "mf_timeline_gate_failed")
+        self.assertIn("dashboard_e2e", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

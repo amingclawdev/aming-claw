@@ -17275,7 +17275,7 @@ def handle_backlog_close(ctx: RequestContext):
     conn = get_connection(pid)
     try:
         row = conn.execute(
-            "SELECT bug_id, status, chain_stage, bypass_policy_json, mf_type FROM backlog_bugs WHERE bug_id = ?",
+            "SELECT bug_id, status, chain_stage, bypass_policy_json, mf_type, chain_trigger_json FROM backlog_bugs WHERE bug_id = ?",
             (bug_id,),
         ).fetchone()
         if not row:
