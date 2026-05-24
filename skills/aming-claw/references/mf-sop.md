@@ -26,15 +26,22 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - for orphan file flows, put the orphan doc/test/config file in the fixture artifact, verify weak evidence first appears as an `asset_binding_proposal`, then let the E2E write the source-controlled governance hint, commit the fixture change, run Update graph, and assert the binding;
    - file a follow-up backlog row when live-AI, DB-mutating, slow, or human-approval E2E is deferred;
    - write `e2e_not_applicable` with a reason for docs-only or non-runtime changes.
-7. If an AI session or `mf_sub` worker proposes doc/test/config binding changes, require the local asset-binding precheck first:
+7. For parallel MF or subagent work, instantiate a source-controlled contract template before delegation:
+   - start from `agent/governance/contract_templates/mf_parallel.v1.json`;
+   - write the instance to `chain_trigger_json.parallel_contract`;
+   - give every required evidence item a stable `id`;
+   - require timeline evidence to reference ids through `payload.requirement_id(s)`,
+     `verification.requirement_id(s)`, or `verification.contract_evidence[].requirement_id`;
+   - make E2E evidence required for dashboard/API/operator-path changes unless explicitly deferred with a follow-up backlog row.
+8. If an AI session or `mf_sub` worker proposes doc/test/config binding changes, require the local asset-binding precheck first:
    - run `agent.governance.asset_binding_proposals.precheck_asset_binding_proposal` against the draft proposal;
    - include compact `self_precheck` evidence with the submitted proposal;
    - do not request direct graph materialization from weak evidence.
-8. Treat documentation as a commit-bound asset before impact scope:
+9. Treat documentation as a commit-bound asset before impact scope:
    - weak doc path matches stay as doc asset state `candidate` rows;
    - only accepted bindings from review decisions, source-controlled hints, or durable rules count as node-owned docs;
    - when changing doc binding behavior, verify `doc-asset-state.json` shows path/hash/status/proposal evidence.
-9. For observer/MF work, append timeline evidence as work proceeds:
+10. For observer/MF work, append timeline evidence as work proceeds:
    - `task_timeline_append` with `event_kind=implementation` after scoped code,
      docs, config, or fixture changes are made;
    - `task_timeline_append` with `event_kind=verification` after focused tests,

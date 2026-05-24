@@ -1,0 +1,74 @@
+{
+  "schema_version": "mf_contract_template.v1",
+  "template_id": "mf_parallel.v1",
+  "description": "Template for observer-led manual-fix work split across parallel agents. Observer instantiates this template into backlog chain_trigger_json before delegation.",
+  "required_instance_fields": [
+    "contract_instance_id",
+    "workers",
+    "evidence_requirements"
+  ],
+  "worker_contract": {
+    "required_fields": [
+      "owned_files",
+      "responsibility",
+      "required_evidence"
+    ],
+    "forbidden_capabilities": [
+      "merge",
+      "push",
+      "activate_graph",
+      "close_backlog"
+    ]
+  },
+  "evidence_requirements": [
+    {
+      "id": "implementation_evidence",
+      "required": true,
+      "phase": "implementation",
+      "description": "Worker or observer records changed files, scope, and implementation notes."
+    },
+    {
+      "id": "focused_tests",
+      "required": true,
+      "phase": "verification",
+      "description": "Focused unit/API/typecheck evidence for each changed surface."
+    },
+    {
+      "id": "integration_build",
+      "required": false,
+      "phase": "integration",
+      "description": "Build or compile evidence when frontend/runtime assets are affected."
+    },
+    {
+      "id": "integration_e2e",
+      "required": false,
+      "phase": "integration",
+      "kind": "e2e",
+      "description": "Observer sets required=true when the instantiated work affects UI/API/operator flows or any E2E-covered surface."
+    }
+  ],
+  "timeline_contract": {
+    "requirement_id_locations": [
+      "payload.requirement_id",
+      "payload.requirement_ids",
+      "verification.requirement_id",
+      "verification.requirement_ids",
+      "verification.contract_evidence[].requirement_id"
+    ],
+    "passing_statuses": [
+      "accepted",
+      "ok",
+      "passed",
+      "succeeded"
+    ]
+  },
+  "gate_contract": {
+    "close_requires": [
+      "implementation",
+      "verification",
+      "close_ready",
+      "all_required_evidence_requirements"
+    ],
+    "waiver_policy": "Required E2E can be disabled only in the instantiated contract with a reason and follow-up backlog for user-visible or API behavior."
+  }
+}

@@ -171,6 +171,106 @@ def test_mf_close_with_required_timeline_evidence_passes(_mock_subprocess, _mock
 
 
 @patch("agent.governance.server.subprocess.run")
+def test_mf_close_instantiated_contract_missing_e2e_is_blocked(_mock_subprocess, _mock_db, _mock_audit):
+    """Instantiated MF contracts can require specific timeline evidence before close."""
+    from agent.governance.errors import GovernanceError
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    _mock_db.execute.return_value.fetchone.return_value = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "mf_type": "observer_hotfix",
+        "bypass_policy_json": "{}",
+        "chain_stage": "",
+        "chain_trigger_json": {
+            "parallel_contract": {
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": "BUG-001",
+                "evidence_requirements": [
+                    {"id": "unit_tests", "required": True, "phase": "verification"},
+                    {"id": "dashboard_e2e", "required": True, "phase": "integration", "kind": "e2e"},
+                ],
+            }
+        },
+    }
+    events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "passed"},
+        {
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "verification": {"requirement_id": "unit_tests"},
+        },
+        {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+    ]
+    ctx = _make_ctx(commit="abc123")
+
+    with patch("agent.governance.task_timeline.list_events", return_value=events):
+        with pytest.raises(GovernanceError) as exc_info:
+            handle_backlog_close(ctx)
+
+    assert exc_info.value.code == "mf_timeline_gate_failed"
+    assert "dashboard_e2e" in str(exc_info.value)
+
+
+@patch("agent.governance.server.subprocess.run")
+def test_mf_close_instantiated_contract_evidence_passes(_mock_subprocess, _mock_db, _mock_audit):
+    """Contract requirement evidence is returned in the close response."""
+    from agent.governance.server import handle_backlog_close
+
+    _mock_subprocess.return_value = MagicMock(returncode=0)
+    _mock_db.execute.return_value.fetchone.return_value = {
+        "bug_id": "BUG-001",
+        "status": "OPEN",
+        "mf_type": "observer_hotfix",
+        "bypass_policy_json": "{}",
+        "chain_stage": "",
+        "chain_trigger_json": {
+            "parallel_contract": {
+                "template_id": "mf_parallel.v1",
+                "contract_instance_id": "BUG-001",
+                "evidence_requirements": [
+                    {"id": "unit_tests", "required": True, "phase": "verification"},
+                    {"id": "dashboard_e2e", "required": True, "phase": "integration", "kind": "e2e"},
+                ],
+            }
+        },
+    }
+    events = [
+        {"event_kind": "implementation", "phase": "implementation", "status": "passed"},
+        {
+            "event_kind": "verification",
+            "phase": "verification",
+            "status": "passed",
+            "verification": {"requirement_id": "unit_tests"},
+        },
+        {
+            "event_kind": "verification",
+            "phase": "integration",
+            "status": "passed",
+            "verification": {
+                "contract_evidence": [
+                    {"requirement_id": "dashboard_e2e", "status": "passed", "command": "npm run e2e"}
+                ]
+            },
+        },
+        {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+    ]
+    ctx = _make_ctx(commit="abc123")
+
+    with patch("agent.governance.task_timeline.list_events", return_value=events):
+        result = handle_backlog_close(ctx)
+
+    assert result["ok"] is True
+    assert result["timeline_gate"]["contract_gate"]["passed"] is True
+    assert result["timeline_gate"]["contract_gate"]["present_requirement_ids"] == [
+        "dashboard_e2e",
+        "unit_tests",
+    ]
+
+
+@patch("agent.governance.server.subprocess.run")
 def test_mf_close_timeline_gate_explicit_bypass_requires_reason(_mock_subprocess, _mock_db, _mock_audit):
     """Emergency bypass is explicit and records timeline evidence."""
     from agent.governance.errors import GovernanceError

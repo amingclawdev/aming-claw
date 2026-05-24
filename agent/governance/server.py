@@ -16791,7 +16791,8 @@ def handle_backlog_timeline_gate(ctx: RequestContext):
 
         events = task_timeline.list_events(conn, pid, backlog_id=bug_id, limit=limit)
         if applicable["is_mf"]:
-            verification = task_timeline.mf_close_gate_verification(events)
+            contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
+            verification = task_timeline.mf_close_gate_verification(events, contract=contract)
         else:
             verification = {
                 "schema_version": "mf_close_timeline_gate.v1",
@@ -17400,9 +17401,13 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
         return verification
 
     events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
-    verification = task_timeline.mf_close_gate_verification(events)
+    contract = backlog_runtime.parse_json_object(_row_get(row, "chain_trigger_json", "{}"))
+    verification = task_timeline.mf_close_gate_verification(events, contract=contract)
     if not verification.get("passed"):
-        missing = ", ".join(verification.get("missing_event_kinds") or [])
+        missing_event_kinds = verification.get("missing_event_kinds") or []
+        contract_gate = verification.get("contract_gate") if isinstance(verification.get("contract_gate"), dict) else {}
+        missing_contract = contract_gate.get("missing_requirement_ids") or []
+        missing = ", ".join([*missing_event_kinds, *missing_contract])
         raise GovernanceError(
             "mf_timeline_gate_failed",
             f"MF backlog close requires task timeline evidence before FIXED; missing: {missing}",

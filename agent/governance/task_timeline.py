@@ -94,6 +94,8 @@ MF_CLOSE_PASS_STATUSES = {
     "succeeded",
 }
 
+MF_CONTRACT_SCHEMA_VERSION = "mf_contract_gate.v1"
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
@@ -132,6 +134,14 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _scenario_spec(payload: dict[str, Any]) -> dict[str, Any]:
@@ -486,7 +496,166 @@ def mf_test_scenario_verification(payload: dict[str, Any] | None) -> dict[str, A
     }
 
 
-def mf_close_gate_verification(events: list[dict[str, Any]] | None) -> dict[str, Any]:
+def _contract_root(contract: dict[str, Any] | None) -> dict[str, Any]:
+    data = _mapping(contract)
+    for key in ("parallel_contract", "mf_contract", "contract_instance", "contract"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            return nested
+    return data
+
+
+def _normalize_requirement(item: Any, *, default_required: bool = True) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        req_id = item.strip()
+        return {"id": req_id, "required": default_required} if req_id else None
+    item = _mapping(item)
+    req_id = str(item.get("id") or item.get("requirement_id") or "").strip()
+    if not req_id:
+        return None
+    return {
+        "id": req_id,
+        "required": bool(item.get("required", default_required)),
+        "phase": str(item.get("phase") or ""),
+        "kind": str(item.get("kind") or item.get("type") or ""),
+        "command": str(item.get("command") or ""),
+        "label": str(item.get("label") or ""),
+    }
+
+
+def mf_contract_requirements(contract: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return evidence requirements from an instantiated MF contract."""
+
+    root = _contract_root(contract)
+    if not root:
+        return []
+
+    raw_requirements: list[Any] = []
+    raw_requirements.extend(_list(root.get("evidence_requirements")))
+    raw_requirements.extend(_list(root.get("required_evidence")))
+
+    integration = _mapping(root.get("integration"))
+    raw_requirements.extend(
+        {**_mapping(item), "required": True}
+        for item in _list(integration.get("required_evidence"))
+    )
+    raw_requirements.extend(
+        {**_mapping(item), "required": False}
+        for item in _list(integration.get("optional_evidence"))
+    )
+
+    e2e_contract = _mapping(root.get("e2e_contract"))
+    if e2e_contract and bool(e2e_contract.get("required")):
+        raw_requirements.append({
+            "id": e2e_contract.get("requirement_id") or "e2e",
+            "required": True,
+            "phase": "integration",
+            "kind": "e2e",
+            "command": e2e_contract.get("command")
+            or " && ".join(_string_list(e2e_contract.get("commands"))),
+            "label": e2e_contract.get("label") or "E2E",
+        })
+
+    requirements: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_requirements:
+        normalized = _normalize_requirement(raw)
+        if not normalized or normalized["id"] in seen:
+            continue
+        seen.add(normalized["id"])
+        requirements.append(normalized)
+    return requirements
+
+
+def _requirement_ids_from_container(container: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for key in ("requirement_id", "contract_requirement_id"):
+        value = str(container.get(key) or "").strip()
+        if value:
+            ids.add(value)
+    for key in ("requirement_ids", "contract_requirement_ids"):
+        ids.update(_string_list(container.get(key)))
+    return ids
+
+
+def _contract_evidence_ids(event: dict[str, Any]) -> set[str]:
+    status = str(event.get("status") or "").strip().lower()
+    event_passed = status in MF_CLOSE_PASS_STATUSES
+    ids: set[str] = set()
+    payload = _mapping(event.get("payload"))
+    verification = _mapping(event.get("verification"))
+    artifact_refs = _mapping(event.get("artifact_refs"))
+
+    if event_passed:
+        ids.update(_requirement_ids_from_container(payload))
+        ids.update(_requirement_ids_from_container(verification))
+        ids.update(_requirement_ids_from_container(artifact_refs))
+
+    for container in (payload, verification, artifact_refs):
+        for item in _list(container.get("contract_evidence")):
+            evidence = _mapping(item)
+            evidence_status = str(evidence.get("status") or status).strip().lower()
+            if evidence_status not in MF_CLOSE_PASS_STATUSES:
+                continue
+            evidence_id = str(evidence.get("requirement_id") or evidence.get("id") or "").strip()
+            if evidence_id:
+                ids.add(evidence_id)
+    return ids
+
+
+def mf_contract_gate_verification(
+    events: list[dict[str, Any]] | None,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate timeline evidence against an instantiated MF contract."""
+
+    rows = events if isinstance(events, list) else []
+    requirements = mf_contract_requirements(contract)
+    required = [item for item in requirements if item.get("required", True)]
+    required_ids = [item["id"] for item in required]
+    all_requirement_ids = {item["id"] for item in requirements}
+    present: set[str] = set()
+    evidence_events: list[dict[str, Any]] = []
+    for event in rows:
+        event = _mapping(event)
+        ids = _contract_evidence_ids(event)
+        if not ids:
+            continue
+        present.update(ids)
+        evidence_events.append({
+            "id": event.get("id"),
+            "event_kind": event.get("event_kind"),
+            "phase": event.get("phase"),
+            "status": event.get("status"),
+            "requirement_ids": sorted(ids),
+        })
+    missing = [req_id for req_id in required_ids if req_id not in present]
+    root = _contract_root(contract)
+    return {
+        "schema_version": MF_CONTRACT_SCHEMA_VERSION,
+        "passed": not missing,
+        "status": "passed" if not missing else "failed",
+        "template_id": str(root.get("template_id") or ""),
+        "contract_instance_id": str(root.get("contract_instance_id") or ""),
+        "required_requirement_ids": required_ids,
+        "optional_requirement_ids": [
+            item["id"] for item in requirements if not item.get("required", True)
+        ],
+        "present_requirement_ids": sorted(req_id for req_id in present if req_id in all_requirement_ids),
+        "missing_requirement_ids": missing,
+        "evidence_events": evidence_events,
+        "checks": {
+            "has_contract": bool(root),
+            "required_count": len(required_ids),
+            "missing_count": len(missing),
+        },
+    }
+
+
+def mf_close_gate_verification(
+    events: list[dict[str, Any]] | None,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate the minimum observer/MF timeline evidence before backlog close."""
 
     rows = events if isinstance(events, list) else []
@@ -509,19 +678,23 @@ def mf_close_gate_verification(events: list[dict[str, Any]] | None) -> dict[str,
                 "id": event.get("id"),
             })
     missing = sorted(MF_CLOSE_REQUIRED_EVENT_KINDS - present)
+    contract_gate = mf_contract_gate_verification(rows, contract)
+    passed = not missing and bool(contract_gate.get("passed"))
     return {
         "schema_version": "mf_close_timeline_gate.v1",
-        "passed": not missing,
-        "status": "passed" if not missing else "failed",
+        "passed": passed,
+        "status": "passed" if passed else "failed",
         "required_event_kinds": sorted(MF_CLOSE_REQUIRED_EVENT_KINDS),
         "present_event_kinds": sorted(present),
         "missing_event_kinds": missing,
         "event_count": len(rows),
         "ignored_required_events": ignored,
+        "contract_gate": contract_gate,
         "checks": {
             "has_implementation": "implementation" in present,
             "has_verification": "verification" in present,
             "has_close_ready": "close_ready" in present,
+            "has_contract_evidence": bool(contract_gate.get("passed")),
         },
     }
 

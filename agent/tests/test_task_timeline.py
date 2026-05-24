@@ -1,11 +1,13 @@
 """Tests for task implementation timeline evidence."""
 
+import json
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -370,6 +372,102 @@ class TestTaskTimeline(unittest.TestCase):
             ["close_ready", "implementation", "verification"],
         )
 
+    def test_mf_close_gate_requires_instantiated_contract_evidence(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-MF-CONTRACT",
+            "evidence_requirements": [
+                {
+                    "id": "backend_tests",
+                    "required": True,
+                    "phase": "verification",
+                    "command": "pytest -q agent/tests/test_task_timeline.py",
+                },
+                {
+                    "id": "review_queue_category_e2e",
+                    "required": True,
+                    "phase": "integration",
+                    "kind": "e2e",
+                    "command": "cd frontend/dashboard && npm run e2e:semantic -- --project fixture --probe",
+                },
+            ],
+        }
+        base_events = [
+            {"event_kind": "implementation", "phase": "implementation", "status": "accepted"},
+            {
+                "event_kind": "verification",
+                "phase": "verification",
+                "status": "passed",
+                "verification": {
+                    "requirement_ids": ["backend_tests"],
+                    "tests_run": ["pytest -q agent/tests/test_task_timeline.py"],
+                },
+            },
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["missing_event_kinds"], [])
+        self.assertEqual(
+            blocked["contract_gate"]["missing_requirement_ids"],
+            ["review_queue_category_e2e"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                {
+                    "event_kind": "verification",
+                    "phase": "integration",
+                    "status": "passed",
+                    "verification": {
+                        "contract_evidence": [
+                            {
+                                "requirement_id": "review_queue_category_e2e",
+                                "status": "passed",
+                                "command": (
+                                    "cd frontend/dashboard && npm run e2e:semantic "
+                                    "-- --project fixture --probe"
+                                ),
+                            }
+                        ]
+                    },
+                },
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertTrue(ready["contract_gate"]["passed"])
+        self.assertEqual(
+            ready["contract_gate"]["present_requirement_ids"],
+            ["backend_tests", "review_queue_category_e2e"],
+        )
+
+    def test_mf_parallel_template_exposes_optional_e2e_requirement(self):
+        from agent.governance import task_timeline
+
+        template_path = (
+            Path(__file__).resolve().parents[1]
+            / "governance"
+            / "contract_templates"
+            / "mf_parallel.v1.json"
+        )
+        template = json.loads(template_path.read_text(encoding="utf-8"))
+
+        requirements = task_timeline.mf_contract_requirements(template)
+        by_id = {item["id"]: item for item in requirements}
+
+        self.assertIn("focused_tests", by_id)
+        self.assertIn("integration_e2e", by_id)
+        self.assertTrue(by_id["focused_tests"]["required"])
+        self.assertFalse(by_id["integration_e2e"]["required"])
+        self.assertEqual(by_id["integration_e2e"]["kind"], "e2e")
+
     def test_db_migration_from_v41_adds_timeline_v2_columns_and_indexes(self):
         from agent.governance import db
 
@@ -420,7 +518,7 @@ class TestTaskTimeline(unittest.TestCase):
         version = conn.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        self.assertEqual(version, "42")
+        self.assertEqual(version, str(db.SCHEMA_VERSION))
         conn.close()
 
     def test_task_timeline_list_handler_filters_by_backlog_id_query(self):
@@ -559,6 +657,90 @@ class TestTaskTimeline(unittest.TestCase):
             ready["timeline_gate"]["present_event_kinds"],
             ["close_ready", "implementation", "verification"],
         )
+
+    def test_backlog_timeline_gate_precheck_uses_instantiated_contract(self):
+        from agent.governance import server, task_timeline
+
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": "BUG-MF-CONTRACT-PRECHECK"},
+                body={
+                    "title": "MF contract precheck",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                    "chain_trigger_json": {
+                        "parallel_contract": {
+                            "template_id": "mf_parallel.v1",
+                            "contract_instance_id": "BUG-MF-CONTRACT-PRECHECK",
+                            "evidence_requirements": [
+                                {"id": "unit_tests", "required": True, "phase": "verification"},
+                                {"id": "dashboard_e2e", "required": True, "phase": "integration", "kind": "e2e"},
+                            ],
+                        }
+                    },
+                },
+                method="POST",
+            )
+        )
+
+        for kind in ("implementation", "close_ready"):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-MF-CONTRACT-PRECHECK",
+                event_type=f"mf.{kind}",
+                phase=kind,
+                event_kind=kind,
+                status="accepted",
+            )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-CONTRACT-PRECHECK",
+            event_type="mf.verification",
+            phase="verification",
+            event_kind="verification",
+            status="passed",
+            verification={"requirement_id": "unit_tests"},
+        )
+        self.conn.commit()
+
+        blocked = server.handle_backlog_timeline_gate(
+            _ctx(path_params={"bug_id": "BUG-MF-CONTRACT-PRECHECK"})
+        )
+
+        self.assertFalse(blocked["can_close"])
+        self.assertEqual(
+            blocked["timeline_gate"]["contract_gate"]["missing_requirement_ids"],
+            ["dashboard_e2e"],
+        )
+
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-CONTRACT-PRECHECK",
+            event_type="mf.integration.e2e",
+            phase="integration",
+            event_kind="verification",
+            status="passed",
+            verification={
+                "contract_evidence": [
+                    {
+                        "requirement_id": "dashboard_e2e",
+                        "status": "passed",
+                        "command": "npm run e2e:semantic -- --project fixture --probe",
+                    }
+                ]
+            },
+        )
+        self.conn.commit()
+
+        ready = server.handle_backlog_timeline_gate(
+            _ctx(path_params={"bug_id": "BUG-MF-CONTRACT-PRECHECK"})
+        )
+        self.assertTrue(ready["can_close"], ready)
+        self.assertTrue(ready["timeline_gate"]["contract_gate"]["passed"])
 
 
 if __name__ == "__main__":

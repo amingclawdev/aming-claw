@@ -202,6 +202,7 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R16 | Asset binding proposal-first | Any doc/test/config binding suggestion produced by an observer, AI session, or `mf_sub` worker | Weak evidence such as path mentions, import-only references, semantic summaries, or downgraded weak test fan-in MUST be submitted as an `asset_binding_proposal` with `self_precheck`, not written as trusted graph state. Only source-controlled governance hints, accepted review decisions, direct test symbol imports, or registered config loader/rule evidence may materialize during reconcile. |
 | R17 | Doc asset impact boundary | Any documentation binding or review-impact claim | Documentation files are commit-bound assets first. Reconcile MUST preserve doc hash/state in doc asset state; weak matches remain `candidate`; review impact MUST consume accepted doc bindings only. Use AI/observer proposal review or source-controlled hints before treating a doc as node-owned. |
 | R18 | Observer MF timeline gate | Every observer/manual-fix backlog close | MUST append task timeline rows for `event_kind=implementation`, `event_kind=verification`, and `event_kind=close_ready` against the same `backlog_id` before calling backlog close. Governance enforces this in `handle_backlog_close`; missing rows return `mf_timeline_gate_failed`. Emergency bypass requires `bypass_timeline_gate=true` plus a non-empty `timeline_bypass_reason`, and the bypass is itself written to the task timeline. |
+| R19 | Instantiated contract gate | Parallel MF work, subagent work, dashboard/API/user-visible behavior, or any task with explicit evidence requirements | Observer MUST instantiate a source-controlled contract template such as `agent/governance/contract_templates/mf_parallel.v1.json` into `chain_trigger_json.parallel_contract` before delegation. Required evidence items MUST have stable `id` values. Timeline evidence MUST reference those ids through `payload.requirement_id(s)`, `verification.requirement_id(s)`, or `verification.contract_evidence[].requirement_id`. `handle_backlog_close` blocks MF close until every required contract evidence id is present with a passing status. |
 
 ---
 
@@ -250,7 +251,32 @@ The allowed outcomes are:
 When the E2E impact planner exists for the project, use it as the source of truth
 for `current`, `stale`, `missing`, and `blocked` suite status. Chain integration
 is tracked separately in backlog rows and is not required for manual execution of
-this rule.
+this rule. For parallel/MF work, encode the E2E decision in the instantiated
+contract:
+
+```json
+{
+  "parallel_contract": {
+    "template_id": "mf_parallel.v1",
+    "contract_instance_id": "<backlog-id>",
+    "evidence_requirements": [
+      {"id": "focused_tests", "required": true, "phase": "verification"},
+      {
+        "id": "integration_e2e",
+        "required": true,
+        "phase": "integration",
+        "kind": "e2e",
+        "command": "cd frontend/dashboard && npm run e2e:semantic -- --project <fixture> --probe"
+      }
+    ]
+  }
+}
+```
+
+Subagents should write only their assigned evidence. The observer writes
+integration/build/E2E evidence after combining branches or worktree changes.
+The close gate checks the instantiated contract, not just the generic
+`verification` event.
 
 #### R14.1 Artifact-backed E2E Flow
 
