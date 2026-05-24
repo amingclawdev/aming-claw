@@ -10,6 +10,7 @@ from agent.governance import graph_events
 from agent.governance import graph_snapshot_store as store
 from agent.governance import server
 from agent.governance.asset_inbox_contract import (
+    ASSET_GROUPS,
     ASSET_STATUSES,
     BATCH_ACTIONS,
     asset_inbox_batch_actions,
@@ -42,6 +43,7 @@ def test_asset_inbox_mock_payload_passes_shared_precheck() -> None:
     assert result["errors"] == []
     assert result["item_count"] == payload["summary"]["total"]
     assert result["status_count"] == len(ASSET_STATUSES)
+    assert {group["group_id"] for group in payload["asset_groups"]} == ASSET_GROUPS
 
 
 def test_asset_inbox_precheck_accepts_empty_read_model() -> None:
@@ -70,6 +72,10 @@ def test_asset_inbox_fixture_covers_every_status_and_batch_action() -> None:
     assert set(payload["summary"]["by_status"]) == ASSET_STATUSES
     assert {action["action"] for action in payload["batch_actions"]} == BATCH_ACTIONS
     assert payload["impact_scope_policy"] == "accepted_bindings_only"
+    assert payload["summary"]["relation_count"] == len(payload["items"])
+    assert payload["summary"]["mount_relation_count"] == payload["summary"]["relation_count"]
+    assert payload["summary"]["impact_scope_count"] == 2
+    assert payload["summary"]["review_required_count"] == 5
     assert payload["backlog_policy"] == {
         "default_container": False,
         "create_from_selected_assets_only": True,
@@ -94,6 +100,28 @@ def test_candidates_are_reviewable_but_not_trusted_bindings() -> None:
         assert candidate["precheck"]["decision"] == "review_required"
         assert candidate["precheck"]["binding_strength"] == "weak"
         assert candidate["precheck"]["proposal_hash"] == candidate["proposal_hash"]
+        assert item["relation_summary"] == {
+            "accepted_count": 0,
+            "candidate_count": 1,
+            "relation_count": 1,
+            "impact_scope_count": 0,
+            "review_required_count": 1,
+        }
+        assert item["mount_relations"] == [
+            {
+                "relation_id": item["mount_relations"][0]["relation_id"],
+                "status": "candidate",
+                "role": item["asset_kind"],
+                "target_node_id": "L7.runtime",
+                "target_title": "src.runtime",
+                "source": candidate["source"],
+                "evidence_kind": candidate["evidence_kind"],
+                "proposal_hash": candidate["proposal_hash"],
+                "binding_strength": "weak",
+                "impact_scope": False,
+                "review_required": True,
+            }
+        ]
 
 
 def test_accepted_bindings_only_enter_impact_scope() -> None:
@@ -111,6 +139,85 @@ def test_accepted_bindings_only_enter_impact_scope() -> None:
             "title": "src.runtime",
             "role": "doc",
             "source": "source_controlled_hint",
+        }
+    ]
+    assert accepted[0]["mount_relations"] == [
+        {
+            "relation_id": "accepted:file_docs_accepted-runtime.md:L7.runtime:doc:source_controlled_hint:0",
+            "status": "accepted",
+            "role": "doc",
+            "target_node_id": "L7.runtime",
+            "target_title": "src.runtime",
+            "source": "source_controlled_hint",
+            "evidence_kind": "accepted_binding",
+            "proposal_hash": "",
+            "binding_strength": "accepted",
+            "impact_scope": True,
+            "review_required": False,
+        }
+    ]
+    assert accepted[0]["relation_summary"]["impact_scope_count"] == 1
+
+
+def test_asset_groups_are_navigation_ready_without_table_parsing() -> None:
+    payload = _fixture()
+    by_group = {group["group_id"]: group for group in payload["asset_groups"]}
+    all_group_ids = [
+        asset_id
+        for group in payload["asset_groups"]
+        for asset_id in group["item_ids"]
+    ]
+
+    assert set(by_group) == ASSET_GROUPS
+    assert sorted(all_group_ids) == sorted(item["asset_id"] for item in payload["items"])
+    assert by_group["doc"]["count"] == 4
+    assert by_group["doc"]["status_counts"] == {
+        "accepted": 1,
+        "archive": 1,
+        "doc_candidate": 1,
+        "doc_unbound": 1,
+    }
+    assert by_group["test"]["items"] == [
+        {
+            "asset_id": "file:tests/test_runtime_bridge.py",
+            "path": "tests/test_runtime_bridge.py",
+            "asset_status": "test_candidate",
+            "asset_kind": "test",
+            "relation_count": 1,
+            "review_required_count": 1,
+            "impact_scope_count": 0,
+        }
+    ]
+    assert by_group["config"]["items"][0]["asset_id"] == "file:config/runtime.yaml"
+    assert by_group["source"]["status_counts"] == {"source_orphan": 1, "stale": 1}
+    assert by_group["ignored"]["item_ids"] == ["file:dist/bundle.js"]
+
+
+def test_no_relation_assets_are_explicit_mount_relation_none() -> None:
+    payload = _fixture()
+    by_path = {item["path"]: item for item in payload["items"]}
+    config = by_path["config/runtime.yaml"]
+
+    assert config["relation_summary"] == {
+        "accepted_count": 0,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 1,
+    }
+    assert config["mount_relations"] == [
+        {
+            "relation_id": "none:file_config_runtime.yaml",
+            "status": "none",
+            "role": "config",
+            "target_node_id": "",
+            "target_title": "",
+            "source": "asset_inbox",
+            "evidence_kind": "no_binding",
+            "proposal_hash": "",
+            "binding_strength": "",
+            "impact_scope": False,
+            "review_required": True,
         }
     ]
 
@@ -336,6 +443,7 @@ def test_live_asset_inbox_response_materializes_from_snapshot_state(asset_inbox_
 
     assert payload["ok"] is True
     assert payload["precheck"]["ok"] is True
+    assert {group["group_id"] for group in payload["asset_groups"]} == ASSET_GROUPS
     assert payload["summary"]["by_status"] == {
         "accepted": 1,
         "archive": 1,
@@ -347,10 +455,18 @@ def test_live_asset_inbox_response_materializes_from_snapshot_state(asset_inbox_
         "stale": 1,
         "test_candidate": 1,
     }
+    assert payload["summary"]["relation_count"] == 9
+    assert payload["summary"]["impact_scope_count"] == 2
+    assert payload["summary"]["review_required_count"] == 5
     assert by_path["docs/runtime.md"]["binding_candidates"][0]["precheck"]["decision"] == "review_required"
+    assert by_path["docs/runtime.md"]["mount_relations"][0]["status"] == "candidate"
+    assert by_path["docs/runtime.md"]["mount_relations"][0]["review_required"] is True
+    assert by_path["config/runtime.yaml"]["mount_relations"][0]["status"] == "none"
     assert by_path["tests/test_runtime_bridge.py"]["asset_status"] == "test_candidate"
     assert by_path["docs/accepted-runtime.md"]["asset_status"] == "accepted"
+    assert by_path["docs/accepted-runtime.md"]["mount_relations"][0]["impact_scope"] is True
     assert by_path["src/runtime.py"]["asset_status"] == "stale"
+    assert by_path["src/runtime.py"]["mount_relations"][0]["status"] == "accepted"
     assert by_path["src/runtime.py"]["backlog"]["eligible"] is True
 
 
@@ -408,6 +524,8 @@ def test_asset_inbox_uses_db_doc_asset_projection_before_json_artifact(asset_inb
     assert payload["source_artifacts"]["doc_asset_projection_source"] == "db_projection"
     assert by_path["docs/service.md"]["asset_status"] == "doc_candidate"
     assert by_path["docs/service.md"]["binding_candidates"][0]["source"] == "db_projection_test"
+    assert by_path["docs/service.md"]["mount_relations"][0]["source"] == "db_projection_test"
+    assert by_path["docs/service.md"]["relation_summary"]["candidate_count"] == 1
 
 
 def test_asset_inbox_api_supports_active_snapshot(asset_inbox_conn) -> None:

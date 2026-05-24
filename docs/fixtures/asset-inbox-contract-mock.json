@@ -41,7 +41,11 @@
     "accepted_count": 1,
     "unbound_count": 1,
     "backlog_eligible_count": 3,
-    "operator_review_count": 4
+    "operator_review_count": 5,
+    "relation_count": 9,
+    "mount_relation_count": 9,
+    "impact_scope_count": 2,
+    "review_required_count": 5
   },
   "items": [
     {
@@ -75,6 +79,28 @@
       "backlog": {
         "eligible": true,
         "reason": "New source orphan may require graph ownership or adapter/config work."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "none:file_src_newFeature.ts",
+          "status": "none",
+          "role": "source",
+          "target_node_id": "",
+          "target_title": "",
+          "source": "asset_inbox",
+          "evidence_kind": "no_binding",
+          "proposal_hash": "",
+          "binding_strength": "",
+          "impact_scope": false,
+          "review_required": true
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 1
       }
     },
     {
@@ -108,6 +134,28 @@
       "backlog": {
         "eligible": false,
         "reason": "Unbound docs are asset state until review finds actionable work."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "none:file_docs_service.md",
+          "status": "none",
+          "role": "doc",
+          "target_node_id": "",
+          "target_title": "",
+          "source": "asset_inbox",
+          "evidence_kind": "no_binding",
+          "proposal_hash": "",
+          "binding_strength": "",
+          "impact_scope": false,
+          "review_required": true
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 1
       }
     },
     {
@@ -164,6 +212,28 @@
       "backlog": {
         "eligible": false,
         "reason": "Candidate binding should be reviewed or hinted before creating implementation work."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "candidate:file_docs_runtime.md:L7.runtime:sha256_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+          "status": "candidate",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "doc_coverage",
+          "evidence_kind": "path_reference",
+          "proposal_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "binding_strength": "weak",
+          "impact_scope": false,
+          "review_required": true
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 1,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 1
       }
     },
     {
@@ -200,6 +270,28 @@
       "backlog": {
         "eligible": false,
         "reason": "Accepted binding is already graph state."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file_docs_accepted-runtime.md:L7.runtime:doc:source_controlled_hint:0",
+          "status": "accepted",
+          "role": "doc",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "source_controlled_hint",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": false
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 0
       }
     },
     {
@@ -255,6 +347,28 @@
       "backlog": {
         "eligible": false,
         "reason": "Weak test evidence should be reviewed before treating as coverage debt."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "candidate:file_tests_test_runtime_bridge.py:L7.runtime:sha256_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0",
+          "status": "candidate",
+          "role": "test",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "test_consumer_fanin",
+          "evidence_kind": "test_import_fanin",
+          "proposal_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "binding_strength": "weak",
+          "impact_scope": false,
+          "review_required": true
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 1,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 1
       }
     },
     {
@@ -288,6 +402,28 @@
       "backlog": {
         "eligible": true,
         "reason": "Config ownership may require a registered config rule or loader."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "none:file_config_runtime.yaml",
+          "status": "none",
+          "role": "config",
+          "target_node_id": "",
+          "target_title": "",
+          "source": "asset_inbox",
+          "evidence_kind": "no_binding",
+          "proposal_hash": "",
+          "binding_strength": "",
+          "impact_scope": false,
+          "review_required": true
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 1
       }
     },
     {
@@ -315,6 +451,28 @@
       "backlog": {
         "eligible": false,
         "reason": "Ignored generated files are not backlog work."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "none:file_dist_bundle.js",
+          "status": "none",
+          "role": "generated",
+          "target_node_id": "",
+          "target_title": "",
+          "source": "asset_inbox",
+          "evidence_kind": "no_binding",
+          "proposal_hash": "",
+          "binding_strength": "",
+          "impact_scope": false,
+          "review_required": false
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 0
       }
     },
     {
@@ -344,6 +502,28 @@
       "backlog": {
         "eligible": false,
         "reason": "Archive docs stay out of impact scope."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "none:file_docs_dev_session-handoff.md",
+          "status": "none",
+          "role": "doc",
+          "target_node_id": "",
+          "target_title": "",
+          "source": "asset_inbox",
+          "evidence_kind": "no_binding",
+          "proposal_hash": "",
+          "binding_strength": "",
+          "impact_scope": false,
+          "review_required": false
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 0,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 0,
+        "review_required_count": 0
       }
     },
     {
@@ -389,6 +569,28 @@
       "backlog": {
         "eligible": true,
         "reason": "Stale mapped source may require semantic refresh or scoped implementation review."
+      },
+      "mount_relations": [
+        {
+          "relation_id": "accepted:file_src_runtime.ts:L7.runtime:primary:graph_node:0",
+          "status": "accepted",
+          "role": "primary",
+          "target_node_id": "L7.runtime",
+          "target_title": "src.runtime",
+          "source": "graph_node",
+          "evidence_kind": "accepted_binding",
+          "proposal_hash": "",
+          "binding_strength": "accepted",
+          "impact_scope": true,
+          "review_required": false
+        }
+      ],
+      "relation_summary": {
+        "accepted_count": 1,
+        "candidate_count": 0,
+        "relation_count": 1,
+        "impact_scope_count": 1,
+        "review_required_count": 0
       }
     }
   ],
@@ -400,6 +602,7 @@
         "doc_unbound",
         "config_pending_decision"
       ],
+      "requires_selection": true,
       "requires_review": true,
       "mutates_source": false,
       "payload_example": {
@@ -417,6 +620,7 @@
         "source_orphan",
         "stale"
       ],
+      "requires_selection": true,
       "requires_review": true,
       "mutates_source": false,
       "payload_example": {
@@ -433,6 +637,7 @@
         "doc_candidate",
         "test_candidate"
       ],
+      "requires_selection": true,
       "requires_review": true,
       "mutates_source": false,
       "payload_example": {
@@ -451,8 +656,8 @@
         "config_pending_decision",
         "stale"
       ],
-      "requires_review": false,
       "requires_selection": true,
+      "requires_review": false,
       "mutates_source": false,
       "creates_backlog": true,
       "payload_example": {
@@ -472,6 +677,7 @@
         "test_candidate",
         "config_pending_decision"
       ],
+      "requires_selection": true,
       "requires_review": true,
       "mutates_source": true,
       "payload_example": {
@@ -480,6 +686,178 @@
         "role": "doc",
         "actor": "observer"
       }
+    }
+  ],
+  "asset_groups": [
+    {
+      "group_id": "doc",
+      "label": "Docs",
+      "count": 4,
+      "status_counts": {
+        "accepted": 1,
+        "archive": 1,
+        "doc_candidate": 1,
+        "doc_unbound": 1
+      },
+      "item_ids": [
+        "file:docs/service.md",
+        "file:docs/runtime.md",
+        "file:docs/accepted-runtime.md",
+        "file:docs/dev/session-handoff.md"
+      ],
+      "items": [
+        {
+          "asset_id": "file:docs/service.md",
+          "path": "docs/service.md",
+          "asset_status": "doc_unbound",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 0
+        },
+        {
+          "asset_id": "file:docs/runtime.md",
+          "path": "docs/runtime.md",
+          "asset_status": "doc_candidate",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 0
+        },
+        {
+          "asset_id": "file:docs/accepted-runtime.md",
+          "path": "docs/accepted-runtime.md",
+          "asset_status": "accepted",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 0,
+          "impact_scope_count": 1
+        },
+        {
+          "asset_id": "file:docs/dev/session-handoff.md",
+          "path": "docs/dev/session-handoff.md",
+          "asset_status": "archive",
+          "asset_kind": "doc",
+          "relation_count": 1,
+          "review_required_count": 0,
+          "impact_scope_count": 0
+        }
+      ]
+    },
+    {
+      "group_id": "test",
+      "label": "Tests",
+      "count": 1,
+      "status_counts": {
+        "test_candidate": 1
+      },
+      "item_ids": [
+        "file:tests/test_runtime_bridge.py"
+      ],
+      "items": [
+        {
+          "asset_id": "file:tests/test_runtime_bridge.py",
+          "path": "tests/test_runtime_bridge.py",
+          "asset_status": "test_candidate",
+          "asset_kind": "test",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 0
+        }
+      ]
+    },
+    {
+      "group_id": "config",
+      "label": "Config",
+      "count": 1,
+      "status_counts": {
+        "config_pending_decision": 1
+      },
+      "item_ids": [
+        "file:config/runtime.yaml"
+      ],
+      "items": [
+        {
+          "asset_id": "file:config/runtime.yaml",
+          "path": "config/runtime.yaml",
+          "asset_status": "config_pending_decision",
+          "asset_kind": "config",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 0
+        }
+      ]
+    },
+    {
+      "group_id": "source",
+      "label": "Source",
+      "count": 2,
+      "status_counts": {
+        "source_orphan": 1,
+        "stale": 1
+      },
+      "item_ids": [
+        "file:src/newFeature.ts",
+        "file:src/runtime.ts"
+      ],
+      "items": [
+        {
+          "asset_id": "file:src/newFeature.ts",
+          "path": "src/newFeature.ts",
+          "asset_status": "source_orphan",
+          "asset_kind": "source",
+          "relation_count": 1,
+          "review_required_count": 1,
+          "impact_scope_count": 0
+        },
+        {
+          "asset_id": "file:src/runtime.ts",
+          "path": "src/runtime.ts",
+          "asset_status": "stale",
+          "asset_kind": "source",
+          "relation_count": 1,
+          "review_required_count": 0,
+          "impact_scope_count": 1
+        }
+      ]
+    },
+    {
+      "group_id": "generated",
+      "label": "Generated",
+      "count": 0,
+      "status_counts": {},
+      "item_ids": [],
+      "items": []
+    },
+    {
+      "group_id": "ignored",
+      "label": "Ignored",
+      "count": 1,
+      "status_counts": {
+        "ignored": 1
+      },
+      "item_ids": [
+        "file:dist/bundle.js"
+      ],
+      "items": [
+        {
+          "asset_id": "file:dist/bundle.js",
+          "path": "dist/bundle.js",
+          "asset_status": "ignored",
+          "asset_kind": "generated",
+          "relation_count": 1,
+          "review_required_count": 0,
+          "impact_scope_count": 0
+        }
+      ]
+    },
+    {
+      "group_id": "other",
+      "label": "Other",
+      "count": 0,
+      "status_counts": {},
+      "item_ids": [],
+      "items": []
     }
   ]
 }

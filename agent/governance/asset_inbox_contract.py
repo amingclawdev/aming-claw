@@ -37,6 +37,16 @@ ASSET_KINDS = {
     "unknown",
 }
 
+ASSET_GROUPS = {
+    "doc",
+    "test",
+    "config",
+    "source",
+    "generated",
+    "ignored",
+    "other",
+}
+
 BATCH_ACTIONS = {
     "queue_asset_binding_proposals",
     "queue_semantic_enrich",
@@ -123,6 +133,8 @@ def validate_asset_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 errors.append(f"{item_path}.binding_candidates[{c_index}].precheck_not_ok")
             if not precheck.get("proposal_hash"):
                 errors.append(f"{item_path}.binding_candidates[{c_index}].proposal_hash_required")
+        relation_errors = _validate_item_relations(raw_item, item_path)
+        errors.extend(relation_errors)
         recommended = raw_item.get("recommended_actions") or []
         if not isinstance(recommended, list):
             errors.append(f"{item_path}.recommended_actions_must_be_list")
@@ -146,6 +158,8 @@ def validate_asset_inbox_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             normalized = {str(key): _int_value(value, 0) for key, value in by_status.items()}
             if normalized != dict(sorted(counts.items())):
                 errors.append("summary_by_status_mismatch")
+
+    errors.extend(_validate_asset_groups(payload.get("asset_groups"), seen_ids, require=bool(items)))
 
     actions = payload.get("batch_actions")
     if not isinstance(actions, list):
@@ -249,6 +263,10 @@ def build_asset_inbox_response(
             "by_kind": dict(sorted(by_kind.items())),
             "candidate_count": by_status.get("doc_candidate", 0) + by_status.get("test_candidate", 0),
             "accepted_count": by_status.get("accepted", 0),
+            "relation_count": sum(_int_value((item.get("relation_summary") or {}).get("relation_count"), 0) for item in items),
+            "mount_relation_count": sum(_int_value((item.get("relation_summary") or {}).get("relation_count"), 0) for item in items),
+            "impact_scope_count": sum(_int_value((item.get("relation_summary") or {}).get("impact_scope_count"), 0) for item in items),
+            "review_required_count": sum(_int_value((item.get("relation_summary") or {}).get("review_required_count"), 0) for item in items),
             "unbound_count": by_status.get("doc_unbound", 0),
             "backlog_eligible_count": sum(
                 1 for item in items
@@ -265,6 +283,7 @@ def build_asset_inbox_response(
                 }
             ),
         },
+        "asset_groups": _asset_groups(items),
         "items": items,
         "batch_actions": asset_inbox_batch_actions(),
     }
@@ -364,7 +383,7 @@ def _asset_item_from_inventory(
     status = _asset_status(row, kind, bindings=bindings, candidates=candidates, doc_asset=doc_asset, stale_paths=stale_paths)
     if not status:
         return None
-    return {
+    item = {
         "asset_id": f"file:{path}",
         "path": path,
         "asset_kind": kind,
@@ -384,6 +403,274 @@ def _asset_item_from_inventory(
         "risk": _risk_for_status(status),
         "evidence": _asset_evidence(row, status=status, doc_asset=doc_asset, stale=status == "stale"),
         "backlog": _backlog_state(status),
+    }
+    _attach_relation_contract(item)
+    return item
+
+
+def _attach_relation_contract(item: dict[str, Any]) -> None:
+    relations = _mount_relations(item)
+    item["mount_relations"] = relations
+    item["relation_summary"] = _relation_summary(relations)
+
+
+def _mount_relations(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    asset_id = str(item.get("asset_id") or "")
+    role_default = _relation_role(str(item.get("asset_kind") or ""))
+    relations: list[dict[str, Any]] = []
+    for index, binding in enumerate(item.get("accepted_bindings") or []):
+        if not isinstance(binding, Mapping):
+            continue
+        target_node_id = str(binding.get("node_id") or binding.get("target_node_id") or "")
+        target_title = str(binding.get("title") or binding.get("target_title") or target_node_id)
+        role = str(binding.get("role") or role_default)
+        source = str(binding.get("source") or "accepted_binding")
+        relations.append({
+            "relation_id": _relation_id("accepted", asset_id, target_node_id, role, source, str(index)),
+            "status": "accepted",
+            "role": role,
+            "target_node_id": target_node_id,
+            "target_title": target_title,
+            "source": source,
+            "evidence_kind": str(binding.get("evidence_kind") or "accepted_binding"),
+            "proposal_hash": "",
+            "binding_strength": str(binding.get("binding_strength") or "accepted"),
+            "impact_scope": True,
+            "review_required": False,
+        })
+    for index, candidate in enumerate(item.get("binding_candidates") or []):
+        if not isinstance(candidate, Mapping):
+            continue
+        precheck = candidate.get("precheck") if isinstance(candidate.get("precheck"), Mapping) else {}
+        target_node_id = str(candidate.get("target_node_id") or "")
+        target_title = str(candidate.get("target_title") or target_node_id)
+        role = str(candidate.get("role") or candidate.get("asset_kind") or role_default)
+        proposal_hash = str(candidate.get("proposal_hash") or precheck.get("proposal_hash") or "")
+        relations.append({
+            "relation_id": _relation_id("candidate", asset_id, target_node_id, proposal_hash, str(index)),
+            "status": "candidate",
+            "role": _relation_role(role),
+            "target_node_id": target_node_id,
+            "target_title": target_title,
+            "source": str(candidate.get("source") or "binding_candidate"),
+            "evidence_kind": str(candidate.get("evidence_kind") or ""),
+            "proposal_hash": proposal_hash,
+            "binding_strength": str(precheck.get("binding_strength") or candidate.get("binding_strength") or ""),
+            "impact_scope": False,
+            "review_required": True,
+        })
+    if relations:
+        return relations
+    return [{
+        "relation_id": _relation_id("none", asset_id),
+        "status": "none",
+        "role": role_default,
+        "target_node_id": "",
+        "target_title": "",
+        "source": "asset_inbox",
+        "evidence_kind": "no_binding",
+        "proposal_hash": "",
+        "binding_strength": "",
+        "impact_scope": False,
+        "review_required": _status_requires_review(str(item.get("asset_status") or "")),
+    }]
+
+
+def _relation_summary(relations: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    relation_list = [relation for relation in relations if isinstance(relation, Mapping)]
+    return {
+        "accepted_count": sum(1 for relation in relation_list if relation.get("status") == "accepted"),
+        "candidate_count": sum(1 for relation in relation_list if relation.get("status") == "candidate"),
+        "relation_count": len(relation_list),
+        "impact_scope_count": sum(1 for relation in relation_list if relation.get("impact_scope") is True),
+        "review_required_count": sum(1 for relation in relation_list if relation.get("review_required") is True),
+    }
+
+
+def _asset_groups(items: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[Mapping[str, Any]]] = {group_id: [] for group_id in sorted(ASSET_GROUPS)}
+    for item in items:
+        buckets[_asset_group_id(item)].append(item)
+    labels = {
+        "doc": "Docs",
+        "test": "Tests",
+        "config": "Config",
+        "source": "Source",
+        "generated": "Generated",
+        "ignored": "Ignored",
+        "other": "Other",
+    }
+    out = []
+    for group_id in ["doc", "test", "config", "source", "generated", "ignored", "other"]:
+        group_items = buckets[group_id]
+        out.append({
+            "group_id": group_id,
+            "label": labels[group_id],
+            "count": len(group_items),
+            "status_counts": dict(sorted(Counter(str(item.get("asset_status") or "") for item in group_items).items())),
+            "item_ids": [str(item.get("asset_id") or "") for item in group_items],
+            "items": [
+                {
+                    "asset_id": str(item.get("asset_id") or ""),
+                    "path": str(item.get("path") or ""),
+                    "asset_status": str(item.get("asset_status") or ""),
+                    "asset_kind": str(item.get("asset_kind") or ""),
+                    "relation_count": _int_value((item.get("relation_summary") or {}).get("relation_count"), 0),
+                    "review_required_count": _int_value((item.get("relation_summary") or {}).get("review_required_count"), 0),
+                    "impact_scope_count": _int_value((item.get("relation_summary") or {}).get("impact_scope_count"), 0),
+                }
+                for item in group_items
+            ],
+        })
+    return out
+
+
+def _asset_group_id(item: Mapping[str, Any]) -> str:
+    if str(item.get("asset_status") or "") == "ignored":
+        return "ignored"
+    kind = str(item.get("asset_kind") or "")
+    if kind == "index_doc":
+        return "doc"
+    if kind in {"doc", "test", "config", "source", "generated"}:
+        return kind
+    return "other"
+
+
+def _validate_item_relations(item: Mapping[str, Any], item_path: str) -> list[str]:
+    errors: list[str] = []
+    relations = item.get("mount_relations")
+    if not isinstance(relations, list) or not relations:
+        return [f"{item_path}.mount_relations_required"]
+    relation_ids: set[str] = set()
+    allowed_statuses = {"accepted", "candidate", "none"}
+    for index, relation in enumerate(relations):
+        relation_path = f"{item_path}.mount_relations[{index}]"
+        if not isinstance(relation, Mapping):
+            errors.append(f"{relation_path}_must_be_object")
+            continue
+        relation_id = str(relation.get("relation_id") or "")
+        if not relation_id:
+            errors.append(f"{relation_path}.relation_id_required")
+        elif relation_id in relation_ids:
+            errors.append(f"{relation_path}.relation_id_duplicate")
+        relation_ids.add(relation_id)
+        status = str(relation.get("status") or "")
+        if status not in allowed_statuses:
+            errors.append(f"{relation_path}.status_invalid")
+        role = str(relation.get("role") or "")
+        if not role:
+            errors.append(f"{relation_path}.role_required")
+        if relation.get("impact_scope") not in {True, False}:
+            errors.append(f"{relation_path}.impact_scope_boolean_required")
+        if relation.get("review_required") not in {True, False}:
+            errors.append(f"{relation_path}.review_required_boolean_required")
+        if status == "accepted":
+            if not relation.get("target_node_id"):
+                errors.append(f"{relation_path}.accepted_target_node_id_required")
+            if relation.get("impact_scope") is not True:
+                errors.append(f"{relation_path}.accepted_must_be_impact_scope")
+        if status == "candidate":
+            if not relation.get("target_node_id"):
+                errors.append(f"{relation_path}.candidate_target_node_id_required")
+            if not relation.get("proposal_hash"):
+                errors.append(f"{relation_path}.candidate_proposal_hash_required")
+            if relation.get("review_required") is not True:
+                errors.append(f"{relation_path}.candidate_must_require_review")
+            if relation.get("impact_scope") is not False:
+                errors.append(f"{relation_path}.candidate_must_not_be_impact_scope")
+    summary = item.get("relation_summary")
+    if not isinstance(summary, Mapping):
+        errors.append(f"{item_path}.relation_summary_required")
+        return errors
+    expected = _relation_summary(relations)
+    for key, value in expected.items():
+        if _int_value(summary.get(key), -1) != value:
+            errors.append(f"{item_path}.relation_summary_{key}_mismatch")
+    return errors
+
+
+def _validate_asset_groups(
+    raw_groups: Any,
+    item_ids: set[str],
+    *,
+    require: bool,
+) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(raw_groups, list):
+        if require:
+            return ["asset_groups_required"]
+        return []
+    seen_group_ids: set[str] = set()
+    grouped_item_ids: list[str] = []
+    for index, raw_group in enumerate(raw_groups):
+        group_path = f"asset_groups[{index}]"
+        if not isinstance(raw_group, Mapping):
+            errors.append(f"{group_path}_must_be_object")
+            continue
+        group_id = str(raw_group.get("group_id") or "")
+        if group_id not in ASSET_GROUPS:
+            errors.append(f"{group_path}.group_id_invalid")
+        elif group_id in seen_group_ids:
+            errors.append(f"{group_path}.group_id_duplicate")
+        seen_group_ids.add(group_id)
+        item_refs = raw_group.get("item_ids")
+        if not isinstance(item_refs, list):
+            errors.append(f"{group_path}.item_ids_must_be_list")
+            item_refs = []
+        normalized_refs = [str(item_id) for item_id in item_refs if str(item_id)]
+        grouped_item_ids.extend(normalized_refs)
+        if _int_value(raw_group.get("count"), -1) != len(normalized_refs):
+            errors.append(f"{group_path}.count_mismatch")
+        for item_id in normalized_refs:
+            if item_id not in item_ids:
+                errors.append(f"{group_path}.unknown_asset_id:{item_id}")
+        group_items = raw_group.get("items")
+        if not isinstance(group_items, list):
+            errors.append(f"{group_path}.items_must_be_list")
+            continue
+        group_item_ids = [
+            str(item.get("asset_id") or "")
+            for item in group_items
+            if isinstance(item, Mapping) and item.get("asset_id")
+        ]
+        if group_item_ids != normalized_refs:
+            errors.append(f"{group_path}.items_do_not_match_item_ids")
+        for item_index, group_item in enumerate(group_items):
+            if not isinstance(group_item, Mapping):
+                errors.append(f"{group_path}.items[{item_index}]_must_be_object")
+                continue
+            if not group_item.get("path"):
+                errors.append(f"{group_path}.items[{item_index}].path_required")
+            if not group_item.get("asset_status"):
+                errors.append(f"{group_path}.items[{item_index}].asset_status_required")
+    if require and seen_group_ids != ASSET_GROUPS:
+        errors.append("asset_groups_missing:" + ",".join(sorted(ASSET_GROUPS - seen_group_ids)))
+    if require and sorted(grouped_item_ids) != sorted(item_ids):
+        errors.append("asset_groups_item_ids_mismatch")
+    return errors
+
+
+def _relation_role(role: str) -> str:
+    if role == "index_doc":
+        return "doc"
+    if role in {"doc", "test", "config", "source", "generated", "primary", "secondary"}:
+        return role
+    return role or "asset"
+
+
+def _relation_id(*parts: str) -> str:
+    normalized = [str(part).replace(":", "_").replace("/", "_") for part in parts if str(part)]
+    return ":".join(normalized)
+
+
+def _status_requires_review(status: str) -> bool:
+    return status in {
+        "source_orphan",
+        "doc_unbound",
+        "doc_candidate",
+        "test_candidate",
+        "config_pending_decision",
+        "stale",
     }
 
 
@@ -832,6 +1119,7 @@ def _utc_now() -> str:
 
 
 __all__ = [
+    "ASSET_GROUPS",
     "ASSET_KINDS",
     "ASSET_STATUSES",
     "BACKLOG_ELIGIBLE_STATUSES",

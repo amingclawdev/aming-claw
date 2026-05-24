@@ -666,6 +666,8 @@ export type AssetInboxKind =
   | "test"
   | "config"
   | "generated"
+  | "ignored"
+  | "other"
   | "unknown";
 
 export type AssetInboxBatchActionName =
@@ -687,6 +689,7 @@ export interface AssetInboxResponse {
   backlog_policy: AssetInboxBacklogPolicy;
   summary: AssetInboxSummary;
   items: AssetInboxItem[];
+  asset_groups?: AssetInboxAssetGroup[];
   batch_actions: AssetInboxBatchAction[];
   precheck?: AssetInboxResponsePrecheck;
 }
@@ -723,11 +726,57 @@ export interface AssetInboxItem {
   size_bytes?: number;
   accepted_bindings: AssetInboxBinding[];
   binding_candidates: AssetInboxBindingCandidate[];
+  mount_relations?: AssetInboxMountRelation[];
+  relation_summary?: AssetInboxRelationSummary;
   recommended_actions: Array<AssetInboxBatchActionName | string>;
   batch_eligible_actions?: Array<AssetInboxBatchActionName | string>;
   risk?: "low" | "medium" | "high" | string;
   evidence: AssetInboxEvidence[];
   backlog: AssetInboxBacklogState;
+}
+
+export interface AssetInboxAssetGroup {
+  group_id?: "doc" | "test" | "config" | "source" | "generated" | "ignored" | "other" | string;
+  group?: "doc" | "test" | "config" | "source" | "generated" | "ignored" | "other" | string;
+  label?: string;
+  count: number;
+  item_ids?: string[];
+  items?: AssetInboxAssetGroupItem[];
+  paths?: string[];
+  status_counts?: Record<AssetInboxStatus | string, number>;
+  statuses?: Record<AssetInboxStatus | string, number>;
+}
+
+export interface AssetInboxAssetGroupItem {
+  asset_id: string;
+  path: string;
+  asset_status: AssetInboxStatus | string;
+  asset_kind: AssetInboxKind | string;
+  relation_count?: number;
+  review_required_count?: number;
+  impact_scope_count?: number;
+}
+
+export interface AssetInboxMountRelation {
+  relation_id: string;
+  status: "accepted" | "candidate" | string;
+  role?: "doc" | "test" | "config" | string;
+  target_node_id: string;
+  target_title?: string;
+  source?: string;
+  evidence_kind?: string;
+  proposal_hash?: string;
+  binding_strength?: "weak" | "strong" | string;
+  impact_scope?: boolean | string | string[];
+  review_required?: boolean;
+}
+
+export interface AssetInboxRelationSummary {
+  accepted_count?: number;
+  candidate_count?: number;
+  relation_count?: number;
+  impact_scope_count?: number;
+  review_required_count?: number;
 }
 
 export interface AssetInboxBinding {
