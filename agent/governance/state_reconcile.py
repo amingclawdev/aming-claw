@@ -3608,6 +3608,24 @@ def _finalize_scope_reconcile_candidate(
             created_by=created_by,
         )
         pending_notes["scope_graph_events"] = scope_event_summary
+        try:
+            from agent.governance import asset_impact
+
+            pending_notes["asset_impact"] = asset_impact.record_scope_asset_impacts(
+                conn,
+                project_id,
+                snapshot_id=sid,
+                commit_sha=target,
+                scope_graph_delta=scope_graph_delta,
+                asset_kind="doc",
+                actor=created_by,
+            )
+        except Exception as exc:
+            pending_notes["asset_impact"] = {
+                "ok": False,
+                "error": str(exc),
+                "source": "scope_reconcile_asset_impact",
+            }
         activation_succeeded = bool(result.get("activation"))
         updated = _update_pending_scope_candidate(
             conn,
