@@ -4615,6 +4615,7 @@ def test_graph_governance_file_hygiene_hint_attach_writes_source_hint(conn, monk
     text = doc.read_text(encoding="utf-8")
     assert text.startswith("<!-- governance-hint ")
     assert '"target_node_id": "L7.1"' in text
+    assert '"target_title": "Feature Node"' in text
     assert '"path": "docs/orphan.md"' in text
 
     second = server.handle_graph_governance_snapshot_file_hygiene_hint_attach(
@@ -4631,6 +4632,82 @@ def test_graph_governance_file_hygiene_hint_attach_writes_source_hint(conn, monk
     )
     assert second["already_present"] is True
     assert doc.read_text(encoding="utf-8").count("governance-hint") == 1
+
+
+def test_graph_governance_file_hygiene_hint_repair_stabilizes_and_withdraws_source_hint(
+    conn,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        server,
+        "_require_graph_governance_operator",
+        lambda _ctx, _conn, _action: {"role": "observer"},
+    )
+    project = tmp_path / "project"
+    doc = project / "docs" / "orphan.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text(
+        "<!-- governance-hint "
+        '{"attach_to_node":{"path":"docs/orphan.md","role":"doc","target_node_id":"L7.1"}}'
+        " -->\n\n# Orphan\n",
+        encoding="utf-8",
+    )
+    graph = _graph()
+    graph["deps_graph"]["nodes"][0]["metadata"]["module"] = "agent.governance.server"
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="full-file-hygiene-hint-repair",
+        commit_sha="head",
+        snapshot_kind="full",
+        graph_json=graph,
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=graph["deps_graph"]["edges"],
+    )
+    conn.commit()
+
+    repaired = server.handle_graph_governance_snapshot_file_hygiene_hint_repair(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "docs/orphan.md",
+                "action": "stabilize",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+            },
+        )
+    )
+
+    assert repaired["ok"] is True
+    assert repaired["state"] == "written_uncommitted"
+    assert repaired["changed"] is True
+    text = doc.read_text(encoding="utf-8")
+    assert '"target_module": "agent.governance.server"' in text
+    assert '"target_title": "Feature Node"' in text
+
+    withdrawn = server.handle_graph_governance_snapshot_file_hygiene_hint_repair(
+        _ctx(
+            {"project_id": PID, "snapshot_id": snapshot["snapshot_id"]},
+            method="POST",
+            body={
+                "path": "docs/orphan.md",
+                "action": "withdraw",
+                "project_root": str(project),
+                "actor": "dashboard-user",
+            },
+        )
+    )
+
+    assert withdrawn["ok"] is True
+    assert withdrawn["withdrawn_count"] == 1
+    assert "governance-hint" not in doc.read_text(encoding="utf-8")
 
 
 def test_graph_governance_file_hygiene_batch_actions_create_auditable_events(conn, monkeypatch):

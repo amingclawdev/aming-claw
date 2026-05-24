@@ -7012,6 +7012,27 @@ def _snapshot_node_by_id(store, conn, project_id: str, snapshot_id: str, node_id
     return {}
 
 
+def _snapshot_node_stable_hint_fields(node: dict) -> dict[str, str]:
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    module = str(node.get("module") or metadata.get("module") or "").strip()
+    title = str(node.get("title") or "").strip()
+    area_key = str(node.get("area_key") or metadata.get("area_key") or "").strip()
+    subsystem_key = str(node.get("subsystem_key") or metadata.get("subsystem_key") or "").strip()
+    asset_key = str(node.get("asset_key") or metadata.get("asset_key") or "").strip()
+    out: dict[str, str] = {}
+    if module:
+        out["target_module"] = module
+    if area_key:
+        out["target_area_key"] = area_key
+    if subsystem_key:
+        out["target_subsystem_key"] = subsystem_key
+    if asset_key:
+        out["target_asset_key"] = asset_key
+    if title:
+        out["target_title"] = title
+    return out
+
+
 @route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/hints/attach")
 def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContext):
     """Write a source-controlled governance hint into an orphan file.
@@ -7071,6 +7092,7 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
                 "path": path,
                 "role": role,
                 "target_node_id": node_id,
+                **_snapshot_node_stable_hint_fields(target_node),
             }
         }
         comment = render_governance_hint_comment(path, payload)
@@ -7119,6 +7141,104 @@ def handle_graph_governance_snapshot_file_hygiene_hint_attach(ctx: RequestContex
             "hint": comment,
             "file": row,
             "target_node": target_node,
+        }
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/snapshots/{snapshot_id}/file-hygiene/hints/repair")
+def handle_graph_governance_snapshot_file_hygiene_hint_repair(ctx: RequestContext):
+    """Repair or withdraw source-controlled governance hint comments.
+
+    This endpoint edits only the project file containing the hint.  The graph
+    changes only after the operator commits the file and runs Update Graph.
+    """
+    project_id = ctx.get_project_id()
+    raw_snapshot_id = ctx.path_params["snapshot_id"]
+    body = ctx.body
+    from . import graph_snapshot_store as store
+    from .errors import ValidationError
+    from .governance_hints import rewrite_governance_hint_text
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.snapshot.file-hygiene.hint.repair")
+        snapshot_id = _resolve_graph_snapshot_id(conn, project_id, raw_snapshot_id)
+        root = _graph_governance_project_root(project_id, body)
+        path = str(body.get("path") or body.get("file_path") or "").strip().replace("\\", "/").strip("/")
+        if not path:
+            raise ValidationError("path is required")
+        action = str(body.get("action") or "").strip().lower()
+        if action not in {"stabilize", "withdraw"}:
+            raise ValidationError("action must be stabilize or withdraw")
+        abs_path = _resolve_project_child(root, path)
+        if not abs_path.exists() or not abs_path.is_file():
+            raise ValidationError(f"file does not exist: {path}")
+        try:
+            text = abs_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(f"file is not utf-8 text: {path}") from exc
+        nodes = store.list_graph_snapshot_nodes(
+            conn,
+            project_id,
+            snapshot_id,
+            limit=2000,
+            include_semantic=False,
+        )
+        rewrite = rewrite_governance_hint_text(
+            text,
+            source_path=path,
+            nodes=[dict(node) for node in nodes],
+            action=action,
+            path=str(body.get("hint_path") or body.get("target_path") or path),
+            role=str(body.get("role") or ""),
+            target_node_id=str(body.get("target_node_id") or body.get("node_id") or ""),
+            target_module=str(body.get("target_module") or ""),
+        )
+        dry_run = bool(body.get("dry_run")) if body.get("dry_run") is not None else False
+        if rewrite["changed"] and not dry_run:
+            abs_path.write_text(str(rewrite["text"]), encoding="utf-8")
+        audit_service.record(
+            conn,
+            project_id,
+            "governance_hint_repair",
+            actor=str(body.get("actor") or "dashboard-user"),
+            request_id=ctx.request_id,
+            details=json.dumps({
+                "snapshot_id": snapshot_id,
+                "path": path,
+                "action": action,
+                "dry_run": dry_run,
+                "changed": rewrite["changed"],
+                "repaired_count": rewrite["repaired_count"],
+                "withdrawn_count": rewrite["withdrawn_count"],
+                "error_count": rewrite["error_count"],
+            }, ensure_ascii=False, sort_keys=True),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "path": path,
+            "action": action,
+            "state": "planned" if dry_run else "written_uncommitted",
+            "dry_run": dry_run,
+            "changed": rewrite["changed"],
+            "repaired_count": rewrite["repaired_count"],
+            "withdrawn_count": rewrite["withdrawn_count"],
+            "unchanged_count": rewrite["unchanged_count"],
+            "error_count": rewrite["error_count"],
+            "errors": rewrite["errors"],
+            "requires_commit": bool(rewrite["changed"] and not dry_run),
+            "update_graph_after_commit": bool(rewrite["changed"] and not dry_run),
+            "message": (
+                "Governance hint repair written. Commit the file, then run Update graph."
+                if rewrite["changed"] and not dry_run
+                else "Governance hint repair planned; no source file was changed."
+                if dry_run
+                else "No matching governance hint needed a change."
+            ),
         }
     finally:
         conn.close()

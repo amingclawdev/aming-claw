@@ -57,6 +57,13 @@ AI proposals are not trusted graph state. A weak doc/test/config match can be
 shown, rejected, waived, or converted into source-controlled evidence such as a
 governance hint. Direct graph DB edits are out of scope.
 
+Governance hints should carry stable target evidence such as `target_module` or
+the composite `target_area_key` + `target_subsystem_key` + `target_title` when
+possible. `target_title` alone is accepted only when it resolves to one graph
+node. Node-id-only or ambiguous title-only hints are repair candidates after a
+full graph rebuild. Resetting a hint means withdrawing the source-controlled
+hint comment, committing the file, and reconciling the graph projection.
+
 ## Mock Fixture
 
 The shared fixture is:

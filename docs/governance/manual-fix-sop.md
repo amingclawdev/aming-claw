@@ -1,4 +1,4 @@
-<!-- governance-hint {"attach_to_node": {"path": "docs/governance/manual-fix-sop.md", "role": "doc", "target_node_id": "L7.148"}} -->
+<!-- governance-hint {"attach_to_node": {"path": "docs/governance/manual-fix-sop.md", "role": "doc", "target_area_key": "agent.governance", "target_node_id": "L3.13", "target_subsystem_key": "workflow_orchestration", "target_title": "Workflow Orchestration"}} -->
 
 # Manual Fix SOP (Standard Operating Procedure)
 
@@ -304,6 +304,29 @@ generated example projects:
 6. If the E2E is deferred, file a backlog row with the missing artifact,
    scenario, expected assertions, and reason for deferral before closing the MF
    row.
+
+#### R14.2 Source-controlled Governance Hint Repair
+
+Governance hints are durable only as source-controlled evidence. Do not repair
+doc/test/config bindings by editing graph DB rows directly.
+
+When a hint contains only `target_node_id`, treat it as a repair candidate:
+node ids can change after a full graph rebuild. Prefer stable target evidence
+such as `target_module`, or the composite `target_area_key` +
+`target_subsystem_key` + `target_title`. `target_title` alone is stable only
+when it resolves to exactly one node. If a hint contains both an unambiguous
+stable target and a node id, the stable target is authoritative; the node id is
+legacy convenience evidence.
+
+For hint reset/repair:
+
+1. Audit the hint against the active snapshot.
+2. Use the source-controlled hint repair path to either:
+   - `stabilize` the hint by adding stable target metadata; or
+   - `withdraw` the hint by removing the hint comment from the file.
+3. Commit the changed file.
+4. Run Update Graph/reconcile so the projected binding is added, moved, or
+   withdrawn from graph state.
 
 ---
 

@@ -1,4 +1,4 @@
-<!-- governance-hint {"attach_to_node": {"path": "skills/aming-claw/references/mf-sop.md", "role": "doc", "target_node_id": "L7.159"}} -->
+<!-- governance-hint {"attach_to_node": {"path": "skills/aming-claw/references/mf-sop.md", "role": "doc", "target_area_key": "agent.governance", "target_node_id": "L3.13", "target_subsystem_key": "workflow_orchestration", "target_title": "Workflow Orchestration"}} -->
 
 # Manual-Fix Checklist
 
@@ -43,6 +43,11 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - weak doc path matches stay as doc asset state `candidate` rows;
    - only accepted bindings from review decisions, source-controlled hints, or durable rules count as node-owned docs;
    - when changing doc binding behavior, verify `doc-asset-state.json` shows path/hash/status/proposal evidence.
+   - governance hints should prefer stable target evidence such as
+     `target_module`, or `target_area_key` + `target_subsystem_key` +
+     `target_title`; title-only hints are repair candidates when the title is
+     ambiguous. Reset/repair hints by editing the source hint, committing it,
+     and running Update Graph/reconcile.
 10. For observer/MF work, append timeline evidence as work proceeds:
    - `task_timeline_append` with `event_kind=implementation` after scoped code,
      docs, config, or fixture changes are made;

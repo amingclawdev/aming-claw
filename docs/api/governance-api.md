@@ -197,6 +197,28 @@ Body: {"project_id": "<pid>", "status": "idle"}
 
 ## API Quick Reference
 
+### Graph Governance: File Hygiene Hints
+
+These endpoints edit source-controlled hint comments only. They do not mutate
+graph DB state directly; commit the changed file and run Update Graph/reconcile
+before expecting the binding projection to change.
+
+| Operation | Method | Path | Description |
+|-----------|--------|------|-------------|
+| Attach hint | POST | `/api/graph-governance/{pid}/snapshots/{sid}/file-hygiene/hints/attach` | Write a governance hint into an orphan doc/test/config file. New hints include stable target metadata such as module, area/subsystem/title, or asset key when the snapshot node exposes it. |
+| Repair hint | POST | `/api/graph-governance/{pid}/snapshots/{sid}/file-hygiene/hints/repair` | `action=stabilize` adds stable target metadata and repairs ambiguous title-only hints; `action=withdraw` removes the source hint comment. |
+
+Repair body shape:
+
+```json
+{
+  "path": "docs/service.md",
+  "action": "stabilize",
+  "project_root": "/path/to/project",
+  "dry_run": false
+}
+```
+
 ### Common to All Roles
 
 | Operation | Method | Path | Description |
