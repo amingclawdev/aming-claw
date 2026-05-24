@@ -169,8 +169,9 @@ claims are available.
 
 If governance is offline or this is a fresh install:
 
-1. If the user asks to install from a Git URL, prefer the host-native plugin
-   flow first:
+1. If the user asks only to install from a Git URL, prefer the host-native
+   plugin flow first. This is install-only; do not start governance or open the
+   dashboard unless the prompt also contains an explicit one-shot trigger:
 
    ```text
    Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
@@ -240,6 +241,7 @@ Use the main `aming-claw` skill (`skills/aming-claw/SKILL.md`) for:
 Default behavior is "show the command and wait." Switch to one-shot mode only
 when the user's prompt contains an explicit completion trigger:
 
+- "one-shot install and open dashboard"
 - "install and start"
 - "install and open dashboard"
 - "install end-to-end"
@@ -313,6 +315,11 @@ Do not enter one-shot mode when:
 
 - The user only asks to start, only asks to open, or only asks for status.
 - The user asks for a dry-run, preview, or "show me the commands first".
+- The user only asks to "install the Aming Claw plugin" or "install from
+  https://github.com/amingclawdev/aming-claw" without "start", "open
+  dashboard", "end-to-end", "full", or "one-shot". Treat that as install-only:
+  refresh plugin assets, then explain that install-only does not start
+  governance or open the dashboard.
 - Governance is already healthy — just confirm health and run `aming-claw open`.
 
 ## What Not To Do

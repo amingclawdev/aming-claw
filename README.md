@@ -78,14 +78,16 @@ and troubleshooting notes are in [Install Details](#install-details).
 
 ### Codex
 
-Ask Codex to install from the GitHub repo:
+Ask Codex for the complete one-shot path. This installs the plugin/runtime,
+starts local governance, and opens the dashboard:
 
 ```text
 One-shot install and open dashboard for Aming Claw from https://github.com/amingclawdev/aming-claw
 ```
 
-If the `aming-claw` CLI is already available and you only want to refresh the
-local plugin package without starting governance, run:
+If you only want to refresh the local plugin package, use the install-only
+command instead. Install-only does not start the long-running governance service
+and does not open the dashboard:
 
 ```bash
 aming-claw plugin install https://github.com/amingclawdev/aming-claw
@@ -541,16 +543,22 @@ surfaces the specific reason (e.g., `missing`, `routing missing`); structural
 graph queries, backlog, and Manual Fix still work without any AI CLI. See
 [Runtime Boundaries](#runtime-boundaries) for the full state model.
 
-If you are starting from a plugin host, give it the repository URL:
+If you are starting from Codex and want the full first-run experience, use the
+one-shot prompt from [Quick Start](#quick-start):
+
+```text
+One-shot install and open dashboard for Aming Claw from https://github.com/amingclawdev/aming-claw
+```
+
+Plain plugin-install wording is install-only. It should install or refresh
+plugin assets, but it should not start governance or open the dashboard:
 
 ```text
 Install the Aming Claw plugin from https://github.com/amingclawdev/aming-claw
 ```
 
-For Codex, the lowest-friction path when `aming-claw` is not yet on `PATH` is
-to ask Codex to install from GitHub (the [Quick Start](#quick-start) prompt
-does this in one line). When you need the raw bootstrap script verbatim —
-Windows PowerShell or macOS/Linux `curl` — see
+When you need the raw bootstrap script verbatim - Windows PowerShell or
+macOS/Linux `curl` - see
 [`docs/install/codex-bootstrap.md`](docs/install/codex-bootstrap.md).
 
 ### Claude Code install detail
