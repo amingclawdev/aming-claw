@@ -17202,7 +17202,8 @@ def handle_backlog_close(ctx: RequestContext):
     conn = get_connection(pid)
     try:
         row = conn.execute(
-            "SELECT bug_id, status FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
+            "SELECT bug_id, status, chain_stage, bypass_policy_json, mf_type FROM backlog_bugs WHERE bug_id = ?",
+            (bug_id,),
         ).fetchone()
         if not row:
             raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
@@ -17235,6 +17236,8 @@ def handle_backlog_close(ctx: RequestContext):
                 log.warning("git rev-parse timed out for commit %s; allowing close", commit_sha)
             except FileNotFoundError:
                 log.warning("git not found; skipping commit verification for %s", commit_sha)
+
+        timeline_gate = _verify_mf_close_timeline_gate(conn, pid, bug_id, row, body)
 
         # Determine chain_stage based on prior status
         chain_stage = "manual-fix" if prior_status == "MF_IN_PROGRESS" else None
@@ -17278,9 +17281,70 @@ def handle_backlog_close(ctx: RequestContext):
         result = {"ok": True, "bug_id": bug_id, "status": "FIXED", "fixed_at": now}
         if chain_stage:
             result["chain_stage"] = chain_stage
+        if timeline_gate:
+            result["timeline_gate"] = timeline_gate
         return result
     finally:
         conn.close()
+
+
+def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body: dict) -> dict:
+    """Require append-only timeline evidence before observer/MF backlog close."""
+
+    policy = backlog_runtime.parse_json_object(_row_get(row, "bypass_policy_json", "{}"))
+    mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
+    chain_stage = str(_row_get(row, "chain_stage", "") or "").strip()
+    prior_status = str(_row_get(row, "status", "") or "").strip()
+    is_mf = bool(
+        prior_status == "MF_IN_PROGRESS"
+        or mf_type
+        or chain_stage in {"manual-fix", "observer-hotfix", "chain_rescue"}
+    )
+    if not is_mf:
+        return {}
+
+    from . import task_timeline
+
+    bypass = bool(body.get("bypass_timeline_gate"))
+    if bypass:
+        reason = str(body.get("timeline_bypass_reason") or "").strip()
+        if len(reason) < 20:
+            raise GovernanceError(
+                "mf_timeline_bypass_reason_required",
+                "bypass_timeline_gate requires timeline_bypass_reason with at least 20 characters",
+                422,
+            )
+        verification = {
+            "schema_version": "mf_close_timeline_gate.v1",
+            "passed": True,
+            "status": "bypassed",
+            "reason": reason,
+        }
+        task_timeline.record_event(
+            conn,
+            project_id=project_id,
+            backlog_id=bug_id,
+            event_type="mf_timeline_gate_bypass",
+            phase="close",
+            event_kind="timeline_gate_bypass",
+            actor=str(body.get("actor") or "observer"),
+            status="accepted",
+            payload={"reason": reason},
+            verification=verification,
+            commit_sha=str(body.get("commit") or ""),
+        )
+        return verification
+
+    events = task_timeline.list_events(conn, project_id, backlog_id=bug_id, limit=1000)
+    verification = task_timeline.mf_close_gate_verification(events)
+    if not verification.get("passed"):
+        missing = ", ".join(verification.get("missing_event_kinds") or [])
+        raise GovernanceError(
+            "mf_timeline_gate_failed",
+            f"MF backlog close requires task timeline evidence before FIXED; missing: {missing}",
+            422,
+        )
+    return verification
 
 
 @route("GET", "/api/docs")

@@ -201,6 +201,7 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R15 | Plugin update state gate | Every manual fix before commit and before close | MUST run MCP `preflight_check` and resolve any `plugin_update_state` blocker. `python -m agent.cli mf precommit-check --json-output` can be used as supplemental local evidence from the repo checkout; do not assume a stale installed `aming-claw` shell command has the same subcommands until plugin/CLI update aftercare has run. `update_available` and missing state are warnings that must be recorded, not blockers. `applied_pending_restart`, failed update state, or unsatisfied MCP/governance/ServiceManager restart obligations MUST be resolved before closing the MF row. |
 | R16 | Asset binding proposal-first | Any doc/test/config binding suggestion produced by an observer, AI session, or `mf_sub` worker | Weak evidence such as path mentions, import-only references, semantic summaries, or downgraded weak test fan-in MUST be submitted as an `asset_binding_proposal` with `self_precheck`, not written as trusted graph state. Only source-controlled governance hints, accepted review decisions, direct test symbol imports, or registered config loader/rule evidence may materialize during reconcile. |
 | R17 | Doc asset impact boundary | Any documentation binding or review-impact claim | Documentation files are commit-bound assets first. Reconcile MUST preserve doc hash/state in doc asset state; weak matches remain `candidate`; review impact MUST consume accepted doc bindings only. Use AI/observer proposal review or source-controlled hints before treating a doc as node-owned. |
+| R18 | Observer MF timeline gate | Every observer/manual-fix backlog close | MUST append task timeline rows for `event_kind=implementation`, `event_kind=verification`, and `event_kind=close_ready` against the same `backlog_id` before calling backlog close. Governance enforces this in `handle_backlog_close`; missing rows return `mf_timeline_gate_failed`. Emergency bypass requires `bypass_timeline_gate=true` plus a non-empty `timeline_bypass_reason`, and the bypass is itself written to the task timeline. |
 
 ---
 
@@ -735,6 +736,9 @@ Phase 4: POST-COMMIT VERIFY
   $ python -m agent.cli mf precommit-check --json-output -> plugin_update_state has no blockers
   $ wf_impact(server.py) -> confirm 15 nodes (unchanged)
   $ task_create type=test for L4.15 verification (Rule R3)
+  $ POST /api/task/<project>/timeline event_kind=implementation with changed files and implementation evidence
+  $ POST /api/task/<project>/timeline event_kind=verification with test/preflight/reconcile evidence
+  $ POST /api/task/<project>/timeline event_kind=close_ready after graph is current and close evidence is complete
 
 Phase 5: WORKFLOW RESTORE PROOF
   $ task_create type=test "verify auto_chain dispatch works"

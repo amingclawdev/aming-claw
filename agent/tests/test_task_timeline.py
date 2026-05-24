@@ -312,6 +312,61 @@ class TestTaskTimeline(unittest.TestCase):
                 result = task_timeline.mf_test_scenario_verification(payload)
                 self.assertEqual(result["passed"], expected, result)
 
+    def test_mf_close_gate_requires_observer_execution_evidence(self):
+        from agent.governance import task_timeline
+
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-GATE",
+            event_type="mf.implementation.completed",
+            phase="implement",
+            event_kind="implementation",
+            actor="observer",
+            status="passed",
+            payload={"changed_files": ["agent/governance/server.py"]},
+        )
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-GATE",
+            event_type="mf.verification.completed",
+            phase="verify",
+            event_kind="verification",
+            actor="observer",
+            status="passed",
+            verification={"tests_run": ["pytest -q agent/tests/test_task_timeline.py"]},
+        )
+        self.conn.commit()
+
+        events = task_timeline.list_events(self.conn, "proj", backlog_id="BUG-MF-GATE")
+        blocked = task_timeline.mf_close_gate_verification(events)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(blocked["missing_event_kinds"], ["close_ready"])
+
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-GATE",
+            event_type="mf.close_ready.accepted",
+            phase="close",
+            event_kind="close_ready",
+            actor="observer",
+            status="accepted",
+            verification={"graph_reconciled": True, "preflight_ok": True},
+        )
+        self.conn.commit()
+
+        ready_events = task_timeline.list_events(self.conn, "proj", backlog_id="BUG-MF-GATE")
+        ready = task_timeline.mf_close_gate_verification(ready_events)
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(
+            ready["present_event_kinds"],
+            ["close_ready", "implementation", "verification"],
+        )
+
     def test_db_migration_from_v41_adds_timeline_v2_columns_and_indexes(self):
         from agent.governance import db
 

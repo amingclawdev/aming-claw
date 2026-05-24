@@ -81,6 +81,19 @@ MF_TEST_SCENARIO_POLICIES = {
     "new_scenario_required",
 }
 
+MF_CLOSE_REQUIRED_EVENT_KINDS = {
+    "implementation",
+    "verification",
+    "close_ready",
+}
+
+MF_CLOSE_PASS_STATUSES = {
+    "accepted",
+    "ok",
+    "passed",
+    "succeeded",
+}
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
@@ -469,6 +482,46 @@ def mf_test_scenario_verification(payload: dict[str, Any] | None) -> dict[str, A
             "has_tests_run": bool(tests_run),
             "has_scenario_id": bool(scenario_id),
             "has_new_scenario_spec": has_new_scenario_spec,
+        },
+    }
+
+
+def mf_close_gate_verification(events: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Validate the minimum observer/MF timeline evidence before backlog close."""
+
+    rows = events if isinstance(events, list) else []
+    present: set[str] = set()
+    ignored: list[dict[str, Any]] = []
+    for event in rows:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("event_kind") or "").strip()
+        phase = str(event.get("phase") or "").strip()
+        status = str(event.get("status") or "").strip().lower()
+        key = kind or phase
+        if key in MF_CLOSE_REQUIRED_EVENT_KINDS and status in MF_CLOSE_PASS_STATUSES:
+            present.add(key)
+        elif key in MF_CLOSE_REQUIRED_EVENT_KINDS:
+            ignored.append({
+                "event_kind": kind,
+                "phase": phase,
+                "status": status,
+                "id": event.get("id"),
+            })
+    missing = sorted(MF_CLOSE_REQUIRED_EVENT_KINDS - present)
+    return {
+        "schema_version": "mf_close_timeline_gate.v1",
+        "passed": not missing,
+        "status": "passed" if not missing else "failed",
+        "required_event_kinds": sorted(MF_CLOSE_REQUIRED_EVENT_KINDS),
+        "present_event_kinds": sorted(present),
+        "missing_event_kinds": missing,
+        "event_count": len(rows),
+        "ignored_required_events": ignored,
+        "checks": {
+            "has_implementation": "implementation" in present,
+            "has_verification": "verification" in present,
+            "has_close_ready": "close_ready" in present,
         },
     }
 
