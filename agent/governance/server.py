@@ -16771,6 +16771,60 @@ def handle_backlog_get(ctx: RequestContext):
         conn.close()
 
 
+@route("GET", "/api/backlog/{project_id}/{bug_id}/timeline-gate")
+def handle_backlog_timeline_gate(ctx: RequestContext):
+    """Read-only MF close-gate precheck for backlog timeline evidence."""
+    pid = ctx.path_params["project_id"]
+    bug_id = ctx.path_params["bug_id"]
+    include_events = _query_bool(ctx.query, "include_events", False)
+    limit = max(1, min(_query_int(ctx.query, "limit", 1000), 1000))
+    conn = get_connection(pid)
+    try:
+        row = conn.execute(
+            "SELECT * FROM backlog_bugs WHERE bug_id = ?", (bug_id,)
+        ).fetchone()
+        if not row:
+            raise GovernanceError("not_found", f"Bug {bug_id} not found", 404)
+
+        applicable = _mf_close_timeline_applicability(row)
+        from . import task_timeline
+
+        events = task_timeline.list_events(conn, pid, backlog_id=bug_id, limit=limit)
+        if applicable["is_mf"]:
+            verification = task_timeline.mf_close_gate_verification(events)
+        else:
+            verification = {
+                "schema_version": "mf_close_timeline_gate.v1",
+                "passed": True,
+                "status": "not_applicable",
+                "required_event_kinds": sorted(task_timeline.MF_CLOSE_REQUIRED_EVENT_KINDS),
+                "present_event_kinds": [],
+                "missing_event_kinds": [],
+                "event_count": len(events),
+                "ignored_required_events": [],
+                "checks": {
+                    "has_implementation": True,
+                    "has_verification": True,
+                    "has_close_ready": True,
+                },
+            }
+        result = {
+            "ok": True,
+            "project_id": pid,
+            "bug_id": bug_id,
+            "applicable": applicable["is_mf"],
+            "reason": applicable["reason"],
+            "can_close": bool(verification.get("passed")),
+            "timeline_gate": verification,
+            "event_count": len(events),
+        }
+        if include_events:
+            result["events"] = events
+        return result
+    finally:
+        conn.close()
+
+
 @route("POST", "/api/backlog/{project_id}/{bug_id}")
 def handle_backlog_upsert(ctx: RequestContext):
     """Upsert a backlog bug (ON CONFLICT DO UPDATE)."""
@@ -17291,16 +17345,8 @@ def handle_backlog_close(ctx: RequestContext):
 def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body: dict) -> dict:
     """Require append-only timeline evidence before observer/MF backlog close."""
 
-    policy = backlog_runtime.parse_json_object(_row_get(row, "bypass_policy_json", "{}"))
-    mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
-    chain_stage = str(_row_get(row, "chain_stage", "") or "").strip()
-    prior_status = str(_row_get(row, "status", "") or "").strip()
-    is_mf = bool(
-        prior_status == "MF_IN_PROGRESS"
-        or mf_type
-        or chain_stage in {"manual-fix", "observer-hotfix", "chain_rescue"}
-    )
-    if not is_mf:
+    applicability = _mf_close_timeline_applicability(row)
+    if not applicability["is_mf"]:
         return {}
 
     from . import task_timeline
@@ -17345,6 +17391,29 @@ def _verify_mf_close_timeline_gate(conn, project_id: str, bug_id: str, row, body
             422,
         )
     return verification
+
+
+def _mf_close_timeline_applicability(row) -> dict:
+    policy = backlog_runtime.parse_json_object(_row_get(row, "bypass_policy_json", "{}"))
+    mf_type = str(_row_get(row, "mf_type", "") or policy.get("mf_type") or "").strip()
+    chain_stage = str(_row_get(row, "chain_stage", "") or "").strip()
+    prior_status = str(_row_get(row, "status", "") or "").strip()
+    is_mf = bool(
+        prior_status == "MF_IN_PROGRESS"
+        or mf_type
+        or chain_stage in {"manual-fix", "observer-hotfix", "chain_rescue"}
+    )
+    reasons = []
+    if prior_status == "MF_IN_PROGRESS":
+        reasons.append("status=MF_IN_PROGRESS")
+    if mf_type:
+        reasons.append(f"mf_type={mf_type}")
+    if chain_stage in {"manual-fix", "observer-hotfix", "chain_rescue"}:
+        reasons.append(f"chain_stage={chain_stage}")
+    return {
+        "is_mf": is_mf,
+        "reason": ", ".join(reasons) if reasons else "not an MF/observer backlog row",
+    }
 
 
 @route("GET", "/api/docs")

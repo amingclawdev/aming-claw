@@ -471,6 +471,9 @@ class TestMCPToolDefinitions(unittest.TestCase):
         self.assertIn("backlog_get", tool_names)
         self.assertIn("backlog_upsert", tool_names)
         self.assertIn("backlog_close", tool_names)
+        self.assertIn("task_timeline_append", tool_names)
+        self.assertIn("task_timeline_list", tool_names)
+        self.assertIn("mf_timeline_precheck", tool_names)
 
     def test_dispatch_backlog_list(self):
         """_dispatch_tool routes backlog_list to HTTP call."""
@@ -516,6 +519,48 @@ class TestMCPToolDefinitions(unittest.TestCase):
             call_args = mock_http.call_args
             self.assertEqual(call_args[0][0], "POST")
             self.assertEqual(call_args[0][1], "/api/backlog/test/B1/close")
+
+    def test_dispatch_timeline_tools(self):
+        from governance.mcp_server import _dispatch_tool
+        with patch("governance.mcp_server._http") as mock_http:
+            mock_http.return_value = {"ok": True}
+            _dispatch_tool("task_timeline_append", {
+                "project_id": "test",
+                "backlog_id": "B1",
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "status": "accepted",
+            })
+            _dispatch_tool("task_timeline_list", {
+                "project_id": "test",
+                "backlog_id": "B1",
+                "event_kind": "implementation",
+                "limit": 25,
+            })
+            _dispatch_tool("mf_timeline_precheck", {
+                "project_id": "test",
+                "bug_id": "B1",
+                "include_events": True,
+                "limit": 25,
+            })
+            self.assertEqual(mock_http.call_args_list[0][0], (
+                "POST",
+                "/api/task/test/timeline",
+                {
+                    "backlog_id": "B1",
+                    "event_type": "mf.implementation",
+                    "event_kind": "implementation",
+                    "status": "accepted",
+                },
+            ))
+            self.assertEqual(mock_http.call_args_list[1][0], (
+                "GET",
+                "/api/task/test/timeline?backlog_id=B1&event_kind=implementation&limit=25",
+            ))
+            self.assertEqual(mock_http.call_args_list[2][0], (
+                "GET",
+                "/api/backlog/test/B1/timeline-gate?include_events=true&limit=25",
+            ))
 
 
 class TestTryBacklogCloseViaDb(unittest.TestCase):

@@ -22,15 +22,18 @@ def _conn(tmp_dir):
     return get_connection("proj")
 
 
-def _ctx(query):
+def _ctx(query=None, *, path_params=None, body=None, method="GET"):
     from agent.governance import server
 
+    params = {"project_id": "proj"}
+    if path_params:
+        params.update(path_params)
     return server.RequestContext(
         None,
-        "GET",
-        {"project_id": "proj"},
-        query,
-        {},
+        method,
+        params,
+        query or {},
+        body or {},
         "req-test",
         "",
         "",
@@ -496,6 +499,66 @@ class TestTaskTimeline(unittest.TestCase):
         self.assertEqual(filtered["decision"], "approved")
         self.assertEqual(filtered["count"], 1)
         self.assertEqual(filtered["events"][0]["task_id"], "task-b")
+
+    def test_backlog_timeline_gate_precheck_matches_close_gate_evidence(self):
+        from agent.governance import server, task_timeline
+
+        server.handle_backlog_upsert(
+            _ctx(
+                path_params={"bug_id": "BUG-MF-PRECHECK"},
+                body={
+                    "title": "MF timeline precheck",
+                    "status": "OPEN",
+                    "mf_type": "observer_hotfix",
+                    "force_admit": True,
+                },
+                method="POST",
+            )
+        )
+
+        for kind in ("implementation", "verification"):
+            task_timeline.record_event(
+                self.conn,
+                project_id="proj",
+                backlog_id="BUG-MF-PRECHECK",
+                event_type=f"mf.{kind}",
+                phase=kind,
+                event_kind=kind,
+                status="accepted",
+            )
+        self.conn.commit()
+
+        blocked = server.handle_backlog_timeline_gate(
+            _ctx({"include_events": "true"}, path_params={"bug_id": "BUG-MF-PRECHECK"})
+        )
+
+        self.assertTrue(blocked["ok"])
+        self.assertTrue(blocked["applicable"])
+        self.assertFalse(blocked["can_close"])
+        self.assertEqual(blocked["timeline_gate"]["missing_event_kinds"], ["close_ready"])
+        self.assertEqual(blocked["event_count"], 2)
+        self.assertEqual(len(blocked["events"]), 2)
+
+        task_timeline.record_event(
+            self.conn,
+            project_id="proj",
+            backlog_id="BUG-MF-PRECHECK",
+            event_type="mf.close_ready",
+            phase="close",
+            event_kind="close_ready",
+            status="accepted",
+        )
+        self.conn.commit()
+
+        ready = server.handle_backlog_timeline_gate(
+            _ctx(path_params={"bug_id": "BUG-MF-PRECHECK"})
+        )
+        self.assertTrue(ready["can_close"])
+        self.assertTrue(ready["timeline_gate"]["passed"])
+        self.assertEqual(
+            ready["timeline_gate"]["present_event_kinds"],
+            ["close_ready", "implementation", "verification"],
+        )
 
 
 if __name__ == "__main__":

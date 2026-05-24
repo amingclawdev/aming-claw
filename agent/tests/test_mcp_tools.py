@@ -99,6 +99,9 @@ def test_active_mcp_exposes_backlog_and_graph_governance_tools():
         "backlog_get",
         "backlog_upsert",
         "backlog_close",
+        "task_timeline_append",
+        "task_timeline_list",
+        "mf_timeline_precheck",
         "backlog_export",
         "backlog_import",
         "graph_status",
@@ -215,6 +218,65 @@ def test_mcp_backlog_list_supports_search_and_closed_page():
             "/api/backlog/aming-claw?view=full&limit=100&offset=3&q=portable+import&include_closed=true",
             None,
         )
+    ]
+
+
+def test_mcp_timeline_tools_route_to_governance_api():
+    recorder = _Recorder()
+    dispatcher = _dispatcher(recorder)
+
+    dispatcher.dispatch(
+        "task_timeline_append",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "BUG-1",
+            "event_type": "mf.implementation",
+            "event_kind": "implementation",
+            "status": "accepted",
+            "payload": {"changed_files": ["agent/mcp/tools.py"]},
+        },
+    )
+    dispatcher.dispatch(
+        "task_timeline_list",
+        {
+            "project_id": "aming-claw",
+            "backlog_id": "BUG-1",
+            "event_kind": "implementation",
+            "limit": 25,
+        },
+    )
+    dispatcher.dispatch(
+        "mf_timeline_precheck",
+        {
+            "project_id": "aming-claw",
+            "bug_id": "BUG-1",
+            "include_events": True,
+            "limit": 25,
+        },
+    )
+
+    assert recorder.calls == [
+        (
+            "POST",
+            "/api/task/aming-claw/timeline",
+            {
+                "backlog_id": "BUG-1",
+                "event_type": "mf.implementation",
+                "event_kind": "implementation",
+                "status": "accepted",
+                "payload": {"changed_files": ["agent/mcp/tools.py"]},
+            },
+        ),
+        (
+            "GET",
+            "/api/task/aming-claw/timeline?backlog_id=BUG-1&event_kind=implementation&limit=25",
+            None,
+        ),
+        (
+            "GET",
+            "/api/backlog/aming-claw/BUG-1/timeline-gate?include_events=true&limit=25",
+            None,
+        ),
     ]
 
 

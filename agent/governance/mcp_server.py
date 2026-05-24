@@ -70,6 +70,54 @@ def _backlog_list_query(args: dict) -> dict:
         query["status"] = "OPEN"
     return query
 
+
+def _task_timeline_query(args: dict) -> dict:
+    query: dict[str, Any] = {}
+    for key in (
+        "task_id",
+        "backlog_id",
+        "trace_id",
+        "phase",
+        "event_kind",
+        "scenario_id",
+        "correlation_id",
+        "severity",
+        "decision",
+    ):
+        if args.get(key):
+            query[key] = str(args[key])
+    if args.get("parent_event_id"):
+        query["parent_event_id"] = str(_int_arg(args, "parent_event_id", 0, minimum=1, maximum=1_000_000_000))
+    if args.get("limit"):
+        query["limit"] = str(_int_arg(args, "limit", 200, minimum=1, maximum=1000))
+    return query
+
+
+def _task_timeline_body(args: dict) -> dict:
+    allowed = {
+        "task_id",
+        "backlog_id",
+        "mf_id",
+        "attempt_num",
+        "event_type",
+        "phase",
+        "event_kind",
+        "scenario_id",
+        "parent_event_id",
+        "correlation_id",
+        "severity",
+        "decision",
+        "schema_version",
+        "actor",
+        "status",
+        "payload",
+        "verification",
+        "artifact_refs",
+        "trace_id",
+        "commit_sha",
+    }
+    return {key: args[key] for key in allowed if key in args and args[key] is not None}
+
 # ---------------------------------------------------------------------------
 # MCP protocol constants
 # ---------------------------------------------------------------------------
@@ -208,6 +256,73 @@ TOOLS: list[dict] = [
             "required": ["project_id", "bug_id"],
         },
     },
+    {
+        "name": "task_timeline_append",
+        "description": "Append observer/agent execution evidence to the task timeline. Use this during MF work before close.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "mf_id": {"type": "string"},
+                "attempt_num": {"type": "integer"},
+                "event_type": {"type": "string"},
+                "phase": {"type": "string"},
+                "event_kind": {"type": "string", "description": "For MF close gate use implementation, verification, or close_ready."},
+                "scenario_id": {"type": "string"},
+                "parent_event_id": {"type": "integer"},
+                "correlation_id": {"type": "string"},
+                "severity": {"type": "string"},
+                "decision": {"type": "string"},
+                "schema_version": {"type": "integer"},
+                "actor": {"type": "string"},
+                "status": {"type": "string", "description": "Use accepted/ok/passed/succeeded for close-gate evidence."},
+                "payload": {"type": "object"},
+                "verification": {"type": "object"},
+                "artifact_refs": {"type": "object"},
+                "trace_id": {"type": "string"},
+                "commit_sha": {"type": "string"},
+            },
+            "required": ["project_id", "event_type"],
+        },
+    },
+    {
+        "name": "task_timeline_list",
+        "description": "List append-only observer/agent timeline events by backlog, task, trace, phase, or event kind.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "backlog_id": {"type": "string"},
+                "trace_id": {"type": "string"},
+                "phase": {"type": "string"},
+                "event_kind": {"type": "string"},
+                "scenario_id": {"type": "string"},
+                "correlation_id": {"type": "string"},
+                "severity": {"type": "string"},
+                "decision": {"type": "string"},
+                "parent_event_id": {"type": "integer"},
+                "limit": {"type": "integer", "description": "Maximum events to return, default 200, max 1000"},
+            },
+            "required": ["project_id"],
+        },
+    },
+    {
+        "name": "mf_timeline_precheck",
+        "description": "Precheck whether an MF/observer backlog row has the required timeline evidence before backlog_close.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "bug_id": {"type": "string"},
+                "include_events": {"type": "boolean", "description": "Include matching timeline rows in the response."},
+                "limit": {"type": "integer", "description": "Maximum events to inspect/return, default 1000, max 1000"},
+            },
+            "required": ["project_id", "bug_id"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -293,6 +408,27 @@ def _dispatch_tool(name: str, args: dict) -> Any:
         pid = args["project_id"]
         bug_id = args["bug_id"]
         return _http("POST", f"/api/backlog/{pid}/{bug_id}/close", args)
+
+    if name == "task_timeline_append":
+        pid = args["project_id"]
+        return _http("POST", f"/api/task/{pid}/timeline", _task_timeline_body(args))
+
+    if name == "task_timeline_list":
+        pid = args["project_id"]
+        query = _task_timeline_query(args)
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http("GET", f"/api/task/{pid}/timeline{qs}")
+
+    if name == "mf_timeline_precheck":
+        pid = args["project_id"]
+        bug_id = urllib.parse.quote(str(args["bug_id"]), safe="")
+        query = {}
+        if "include_events" in args:
+            query["include_events"] = "true" if args.get("include_events") else "false"
+        if args.get("limit"):
+            query["limit"] = str(_int_arg(args, "limit", 1000, minimum=1, maximum=1000))
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http("GET", f"/api/backlog/{pid}/{bug_id}/timeline-gate{qs}")
 
     raise ValueError(f"Unknown tool: {name!r}")
 

@@ -70,11 +70,24 @@ as the default operator path.
 - `backlog_get`: inspect the selected row.
 - `backlog_upsert`: create/update a row before code or doc mutations.
 - `backlog_close`: close with commit evidence.
+- `task_timeline_append`: append observer/agent execution evidence during MF
+  work. For close-gate evidence use `event_kind=implementation`,
+  `event_kind=verification`, and `event_kind=close_ready` with
+  `status=accepted`/`passed`/`succeeded`.
+- `task_timeline_list`: inspect append-only timeline events by `backlog_id`,
+  `task_id`, `trace_id`, `phase`, or `event_kind`.
+- `mf_timeline_precheck`: run the same non-mutating MF close-gate check that
+  `backlog_close` will enforce.
 - `backlog_export`: export backlog rows as portable JSON for transfer or backup.
 - `backlog_import`: import portable backlog JSON with `skip`, `overwrite`, or
   `fail` conflict handling and optional dry-run.
 
 For MF work, use the backlog row as the single source of scope, target files, acceptance, and commit evidence.
+Use the timeline tools as the execution ledger: write implementation evidence
+when code/docs/config change, verification evidence after tests or review, and
+close-ready evidence after commit/redeploy/reconcile checks. Run
+`mf_timeline_precheck` before `backlog_close` so a session can repair missing
+evidence before the authoritative gate rejects the close.
 During MVP, some observer-hotfix/manual-fix flows are stored as
 `mf_type=chain_rescue`. Treat that as the internal audited MF bucket, not as a
 requirement that ordinary implementation must run through chain automation.
@@ -101,6 +114,12 @@ governance HTTP routes directly:
 - `POST /api/backlog/{project_id}/{bug_id}/start-mf` — mark MF in progress.
 - `POST /api/backlog/{project_id}/{bug_id}/close` — close with commit
   evidence after the MF lands.
+- `POST /api/task/{project_id}/timeline` — append task/MF execution evidence.
+- `GET  /api/task/{project_id}/timeline` — list timeline events. Query filters:
+  `task_id`, `backlog_id`, `trace_id`, `phase`, `event_kind`, `scenario_id`,
+  `correlation_id`, `severity`, `decision`, `parent_event_id`, `limit`.
+- `GET  /api/backlog/{project_id}/{bug_id}/timeline-gate` — read-only MF
+  close-gate precheck. Optional query: `include_events=true`, `limit`.
 - `GET  /api/backlog/{project_id}/portable/export` — export portable JSON.
   Optional query: `status`, `priority`, `bug_id` (comma-separated).
 - `POST /api/backlog/{project_id}/portable/import` — import portable JSON.

@@ -34,6 +34,14 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - weak doc path matches stay as doc asset state `candidate` rows;
    - only accepted bindings from review decisions, source-controlled hints, or durable rules count as node-owned docs;
    - when changing doc binding behavior, verify `doc-asset-state.json` shows path/hash/status/proposal evidence.
+9. For observer/MF work, append timeline evidence as work proceeds:
+   - `task_timeline_append` with `event_kind=implementation` after scoped code,
+     docs, config, or fixture changes are made;
+   - `task_timeline_append` with `event_kind=verification` after focused tests,
+     review checks, or documented no-test decisions;
+   - `task_timeline_append` with `event_kind=close_ready` after commit,
+     redeploy/reconcile/version checks are complete;
+   - run `mf_timeline_precheck` before `backlog_close`.
 
 ## Commit
 
@@ -59,4 +67,5 @@ Use `[observer-hotfix]` or `manual fix:` in the subject when this is a true MF b
 4. Check graph status. If HEAD is ahead of the active graph, run direct Update graph/scope reconcile before telling a dashboard user the graph is current. Explicit pending-scope queueing is legacy/debug only.
 5. Rebuild or refresh semantic projection when dashboard semantic state changed.
 6. Confirm the E2E impact decision is current, deferred with a backlog row, or explicitly not applicable.
-7. Close the backlog row with the commit hash and verification evidence.
+7. Append `close_ready` timeline evidence and run `mf_timeline_precheck`.
+8. Close the backlog row with the commit hash and verification evidence.
