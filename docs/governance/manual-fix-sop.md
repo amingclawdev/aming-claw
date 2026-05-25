@@ -206,6 +206,24 @@ These rules are **not guidelines**. Violation constitutes a governance breach:
 | R18 | Observer MF timeline gate | Every observer/manual-fix backlog close | MUST append task timeline rows for `event_kind=implementation`, `event_kind=verification`, and `event_kind=close_ready` against the same `backlog_id` before calling backlog close. Governance enforces this in `handle_backlog_close`; missing rows return `mf_timeline_gate_failed`. Emergency bypass requires `bypass_timeline_gate=true` plus a non-empty `timeline_bypass_reason`, and the bypass is itself written to the task timeline. |
 | R19 | Instantiated contract gate | Parallel MF work, subagent work, dashboard/API/user-visible behavior, or any task with explicit evidence requirements | Observer MUST instantiate a source-controlled contract template such as `agent/governance/contract_templates/mf_parallel.v1.json` into `chain_trigger_json.parallel_contract` before delegation. Required evidence items MUST have stable `id` values. For `mf_sub` workers, the instance MUST include task metadata `task_id`, `parent_task_id`, `worker_role=mf_sub`, and `fence_token`; graph lookups MUST use audited `query_source=mf_subagent` with the same identity context, and timeline evidence MUST record returned graph trace ids through `payload.graph_trace_ids`, `payload.graph_query_trace_ids`, `verification.graph_trace_ids`, `verification.graph_query_trace_ids`, or `verification.contract_evidence[].graph_trace_ids`. Timeline evidence MUST reference requirement ids through `payload.requirement_id(s)`, `verification.requirement_id(s)`, or `verification.contract_evidence[].requirement_id`. `handle_backlog_close` blocks MF close until every required contract evidence id is present with a passing status. |
 
+#### R19.1 Local `mf_sub` Dispatch Gate
+
+Before `spawn_agent`, the observer MUST run and record
+`agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate` for
+each local `mf_sub` worker. The gate must pass before non-blocking dispatch and
+must prove an isolated branch/worktree/file fence, `base_commit`,
+`target_head_commit`, `fence_token`, owned files, and dirty-scope evidence.
+
+Dispatch into the target/main worktree is blocked by default. If a
+same-worktree exception is ever used, it MUST include
+`same_worktree_allowed=true`, an explicit operator reason, exact dirty-scope
+evidence, and observer timeline evidence before dispatch. The observer must
+also run audited graph lookups with `query_source=mf_subagent` and the task
+identity/fence context, record returned trace ids in implementation or
+verification timeline evidence, then stop after dispatch unless the user
+explicitly asks to wait, review, merge, close, or perform another privileged
+action.
+
 ---
 
 ### R13 Graph-First Reuse Checklist

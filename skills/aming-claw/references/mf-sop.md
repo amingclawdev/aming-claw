@@ -55,6 +55,15 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - require subagent graph lookups to use audited
      `query_source=mf_subagent`, with `task_id`, `parent_task_id`,
      `worker_role`, and `fence_token` in the query context;
+   - before `spawn_agent`, run and record
+     `agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate`
+     for each local `mf_sub` worker; the gate must pass with an isolated
+     branch/worktree/file fence, `base_commit`, `target_head_commit`,
+     `fence_token`, owned files, and dirty-scope evidence before non-blocking
+     dispatch;
+   - block target/main worktree dispatch by default. A same-worktree exception
+     requires `same_worktree_allowed=true`, an explicit operator reason, exact
+     dirty-scope evidence, and observer timeline evidence before dispatch;
    - require subagent implementation or verification timeline evidence to
      include returned graph trace ids in `payload.graph_trace_ids`,
      `payload.graph_query_trace_ids`, `verification.graph_trace_ids`, or
@@ -71,6 +80,9 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
    - require structured worker final output with status, branch/worktree, owned
      changed files, tests run, graph query trace ids, precheck evidence,
      generated assets policy, and risks/open questions;
+   - after a dispatch gate passes, stop at non-blocking dispatch unless the
+     user explicitly asks the observer to wait, review, merge, close, or take
+     another privileged action;
    - give every required evidence item a stable `id`;
    - require timeline evidence to reference ids through `payload.requirement_id(s)`,
      `verification.requirement_id(s)`, or `verification.contract_evidence[].requirement_id`;

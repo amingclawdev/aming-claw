@@ -71,6 +71,37 @@
       ],
       "description": "Observer must instantiate these values from durable task metadata before delegating work. Subagents must echo them in implementation and verification evidence."
     },
+    "worktree_policy": {
+      "mode": "isolated_worktree_required",
+      "dispatch_default": "non_blocking_after_gate",
+      "same_worktree_allowed": false,
+      "target_main_worktree_dispatch": "blocked_by_default",
+      "local_precheck": {
+        "schema_version": "mf_subagent_dispatch_gate.v1",
+        "function": "agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate",
+        "description": "Observer must run and record this dispatch gate before spawn_agent. Passing evidence proves the local mf_sub worker has an isolated branch/worktree/file fence before non-blocking handoff."
+      },
+      "required_dispatch_fields": [
+        "branch",
+        "worktree",
+        "base_commit",
+        "target_head_commit",
+        "fence_token",
+        "owned_files",
+        "dirty_scope_check"
+      ],
+      "override_policy": {
+        "allowed": true,
+        "default": "reject",
+        "requires": [
+          "same_worktree_allowed=true",
+          "explicit_operator_reason",
+          "dirty_scope_exact_match",
+          "observer_timeline_event_before_dispatch"
+        ],
+        "description": "Dispatch into the target/main worktree is blocked by default. A same-worktree exception must be operator-approved, exact dirty-scope checked, and recorded to timeline before spawn_agent."
+      }
+    },
     "graph_queries": {
       "audited": true,
       "query_source": "mf_subagent",

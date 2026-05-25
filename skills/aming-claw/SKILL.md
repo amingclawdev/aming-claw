@@ -256,6 +256,13 @@ not enough: the worker result must pass the finish gate, which validates the
 current fence and, when the assigned worktree exists, recomputes the
 `base_commit..HEAD` changed-file set from that worktree before checkpoint or
 merge-queue entry.
+Before `spawn_agent`, the observer must run and record the local dispatch gate
+`agent.governance.mf_subagent_contract.validate_mf_subagent_dispatch_gate`.
+The gate must prove an isolated branch/worktree/file fence, `base_commit`,
+`target_head_commit`, `fence_token`, owned files, and dirty-scope evidence.
+Dispatch into the target/main worktree is blocked by default. A same-worktree
+exception requires `same_worktree_allowed=true`, an explicit operator reason,
+exact dirty-scope evidence, and observer timeline evidence before dispatch.
 Use role/capability boundaries for parallel workers: `mf_sub` sessions may use
 the finish gate and task-scoped audited graph queries with
 `query_source=mf_subagent`, `parent_task_id`/`task_id`, and `fence_token`.
@@ -266,9 +273,10 @@ identify as observer to get graph access.
 
 Observer-only collaboration mode is the default for parallel MF work. The
 observer clarifies requirements, checks runtime/graph/backlog state, writes the
-backlog row and `mf_parallel.v1` task contract, starts implementation agents
-only when the user explicitly asks or an approved contract calls for it, and
-reviews their merge candidates. The
+backlog row and `mf_parallel.v1` task contract, runs audited graph lookups and
+the dispatch gate, starts implementation agents only when the user explicitly
+asks or an approved contract calls for it, and treats the handoff as
+non-blocking after the gate passes. The
 observer does not implement, wait on agents, merge, push, or release gates by
 default; those actions require an explicit user request or a documented
 governance transition. Implementation agents must be assigned bounded

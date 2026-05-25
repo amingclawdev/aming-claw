@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from agent.governance.asset_binding_proposals import (
@@ -16,8 +17,11 @@ MF_SUB_ROLE = "mf_sub"
 INPUT_SCHEMA_VERSION = "mf_subagent_input.v1"
 RESULT_SCHEMA_VERSION = "mf_subagent_result.v1"
 FINISH_GATE_SCHEMA_VERSION = "mf_subagent_finish_gate.v1"
+DISPATCH_GATE_SCHEMA_VERSION = "mf_subagent_dispatch_gate.v1"
 FINISH_GATE_REPLAY_SOURCE = "mf_sub_finish_gate"
 BACKEND_CONTRACT = "parallel_branch_worker.v1"
+DISPATCH_DEFAULT = "non_blocking_after_gate"
+WORKTREE_POLICY_MODE = "isolated_worktree_required"
 
 MF_SUB_ALLOWED_CAPABILITIES = (
     "modify_code",
@@ -72,10 +76,21 @@ _FINISH_IDENTITY_FIELDS = (
     "base_commit",
     "target_head_commit",
 )
+_DISPATCH_REQUIRED_FIELDS = (
+    "branch",
+    "worktree",
+    "base_commit",
+    "target_head_commit",
+    "fence_token",
+)
 
 
 class MfSubagentContractError(ValueError):
     """Raised when an MF subagent payload violates the worker contract."""
+
+
+def _string(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def _string_list(value: Any, *, field_name: str) -> list[str]:
@@ -100,6 +115,261 @@ def _mapping(value: Any, *, field_name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise MfSubagentContractError(f"{field_name} must be a mapping")
     return dict(value)
+
+
+def _bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _normalize_worktree_path(path: str) -> str:
+    token = _string(path)
+    if not token:
+        return ""
+    return str(Path(token).expanduser().resolve())
+
+
+def _nested_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _dispatch_string(
+    payload: Mapping[str, Any],
+    *,
+    names: Sequence[str],
+    nested_keys: Sequence[tuple[str, Sequence[str]]] = (),
+) -> str:
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, Mapping):
+            for nested_name in (
+                "branch_ref",
+                "ref_name",
+                "name",
+                "path",
+                "worktree_path",
+            ):
+                token = _string(value.get(nested_name))
+                if token:
+                    return token
+        token = _string(value)
+        if token:
+            return token
+    for parent_key, child_names in nested_keys:
+        nested = _nested_mapping(payload, parent_key)
+        for child_name in child_names:
+            token = _string(nested.get(child_name))
+            if token:
+                return token
+    return ""
+
+
+def _dirty_scope_evidence(value: Any) -> dict[str, Any]:
+    check = _mapping(value, field_name="dirty_scope_check")
+    status = _string(check.get("status") or check.get("result")).lower()
+    passed = _bool(check.get("passed")) or status in _PASS_STATUSES
+    exact_match = _bool(
+        check.get("dirty_scope_exact_match")
+        or check.get("exact_match")
+        or check.get("owned_scope_only")
+    )
+    evidence_fields = [
+        "changed_files",
+        "dirty_files",
+        "owned_files",
+        "checked_paths",
+        "allowed_dirty_files",
+    ]
+    has_file_evidence = any(key in check for key in evidence_fields)
+    if not passed or not has_file_evidence:
+        raise MfSubagentContractError(
+            "dirty_scope_check must include passing dirty-scope evidence"
+        )
+    return {
+        "status": status or "passed",
+        "passed": True,
+        "dirty_scope_exact_match": exact_match,
+        "changed_file_count": len(
+            _string_list(check.get("changed_files"), field_name="changed_files")
+        ),
+        "dirty_file_count": len(
+            _string_list(check.get("dirty_files"), field_name="dirty_files")
+        ),
+    }
+
+
+def _override_reason(payload: Mapping[str, Any], override: Mapping[str, Any]) -> str:
+    for key in (
+        "same_worktree_reason",
+        "operator_reason",
+        "explicit_operator_reason",
+        "reason",
+    ):
+        token = _string(payload.get(key))
+        if token:
+            return token
+    for key in ("operator_reason", "explicit_operator_reason", "reason"):
+        token = _string(override.get(key))
+        if token:
+            return token
+    return ""
+
+
+def _timeline_evidence_present(
+    payload: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> bool:
+    if _bool(payload.get("timeline_event_recorded")) or _bool(
+        override.get("timeline_event_recorded")
+    ):
+        return True
+    for key in (
+        "timeline_evidence",
+        "observer_timeline_event",
+        "dispatch_timeline_evidence",
+    ):
+        value = payload.get(key) if key in payload else override.get(key)
+        if isinstance(value, Mapping) and (
+            _string(value.get("event_id"))
+            or _string(value.get("event_type"))
+            or _string(value.get("recorded_at"))
+        ):
+            return True
+    return False
+
+
+def validate_mf_subagent_dispatch_gate(
+    payload: Mapping[str, Any],
+    *,
+    target_worktree_path: str = "",
+    main_worktree_path: str = "",
+) -> dict[str, Any]:
+    """Validate local MF subagent dispatch evidence before handoff.
+
+    The gate is intentionally local and backend-neutral: observers and AI
+    self-checks can run it before spawning a bounded `mf_sub` worker.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise MfSubagentContractError("MF subagent dispatch payload must be a mapping")
+    payload = dict(payload)
+    branch = _dispatch_string(
+        payload,
+        names=("branch", "branch_ref", "ref_name"),
+        nested_keys=(("branch_context", ("branch_ref", "ref_name")),),
+    )
+    worktree = _dispatch_string(
+        payload,
+        names=("worktree", "worktree_path"),
+        nested_keys=(("branch", ("worktree_path", "path")),),
+    )
+    base_commit = _dispatch_string(
+        payload,
+        names=("base_commit",),
+        nested_keys=(("branch", ("base_commit",)),),
+    )
+    target_head_commit = _dispatch_string(
+        payload,
+        names=("target_head_commit",),
+        nested_keys=(("branch", ("target_head_commit", "head_commit")),),
+    )
+    fence_token = _dispatch_string(payload, names=("fence_token",))
+    values = {
+        "branch": branch,
+        "worktree": worktree,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "fence_token": fence_token,
+    }
+    missing = [field for field in _DISPATCH_REQUIRED_FIELDS if not values[field]]
+    if missing:
+        raise MfSubagentContractError(
+            "MF subagent dispatch missing required fields: " + ", ".join(missing)
+        )
+
+    owned_files = _string_list(
+        payload.get("owned_files") or payload.get("write_scope"),
+        field_name="owned_files",
+    )
+    if not owned_files:
+        raise MfSubagentContractError("MF subagent dispatch missing owned_files fence")
+    dirty_scope = _dirty_scope_evidence(payload.get("dirty_scope_check"))
+
+    policy = _nested_mapping(payload, "worktree_policy")
+    override = _nested_mapping(payload, "same_worktree_override")
+    if not override:
+        override = _nested_mapping(payload, "override_policy")
+    same_worktree_allowed = _bool(
+        payload.get("same_worktree_allowed")
+        or policy.get("same_worktree_allowed")
+        or override.get("same_worktree_allowed")
+    )
+    normalized_worktree = _normalize_worktree_path(worktree)
+    target_paths = [
+        _normalize_worktree_path(path)
+        for path in (
+            target_worktree_path,
+            main_worktree_path,
+            _string(payload.get("target_worktree_path")),
+            _string(payload.get("main_worktree_path")),
+            _string(policy.get("target_worktree_path")),
+            _string(policy.get("main_worktree_path")),
+        )
+        if _string(path)
+    ]
+    target_role = _string(
+        payload.get("worktree_role") or policy.get("worktree_role")
+    ).lower()
+    same_worktree = normalized_worktree in target_paths or target_role in {
+        "target",
+        "main",
+    }
+    if same_worktree and not same_worktree_allowed:
+        raise MfSubagentContractError(
+            "same-worktree dispatch is blocked by default for local mf_sub workers"
+        )
+
+    override_used = same_worktree and same_worktree_allowed
+    override_reason = ""
+    if override_used:
+        override_reason = _override_reason(payload, override)
+        if not override_reason:
+            raise MfSubagentContractError(
+                "same-worktree dispatch override requires explicit operator reason"
+            )
+        if not dirty_scope["dirty_scope_exact_match"]:
+            raise MfSubagentContractError(
+                "same-worktree dispatch override requires dirty_scope_exact_match evidence"
+            )
+        if not _timeline_evidence_present(payload, override):
+            raise MfSubagentContractError(
+                "same-worktree dispatch override requires observer timeline evidence"
+            )
+
+    return {
+        "schema_version": DISPATCH_GATE_SCHEMA_VERSION,
+        "role": MF_SUB_ROLE,
+        "dispatch_default": DISPATCH_DEFAULT,
+        "worktree_policy": WORKTREE_POLICY_MODE,
+        "branch": branch,
+        "worktree": worktree,
+        "base_commit": base_commit,
+        "target_head_commit": target_head_commit,
+        "fence_token": fence_token,
+        "owned_files": owned_files,
+        "isolated_worktree": not same_worktree,
+        "same_worktree_allowed": same_worktree_allowed,
+        "override": {
+            "used": override_used,
+            "reason": override_reason,
+            "timeline_evidence_recorded": override_used,
+        },
+        "dirty_scope_check": dirty_scope,
+    }
 
 
 def _require_context(context: BranchTaskRuntimeContext) -> None:
