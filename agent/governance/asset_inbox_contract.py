@@ -25,6 +25,11 @@ ASSET_STATUSES = {
     "ignored",
     "archive",
     "stale",
+    "impact_pending",
+    "drift_suspected",
+    "drift_confirmed",
+    "drift_resolved",
+    "drift_waived",
 }
 
 ASSET_KINDS = {
@@ -53,6 +58,9 @@ BATCH_ACTIONS = {
     "reject_or_waive_candidates",
     "create_backlog_from_selection",
     "write_governance_hint",
+    "propose_remove_binding",
+    "resolve_drift",
+    "mark_drift_state",
 }
 
 ACCEPTED_BINDING_STATUSES = {"accepted"}
@@ -61,6 +69,8 @@ BACKLOG_ELIGIBLE_STATUSES = {
     "source_orphan",
     "config_pending_decision",
     "stale",
+    "impact_pending",
+    "drift_confirmed",
 }
 
 
@@ -223,6 +233,19 @@ def build_asset_inbox_response(
     if not doc_assets:
         doc_asset_state = _read_json_file(doc_asset_state_path, {}) if doc_asset_state_path else {}
         doc_assets = _doc_assets_by_path(doc_asset_state)
+    drift_states: dict[tuple[str, str], dict[str, Any]] = {}
+    drift_proposals: dict[tuple[str, str], dict[str, Any]] = {}
+    impact_reminders: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    try:
+        from . import asset_impact
+
+        drift_states = asset_impact.list_asset_drift_states(conn, project_id, snapshot_id=snapshot_id)
+        drift_proposals = asset_impact.latest_asset_drift_proposals_by_asset(conn, project_id)
+        impact_reminders = asset_impact.list_asset_impact_reminders_by_asset(conn, project_id)
+    except Exception:
+        drift_states = {}
+        drift_proposals = {}
+        impact_reminders = {}
 
     items: list[dict[str, Any]] = []
     for row in sorted(files, key=lambda item: str(item.get("path") or "")):
@@ -231,6 +254,9 @@ def build_asset_inbox_response(
             node_by_id=node_by_id,
             node_by_title=node_by_title,
             doc_asset=doc_assets.get(str(row.get("path") or "")),
+            drift_state=drift_states.get((_asset_kind(row), str(row.get("path") or "").replace("\\", "/").strip("/"))),
+            drift_proposal=drift_proposals.get((_asset_kind(row), str(row.get("path") or "").replace("\\", "/").strip("/"))),
+            impact_reminders=impact_reminders.get((_asset_kind(row), str(row.get("path") or "").replace("\\", "/").strip("/")), []),
             stale_paths=stale_paths,
         )
         if item:
@@ -280,6 +306,9 @@ def build_asset_inbox_response(
                     "test_candidate",
                     "config_pending_decision",
                     "stale",
+                    "impact_pending",
+                    "drift_suspected",
+                    "drift_confirmed",
                 }
             ),
         },
@@ -352,7 +381,7 @@ def asset_inbox_batch_actions() -> list[dict[str, Any]]:
         {
             "action": "write_governance_hint",
             "label": "Write governance hint",
-            "allowed_statuses": ["doc_candidate", "test_candidate", "config_pending_decision"],
+            "allowed_statuses": ["doc_unbound"],
             "requires_selection": True,
             "requires_review": True,
             "mutates_source": True,
@@ -361,6 +390,45 @@ def asset_inbox_batch_actions() -> list[dict[str, Any]]:
                 "target_node_id": "L7.runtime",
                 "role": "doc",
                 "actor": "observer",
+            },
+        },
+        {
+            "action": "propose_remove_binding",
+            "label": "Propose remove binding",
+            "allowed_statuses": ["accepted", "impact_pending", "drift_suspected", "drift_confirmed"],
+            "requires_selection": True,
+            "requires_review": True,
+            "mutates_source": False,
+            "payload_example": {
+                "asset_id": "file:docs/runtime.md",
+                "target_node_id": "L7.runtime",
+                "reason": "Binding appears stale; review before materialization.",
+            },
+        },
+        {
+            "action": "resolve_drift",
+            "label": "Resolve drift",
+            "allowed_statuses": ["impact_pending", "drift_suspected", "drift_confirmed", "stale"],
+            "requires_selection": True,
+            "requires_review": True,
+            "mutates_source": False,
+            "payload_example": {
+                "asset_id": "file:docs/runtime.md",
+                "mode": "ai_assisted_proposal",
+                "self_precheck_required": True,
+            },
+        },
+        {
+            "action": "mark_drift_state",
+            "label": "Mark drift state",
+            "allowed_statuses": ["accepted", "impact_pending", "drift_suspected", "drift_confirmed", "stale"],
+            "requires_selection": True,
+            "requires_review": False,
+            "mutates_source": False,
+            "payload_example": {
+                "asset_id": "file:docs/runtime.md",
+                "drift_state": "suspected",
+                "evidence": {"source": "observer_review"},
             },
         },
     ]
@@ -372,6 +440,9 @@ def _asset_item_from_inventory(
     node_by_id: Mapping[str, Mapping[str, Any]],
     node_by_title: Mapping[str, Mapping[str, Any]],
     doc_asset: Mapping[str, Any] | None,
+    drift_state: Mapping[str, Any] | None,
+    drift_proposal: Mapping[str, Any] | None,
+    impact_reminders: list[Mapping[str, Any]],
     stale_paths: set[str],
 ) -> dict[str, Any] | None:
     path = str(row.get("path") or "")
@@ -380,7 +451,16 @@ def _asset_item_from_inventory(
     kind = _asset_kind(row)
     bindings = _accepted_bindings(row, doc_asset, node_by_id=node_by_id, node_by_title=node_by_title)
     candidates = _binding_candidates(row, doc_asset, node_by_id=node_by_id, node_by_title=node_by_title)
-    status = _asset_status(row, kind, bindings=bindings, candidates=candidates, doc_asset=doc_asset, stale_paths=stale_paths)
+    status = _asset_status(
+        row,
+        kind,
+        bindings=bindings,
+        candidates=candidates,
+        doc_asset=doc_asset,
+        stale_paths=stale_paths,
+        drift_state=drift_state,
+        impact_reminders=impact_reminders,
+    )
     if not status:
         return None
     item = {
@@ -398,6 +478,8 @@ def _asset_item_from_inventory(
         "size_bytes": int(row.get("size_bytes") or 0),
         "accepted_bindings": bindings,
         "binding_candidates": candidates,
+        "drift": _asset_drift_block(drift_state, impact_reminders=impact_reminders),
+        "drift_proposal": _asset_drift_proposal_block(drift_proposal),
         "recommended_actions": _recommended_actions(status),
         "batch_eligible_actions": _batch_eligible_actions(status),
         "risk": _risk_for_status(status),
@@ -414,9 +496,66 @@ def _attach_relation_contract(item: dict[str, Any]) -> None:
     item["relation_summary"] = _relation_summary(relations)
 
 
+def _asset_drift_block(
+    drift_state: Mapping[str, Any] | None,
+    *,
+    impact_reminders: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    explicit_state = str((drift_state or {}).get("drift_state") or "")
+    if explicit_state:
+        state = explicit_state
+        source = "manual"
+    elif impact_reminders:
+        state = "suspected"
+        source = "asset_impact_reminder"
+    else:
+        state = "not_drifted"
+        source = "default"
+    return {
+        "schema_version": "asset_drift_state.v1",
+        "state": state,
+        "source": source,
+        "actor": str((drift_state or {}).get("actor") or ""),
+        "evidence": (drift_state or {}).get("evidence") if isinstance((drift_state or {}).get("evidence"), dict) else {},
+        "impact_pending": bool(impact_reminders),
+        "impact_reminders": [
+            {
+                "reminder_id": str(reminder.get("reminder_id") or ""),
+                "node_id": str(reminder.get("node_id") or ""),
+                "node_title": str(reminder.get("node_title") or ""),
+                "impact_count": _int_value(reminder.get("impact_count"), 0),
+                "latest_commit_sha": str(reminder.get("latest_commit_sha") or ""),
+            }
+            for reminder in impact_reminders
+        ],
+    }
+
+
+def _asset_drift_proposal_block(proposal: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not proposal:
+        return {}
+    return {
+        "proposal_id": str(proposal.get("proposal_id") or ""),
+        "status": str(proposal.get("status") or ""),
+        "ai_status": str(proposal.get("ai_status") or ""),
+        "node_id": str(proposal.get("node_id") or ""),
+        "self_precheck": proposal.get("self_precheck") if isinstance(proposal.get("self_precheck"), dict) else {},
+        "evidence": proposal.get("evidence") if isinstance(proposal.get("evidence"), dict) else {},
+        "updated_at": str(proposal.get("updated_at") or ""),
+    }
+
+
 def _mount_relations(item: Mapping[str, Any]) -> list[dict[str, Any]]:
     asset_id = str(item.get("asset_id") or "")
     role_default = _relation_role(str(item.get("asset_kind") or ""))
+    drift = item.get("drift") if isinstance(item.get("drift"), Mapping) else {}
+    impact_reminders = drift.get("impact_reminders") if isinstance(drift.get("impact_reminders"), list) else []
+    impact_by_node = {
+        str(reminder.get("node_id") or ""): reminder
+        for reminder in impact_reminders
+        if isinstance(reminder, Mapping)
+    }
+    drift_state = str(drift.get("state") or "not_drifted")
     relations: list[dict[str, Any]] = []
     for index, binding in enumerate(item.get("accepted_bindings") or []):
         if not isinstance(binding, Mapping):
@@ -425,9 +564,11 @@ def _mount_relations(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         target_title = str(binding.get("title") or binding.get("target_title") or target_node_id)
         role = str(binding.get("role") or role_default)
         source = str(binding.get("source") or "accepted_binding")
+        impact = impact_by_node.get(target_node_id)
+        status = "impact_pending" if impact else "stale_drift" if drift_state in {"suspected", "confirmed"} else "accepted"
         relations.append({
             "relation_id": _relation_id("accepted", asset_id, target_node_id, role, source, str(index)),
-            "status": "accepted",
+            "status": status,
             "role": role,
             "target_node_id": target_node_id,
             "target_title": target_title,
@@ -436,7 +577,9 @@ def _mount_relations(item: Mapping[str, Any]) -> list[dict[str, Any]]:
             "proposal_hash": "",
             "binding_strength": str(binding.get("binding_strength") or "accepted"),
             "impact_scope": True,
-            "review_required": False,
+            "review_required": status != "accepted",
+            "impact_reminder_id": str((impact or {}).get("reminder_id") or ""),
+            "drift_state": drift_state,
         })
     for index, candidate in enumerate(item.get("binding_candidates") or []):
         if not isinstance(candidate, Mapping):
@@ -458,12 +601,14 @@ def _mount_relations(item: Mapping[str, Any]) -> list[dict[str, Any]]:
             "binding_strength": str(precheck.get("binding_strength") or candidate.get("binding_strength") or ""),
             "impact_scope": False,
             "review_required": True,
+            "drift_state": drift_state,
         })
     if relations:
         return relations
+    unbound_status = "stale_drift" if drift_state in {"suspected", "confirmed"} else "unbound"
     return [{
         "relation_id": _relation_id("none", asset_id),
-        "status": "none",
+        "status": unbound_status,
         "role": role_default,
         "target_node_id": "",
         "target_title": "",
@@ -473,13 +618,15 @@ def _mount_relations(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         "binding_strength": "",
         "impact_scope": False,
         "review_required": _status_requires_review(str(item.get("asset_status") or "")),
+        "drift_state": drift_state,
     }]
 
 
 def _relation_summary(relations: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     relation_list = [relation for relation in relations if isinstance(relation, Mapping)]
+    accepted_like = {"accepted", "impact_pending", "stale_drift"}
     return {
-        "accepted_count": sum(1 for relation in relation_list if relation.get("status") == "accepted"),
+        "accepted_count": sum(1 for relation in relation_list if relation.get("status") in accepted_like),
         "candidate_count": sum(1 for relation in relation_list if relation.get("status") == "candidate"),
         "relation_count": len(relation_list),
         "impact_scope_count": sum(1 for relation in relation_list if relation.get("impact_scope") is True),
@@ -542,7 +689,7 @@ def _validate_item_relations(item: Mapping[str, Any], item_path: str) -> list[st
     if not isinstance(relations, list) or not relations:
         return [f"{item_path}.mount_relations_required"]
     relation_ids: set[str] = set()
-    allowed_statuses = {"accepted", "candidate", "none"}
+    allowed_statuses = {"accepted", "candidate", "unbound", "stale_drift", "impact_pending"}
     for index, relation in enumerate(relations):
         relation_path = f"{item_path}.mount_relations[{index}]"
         if not isinstance(relation, Mapping):
@@ -564,7 +711,7 @@ def _validate_item_relations(item: Mapping[str, Any], item_path: str) -> list[st
             errors.append(f"{relation_path}.impact_scope_boolean_required")
         if relation.get("review_required") not in {True, False}:
             errors.append(f"{relation_path}.review_required_boolean_required")
-        if status == "accepted":
+        if status in {"accepted", "stale_drift", "impact_pending"}:
             if not relation.get("target_node_id"):
                 errors.append(f"{relation_path}.accepted_target_node_id_required")
             if relation.get("impact_scope") is not True:
@@ -682,11 +829,24 @@ def _asset_status(
     candidates: list[dict[str, Any]],
     doc_asset: Mapping[str, Any] | None,
     stale_paths: set[str],
+    drift_state: Mapping[str, Any] | None,
+    impact_reminders: list[Mapping[str, Any]],
 ) -> str:
     path = str(row.get("path") or "")
     scan = str(row.get("scan_status") or "")
     graph = str(row.get("graph_status") or "")
     doc_binding = str((doc_asset or {}).get("binding_status") or "")
+    explicit_drift = str((drift_state or {}).get("drift_state") or "")
+    if impact_reminders:
+        return "impact_pending"
+    if explicit_drift == "suspected":
+        return "drift_suspected"
+    if explicit_drift == "confirmed":
+        return "drift_confirmed"
+    if explicit_drift == "resolved":
+        return "drift_resolved"
+    if explicit_drift == "waived":
+        return "drift_waived"
     if kind == "source" and path in stale_paths:
         return "stale"
     if scan == "archive" or graph == "archive":
@@ -845,6 +1005,10 @@ def _recommended_actions(status: str) -> list[str]:
         return ["queue_asset_binding_proposals", "create_backlog_from_selection"]
     if status == "stale":
         return ["queue_semantic_enrich", "create_backlog_from_selection"]
+    if status in {"impact_pending", "drift_suspected", "drift_confirmed"}:
+        return ["mark_drift_state", "resolve_drift", "propose_remove_binding"]
+    if status in {"drift_resolved", "drift_waived"}:
+        return ["mark_drift_state"]
     return []
 
 
@@ -857,9 +1021,9 @@ def _batch_eligible_actions(status: str) -> list[str]:
 
 
 def _risk_for_status(status: str) -> str:
-    if status in {"source_orphan", "stale"}:
+    if status in {"source_orphan", "stale", "impact_pending", "drift_confirmed"}:
         return "high"
-    if status in {"doc_candidate", "test_candidate", "config_pending_decision", "doc_unbound"}:
+    if status in {"doc_candidate", "test_candidate", "config_pending_decision", "doc_unbound", "drift_suspected"}:
         return "medium"
     return "low"
 
@@ -870,6 +1034,8 @@ def _backlog_state(status: str) -> dict[str, Any]:
         "source_orphan": "New source orphan may require graph ownership or adapter/config work.",
         "config_pending_decision": "Config-like asset needs classification or durable rule work.",
         "stale": "Stale mapped source may require semantic refresh or scoped implementation review.",
+        "impact_pending": "Bound asset may need review after accepted node changes.",
+        "drift_confirmed": "Confirmed asset drift may require implementation, docs, tests, or config work.",
     }
     return {
         "eligible": eligible,
@@ -882,6 +1048,8 @@ def _binding_status(status: str, doc_asset: Mapping[str, Any] | None) -> str:
         return str(doc_asset.get("binding_status") or "")
     if status == "accepted":
         return "accepted"
+    if status in {"impact_pending", "drift_suspected", "drift_confirmed", "drift_resolved", "drift_waived"}:
+        return "accepted_with_drift_state"
     if status in {"doc_candidate", "test_candidate"}:
         return "candidate"
     if status == "doc_unbound":

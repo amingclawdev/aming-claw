@@ -4,12 +4,15 @@ import type {
   AssetImpactReminderResolveResponse,
   AssetImpactRemindersResponse,
   AssetImpactResolutionKind,
+  AssetDriftProposalResponse,
+  AssetDriftStateResponse,
   AssetInboxResponse,
   AttachFileHintResponse,
   BacklogTimelineGateResponse,
   BacklogResponse,
   EdgesResponse,
   FeedbackQueueResponse,
+  FileHygieneActionResponse,
   SnapshotFilesResponse,
   HealthResponse,
   NodesResponse,
@@ -259,6 +262,45 @@ export const api = {
       signal,
     );
   },
+  recordAssetDriftStateFor(
+    projectId: string,
+    payload: {
+      asset_kind: string;
+      asset_path: string;
+      drift_state: string;
+      snapshot_id?: string;
+      commit_sha?: string;
+      actor?: string;
+      evidence?: Record<string, unknown>;
+    },
+    signal?: AbortSignal,
+  ) {
+    return postJSON<AssetDriftStateResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/asset-drift/state`,
+      { ...payload, actor: payload.actor ?? "dashboard_user" },
+      signal,
+    );
+  },
+  queueAssetDriftProposalFor(
+    projectId: string,
+    payload: {
+      asset_kind: string;
+      asset_path: string;
+      snapshot_id: string;
+      commit_sha?: string;
+      node_id?: string;
+      actor?: string;
+      note?: string;
+      mode?: string;
+    },
+    signal?: AbortSignal,
+  ) {
+    return postJSON<AssetDriftProposalResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/asset-drift/proposals`,
+      { ...payload, actor: payload.actor ?? "dashboard_user" },
+      signal,
+    );
+  },
   activeProjection(signal?: AbortSignal) {
     return getJSON<ProjectionResponse>(
       `/api/graph-governance/${pid()}/snapshots/active/semantic/projection`,
@@ -358,6 +400,27 @@ export const api = {
   ) {
     return postJSON<AttachFileHintResponse>(
       `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}/file-hygiene/hints/attach`,
+      { ...payload, actor: payload.actor ?? "dashboard_user" },
+      signal,
+    );
+  },
+  fileHygieneActionFor(
+    projectId: string,
+    snapshotId: string,
+    payload: {
+      action: string;
+      path: string;
+      target_node_id?: string;
+      role?: "doc" | "test" | "config";
+      actor?: string;
+      reason?: string;
+      operator_signoff?: boolean;
+      confirm_delete_candidate?: boolean;
+    },
+    signal?: AbortSignal,
+  ) {
+    return postJSON<FileHygieneActionResponse>(
+      `/api/graph-governance/${pidFor(projectId)}/snapshots/${encodeURIComponent(snapshotId)}/file-hygiene/actions`,
       { ...payload, actor: payload.actor ?? "dashboard_user" },
       signal,
     );

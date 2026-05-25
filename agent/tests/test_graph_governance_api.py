@@ -267,6 +267,127 @@ def test_graph_governance_asset_impact_reminders_api_lists_events_and_resolves(c
     assert after["count"] == 0
 
 
+def test_graph_governance_asset_inbox_relation_drift_and_proposal_contract(conn):
+    graph = _graph("L7.runtime")
+    graph["deps_graph"]["nodes"][0]["title"] = "Runtime Service"
+    snapshot = store.create_graph_snapshot(
+        conn,
+        PID,
+        snapshot_id="asset-inbox-drift",
+        commit_sha="c-drift",
+        snapshot_kind="scope",
+        graph_json=graph,
+        file_inventory=[
+            {
+                "path": "docs/runtime.md",
+                "file_kind": "doc",
+                "scan_status": "secondary_attached",
+                "graph_status": "attached",
+                "attached_node_ids": ["L7.runtime"],
+                "mapped_node_ids": ["L7.runtime"],
+                "file_hash": "sha256:doc",
+            },
+            {
+                "path": "docs/orphan.md",
+                "file_kind": "doc",
+                "scan_status": "orphan",
+                "graph_status": "unmapped",
+                "file_hash": "sha256:orphan",
+            },
+            {
+                "path": "config/runtime.yaml",
+                "file_kind": "config",
+                "scan_status": "pending_decision",
+                "graph_status": "pending_decision",
+                "candidate_node_id": "L7.runtime",
+                "file_hash": "sha256:config",
+            },
+        ],
+    )
+    store.index_graph_snapshot(
+        conn,
+        PID,
+        snapshot["snapshot_id"],
+        nodes=graph["deps_graph"]["nodes"],
+        edges=[],
+    )
+    asset_impact.record_asset_impact_detected(
+        conn,
+        project_id=PID,
+        asset_kind="doc",
+        asset_path="docs/runtime.md",
+        node_id="L7.runtime",
+        node_title="Runtime Service",
+        commit_sha="c-drift",
+        snapshot_id=snapshot["snapshot_id"],
+        actor="scope-reconcile",
+    )
+    conn.commit()
+
+    inbox = server.handle_graph_governance_snapshot_asset_inbox(
+        _ctx({"project_id": PID, "snapshot_id": snapshot["snapshot_id"]})
+    )
+
+    by_path = {item["path"]: item for item in inbox["items"]}
+    assert inbox["ok"] is True
+    runtime_doc = by_path["docs/runtime.md"]
+    assert runtime_doc["asset_status"] == "impact_pending"
+    assert runtime_doc["drift"]["state"] == "suspected"
+    assert runtime_doc["drift"]["source"] == "asset_impact_reminder"
+    assert runtime_doc["mount_relations"][0]["status"] == "impact_pending"
+    assert runtime_doc["mount_relations"][0]["impact_reminder_id"]
+    assert "resolve_drift" in runtime_doc["recommended_actions"]
+
+    orphan = by_path["docs/orphan.md"]
+    assert orphan["asset_status"] == "doc_unbound"
+    assert orphan["mount_relations"][0]["status"] == "unbound"
+
+    config = by_path["config/runtime.yaml"]
+    assert config["asset_status"] == "config_pending_decision"
+    assert config["mount_relations"][0]["status"] == "candidate"
+    assert "write_governance_hint" not in config["batch_eligible_actions"]
+
+
+def test_graph_governance_asset_drift_state_and_proposal_api_are_auditable(conn):
+    code, recorded = server.handle_graph_governance_asset_drift_state_record(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "asset_kind": "doc",
+                "asset_path": "docs/runtime.md",
+                "snapshot_id": "asset-inbox-drift",
+                "commit_sha": "c-drift",
+                "drift_state": "confirmed",
+                "actor": "unit-test",
+                "evidence": {"source": "fixture"},
+            },
+        )
+    )
+    assert code == 201
+    assert recorded["drift_state"]["drift_state"] == "confirmed"
+    assert recorded["drift_state"]["evidence"]["source"] == "fixture"
+
+    code, proposal = server.handle_graph_governance_asset_drift_proposal_queue(
+        _ctx(
+            {"project_id": PID},
+            method="POST",
+            body={
+                "asset_kind": "doc",
+                "asset_path": "docs/runtime.md",
+                "snapshot_id": "asset-inbox-drift",
+                "commit_sha": "c-drift",
+                "node_id": "L7.runtime",
+                "actor": "unit-test",
+            },
+        )
+    )
+    assert code == 201
+    assert proposal["proposal"]["status"] == "blocked"
+    assert proposal["proposal"]["self_precheck"]["ok"] is False
+    assert proposal["proposal"]["self_precheck"]["required_gate"] == "local_precheck_before_review_queue"
+
+
 def test_graph_structure_hint_projection_api_returns_snapshot_notes(conn):
     notes = {
         "graph_structure_hint_projection": {

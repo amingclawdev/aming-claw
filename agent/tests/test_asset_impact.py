@@ -10,8 +10,12 @@ from agent.governance.asset_impact import (
     STATUS_RECORDED,
     build_asset_impact_reminder_projection,
     get_asset_impact_reminder_events,
+    get_asset_drift_state,
+    list_asset_drift_proposals,
     list_asset_impact_events,
     list_pending_asset_impact_reminders,
+    queue_asset_drift_proposal,
+    record_asset_drift_state,
     record_asset_impact_resolution,
     record_scope_asset_impacts,
     resolve_asset_impact_reminder,
@@ -370,6 +374,53 @@ def test_scope_asset_impacts_cover_accepted_doc_test_config_bindings_only() -> N
         ("config", "config/runtime-contract.yaml"),
     }
     assert not any(row["asset_path"].startswith("candidate/") for row in reminders)
+
+
+def test_asset_drift_state_defaults_manual_updates_and_ai_proposal_precheck() -> None:
+    conn = _conn()
+    _index_runtime_snapshot(conn, "scope-drift", "c-drift")
+
+    assert get_asset_drift_state(
+        conn,
+        PID,
+        asset_kind="doc",
+        asset_path="docs/runtime.md",
+    ) == {}
+
+    recorded = record_asset_drift_state(
+        conn,
+        project_id=PID,
+        asset_kind="doc",
+        asset_path="docs/runtime.md",
+        drift_state="suspected",
+        snapshot_id="scope-drift",
+        commit_sha="c-drift",
+        actor="observer",
+        evidence={"reason": "hash mismatch under review"},
+    )
+    assert recorded["drift_state"]["drift_state"] == "suspected"
+    assert recorded["drift_state"]["evidence"]["reason"] == "hash mismatch under review"
+
+    proposal = queue_asset_drift_proposal(
+        conn,
+        project_id=PID,
+        asset_kind="doc",
+        asset_path="docs/runtime.md",
+        snapshot_id="scope-drift",
+        commit_sha="c-drift",
+        node_id="L7.runtime",
+        actor="observer",
+        ai_available=False,
+        ai_reason="semantic AI route missing",
+        evidence={"source": "unit-test"},
+    )
+    assert proposal["proposal"]["status"] == "blocked"
+    assert proposal["proposal"]["ai_status"] == "blocked_no_ai_route"
+    assert proposal["proposal"]["self_precheck"]["ok"] is False
+    assert proposal["proposal"]["self_precheck"]["allowed_materialization"] == "review_queue_only"
+
+    rows = list_asset_drift_proposals(conn, PID, asset_kind="doc", asset_path="docs/runtime.md")
+    assert [row["proposal_id"] for row in rows] == [proposal["proposal"]["proposal_id"]]
 
 
 def test_db_migration_from_v43_adds_asset_impact_tables() -> None:

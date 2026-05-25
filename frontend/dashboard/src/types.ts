@@ -657,7 +657,12 @@ export type AssetInboxStatus =
   | "config_pending_decision"
   | "ignored"
   | "archive"
-  | "stale";
+  | "stale"
+  | "impact_pending"
+  | "drift_suspected"
+  | "drift_confirmed"
+  | "drift_resolved"
+  | "drift_waived";
 
 export type AssetInboxKind =
   | "source"
@@ -675,7 +680,10 @@ export type AssetInboxBatchActionName =
   | "queue_semantic_enrich"
   | "reject_or_waive_candidates"
   | "create_backlog_from_selection"
-  | "write_governance_hint";
+  | "write_governance_hint"
+  | "propose_remove_binding"
+  | "resolve_drift"
+  | "mark_drift_state";
 
 export interface AssetInboxResponse {
   schema_version: "asset_inbox.v1" | string;
@@ -728,6 +736,8 @@ export interface AssetInboxItem {
   binding_candidates: AssetInboxBindingCandidate[];
   mount_relations?: AssetInboxMountRelation[];
   relation_summary?: AssetInboxRelationSummary;
+  drift?: AssetInboxDriftState;
+  drift_proposal?: AssetInboxDriftProposal;
   recommended_actions: Array<AssetInboxBatchActionName | string>;
   batch_eligible_actions?: Array<AssetInboxBatchActionName | string>;
   risk?: "low" | "medium" | "high" | string;
@@ -759,7 +769,7 @@ export interface AssetInboxAssetGroupItem {
 
 export interface AssetInboxMountRelation {
   relation_id: string;
-  status: "accepted" | "candidate" | string;
+  status: "accepted" | "candidate" | "unbound" | "stale_drift" | "impact_pending" | string;
   role?: "doc" | "test" | "config" | string;
   target_node_id: string;
   target_title?: string;
@@ -769,6 +779,36 @@ export interface AssetInboxMountRelation {
   binding_strength?: "weak" | "strong" | string;
   impact_scope?: boolean | string | string[];
   review_required?: boolean;
+  impact_reminder_id?: string;
+  drift_state?: AssetInboxDriftStateName | string;
+}
+
+export type AssetInboxDriftStateName = "not_drifted" | "suspected" | "confirmed" | "resolved" | "waived";
+
+export interface AssetInboxDriftState {
+  schema_version?: "asset_drift_state.v1" | string;
+  state: AssetInboxDriftStateName | string;
+  source?: string;
+  actor?: string;
+  evidence?: Record<string, unknown>;
+  impact_pending?: boolean;
+  impact_reminders?: Array<{
+    reminder_id: string;
+    node_id?: string;
+    node_title?: string;
+    impact_count?: number;
+    latest_commit_sha?: string;
+  }>;
+}
+
+export interface AssetInboxDriftProposal {
+  proposal_id?: string;
+  status?: string;
+  ai_status?: string;
+  node_id?: string;
+  self_precheck?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  updated_at?: string;
 }
 
 export interface AssetInboxRelationSummary {
@@ -884,4 +924,29 @@ export interface AttachFileHintResponse {
   hint?: string;
   file?: FileInventoryRow;
   target_node?: NodeRecord;
+}
+
+export interface AssetDriftStateResponse {
+  ok: boolean;
+  project_id: string;
+  schema_version: string;
+  drift_state: Record<string, unknown>;
+}
+
+export interface AssetDriftProposalResponse {
+  ok: boolean;
+  project_id: string;
+  schema_version: string;
+  ai_available: boolean;
+  ai_reason: string;
+  proposal: AssetInboxDriftProposal & Record<string, unknown>;
+}
+
+export interface FileHygieneActionResponse {
+  ok: boolean;
+  project_id: string;
+  snapshot_id: string;
+  action: string;
+  event: Record<string, unknown>;
+  file?: FileInventoryRow;
 }

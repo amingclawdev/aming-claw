@@ -3453,6 +3453,105 @@ def handle_graph_governance_asset_impact_reminder_resolve(ctx: RequestContext):
         conn.close()
 
 
+def _asset_drift_ai_route_ready(project_id: str) -> tuple[bool, str]:
+    try:
+        project_config = project_service.get_project_config_metadata(project_id)
+    except Exception as exc:
+        return False, f"project AI config unavailable: {exc}"
+    if not isinstance(project_config, dict) or not project_config:
+        return False, "project AI config is missing"
+    route = _semantic_route_from_project_config(project_config)
+    provider = str(route.get("provider") or "")
+    model = str(route.get("model") or "")
+    if not provider or not model:
+        return False, "semantic AI provider/model route is not configured"
+    return True, f"semantic route configured: {provider}/{model}"
+
+
+@route("POST", "/api/graph-governance/{project_id}/asset-drift/state")
+def handle_graph_governance_asset_drift_state_record(ctx: RequestContext):
+    """Record manual asset drift state with audit evidence."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    from . import asset_impact
+
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.asset-drift.state")
+        try:
+            result = asset_impact.record_asset_drift_state(
+                conn,
+                project_id=project_id,
+                asset_kind=str(body.get("asset_kind") or ""),
+                asset_path=str(body.get("asset_path") or body.get("path") or ""),
+                drift_state=str(body.get("drift_state") or ""),
+                snapshot_id=str(body.get("snapshot_id") or ""),
+                commit_sha=str(body.get("commit_sha") or ""),
+                actor=str(body.get("actor") or "observer"),
+                evidence=body.get("evidence") if isinstance(body.get("evidence"), dict) else {},
+            )
+            conn.commit()
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        audit_service.record(
+            conn,
+            project_id,
+            "asset_drift_state_recorded",
+            actor=str(body.get("actor") or "observer"),
+            request_id=ctx.request_id,
+            details=json.dumps(result.get("drift_state", {}), ensure_ascii=False, sort_keys=True),
+        )
+        conn.commit()
+        return 201, {"ok": True, **result}
+    finally:
+        conn.close()
+
+
+@route("POST", "/api/graph-governance/{project_id}/asset-drift/proposals")
+def handle_graph_governance_asset_drift_proposal_queue(ctx: RequestContext):
+    """Queue or record an AI-assisted asset drift proposal without materializing it."""
+    project_id = ctx.get_project_id()
+    body = ctx.body
+    from . import asset_impact
+
+    ai_available, ai_reason = _asset_drift_ai_route_ready(project_id)
+    conn = get_connection(project_id)
+    try:
+        _require_graph_governance_operator(ctx, conn, "graph-governance.asset-drift.proposal")
+        try:
+            result = asset_impact.queue_asset_drift_proposal(
+                conn,
+                project_id=project_id,
+                asset_kind=str(body.get("asset_kind") or ""),
+                asset_path=str(body.get("asset_path") or body.get("path") or ""),
+                snapshot_id=str(body.get("snapshot_id") or ""),
+                commit_sha=str(body.get("commit_sha") or ""),
+                node_id=str(body.get("node_id") or body.get("target_node_id") or ""),
+                actor=str(body.get("actor") or "observer"),
+                ai_available=ai_available,
+                ai_reason=ai_reason,
+                evidence={
+                    "mode": str(body.get("mode") or "ai_assisted_proposal"),
+                    "operator_note": str(body.get("note") or body.get("reason") or ""),
+                },
+            )
+            conn.commit()
+        except ValueError as exc:
+            _raise_graph_api_validation(exc)
+        audit_service.record(
+            conn,
+            project_id,
+            "asset_drift_proposal_queued",
+            actor=str(body.get("actor") or "observer"),
+            request_id=ctx.request_id,
+            details=json.dumps(result.get("proposal", {}), ensure_ascii=False, sort_keys=True),
+        )
+        conn.commit()
+        return 201, {"ok": True, "ai_available": ai_available, "ai_reason": ai_reason, **result}
+    finally:
+        conn.close()
+
+
 @route("GET", "/api/graph-governance/{project_id}/parallel-branches")
 def handle_graph_governance_parallel_branches(ctx: RequestContext):
     """Return compact parallel branch lanes, queue, and rollback state."""
@@ -6835,6 +6934,7 @@ def handle_graph_governance_snapshot_asset_inbox(ctx: RequestContext):
 
 _FILE_HYGIENE_ACTIONS = {
     "attach_to_node",
+    "remove_binding",
     "create_node",
     "delete_candidate",
     "waive",
@@ -6852,6 +6952,7 @@ def _file_hygiene_event_type(action: str, file_kind: str, node_id: str = "") -> 
             return "config_binding_added"
     return {
         "attach_to_node": "file_attach_requested",
+        "remove_binding": "asset_binding_remove_requested",
         "create_node": "file_node_create_requested",
         "delete_candidate": "file_delete_candidate",
         "waive": "file_waived",
@@ -6876,6 +6977,8 @@ def _prepare_file_hygiene_action(conn, store, project_id: str, snapshot_id: str,
         raise ValidationError(f"unsupported file hygiene action: {action}")
     if not path:
         raise ValidationError("path is required")
+    if action == "remove_binding" and not node_id:
+        raise ValidationError("remove_binding requires target_node_id")
     if action == "delete_candidate" and not bool(
         body.get("confirm_delete_candidate") or body.get("operator_signoff")
     ):
@@ -6900,7 +7003,7 @@ def _prepare_file_hygiene_action(conn, store, project_id: str, snapshot_id: str,
     event_type = _file_hygiene_event_type(action, file_kind, node_id=node_id)
     target_type = "node" if event_type.endswith("_binding_added") else "file"
     target_id = node_id if target_type == "node" else path
-    risk = "high" if action == "delete_candidate" else "medium" if action == "create_node" else "low"
+    risk = "high" if action in {"delete_candidate", "remove_binding"} else "medium" if action == "create_node" else "low"
     payload = {
         "action": action,
         "path": path,

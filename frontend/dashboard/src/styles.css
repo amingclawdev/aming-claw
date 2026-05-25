@@ -1171,9 +1171,127 @@ a:hover { text-decoration: underline; }
 
 .asset-meta-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin: 12px 0;
+}
+
+.asset-one-hop-graph {
+  border: 1px solid var(--ink-100);
+  border-radius: 8px;
+  background: #fff;
+  margin: 0 0 12px;
+  padding: 10px;
+}
+
+.asset-graph-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.asset-relation-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+  max-width: 420px;
+}
+
+.asset-legend-item {
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.asset-graph-canvas {
+  height: 260px;
+  margin-top: 8px;
+  border: 1px solid var(--ink-100);
+  border-radius: 7px;
+  background: #f8fafc;
+}
+
+.asset-graph-canvas svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.asset-graph-edge {
+  stroke-width: 2.5;
+  stroke: var(--ink-300);
+}
+
+.asset-graph-root {
+  fill: #0f172a;
+  stroke: #fff;
+  stroke-width: 3;
+}
+
+.asset-graph-root-label,
+.asset-graph-root-kind,
+.asset-graph-node-label {
+  pointer-events: none;
+  font-weight: 800;
+}
+
+.asset-graph-root-label {
+  fill: #fff;
+  font-size: 12px;
+}
+
+.asset-graph-root-kind {
+  fill: #cbd5e1;
+  font-size: 9px;
+}
+
+.asset-graph-node-wrap {
+  cursor: pointer;
+}
+
+.asset-graph-node-wrap.active .asset-graph-node {
+  stroke-width: 4;
+}
+
+.asset-graph-node {
+  fill: #f8fafc;
+  stroke: var(--ink-400);
+  stroke-width: 2.5;
+}
+
+.asset-graph-node-label {
+  fill: var(--ink-900);
+  font-size: 9px;
+}
+
+.asset-graph-edge.accepted,
+.asset-graph-node.accepted {
+  stroke: #16a34a;
+}
+
+.asset-graph-edge.candidate,
+.asset-graph-node.candidate {
+  stroke: #d97706;
+}
+
+.asset-graph-edge.unbound,
+.asset-graph-node.unbound {
+  stroke: #64748b;
+  stroke-dasharray: 5 5;
+}
+
+.asset-graph-edge.stale-drift,
+.asset-graph-node.stale-drift {
+  stroke: #dc2626;
+}
+
+.asset-graph-edge.impact-pending,
+.asset-graph-node.impact-pending {
+  stroke: #7c3aed;
 }
 
 .asset-meta-cell {
@@ -1311,6 +1429,25 @@ a:hover { text-decoration: underline; }
   background: #fffbeb;
 }
 
+.asset-relation-card.unbound {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+}
+
+.asset-relation-card.stale-drift {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.asset-relation-card.impact-pending {
+  border-color: #ddd6fe;
+  background: #f5f3ff;
+}
+
+.asset-relation-card.active {
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
 .asset-relation-card-head {
   display: flex;
   align-items: center;
@@ -1333,6 +1470,34 @@ a:hover { text-decoration: underline; }
 }
 
 .asset-relation-state.candidate {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.asset-relation-state.unbound,
+.asset-legend-item.unbound {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.asset-relation-state.stale-drift,
+.asset-legend-item.stale-drift {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.asset-relation-state.impact-pending,
+.asset-legend-item.impact-pending {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
+.asset-legend-item.accepted {
+  background: #dcfce7;
+  color: #047857;
+}
+
+.asset-legend-item.candidate {
   background: #fef3c7;
   color: #92400e;
 }
@@ -1373,6 +1538,44 @@ a:hover { text-decoration: underline; }
   white-space: nowrap;
   font-size: 10px;
   color: var(--ink-500);
+}
+
+.asset-relation-actions,
+.asset-drift-control-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.asset-drift-control-grid {
+  margin-bottom: 8px;
+}
+
+.asset-drift-state-btn {
+  border: 1px solid var(--ink-200);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink-700);
+  padding: 4px 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.asset-drift-state-btn.active {
+  border-color: var(--blue);
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.asset-resolve-drift-btn {
+  margin-bottom: 8px;
+}
+
+.attach-state-blocked {
+  color: #92400e;
 }
 
 .asset-compact-list {
@@ -1577,6 +1780,14 @@ a:hover { text-decoration: underline; }
   .asset-hint-controls,
   .asset-compact-row {
     grid-template-columns: 1fr;
+  }
+
+  .asset-graph-head {
+    display: grid;
+  }
+
+  .asset-relation-legend {
+    justify-content: flex-start;
   }
 }
 

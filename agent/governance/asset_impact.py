@@ -19,6 +19,10 @@ EVENT_IMPACT_DETECTED = "impact_detected"
 EVENT_RESOLUTION_RECORDED = "resolution_recorded"
 STATUS_PENDING = "pending"
 STATUS_RECORDED = "recorded"
+DRIFT_STATES = {"not_drifted", "suspected", "confirmed", "resolved", "waived"}
+DRIFT_PROPOSAL_STATUSES = {"queued", "blocked", "precheck_failed", "ready_for_review", "reviewed"}
+EVENT_DRIFT_STATE_RECORDED = "drift_state_recorded"
+EVENT_DRIFT_PROPOSAL_QUEUED = "drift_proposal_queued"
 RESOLUTION_KINDS = {"updated", "keep_unchanged", "waived"}
 ACTION_CATALOG = {
     "primary_actions": ["updated", "keep_unchanged", "waived"],
@@ -89,6 +93,42 @@ CREATE INDEX IF NOT EXISTS idx_graph_asset_impact_reminders_status
     ON graph_asset_impact_reminders(project_id, status, asset_kind, node_id);
 CREATE INDEX IF NOT EXISTS idx_graph_asset_impact_reminders_asset
     ON graph_asset_impact_reminders(project_id, asset_kind, asset_path);
+
+CREATE TABLE IF NOT EXISTS graph_asset_drift_state (
+    project_id                 TEXT NOT NULL,
+    asset_kind                 TEXT NOT NULL DEFAULT '',
+    asset_path                 TEXT NOT NULL DEFAULT '',
+    snapshot_id                TEXT NOT NULL DEFAULT '',
+    commit_sha                 TEXT NOT NULL DEFAULT '',
+    drift_state                TEXT NOT NULL DEFAULT 'not_drifted',
+    actor                      TEXT NOT NULL DEFAULT '',
+    evidence_json              TEXT NOT NULL DEFAULT '{}',
+    created_at                 TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL,
+    PRIMARY KEY(project_id, asset_kind, asset_path)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_asset_drift_state_snapshot
+    ON graph_asset_drift_state(project_id, snapshot_id, drift_state);
+
+CREATE TABLE IF NOT EXISTS graph_asset_drift_proposals (
+    project_id                 TEXT NOT NULL,
+    proposal_id                TEXT NOT NULL,
+    asset_kind                 TEXT NOT NULL DEFAULT '',
+    asset_path                 TEXT NOT NULL DEFAULT '',
+    snapshot_id                TEXT NOT NULL DEFAULT '',
+    commit_sha                 TEXT NOT NULL DEFAULT '',
+    node_id                    TEXT NOT NULL DEFAULT '',
+    status                     TEXT NOT NULL DEFAULT '',
+    ai_status                  TEXT NOT NULL DEFAULT '',
+    actor                      TEXT NOT NULL DEFAULT '',
+    self_precheck_json         TEXT NOT NULL DEFAULT '{}',
+    evidence_json              TEXT NOT NULL DEFAULT '{}',
+    created_at                 TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL,
+    PRIMARY KEY(project_id, proposal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_asset_drift_proposals_asset
+    ON graph_asset_drift_proposals(project_id, asset_kind, asset_path, status);
 """
 
 
@@ -154,6 +194,18 @@ def _reminder_id(impact_key: str) -> str:
     return f"air-{digest[:16]}"
 
 
+def _drift_proposal_id(
+    project_id: str,
+    asset_kind: str,
+    asset_path: str,
+    snapshot_id: str,
+    node_id: str = "",
+) -> str:
+    payload = "\0".join([project_id, asset_kind, asset_path, snapshot_id, node_id])
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"adp-{digest[:16]}"
+
+
 def _event_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     out = dict(row)
     out["covers_event_ids"] = [
@@ -172,6 +224,19 @@ def _reminder_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
         for item in _loads(out.pop("open_event_ids_json", "[]"), [])
         if str(item).isdigit()
     ]
+    out["evidence"] = _loads(out.pop("evidence_json", "{}"), {})
+    return out
+
+
+def _drift_state_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    out["evidence"] = _loads(out.pop("evidence_json", "{}"), {})
+    return out
+
+
+def _drift_proposal_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    out["self_precheck"] = _loads(out.pop("self_precheck_json", "{}"), {})
     out["evidence"] = _loads(out.pop("evidence_json", "{}"), {})
     return out
 
@@ -750,6 +815,249 @@ def list_pending_asset_impact_reminders(
     return [_reminder_row(row) for row in rows]
 
 
+def list_asset_impact_reminders_by_asset(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    status: str = STATUS_PENDING,
+    limit: int = 5000,
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    ensure_schema(conn)
+    clauses = ["project_id = ?"]
+    params: list[Any] = [_text(project_id)]
+    if status:
+        clauses.append("status = ?")
+        params.append(_text(status))
+    params.append(max(1, min(int(limit or 5000), 10000)))
+    rows = conn.execute(
+        f"""SELECT * FROM graph_asset_impact_reminders
+            WHERE {' AND '.join(clauses)}
+            ORDER BY latest_event_id DESC
+            LIMIT ?""",
+        params,
+    ).fetchall()
+    out: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        reminder = _reminder_row(row)
+        out[(str(reminder.get("asset_kind") or ""), _norm_path(reminder.get("asset_path")))].append(reminder)
+    return out
+
+
+def get_asset_drift_state(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    asset_kind: str,
+    asset_path: str,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    row = conn.execute(
+        """SELECT * FROM graph_asset_drift_state
+           WHERE project_id = ? AND asset_kind = ? AND asset_path = ?
+           LIMIT 1""",
+        (_text(project_id), _text(asset_kind), _norm_path(asset_path)),
+    ).fetchone()
+    return _drift_state_row(row) if row else {}
+
+
+def list_asset_drift_states(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    snapshot_id: str = "",
+    limit: int = 5000,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    ensure_schema(conn)
+    clauses = ["project_id = ?"]
+    params: list[Any] = [_text(project_id)]
+    if snapshot_id:
+        clauses.append("(snapshot_id = ? OR snapshot_id = '')")
+        params.append(_text(snapshot_id))
+    params.append(max(1, min(int(limit or 5000), 10000)))
+    rows = conn.execute(
+        f"""SELECT * FROM graph_asset_drift_state
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+        params,
+    ).fetchall()
+    return {
+        (str(row["asset_kind"] or ""), _norm_path(row["asset_path"])): _drift_state_row(row)
+        for row in rows
+    }
+
+
+def record_asset_drift_state(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    asset_kind: str,
+    asset_path: str,
+    drift_state: str,
+    snapshot_id: str = "",
+    commit_sha: str = "",
+    actor: str = "",
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    pid = _text(project_id)
+    kind = _text(asset_kind)
+    path = _norm_path(asset_path)
+    state = _text(drift_state)
+    if state not in DRIFT_STATES:
+        raise ValueError(f"drift_state must be one of {sorted(DRIFT_STATES)}")
+    if not pid or not kind or not path:
+        raise ValueError("project_id, asset_kind, and asset_path are required")
+    now = _utc_iso()
+    from .db import sqlite_write_lock
+
+    with sqlite_write_lock():
+        conn.execute(
+            """INSERT INTO graph_asset_drift_state
+               (project_id, asset_kind, asset_path, snapshot_id, commit_sha,
+                drift_state, actor, evidence_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_id, asset_kind, asset_path) DO UPDATE SET
+                 snapshot_id = excluded.snapshot_id,
+                 commit_sha = excluded.commit_sha,
+                 drift_state = excluded.drift_state,
+                 actor = excluded.actor,
+                 evidence_json = excluded.evidence_json,
+                 updated_at = excluded.updated_at""",
+            (
+                pid,
+                kind,
+                path,
+                _text(snapshot_id),
+                _text(commit_sha),
+                state,
+                _text(actor or "observer"),
+                _json({"source": EVENT_DRIFT_STATE_RECORDED, **dict(evidence or {})}, {}),
+                now,
+                now,
+            ),
+        )
+    row = get_asset_drift_state(conn, pid, asset_kind=kind, asset_path=path)
+    return {"schema_version": SCHEMA_VERSION, "project_id": pid, "drift_state": row}
+
+
+def list_asset_drift_proposals(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    asset_kind: str = "",
+    asset_path: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    ensure_schema(conn)
+    clauses = ["project_id = ?"]
+    params: list[Any] = [_text(project_id)]
+    if asset_kind:
+        clauses.append("asset_kind = ?")
+        params.append(_text(asset_kind))
+    if asset_path:
+        clauses.append("asset_path = ?")
+        params.append(_norm_path(asset_path))
+    params.append(max(1, min(int(limit or 500), 5000)))
+    rows = conn.execute(
+        f"""SELECT * FROM graph_asset_drift_proposals
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+        params,
+    ).fetchall()
+    return [_drift_proposal_row(row) for row in rows]
+
+
+def latest_asset_drift_proposals_by_asset(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    limit: int = 5000,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in list_asset_drift_proposals(conn, project_id, limit=limit):
+        key = (str(row.get("asset_kind") or ""), _norm_path(row.get("asset_path")))
+        out.setdefault(key, row)
+    return out
+
+
+def queue_asset_drift_proposal(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    asset_kind: str,
+    asset_path: str,
+    snapshot_id: str,
+    commit_sha: str = "",
+    node_id: str = "",
+    actor: str = "",
+    ai_available: bool = False,
+    ai_reason: str = "",
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    ensure_schema(conn)
+    pid = _text(project_id)
+    kind = _text(asset_kind)
+    path = _norm_path(asset_path)
+    sid = _text(snapshot_id)
+    if not pid or not kind or not path or not sid:
+        raise ValueError("project_id, asset_kind, asset_path, and snapshot_id are required")
+    proposal_id = _drift_proposal_id(pid, kind, path, sid, node_id)
+    precheck = {
+        "schema_version": "asset_drift_ai_precheck.v1",
+        "ok": bool(ai_available),
+        "required_gate": "local_precheck_before_review_queue",
+        "ai_available": bool(ai_available),
+        "reason": _text(ai_reason or ("ai_route_ready" if ai_available else "ai_route_unavailable")),
+        "allowed_materialization": "review_queue_only",
+    }
+    status = "queued" if ai_available else "blocked"
+    ai_status = "queued_for_ai_proposal" if ai_available else "blocked_no_ai_route"
+    now = _utc_iso()
+    from .db import sqlite_write_lock
+
+    with sqlite_write_lock():
+        conn.execute(
+            """INSERT INTO graph_asset_drift_proposals
+               (project_id, proposal_id, asset_kind, asset_path, snapshot_id, commit_sha,
+                node_id, status, ai_status, actor, self_precheck_json,
+                evidence_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_id, proposal_id) DO UPDATE SET
+                 commit_sha = excluded.commit_sha,
+                 node_id = excluded.node_id,
+                 status = excluded.status,
+                 ai_status = excluded.ai_status,
+                 actor = excluded.actor,
+                 self_precheck_json = excluded.self_precheck_json,
+                 evidence_json = excluded.evidence_json,
+                 updated_at = excluded.updated_at""",
+            (
+                pid,
+                proposal_id,
+                kind,
+                path,
+                sid,
+                _text(commit_sha),
+                _text(node_id),
+                status,
+                ai_status,
+                _text(actor or "observer"),
+                _json(precheck, {}),
+                _json({"source": EVENT_DRIFT_PROPOSAL_QUEUED, **dict(evidence or {})}, {}),
+                now,
+                now,
+            ),
+        )
+    proposals = list_asset_drift_proposals(conn, pid, asset_kind=kind, asset_path=path, limit=1)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "project_id": pid,
+        "proposal": proposals[0] if proposals else {},
+    }
+
+
 def build_asset_impact_reminder_projection(
     conn: sqlite3.Connection,
     project_id: str,
@@ -918,9 +1226,16 @@ __all__ = [
     "STATUS_RECORDED",
     "build_asset_impact_reminder_projection",
     "ensure_schema",
+    "get_asset_drift_state",
     "get_asset_impact_reminder_events",
+    "latest_asset_drift_proposals_by_asset",
+    "list_asset_drift_proposals",
+    "list_asset_drift_states",
     "list_asset_impact_events",
+    "list_asset_impact_reminders_by_asset",
     "list_pending_asset_impact_reminders",
+    "queue_asset_drift_proposal",
+    "record_asset_drift_state",
     "record_asset_impact_detected",
     "record_asset_impact_resolution",
     "record_scope_asset_impacts",
