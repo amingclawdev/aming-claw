@@ -534,6 +534,9 @@ export interface BacklogBug {
   details_md?: string;
   details_preview?: string;
   commit?: string;
+  chain_trigger_json?: Record<string, unknown> | string;
+  bypass_policy_json?: string;
+  bypass_policy?: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
   fixed_at?: string;

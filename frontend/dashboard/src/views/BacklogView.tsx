@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import type {
   BacklogBug,
@@ -19,6 +19,51 @@ type PriorityFilter = "ALL" | "P0" | "P1" | "P2" | "P3";
 const PRIORITIES: PriorityFilter[] = ["ALL", "P0", "P1", "P2", "P3"];
 const PRIORITY_WEIGHT: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const CLOSED_STATUSES = new Set(["FIXED", "CLOSED", "DONE", "RESOLVED", "CANCELLED"]);
+const BACKLOG_URL_PARAM = "backlog";
+const BACKLOG_DETAIL_TIMELINE_LIMIT = 250;
+
+export const BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS: TaskTimelineEvent[] = [
+  {
+    event_id: "fixture-observer-dispatch",
+    event_type: "mf_dispatch",
+    event_kind: "implementation",
+    actor: "observer",
+    phase: "dispatch",
+    status: "accepted",
+    payload: { lane: "observer", requirement_ids: ["impact_scope_analysis"] },
+    created_at: "2026-05-25T12:00:00Z",
+  },
+  {
+    event_id: "fixture-worker-frontend",
+    event_type: "subagent_result",
+    event_kind: "implementation",
+    actor: "mf_sub_frontend",
+    phase: "implementation",
+    status: "passed",
+    payload: { lane: "frontend", requirement_ids: ["parallel_timeline_dag", "evidence_inspector"] },
+    created_at: "2026-05-25T12:01:00Z",
+  },
+  {
+    event_id: "fixture-worker-backend",
+    event_type: "subagent_result",
+    event_kind: "implementation",
+    actor: "mf_sub_backend",
+    phase: "implementation",
+    status: "passed",
+    payload: { lane: "backend", requirement_ids: ["modal_summary_contract"] },
+    created_at: "2026-05-25T12:01:00Z",
+  },
+  {
+    event_id: "fixture-gate-merge",
+    event_type: "merge_gate",
+    event_kind: "verification",
+    actor: "observer",
+    phase: "merge_gate",
+    status: "passed",
+    payload: { lane: "gate", requirement_ids: ["fixture_parallel_timeline", "no_false_evidence_gate"] },
+    created_at: "2026-05-25T12:03:00Z",
+  },
+];
 
 interface TimelineState {
   expanded: boolean;
@@ -37,6 +82,16 @@ export default function BacklogView({ backlog, projectId }: Props) {
   const [query, setQuery] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [timelineByBug, setTimelineByBug] = useState<Record<string, TimelineState>>({});
+  const [selectedBugId, setSelectedBugId] = useState(() => readBacklogIdFromUrl());
+  const [detailByBug, setDetailByBug] = useState<Record<string, BacklogBug>>({});
+  const [detailLoadingByBug, setDetailLoadingByBug] = useState<Record<string, boolean>>({});
+  const [detailErrorByBug, setDetailErrorByBug] = useState<Record<string, string>>({});
+  const [modalTrail, setModalTrail] = useState<string[]>([]);
+  const timelineByBugRef = useRef<Record<string, TimelineState>>({});
+
+  useEffect(() => {
+    timelineByBugRef.current = timelineByBug;
+  }, [timelineByBug]);
 
   const stats = useMemo(() => {
     if (backlog.summary) {
@@ -92,7 +147,20 @@ export default function BacklogView({ backlog, projectId }: Props) {
 
   useEffect(() => {
     setTimelineByBug({});
+    setDetailByBug({});
+    setDetailLoadingByBug({});
+    setDetailErrorByBug({});
+    setModalTrail([]);
   }, [projectId]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setSelectedBugId(readBacklogIdFromUrl());
+      setModalTrail([]);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
 
   const copySyncCommands = async () => {
     try {
@@ -105,23 +173,16 @@ export default function BacklogView({ backlog, projectId }: Props) {
     }
   };
 
-  const toggleTimeline = (bugId: string) => {
-    const current = timelineByBug[bugId];
-    if (current?.expanded) {
-      setTimelineByBug((states) => ({
-        ...states,
-        [bugId]: { ...states[bugId], expanded: false },
-      }));
-      return;
-    }
-
+  const loadTimeline = useCallback((bugId: string, expanded: boolean) => {
+    const existingSnapshot = timelineByBugRef.current[bugId];
+    const shouldFetch = !(existingSnapshot?.loaded || existingSnapshot?.loading);
     setTimelineByBug((states) => {
       const existing = states[bugId];
       return {
         ...states,
         [bugId]: {
-          expanded: true,
-          loading: existing?.loaded ? false : true,
+          expanded,
+          loading: existing?.loaded ? false : shouldFetch,
           loaded: existing?.loaded ?? false,
           error: "",
           events: existing?.events ?? [],
@@ -131,16 +192,16 @@ export default function BacklogView({ backlog, projectId }: Props) {
       };
     });
 
-    if (current?.loaded || current?.loading) return;
+    if (!shouldFetch) return;
 
-    api.backlogTimelineGateFor(projectId, bugId, 50)
+    api.backlogTimelineGateFor(projectId, bugId, BACKLOG_DETAIL_TIMELINE_LIMIT)
       .then((res) => {
         setTimelineByBug((states) => {
           const existing = states[bugId];
           return {
             ...states,
             [bugId]: {
-              expanded: existing?.expanded ?? true,
+              expanded: existing?.expanded ?? expanded,
               loading: false,
               loaded: true,
               error: "",
@@ -158,7 +219,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
           return {
             ...states,
             [bugId]: {
-              expanded: existing?.expanded ?? true,
+              expanded: existing?.expanded ?? expanded,
               loading: false,
               loaded: true,
               error: msg,
@@ -169,7 +230,79 @@ export default function BacklogView({ backlog, projectId }: Props) {
           };
         });
       });
+  }, [projectId]);
+
+  const toggleTimeline = (bugId: string) => {
+    const current = timelineByBug[bugId];
+    if (current?.expanded) {
+      setTimelineByBug((states) => ({
+        ...states,
+        [bugId]: { ...states[bugId], expanded: false },
+      }));
+      return;
+    }
+    loadTimeline(bugId, true);
   };
+
+  const fetchBugDetail = useCallback((bugId: string) => {
+    if (detailByBug[bugId] || detailLoadingByBug[bugId]) return;
+    setDetailLoadingByBug((states) => ({ ...states, [bugId]: true }));
+    setDetailErrorByBug((states) => ({ ...states, [bugId]: "" }));
+    api.backlogBugFor(projectId, bugId)
+      .then((bug) => {
+        setDetailByBug((states) => ({ ...states, [bugId]: bug }));
+      })
+      .catch((error) => {
+        const msg = error instanceof ApiError ? `${error.message} ${error.body}` : String(error);
+        setDetailErrorByBug((states) => ({ ...states, [bugId]: msg }));
+      })
+      .finally(() => {
+        setDetailLoadingByBug((states) => ({ ...states, [bugId]: false }));
+      });
+  }, [detailByBug, detailLoadingByBug, projectId]);
+
+  const openDetail = useCallback((bugId: string, mode: "push" | "replace" = "push", keepTrail = false) => {
+    setModalTrail((trail) => {
+      if (!keepTrail || !selectedBugId || selectedBugId === bugId) return trail;
+      return [...trail.filter((id) => id !== bugId), selectedBugId].slice(-5);
+    });
+    setSelectedBugId(bugId);
+    writeBacklogIdToUrl(bugId, mode);
+    fetchBugDetail(bugId);
+    loadTimeline(bugId, false);
+  }, [fetchBugDetail, loadTimeline, selectedBugId]);
+
+  const closeDetail = useCallback(() => {
+    setSelectedBugId(null);
+    setModalTrail([]);
+    writeBacklogIdToUrl(null, "push");
+  }, []);
+
+  const stepBackDetail = useCallback(() => {
+    setModalTrail((trail) => {
+      const nextTrail = trail.slice(0, -1);
+      const nextId = trail[trail.length - 1];
+      if (nextId) {
+        setSelectedBugId(nextId);
+        writeBacklogIdToUrl(nextId, "push");
+        fetchBugDetail(nextId);
+        loadTimeline(nextId, false);
+      }
+      return nextTrail;
+    });
+  }, [fetchBugDetail, loadTimeline]);
+
+  useEffect(() => {
+    if (!selectedBugId) return;
+    fetchBugDetail(selectedBugId);
+    loadTimeline(selectedBugId, false);
+  }, [fetchBugDetail, loadTimeline, selectedBugId]);
+
+  const selectedBug = selectedBugId
+    ? detailByBug[selectedBugId] ?? bugs.find((bug) => bug.bug_id === selectedBugId) ?? null
+    : null;
+
+  const selectedTimeline = selectedBugId ? timelineByBug[selectedBugId] : undefined;
 
   return (
     <div className="view">
@@ -260,6 +393,7 @@ export default function BacklogView({ backlog, projectId }: Props) {
                     bug={bug}
                     timeline={timelineByBug[bug.bug_id]}
                     onToggleTimeline={() => toggleTimeline(bug.bug_id)}
+                    onOpenDetail={() => openDetail(bug.bug_id)}
                   />
                 ))}
               </tbody>
@@ -267,6 +401,19 @@ export default function BacklogView({ backlog, projectId }: Props) {
           </div>
         )}
       </div>
+      {selectedBugId ? (
+        <BacklogDetailModal
+          bug={selectedBug}
+          fallbackBugId={selectedBugId}
+          timeline={selectedTimeline}
+          loadingBug={detailLoadingByBug[selectedBugId] ?? false}
+          error={detailErrorByBug[selectedBugId] ?? ""}
+          breadcrumb={modalTrail}
+          onBack={stepBackDetail}
+          onClose={closeDetail}
+          onSelectRelated={(bugId) => openDetail(bugId, "push", true)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -275,10 +422,12 @@ function BacklogRow({
   bug,
   timeline,
   onToggleTimeline,
+  onOpenDetail,
 }: {
   bug: BacklogBug;
   timeline?: TimelineState;
   onToggleTimeline: () => void;
+  onOpenDetail: () => void;
 }) {
   const files = listFrom(bug.target_files);
   const criteria = listFrom(bug.acceptance_criteria);
@@ -300,6 +449,14 @@ function BacklogRow({
         <td className="backlog-title-cell">
           <div className="cell-strong">{bug.title || bug.bug_id}</div>
           <div className="cell-mono-id">{bug.bug_id}</div>
+          <button
+            type="button"
+            className="backlog-detail-link"
+            onClick={onOpenDetail}
+            aria-label={`Open detail for ${bug.bug_id}`}
+          >
+            Open detail
+          </button>
           <button
             type="button"
             className={`timeline-toggle ${timeline?.expanded ? "on" : "off"}`}
@@ -436,6 +593,237 @@ function TimelinePanel({ timeline, backlogId }: { timeline: TimelineState; backl
   );
 }
 
+function BacklogDetailModal({
+  bug,
+  fallbackBugId,
+  timeline,
+  loadingBug,
+  error,
+  breadcrumb,
+  onBack,
+  onClose,
+  onSelectRelated,
+}: {
+  bug: BacklogBug | null;
+  fallbackBugId: string;
+  timeline?: TimelineState;
+  loadingBug: boolean;
+  error: string;
+  breadcrumb: string[];
+  onBack: () => void;
+  onClose: () => void;
+  onSelectRelated: (bugId: string) => void;
+}) {
+  const events = timeline?.events ?? [];
+  const gate = timeline?.gate?.timeline_gate;
+  const dag = useMemo(() => buildTimelineDag(bug, events, gate), [bug, events, gate]);
+  const [selectedNodeId, setSelectedNodeId] = useState<string>("");
+  const selectedNode = dag.nodes.find((node) => node.id === selectedNodeId) ?? dag.nodes[0] ?? null;
+  const title = bug?.title || fallbackBugId;
+
+  useEffect(() => {
+    if (!selectedNode || dag.nodes.some((node) => node.id === selectedNodeId)) return;
+    setSelectedNodeId(selectedNode.id);
+  }, [dag.nodes, selectedNode, selectedNodeId]);
+
+  return (
+    <div className="backlog-modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="backlog-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="backlog-modal-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="backlog-modal-head">
+          <div>
+            <div className="backlog-modal-breadcrumb">
+              <button type="button" onClick={onBack} disabled={breadcrumb.length === 0}>
+                Back
+              </button>
+              {breadcrumb.map((id) => (
+                <button type="button" key={id} onClick={() => onSelectRelated(id)}>
+                  {id}
+                </button>
+              ))}
+            </div>
+            <h3 id="backlog-modal-title">{title}</h3>
+            <div className="cell-mono-id">{fallbackBugId}</div>
+          </div>
+          <button type="button" className="modal-close" onClick={onClose} aria-label="Close backlog detail">
+            x
+          </button>
+        </div>
+
+        {loadingBug ? <div className="timeline-empty">Loading backlog detail...</div> : null}
+        {error ? <div className="timeline-empty timeline-error">Backlog detail load failed: {error}</div> : null}
+        {bug ? <BacklogDetailSummary bug={bug} gate={gate} /> : null}
+
+        <div className="backlog-modal-section">
+          <div className="backlog-modal-section-head">
+            <span>Related backlog</span>
+            <span className="mono">{dag.relatedIds.length} discovered</span>
+          </div>
+          {dag.relatedIds.length > 0 ? (
+            <div className="backlog-relation-strip">
+              {dag.relatedIds.map((id) => (
+                <button type="button" key={id} onClick={() => onSelectRelated(id)}>
+                  {id}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="timeline-empty">No related backlog ids discovered from provenance, contract, timeline, or task fields.</div>
+          )}
+        </div>
+
+        <div className="backlog-modal-section">
+          <div className="backlog-modal-section-head">
+            <span>Parallel timeline DAG</span>
+            <span className="mono">
+              {dag.nodes.length} node{dag.nodes.length === 1 ? "" : "s"} · {dag.phaseLabels.length} phase{dag.phaseLabels.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          {timeline?.loading ? <div className="timeline-empty">Loading timeline...</div> : null}
+          {timeline?.error ? <div className="timeline-empty timeline-error">Timeline load failed: {timeline.error}</div> : null}
+          {!timeline?.loading && !timeline?.error && dag.nodes.length === 0 ? (
+            <div className="timeline-empty">No execution events or contract evidence nodes are available.</div>
+          ) : null}
+          {dag.nodes.length > 0 ? (
+            <div className="backlog-dag-shell">
+              <div className="backlog-dag-phases" style={{ gridTemplateColumns: `120px repeat(${dag.phaseLabels.length}, minmax(130px, 1fr))` }}>
+                <span />
+                {dag.phaseLabels.map((phase) => (
+                  <span key={phase}>{phase}</span>
+                ))}
+              </div>
+              <div className="backlog-dag-grid">
+                {dag.lanes.map((lane) => (
+                  <div className="backlog-dag-lane" key={lane.id}>
+                    <div className="backlog-dag-lane-label">{lane.label}</div>
+                    <div className="backlog-dag-lane-track" style={{ gridTemplateColumns: `repeat(${dag.phaseLabels.length}, minmax(130px, 1fr))` }}>
+                      {lane.nodes.map((node) => (
+                        <button
+                          type="button"
+                          key={node.id}
+                          className={`backlog-dag-node status-${node.status} ${selectedNode?.id === node.id ? "selected" : ""}`}
+                          style={{ gridColumn: `${node.phaseIndex + 1} / span 1` }}
+                          onClick={() => setSelectedNodeId(node.id)}
+                          title={node.inferred ? "Lane/phase inferred from event fields" : node.label}
+                        >
+                          <span>{node.label}</span>
+                          <em>{node.statusLabel}</em>
+                          {node.inferred ? <strong>inferred</strong> : null}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <EvidenceInspector node={selectedNode} />
+      </section>
+    </div>
+  );
+}
+
+function BacklogDetailSummary({ bug, gate }: { bug: BacklogBug; gate?: MfCloseTimelineGate }) {
+  const contract = gate?.contract_gate;
+  const missing = stableUnique([...(gate?.missing_event_kinds ?? []), ...(contract?.missing_requirement_ids ?? [])]);
+  const related = relatedIdsFromBug(bug, []);
+  return (
+    <div className="backlog-modal-summary">
+      <SummaryItem label="Priority" value={normalizePriority(bug.priority)} tone={priorityTone(bug.priority)} />
+      <SummaryItem label="Status" value={normalizeStatus(bug.status)} tone={statusClass(bug.status)} />
+      <SummaryItem label="Commit" value={bug.commit ? shortCommit(bug.commit) : "none"} mono />
+      <SummaryItem label="Contract" value={contract?.status || (bug.contract_summary?.has_contract ? "declared" : "not declared")} tone={contract?.passed ? "status-complete" : contract ? "status-failed" : "status-unknown"} />
+      <SummaryItem label="Close gate" value={gate?.status || (gate?.passed ? "passed" : "blocked")} tone={gate?.passed ? "status-complete" : "status-failed"} />
+      <SummaryItem label="Missing" value={missing.length ? String(missing.length) : "none"} tone={missing.length ? "status-failed" : "status-complete"} />
+      <DetailList label="Target files" values={listFrom(bug.target_files)} />
+      <DetailList label="Tests" values={listFrom(bug.test_files)} />
+      <DetailList label="Required docs" values={listFrom(bug.required_docs)} />
+      <DetailList label="Provenance / related" values={related} />
+    </div>
+  );
+}
+
+function SummaryItem({ label, value, tone, mono = false }: { label: string; value: string; tone?: string; mono?: boolean }) {
+  return (
+    <div className="backlog-summary-item">
+      <span>{label}</span>
+      <strong className={`${mono ? "mono" : ""} ${tone ?? ""}`}>{value}</strong>
+    </div>
+  );
+}
+
+function DetailList({ label, values }: { label: string; values: string[] }) {
+  return (
+    <div className="backlog-summary-list">
+      <span>{label}</span>
+      <div>
+        {(values.length > 0 ? values : ["none"]).slice(0, 8).map((value) => (
+          <em key={value} className="mono">{value}</em>
+        ))}
+        {values.length > 8 ? <strong>+{values.length - 8}</strong> : null}
+      </div>
+    </div>
+  );
+}
+
+function EvidenceInspector({ node }: { node: TimelineDagNode | null }) {
+  const event = node?.event;
+  const rows = [
+    ["event_type", event?.event_type],
+    ["event_kind", event?.event_kind],
+    ["actor", event?.actor],
+    ["phase", event?.phase],
+    ["status", event?.status ?? node?.statusLabel],
+    ["created_at", event?.created_at],
+    ["commit_sha", event?.commit_sha],
+    ["task_id", event?.task_id],
+    ["attempt_num", event?.attempt_num],
+  ];
+  return (
+    <div className="backlog-evidence-inspector">
+      <div className="backlog-modal-section-head">
+        <span>Evidence inspector</span>
+        <span className="mono">{node?.id ?? "no node"}</span>
+      </div>
+      {node ? (
+        <>
+          <div className="backlog-inspector-grid">
+            {rows.map(([key, value]) => (
+              <div key={key}>
+                <span>{key}</span>
+                <strong className="mono">{value == null || value === "" ? "-" : String(value)}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="backlog-inspector-json">
+            <div>
+              <span>verification</span>
+              <pre>{JSON.stringify(event?.verification ?? node.syntheticVerification ?? {}, null, 2)}</pre>
+            </div>
+            <div>
+              <span>artifact_refs</span>
+              <pre>{JSON.stringify(event?.artifact_refs ?? {}, null, 2)}</pre>
+            </div>
+            <div>
+              <span>raw payload</span>
+              <pre>{JSON.stringify(event?.payload ?? node.syntheticPayload ?? {}, null, 2)}</pre>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="timeline-empty">Select a timeline or contract node to inspect evidence.</div>
+      )}
+    </div>
+  );
+}
+
 function GateSummary({
   gate,
   response,
@@ -510,6 +898,254 @@ function TokenList({
   );
 }
 
+interface TimelineDag {
+  lanes: TimelineDagLane[];
+  nodes: TimelineDagNode[];
+  phaseLabels: string[];
+  relatedIds: string[];
+}
+
+interface TimelineDagLane {
+  id: string;
+  label: string;
+  nodes: TimelineDagNode[];
+}
+
+interface TimelineDagNode {
+  id: string;
+  label: string;
+  lane: string;
+  phase: string;
+  phaseIndex: number;
+  status: "passed" | "missing" | "failed" | "retry" | "bypassed" | "running" | "unknown";
+  statusLabel: string;
+  event?: TaskTimelineEvent;
+  inferred?: boolean;
+  syntheticPayload?: Record<string, unknown>;
+  syntheticVerification?: Record<string, unknown>;
+}
+
+export function buildBacklogParallelTimelineFixtureDagForTest(): TimelineDag {
+  return buildTimelineDag(
+    {
+      bug_id: "FIXTURE-BACKLOG-PARALLEL-TIMELINE",
+      title: "Fixture backlog parallel timeline",
+      status: "OPEN",
+      priority: "P0",
+      provenance_paths: ["FIXTURE-RELATED-BACKLOG"],
+    },
+    BACKLOG_PARALLEL_TIMELINE_FIXTURE_EVENTS,
+    {
+      passed: false,
+      status: "blocked",
+      required_event_kinds: ["implementation", "verification", "close_ready"],
+      present_event_kinds: ["implementation", "verification"],
+      missing_event_kinds: ["close_ready"],
+      contract_gate: {
+        passed: false,
+        status: "blocked",
+        required_requirement_ids: ["parallel_timeline_dag", "evidence_inspector", "contract_missing_visualization"],
+        present_requirement_ids: ["parallel_timeline_dag", "evidence_inspector"],
+        missing_requirement_ids: ["contract_missing_visualization"],
+      },
+    },
+  );
+}
+
+function buildTimelineDag(bug: BacklogBug | null, events: TaskTimelineEvent[], gate?: MfCloseTimelineGate): TimelineDag {
+  const phaseLabels: string[] = [];
+  const nodes: TimelineDagNode[] = [];
+  const orderedEvents = events.slice().sort(compareTimelineEvents);
+  orderedEvents.forEach((event, index) => {
+    const phase = phaseLabelForEvent(event, index);
+    const lane = laneLabelForEvent(event);
+    const eventNode: TimelineDagNode = {
+      id: `event:${timelineEventKey(event, index)}`,
+      label: event.event_type || event.event_kind || `event ${index + 1}`,
+      lane,
+      phase,
+      phaseIndex: phaseIndex(phaseLabels, phase),
+      status: dagStatusForEvent(event),
+      statusLabel: event.status || event.decision || event.event_kind || "event",
+      event,
+      inferred: isInferredLane(event),
+    };
+    nodes.push(eventNode);
+  });
+
+  const contract = gate?.contract_gate;
+  const required = stableUnique(contract?.required_requirement_ids ?? []);
+  const present = new Set(contract?.present_requirement_ids ?? []);
+  const missing = new Set(contract?.missing_requirement_ids ?? []);
+  for (const requirementId of required) {
+    const matching = orderedEvents.find((event) => evidenceRequirementIds(event).includes(requirementId));
+    const status = missing.has(requirementId) ? "missing" : matching ? dagStatusForEvent(matching) : present.has(requirementId) ? "passed" : "missing";
+    nodes.push({
+      id: `requirement:${requirementId}`,
+      label: requirementId,
+      lane: status === "retry" ? "retry" : "gate",
+      phase: "contract",
+      phaseIndex: phaseIndex(phaseLabels, "contract"),
+      status,
+      statusLabel: status,
+      event: matching,
+      inferred: !matching,
+      syntheticPayload: { requirement_id: requirementId, source: "contract_gate" },
+      syntheticVerification: {
+        requirement_id: requirementId,
+        present: present.has(requirementId),
+        missing: missing.has(requirementId),
+        no_false_evidence_gate: status !== "passed" || !missing.has(requirementId),
+      },
+    });
+  }
+
+  for (const eventKind of gate?.missing_event_kinds ?? []) {
+    nodes.push({
+      id: `missing-kind:${eventKind}`,
+      label: eventKind,
+      lane: "gate",
+      phase: "close gate",
+      phaseIndex: phaseIndex(phaseLabels, "close gate"),
+      status: "missing",
+      statusLabel: "missing",
+      inferred: false,
+      syntheticPayload: { required_event_kind: eventKind, source: "mf_close_gate" },
+      syntheticVerification: { missing: true, present: false },
+    });
+  }
+
+  const laneOrder = ["observer", "worker", "frontend", "backend", "verification", "browser_audit", "gate", "merge", "retry"];
+  const laneMap = new Map<string, TimelineDagNode[]>();
+  for (const node of nodes) {
+    laneMap.set(node.lane, [...(laneMap.get(node.lane) ?? []), node]);
+  }
+  const lanes = Array.from(laneMap.entries())
+    .map(([id, laneNodes]) => ({
+      id,
+      label: titleizeLane(id),
+      nodes: laneNodes.sort((a, b) => a.phaseIndex - b.phaseIndex || a.label.localeCompare(b.label)),
+    }))
+    .sort((a, b) => {
+      const ai = laneOrder.indexOf(a.id);
+      const bi = laneOrder.indexOf(b.id);
+      if (ai !== bi) return (ai < 0 ? laneOrder.length : ai) - (bi < 0 ? laneOrder.length : bi);
+      return a.id.localeCompare(b.id);
+    });
+
+  return {
+    lanes,
+    nodes,
+    phaseLabels,
+    relatedIds: relatedIdsFromBug(bug, events),
+  };
+}
+
+function phaseIndex(phases: string[], phase: string): number {
+  const existing = phases.indexOf(phase);
+  if (existing >= 0) return existing;
+  phases.push(phase);
+  return phases.length - 1;
+}
+
+function phaseLabelForEvent(event: TaskTimelineEvent, index: number): string {
+  const payload = asRecord(event.payload);
+  const explicit = event.phase || stringField(payload, "phase") || stringField(payload, "stage");
+  if (explicit) return explicit.replace(/_/g, " ");
+  if (event.event_kind) return event.event_kind.replace(/_/g, " ");
+  return `event ${index + 1}`;
+}
+
+function dagStatusForEvent(event: TaskTimelineEvent): TimelineDagNode["status"] {
+  const text = [event.status, event.decision, event.event_type, event.event_kind, event.phase].join(" ").toLowerCase();
+  if (text.includes("retry")) return "retry";
+  if (text.includes("bypass") || text.includes("waived")) return "bypassed";
+  if (text.includes("fail") || text.includes("blocked") || text.includes("reject")) return "failed";
+  if (text.includes("running") || text.includes("claimed") || text.includes("pending")) return "running";
+  if (text.includes("pass") || text.includes("accept") || text.includes("success") || text.includes("ok") || text.includes("succeed")) return "passed";
+  return "unknown";
+}
+
+function evidenceRequirementIds(event: TaskTimelineEvent): string[] {
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  const contractEvidence = listUnknown(verification.contract_evidence).flatMap((item) => {
+    const record = asRecord(item);
+    return [stringField(record, "requirement_id"), ...listUnknown(record.requirement_ids).map(String)];
+  });
+  return stableUnique([
+    stringField(payload, "requirement_id"),
+    ...listUnknown(payload.requirement_ids).map(String),
+    ...listUnknown(payload.requirement_id).map(String),
+    stringField(verification, "requirement_id"),
+    ...listUnknown(verification.requirement_ids).map(String),
+    ...listUnknown(verification.requirement_id).map(String),
+    ...contractEvidence,
+  ].map((value) => value.trim()).filter(Boolean));
+}
+
+function isInferredLane(event: TaskTimelineEvent): boolean {
+  const payload = asRecord(event.payload);
+  const verification = asRecord(event.verification);
+  return !(
+    stringField(payload, "lane") ||
+    stringField(payload, "agent_lane") ||
+    stringField(payload, "worker_lane") ||
+    stringField(payload, "agent_id") ||
+    stringField(payload, "parallel_agent_id") ||
+    stringField(verification, "lane")
+  );
+}
+
+function relatedIdsFromBug(bug: BacklogBug | null, events: TaskTimelineEvent[]): string[] {
+  const values: unknown[] = [];
+  if (bug) {
+    values.push(bug.provenance_paths, bug.chain_trigger_json, bug.current_task_id, bug.root_task_id, bug.bug_id);
+  }
+  for (const event of events) {
+    values.push(
+      event.backlog_id,
+      event.task_id,
+      event.trace_id,
+      event.correlation_id,
+      event.payload,
+      event.verification,
+      event.artifact_refs,
+    );
+  }
+  return stableUnique(collectBacklogIds(values)).filter((id) => id !== bug?.bug_id);
+}
+
+function collectBacklogIds(values: unknown[]): string[] {
+  const ids: string[] = [];
+  const visit = (value: unknown) => {
+    if (value == null) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value === "object") {
+      Object.entries(value as Record<string, unknown>).forEach(([key, item]) => {
+        if (/backlog|bug|related|parent|child|provenance|correlation|trace|task/i.test(key)) visit(item);
+      });
+      return;
+    }
+    const text = String(value);
+    for (const match of text.matchAll(/\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+){2,}\b/g)) {
+      ids.push(match[0]);
+    }
+  };
+  values.forEach(visit);
+  return ids;
+}
+
+function compareTimelineEvents(a: TaskTimelineEvent, b: TaskTimelineEvent): number {
+  const at = dateValue(a.created_at);
+  const bt = dateValue(b.created_at);
+  if (at !== bt) return at - bt;
+  return Number(a.id ?? 0) - Number(b.id ?? 0);
+}
+
 interface TimelineLane {
   id: string;
   label: string;
@@ -563,6 +1199,9 @@ function laneLabelForEvent(event: TaskTimelineEvent): string {
     event.event_kind ||
     event.event_type;
   const normalized = raw.toLowerCase();
+  if (normalized.includes("browser") || normalized.includes("playwright") || normalized.includes("screenshot")) return "browser_audit";
+  if (normalized.includes("retry") || normalized.includes("attempt_")) return "retry";
+  if (normalized.includes("subagent") || normalized.includes("worker") || normalized.includes("mf_sub")) return "worker";
   if (normalized.includes("front")) return "frontend";
   if (normalized.includes("back")) return "backend";
   if (normalized.includes("observer")) return "observer";
@@ -592,8 +1231,11 @@ function titleizeLane(value: string): string {
   if (value === "frontend") return "Frontend";
   if (value === "backend") return "Backend";
   if (value === "observer") return "Observer";
+  if (value === "worker") return "Subagents / Workers";
+  if (value === "browser_audit") return "Browser Audit";
   if (value === "gate") return "Gate";
   if (value === "merge") return "Merge";
+  if (value === "retry") return "Retry";
   if (value === "verification") return "Verification";
   return value.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
@@ -667,6 +1309,25 @@ function compactUnknown(value: unknown): string {
 
 function stableUnique(values: string[]): string[] {
   return values.filter((value, index) => values.indexOf(value) === index);
+}
+
+function readBacklogIdFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get(BACKLOG_URL_PARAM);
+  return value?.trim() || null;
+}
+
+function writeBacklogIdToUrl(backlogId: string | null, mode: "push" | "replace"): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("view", "backlog");
+  if (backlogId) url.searchParams.set(BACKLOG_URL_PARAM, backlogId);
+  else url.searchParams.delete(BACKLOG_URL_PARAM);
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextUrl === currentUrl) return;
+  if (mode === "push") window.history.pushState({ backlogId }, "", nextUrl);
+  else window.history.replaceState({ backlogId }, "", nextUrl);
 }
 
 function shortDateTime(value?: string): string {

@@ -9,6 +9,7 @@ import type {
   AssetInboxResponse,
   AttachFileHintResponse,
   BacklogTimelineGateResponse,
+  BacklogBug,
   BacklogResponse,
   EdgesResponse,
   FeedbackQueueResponse,
@@ -354,6 +355,12 @@ export const api = {
   },
   backlogFor(projectId: string, signal?: AbortSignal) {
     return getJSON<BacklogResponse>(`/api/backlog/${pidFor(projectId)}?${backlogListQuery()}`, signal);
+  },
+  backlogBugFor(projectId: string, backlogId: string, signal?: AbortSignal) {
+    return getJSON<BacklogBug>(
+      `/api/backlog/${pidFor(projectId)}/${encodeURIComponent(backlogId)}`,
+      signal,
+    );
   },
   taskTimelineFor(projectId: string, backlogId: string, limit = 50, signal?: AbortSignal) {
     const q = backlogTimelineQuery(backlogId, limit);
