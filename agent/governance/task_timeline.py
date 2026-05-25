@@ -81,6 +81,15 @@ MF_TEST_SCENARIO_POLICIES = {
     "new_scenario_required",
 }
 
+MF_TEST_SCENARIO_POLICY_MODE = "observer_configured"
+
+MF_TEST_SCENARIO_E2E_DECISIONS = {
+    "e2e_current",
+    "e2e_added",
+    "e2e_deferred",
+    "e2e_not_applicable",
+}
+
 MF_CLOSE_REQUIRED_EVENT_KINDS = {
     "implementation",
     "verification",
@@ -150,6 +159,14 @@ def _scenario_spec(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     return {}
+
+
+def _test_scenario_policy(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    raw = payload.get("test_scenario_policy")
+    if isinstance(raw, dict):
+        policy = str(raw.get("decision") or raw.get("policy") or "").strip()
+        return policy, raw
+    return str(raw or "").strip(), {}
 
 
 def _insert_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str, Any]:
@@ -439,16 +456,53 @@ def mf_test_scenario_verification(payload: dict[str, Any] | None) -> dict[str, A
     """
 
     payload = payload if isinstance(payload, dict) else {}
-    policy = str(payload.get("test_scenario_policy") or "").strip()
+    policy, policy_object = _test_scenario_policy(payload)
     verification_notes = _string_list(payload.get("verification_notes"))
     tests_run = _string_list(payload.get("tests_run"))
     scenario_id = str(payload.get("scenario_id") or "").strip()
     scenario = _scenario_spec(payload)
     if not scenario_id and scenario:
         scenario_id = str(scenario.get("id") or "").strip()
+    policy_mode = str(policy_object.get("mode") or "").strip()
+    reason = str(policy_object.get("reason") or "").strip()
+    allowed_decisions = _string_list(policy_object.get("allowed_decisions"))
+    required_evidence_ids = _string_list(policy_object.get("required_evidence_ids"))
+    e2e_decision = str(policy_object.get("e2e_decision") or "").strip()
+    followup_backlog_id = str(policy_object.get("followup_backlog_id") or "").strip()
 
     errors: list[str] = []
     warnings: list[str] = []
+
+    if policy_object:
+        if policy_mode != MF_TEST_SCENARIO_POLICY_MODE:
+            errors.append(
+                f"test_scenario_policy.mode must be {MF_TEST_SCENARIO_POLICY_MODE}"
+            )
+        if not allowed_decisions:
+            errors.append("test_scenario_policy.allowed_decisions must be non-empty")
+        else:
+            unsupported = sorted(set(allowed_decisions) - MF_TEST_SCENARIO_POLICIES)
+            if unsupported:
+                errors.append(
+                    "test_scenario_policy.allowed_decisions contains unsupported "
+                    "decision(s): " + ", ".join(unsupported)
+                )
+            if policy and policy not in allowed_decisions:
+                errors.append("test_scenario_policy.decision must be allowed")
+        if not reason:
+            errors.append("test_scenario_policy.reason is required")
+        if not required_evidence_ids:
+            errors.append("test_scenario_policy.required_evidence_ids must be non-empty")
+        if e2e_decision not in MF_TEST_SCENARIO_E2E_DECISIONS:
+            errors.append(
+                "test_scenario_policy.e2e_decision must be one of: "
+                + ", ".join(sorted(MF_TEST_SCENARIO_E2E_DECISIONS))
+            )
+        elif e2e_decision == "e2e_deferred" and not followup_backlog_id:
+            errors.append(
+                "test_scenario_policy.followup_backlog_id is required when "
+                "e2e_decision=e2e_deferred"
+            )
 
     if policy not in MF_TEST_SCENARIO_POLICIES:
         errors.append(
@@ -456,7 +510,7 @@ def mf_test_scenario_verification(payload: dict[str, Any] | None) -> dict[str, A
             + ", ".join(sorted(MF_TEST_SCENARIO_POLICIES))
         )
     elif policy == "none":
-        if not verification_notes and not tests_run:
+        if not verification_notes and not tests_run and not reason:
             errors.append("policy=none requires verification_notes or tests_run explaining why no scenario is needed")
     elif policy == "reuse_existing":
         if not scenario_id and not tests_run and not verification_notes:
@@ -483,11 +537,22 @@ def mf_test_scenario_verification(payload: dict[str, Any] | None) -> dict[str, A
         "passed": not errors,
         "status": "passed" if not errors else "failed",
         "policy": policy,
+        "effective_decision": policy,
+        "policy_mode": policy_mode,
+        "reason": reason,
+        "allowed_decisions": allowed_decisions,
+        "required_evidence_ids": required_evidence_ids,
+        "e2e_decision": e2e_decision,
+        "followup_backlog_id": followup_backlog_id,
         "scenario_id": scenario_id,
         "warnings": warnings,
         "errors": errors,
         "checks": {
             "has_explicit_policy": policy in MF_TEST_SCENARIO_POLICIES,
+            "has_observer_configured_policy": policy_mode == MF_TEST_SCENARIO_POLICY_MODE,
+            "has_decision_reason": bool(reason),
+            "has_required_evidence_ids": bool(required_evidence_ids),
+            "has_e2e_decision": e2e_decision in MF_TEST_SCENARIO_E2E_DECISIONS,
             "has_verification_notes": bool(verification_notes),
             "has_tests_run": bool(tests_run),
             "has_scenario_id": bool(scenario_id),
@@ -556,11 +621,33 @@ def mf_contract_requirements(contract: dict[str, Any] | None) -> list[dict[str, 
             "label": e2e_contract.get("label") or "E2E",
         })
 
+    test_policy = _mapping(root.get("test_scenario_policy"))
+    raw_requirements.extend(
+        {
+            "id": req_id,
+            "required": True,
+            "phase": "verification",
+            "kind": "test_scenario_policy",
+        }
+        for req_id in _string_list(test_policy.get("required_evidence_ids"))
+    )
+
     requirements: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in raw_requirements:
         normalized = _normalize_requirement(raw)
-        if not normalized or normalized["id"] in seen:
+        if not normalized:
+            continue
+        if normalized["id"] in seen:
+            for existing in requirements:
+                if existing["id"] != normalized["id"]:
+                    continue
+                if normalized.get("required", True):
+                    existing["required"] = True
+                for key in ("phase", "kind", "command", "label"):
+                    if not existing.get(key) and normalized.get(key):
+                        existing[key] = normalized[key]
+                break
             continue
         seen.add(normalized["id"])
         requirements.append(normalized)

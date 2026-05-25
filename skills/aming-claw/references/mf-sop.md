@@ -63,6 +63,11 @@ Canonical source: `docs/governance/manual-fix-sop.md`. This file is only the sho
      evidence ids, focused test commands, E2E decision or defer row, finish-gate
      fence expectations, and the compact `self_check` evidence the subagent must
      report;
+   - record the observer-configured test scenario policy before delegation:
+     MF/subagent work is not universally test-first; the observer must choose
+     `none`, `reuse_existing`, or `new_scenario_required`, give the reason,
+     list required evidence ids, and record the E2E run/defer/not_applicable
+     decision with a follow-up backlog id when deferred;
    - require structured worker final output with status, branch/worktree, owned
      changed files, tests run, graph query trace ids, precheck evidence,
      generated assets policy, and risks/open questions;

@@ -311,11 +311,67 @@ class TestTaskTimeline(unittest.TestCase):
                 },
                 True,
             ),
+            (
+                "observer configured new scenario with deferred e2e",
+                {
+                    "test_scenario_policy": {
+                        "mode": "observer_configured",
+                        "decision": "new_scenario_required",
+                        "allowed_decisions": [
+                            "none",
+                            "reuse_existing",
+                            "new_scenario_required",
+                        ],
+                        "reason": "contract policy behavior needs focused coverage",
+                        "required_evidence_ids": [
+                            "observer_test_strategy",
+                            "focused_tests",
+                            "contract_gate_tests",
+                            "docs_policy_update",
+                            "e2e_deferred_followup",
+                        ],
+                        "e2e_decision": "e2e_deferred",
+                        "followup_backlog_id": "E2E-OBSERVER-TEST-SCENARIO-POLICY-20260524",
+                    },
+                    "test_scenario_spec": {
+                        "id": "scn-observer-policy",
+                        "steps": ["instantiate contract", "run close gate"],
+                        "expected": ["required evidence ids block close until referenced"],
+                    },
+                },
+                True,
+            ),
+            (
+                "observer configured deferred e2e missing followup",
+                {
+                    "test_scenario_policy": {
+                        "mode": "observer_configured",
+                        "decision": "none",
+                        "allowed_decisions": [
+                            "none",
+                            "reuse_existing",
+                            "new_scenario_required",
+                        ],
+                        "reason": "docs-only policy wording",
+                        "required_evidence_ids": ["observer_test_strategy"],
+                        "e2e_decision": "e2e_deferred",
+                    },
+                },
+                False,
+            ),
         ]
         for label, payload, expected in cases:
             with self.subTest(label=label):
                 result = task_timeline.mf_test_scenario_verification(payload)
                 self.assertEqual(result["passed"], expected, result)
+                self.assertEqual(
+                    result["effective_decision"],
+                    (
+                        payload["test_scenario_policy"]["decision"]
+                        if isinstance(payload["test_scenario_policy"], dict)
+                        else payload["test_scenario_policy"]
+                    ),
+                )
 
     def test_mf_close_gate_requires_observer_execution_evidence(self):
         from agent.governance import task_timeline
@@ -448,6 +504,112 @@ class TestTaskTimeline(unittest.TestCase):
             ["backend_tests", "review_queue_category_e2e"],
         )
 
+    def test_mf_contract_gate_uses_observer_configured_required_evidence_ids(self):
+        from agent.governance import task_timeline
+
+        contract = {
+            "template_id": "mf_parallel.v1",
+            "contract_instance_id": "BUG-OBSERVER-POLICY",
+            "evidence_requirements": [
+                {
+                    "id": "e2e_deferred_followup",
+                    "required": False,
+                    "phase": "integration",
+                    "kind": "e2e_defer",
+                },
+            ],
+            "test_scenario_policy": {
+                "mode": "observer_configured",
+                "decision": "new_scenario_required",
+                "allowed_decisions": [
+                    "none",
+                    "reuse_existing",
+                    "new_scenario_required",
+                ],
+                "reason": "observer requires contract-backed evidence",
+                "required_evidence_ids": [
+                    "observer_test_strategy",
+                    "implementation_evidence",
+                    "focused_tests",
+                    "contract_gate_tests",
+                    "docs_policy_update",
+                    "e2e_deferred_followup",
+                ],
+                "e2e_decision": "e2e_deferred",
+                "followup_backlog_id": "E2E-OBSERVER-TEST-SCENARIO-POLICY-20260524",
+            },
+        }
+        base_events = [
+            {
+                "event_kind": "implementation",
+                "phase": "implementation",
+                "status": "accepted",
+                "payload": {
+                    "requirement_ids": [
+                        "implementation_evidence",
+                        "docs_policy_update",
+                    ],
+                },
+            },
+            {
+                "event_kind": "verification",
+                "phase": "verification",
+                "status": "passed",
+                "verification": {
+                    "requirement_ids": [
+                        "observer_test_strategy",
+                        "focused_tests",
+                        "contract_gate_tests",
+                    ],
+                },
+            },
+            {"event_kind": "close_ready", "phase": "close", "status": "accepted"},
+        ]
+
+        blocked = task_timeline.mf_close_gate_verification(base_events, contract=contract)
+
+        self.assertFalse(blocked["passed"], blocked)
+        self.assertEqual(
+            blocked["contract_gate"]["missing_requirement_ids"],
+            ["e2e_deferred_followup"],
+        )
+
+        ready = task_timeline.mf_close_gate_verification(
+            [
+                *base_events,
+                {
+                    "event_kind": "verification",
+                    "phase": "integration",
+                    "status": "passed",
+                    "verification": {
+                        "contract_evidence": [
+                            {
+                                "requirement_id": "e2e_deferred_followup",
+                                "status": "passed",
+                                "followup_backlog_id": (
+                                    "E2E-OBSERVER-TEST-SCENARIO-POLICY-20260524"
+                                ),
+                            }
+                        ]
+                    },
+                },
+            ],
+            contract=contract,
+        )
+
+        self.assertTrue(ready["passed"], ready)
+        self.assertEqual(
+            ready["contract_gate"]["present_requirement_ids"],
+            [
+                "contract_gate_tests",
+                "docs_policy_update",
+                "e2e_deferred_followup",
+                "focused_tests",
+                "implementation_evidence",
+                "observer_test_strategy",
+            ],
+        )
+
     def test_mf_parallel_template_exposes_optional_e2e_requirement(self):
         from agent.governance import task_timeline
 
@@ -461,10 +623,25 @@ class TestTaskTimeline(unittest.TestCase):
 
         requirements = task_timeline.mf_contract_requirements(template)
         by_id = {item["id"]: item for item in requirements}
+        policy = template["test_scenario_policy"]
 
+        self.assertEqual(policy["mode"], "observer_configured")
+        self.assertEqual(
+            policy["allowed_decisions"],
+            ["none", "reuse_existing", "new_scenario_required"],
+        )
+        self.assertIn("observer_test_strategy", policy["required_evidence_ids"])
         self.assertIn("focused_tests", by_id)
+        self.assertIn("observer_test_strategy", by_id)
+        self.assertIn("contract_gate_tests", by_id)
+        self.assertIn("docs_policy_update", by_id)
+        self.assertIn("e2e_deferred_followup", by_id)
         self.assertIn("integration_e2e", by_id)
+        self.assertTrue(by_id["observer_test_strategy"]["required"])
         self.assertTrue(by_id["focused_tests"]["required"])
+        self.assertFalse(by_id["contract_gate_tests"]["required"])
+        self.assertFalse(by_id["docs_policy_update"]["required"])
+        self.assertFalse(by_id["e2e_deferred_followup"]["required"])
         self.assertFalse(by_id["integration_e2e"]["required"])
         self.assertEqual(by_id["integration_e2e"]["kind"], "e2e")
 

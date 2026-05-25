@@ -256,6 +256,13 @@ is tracked separately in backlog rows and is not required for manual execution o
 this rule. For parallel/MF work, encode the E2E decision in the instantiated
 contract:
 
+Observer-started MF/subagent work is not universally test-first. Before
+delegation, the observer records `parallel_contract.test_scenario_policy` with
+`mode=observer_configured`, the explicit test-scenario decision (`none`,
+`reuse_existing`, or `new_scenario_required`), the reason, required evidence
+ids, and the E2E run/defer/not_applicable decision. Deferred E2E must name the
+follow-up backlog row before close-gate evidence can pass.
+
 ```json
 {
   "parallel_contract": {

@@ -13,6 +13,18 @@ CONTRACT_SCHEMA_VERSION = "parallel_agent_contract.v1"
 CONTRACT_ROW_TYPE = "contract"
 CONTRACT_TYPE = "parallel_agent_contract"
 ACCEPTED_CONTRACT_STATUS = "ACCEPTED"
+TEST_SCENARIO_POLICY_MODE = "observer_configured"
+TEST_SCENARIO_DECISIONS = {
+    "none",
+    "reuse_existing",
+    "new_scenario_required",
+}
+TEST_SCENARIO_E2E_DECISIONS = {
+    "e2e_current",
+    "e2e_added",
+    "e2e_deferred",
+    "e2e_not_applicable",
+}
 
 _ACTIVE_BACKLOG_STATUSES = {"OPEN", "IN_PROGRESS", "MF_IN_PROGRESS"}
 _PARALLEL_MARKER_KEYS = {
@@ -156,10 +168,72 @@ def _contract_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
     return dict(raw)
 
 
+def _validate_test_scenario_policy(value: Any) -> dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, Mapping):
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy must be an object"
+        )
+    policy = dict(value)
+    mode = _string(policy.get("mode"))
+    if mode != TEST_SCENARIO_POLICY_MODE:
+        raise ParallelAgentContractError(
+            f"parallel contract test_scenario_policy.mode must be {TEST_SCENARIO_POLICY_MODE}"
+        )
+    allowed_decisions = _string_list(policy.get("allowed_decisions"))
+    if not allowed_decisions:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.allowed_decisions is required"
+        )
+    unsupported = sorted(set(allowed_decisions) - TEST_SCENARIO_DECISIONS)
+    if unsupported:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.allowed_decisions contains "
+            "unsupported decision(s): " + ", ".join(unsupported)
+        )
+    decision = _string(policy.get("decision") or policy.get("policy"))
+    if decision not in allowed_decisions:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.decision must be allowed"
+        )
+    reason = _string(policy.get("reason"))
+    if not reason:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.reason is required"
+        )
+    required_evidence_ids = _string_list(policy.get("required_evidence_ids"))
+    if not required_evidence_ids:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.required_evidence_ids is required"
+        )
+    e2e_decision = _string(policy.get("e2e_decision"))
+    if e2e_decision not in TEST_SCENARIO_E2E_DECISIONS:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.e2e_decision must be one of: "
+            + ", ".join(sorted(TEST_SCENARIO_E2E_DECISIONS))
+        )
+    followup_backlog_id = _string(policy.get("followup_backlog_id"))
+    if e2e_decision == "e2e_deferred" and not followup_backlog_id:
+        raise ParallelAgentContractError(
+            "parallel contract test_scenario_policy.followup_backlog_id is required "
+            "when e2e_decision=e2e_deferred"
+        )
+    return {
+        "mode": mode,
+        "decision": decision,
+        "allowed_decisions": allowed_decisions,
+        "reason": reason,
+        "required_evidence_ids": required_evidence_ids,
+        "e2e_decision": e2e_decision,
+        "followup_backlog_id": followup_backlog_id,
+    }
+
+
 def _validate_contract_shape(
     raw: Mapping[str, Any],
     payload: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+) -> tuple[list[dict[str, Any]], dict[str, list[str]], dict[str, Any]]:
     row_type = _string(raw.get("row_type") or payload.get("row_type"))
     contract_type = _string(raw.get("contract_type") or payload.get("contract_type"))
     contract_status = _string(raw.get("contract_status") or payload.get("contract_status")).upper()
@@ -221,6 +295,9 @@ def _validate_contract_shape(
         raise ParallelAgentContractError(
             "parallel contract integration_gate.required_checks is required"
         )
+    test_scenario_policy = _validate_test_scenario_policy(
+        payload.get("test_scenario_policy")
+    )
 
     agent_ids = list(scopes_by_agent)
     for index, left_id in enumerate(agent_ids):
@@ -233,7 +310,7 @@ def _validate_contract_shape(
                             f"{left_id}:{left_scope} overlaps {right_id}:{right_scope}"
                         )
 
-    return participants, scopes_by_agent
+    return participants, scopes_by_agent, test_scenario_policy
 
 
 def validate_parallel_agent_task_gate(
@@ -280,7 +357,7 @@ def validate_parallel_agent_task_gate(
             f"parallel contract parent_bug_id {parent_bug_id} does not match task bug_id {task_bug_id}"
         )
 
-    participants, scopes_by_agent = _validate_contract_shape(raw, payload)
+    participants, scopes_by_agent, test_scenario_policy = _validate_contract_shape(raw, payload)
     participant_ids = {participant["agent_id"] for participant in participants}
     if agent_id not in participant_ids:
         raise ParallelAgentContractError(
@@ -312,7 +389,7 @@ def validate_parallel_agent_task_gate(
             + ", ".join(sorted(set(other_cross_writes)))
         )
 
-    return {
+    evidence = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "project_id": project_id,
         "task_type": task_type,
@@ -324,3 +401,6 @@ def validate_parallel_agent_task_gate(
         "owned_write_scope": owned_scope,
         "participant_count": len(participants),
     }
+    if test_scenario_policy:
+        evidence["test_scenario_policy"] = test_scenario_policy
+    return evidence

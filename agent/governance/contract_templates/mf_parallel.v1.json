@@ -5,6 +5,7 @@
   "required_instance_fields": [
     "contract_instance_id",
     "workers",
+    "test_scenario_policy",
     "evidence_requirements"
   ],
   "lifecycle_states": [
@@ -154,7 +155,38 @@
       "description": "Backlog close is deferred until merge, verification, reconcile/update, and close-ready evidence are complete."
     }
   ],
+  "test_scenario_policy": {
+    "mode": "observer_configured",
+    "decision": "",
+    "allowed_decisions": [
+      "none",
+      "reuse_existing",
+      "new_scenario_required"
+    ],
+    "reason": "",
+    "required_evidence_ids": [
+      "observer_test_strategy",
+      "focused_tests"
+    ],
+    "timeline_event_type": "mf.test_scenario.decision",
+    "timeline_event_kind": "scenario_spec",
+    "e2e_decision": "",
+    "allowed_e2e_decisions": [
+      "e2e_current",
+      "e2e_added",
+      "e2e_deferred",
+      "e2e_not_applicable"
+    ],
+    "followup_backlog_id": ""
+  },
   "evidence_requirements": [
+    {
+      "id": "observer_test_strategy",
+      "required": true,
+      "phase": "plan",
+      "kind": "test_strategy",
+      "description": "Observer records the test-scenario decision, reason, required evidence ids, and E2E run/defer/not-applicable decision before delegation."
+    },
     {
       "id": "implementation_evidence",
       "required": true,
@@ -179,6 +211,27 @@
       "phase": "integration",
       "kind": "e2e",
       "description": "Observer sets required=true when the instantiated work affects UI/API/operator flows or any E2E-covered surface."
+    },
+    {
+      "id": "contract_gate_tests",
+      "required": false,
+      "phase": "verification",
+      "kind": "pytest",
+      "description": "Focused tests for the instantiated contract gate behavior when the work changes contract validation or close-gate policy."
+    },
+    {
+      "id": "docs_policy_update",
+      "required": false,
+      "phase": "implementation",
+      "kind": "docs",
+      "description": "Documentation update evidence when the work changes MF/subagent policy."
+    },
+    {
+      "id": "e2e_deferred_followup",
+      "required": false,
+      "phase": "integration",
+      "kind": "e2e_defer",
+      "description": "Follow-up backlog evidence when observer explicitly defers E2E."
     }
   ],
   "timeline_contract": {

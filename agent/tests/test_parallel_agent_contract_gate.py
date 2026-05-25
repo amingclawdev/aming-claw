@@ -76,6 +76,28 @@ def _accepted_contract() -> dict:
     }
 
 
+def _observer_test_scenario_policy() -> dict:
+    return {
+        "mode": "observer_configured",
+        "decision": "new_scenario_required",
+        "allowed_decisions": [
+            "none",
+            "reuse_existing",
+            "new_scenario_required",
+        ],
+        "reason": "contract validation policy needs focused coverage",
+        "required_evidence_ids": [
+            "observer_test_strategy",
+            "focused_tests",
+            "contract_gate_tests",
+            "docs_policy_update",
+            "e2e_deferred_followup",
+        ],
+        "e2e_decision": "e2e_deferred",
+        "followup_backlog_id": "E2E-OBSERVER-TEST-SCENARIO-POLICY-20260524",
+    }
+
+
 def _insert_contract(
     conn: sqlite3.Connection,
     *,
@@ -111,6 +133,69 @@ def test_parallel_contract_accepts_backend_task_within_owned_scope() -> None:
     assert evidence["contract_id"] == "CONTRACT-PARALLEL-AI-SUMMARY-20260523"
     assert evidence["agent_id"] == "backend"
     assert evidence["contract_status"] == "ACCEPTED"
+
+
+def test_parallel_contract_validates_observer_configured_test_scenario_policy() -> None:
+    from governance.parallel_agent_contract import validate_parallel_agent_task_gate
+
+    conn = _conn()
+    contract = _accepted_contract()
+    contract["parallel_contract"]["test_scenario_policy"] = _observer_test_scenario_policy()
+    _insert_contract(conn, chain_trigger_json=contract)
+
+    evidence = validate_parallel_agent_task_gate(
+        conn,
+        "aming-claw",
+        "dev",
+        {
+            "bug_id": "FEATURE-AI-SUMMARY-20260523",
+            "parallel_contract_id": "CONTRACT-PARALLEL-AI-SUMMARY-20260523",
+            "parallel_agent_id": "backend",
+            "target_files": ["agent/governance/server.py"],
+        },
+    )
+
+    policy = evidence["test_scenario_policy"]
+    assert policy["mode"] == "observer_configured"
+    assert policy["decision"] == "new_scenario_required"
+    assert policy["required_evidence_ids"] == [
+        "observer_test_strategy",
+        "focused_tests",
+        "contract_gate_tests",
+        "docs_policy_update",
+        "e2e_deferred_followup",
+    ]
+    assert policy["e2e_decision"] == "e2e_deferred"
+    assert policy["followup_backlog_id"] == (
+        "E2E-OBSERVER-TEST-SCENARIO-POLICY-20260524"
+    )
+
+
+def test_parallel_contract_rejects_deferred_e2e_without_followup_backlog_id() -> None:
+    from governance.parallel_agent_contract import (
+        ParallelAgentContractError,
+        validate_parallel_agent_task_gate,
+    )
+
+    conn = _conn()
+    contract = _accepted_contract()
+    policy = _observer_test_scenario_policy()
+    policy["followup_backlog_id"] = ""
+    contract["parallel_contract"]["test_scenario_policy"] = policy
+    _insert_contract(conn, chain_trigger_json=contract)
+
+    with pytest.raises(ParallelAgentContractError, match="followup_backlog_id"):
+        validate_parallel_agent_task_gate(
+            conn,
+            "aming-claw",
+            "dev",
+            {
+                "bug_id": "FEATURE-AI-SUMMARY-20260523",
+                "parallel_contract_id": "CONTRACT-PARALLEL-AI-SUMMARY-20260523",
+                "parallel_agent_id": "backend",
+                "target_files": ["agent/governance/server.py"],
+            },
+        )
 
 
 def test_parallel_contract_rejects_missing_contract_id_when_parallel_agent_is_declared() -> None:
